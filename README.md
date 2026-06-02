@@ -169,9 +169,30 @@ CREATE TABLE certs (
 
 ## 核心规则
 
-### 泛域名判断
+### 泛域名匹配（请求路由时）
+
+请求到来时,先 exact 查 `domainIndex`,miss 后 fall back 到 wildcard（按 suffix 最长优先匹配）:
 
 ```go
+// 内存里维护两个结构：
+var domainIndex = map[string]*Site{}      // exact match: "app.example.com" → *Site
+var wildcardList = []*Site{}              // 所有 isWildcard 的 site，按 suffix 长度倒序
+
+func lookupSite(domain string) (*Site, bool) {
+    // 1. exact 优先
+    if site, ok := domainIndex[domain]; ok {
+        return site, true
+    }
+    // 2. wildcard fall back: 找 "*.suffix" 中 suffix 最长的
+    for _, site := range wildcardList {
+        suffix := strings.TrimPrefix(site.Domain, "*.")
+        if strings.HasSuffix(domain, "."+suffix) {
+            return site, true
+        }
+    }
+    return nil, false
+}
+
 func isWildcard(domain string) bool {
     return strings.HasPrefix(domain, "*.")
 }
@@ -179,12 +200,27 @@ func isWildcard(domain string) bool {
 
 - `*.example.com` → 泛域名
 - `app.example.com` → 单域名
+- 请求 `foo.example.com` → exact miss → fall back 到 `*.example.com`（若存在）
+- 请求 `foo.bar.example.com` → exact miss → fall back 到 `*.bar.example.com`（若存在）优先于 `*.example.com`（suffix 更长优先）
 
 ### 证书自动申请
 
 - 泛域名 `*.example.com` → 申请 `*.example.com` + `example.com`
 - 单域名 `app.example.com` → 申请 `app.example.com`
 - Let's Encrypt ACME 自动申请 + 续期
+
+---
+
+## in-flight 请求与 tun 断连
+
+**tun 离线时**：
+- 新请求：直接返回 `502 Bad Gateway`
+- 已转发到 tun、在 WS 上等响应的请求：tun 断连 → 协议层 `request_id` 无响应 → 客户端重试
+- ngx 侧不需要特殊处理（WS 断了就是断了）
+
+**tun 重连时**：
+- onTunConnect 重新拿一次 `tunIndex[tunName]` 推给 tun
+- 期间 in-flight 但被中断的请求由客户端重试
 
 ---
 
@@ -209,7 +245,7 @@ domainIndex[app.example.com]  →  *Site
             └── WS → tun → proxy_pass → backend
 ```
 
-**关键**：请求热路径**不读 SQLite**。启动时一次性构建两个内存索引，请求处理 O(1) 查 map。详见下文「内存缓存与重载」一节。
+**关键**：请求热路径**不读 SQLite**。启动时一次性构建内存索引，请求处理 O(1) 查 map。详见下文「内存缓存与重载」一节。
 
 ### 2. tun 启动流程
 
@@ -262,16 +298,20 @@ tun 开始代理这些域名的请求
 
 ## Admin API
 
+所有 API 资源的主键是自然键（`name` / `domain` / `token`），URL 段用主键值。
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET/POST | `/api/sites` | 站点列表/新增 |
-| PUT/DELETE | `/api/sites/:id` | 更新/删除站点 |
+| PUT/DELETE | `/api/sites/:name` | 更新/删除站点（name 主键） |
 | GET/POST | `/api/domains` | 域名列表/新增 |
-| PUT/DELETE | `/api/domains/:id` | 更新/删除域名 |
+| PUT/DELETE | `/api/domains/:domain` | 更新/删除域名（domain 主键） |
 | GET/POST | `/api/tun` | tun 节点列表/新增 |
-| PUT/DELETE | `/api/tun/:id` | 更新/删除 tun |
+| PUT/DELETE | `/api/tun/:name` | 更新/删除 tun（name 主键） |
+| GET/POST | `/api/tokens` | token 列表/新增 |
+| PUT/DELETE | `/api/tokens/:token` | 更新/删除 token（token 主键） |
 | GET/POST | `/api/certs` | 证书列表/上传 |
-| DELETE | `/api/certs/:id` | 删除证书 |
+| DELETE | `/api/certs/:domain` | 删除证书（domain 主键） |
 
 ---
 
@@ -321,11 +361,10 @@ tun 开始代理这些域名的请求
 6. tun 启动 → WS 连 ngx → 发 token + name
    ngx 查 tokenIndex[token] → 验证 token 有效（内存，一次 map lookup）
    ngx 查 tun 表（name=office）验证身份（SQL 一次）
-   ngx 扫内存 site 索引，找 backend 以 'office:' 开头的 site
-   → 收集这些 site 关联的 domain（内存，零 SQL）
+   ngx 查内存 tunIndex['office'] → 拿该 tun 应代理的 domain 列表
    → 返回 domain 列表 + 每个 domain 的 backend 给 tun
 
-6. 外部访问 app.example.com
+7. 外部访问 app.example.com
    → ngx 查内存 domainIndex[app.example.com] → *Site
    → site.backend = office:http://...（有前缀）→ tunnel 路径
    → tunIndex['office'] 在线 → WS 转发
@@ -428,7 +467,7 @@ func handleHTTP(w, req) {
 
 | 触发 | 动作 |
 |------|------|
-| ngx 启动 | 一次性加载 → 构建三张内存索引 |
+| ngx 启动 | 一次性加载 → 构建四张内存索引 |
 | admin 增/删/改 site | 重新扫描所有 site，重建 `tunIndex` 和 `domainIndex` |
 | admin 增/删/改 domain | 重建 `domainIndex`（增量：先删旧 key，再加新 key） |
 | admin 增/删/改 tun | 重建 `tunIndex`（过滤 backend 前缀） |
@@ -440,10 +479,10 @@ func handleHTTP(w, req) {
 - site 表小（百级）→ 全量重建 O(n)，n 是 site 数，足够快
 - domain 表可能大（万级）→ 增量更新，避免全量扫
 
-### tun 注册时（唯一在内存里"反推"的位置）
+### tun 注册时（直接查 tunIndex，不重新扫 sites）
 
 ```go
-// tun 连上来时：先验证 token，再反推它该代理哪些 domain
+// tun 连上来时：先验证 token，再从 tunIndex 拿该 tun 应代理的 domain
 func onTunConnect(token, tunName string) {
     // 1. 内存验证 token（一次 map lookup）
     if !tokenIndex[token] {
@@ -451,20 +490,34 @@ func onTunConnect(token, tunName string) {
         return
     }
 
-    // 2. 内存反推 domain 列表
-    var domains []*Domain
-    for _, site := range sites {                    // 内存扫描
-        if strings.HasPrefix(site.Backend, tunName+":") {
-            for _, d := range site.Domains {        // 内存 join
-                domains = append(domains, d)
-            }
-        }
+    // 2. 查 tunIndex：tunIndex 在 reload 时已经按 tun_name 索引好了
+    //    严格匹配 site.TunName == tunName，避免 HasPrefix 误匹配（'home' vs 'homestay'）
+    domains, ok := tunIndex[tunName]
+    if !ok {
+        domains = nil  // 该 tun 当前不代理任何 domain
     }
     sendToTun(tunName, domains)
 }
 ```
 
-这一步用 `strings.HasPrefix`（内存调用），**不是 SQL LIKE**。`HasPrefix` 比 LIKE 严格：要求 `tun_name:` 整体作为前缀，匹配规则与 backend 解析器一致，避免误匹配。
+**关键**：反推逻辑不在 tun 连接时做,而是在 reload 时**预先**按 tun_name 索引（`tunIndex`）。tun 连上来时直接 `tunIndex[tunName]` 一次 lookup,O(1),不扫 sites。
+
+`tunIndex` 的构建（在 reload 时）：
+
+```go
+// 扫一次 sites，对每个 site 解析 backend 拿 tun_name，按 tun_name 分组
+func rebuildTunIndex() {
+    tunIndex = map[string][]*Domain{}
+    for _, site := range sites {
+        if site.TunName == "" {
+            continue  // direct 路径，不进 tunIndex
+        }
+        for _, d := range site.Domains {
+            tunIndex[site.TunName] = append(tunIndex[site.TunName], d)
+        }
+    }
+}
+```
 
 ---
 
@@ -477,7 +530,7 @@ func onTunConnect(token, tunName string) {
 **格式约束**：
 - 仅允许 `[a-z0-9_-]+`，长度 1~32
 - 内部统一存小写
-- 不可为空字符串，不可为纯数字（避免与"无前缀=direct"歧义）
+- 不可为空字符串，不可为纯数字（纯数字是历史 tunid 遗物，文本名是新的契约）
 
 **为什么用文本名而非整数 ID**：
 - **可读**：`office:http://...` 一眼看出"走办公室 tun"，比 `5:http://...` 直观
@@ -485,13 +538,54 @@ func onTunConnect(token, tunName string) {
 - **自描述**：客户运维看 backend 字段就知道是哪个 tun，不需查 ngx 内部表
 
 **backend 解析规则**：
+
+```go
+// parseBackend 切第一个 ':'，左半是 tun_name，右半是 URL
+// 例: 'office:https://x:y:z' → tun_name='office', url='https://x:y:z'
+func parseBackend(s string) (tunName, url string, err error) {
+    idx := strings.IndexByte(s, ':')
+    if idx < 0 {
+        return "", s, nil  // 无前缀 → direct
+    }
+    candidate := s[:idx]
+    if !isValidTunName(candidate) {
+        return "", "", fmt.Errorf("invalid tun_name in backend: %q", candidate)
+    }
+    return candidate, s[idx+1:], nil
+}
+
+func isValidTunName(s string) bool {
+    if s == "" || isAllDigits(s) {
+        return false  // 空串/纯数字不接受
+    }
+    return validTunNameRE.MatchString(s)  // ^[a-z0-9_-]+$, 1~32 字符
+}
+```
+
+**解析规则**：
 - 无 `:` 前缀 → `direct` 路径，ngx 直连后端
-- 有 `name:` 前缀（`name` 匹配 `[a-z0-9_-]+`）→ `tunnel` 路径，ngx 查 tun 表（按 name 匹配）
-- 解析失败 → 配置错误，启动时 fail-fast，不进入请求循环
+- 有 `name:` 前缀 → `tunnel` 路径，**切第一个 `:`**（不是最后一个）
+- `name` 匹配 `^[a-z0-9_-]+$`、1~32 字符、**非纯数字**、**小写存储**
+- 解析失败 → 启动时 fail-fast，不进入请求循环
+- 大小写：内部统一存小写，匹配前 toLower
 
 **示例**：
 ```
-http://127.0.0.1:8080      → direct
-office:http://192.168.1.x  → tunnel via tun.name='office'
-home:https://10.0.0.5:443  → tunnel via tun.name='home'（https 协议）
+http://127.0.0.1:8080           → direct
+office:http://192.168.1.x       → tunnel via tun.name='office'
+home:https://10.0.0.5:443       → tunnel via tun.name='home'（https 协议，第二个 ':' 是端口）
+office:mailto:foo@bar.com       → tunnel via tun.name='office', url='mailto:foo@bar.com'
+```
+
+**反推匹配（reload/onTunConnect 时）**：
+```go
+// 严格匹配：site 的 tun_name 字段 == 查询的 tunName
+// 不用 HasPrefix，避免 'home' 误匹配 'homestay:...'
+for _, site := range sites {
+    if site.TunName == tunName {  // site.TunName 在 reload 时 parseBackend 解析缓存
+        for _, d := range site.Domains {
+            domains = append(domains, d)
+        }
+    }
+}
 ```
