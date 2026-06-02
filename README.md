@@ -279,7 +279,7 @@ async fn upstream_request_filter(
 **wildcard 路径的语义约束**：
 
 - **只支持单层 `*.` 前缀**：`*.example.com` ✓；`*.*.example.com` ✗（启动时 fail-fast）
-- **wildcard 站点不能走 tunnel 路径**：`site.backend` 不能是 `*:http://...` 或 `*:file:///...`（`*` 不是合法 tun_name,被 `is_valid_tun_name` 拒）。wildcard 站点的 backend 只能是 direct 的 http/https/file。
+- **wildcard 是 domain 的属性，不是 site 的属性**：一个 site 可以同时拥有 wildcard domain 和 exact domain，可以有任何 backend（http/https/file/tunnel）。`site.backend` 不受 domain 形式影响。
 - **请求来时只能走 forward**,不能 rewrite。后端必须自己处理多子域路由。
 - **大小写归一化**：SQLite 存的 domain 全部小写;请求 host 进来先 to_lowercase 再查。
 - **端口忽略**:`foo.example.com:8443` 和 `foo.example.com` 等价查。
@@ -291,6 +291,18 @@ async fn upstream_request_filter(
 - 请求 `foo.example.com` → exact miss → 变形 `*.example.com` 查 → 命中
 - 请求 `foo.bar.example.com` → exact miss → 变形 `*.bar.example.com` 查（命中优先）→ 若没有再变形 `*.example.com` 查
 - 请求 `Foo.Example.COM:8443` → 归一化 `foo.example.com` → exact miss → 变形
+
+**wildcard + tunnel 的合法场景示例**：
+
+```
+site: customer-web, backend = office:http://192.168.1.100:8080
+
+domains:
+  - *.example.com   → site customer-web  （外网访问所有子域,走 office tun）
+  - app.example.com → site customer-web  （也可以是 exact 域名,同 site）
+```
+
+外部访问 `foo.example.com` → 命中 `*.example.com` → 查到 site → 解析 backend `office:http://...` → tunnel 路径 → WS 转发到 office tun。完全合法,wildcard 不限制 backend 形式。
 
 ### 证书自动申请
 
