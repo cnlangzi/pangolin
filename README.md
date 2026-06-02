@@ -18,7 +18,7 @@
 |------|------|---------|
 | **同网段直连** | Gateway 直接 proxy_pass 到内网服务 | 网络可达 |
 | **SDK 嵌入式** | Gateway → WS → SDK → 本地 IPC | 目标 web 可引入 SDK |
-| **Client 节点** | Gateway → WS → Client → proxy_pass → web | 目标 web 无法修改 |
+| **CLI 节点** | Gateway → WS → Client → proxy_pass → web | 目标 web 无法修改 |
 
 ---
 
@@ -28,7 +28,7 @@
 Site (后端服务)
     │
     ├── 1:N Domains (域名绑定)
-    └── 1:N Clients (客户端节点)
+    └── 1:N Clients (CLI 节点)
 
 Runtime (运行时状态) ── 在线/离线
 Certs (证书) ── Let's Encrypt 自动申请
@@ -75,8 +75,8 @@ CREATE TABLE certs (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 客户端节点
-CREATE TABLE clients (
+-- CLI 节点
+CREATE TABLE cli (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT NOT NULL,
     token        TEXT NOT NULL,
@@ -89,7 +89,7 @@ CREATE TABLE clients (
 -- 运行时状态
 CREATE TABLE runtime (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    target_type  TEXT NOT NULL,         -- 'domain' | 'client'
+    target_type  TEXT NOT NULL,         -- 'domain' | 'cli'
     target_id    INTEGER NOT NULL,
     online       INTEGER DEFAULT 0,
     last_seen_at DATETIME
@@ -109,8 +109,8 @@ CREATE TABLE runtime (
 | PUT/DELETE | `/api/domains/:id` | 更新/删除域名 |
 | GET/POST | `/api/certs` | 证书列表/上传 |
 | DELETE | `/api/certs/:id` | 删除证书 |
-| GET/POST | `/api/clients` | 客户端节点列表/新增 |
-| DELETE | `/api/clients/:id` | 删除客户端 |
+| GET/POST | `/api/cli` | CLI 节点列表/新增 |
+| DELETE | `/api/cli/:id` | 删除 CLI 节点 |
 | GET | `/api/runtime` | 在线状态监控 |
 
 ---
@@ -191,9 +191,9 @@ domains:
 
 SDK 嵌入目标 web 代码后，WebSocket 隧道直接连到 Gateway，本地 IPC 调用，速度最快。
 
-### 路径三：Client 节点部署
+### 路径三：CLI 节点部署
 
-目标 web 无法修改，在其内网部署独立 Client 节点：
+目标 web 无法修改，在其内网部署独立 CLI 节点：
 
 ```yaml
 server: "yourdomain.com:8080"
@@ -205,7 +205,7 @@ domains:
     local: "192.168.1.100:8080"
 ```
 
-Client 节点在对方内网运行，建立 WebSocket 隧道到 Gateway，再 proxy_pass 到目标 web。
+CLI 节点在对方内网运行，建立 WebSocket 隧道到 Gateway，再 proxy_pass 到目标 web。
 
 ---
 
