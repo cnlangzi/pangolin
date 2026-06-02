@@ -411,6 +411,25 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 
 ---
 
+## 行为对齐 nginx
+
+代理行为、headers、超时、缓存、错误码等所有「行为类」决策，默认对齐 nginx。
+
+- **路径前缀转发**：对齐 nginx `proxy_pass` 语义（含带斜杠/不带斜杠的差异）
+- **错误码**：对齐 nginx（502 后端不通、504 超时、404 未路由、413 body 过大、499 客户端断开）
+- **Headers**：对齐 `proxy_set_header` 约定（`X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host`）
+- **超时**：对齐 `proxy_connect_timeout` / `proxy_read_timeout` / `proxy_send_timeout` 语义
+- **WebSocket**：对齐 nginx 的 `Upgrade` / `Connection` 头处理 + `proxy_read_timeout` 行为
+- **重定向**：对齐 `proxy_redirect`（后端 30x 时的 Location 改写规则）
+- **请求体缓冲**：对齐 `client_body_buffer_size` / `proxy_request_buffering`
+- **上游 keepalive**：对齐 `upstream {}` keepalive 连接池
+
+只有 pangolin 特有的（`tun_name` 解析、`tunnel` 路径、token 验证、内存索引 reload）才自定义。
+
+实现时遇到「行为不确定」的决策，**先查 nginx 默认**，再考虑 pangolin 是否有必要偏离。
+
+---
+
 ## 内存缓存与重载
 
 **原则**：请求热路径不读 SQLite。所有配置数据启动时一次性加载进内存，admin 增删改时触发 reload。
