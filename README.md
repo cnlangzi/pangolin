@@ -13,6 +13,7 @@
 | **site** | 站点（后端服务） | 配置 `backend`，指向具体服务 |
 | **domain** | 域名 | 关联到 site，外部访问入口 |
 | **tun_name** | 隧道节点名 | 文本名（如 `office`），用于 backend 字段路由到指定 tun |
+| **token** | 客户端 token | tokens 表里管理，tun 启动时携带，身份验证用 |
 | **backend** | 后端 URL | `[tun_name:]url` 格式 |
 
 ---
@@ -68,8 +69,8 @@ pangolin/
 # tun 隧道节点（客户内网）
 ./tun --server gateway.example.com:8080 --token abc123
 
-# token 是 ngx 全局管理的（见 cfg.Server.Token），所有 tun 共享同一个，
-# 不为每个 tun 单独生成。tun 用 name 标识身份。
+# token 在 ngx 的 tokens 表里统一管理（admin 增删，热加载生效），
+# 多个 token 可共存。tun 启动时任意携带一个有效 token + name 即可连上。
 ```
 
 无需 `--mode` 标志，二进制名 = 角色名。
@@ -132,14 +133,25 @@ CREATE TABLE domains (
 --     1. tun 与 domain 不需要中间表。domain 走哪个 tun 完全由 site.backend
 --        决定（有无 tun_name: 前缀），ngx 通过 site 表 JOIN domains 表反查
 --        得到 tun 应代理的 domain 列表。
---     2. token 不在 tun 表里，全局管理（cfg.Server.Token），所有 tun 共享。
---        启动时所有 tun 节点用同一个 token 连上来，再用 name 区分身份。
+--     2. token 不在 tun 表里。tun 启动时携带任意一个 tokens 表里的有效 token，
+--        用 name 区分身份。token 与 tun 完全解耦。
 CREATE TABLE tun (
     name      TEXT PRIMARY KEY,             -- tun_name（小写字母数字下划线短横线，1~32 字符）
     enabled   INTEGER DEFAULT 1,
     online    INTEGER DEFAULT 0,
     registered_at DATETIME,
     last_seen_at  DATETIME
+);
+
+-- token 白名单
+--   任何客户端（tun 节点、admin CLI、未来其他客户端）连接 ngx 时，
+--   必须在 tokens 表里有对应 token（且 enabled=1、未过期）。
+--   token 与 tun 解耦：tun 启动时用哪个有效 token 都行，用 name 区分身份。
+CREATE TABLE tokens (
+    token      TEXT PRIMARY KEY,            -- token 字符串本身
+    enabled    INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME                     -- NULL = 永不过期
 );
 
 -- 证书（Let's Encrypt 自动管理）
@@ -208,7 +220,7 @@ tun 配置: --server gateway.com:8080 --token abc123 --name office
 WS 连接 ngx，发 token + name
     │
     ▼
-ngx 验证全局 token（对比 cfg.Server.Token，内存里比对，零 SQL）
+ngx 查 tokenIndex（内存）→ 验证 token 有效（一次 map lookup）
 ngx 查 tun 表（name 匹配）→ 验证身份（这一步走 SQL，只在注册时发生一次）
     │
     ▼
@@ -228,12 +240,13 @@ tun 开始代理这些域名的请求
 ./ngx --port 8080
     │
     ▼
-初始化 SQLite（sites/domains/tun/certs）
+初始化 SQLite（sites/domains/tun/tokens/certs）
     │
     ▼
 构建内存索引（启动时一次性）：
    domainIndex[domain]  →  *Site
    tunIndex[tun_name]   →  []*Domain
+   tokenIndex[token]    →  bool
    sites[]              →  []*Site（供 tun 注册时前缀扫描）
     │
     ▼
@@ -288,23 +301,25 @@ tun 开始代理这些域名的请求
 客户内网 web 服务在防火墙后，ngx 无法直接访问：
 
 ```
-1. admin 添加 tun 节点
-   - name: office
-   （token 是全局的，配置在 cfg.Server.Token，不需要单独生成）
+1. admin 添加 token
+   - token: auto-generated（或粘贴现有值）
 
-2. admin 添加 site
+2. admin 添加 tun 节点
+   - name: office
+
+3. admin 添加 site
    - name: customer-web
    - backend: office:http://192.168.1.100:8080
 
-3. admin 添加 domain
+4. admin 添加 domain
    - domain: app.example.com
    - site_name: customer-web
 
-4. 客户在内网部署 tun
-   ./tun --name office --server gateway.example.com:8080 --token abc123
+5. 客户在内网部署 tun
+   ./tun --name office --server gateway.example.com:8080 --token <admin 给的 token>
 
-5. tun 启动 → WS 连 ngx → 发 token + name
-   ngx 验证全局 token（cfg.Server.Token 内存比对，零 SQL）
+6. tun 启动 → WS 连 ngx → 发 token + name
+   ngx 查 tokenIndex[token] → 验证 token 有效（内存，一次 map lookup）
    ngx 查 tun 表（name=office）验证身份（SQL 一次）
    ngx 扫内存 site 索引，找 backend 以 'office:' 开头的 site
    → 收集这些 site 关联的 domain（内存，零 SQL）
@@ -364,7 +379,7 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 ### 内存索引
 
 ```go
-// 三张内存索引，启动时从 SQLite 一次加载：
+// 四张内存索引，启动时从 SQLite 一次加载：
 
 // 请求热路径用：domain → site 单跳 O(1)
 var domainIndex = map[string]*Site{}  // key: domain (含 *.wildcard)
@@ -374,6 +389,9 @@ var tunIndex = map[string][]*Domain{}  // key: tun_name
 
 // tun 注册时用：所有 site（用于前缀扫描 backend 字段）
 var sites = []*Site{}
+
+// tun 注册时用：token 白名单（O(1) 验证）
+var tokenIndex = map[string]bool{}    // key: token string, value: enabled && !expired
 ```
 
 **请求处理**（热路径）：
@@ -414,6 +432,7 @@ func handleHTTP(w, req) {
 | admin 增/删/改 site | 重新扫描所有 site，重建 `tunIndex` 和 `domainIndex` |
 | admin 增/删/改 domain | 重建 `domainIndex`（增量：先删旧 key，再加新 key） |
 | admin 增/删/改 tun | 重建 `tunIndex`（过滤 backend 前缀） |
+| admin 增/删/改 token | 重建 `tokenIndex`（增量：先删旧 key，再加新 key） |
 | tun 重连/上线 | 重新扫描 `tunIndex[tunName]`，向 tun 推送新 domain 列表 |
 | tun 离线 | 仅标记 `Online=false`，不动索引 |
 
@@ -424,8 +443,15 @@ func handleHTTP(w, req) {
 ### tun 注册时（唯一在内存里"反推"的位置）
 
 ```go
-// tun 连上来时，反推它该代理哪些 domain
-func onTunConnect(tunName string) {
+// tun 连上来时：先验证 token，再反推它该代理哪些 domain
+func onTunConnect(token, tunName string) {
+    // 1. 内存验证 token（一次 map lookup）
+    if !tokenIndex[token] {
+        conn.WriteJSON(Message{Type: "error", Body: "invalid token"})
+        return
+    }
+
+    // 2. 内存反推 domain 列表
     var domains []*Domain
     for _, site := range sites {                    // 内存扫描
         if strings.HasPrefix(site.Backend, tunName+":") {
