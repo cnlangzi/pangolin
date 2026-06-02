@@ -1,35 +1,103 @@
 # 🦔 Pangolin - 一体化内网穿透与反向代理
 
-> 穿山甲是 **nginx + WebSocket 隧道** 一体化方案，两级架构，支持直连和隧道两种路径。
+> 穿山甲 — **ngx + tun** 两级架构，支持直连和隧道两种路径，一站式解决反向代理和内网穿透。
+
+## 术语
+
+| 术语 | 含义 | 说明 |
+|------|------|------|
+| **ngx** | 主节点（Gateway） | 公网入口，监听端口，反向代理 |
+| **tun** | 隧道节点（Tunnel） | 客户内网部署，连接到 ngx |
+| **paw** | 爪子走（直连路径） | ngx 内部直接 `proxy_pass` 到后端 |
+| **claw** | 爪子挖（隧道路径） | ngx → tun → `proxy_pass` 到后端 |
+| **site** | 站点（后端服务） | 配置 `backend`，指向具体服务 |
+| **domain** | 域名 | 关联到 site，外部访问入口 |
+| **tun_id** | 隧道节点 ID | 用于 backend 字段，路由到指定 tun |
+| **tun_domains** | 隧道代理的域名 | token → domains 映射表 |
+| **backend** | 后端 URL | `[tunid:]url` 格式 |
+
+---
 
 ## 架构
 
 ```
-Root Gateway (公网入口)
+外部用户
     │
-    ├── 直连路径 (direct)
-    │       └── proxy_pass → site
-    │
-    └── 隧道路径 (tunnel)
-            └── WS → CLI Node → proxy_pass → site
-                     (最多一级)
+    ▼
+[公网 DNS] ──► [ngx (Gateway)]
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+    paw 路径                claw 路径
+    (直连)                  (隧道)
+        │                       │
+        ▼                       ▼
+    proxy_pass              WebSocket
+        │                       │
+        ▼                       ▼
+   [后端服务]               [tun (内网)]
+                                │
+                                ▼
+                            proxy_pass
+                                │
+                                ▼
+                          [后端服务]
 ```
-
-**同一套程序，两个模式：**
-
-| 模式 | 说明 |
-|------|------|
-| `ngx` (默认) | Root Gateway，监听端口，接收请求和 CLI 连接 |
-| `cli` | CLI 节点，WS 连接到 Root，proxy_pass 上游转发 |
 
 ---
 
-## 两种路径
+## 两个 cmd
 
-| 路径 | 说明 | 条件 |
-|------|------|------|
-| **直连 (direct)** | Root Gateway 直接 `proxy_pass` + `proxy_protocol` 到站点 | 网络互通 |
-| **隧道 (tunnel)** | Root → WS → CLI 节点 → `proxy_pass` + `proxy_protocol` | 网络不通 |
+```
+pangolin/
+├── cmd/
+│   ├── ngx/        # 主节点 binary
+│   └── tun/        # 隧道节点 binary
+└── internal/       # 共享代码
+    ├── proxy/      # proxy_pass（ngx 和 tun 共享）
+    ├── tunnel/     # WebSocket 隧道
+    ├── cache/      # 文件缓存
+    └── db/         # SQLite（ngx 侧）
+```
+
+**使用方式：**
+
+```bash
+# ngx 主节点
+./ngx --port 8080
+
+# tun 隧道节点（客户内网）
+./tun --server gateway.example.com:8080 --token abc123
+```
+
+无需 `--mode` 标志，二进制名 = 角色名。
+
+---
+
+## backend 字段格式
+
+格式：`[tunid:]url`
+
+| 例子 | 含义 |
+|------|------|
+| `http://127.0.0.1:8080` | paw（默认，无前缀） |
+| `https://x.example.com` | paw，https 协议 |
+| `0:http://127.0.0.1:8080` | paw（显式 tunid=0） |
+| `5:http://192.168.1.100:8080` | claw，经 tun#5 代理 |
+| `3:http://192.168.1.100:8080/apis` | claw + 路径前缀 |
+| `http://127.0.0.1:8080/admin` | paw + 路径前缀 |
+
+**路径前缀行为**（类 nginx proxy_pass）：
+
+```
+请求: GET /v1/users
+backend: http://127.0.0.1:8080/apis
+    │
+    ▼
+转发: http://127.0.0.1:8080/apis/v1/users
+```
+
+**注意：** `http://127.0.0.1:8080/`（带斜杠）保持原路径转发。
 
 ---
 
@@ -40,41 +108,40 @@ Root Gateway (公网入口)
 CREATE TABLE sites (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT UNIQUE NOT NULL,
-    local_ip   TEXT NOT NULL,
-    local_port INTEGER NOT NULL,
+    backend    TEXT NOT NULL,    -- '[tunid:]url'
     enabled    INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 域名（关联站点）
+-- 域名
 CREATE TABLE domains (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain     TEXT UNIQUE NOT NULL,
+    domain     TEXT UNIQUE NOT NULL,    -- 'example.com' 或 '*.example.com'
     site_id    INTEGER NOT NULL,
     enabled    INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- CLI 节点
-CREATE TABLE cli (
+-- 隧道节点
+CREATE TABLE tun (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     name      TEXT NOT NULL,
-    token     TEXT UNIQUE NOT NULL,   -- 生成给客户的 token
+    token     TEXT UNIQUE NOT NULL,    -- 生成给客户的 token
     enabled   INTEGER DEFAULT 1,
     online    INTEGER DEFAULT 0,
     registered_at DATETIME,
     last_seen_at  DATETIME
 );
 
--- CLI 要代理的域名（token → domains 映射）
-CREATE TABLE cli_domains (
+-- 隧道代理的域名（token → domains 映射）
+CREATE TABLE tun_domains (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    cli_id   INTEGER NOT NULL,
+    tun_id   INTEGER NOT NULL,
     domain   TEXT NOT NULL
 );
 
--- 证书（Let's Encrypt）
+-- 证书（Let's Encrypt 自动管理）
 CREATE TABLE certs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     domain     TEXT UNIQUE NOT NULL,
@@ -108,86 +175,60 @@ func isWildcard(domain string) bool {
 
 ---
 
-## 请求路由流程
+## 路由流程
+
+### 1. 请求路由
 
 ```
 请求 app.example.com
     │
     ▼
-查 domains 表 → site_id
+查 domains → site
     │
     ▼
-查 sites 表 → local_ip:local_port
+解析 site.backend
     │
-    ├── 直连路径 (direct)
-    │       └── proxy_pass → local_ip:local_port
+    ├── 无 tunid / tunid=0 → paw 路径
+    │       └── proxy_pass → backend
     │
-    └── 隧道路径 (tunnel)
-            ├── 查 cli_domains → 哪个 CLI 注册了这个 domain
-            ├── 查 cli 表 → CLI 在线？
-            └── WS → CLI → proxy_pass → local_ip:local_port
+    └── 有 tunid → claw 路径
+            ├── 查 tun 表 → 在线？
+            └── WS → tun → proxy_pass → backend
 ```
 
----
-
-## CLI 启动流程
+### 2. tun 启动流程
 
 ```
-CLI 配置: server + token
+tun 配置: --server gateway.com:8080 --token abc123
     │
     ▼
-WS 连接 Root，发 token
+WS 连接 ngx，发 token
     │
     ▼
-Root 验证 token，查 cli_domains
+ngx 验证 token，查 tun_domains
     │
     ▼
-Root 返回 domain 列表 + 每个 domain 的 local_ip:local_port
+ngx 返回 domain 列表 + 每个 domain 的 backend
     │
     ▼
-CLI 开始代理这些域名的请求
+tun 开始代理这些域名的请求
 ```
 
----
-
-## 目录结构
-
-```
-pangolin/
-├── cmd/
-│   └── ngx/           # 同一程序，mode 区分 ngx/cli
-├── internal/
-│   ├── proxy/        # HTTP 反向代理 (proxy_pass)
-│   ├── tunnel/       # WebSocket 隧道
-│   ├── cache/        # 文件缓存
-│   └── db/           # SQLite 持久化
-├── web/admin/        # 管理后台
-└── tools/            # 工具脚本
-```
-
----
-
-## 快速开始
-
-### Root Gateway
+### 3. ngx 启动流程
 
 ```bash
-# 启动 ngx 模式
-./pangolin --mode ngx --port 8080
-
-# 或默认 ngx 模式
-./pangolin --port 8080
+./ngx --port 8080
+    │
+    ▼
+初始化 SQLite（sites/domains/tun/tun_domains/certs）
+    │
+    ▼
+启动 HTTP 服务器
+    │
+    ├── Handle HTTP 请求 → 路由到 site.backend
+    ├── Handle WS 连接（来自 tun）
+    └── Handle ACME 证书申请
 ```
-
-通过 admin API 添加站点和域名。
-
-### CLI 节点（客户内网部署）
-
-```bash
-./pangolin --mode cli --server gateway.example.com:8080 --token <token>
-```
-
-CLI 只需配置 server 和 token，domains 由 Root 下发。
 
 ---
 
@@ -199,11 +240,87 @@ CLI 只需配置 server 和 token，domains 由 Root 下发。
 | PUT/DELETE | `/api/sites/:id` | 更新/删除站点 |
 | GET/POST | `/api/domains` | 域名列表/新增 |
 | PUT/DELETE | `/api/domains/:id` | 更新/删除域名 |
-| GET/POST | `/api/cli` | CLI 节点列表/新增 |
-| PUT | `/api/cli/:id` | 更新 CLI（分配 domains） |
-| DELETE | `/api/cli/:id` | 删除 CLI 节点 |
+| GET/POST | `/api/tun` | tun 节点列表/新增 |
+| PUT/DELETE | `/api/tun/:id` | 更新/删除 tun |
 | GET/POST | `/api/certs` | 证书列表/上传 |
 | DELETE | `/api/certs/:id` | 删除证书 |
+
+---
+
+## 典型使用场景
+
+### 场景一：客户内网与 ngx 网络互通（paw）
+
+客户内网 web 服务可以被 ngx 直接访问到：
+
+```
+1. admin 添加 site
+   - name: customer-web
+   - backend: http://192.168.1.100:8080
+
+2. admin 添加 domain
+   - domain: app.example.com
+   - site_id: customer-web 的 id
+
+3. 外部访问 app.example.com
+   → ngx 查 domains → site → backend: http://192.168.1.100:8080
+   → proxy_pass 直连
+```
+
+### 场景二：客户内网与 ngx 网络不通（claw）
+
+客户内网 web 服务在防火墙后，ngx 无法直接访问：
+
+```
+1. admin 添加 site
+   - name: customer-web
+   - backend: 5:http://192.168.1.100:8080  (tun#5)
+
+2. admin 添加 domain
+   - domain: app.example.com
+   - site_id: customer-web 的 id
+
+3. admin 添加 tun 节点（分配 domain）
+   - name: customer-tun
+   - token: auto-generated
+   - domains: [app.example.com]
+
+4. 客户在内网部署 tun
+   ./tun --server gateway.example.com:8080 --token abc123
+
+5. 外部访问 app.example.com
+   → ngx 查 domains → site → backend: 5:http://...
+   → 查 tun#5 在线 → WS 转发
+   → tun#5 收到请求 → proxy_pass http://192.168.1.100:8080
+```
+
+### 场景三：单 site 多域名
+
+一个站点绑定多个域名（包括泛域名）：
+
+```
+site: customer-web, backend: http://192.168.1.100:8080
+
+domains:
+  - app.example.com   → site customer-web
+  - api.example.com   → site customer-web
+  - *.example.com     → site customer-web
+```
+
+所有域名都走同一后端，配置无重复。
+
+### 场景四：路径前缀路由
+
+后端要求带路径前缀：
+
+```
+site: admin-app, backend: 3:http://192.168.1.100:8080/admin
+
+请求: GET /dashboard
+    │
+    ▼
+转发: http://192.168.1.100:8080/admin/dashboard
+```
 
 ---
 
