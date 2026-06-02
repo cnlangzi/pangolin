@@ -106,27 +106,28 @@ backend: http://127.0.0.1:8080/apis
 
 ```sql
 -- 站点（后端服务）
+--   name: 业务名（例 'customer-web'），主键
 CREATE TABLE sites (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT UNIQUE NOT NULL,
-    backend    TEXT NOT NULL,    -- '[tun_name:]url'
+    name       TEXT PRIMARY KEY,            -- 唯一业务标识（例 'customer-web'）
+    backend    TEXT NOT NULL,               -- '[tun_name:]url'
     enabled    INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 域名
+--   domain: 域名（例 'app.example.com' 或 '*.example.com'），主键
+--   site_name: 引用 sites.name（外键）
 CREATE TABLE domains (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain     TEXT UNIQUE NOT NULL,    -- 'example.com' 或 '*.example.com'
-    site_id    INTEGER NOT NULL,
+    domain     TEXT PRIMARY KEY,            -- 'example.com' 或 '*.example.com'
+    site_name  TEXT NOT NULL,               -- 引用 sites.name
     enabled    INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (site_name) REFERENCES sites(name)
 );
 
 -- 隧道节点
---   id: 内部整数主键
---   name: tun_name，文本名（backend 字段引用此值，例 'office'）
+--   name: tun_name，文本名（backend 字段引用此值，例 'office'），主键
 --   注意：
 --     1. tun 与 domain 不需要中间表。domain 走哪个 tun 完全由 site.backend
 --        决定（有无 tun_name: 前缀），ngx 通过 site 表 JOIN domains 表反查
@@ -134,8 +135,7 @@ CREATE TABLE domains (
 --     2. token 不在 tun 表里，全局管理（cfg.Server.Token），所有 tun 共享。
 --        启动时所有 tun 节点用同一个 token 连上来，再用 name 区分身份。
 CREATE TABLE tun (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    name      TEXT UNIQUE NOT NULL,    -- tun_name，文本名（小写字母数字下划线短横线，1~32 字符）
+    name      TEXT PRIMARY KEY,             -- tun_name（小写字母数字下划线短横线，1~32 字符）
     enabled   INTEGER DEFAULT 1,
     online    INTEGER DEFAULT 0,
     registered_at DATETIME,
@@ -143,9 +143,9 @@ CREATE TABLE tun (
 );
 
 -- 证书（Let's Encrypt 自动管理）
+--   domain: 域名，主键（一对一）
 CREATE TABLE certs (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    domain     TEXT UNIQUE NOT NULL,
+    domain     TEXT PRIMARY KEY,
     cert_file  TEXT NOT NULL,
     key_file   TEXT NOT NULL,
     expires_at DATETIME,
@@ -275,7 +275,7 @@ tun 开始代理这些域名的请求
 
 2. admin 添加 domain
    - domain: app.example.com
-   - site_id: customer-web 的 id
+   - site_name: customer-web
 
 3. 外部访问 app.example.com
    → ngx 查内存 domainIndex[app.example.com] → *Site
@@ -298,7 +298,7 @@ tun 开始代理这些域名的请求
 
 3. admin 添加 domain
    - domain: app.example.com
-   - site_id: customer-web 的 id
+   - site_name: customer-web
 
 4. 客户在内网部署 tun
    ./tun --name office --server gateway.example.com:8080 --token abc123
