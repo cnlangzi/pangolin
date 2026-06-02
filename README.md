@@ -458,12 +458,13 @@ office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴�
 
 ## 技术栈
 
-- **语言**：Rust 1.75+（stable）
-- **HTTP 代理 / 服务框架**：[pingora](https://github.com/cloudflare/pingora)（Cloudflare 开源，提供 nginx 行为语义的 Rust 实现）
+- **语言**：Rust 1.84+ stable（pingora 当前 MSRV）
+- **HTTP 代理 / 服务框架**：[pingora](https://github.com/cloudflare/pingora)（Cloudflare 开源，Apache 2.0；提供 nginx 行为语义的 Rust 实现；生产环境已使用超 4 年，处理 4000 万+ req/s）
 - **异步运行时**：tokio（pingora 内置）
 - **WebSocket**：tokio-tungstenite（tun 节点侧）
 - **数据库**：rusqlite（同步，零依赖）或 sqlx（async，本项目用同步即可）
-- **证书**：rcgen（生成）+ instant-acme（Let's Encrypt ACME 客户端）
+- **TLS**：pingora 自带（OpenSSL / BoringSSL / s2n-tls / rustls 可选）
+- **证书**：pingora TLS + 外部 ACME 客户端（`instant-acme`）负责 Let's Encrypt 申请 / 续期
 - **配置**：serde + toml / yaml-rust
 
 ---
@@ -525,7 +526,9 @@ pub type SharedIndexes = Arc<RwLock<Indexes>>;
 **请求处理**（热路径）：
 
 ```rust
-// pingora ProxyHttp trait：实现 upstream_peer + request_filter 走内存索引
+// pingora ProxyHttp trait：实现 request_filter + upstream_peer 走内存索引
+use pingora::prelude::*;
+
 struct Pangolin {
     indexes: SharedIndexes,
 }
@@ -535,18 +538,26 @@ impl ProxyHttp for Pangolin {
     type CTX = RequestCtx;
     fn new_ctx(&self) -> Self::CTX { RequestCtx::default() }
 
+    // request_filter 签名：Result<bool>
+    //   Ok(true)  → 已发响应，proxy 退出
+    //   Ok(false) → 继续到 upstream_peer 等后续阶段
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let host = session.req_header().uri.host().unwrap_or("");
         let index = self.indexes.read().await;
-        let site = match lookup_site(&index, host) {
-            Some(s) => s,
-            None => {
-                let _ = session.respond_error(404).await;
-                return Ok(true);  // 短路
+        match lookup_site(&index, host) {
+            Some(site) => {
+                ctx.site = Some(site);
+                Ok(false)  // 继续
             }
-        };
-        ctx.site = Some(site);
-        Ok(false)
+            None => {
+                // 域名未注册 → 404。发响应并返回 Ok(true) 短路。
+                let mut resp = ResponseHeader::build(404, None).unwrap();
+                resp.insert_header("Content-Type", "text/plain").unwrap();
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(Bytes::from_static(b"404 Not Found")), true).await?;
+                Ok(true)
+            }
+        }
     }
 
     async fn upstream_peer(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
