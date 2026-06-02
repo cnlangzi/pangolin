@@ -81,6 +81,15 @@ pangolin/
 
 格式：`[tun_name:]url`
 
+**支持的 URL scheme**：
+
+| Scheme | 行为 | 走 upstream? |
+|--------|------|-------------|
+| `http://` / `https://` | 反向代理 | 是 |
+| `file:///` | 本地静态文件服务 | **否**（自处理） |
+
+**例子**：
+
 | 例子 | 含义 |
 |------|------|
 | `http://127.0.0.1:8080` | direct（默认，无前缀） |
@@ -88,6 +97,18 @@ pangolin/
 | `office:http://192.168.1.100:8080` | tunnel，经 office tun 代理 |
 | `home:http://192.168.1.100:8080/apis` | tunnel + 路径前缀 |
 | `http://127.0.0.1:8080/admin` | direct + 路径前缀 |
+| `file:///var/www/static` | **direct + 静态文件**：ngx 直接从 `/var/www/static` 服务文件（类 nginx `root`） |
+| `office:file:///home/user/docs` | **tunnel + 静态文件**：通过 office tun 把客户内网目录暴露为可访问的网站 |
+
+**静态文件后端（file:///）行为**（对齐 nginx）：
+
+- 请求 `/foo/bar.html` → 服务 `<dir>/foo/bar.html`
+- 目录请求 `/` → 尝试 `index.html` / `index.htm`（对齐 nginx `index` 指令）
+- 404 → 走通用 404 路径（**不**回退到 try_files，由 admin 决定）
+- Range 请求：支持（视频/大文件）
+- MIME：按扩展名推断（`mime_guess` crate）
+- 缓存：复用 `internal/cache/` 现有机制
+- 安全：path traversal 防护（`..` 解出后必须在 dir 内）
 
 **路径前缀行为**（类 nginx proxy_pass）：
 
@@ -402,6 +423,39 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 
 ---
 
+## 静态文件后端（file:///）
+
+backend 字段支持 `file:///` 协议，让 ngx 直接服务本地目录为静态资源（类 nginx `root`）：
+
+```
+file:///var/www/static           → ngx 本地服务 /var/www/static
+office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴露为可访问网站
+```
+
+**对齐 nginx 行为**：
+
+- 路径拼接：`请求 /foo/bar.html` + `dir=/var/www/static` → 服务 `/var/www/static/foo/bar.html`
+- 目录索引：请求 `/` → 尝试 `index.html` / `index.htm`（对齐 `index` 指令）
+- 404：纯 404，不走 `try_files` 回退（不误导成 SPA 路由）
+- Range 请求：支持（视频/大文件走分片）
+- MIME：按扩展名推断（用 `mime_guess` crate）
+- 缓存：复用 `internal/cache/` 现有文件缓存机制
+- ETag / Last-Modified：返回，供客户端做条件请求
+
+**安全 TODO**（后续处理，不在本次设计）：
+
+- path traversal 防护：解开 `..` 后必须仍在 `dir` 内
+- symlink 防护：默认不跟随 symlink（管理员可逐站开启）
+- 隐藏文件：默认拒绝 `.` 开头文件
+
+**实现注意**：
+
+- pingora 自身不做静态文件服务。需要识别 `file:///` scheme 后**不走 `upstream_peer`**，走 ngx 自实现的文件读取 + 响应生成路径。
+- 具体的 pingora hook（`upstream_request_filter` / `response_filter` / 其他）需代码实施时验证。
+- 大文件（> 内存阈值）走 streaming I/O，不一次性读入内存。
+
+---
+
 ## 技术栈
 
 - **语言**：Rust 1.75+（stable）
@@ -499,6 +553,14 @@ impl ProxyHttp for Pangolin {
         let site = ctx.site.as_ref().unwrap();
         let (tun_name, target_url) = parse_backend(&site.backend).unwrap();
 
+        if let Some(dir) = target_url.strip_prefix("file:///") {
+            // file:/// 协议：不走 upstream，ngx 自己读本地文件服务静态资源
+            ctx.static_dir = Some(dir.to_string());
+            // TODO: pingora 实际 API 选型——这里可能需要走一个特殊的 self-handle 路径
+            //       （详见下面「静态文件后端（file:///）」一节）
+            return Err(Error::new(ErrorType::HTTPStatus(0)));  // 占位，实际实现时调整
+        }
+
         if tun_name.is_empty() {
             // direct 路径：上游 = backend URL
             Ok(Box::new(HttpPeer::new(target_url, false, host.to_string())))
@@ -519,6 +581,8 @@ impl ProxyHttp for Pangolin {
 ```
 
 零 SQL。整条链路 `RwLock::read` 一次 + 一次 `parse_backend` + 一次 map lookup。
+
+**file:/// 协议的特殊处理**：上面 `upstream_peer` 里留了 `TODO` 标记。pingora 真实 API 里"不走 upstream 自处理响应"的具体 hook 还没确认（要么是 `upstream_request_filter` 里短路、要么另找路径），待代码实施时验证。当前设计是**先识别 scheme、放进 ctx、然后走自处理路径**。
 
 ### Reload 策略
 
@@ -635,13 +699,17 @@ fn is_valid_tun_name(s: &str) -> bool {
 - `name` 匹配 `^[a-z0-9_-]+$`、1~32 字符、**非纯数字**、**小写存储**
 - 解析失败 → 启动时 fail-fast，不进入请求循环
 - 大小写：内部统一存小写，匹配前 toLower
+- 右半 URL 必须是 `http://` / `https://` / `file:///` 之一；其他 scheme 启动时 fail-fast
 
 **示例**：
 ```
-http://127.0.0.1:8080           → direct
-office:http://192.168.1.x       → tunnel via tun.name='office'
-home:https://10.0.0.5:443       → tunnel via tun.name='home'（https 协议，第二个 ':' 是端口）
-office:mailto:foo@bar.com       → tunnel via tun.name='office', url='mailto:foo@bar.com'
+http://127.0.0.1:8080           → direct (http)
+https://x.example.com           → direct (https)
+file:///var/www/static          → direct (静态文件服务)
+office:http://192.168.1.x       → tunnel via tun.name='office' (http)
+home:https://10.0.0.5:443       → tunnel via tun.name='home'（https，第二个 ':' 是端口）
+office:file:///home/user/docs   → tunnel via tun.name='office'（把客户内网目录暴露为可访问网站）
+office:mailto:foo@bar.com       → tunnel via tun.name='office', url='mailto:...'（当前不支持，启动 fail-fast）
 ```
 
 **反推匹配（reload 时）**：见 `rebuild_tun_index`（已在「内存缓存与重载」一节中给出）。`site.TunName` 在 reload 时由 `parse_backend` 解析缓存，避免运行时重复解析。
