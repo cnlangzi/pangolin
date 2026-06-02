@@ -304,11 +304,24 @@ domains:
 
 外部访问 `foo.example.com` → 命中 `*.example.com` → 查到 site → 解析 backend `office:http://...` → tunnel 路径 → WS 转发到 office tun。完全合法,wildcard 不限制 backend 形式。
 
-### 证书自动申请
+### 证书管理
+
+**申请规则**：
 
 - 泛域名 `*.example.com` → 申请 `*.example.com` + `example.com`
 - 单域名 `app.example.com` → 申请 `app.example.com`
-- Let's Encrypt ACME 自动申请 + 续期
+- 用 `instant-acme` 客户端走 ACME 协议
+
+**续期规则**（受 `cert.autorenew` 控制，详见「全局配置」一节）：
+
+- `autorenew = true`（默认）：启动时扫 `certs` 表，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
+- `autorenew = false`：完全跳过 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
+
+**适用场景**：
+
+- `autorenew = true`：公网部署，Let's Encrypt 可访问
+- `autorenew = false`：ngx 部署在内网无法被 Let's Encrypt 访问，需要 admin 手动管 cert；或企业用自有 CA 签发 cert
+
 
 ---
 
@@ -535,7 +548,60 @@ office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴�
 
 ---
 
+## 全局配置
+
+ngx 启动时读一个 TOML 配置文件。文件位置按优先级：
+
+1. `--config /path/to/config.toml` 命令行参数
+2. `./config.toml`（当前目录）
+3. `/etc/pangolin/config.toml`（系统级）
+
+**完整配置示例**：
+
+```toml
+[server]
+port = 8080           # HTTP 监听端口
+tls_port = 8443       # HTTPS 监听端口
+ws_path = "/tunnel"   # tun WS 接入路径
+workers = 4           # tokio runtime worker 数（默认 = CPU 核数）
+
+[admin]
+username = "admin"
+password = "***"      # 生产用 secret 管理器注入，不要明文进文件
+
+[cache]
+enabled = true
+dir = "./cache"
+
+[cert]
+email = "admin@yourdomain.com"   # ACME 注册邮箱
+cert_dir = "./certs"             # 证书落盘目录
+autorenew = true                  # 是否自动续期（+ 首次申请），默认 true
+acme_directory = "https://acme-v02.api.letsencrypt.org/directory"  # ACME 目录
+renew_threshold_days = 30         # 过期 < N 天触发续期
+renew_check_interval_hours = 6    # 后台续期检查周期
+renew_max_retries = 3             # 单次续期失败重试次数
+
+[log]
+level = "info"          # trace | debug | info | warn | error
+file = "./pangolin.log" # 空字符串 = stdout
+```
+
+**关键配置项说明**：
+
+- `cert.autorenew`：**总开关**，决定是否走 ACME 流程
+  - `true`（默认，公网部署）：启动时申请缺失 cert + 定期续期
+  - `false`（内网部署，ngx 无法被 Let's Encrypt 访问）：完全跳过 ACME，admin 通过 `POST /api/certs` 手动上传 cert
+- `cert.acme_directory`：可指向 staging (`https://acme-staging-v02.api.letsencrypt.org/directory`) 测玴
+- `server.workers`：pingora 推荐设为 CPU 核数
+
+**后续**：未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
+
+---
+
 ## 技术栈
+
+
 
 - **语言**：Rust 1.84+ stable（pingora 当前 MSRV）
 - **HTTP 代理 / 服务框架**：[pingora](https://github.com/cloudflare/pingora)（Cloudflare 开源，Apache 2.0；提供 nginx 行为语义的 Rust 实现；生产环境已使用超 4 年，处理 4000 万+ req/s）
