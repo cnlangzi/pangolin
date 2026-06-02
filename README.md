@@ -190,30 +190,40 @@ CREATE TABLE certs (
 
 ## 核心规则
 
-### 泛域名匹配（请求路由时）
+### 泛域名匹配（请求路由时，Devin 方案：单 map + key 变形）
 
-请求到来时,先 exact 查 `domainIndex`,miss 后 fall back 到 wildcard（按 suffix 最长优先匹配）:
+**核心思路**：只一张 `domainIndex` map，key 是原始 domain（包括 `*.example.com` 字面量）。查询时先 exact 查，miss 后把 host 做"逐级变形"（把第一个 `.` 前的子域换成 `*`），变形结果再查同一张 map，第一个命中即返回。
+
+**不需要双索引**（之前的 `domainIndex` + `wildcardList` 设计是过度设计，已删）。
 
 ```rust
-// 内存里维护两个结构：
-//   domainIndex: HashMap<String, Arc<Site>>  // exact match
-//   wildcardList: Vec<Arc<Site>>             // 所有 isWildcard 的 site，suffix 长度倒序
+// 索引只有一张：原始 domain → Site
+//   'foo.example.com' → Site
+//   '*.example.com'   → Site
+//   '*.bar.example.com' → Site
+// 全部作为字符串 key 塞同一张 map，不分类
 
-fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
-    // 0. host 归一化：小写 + 剥端口
+fn lookup_site(index: &DomainIndex, host: &str) -> Option<Arc<Site>> {
+    // 0. host 归一化：剥端口 + 小写
     let domain = normalize_host(host);
 
-    // 1. exact 优先
-    if let Some(site) = index.domain.get(&domain) {
+    // 1. exact 查（foo.example.com 本身可能是个 exact 站点）
+    if let Some(site) = index.get(&domain) {
         return Some(site.clone());
     }
-    // 2. wildcard fall back：wildcardList 已按 suffix 长度倒序，第一个命中即最长
-    for site in &index.wildcard {
-        let suffix = site.domain.strip_prefix("*.").unwrap();
-        if domain.ends_with(&format!(".{}", suffix)) {
+
+    // 2. 逐级变形：把第一个 . 前的子域换成 *，再查
+    //    'foo.bar.example.com' → '*.bar.example.com' → '*.example.com'
+    //    第一个命中即返回（前面的 . 比后面的 . 多，suffix 更长优先）
+    let mut rest = domain.as_str();
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        let candidate = format!("*.{}", rest);
+        if let Some(site) = index.get(&candidate) {
             return Some(site.clone());
         }
     }
+
     None
 }
 
@@ -223,37 +233,32 @@ fn normalize_host(host: &str) -> String {
     host.split(':').next().unwrap_or(host).to_lowercase()
 }
 
-fn is_wildcard(domain: &str) -> bool {
-    // 仅单层 '*.' 前缀。'*.example.com' ✓；'*.*.example.com' ✗
-    domain.starts_with("*.") && !domain[2..].contains("*")
+fn is_valid_domain(domain: &str) -> bool {
+    // 仅允许单层 '*.xxx' 或纯域名字符串
+    //   '*.example.com' ✓
+    //   '*.*.example.com' ✗
+    //   'foo.*.com' ✗（中间不能有 *）
+    if let Some(rest) = domain.strip_prefix("*.") {
+        !rest.is_empty() && !rest.contains('*')
+    } else {
+        !domain.contains('*')
+    }
 }
 ```
 
-**reload 时如何拆分 domainIndex 与 wildcardList**（之前缺失，现在补上）:
+**reload 时只塞一张 map**（不再拆 exact / wildcard）:
 
 ```rust
-// 在 reload / 启动时调用，拆 exact vs wildcard
-fn rebuild_domain_index(sites: &[Arc<Site>]) -> (DomainIndex, WildcardList) {
-    let mut domain_index = HashMap::new();
-    let mut wildcard_list: Vec<Arc<Site>> = Vec::new();
-
+fn rebuild_domain_index(sites: &[Arc<Site>]) -> DomainIndex {
+    let mut idx = HashMap::new();
     for site in sites {
-        if is_wildcard(&site.domain) {
-            wildcard_list.push(site.clone());
-        } else {
-            domain_index.insert(site.domain.clone(), site.clone());
-        }
+        idx.insert(site.domain.clone(), site.clone());
     }
-
-    // wildcardList 按 suffix 长度倒序：'*.foo.example.com' (15) 排在
-    // '*.example.com' (14) 之前，lookup 第一个命中即最长
-    wildcard_list.sort_by(|a, b| b.domain.len().cmp(&a.domain.len()));
-
-    (domain_index, wildcard_list)
+    idx
 }
 ```
 
-**wildcard 命中后,Host 头保留原 host**(用 `upstream_request_filter` 显式设):
+**wildcard 命中后,Host 头保留原 host**（用 `upstream_request_filter` 显式设）:
 
 ```rust
 async fn upstream_request_filter(
@@ -283,9 +288,9 @@ async fn upstream_request_filter(
 
 - `*.example.com` → 泛域名
 - `app.example.com` → 单域名
-- 请求 `foo.example.com` → exact miss → fall back 到 `*.example.com`（若存在）
-- 请求 `foo.bar.example.com` → exact miss → fall back 到 `*.bar.example.com`（若存在）优先于 `*.example.com`（suffix 更长优先）
-- 请求 `Foo.Example.COM:8443` → 归一化 `foo.example.com` → exact miss → fall back
+- 请求 `foo.example.com` → exact miss → 变形 `*.example.com` 查 → 命中
+- 请求 `foo.bar.example.com` → exact miss → 变形 `*.bar.example.com` 查（命中优先）→ 若没有再变形 `*.example.com` 查
+- 请求 `Foo.Example.COM:8443` → 归一化 `foo.example.com` → exact miss → 变形
 
 ### 证书自动申请
 
@@ -561,10 +566,10 @@ office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴�
 ```rust
 // 四张内存索引，启动时从 SQLite 一次加载，Arc<RwLock<>> 包装以支持并发读 + reload 原子替换
 
-// 请求热路径用：domain → site 单跳 O(1)
-type DomainIndex = HashMap<String, Arc<Site>>;          // key: domain (exact match)
-type WildcardList = Vec<Arc<Site>>;                     // 所有 isWildcard 的 site，suffix 长度倒序
-type DomainLookup = (DomainIndex, WildcardList);
+// 请求热路径用：domain → site 单跳 O(1) 查 map，wildcard 走 host 变形
+//   key 是原始 domain（包含 '*.example.com' 这种 wildcard 字面量）
+//   查询时：exact miss 后逐级把第一个 . 前的子域换成 '*' 再查
+type DomainIndex = HashMap<String, Arc<Site>>;          // key: domain (含 '*.example.com')
 
 // tunnel 转发用：tun_name → 该 tun 代理的所有 domain
 type TunIndex = HashMap<String, Vec<Arc<Domain>>>;      // key: tun_name
@@ -577,7 +582,6 @@ type TokenIndex = HashMap<String, bool>;                // key: token, value: en
 
 pub struct Indexes {
     pub domain: DomainIndex,
-    pub wildcard: WildcardList,
     pub tun: TunIndex,
     pub token: TokenIndex,
     pub sites: Sites,
