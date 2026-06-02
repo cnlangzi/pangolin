@@ -173,28 +173,29 @@ CREATE TABLE certs (
 
 请求到来时,先 exact 查 `domainIndex`,miss 后 fall back 到 wildcard（按 suffix 最长优先匹配）:
 
-```go
+```rust
 // 内存里维护两个结构：
-var domainIndex = map[string]*Site{}      // exact match: "app.example.com" → *Site
-var wildcardList = []*Site{}              // 所有 isWildcard 的 site，按 suffix 长度倒序
+//   domainIndex: HashMap<String, Arc<Site>>  // exact match
+//   wildcardList: Vec<Arc<Site>>             // 所有 isWildcard 的 site，suffix 长度倒序
 
-func lookupSite(domain string) (*Site, bool) {
+fn lookup_site(index: &Indexes, domain: &str) -> Option<Arc<Site>> {
     // 1. exact 优先
-    if site, ok := domainIndex[domain]; ok {
-        return site, true
+    if let Some(site) = index.domain.get(domain) {
+        return Some(site.clone());
     }
     // 2. wildcard fall back: 找 "*.suffix" 中 suffix 最长的
-    for _, site := range wildcardList {
-        suffix := strings.TrimPrefix(site.Domain, "*.")
-        if strings.HasSuffix(domain, "."+suffix) {
-            return site, true
+    //    wildcardList 已在 reload 时按 suffix 长度倒序，第一个命中即最长
+    for site in &index.wildcard {
+        let suffix = site.domain.strip_prefix("*.").unwrap();
+        if domain.ends_with(&format!(".{}", suffix)) {
+            return Some(site.clone());
         }
     }
-    return nil, false
+    None
 }
 
-func isWildcard(domain string) bool {
-    return strings.HasPrefix(domain, "*.")
+fn is_wildcard(domain: &str) -> bool {
+    domain.starts_with("*.")
 }
 ```
 
@@ -403,17 +404,21 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 
 ## 技术栈
 
-- **语言**：Go 1.21+
-- **WebSocket**：github.com/gorilla/websocket
-- **HTTP 代理**：net/http + net/http/httputil
-- **数据库**：mattn/go-sqlite3
-- **证书**：golang.org/x/crypto/acme/autocert
+- **语言**：Rust 1.75+（stable）
+- **HTTP 代理 / 服务框架**：[pingora](https://github.com/cloudflare/pingora)（Cloudflare 开源，提供 nginx 行为语义的 Rust 实现）
+- **异步运行时**：tokio（pingora 内置）
+- **WebSocket**：tokio-tungstenite（tun 节点侧）
+- **数据库**：rusqlite（同步，零依赖）或 sqlx（async，本项目用同步即可）
+- **证书**：rcgen（生成）+ instant-acme（Let's Encrypt ACME 客户端）
+- **配置**：serde + toml / yaml-rust
 
 ---
 
 ## 行为对齐 nginx
 
 代理行为、headers、超时、缓存、错误码等所有「行为类」决策，默认对齐 nginx。
+
+**实现路径**：直接用 pingora（Cloudflare 用它替代 nginx 的部分流量，行为上与 nginx 对齐）。pingora 已经实现了 nginx 的代理语义、错误码、headers 处理、WebSocket、重定向、缓冲等，我们只在其上做 pangolin 特有逻辑（tun_name 解析、tunnel 路径、token 验证、内存索引 reload）。
 
 - **路径前缀转发**：对齐 nginx `proxy_pass` 语义（含带斜杠/不带斜杠的差异）
 - **错误码**：对齐 nginx（502 后端不通、504 超时、404 未路由、413 body 过大、499 客户端断开）
@@ -436,51 +441,84 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 
 ### 内存索引
 
-```go
-// 四张内存索引，启动时从 SQLite 一次加载：
+```rust
+// 四张内存索引，启动时从 SQLite 一次加载，Arc<RwLock<>> 包装以支持并发读 + reload 原子替换
 
 // 请求热路径用：domain → site 单跳 O(1)
-var domainIndex = map[string]*Site{}  // key: domain (含 *.wildcard)
+type DomainIndex = HashMap<String, Arc<Site>>;          // key: domain (exact match)
+type WildcardList = Vec<Arc<Site>>;                     // 所有 isWildcard 的 site，suffix 长度倒序
+type DomainLookup = (DomainIndex, WildcardList);
 
 // tunnel 转发用：tun_name → 该 tun 代理的所有 domain
-var tunIndex = map[string][]*Domain{}  // key: tun_name
+type TunIndex = HashMap<String, Vec<Arc<Domain>>>;      // key: tun_name
 
-// tun 注册时用：所有 site（用于前缀扫描 backend 字段）
-var sites = []*Site{}
+// tun 注册时用：所有 site（reload 时扫，建 tunIndex 用）
+type Sites = Vec<Arc<Site>>;
 
 // tun 注册时用：token 白名单（O(1) 验证）
-var tokenIndex = map[string]bool{}    // key: token string, value: enabled && !expired
+type TokenIndex = HashMap<String, bool>;                // key: token, value: enabled && !expired
+
+pub struct Indexes {
+    pub domain: DomainIndex,
+    pub wildcard: WildcardList,
+    pub tun: TunIndex,
+    pub token: TokenIndex,
+    pub sites: Sites,
+}
+pub type SharedIndexes = Arc<RwLock<Indexes>>;
 ```
 
 **请求处理**（热路径）：
 
-```go
-func handleHTTP(w, req) {
-    domain := req.Host
+```rust
+// pingora ProxyHttp trait：实现 upstream_peer + request_filter 走内存索引
+struct Pangolin {
+    indexes: SharedIndexes,
+}
 
-    // 1. domainIndex O(1) 命中
-    site, ok := domainIndex[domain]
-    if !ok { /* 404 */ }
+#[async_trait]
+impl ProxyHttp for Pangolin {
+    type CTX = RequestCtx;
+    fn new_ctx(&self) -> Self::CTX { RequestCtx::default() }
 
-    // 2. 解析 backend 前缀
-    tunName, targetURL := parseBackend(site.Backend)
-
-    if tunName == "" {
-        // direct 路径：proxy_pass 到 targetURL
-        proxyPass(targetURL, req, w)
-        return
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        let host = session.req_header().uri.host().unwrap_or("");
+        let index = self.indexes.read().await;
+        let site = match lookup_site(&index, host) {
+            Some(s) => s,
+            None => {
+                let _ = session.respond_error(404).await;
+                return Ok(true);  // 短路
+            }
+        };
+        ctx.site = Some(site);
+        Ok(false)
     }
 
-    // tunnel 路径：查内存 tunIndex 拿在线 tun
-    tun, ok := tunIndex[tunName]
-    if !ok || !tun.Online { /* 502 */ }
+    async fn upstream_peer(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
+        let site = ctx.site.as_ref().unwrap();
+        let (tun_name, target_url) = parse_backend(&site.backend).unwrap();
 
-    // WS 转发到 tun
-    wsForward(tun, req, w)
+        if tun_name.is_empty() {
+            // direct 路径：上游 = backend URL
+            Ok(Box::new(HttpPeer::new(target_url, false, host.to_string())))
+        } else {
+            // tunnel 路径：上游 = tun 节点的 WS 端点
+            let index = self.indexes.read().await;
+            let tun = index.tun.get(&tun_name).and_then(|t| t.first().cloned());
+            match tun {
+                Some(t) if t.online => Ok(Box::new(HttpPeer::new(t.endpoint, true, host.to_string()))),
+                _ => {
+                    let _ = session.respond_error(502).await;
+                    Err(Error::new(ErrorType::HTTPStatus(502)))
+                }
+            }
+        }
+    }
 }
 ```
 
-零 SQL。整条链路 map lookup + 一次 WS write。
+零 SQL。整条链路 `RwLock::read` 一次 + 一次 `parse_backend` + 一次 map lookup。
 
 ### Reload 策略
 
@@ -500,22 +538,23 @@ func handleHTTP(w, req) {
 
 ### tun 注册时（直接查 tunIndex，不重新扫 sites）
 
-```go
+```rust
 // tun 连上来时：先验证 token，再从 tunIndex 拿该 tun 应代理的 domain
-func onTunConnect(token, tunName string) {
-    // 1. 内存验证 token（一次 map lookup）
-    if !tokenIndex[token] {
-        conn.WriteJSON(Message{Type: "error", Body: "invalid token"})
-        return
+async fn on_tun_connect(
+    indexes: SharedIndexes,
+    token: &str,
+    tun_name: &str,
+    ws_tx: &mut WsSender,
+) {
+    let index = indexes.read().await;
+    if !index.token.get(token).copied().unwrap_or(false) {
+        let _ = ws_tx.send(Message::Error("invalid token".into())).await;
+        return;
     }
 
-    // 2. 查 tunIndex：tunIndex 在 reload 时已经按 tun_name 索引好了
-    //    严格匹配 site.TunName == tunName，避免 HasPrefix 误匹配（'home' vs 'homestay'）
-    domains, ok := tunIndex[tunName]
-    if !ok {
-        domains = nil  // 该 tun 当前不代理任何 domain
-    }
-    sendToTun(tunName, domains)
+    // 严格匹配（HasPrefix 会误匹配 'home' vs 'homestay:...'）
+    let domains = index.tun.get(tun_name).cloned().unwrap_or_default();
+    let _ = ws_tx.send(Message::DomainList(domains)).await;
 }
 ```
 
@@ -523,18 +562,23 @@ func onTunConnect(token, tunName string) {
 
 `tunIndex` 的构建（在 reload 时）：
 
-```go
+```rust
 // 扫一次 sites，对每个 site 解析 backend 拿 tun_name，按 tun_name 分组
-func rebuildTunIndex() {
-    tunIndex = map[string][]*Domain{}
-    for _, site := range sites {
-        if site.TunName == "" {
-            continue  // direct 路径，不进 tunIndex
+fn rebuild_tun_index(sites: &[Arc<Site>]) -> TunIndex {
+    let mut tun_index: TunIndex = HashMap::new();
+    for site in sites {
+        let (tun_name, _) = match parse_backend(&site.backend) {
+            Ok(v) => v,
+            Err(_) => continue,  // backend 格式错误，跳过
+        };
+        if tun_name.is_empty() {
+            continue;  // direct 路径，不进 tunIndex
         }
-        for _, d := range site.Domains {
-            tunIndex[site.TunName] = append(tunIndex[site.TunName], d)
+        for d in &site.domains {
+            tun_index.entry(tun_name.clone()).or_default().push(d.clone());
         }
     }
+    tun_index
 }
 ```
 
@@ -558,26 +602,30 @@ func rebuildTunIndex() {
 
 **backend 解析规则**：
 
-```go
-// parseBackend 切第一个 ':'，左半是 tun_name，右半是 URL
+```rust
+// parse_backend 切第一个 ':'，左半是 tun_name，右半是 URL
 // 例: 'office:https://x:y:z' → tun_name='office', url='https://x:y:z'
-func parseBackend(s string) (tunName, url string, err error) {
-    idx := strings.IndexByte(s, ':')
-    if idx < 0 {
-        return "", s, nil  // 无前缀 → direct
+fn parse_backend(s: &str) -> Result<(String, String), String> {
+    match s.find(':') {
+        None => Ok((String::new(), s.to_string())),  // 无前缀 → direct
+        Some(idx) => {
+            let candidate = &s[..idx];
+            if !is_valid_tun_name(candidate) {
+                return Err(format!("invalid tun_name in backend: {:?}", candidate));
+            }
+            Ok((candidate.to_string(), s[idx+1..].to_string()))
+        }
     }
-    candidate := s[:idx]
-    if !isValidTunName(candidate) {
-        return "", "", fmt.Errorf("invalid tun_name in backend: %q", candidate)
-    }
-    return candidate, s[idx+1:], nil
 }
 
-func isValidTunName(s string) bool {
-    if s == "" || isAllDigits(s) {
-        return false  // 空串/纯数字不接受
+fn is_valid_tun_name(s: &str) -> bool {
+    if s.is_empty() || s.chars().all(|c| c.is_ascii_digit()) {
+        return false;  // 空串/纯数字不接受
     }
-    return validTunNameRE.MatchString(s)  // ^[a-z0-9_-]+$, 1~32 字符
+    // ^[a-z0-9_-]+$, 1~32 字符
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 ```
 
@@ -596,15 +644,4 @@ home:https://10.0.0.5:443       → tunnel via tun.name='home'（https 协议，
 office:mailto:foo@bar.com       → tunnel via tun.name='office', url='mailto:foo@bar.com'
 ```
 
-**反推匹配（reload/onTunConnect 时）**：
-```go
-// 严格匹配：site 的 tun_name 字段 == 查询的 tunName
-// 不用 HasPrefix，避免 'home' 误匹配 'homestay:...'
-for _, site := range sites {
-    if site.TunName == tunName {  // site.TunName 在 reload 时 parseBackend 解析缓存
-        for _, d := range site.Domains {
-            domains = append(domains, d)
-        }
-    }
-}
-```
+**反推匹配（reload 时）**：见 `rebuild_tun_index`（已在「内存缓存与重载」一节中给出）。`site.TunName` 在 reload 时由 `parse_backend` 解析缓存，避免运行时重复解析。
