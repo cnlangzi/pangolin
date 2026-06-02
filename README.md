@@ -67,6 +67,9 @@ pangolin/
 
 # tun 隧道节点（客户内网）
 ./tun --server gateway.example.com:8080 --token abc123
+
+# token 是 ngx 全局管理的（见 cfg.Server.Token），所有 tun 共享同一个，
+# 不为每个 tun 单独生成。tun 用 name 标识身份。
 ```
 
 无需 `--mode` 标志，二进制名 = 角色名。
@@ -124,13 +127,15 @@ CREATE TABLE domains (
 -- 隧道节点
 --   id: 内部整数主键
 --   name: tun_name，文本名（backend 字段引用此值，例 'office'）
---   注意：tun 与 domain 不需要中间表。
---         domain 走哪个 tun 完全由 site.backend 决定（有无 tun_name: 前缀），
---         ngx 通过 site 表 JOIN domains 表反查得到 tun 应代理的 domain 列表。
+--   注意：
+--     1. tun 与 domain 不需要中间表。domain 走哪个 tun 完全由 site.backend
+--        决定（有无 tun_name: 前缀），ngx 通过 site 表 JOIN domains 表反查
+--        得到 tun 应代理的 domain 列表。
+--     2. token 不在 tun 表里，全局管理（cfg.Server.Token），所有 tun 共享。
+--        启动时所有 tun 节点用同一个 token 连上来，再用 name 区分身份。
 CREATE TABLE tun (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     name      TEXT UNIQUE NOT NULL,    -- tun_name，文本名（小写字母数字下划线短横线，1~32 字符）
-    token     TEXT UNIQUE NOT NULL,    -- 生成给客户的 token
     enabled   INTEGER DEFAULT 1,
     online    INTEGER DEFAULT 0,
     registered_at DATETIME,
@@ -173,13 +178,13 @@ func isWildcard(domain string) bool {
 
 ## 路由流程
 
-### 1. 请求路由
+### 1. 请求路由（热路径，全部走内存）
 
 ```
 请求 app.example.com
     │
     ▼
-查 domains → site
+domainIndex[app.example.com]  →  *Site
     │
     ▼
 解析 site.backend
@@ -188,9 +193,11 @@ func isWildcard(domain string) bool {
     │       └── proxy_pass → backend
     │
     └── 有 tun_name 前缀 → tunnel 路径
-            ├── 查 tun 表（按 name 匹配） → 在线？
+            ├── tunIndex[tun_name] 在线？
             └── WS → tun → proxy_pass → backend
 ```
+
+**关键**：请求热路径**不读 SQLite**。启动时一次性构建两个内存索引，请求处理 O(1) 查 map。详见下文「内存缓存与重载」一节。
 
 ### 2. tun 启动流程
 
@@ -201,11 +208,12 @@ tun 配置: --server gateway.com:8080 --token abc123 --name office
 WS 连接 ngx，发 token + name
     │
     ▼
-ngx 查 tun 表（token + name 匹配）→ 验证身份
+ngx 验证全局 token（对比 cfg.Server.Token，内存里比对，零 SQL）
+ngx 查 tun 表（name 匹配）→ 验证身份（这一步走 SQL，只在注册时发生一次）
     │
     ▼
-ngx 查 site 表：找所有 backend 形如 'office:%' 的 site
-ngx 查 domains 表：这些 site 的所有 domain
+ngx 扫内存 site 索引：找所有 backend 以 'office:' 开头的 site
+   收集这些 site 关联的 domain（在内存里做前缀匹配，零 SQL）
     │
     ▼
 ngx 返回 domain 列表 + 每个 domain 对应 site 的 backend
@@ -223,10 +231,17 @@ tun 开始代理这些域名的请求
 初始化 SQLite（sites/domains/tun/certs）
     │
     ▼
+构建内存索引（启动时一次性）：
+   domainIndex[domain]  →  *Site
+   tunIndex[tun_name]   →  []*Domain
+   sites[]              →  []*Site（供 tun 注册时前缀扫描）
+    │
+    ▼
 启动 HTTP 服务器
     │
-    ├── Handle HTTP 请求 → 路由到 site.backend
-    ├── Handle WS 连接（来自 tun）
+    ├── Handle HTTP 请求 → 路由走内存索引（O(1)）
+    ├── Handle WS 连接（来自 tun）→ 注册时扫内存索引
+    ├── Handle Admin API → 写 SQLite + 触发 reload 重建内存索引
     └── Handle ACME 证书申请
 ```
 
@@ -263,7 +278,8 @@ tun 开始代理这些域名的请求
    - site_id: customer-web 的 id
 
 3. 外部访问 app.example.com
-   → ngx 查 domains → site → backend: http://192.168.1.100:8080
+   → ngx 查内存 domainIndex[app.example.com] → *Site
+   → site.backend = http://192.168.1.100:8080（无前缀）
    → proxy_pass 直连
 ```
 
@@ -274,7 +290,7 @@ tun 开始代理这些域名的请求
 ```
 1. admin 添加 tun 节点
    - name: office
-   - token: auto-generated
+   （token 是全局的，配置在 cfg.Server.Token，不需要单独生成）
 
 2. admin 添加 site
    - name: customer-web
@@ -288,13 +304,16 @@ tun 开始代理这些域名的请求
    ./tun --name office --server gateway.example.com:8080 --token abc123
 
 5. tun 启动 → WS 连 ngx → 发 token + name
-   ngx 验证 → 查 site 表找 backend 以 'office:' 开头的 site
-   → 关联这些 site 的 domain
+   ngx 验证全局 token（cfg.Server.Token 内存比对，零 SQL）
+   ngx 查 tun 表（name=office）验证身份（SQL 一次）
+   ngx 扫内存 site 索引，找 backend 以 'office:' 开头的 site
+   → 收集这些 site 关联的 domain（内存，零 SQL）
    → 返回 domain 列表 + 每个 domain 的 backend 给 tun
 
 6. 外部访问 app.example.com
-   → ngx 查 domains → site → backend: office:http://...
-   → 查 tun 表（name=office）→ 在线 → WS 转发
+   → ngx 查内存 domainIndex[app.example.com] → *Site
+   → site.backend = office:http://...（有前缀）→ tunnel 路径
+   → tunIndex['office'] 在线 → WS 转发
    → tun 收到请求 → proxy_pass http://192.168.1.100:8080
 ```
 
@@ -335,6 +354,91 @@ site: admin-app, backend: home:http://192.168.1.100:8080/admin
 - **HTTP 代理**：net/http + net/http/httputil
 - **数据库**：mattn/go-sqlite3
 - **证书**：golang.org/x/crypto/acme/autocert
+
+---
+
+## 内存缓存与重载
+
+**原则**：请求热路径不读 SQLite。所有配置数据启动时一次性加载进内存，admin 增删改时触发 reload。
+
+### 内存索引
+
+```go
+// 三张内存索引，启动时从 SQLite 一次加载：
+
+// 请求热路径用：domain → site 单跳 O(1)
+var domainIndex = map[string]*Site{}  // key: domain (含 *.wildcard)
+
+// tunnel 转发用：tun_name → 该 tun 代理的所有 domain
+var tunIndex = map[string][]*Domain{}  // key: tun_name
+
+// tun 注册时用：所有 site（用于前缀扫描 backend 字段）
+var sites = []*Site{}
+```
+
+**请求处理**（热路径）：
+
+```go
+func handleHTTP(w, req) {
+    domain := req.Host
+
+    // 1. domainIndex O(1) 命中
+    site, ok := domainIndex[domain]
+    if !ok { /* 404 */ }
+
+    // 2. 解析 backend 前缀
+    tunName, targetURL := parseBackend(site.Backend)
+
+    if tunName == "" {
+        // direct 路径：proxy_pass 到 targetURL
+        proxyPass(targetURL, req, w)
+        return
+    }
+
+    // tunnel 路径：查内存 tunIndex 拿在线 tun
+    tun, ok := tunIndex[tunName]
+    if !ok || !tun.Online { /* 502 */ }
+
+    // WS 转发到 tun
+    wsForward(tun, req, w)
+}
+```
+
+零 SQL。整条链路 map lookup + 一次 WS write。
+
+### Reload 策略
+
+| 触发 | 动作 |
+|------|------|
+| ngx 启动 | 一次性加载 → 构建三张内存索引 |
+| admin 增/删/改 site | 重新扫描所有 site，重建 `tunIndex` 和 `domainIndex` |
+| admin 增/删/改 domain | 重建 `domainIndex`（增量：先删旧 key，再加新 key） |
+| admin 增/删/改 tun | 重建 `tunIndex`（过滤 backend 前缀） |
+| tun 重连/上线 | 重新扫描 `tunIndex[tunName]`，向 tun 推送新 domain 列表 |
+| tun 离线 | 仅标记 `Online=false`，不动索引 |
+
+**Reload 粒度**：
+- site 表小（百级）→ 全量重建 O(n)，n 是 site 数，足够快
+- domain 表可能大（万级）→ 增量更新，避免全量扫
+
+### tun 注册时（唯一在内存里"反推"的位置）
+
+```go
+// tun 连上来时，反推它该代理哪些 domain
+func onTunConnect(tunName string) {
+    var domains []*Domain
+    for _, site := range sites {                    // 内存扫描
+        if strings.HasPrefix(site.Backend, tunName+":") {
+            for _, d := range site.Domains {        // 内存 join
+                domains = append(domains, d)
+            }
+        }
+    }
+    sendToTun(tunName, domains)
+}
+```
+
+这一步用 `strings.HasPrefix`（内存调用），**不是 SQL LIKE**。`HasPrefix` 比 LIKE 严格：要求 `tun_name:` 整体作为前缀，匹配规则与 backend 解析器一致，避免误匹配。
 
 ---
 
