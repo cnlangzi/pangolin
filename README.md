@@ -13,7 +13,6 @@
 | **site** | 站点（后端服务） | 配置 `backend`，指向具体服务 |
 | **domain** | 域名 | 关联到 site，外部访问入口 |
 | **tun_name** | 隧道节点名 | 文本名（如 `office`），用于 backend 字段路由到指定 tun |
-| **tun_domains** | 隧道代理的域名 | tun_name → domains 映射表 |
 | **backend** | 后端 URL | `[tun_name:]url` 格式 |
 
 ---
@@ -125,6 +124,9 @@ CREATE TABLE domains (
 -- 隧道节点
 --   id: 内部整数主键
 --   name: tun_name，文本名（backend 字段引用此值，例 'office'）
+--   注意：tun 与 domain 不需要中间表。
+--         domain 走哪个 tun 完全由 site.backend 决定（有无 tun_name: 前缀），
+--         ngx 通过 site 表 JOIN domains 表反查得到 tun 应代理的 domain 列表。
 CREATE TABLE tun (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     name      TEXT UNIQUE NOT NULL,    -- tun_name，文本名（小写字母数字下划线短横线，1~32 字符）
@@ -133,13 +135,6 @@ CREATE TABLE tun (
     online    INTEGER DEFAULT 0,
     registered_at DATETIME,
     last_seen_at  DATETIME
-);
-
--- 隧道代理的域名（token → domains 映射）
-CREATE TABLE tun_domains (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    tun_id   INTEGER NOT NULL,
-    domain   TEXT NOT NULL
 );
 
 -- 证书（Let's Encrypt 自动管理）
@@ -200,16 +195,20 @@ func isWildcard(domain string) bool {
 ### 2. tun 启动流程
 
 ```
-tun 配置: --server gateway.com:8080 --token abc123
+tun 配置: --server gateway.com:8080 --token abc123 --name office
     │
     ▼
-WS 连接 ngx，发 token
+WS 连接 ngx，发 token + name
     │
     ▼
-ngx 验证 token，查 tun_domains
+ngx 查 tun 表（token + name 匹配）→ 验证身份
     │
     ▼
-ngx 返回 domain 列表 + 每个 domain 的 backend
+ngx 查 site 表：找所有 backend 形如 'office:%' 的 site
+ngx 查 domains 表：这些 site 的所有 domain
+    │
+    ▼
+ngx 返回 domain 列表 + 每个 domain 对应 site 的 backend
     │
     ▼
 tun 开始代理这些域名的请求
@@ -221,7 +220,7 @@ tun 开始代理这些域名的请求
 ./ngx --port 8080
     │
     ▼
-初始化 SQLite（sites/domains/tun/tun_domains/certs）
+初始化 SQLite（sites/domains/tun/certs）
     │
     ▼
 启动 HTTP 服务器
@@ -285,12 +284,13 @@ tun 开始代理这些域名的请求
    - domain: app.example.com
    - site_id: customer-web 的 id
 
-4. admin 关联 tun 与 domain（tun_domains）
-   - tun_name: office
-   - domains: [app.example.com]
-
-5. 客户在内网部署 tun
+4. 客户在内网部署 tun
    ./tun --name office --server gateway.example.com:8080 --token abc123
+
+5. tun 启动 → WS 连 ngx → 发 token + name
+   ngx 验证 → 查 site 表找 backend 以 'office:' 开头的 site
+   → 关联这些 site 的 domain
+   → 返回 domain 列表 + 每个 domain 的 backend 给 tun
 
 6. 外部访问 app.example.com
    → ngx 查 domains → site → backend: office:http://...
