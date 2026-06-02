@@ -1,0 +1,27 @@
+# Binaries
+cli
+ngx
+cmd/cli/sdk
+cmd/ngx/gateway
+
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.o
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+*.local.yaml
+*.local.yml

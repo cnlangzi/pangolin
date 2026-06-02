@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>穿山甲管理后台</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#10b981',
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <!-- 登录页 -->
+    <div id="loginPage" class="min-h-screen flex items-center justify-center">
+        <div class="bg-white p-8 rounded-lg shadow-md w-96">
+            <h1 class="text-2xl font-bold text-center mb-6">🦔 穿山甲管理后台</h1>
+            <form id="loginForm">
+                <div class="mb-4">
+                    <label class="block text-gray-700 text-sm font-bold mb-2">用户名</label>
+                    <input type="text" id="username" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary" required>
+                </div>
+                <div class="mb-6">
+                    <label class="block text-gray-700 text-sm font-bold mb-2">密码</label>
+                    <input type="password" id="password" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-primary" required>
+                </div>
+                <button type="submit" class="w-full bg-primary text-white font-bold py-2 px-4 rounded-md hover:bg-green-600 transition">
+                    登录
+                </button>
+                <p id="loginError" class="text-red-500 text-sm mt-3 hidden">用户名或密码错误</p>
+            </form>
+        </div>
+    </div>
+
+    <!-- 管理后台 -->
+    <div id="adminPage" class="hidden">
+        <!-- 顶部导航 -->
+        <nav class="bg-white shadow">
+            <div class="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
+                <h1 class="text-xl font-bold">🦔 穿山甲管理后台</h1>
+                <div class="flex items-center gap-4">
+                    <span id="onlineCount" class="text-sm text-gray-600">在线站点: 0</span>
+                    <button onclick="logout()" class="text-sm text-gray-500 hover:text-gray-700">退出</button>
+                </div>
+            </div>
+        </nav>
+
+        <!-- 主内容 -->
+        <div class="max-w-7xl mx-auto px-4 py-6">
+            <!-- 站点列表 -->
+            <div class="bg-white rounded-lg shadow overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold">在线站点</h2>
+                </div>
+                <div class="p-6">
+                    <table class="w-full">
+                        <thead>
+                            <tr class="text-left text-gray-500 text-sm">
+                                <th class="pb-3">域名</th>
+                                <th class="pb-3">内网地址</th>
+                                <th class="pb-3">状态</th>
+                                <th class="pb-3">连接时间</th>
+                                <th class="pb-3">请求数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="siteList">
+                            <tr>
+                                <td colspan="5" class="py-8 text-center text-gray-400">暂无在线站点</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 操作 -->
+            <div class="mt-6 flex gap-4">
+                <button onclick="refreshSites()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-4 py-2 rounded-md transition">
+                    🔄 刷新
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 状态
+        let token = localStorage.getItem('pangolin_token') || '';
+        
+        // 检查登录状态
+        if (token) {
+            showAdminPage();
+        }
+
+        // 登录
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            const res = await fetch('/api/admin/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            
+            if (res.ok) {
+                const data = await res.json();
+                token = data.token;
+                localStorage.setItem('pangolin_token', token);
+                showAdminPage();
+            } else {
+                document.getElementById('loginError').classList.remove('hidden');
+            }
+        });
+
+        // 显示后台
+        function showAdminPage() {
+            document.getElementById('loginPage').classList.add('hidden');
+            document.getElementById('adminPage').classList.remove('hidden');
+            loadSites();
+            // 自动刷新
+            setInterval(loadSites, 5000);
+        }
+
+        // 加载站点列表
+        async function loadSites() {
+            try {
+                const res = await fetch('/api/admin/sites', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                if (res.status === 401) {
+                    logout();
+                    return;
+                }
+                const sites = await res.json();
+                renderSites(sites);
+            } catch (err) {
+                console.error('加载失败:', err);
+            }
+        }
+
+        // 渲染站点
+        function renderSites(sites) {
+            document.getElementById('onlineCount').textContent = `在线站点: ${sites.length}`;
+            
+            if (sites.length === 0) {
+                document.getElementById('siteList').innerHTML = `
+                    <tr>
+                        <td colspan="5" class="py-8 text-center text-gray-400">暂无在线站点</td>
+                    </tr>
+                `;
+                return;
+            }
+            
+            document.getElementById('siteList').innerHTML = sites.map(site => `
+                <tr class="border-t border-gray-100">
+                    <td class="py-3 font-medium">${site.domain}</td>
+                    <td class="py-3 text-gray-600">${site.local_ip}:${site.local_port}</td>
+                    <td class="py-3">
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs ${site.online ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600'}">
+                            ${site.online ? '🟢 在线' : '⚪ 离线'}
+                        </span>
+                    </td>
+                    <td class="py-3 text-gray-600">${site.connected_at || '-'}</td>
+                    <td class="py-3 text-gray-600">${site.request_count || 0}</td>
+                </tr>
+            `).join('');
+        }
+
+        // 刷新
+        function refreshSites() {
+            loadSites();
+        }
+
+        // 登出
+        function logout() {
+            localStorage.removeItem('pangolin_token');
+            token = '';
+            location.reload();
+        }
+    </script>
+</body>
+</html>

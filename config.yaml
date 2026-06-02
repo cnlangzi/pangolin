@@ -1,0 +1,36 @@
+server:
+  port: 8080
+  ws_path: /tunnel
+  token: "pangolin-secret-token"
+
+# 域名映射配置
+domains:
+  app1.yourdomain.com:
+    local_ip: 127.0.0.1
+    local_port: 8080
+    enabled: true
+
+  app2.yourdomain.com:
+    local_ip: 192.168.1.100
+    local_port: 3000
+    enabled: true
+
+# 管理后台账号
+admin:
+  username: admin
+  password: "admin123"
+
+# 缓存配置
+cache:
+  enabled: true
+  dir: ./cache
+
+# HTTPS证书 (自动Let's Encrypt)
+cert:
+  email: admin@yourdomain.com
+  cert_dir: ./certs
+
+# 日志
+log:
+  level: info
+  file: ./pangolin.log
