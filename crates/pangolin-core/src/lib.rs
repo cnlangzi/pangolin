@@ -1,0 +1,39 @@
+//! Pangolin core: types, parsing, validation, in-memory indexes, SQLite I/O.
+//!
+//! **Deliberately does not depend on `pingora`** — this crate is the
+//! shared domain model that both `ngx` (the gateway) and any future
+//! tooling (CLI, admin) link against. Keeping pingora out of the
+//! dependency graph here means unit tests compile in seconds rather
+//! than minutes.
+//!
+//! ```text
+//! Site (1) ──* Domain      (in-memory: domainIndex)
+//! Site (1) ──* (via backend prefix) → tun_name → *Domain (tunIndex)
+//! Tun (independent)
+//! Token (independent, decoupled from tun)
+//! Cert (independent, 1:1 with domain)
+//! ```
+//!
+//! See `README.md` for the design rationale.
+
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod index;
+pub mod normalize;
+pub mod parse;
+pub mod types;
+
+pub use error::{PangolinError, Result};
+pub use index::{lookup_site, Indexes};
+pub use parse::{
+    detect_scheme, file_url_to_path, is_valid_domain, is_valid_tun_name, matches_tun_name_charset,
+    parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
+};
+pub use types::{BackendKind, Cert, Domain, Site, Token, Tun};
+
+/// Re-export the schema SQL for tests and migrations.
+pub const SCHEMA_SQL: &str = include_str!("schema.sql");
+
+/// Library version, e.g. for admin templates and log lines.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -11,6 +11,7 @@ name = "pangolin"
 path = "src/main.rs"
 
 [dependencies]
+pangolin-core = { path = "../pangolin-core" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

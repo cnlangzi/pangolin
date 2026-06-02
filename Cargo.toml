@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pangolin-core",
     "crates/ngx",
     "crates/tun",
     "crates/admin",
