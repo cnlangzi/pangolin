@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main, fix/rust]
+  pull_request:
+    branches: [main, fix/rust]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ----------------------------------------------------------------
+  # Rust build + test (no pebble, unit tests only)
+  # ----------------------------------------------------------------
+  rust:
+    name: Rust build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.84
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test (no pebble)
+        run: cargo test --workspace --lib --bins
+
+  # ----------------------------------------------------------------
+  # Integration tests with pebble (ACME test server)
+  # ----------------------------------------------------------------
+  integration:
+    name: Integration tests with pebble
+    runs-on: ubuntu-latest
+    needs: rust
+    services:
+      pebble:
+        image: letsencrypt/pebble:latest
+        ports:
+          - 14000:14000   # ACME directory
+          - 15000:15000   # challtestsrv (DNS/HTTP challenge)
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_LISTEN: "0.0.0.0:14000"
+    env:
+      PANGOLIN_PEBBLE_DIR: "https://localhost:14000/directory"
+      PANGOLIN_PEBBLE_INSECURE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.84
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-int-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-int-
+
+      - name: cargo test --features integration
+        run: cargo test --workspace --features integration
+
+  # ----------------------------------------------------------------
+  # Admin UI build (tailwindcss)
+  # ----------------------------------------------------------------
+  ui:
+    name: Admin UI build (tailwindcss)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run build
+        run: npm run build
+
+      - name: Upload CSS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-style
+          path: assets/static/style.css
+          if-no-files-found: error
