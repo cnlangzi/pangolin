@@ -199,13 +199,15 @@ CREATE TABLE certs (
 //   domainIndex: HashMap<String, Arc<Site>>  // exact match
 //   wildcardList: Vec<Arc<Site>>             // 所有 isWildcard 的 site，suffix 长度倒序
 
-fn lookup_site(index: &Indexes, domain: &str) -> Option<Arc<Site>> {
+fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
+    // 0. host 归一化：小写 + 剥端口
+    let domain = normalize_host(host);
+
     // 1. exact 优先
-    if let Some(site) = index.domain.get(domain) {
+    if let Some(site) = index.domain.get(&domain) {
         return Some(site.clone());
     }
-    // 2. wildcard fall back: 找 "*.suffix" 中 suffix 最长的
-    //    wildcardList 已在 reload 时按 suffix 长度倒序，第一个命中即最长
+    // 2. wildcard fall back：wildcardList 已按 suffix 长度倒序，第一个命中即最长
     for site in &index.wildcard {
         let suffix = site.domain.strip_prefix("*.").unwrap();
         if domain.ends_with(&format!(".{}", suffix)) {
@@ -215,15 +217,75 @@ fn lookup_site(index: &Indexes, domain: &str) -> Option<Arc<Site>> {
     None
 }
 
+fn normalize_host(host: &str) -> String {
+    // 剥端口: 'foo.example.com:8443' → 'foo.example.com'
+    // to_lowercase: 'Foo.Example.COM' → 'foo.example.com'
+    host.split(':').next().unwrap_or(host).to_lowercase()
+}
+
 fn is_wildcard(domain: &str) -> bool {
-    domain.starts_with("*.")
+    // 仅单层 '*.' 前缀。'*.example.com' ✓；'*.*.example.com' ✗
+    domain.starts_with("*.") && !domain[2..].contains("*")
 }
 ```
+
+**reload 时如何拆分 domainIndex 与 wildcardList**（之前缺失，现在补上）:
+
+```rust
+// 在 reload / 启动时调用，拆 exact vs wildcard
+fn rebuild_domain_index(sites: &[Arc<Site>]) -> (DomainIndex, WildcardList) {
+    let mut domain_index = HashMap::new();
+    let mut wildcard_list: Vec<Arc<Site>> = Vec::new();
+
+    for site in sites {
+        if is_wildcard(&site.domain) {
+            wildcard_list.push(site.clone());
+        } else {
+            domain_index.insert(site.domain.clone(), site.clone());
+        }
+    }
+
+    // wildcardList 按 suffix 长度倒序：'*.foo.example.com' (15) 排在
+    // '*.example.com' (14) 之前，lookup 第一个命中即最长
+    wildcard_list.sort_by(|a, b| b.domain.len().cmp(&a.domain.len()));
+
+    (domain_index, wildcard_list)
+}
+```
+
+**wildcard 命中后,Host 头保留原 host**(用 `upstream_request_filter` 显式设):
+
+```rust
+async fn upstream_request_filter(
+    &self,
+    session: &mut Session,
+    upstream_request: &mut RequestHeader,
+    _ctx: &mut Self::CTX,
+) -> Result<()> {
+    // wildcard 站点 ('foo.example.com' 命中 '*.example.com') 的关键设计：
+    // 后端必须拿到原 host（'foo.example.com'），不是 wildcard 字面量
+    // (不是 '*.example.com')，也不是 backend URL 的 host
+    let host = session.req_header().uri.host().unwrap_or("");
+    upstream_request.insert_header("Host", host).unwrap();
+    Ok(())
+}
+```
+
+**wildcard 路径的语义约束**：
+
+- **只支持单层 `*.` 前缀**：`*.example.com` ✓；`*.*.example.com` ✗（启动时 fail-fast）
+- **wildcard 站点不能走 tunnel 路径**：`site.backend` 不能是 `*:http://...` 或 `*:file:///...`（`*` 不是合法 tun_name,被 `is_valid_tun_name` 拒）。wildcard 站点的 backend 只能是 direct 的 http/https/file。
+- **请求来时只能走 forward**,不能 rewrite。后端必须自己处理多子域路由。
+- **大小写归一化**：SQLite 存的 domain 全部小写;请求 host 进来先 to_lowercase 再查。
+- **端口忽略**:`foo.example.com:8443` 和 `foo.example.com` 等价查。
+
+**示例**：
 
 - `*.example.com` → 泛域名
 - `app.example.com` → 单域名
 - 请求 `foo.example.com` → exact miss → fall back 到 `*.example.com`（若存在）
 - 请求 `foo.bar.example.com` → exact miss → fall back 到 `*.bar.example.com`（若存在）优先于 `*.example.com`（suffix 更长优先）
+- 请求 `Foo.Example.COM:8443` → 归一化 `foo.example.com` → exact miss → fall back
 
 ### 证书自动申请
 
