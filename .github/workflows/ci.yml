@@ -10,7 +10,7 @@ env:
 
 jobs:
   # ----------------------------------------------------------------
-  # Rust build + test (no pebble, unit tests only)
+  # Rust build + test
   # All steps reuse Makefile targets so local and CI stay in sync.
   # ----------------------------------------------------------------
   rust:
@@ -43,28 +43,8 @@ jobs:
       - name: make build
         run: make build
 
-  # ----------------------------------------------------------------
-  # Admin UI build (tailwindcss)
-  # ----------------------------------------------------------------
-  ui:
-    name: Admin UI build (tailwindcss)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      # make build-ui is called separately before `make ci-full` locally,
+      # not needed in CI since CSS artifact is committed to git.
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      # Runs: npm ci + npm run build
-      - name: make ui
-        run: make ui
-
-      - name: Upload CSS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: admin-style
-          path: assets/static/style.css
-          if-no-files-found: error
+  # Note: Admin UI (tailwindcss) is built locally with `make build-ui`
+  # before starting the server. CSS is committed to the repo.
