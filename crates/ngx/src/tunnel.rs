@@ -220,11 +220,33 @@ async fn handle_tun_ws(
         sessions.insert(tun_name.clone(), tx);
     }
 
-    // Spawn a task that:
-    // - Reads TunnelResponseFrame from tun over WS
-    // - Routes it to the correct pending request via resp_tx
-    // - Sends TunnelRequestFrame to tun when received from proxy
-    let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>>::new()));
+    // Pending requests: rid → (resp_tx, insertion_time)
+    // Values are periodically cleaned up when they expire (120s > 60s ngx timeout)
+    let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        (tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>, std::time::Instant),
+    >::new()));
+
+    // Background task: clean up expired pending entries every 30s
+    let pending_clean = pending.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        // Skip first immediate tick
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = std::time::Instant::now();
+            let mut map = pending_clean.lock().await;
+            let before = map.len();
+            map.retain(|_, (_, inserted)| {
+                now.duration_since(*inserted).as_secs() < 120
+            });
+            let removed = before.saturating_sub(map.len());
+            if removed > 0 {
+                debug!("cleaned {} expired pending requests", removed);
+            }
+        }
+    });
 
     let pending_read = pending.clone();
     let write_task = tokio::spawn(async move {
@@ -234,7 +256,7 @@ async fn handle_tun_ws(
             // Store resp_tx by rid so the read side can route the response
             {
                 let mut map = pending_read.lock().await;
-                map.insert(msg.rid.clone(), msg.resp_tx);
+                map.insert(msg.rid.clone(), (msg.resp_tx, std::time::Instant::now()));
             }
             let ws_msg = tungstenite::Message::Binary(msg.body);
             if sender.send(ws_msg).await.is_err() {
@@ -246,56 +268,72 @@ async fn handle_tun_ws(
     // Also read frames from the WebSocket:
     // - Req frames from tun: unhandled (architecture is proxy → tun)
     // - Res frames from tun: route to pending request via resp_tx
+    // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_ws = pending.clone();
+    let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
     while let Some(msg) = ws_read.next().await {
-        match msg {
-            Ok(tungstenite::Message::Binary(buf)) => {
-                match deserialize_msgpack::<TunnelFrame>(&buf) {
-                    Ok(TunnelFrame::Req(req_frame)) => {
-                        debug!("tun {} → req {} {} (unhandled in proxy→tun architecture)",
-                            tun_name, req_frame.rid, req_frame.path);
-                    }
-                    Ok(TunnelFrame::Res(resp_frame)) => {
-                        debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
-                        // Route response to the waiting proxy.rs via resp_tx
-                        let mut map = pending_ws.lock().await;
-                        if let Some(tx) = map.remove(&resp_frame.rid) {
-                            let _ = tx.send(resp_frame);
-                        } else {
-                            warn!("no pending request for rid {}", resp_frame.rid);
+        tokio::select! {
+            _ = cleanup_ticker.tick() => {
+                // Clean up pending entries older than 120s
+                let now = std::time::Instant::now();
+                let mut map = pending_ws.lock().await;
+                map.retain(|_, (_, inserted)| {
+                    now.duration_since(*inserted).as_secs() < 120
+                });
+            }
+            msg = futures_util::StreamExt::next(&mut ws_read) => {
+                match msg {
+                    Some(Ok(tungstenite::Message::Binary(buf))) => {
+                        match deserialize_msgpack::<TunnelFrame>(&buf) {
+                            Ok(TunnelFrame::Req(req_frame)) => {
+                                debug!("tun {} → req {} {} (unhandled in proxy→tun architecture)",
+                                    tun_name, req_frame.rid, req_frame.path);
+                            }
+                            Ok(TunnelFrame::Res(resp_frame)) => {
+                                debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
+                                let mut map = pending_ws.lock().await;
+                                if let Some((tx, _)) = map.remove(&resp_frame.rid) {
+                                    let _ = tx.send(resp_frame);
+                                } else {
+                                    warn!("no pending request for rid {}", resp_frame.rid);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("malformed tunnel frame from {}: {}", tun_name, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("malformed tunnel frame from {}: {}", tun_name, e);
+                    Some(Ok(tungstenite::Message::Text(t))) => {
+                        if let Ok(frame) = serde_json::from_str::<TunnelFrame>(&t) {
+                            debug!("tun {} sent JSON frame (decoded but unhandled)", tun_name);
+                        } else {
+                            warn!("malformed text frame from {}: {}", tun_name, t);
+                        }
                     }
+                    Some(Ok(tungstenite::Message::Close(_))) => {
+                        info!("tun {} sent close", tun_name);
+                        break;
+                    }
+                    Some(Ok(tungstenite::Message::Ping(_))) | Some(Ok(tungstenite::Message::Pong(_))) => {
+                        // Ping/pong handled automatically by tungstenite auto-pong
+                    }
+                    Some(Ok(tungstenite::Message::Frame(_))) => {
+                        // WebSocket frame (part of stream) — skip
+                    }
+                    Some(Err(e)) => {
+                        warn!("WS read error from {}: {}", tun_name, e);
+                        break;
+                    }
+                    None => break,
                 }
             }
-            Ok(tungstenite::Message::Text(t)) => {
-                if let Ok(frame) = serde_json::from_str::<TunnelFrame>(&t) {
-                    debug!("tun {} sent JSON frame (decoded but unhandled)", tun_name);
-                } else {
-                    warn!("malformed text frame from {}: {}", tun_name, t);
-                }
-            }
-            Ok(tungstenite::Message::Close(_)) => {
-                info!("tun {} sent close", tun_name);
-                break;
-            }
-            Ok(tungstenite::Message::Ping(_)) | Ok(tungstenite::Message::Pong(_)) => {
-                // Ping/pong handled automatically by tungstenite auto-pong
-            }
-            Err(e) => {
-                warn!("WS read error from {}: {}", tun_name, e);
-                break;
-            }
-            _ => continue,
         }
     }
 
     // Drain pending map on disconnect (all pending requests get 504)
     {
         let mut map = pending_ws.lock().await;
-        for (_, tx) in map.drain() {
+        for (_, (tx, _)) in map.drain() {
             let _ = tx.send(pangolin_core::TunnelResponseFrame {
                 rid: String::new(),
                 status: 504,
