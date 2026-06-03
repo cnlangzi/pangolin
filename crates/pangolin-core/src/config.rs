@@ -31,6 +31,12 @@ pub struct ServerConfig {
     pub tls_port: u16,
     pub ws_path: String,
     pub workers: Option<usize>,
+    #[serde(default = "default_tunnel_port")]
+    pub tunnel_port: u16,
+}
+
+fn default_tunnel_port() -> u16 {
+    9001
 }
 
 impl Default for ServerConfig {
@@ -40,6 +46,7 @@ impl Default for ServerConfig {
             tls_port: 8443,
             ws_path: "/tunnel".into(),
             workers: None,
+            tunnel_port: 9001,
         }
     }
 }

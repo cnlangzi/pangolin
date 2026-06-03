@@ -7,6 +7,7 @@
 mod admin;
 mod proxy;
 mod serve;
+mod tunnel;
 
 pub use proxy::AppProxy;
 pub use serve::AppHttp;
@@ -16,8 +17,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use pingora::apps::http_app::HttpServer;
-use pingora::http::ResponseHeader;
-use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
+use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 use rusqlite::Connection;
@@ -119,6 +119,12 @@ impl CertManager {
     /// Issue or retrieve an existing cert for the given domain.
     /// Returns `(cert_path, key_path)`.
     pub fn get_or_issue_cert(&self, domain: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+        // Check for existing cert files first
+        let cert_path = self.cert_dir.join("fullchain.pem");
+        let key_path = self.cert_dir.join("privkey.pem");
+        if cert_path.exists() && key_path.exists() {
+            return Ok((cert_path, key_path));
+        }
         // TODO: implement ACME flow with instant-acme
         anyhow::bail!("ACME not yet implemented for domain: {}", domain)
     }
@@ -178,8 +184,14 @@ async fn main() -> anyhow::Result<()> {
     );
     server.add_service(http_server);
 
+    // Tunnel WebSocket server (independent TCP listener, runs as background task)
+    let app_tunnel = app.clone();
+    let tunnel_addr = format!("127.0.0.1:{}", config.server.tunnel_port);
+    tokio::spawn(async move {
+        tunnel::start_tunnel_server(app_tunnel, &tunnel_addr).await;
+    });
+
     // TODO: TLS listener on config.server.tls_port
 
     server.run_forever();
-    Ok(())
 }
