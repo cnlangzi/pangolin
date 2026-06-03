@@ -127,13 +127,19 @@ impl CertManager {
         let cert = host_dir.join("fullchain.pem");
         let key = host_dir.join("privkey.pem");
         if cert.exists() && key.exists() {
-            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+            return Ok((
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            ));
         }
         // Fall back to default cert_dir root
         let cert = self.cert_dir.join("fullchain.pem");
         let key = self.cert_dir.join("privkey.pem");
         if cert.exists() && key.exists() {
-            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+            return Ok((
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            ));
         }
         anyhow::bail!(
             "no certificate found for host {} (searched {}/ and {}/)",
