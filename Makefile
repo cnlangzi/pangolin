@@ -57,18 +57,18 @@ lint: fmt-check clippy test
 
 # Build admin UI (tailwindcss) — for local dev and release builds.
 # Run this before starting the server to compile final CSS.
-.PHONY: build-ui
-build-ui:
+.PHONY: build-css
+build-css:
 	npm ci
 	npm run build
 
 # Full local CI mirror: fmt-check + clippy + test + build --release.
-# Does NOT call build-ui — run `make build-ui` separately before starting the server.
+# Does NOT call build-css — run `make build-css` separately before starting the server.
 .PHONY: ci
 ci: fmt-check clippy test build
 	@echo "✓ full local CI passed"
 
 # Full CI including integration tests (requires pebble).
 .PHONY: ci-full
-ci-full: fmt-check clippy test test-integration build build-ui
+ci-full: fmt-check clippy test test-integration build build-css
 	@echo "✓ full CI (with integration) passed"
