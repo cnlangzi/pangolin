@@ -13,7 +13,7 @@ use tokio::time::{timeout, Duration};
 
 /// Pebble root CA (self-signed, from letsencrypt/pebble test/config/pebble-root.cert.pem).
 /// DO NOT use in production.
-static PEBBLE_ROOT_CA: &[u8] = include_bytes!("../../../test-support/pebble-root.pem");
+static PEBBLE_ROOT_CA: &[u8] = include_bytes!("./pebble-root.pem");
 
 /// Build a reqwest client that trusts our custom CA for ACME operations.
 fn build_acme_client(ca_pem: &[u8]) -> anyhow::Result<reqwest::Client> {
