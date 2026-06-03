@@ -2,9 +2,10 @@
 # Local development commands mirroring CI checks.
 # CI runs on: cargo fmt --check, cargo clippy -D warnings, cargo test, cargo build --release
 
-# Use the explicit cargo path so this works regardless of $PATH
-CARGO := /home/devin/.cargo/bin/cargo
-RUSTUP := /home/devin/.cargo/bin/rustup
+# Use cargo from $PATH (works in both local dev and CI).
+# On dev machines, install rustup + 1.96 toolchain (see 'make setup').
+CARGO := cargo
+RUSTUP := rustup
 TOOLCHAIN := 1.96
 
 # Install Rust 1.96 toolchain (with rustfmt + clippy components).
