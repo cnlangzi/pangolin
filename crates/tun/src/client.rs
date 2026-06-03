@@ -1,18 +1,24 @@
 //! Pangolin tunnel node (tun) — WebSocket client implementation.
 
-use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
-use reqwest::{Client, header::{HeaderName, HeaderValue}};
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{interval, sleep, Instant};
+use log::warn;
+use reqwest::{
+    header::{HeaderName, HeaderValue},
+    Client,
+};
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite};
 
-use crate::frame::{deserialize_msgpack, serialize_frames, serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame};
+use crate::frame::{
+    deflate_decode, deflate_encode, deserialize_msgpack, serialize_frames, TunnelFrame,
+    TunnelRequestFrame, TunnelResponseFrame,
+};
 
 pub struct Config {
     pub server: String,
@@ -20,9 +26,7 @@ pub struct Config {
     pub name: String,
 }
 
-struct PendingRequest {
-    created_at: Instant,
-}
+struct PendingRequest;
 
 pub struct TunnelClient {
     config: Config,
@@ -47,8 +51,11 @@ impl TunnelClient {
     }
 
     pub async fn run(&self) {
-        log::info!("tun {} starting, target {}",
-            self.config.name, self.config.server);
+        log::info!(
+            "tun {} starting, target {}",
+            self.config.name,
+            self.config.server
+        );
 
         let mut reconnect_delay_secs: u64 = 1;
         let max_delay_secs: u64 = 30;
@@ -60,8 +67,12 @@ impl TunnelClient {
                     break;
                 }
                 Err(e) => {
-                    log::error!("tun {} connection error: {}, reconnecting in {}s",
-                        self.config.name, e, reconnect_delay_secs);
+                    log::error!(
+                        "tun {} connection error: {}, reconnecting in {}s",
+                        self.config.name,
+                        e,
+                        reconnect_delay_secs
+                    );
                     sleep(Duration::from_secs(reconnect_delay_secs)).await;
                     reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_delay_secs);
                 }
@@ -75,7 +86,12 @@ impl TunnelClient {
             self.config.server, self.config.token, self.config.name
         );
 
-        log::info!("connecting to {}", ws_url);
+        log::info!(
+            "tun {} connecting to ws://{}/tunnel?token=***&name={}",
+            self.config.name,
+            self.config.server,
+            self.config.name
+        );
         let (ws_stream, _) = connect_async(&ws_url).await?;
         log::info!("tun {} connected to ngx", self.config.name);
 
@@ -84,7 +100,9 @@ impl TunnelClient {
 
     async fn handle_stream(
         &self,
-        ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        ws: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     ) -> Result<()> {
         let (ws_sender, mut ws_read) = ws.split();
         let pending = self.pending.clone();
@@ -113,8 +131,9 @@ impl TunnelClient {
                             let frames: Vec<TunnelFrame> = batch.drain(..).map(TunnelFrame::Res).collect();
                             if !frames.is_empty() {
                                 if let Ok(buf) = serialize_frames(&frames) {
+                                    let compressed = deflate_encode(&buf);
                                     let mut sender = ws_sender_batch.lock().await;
-                                    if sender.send(tungstenite::Message::Binary(buf)).await.is_err() {
+                                    if sender.send(tungstenite::Message::Binary(compressed.into())).await.is_err() {
                                         break;
                                     }
                                 }
@@ -128,8 +147,9 @@ impl TunnelClient {
                         let frames: Vec<TunnelFrame> = batch.drain(..).map(TunnelFrame::Res).collect();
                         if !frames.is_empty() {
                             if let Ok(buf) = serialize_frames(&frames) {
+                                let compressed = deflate_encode(&buf);
                                 let mut sender = ws_sender_batch.lock().await;
-                                if sender.send(tungstenite::Message::Binary(buf)).await.is_err() {
+                                if sender.send(tungstenite::Message::Binary(compressed.into())).await.is_err() {
                                     break;
                                 }
                             }
@@ -141,8 +161,11 @@ impl TunnelClient {
             if !batch.is_empty() {
                 let frames: Vec<TunnelFrame> = batch.drain(..).map(TunnelFrame::Res).collect();
                 if let Ok(buf) = serialize_frames(&frames) {
+                    let compressed = deflate_encode(&buf);
                     let mut sender = ws_sender_batch.lock().await;
-                    let _ = sender.send(tungstenite::Message::Binary(buf)).await;
+                    let _ = sender
+                        .send(tungstenite::Message::Binary(compressed.into()))
+                        .await;
                 }
             }
         });
@@ -154,7 +177,11 @@ impl TunnelClient {
             loop {
                 ticker.tick().await;
                 let mut sender = ws_sender_ping.lock().await;
-                if sender.send(tungstenite::Message::Ping(vec![].into())).await.is_err() {
+                if sender
+                    .send(tungstenite::Message::Ping(vec![].into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -178,6 +205,11 @@ impl TunnelClient {
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(tungstenite::Message::Binary(buf)) => {
+                    // Try decompress raw DEFLATE, fallback to raw if not compressed
+                    let buf = match deflate_decode(&buf) {
+                        Ok(d) => d,
+                        Err(_) => buf.to_vec(),
+                    };
                     match deserialize_msgpack::<TunnelFrame>(&buf) {
                         Ok(TunnelFrame::Req(req)) => {
                             let pending = pending.clone();
@@ -185,7 +217,9 @@ impl TunnelClient {
                             let http_client = http_client.clone();
                             let name = name.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_request(req, http_client, batch_tx, pending).await {
+                                if let Err(e) =
+                                    Self::handle_request(req, http_client, batch_tx, pending).await
+                                {
                                     log::warn!("tun {} handle_request error: {}", name, e);
                                 }
                             });
@@ -199,7 +233,10 @@ impl TunnelClient {
                     }
                 }
                 Ok(tungstenite::Message::Text(t)) => {
-                    log::warn!("received text frame from ngx (expected binary msgpack): {}", t);
+                    log::warn!(
+                        "received text frame from ngx (expected binary msgpack): {}",
+                        t
+                    );
                 }
                 Ok(tungstenite::Message::Close(_)) => {
                     log::info!("tun {} received close from ngx", name);
@@ -232,7 +269,7 @@ impl TunnelClient {
         let rid = req.rid.clone();
 
         // Track pending request
-        pending.lock().await.insert(rid.clone(), PendingRequest { created_at: Instant::now() });
+        pending.lock().await.insert(rid.clone(), PendingRequest);
 
         // Proxy to backend
         let result = Self::proxy_request(req, &http_client).await;
@@ -253,13 +290,21 @@ impl TunnelClient {
             }
         };
 
-        batch_tx.send(resp_frame).await.map_err(|_| anyhow::anyhow!("batch channel closed"))?;
+        batch_tx
+            .send(resp_frame)
+            .await
+            .map_err(|_| anyhow::anyhow!("batch channel closed"))?;
         Ok(())
     }
 
-    async fn proxy_request(req: TunnelRequestFrame, http_client: &Client) -> Result<TunnelResponseFrame> {
+    async fn proxy_request(
+        req: TunnelRequestFrame,
+        http_client: &Client,
+    ) -> Result<TunnelResponseFrame> {
         // Determine backend URL from Host header + path
-        let host = req.headers.iter()
+        let host = req
+            .headers
+            .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
             .map(|(_, v)| v.as_str())
             .unwrap_or("127.0.0.1");
@@ -286,10 +331,16 @@ impl TunnelClient {
             request.headers_mut().insert(header_name, header_value);
         }
 
+        // Add request body if present
+        if !req.body.is_empty() {
+            *request.body_mut() = Some(reqwest::Body::from(req.body));
+        }
+
         let resp = http_client.execute(request).await?;
 
         let status = resp.status().as_u16();
-        let headers: Vec<(String, String)> = resp.headers()
+        let headers: Vec<(String, String)> = resp
+            .headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
@@ -316,7 +367,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if config.name.len() > 32 {
         anyhow::bail!("name must be at most 32 characters");
     }
-    if !config.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+    if !config
+        .name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
         anyhow::bail!(
             "name '{}' must match ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore only)",
             config.name

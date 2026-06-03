@@ -21,7 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::{accept_async, tungstenite};
 
-use crate::frame::{deserialize_msgpack, serialize_frames, serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame};
+use crate::frame::{
+    deserialize_msgpack, serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
+};
 
 pub struct MockNgx {
     addr: String,
@@ -89,6 +91,7 @@ impl MockNgx {
 
     /// Wait for and return the next request frame.
     /// Times out after `dur`.
+    #[allow(dead_code)]
     pub async fn next_request(&self, dur: Duration) -> Option<TunnelRequestFrame> {
         let requests = self.requests.clone();
         let deadline = tokio::time::Instant::now() + dur;
@@ -110,27 +113,25 @@ impl MockNgx {
         }
     }
 
-    async fn handle_ws(stream: TcpStream, requests: Arc<Mutex<Vec<TunnelRequestFrame>>>) -> Result<()> {
+    async fn handle_ws(
+        stream: TcpStream,
+        requests: Arc<Mutex<Vec<TunnelRequestFrame>>>,
+    ) -> Result<()> {
         let ws = accept_async(stream).await?;
         let (mut ws_sender, mut ws_read) = ws.split();
 
         // Read one request
-        if let Some(msg) = ws_read.next().await {
-            match msg? {
-                tungstenite::Message::Binary(buf) => {
-                    match deserialize_msgpack::<TunnelFrame>(&buf) {
-                        Ok(TunnelFrame::Req(req)) => {
-                            requests.lock().await.push(req);
-                        }
-                        Ok(TunnelFrame::Res(_)) => {
-                            // tun sent a response to our request
-                        }
-                        Err(e) => {
-                            log::warn!("mock ngx malformed frame: {}", e);
-                        }
-                    }
+        if let Some(Ok(tungstenite::Message::Binary(buf))) = ws_read.next().await {
+            match deserialize_msgpack::<TunnelFrame>(&buf) {
+                Ok(TunnelFrame::Req(req)) => {
+                    requests.lock().await.push(req);
                 }
-                _ => {}
+                Ok(TunnelFrame::Res(_)) => {
+                    // tun sent a response to our request
+                }
+                Err(e) => {
+                    log::warn!("mock ngx malformed frame: {}", e);
+                }
             }
         }
 
@@ -163,17 +164,25 @@ mod tests {
             body: vec![],
         };
         let buf = serialize_msgpack(&TunnelFrame::Req(req.clone())).unwrap();
-        ws_sender.send(tungstenite::Message::Binary(buf)).await.unwrap();
+        ws_sender
+            .send(tungstenite::Message::Binary(buf.into()))
+            .await
+            .unwrap();
 
         // Receive response
-        ws_sender.send(tungstenite::Message::Binary(
-            serialize_msgpack(&TunnelFrame::Res(TunnelResponseFrame {
-                rid: "test-1".into(),
-                status: 200,
-                headers: vec![],
-                body: b"ok".to_vec(),
-            })).unwrap()
-        )).await.unwrap();
+        ws_sender
+            .send(tungstenite::Message::Binary(
+                serialize_msgpack(&TunnelFrame::Res(TunnelResponseFrame {
+                    rid: "test-1".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: b"ok".to_vec(),
+                }))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
 
         ws_sender.close().await.unwrap();
 

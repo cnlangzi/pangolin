@@ -4,5 +4,9 @@
 //! with ngx's frame definitions. This avoids duplication and ensures
 //! both sides use identical structs.
 
-pub use pangolin_core::{TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
-    serialize_msgpack, serialize_frames, deserialize_msgpack};
+pub use pangolin_core::compress::{deflate_decode, deflate_encode};
+#[allow(unused)]
+pub use pangolin_core::{
+    deserialize_msgpack, serialize_frames, serialize_msgpack, TunnelFrame, TunnelRequestFrame,
+    TunnelResponseFrame,
+};

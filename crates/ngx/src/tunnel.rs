@@ -20,7 +20,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite};
 
-use pangolin_core::{serialize_msgpack, deserialize_msgpack, TunnelFrame, TunnelResponseFrame, TunnelRequestFrame};
+use pangolin_core::compress::{deflate_decode, deflate_encode};
+use pangolin_core::{deserialize_msgpack, serialize_msgpack, TunnelFrame};
 
 use crate::{App, TunnelMessage};
 
@@ -170,7 +171,10 @@ async fn handle_client(
     {
         let sessions = app.tun_sessions.read().await;
         if sessions.contains_key(name) {
-            warn!("tunnel: name {} already registered, rejecting duplicate", name);
+            warn!(
+                "tunnel: name {} already registered, rejecting duplicate",
+                name
+            );
             return Ok(());
         }
     }
@@ -224,7 +228,10 @@ async fn handle_tun_ws(
     // Values are periodically cleaned up when they expire (120s > 60s ngx timeout)
     let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
         String,
-        (tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>, std::time::Instant),
+        (
+            tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
+            std::time::Instant,
+        ),
     >::new()));
 
     // Background task: clean up expired pending entries every 30s
@@ -238,9 +245,7 @@ async fn handle_tun_ws(
             let now = std::time::Instant::now();
             let mut map = pending_clean.lock().await;
             let before = map.len();
-            map.retain(|_, (_, inserted)| {
-                now.duration_since(*inserted).as_secs() < 120
-            });
+            map.retain(|_, (_, inserted)| now.duration_since(*inserted).as_secs() < 120);
             let removed = before.saturating_sub(map.len());
             if removed > 0 {
                 debug!("cleaned {} expired pending requests", removed);
@@ -258,7 +263,7 @@ async fn handle_tun_ws(
                 let mut map = pending_read.lock().await;
                 map.insert(msg.rid.clone(), (msg.resp_tx, std::time::Instant::now()));
             }
-            let ws_msg = tungstenite::Message::Binary(msg.body);
+            let ws_msg = tungstenite::Message::Binary(deflate_encode(&msg.body).into());
             if sender.send(ws_msg).await.is_err() {
                 break;
             }
@@ -271,7 +276,7 @@ async fn handle_tun_ws(
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_ws = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    while let Some(msg) = ws_read.next().await {
+    while let Some(_msg) = ws_read.next().await {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
                 // Clean up pending entries older than 120s
@@ -284,6 +289,11 @@ async fn handle_tun_ws(
             msg = futures_util::StreamExt::next(&mut ws_read) => {
                 match msg {
                     Some(Ok(tungstenite::Message::Binary(buf))) => {
+                        // Try decompress raw DEFLATE, fallback to raw if not compressed
+                        let buf = match deflate_decode(&buf) {
+                            Ok(d) => d,
+                            Err(_) => buf.to_vec(),
+                        };
                         match deserialize_msgpack::<TunnelFrame>(&buf) {
                             Ok(TunnelFrame::Req(req_frame)) => {
                                 debug!("tun {} → req {} {} (unhandled in proxy→tun architecture)",
@@ -304,7 +314,7 @@ async fn handle_tun_ws(
                         }
                     }
                     Some(Ok(tungstenite::Message::Text(t))) => {
-                        if let Ok(frame) = serde_json::from_str::<TunnelFrame>(&t) {
+                        if let Ok(_frame) = serde_json::from_str::<TunnelFrame>(&t) {
                             debug!("tun {} sent JSON frame (decoded but unhandled)", tun_name);
                         } else {
                             warn!("malformed text frame from {}: {}", tun_name, t);

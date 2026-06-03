@@ -299,12 +299,14 @@ let msg = TunnelMessage {
 ## 优化方向（性能增强）
 
 ### 优化 1：WS 层压缩（gzip/brotli）
-- **收益**：比换 MessagePack 大得多，Body 压缩率 70~90%
-- **实现**：
-  - 启用 tungstenite 的 `permessage-deflate` 扩展（WS 压缩）
-  - 协商：`Sec-WebSocket-Extensions: permessage-deflate`
-  - ngx 和 tun 都需要支持 deflate（大多数 WS 库原生支持）
-- **无需改帧格式**，在 WS 层自动压缩所有二进制帧
+- [x] ~~启用 tungstenite 的 `permessage-deflate` 扩展（WS 压缩）~~
+- [x] 手动 DEFLATE 压缩：ngx 和 tun 都在 WS Binary 帧层压缩/解压缩
+- **完成情况**：
+  - tokio-tungstenite 升级 0.24 → 0.29 ✓
+  - flate2 集成到 pangolin-core ✓
+  - ngx tunnel.rs: 发送前 `deflate_encode`，收到后 `deflate_decode` ✓
+  - tun client.rs: 发送前 `deflate_encode`，收到后 `deflate_decode` ✓
+  - 实现了 fallback（非压缩帧直接透传），确保向后兼容
 
 ### 优化 2：批量处理（Batch ACK）
 - **问题**：每个请求单独发 response，WS 帧数多，overhead 大

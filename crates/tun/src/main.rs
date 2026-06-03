@@ -8,7 +8,7 @@ mod frame;
 #[cfg(test)]
 mod mock_ngx;
 
-use client::{Config, TunnelClient, validate_config};
+use client::{validate_config, Config, TunnelClient};
 
 /// CLI arguments for the tunnel node.
 #[derive(Debug, clap::Parser)]
@@ -40,7 +40,11 @@ async fn main() -> Result<()> {
 
     validate_config(&config)?;
 
-    log::info!("starting tun node: name={}, server={}", config.name, config.server);
+    log::info!(
+        "starting tun node: name={}, server={}",
+        config.name,
+        config.server
+    );
 
     let client = TunnelClient::new(config);
     client.run().await;

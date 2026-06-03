@@ -96,10 +96,22 @@ impl ProxyHttp for AppProxy {
                         .as_nanos()
                 );
 
-                // Build full request frame with all headers and body
+                // Build full request frame with all headers and body.
+                // read_body returns a borrow; we must copy data before getting req_header.
+                let body_bytes = {
+                    match session.read_body_or_idle(false).await {
+                        Ok(Some(data)) => data.to_vec(),
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            error!("failed to read request body: {}", e);
+                            let _ = session.respond_error(400).await;
+                            return Ok(true);
+                        }
+                    }
+                };
+
                 let req_header = session.req_header();
                 let mut headers: Vec<(String, String)> = Vec::new();
-                // RequestHeader.headers is a field, not a method
                 for (k, v) in &req_header.headers {
                     headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
                 }
@@ -109,7 +121,7 @@ impl ProxyHttp for AppProxy {
                     method: method.clone(),
                     path: req_header.uri.to_string(),
                     headers,
-                    body: Vec::new(),
+                    body: body_bytes,
                 };
 
                 let buf = match pangolin_core::serialize_msgpack(&req_frame) {
@@ -139,11 +151,14 @@ impl ProxyHttp for AppProxy {
                 match timeout(Duration::from_secs(60), response).await {
                     Ok(Ok(response_frame)) => {
                         // Got response from tun — write it to client
-                        debug!("tunnel response {} bytes for rid {}", response_frame.body.len(), rid);
+                        debug!(
+                            "tunnel response {} bytes for rid {}",
+                            response_frame.body.len(),
+                            rid
+                        );
 
                         // Build pingora response from the frame
-                        let mut resp = http::Response::builder()
-                            .status(response_frame.status);
+                        let mut resp = http::Response::builder().status(response_frame.status);
                         for (k, v) in response_frame.headers.iter() {
                             if let (Ok(name), Ok(value)) = (
                                 HeaderName::from_bytes(k.as_bytes()),
@@ -177,7 +192,10 @@ impl ProxyHttp for AppProxy {
                             let _ = session.respond_error(500).await;
                             return Ok(true);
                         }
-                        if let Err(e) = session.write_response_body(Some(Bytes::from(body)), true).await {
+                        if let Err(e) = session
+                            .write_response_body(Some(Bytes::from(body)), true)
+                            .await
+                        {
                             error!("failed to write tunnel response body: {}", e);
                         }
                         Ok(true)

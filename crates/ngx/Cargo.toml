@@ -39,6 +39,7 @@ hyper-rustls = "0.27"
 
 # WebSocket
 tokio-tungstenite.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 
 # TLS / ACME

@@ -77,7 +77,7 @@ pub enum BackendKind {
 pub struct TunnelRequestFrame {
     pub rid: String,
     pub method: String,
-    pub path: String,        // includes query string
+    pub path: String, // includes query string
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
@@ -114,7 +114,9 @@ pub fn serialize_frames(frames: &[TunnelFrame]) -> Result<Vec<u8>, rmp_serde::en
 }
 
 /// Deserialize msgpack bytes to a struct using rmp-serde.
-pub fn deserialize_msgpack<T: serde::de::DeserializeOwned>(buf: &[u8]) -> Result<T, rmp_serde::decode::Error> {
+pub fn deserialize_msgpack<T: serde::de::DeserializeOwned>(
+    buf: &[u8],
+) -> Result<T, rmp_serde::decode::Error> {
     let mut de = rmp_serde::Deserializer::new(buf);
     T::deserialize(&mut de)
 }

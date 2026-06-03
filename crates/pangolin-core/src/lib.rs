@@ -16,6 +16,7 @@
 //!
 //! See `README.md` for the design rationale.
 
+pub mod compress;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -30,7 +31,10 @@ pub use parse::{
     detect_scheme, file_url_to_path, is_valid_domain, is_valid_tun_name, matches_tun_name_charset,
     parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
 };
-pub use types::{BackendKind, Cert, Domain, Site, Token, Tun, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame, serialize_msgpack, serialize_frames, deserialize_msgpack};
+pub use types::{
+    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, Domain, Site,
+    Token, Tun, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
+};
 
 /// Re-export the schema SQL for tests and migrations.
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");

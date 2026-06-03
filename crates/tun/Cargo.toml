@@ -26,5 +26,6 @@ chrono.workspace = true
 reqwest = { version = "0.13.4", features = ["json"] }
 rmp-serde.workspace = true
 pangolin-core = { version = "0.2.0", path = "../pangolin-core" }
+flate2.workspace = true
 http = "1.4.1"
 url = "2.5.8"
