@@ -13,13 +13,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite};
 
 use crate::{App, TunnelMessage};
@@ -212,7 +211,7 @@ async fn handle_tun_ws(
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     tun_name: String,
 ) {
-    let (mut ws_sender, mut ws_read) = ws.split();
+    let (ws_sender, mut ws_read) = ws.split();
 
     // Channel for proxy → tun requests
     let (tx, mut rx) = mpsc::channel::<TunnelMessage>(100);
@@ -263,7 +262,7 @@ async fn handle_tun_ws(
                 // (In practice, proxy sends requests TO tun via tun_sessions,
                 // so this path is for tun-initiated requests in the reverse direction.)
                 let body = serde_json::to_vec(&req_frame).unwrap_or_default();
-                let tun_msg = TunnelMessage {
+                let _tun_msg = TunnelMessage {
                     rid: req_frame.rid.clone(),
                     body,
                     last: true,

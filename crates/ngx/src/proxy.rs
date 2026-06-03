@@ -49,7 +49,7 @@ impl ProxyHttp for AppProxy {
         if path == self.app.ws_path {
             info!("WebSocket tunnel request, upgrading connection");
             // TODO: handle WS upgrade to tunnel handler
-            session.respond_error(426).await;
+            let _ = session.respond_error(426).await;
             return Ok(true);
         }
 
@@ -64,7 +64,7 @@ impl ProxyHttp for AppProxy {
             Some(s) => s.clone(),
             None => {
                 debug!("No site found for host: {}", host);
-                session.respond_error(404).await;
+                let _ = session.respond_error(404).await;
                 return Ok(true);
             }
         };
@@ -76,7 +76,7 @@ impl ProxyHttp for AppProxy {
             Ok((t, u)) => (t, u),
             Err(e) => {
                 error!("Invalid backend for site {}: {}", site.name, e);
-                session.respond_error(502).await;
+                let _ = session.respond_error(502).await;
                 return Ok(true);
             }
         };
@@ -104,14 +104,14 @@ impl ProxyHttp for AppProxy {
                 };
                 if sender.send(msg).await.is_err() {
                     warn!("Tun {} disconnected", tun_name);
-                    session.respond_error(503).await;
+                    let _ = session.respond_error(503).await;
                 } else {
-                    session.respond_error(200).await;
+                    let _ = session.respond_error(200).await;
                 }
                 return Ok(true);
             } else {
                 warn!("Tun {} not online", tun_name);
-                session.respond_error(503).await;
+                let _ = session.respond_error(503).await;
                 return Ok(true);
             }
         }

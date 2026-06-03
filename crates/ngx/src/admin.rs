@@ -14,16 +14,13 @@
 //!   GET/POST   /api/certs
 //!   DELETE     /api/certs/:domain
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use chrono::Utc;
-use http::{Response, StatusCode};
+use http::Response;
 use log::{debug, warn};
 use pingora::http::ResponseHeader;
 use pingora::proxy::Session;
 use pingora::protocols::http::ServerSession;
-use tokio::sync::RwLock;
 
 use crate::App;
 use pangolin_core::{
@@ -374,7 +371,7 @@ pub async fn handle_api_request(
 ) -> pingora::Result<()> {
     let parts: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
     if parts.len() < 2 {
-        session.respond_error(400).await;
+        let _ = session.respond_error(400).await;
         return Ok(());
     }
 
@@ -384,7 +381,7 @@ pub async fn handle_api_request(
         Ok(Some(b)) => b.to_vec(),
         Ok(None) => vec![],
         Err(_) => {
-            session.respond_error(400).await;
+            let _ = session.respond_error(400).await;
             return Ok(());
         }
     };
@@ -427,7 +424,7 @@ pub async fn handle_api_request(
             write_json_response(session, resp).await;
         }
         _ => {
-            session.respond_error(404).await;
+            let _ = session.respond_error(404).await;
         }
     }
     Ok(())
@@ -435,7 +432,7 @@ pub async fn handle_api_request(
 
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
-    http_session: &mut ServerSession,
+    _http_session: &mut ServerSession,
     app: &App,
     path: &str,
     method: &str,
