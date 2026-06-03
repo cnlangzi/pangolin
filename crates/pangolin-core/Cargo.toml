@@ -14,3 +14,4 @@ toml.workspace = true
 log.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+rmp-serde.workspace = true

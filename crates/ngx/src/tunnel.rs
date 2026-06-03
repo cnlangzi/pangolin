@@ -1,15 +1,14 @@
 //! Tunnel WebSocket endpoint — receives connections from remote tun nodes.
 //!
-//! The tun node connects via WS to `ngx:tunnel_port` with token/name in path.
+//! The tun node connects via WS to `ngx:tunnel_port` with token/name in query.
 //! After validating, the session is registered in `App.tun_sessions[tun_name]`.
 //!
 //! Flow:
 //!   tun connects → WS handshake → validates token+name → marks online
-//!   Proxy sends requests via App.tun_sessions → handle_tun_ws reads from mpsc
-//!   handle_tun_ws forwards to backend, gets response, writes back over WS
+//!   Proxy sends requests via App.tun_sessions → write_task reads from mpsc → sends ResponseFrame
+//!   ngx reads request frames from WS (for future tun-initiated requests)
 //!
-//! This module runs an independent TCP listener on the configured tunnel port
-//! so we get raw `tokio::net::TcpStream` access for direct WebSocket handling.
+//! Transport: MessagePack binary frames (not JSON).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,36 +20,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite};
 
+use pangolin_core::{serialize_msgpack, deserialize_msgpack, TunnelFrame, TunnelResponseFrame, TunnelRequestFrame};
+
 use crate::{App, TunnelMessage};
-
-// ---- Tunnel protocol frames ----
-
-/// HTTP request frame: tun → ngx (via mpsc from proxy).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TunnelRequestFrame {
-    pub rid: String,
-    pub method: String,
-    pub path: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// HTTP response frame: ngx → tun (via WS).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct TunnelResponseFrame {
-    pub rid: String,
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// Unified tunnel frame (request or response), serialized as JSON.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum TunnelFrame {
-    Req(TunnelRequestFrame),
-    Res(TunnelResponseFrame),
-}
 
 // ---- Token validation ----
 
@@ -194,6 +166,15 @@ async fn handle_client(
         return Ok(());
     }
 
+    // Check for duplicate registration
+    {
+        let sessions = app.tun_sessions.read().await;
+        if sessions.contains_key(name) {
+            warn!("tunnel: name {} already registered, rejecting duplicate", name);
+            return Ok(());
+        }
+    }
+
     let tun_name = name.to_string();
     mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected", tun_name);
@@ -202,8 +183,9 @@ async fn handle_client(
     Ok(())
 }
 
-/// Main handler: reads TunnelRequestFrames from mpsc (sent by proxy via tun_sessions),
-/// forwards to backend (HTTP request), waits for response, writes back over WS.
+/// Main handler: proxy → tun requests arrive via mpsc channel,
+/// write_task reads from mpsc and sends TunnelResponseFrame over WS.
+/// ngx also reads frames from WS (for future tun-initiated requests).
 async fn handle_tun_ws(
     app: Arc<App>,
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
@@ -211,7 +193,7 @@ async fn handle_tun_ws(
 ) {
     let (ws_sender, mut ws_read) = ws.split();
 
-    // Channel for proxy → tun requests
+    // Channel for proxy → tun requests (delivers TunnelResponseFrame bytes)
     let (tx, mut rx) = mpsc::channel::<TunnelMessage>(100);
 
     // Register this tun in App.tun_sessions
@@ -220,69 +202,88 @@ async fn handle_tun_ws(
         sessions.insert(tun_name.clone(), tx);
     }
 
-    // Spawn a task that reads responses from the mpsc channel and writes to WS
+    // Spawn a task that:
+    // - Reads TunnelResponseFrame from tun over WS
+    // - Routes it to the correct pending request via resp_tx
+    // - Sends TunnelRequestFrame to tun when received from proxy
+    let pending = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>>::new()));
+
+    let pending_read = pending.clone();
     let write_task = tokio::spawn(async move {
         let mut sender = ws_sender;
         while let Some(msg) = rx.recv().await {
-            // msg.body is the serialized TunnelResponseFrame JSON
-            let ws_msg =
-                tungstenite::Message::Text(String::from_utf8(msg.body).unwrap_or_default());
+            // msg.body = serialized TunnelRequestFrame (msgpack)
+            // Store resp_tx by rid so the read side can route the response
+            {
+                let mut map = pending_read.lock().unwrap();
+                map.insert(msg.rid.clone(), msg.resp_tx);
+            }
+            let ws_msg = tungstenite::Message::Binary(msg.body);
             if sender.send(ws_msg).await.is_err() {
                 break;
             }
         }
     });
 
-    // Read request frames from the WebSocket and forward them through tun_sessions
-    // (In the current architecture, the proxy sends TO tun via tun_sessions,
-    // not the other way around. But we keep WS reading here for future extension
-    // where tun initiates requests.)
+    // Also read frames from the WebSocket:
+    // - Req frames from tun: unhandled (architecture is proxy → tun)
+    // - Res frames from tun: route to pending request via resp_tx
+    let pending_ws = pending.clone();
     while let Some(msg) = ws_read.next().await {
-        let text = match msg {
-            Ok(tungstenite::Message::Text(t)) => t,
+        match msg {
+            Ok(tungstenite::Message::Binary(buf)) => {
+                match deserialize_msgpack::<TunnelFrame>(&buf) {
+                    Ok(TunnelFrame::Req(req_frame)) => {
+                        debug!("tun {} → req {} {} (unhandled in proxy→tun architecture)",
+                            tun_name, req_frame.rid, req_frame.path);
+                    }
+                    Ok(TunnelFrame::Res(resp_frame)) => {
+                        debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
+                        // Route response to the waiting proxy.rs via resp_tx
+                        let mut map = pending_ws.lock().unwrap();
+                        if let Some(tx) = map.remove(&resp_frame.rid) {
+                            let _ = tx.send(resp_frame);
+                        } else {
+                            warn!("no pending request for rid {}", resp_frame.rid);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("malformed tunnel frame from {}: {}", tun_name, e);
+                    }
+                }
+            }
+            Ok(tungstenite::Message::Text(t)) => {
+                if let Ok(frame) = serde_json::from_str::<TunnelFrame>(&t) {
+                    debug!("tun {} sent JSON frame (decoded but unhandled)", tun_name);
+                } else {
+                    warn!("malformed text frame from {}: {}", tun_name, t);
+                }
+            }
             Ok(tungstenite::Message::Close(_)) => {
                 info!("tun {} sent close", tun_name);
                 break;
+            }
+            Ok(tungstenite::Message::Ping(_)) | Ok(tungstenite::Message::Pong(_)) => {
+                // Ping/pong handled automatically by tungstenite auto-pong
             }
             Err(e) => {
                 warn!("WS read error from {}: {}", tun_name, e);
                 break;
             }
             _ => continue,
-        };
+        }
+    }
 
-        let frame: Result<TunnelFrame, _> = serde_json::from_str(&text);
-        match frame {
-            Ok(TunnelFrame::Req(req_frame)) => {
-                debug!(
-                    "tun {} → req {} {}",
-                    tun_name, req_frame.rid, req_frame.path
-                );
-
-                // Build TunnelMessage and send to proxy for backend forwarding
-                // (In practice, proxy sends requests TO tun via tun_sessions,
-                // so this path is for tun-initiated requests in the reverse direction.)
-                let body = serde_json::to_vec(&req_frame).unwrap_or_default();
-                let _tun_msg = TunnelMessage {
-                    rid: req_frame.rid.clone(),
-                    body,
-                    last: true,
-                };
-
-                // Get the sender for this tun (proxy side will pick this up)
-                // Actually proxy → tun is via tun_sessions; tun → proxy needs a separate path
-                // For now, just log that we received a tun-initiated request
-                debug!(
-                    "tun {} sent request (unhandled in current architecture): {} {}",
-                    tun_name, req_frame.method, req_frame.path
-                );
-            }
-            Ok(TunnelFrame::Res(_)) => {
-                warn!("unexpected response frame from tun {}", tun_name);
-            }
-            Err(e) => {
-                warn!("malformed tunnel frame from {}: {}", tun_name, e);
-            }
+    // Drain pending map on disconnect (all pending requests get 504)
+    {
+        let mut map = pending_ws.lock().unwrap();
+        for (_, tx) in map.drain() {
+            let _ = tx.send(pangolin_core::TunnelResponseFrame {
+                rid: String::new(),
+                status: 504,
+                headers: vec![],
+                body: b"tunnel disconnected".to_vec(),
+            });
         }
     }
 

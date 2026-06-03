@@ -81,14 +81,14 @@ impl App {
 }
 
 /// Message sent over a tunnel WebSocket to the remote tun node.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct TunnelMessage {
     /// Unique request ID to match response
     pub rid: String,
-    /// Serialized HTTP request headers + path + method
+    /// Serialized TunnelRequestFrame msgpack bytes
     pub body: Vec<u8>,
-    /// Whether this is the last chunk
-    pub last: bool,
+    /// Response channel (filled by write_task when tun sends response frame)
+    pub resp_tx: tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
 }
 
 // ---- Tunnel session management ----

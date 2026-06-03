@@ -70,6 +70,48 @@ pub enum BackendKind {
     Tunnel { tun_name: String },
 }
 
+// ---- Tunnel frames (used by both ngx and tun) ----
+
+/// HTTP request frame: ngx → tun (via WS).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TunnelRequestFrame {
+    pub rid: String,
+    pub method: String,
+    pub path: String,        // includes query string
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// HTTP response frame: tun → ngx (via WS).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TunnelResponseFrame {
+    pub rid: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Unified tunnel frame (request or response).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum TunnelFrame {
+    Req(TunnelRequestFrame),
+    Res(TunnelResponseFrame),
+}
+
+/// Serialize a struct to msgpack bytes using rmp-serde.
+pub fn serialize_msgpack<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut buf = Vec::new();
+    v.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+    Ok(buf)
+}
+
+/// Deserialize msgpack bytes to a struct using rmp-serde.
+pub fn deserialize_msgpack<T: serde::de::DeserializeOwned>(buf: &[u8]) -> Result<T, rmp_serde::decode::Error> {
+    let mut de = rmp_serde::Deserializer::new(buf);
+    T::deserialize(&mut de)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
