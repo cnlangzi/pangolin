@@ -8,6 +8,7 @@ mod admin;
 mod proxy;
 mod serve;
 mod tunnel;
+mod acme;
 
 pub use proxy::AppProxy;
 pub use serve::AppHttp;

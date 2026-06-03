@@ -39,6 +39,8 @@ futures-util.workspace = true
 rcgen.workspace = true
 instant-acme = "0.7"
 rustls.workspace = true
+pem = "3"
+x509-parser = "0.15"
 
 # Serialization
 mime_guess = "2"

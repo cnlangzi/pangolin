@@ -30,7 +30,7 @@ futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # TLS / ACME
-rcgen = "0.13"
+rcgen = "0.14"
 instant-acme = "0.7"
 rustls = "0.23"
 
