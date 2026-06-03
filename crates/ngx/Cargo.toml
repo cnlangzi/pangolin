@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pangolin gateway (ngx) — public-facing HTTP/WebSocket proxy"
 
+[lib]
+name = "ngx"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ngx"
 path = "src/main.rs"
@@ -30,6 +34,8 @@ clap = { workspace = true, features = ["cargo"] }
 # HTTP protocol
 http = "1"
 http-body-util = "0.1"
+hyper = { version = "1.10", features = ["client", "http1"] }
+hyper-rustls = "0.27"
 
 # WebSocket
 tokio-tungstenite.workspace = true
@@ -38,9 +44,10 @@ futures-util.workspace = true
 # TLS / ACME
 rcgen.workspace = true
 instant-acme = "0.7"
-rustls.workspace = true
+rustls = { workspace = true, features = ["ring"] }
 pem = "3"
 x509-parser = "0.15"
+rustls-native-certs = "0.7"
 
 # Serialization
 mime_guess = "2"
@@ -51,3 +58,13 @@ time = "0.3"
 
 # Utilities
 bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+bytes = "1"
+http-body = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1.10", features = ["http1"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

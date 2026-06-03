@@ -4,11 +4,11 @@
 //!   - HTTP proxy via `http_proxy_service` + `impl ProxyHttp` for domain-routed proxying
 //!   - HTTP server via `HttpServer::new_app` + `impl ServeHttp` for admin API + static files
 
+mod acme;
 mod admin;
 mod proxy;
 mod serve;
 mod tunnel;
-mod acme;
 
 pub use proxy::AppProxy;
 pub use serve::AppHttp;

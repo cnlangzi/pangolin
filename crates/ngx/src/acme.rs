@@ -3,12 +3,14 @@
 //! Uses HTTP-01 challenge for domain verification. The challenge response
 //! is served by the admin HTTP server at `/.well-known/acme-challenge/<token>`.
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewOrder, Order, OrderStatus};
+use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewOrder, OrderStatus};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -19,13 +21,14 @@ const ACCOUNT_KEY_FILE: &str = "account_key.pem";
 pub struct AcmeClient {
     account: Account,
     cert_dir: PathBuf,
-    email: String,
+    #[allow(dead_code)]
+    email: String, // stored for potential future ACME account metadata
     renew_threshold_days: u32,
     renew_check_interval_hours: u32,
 }
 
 impl AcmeClient {
-    /// Create ACME client, loading or creating account key.
+    /// Create ACME client using native root CAs for TLS verification.
     pub async fn new(
         cert_dir: PathBuf,
         email: String,
@@ -36,7 +39,10 @@ impl AcmeClient {
         let account_key_path = cert_dir.join(ACCOUNT_KEY_FILE);
 
         let account = if account_key_path.exists() {
-            log::info!("loading existing ACME account from {}", account_key_path.display());
+            log::info!(
+                "loading existing ACME account from {}",
+                account_key_path.display()
+            );
             let cred_json = tokio::fs::read_to_string(&account_key_path).await?;
             let cred: AccountCredentials = serde_json::from_str(&cred_json)
                 .map_err(|e| anyhow::anyhow!("invalid account credentials: {}", e))?;
@@ -69,28 +75,94 @@ impl AcmeClient {
         })
     }
 
+    /// Create ACME client with a custom HTTP client (allows custom TLS roots, e.g. for Pebble).
+    pub async fn with_http_client(
+        http: Box<dyn instant_acme::HttpClient>,
+        cert_dir: PathBuf,
+        email: String,
+        acme_directory: &str,
+        renew_threshold_days: u32,
+        renew_check_interval_hours: u32,
+    ) -> anyhow::Result<Self> {
+        let account_key_path = cert_dir.join(ACCOUNT_KEY_FILE);
+
+        let account = if account_key_path.exists() {
+            log::info!(
+                "loading existing ACME account from {}",
+                account_key_path.display()
+            );
+            let cred_json = tokio::fs::read_to_string(&account_key_path).await?;
+            let cred: AccountCredentials = serde_json::from_str(&cred_json)
+                .map_err(|e| anyhow::anyhow!("invalid account credentials: {}", e))?;
+            Account::from_credentials_and_http(cred, http).await?
+        } else {
+            log::info!("registering new ACME account for {}", email);
+            let (account, cred) = Account::create_with_http(
+                &instant_acme::NewAccount {
+                    contact: &[],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                acme_directory,
+                None,
+                http,
+            )
+            .await?;
+            tokio::fs::create_dir_all(&cert_dir).await?;
+            let cred_json = serde_json::to_string_pretty(&cred)?;
+            tokio::fs::write(&account_key_path, cred_json).await?;
+            log::info!("ACME account registered, credentials saved");
+            account
+        };
+
+        Ok(Self {
+            account,
+            cert_dir,
+            email,
+            renew_threshold_days,
+            renew_check_interval_hours,
+        })
+    }
+
     /// Issue a certificate for the given domains.
     pub async fn issue_cert(&self, domains: &[String]) -> anyhow::Result<(PathBuf, PathBuf)> {
         log::info!("ACME: requesting certificate for domains: {:?}", domains);
 
-        let identifiers: Vec<Identifier> = domains
-            .iter()
-            .map(|d| Identifier::Dns(d.clone()))
-            .collect();
+        let identifiers: Vec<Identifier> =
+            domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
 
-        let new_order = NewOrder { identifiers: &identifiers };
+        let new_order = NewOrder {
+            identifiers: &identifiers,
+        };
         let mut order = self.account.new_order(&new_order).await?;
         log::info!("ACME order created: {}", order.url());
 
-        // HTTP-01 challenge
         let authorizations = order.authorizations().await?;
+        log::info!("authorizations count: {}", authorizations.len());
+        if let Some(auth) = authorizations.first() {
+            log::info!("auth status: {:?}", auth.status);
+            log::info!("auth challenges count: {}", auth.challenges.len());
+            for (i, c) in auth.challenges.iter().enumerate() {
+                log::info!(
+                    "  challenge[{}]: type={:?} url={} token={}",
+                    i,
+                    c.r#type,
+                    c.url,
+                    c.token
+                );
+            }
+        }
         let auth = authorizations
             .first()
             .ok_or_else(|| anyhow::anyhow!("no authorization in order"))?;
 
+        log::info!("auth: {:?}", auth);
+        log::info!("challenges: {:?}", auth.challenges);
+
         let challenge = auth
             .challenges
             .iter()
+            .filter(|c| !c.token.is_empty())
             .find(|c| c.r#type == ChallengeType::Http01)
             .ok_or_else(|| anyhow::anyhow!("no HTTP-01 challenge found"))?;
 
@@ -144,7 +216,11 @@ impl AcmeClient {
         tokio::fs::write(&cert_path, &cert_pem).await?;
         tokio::fs::write(&key_path, &key_pem).await?;
 
-        log::info!("ACME certificate saved: {} / {}", cert_path.display(), key_path.display());
+        log::info!(
+            "ACME certificate saved: {} / {}",
+            cert_path.display(),
+            key_path.display()
+        );
 
         self.remove_challenge(&challenge.token).await;
         Ok((cert_path, key_path))
@@ -152,15 +228,13 @@ impl AcmeClient {
 
     /// Generate a CSR (DER) and private key (PEM) for the given domains.
     fn generate_csr(&self, domains: &[String]) -> anyhow::Result<(Vec<u8>, String)> {
-        use rcgen::{
-            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-            SanType, SignatureAlgorithm,
-        };
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
         let mut params = CertificateParams::default();
-        params.is_ca = IsCa::NoCa;
         params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(DnType::CommonName, domains[0].as_str());
+        params
+            .distinguished_name
+            .push(DnType::CommonName, domains[0].as_str());
         params.subject_alt_names = domains
             .iter()
             .skip(1)
@@ -191,7 +265,10 @@ impl AcmeClient {
     }
 
     /// Check expiry of existing cert and renew if within threshold.
-    pub async fn check_and_renew(&self, domains: &[String]) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    pub async fn check_and_renew(
+        &self,
+        domains: &[String],
+    ) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
         let host_dir = self.cert_dir.join(&domains[0]);
         let cert_path = host_dir.join("fullchain.pem");
         let key_path = host_dir.join("privkey.pem");
@@ -207,10 +284,18 @@ impl AcmeClient {
         let now = Utc::now();
         let days = (expiry - now).num_days();
 
-        log::info!("certificate for {} expires on {} (in {} days)", domains[0], expiry, days);
+        log::info!(
+            "certificate for {} expires on {} (in {} days)",
+            domains[0],
+            expiry,
+            days
+        );
 
         if days <= self.renew_threshold_days as i64 {
-            log::info!("renewing certificate (threshold {} days)", self.renew_threshold_days);
+            log::info!(
+                "renewing certificate (threshold {} days)",
+                self.renew_threshold_days
+            );
             let result = self.issue_cert(domains).await?;
             return Ok(Some(result));
         }
@@ -250,13 +335,10 @@ fn parse_cert_expiry(pem_str: &str) -> anyhow::Result<DateTime<Utc>> {
         .map_err(|e| anyhow::anyhow!("X509 parse error: {}", e))?;
 
     let not_after = cert.tbs_certificate.validity.not_after.timestamp();
-    DateTime::from_timestamp(not_after, 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
+    DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
 }
 
 // ---- CertManager (exposed to main.rs) ----
-
-use std::sync::Arc as StdArc;
 
 /// TLS certificate manager for ngx main.rs.
 /// Handles both ACME auto-renewal and manual file-based certs.
@@ -272,6 +354,28 @@ pub struct CertManager {
 }
 
 impl CertManager {
+    /// Create a new CertManager.
+    pub fn new(
+        enabled: bool,
+        cert_dir: PathBuf,
+        email: String,
+        acme_directory: String,
+        renew_threshold_days: u32,
+        renew_check_interval_hours: u32,
+        renew_max_retries: u32,
+    ) -> Self {
+        Self {
+            enabled,
+            cert_dir,
+            email,
+            acme_directory,
+            renew_threshold_days,
+            renew_check_interval_hours,
+            renew_max_retries,
+            acme_client: RwLock::new(None),
+        }
+    }
+
     /// Initialize ACME client if autorenew is enabled.
     pub async fn init(&self) -> anyhow::Result<()> {
         if !self.enabled {
@@ -297,12 +401,18 @@ impl CertManager {
         let cert = host_dir.join("fullchain.pem");
         let key = host_dir.join("privkey.pem");
         if cert.exists() && key.exists() {
-            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+            return Ok((
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            ));
         }
         let cert = self.cert_dir.join("fullchain.pem");
         let key = self.cert_dir.join("privkey.pem");
         if cert.exists() && key.exists() {
-            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+            return Ok((
+                cert.to_string_lossy().into_owned(),
+                key.to_string_lossy().into_owned(),
+            ));
         }
         anyhow::bail!(
             "no certificate found for host {} (searched {}/ and {}/)",
