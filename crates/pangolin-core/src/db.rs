@@ -82,9 +82,8 @@ pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 // ---- Domain CRUD ----
 
 pub fn list_domains(conn: &Connection) -> rusqlite::Result<Vec<Domain>> {
-    let mut stmt = conn.prepare(
-        "SELECT domain, site_name, enabled, created_at FROM domains ORDER BY domain",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT domain, site_name, enabled, created_at FROM domains ORDER BY domain")?;
     let rows = stmt.query_map([], row_to_domain)?;
     rows.collect()
 }
@@ -313,11 +312,7 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
 
 fn parse_dt(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::from_str(s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
 

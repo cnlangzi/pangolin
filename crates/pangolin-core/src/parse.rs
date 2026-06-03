@@ -98,7 +98,7 @@ pub fn detect_scheme(url: &str) -> Option<BackendScheme> {
 /// Extract local filesystem path from a `file:///` URL.
 /// e.g. `file:///var/www/static` → `/var/www/static`
 pub fn file_url_to_path(url: &str) -> Option<&str> {
-    url.strip_prefix("file:///")
+    url.strip_prefix("file://")
 }
 
 /// Parse a backend string. Returns `(tun_name, url)` where `tun_name == ""`
@@ -121,6 +121,13 @@ pub fn file_url_to_path(url: &str) -> Option<&str> {
 pub fn parse_backend(s: &str) -> Result<(String, String), ParseError> {
     if s.is_empty() {
         return Err(ParseError::Empty);
+    }
+    // If the string itself starts with a known URL scheme (http://, https://,
+    // file:///), there is no tun_name prefix — the whole thing is a direct URL.
+    // This avoids the trap of splitting on the first `:` (which would split
+    // inside the scheme itself: `http://x` → candidate="http", url="//x").
+    if detect_scheme(s).is_some() {
+        return Ok((String::new(), s.to_string()));
     }
     match s.find(':') {
         None => {
@@ -192,8 +199,8 @@ mod tests {
         assert!(is_valid_domain("*.foo.bar.com"));
         assert!(!is_valid_domain("*.*.example.com"));
         assert!(!is_valid_domain("foo.*.com"));
-        assert!(!is_valid_domain("app.example.com"));
-        // exact is a different check (allowed in is_valid_domain):
+        // Plain (non-wildcard) domains are also accepted by is_valid_domain —
+        // it's a character-shape check, not a "is this a wildcard?" check.
         assert!(is_valid_domain("app.example.com"));
     }
 
@@ -213,8 +220,14 @@ mod tests {
 
     #[test]
     fn file_url_to_path_basic() {
-        assert_eq!(file_url_to_path("file:///var/www/static"), Some("/var/www/static"));
-        assert_eq!(file_url_to_path("file:///home/user/docs"), Some("/home/user/docs"));
+        assert_eq!(
+            file_url_to_path("file:///var/www/static"),
+            Some("/var/www/static")
+        );
+        assert_eq!(
+            file_url_to_path("file:///home/user/docs"),
+            Some("/home/user/docs")
+        );
         assert_eq!(file_url_to_path("http://x"), None);
     }
 

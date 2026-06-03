@@ -23,9 +23,7 @@ use pingora::services::listening::Service;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use pangolin_core::{
-    config::Config, db, Indexes,
-};
+use pangolin_core::{config::Config, db, Indexes};
 
 /// The shared application state for both the proxy and the HTTP server.
 pub struct App {
@@ -45,7 +43,11 @@ pub struct App {
 
 impl App {
     /// Open (or create) the SQLite database, run migrations, build indexes.
-    pub fn new(db_path: &PathBuf, config: Config, cert_manager: CertManager) -> anyhow::Result<Self> {
+    pub fn new(
+        db_path: &PathBuf,
+        config: Config,
+        cert_manager: CertManager,
+    ) -> anyhow::Result<Self> {
         let conn = db::open(db_path)?;
         db::migrate(&conn)?;
 
@@ -149,7 +151,8 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
-    let config = Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
+    let config =
+        Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager {
@@ -163,7 +166,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = Arc::new(App::new(&db_path, config.clone(), cert_manager)?);
 
-    log::info!("Pangolin ngx {} starting on port {}", pangolin_core::VERSION, config.server.port);
+    log::info!(
+        "Pangolin ngx {} starting on port {}",
+        pangolin_core::VERSION,
+        config.server.port
+    );
 
     // Build pingora server
     let mut server = Server::new(None)?;
@@ -178,10 +185,8 @@ async fn main() -> anyhow::Result<()> {
     server.add_service(proxy_service);
 
     // HTTP server (admin API + static files)
-    let http_server: Service<_> = Service::new(
-        "pangolin-http".to_string(),
-        HttpServer::new_app(app_http),
-    );
+    let http_server: Service<_> =
+        Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
     server.add_service(http_server);
 
     // Tunnel WebSocket server (independent TCP listener, runs as background task)

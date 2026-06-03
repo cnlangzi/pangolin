@@ -30,11 +30,7 @@ impl ProxyHttp for AppProxy {
     ///
     /// Returns `Ok(true)` if we handled the response locally (no upstream proxy).
     /// Returns `Ok(false)` to continue to `upstream_peer`.
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_string();
 
@@ -145,7 +141,10 @@ impl ProxyHttp for AppProxy {
         let url = match pangolin_core::parse::parse_backend(&site.backend) {
             Ok((_, u)) => u,
             Err(e) => {
-                return Err(Error::explain(ErrorType::ReadError, format!("bad backend: {}", e)));
+                return Err(Error::explain(
+                    ErrorType::ReadError,
+                    format!("bad backend: {}", e),
+                ));
             }
         };
 
@@ -158,7 +157,11 @@ impl ProxyHttp for AppProxy {
                 .trim_start_matches(':')
                 .parse()
                 .unwrap_or(443);
-            (format!("{}:{}", host_part, port), true, host_part.to_string())
+            (
+                format!("{}:{}", host_part, port),
+                true,
+                host_part.to_string(),
+            )
         } else if url.starts_with("http://") {
             let addr = url.trim_start_matches("http://");
             let port_sep = addr.find(':').unwrap_or(addr.len());

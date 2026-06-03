@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
-use crate::types::{Domain, Site, Token, Tun};
+use crate::types::{Domain, Site, Token};
 
 /// Site + its domains, as assembled in `Indexes::build`.
 /// Used for `rebuild_tun_index` which needs the relationship.
@@ -136,9 +136,7 @@ fn rebuild_tun_index(sites: &[SiteWithDomains]) -> HashMap<String, Vec<Arc<Domai
             continue; // direct path, not in tunIndex
         }
         for d in &swd.domains {
-            idx.entry(tun_name.clone())
-                .or_default()
-                .push(d.clone());
+            idx.entry(tun_name.clone()).or_default().push(d.clone());
         }
     }
     idx
@@ -206,6 +204,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_token(token: &str, enabled: bool) -> Token {
         Token {
             token: token.into(),

@@ -19,8 +19,8 @@ use chrono::Utc;
 use http::Response;
 use log::{debug, warn};
 use pingora::http::ResponseHeader;
-use pingora::proxy::Session;
 use pingora::protocols::http::ServerSession;
+use pingora::proxy::Session;
 
 use crate::App;
 use pangolin_core::{
@@ -55,6 +55,7 @@ fn json_error(status: u16, message: &str) -> Response<Vec<u8>> {
 
 // ---- Read body helper ----
 
+#[allow(dead_code)]
 async fn read_body_http(http_session: &mut ServerSession) -> Result<Vec<u8>, Response<Vec<u8>>> {
     match http_session.read_body_or_idle(false).await {
         Ok(Some(data)) => Ok(data.to_vec()),
@@ -266,7 +267,9 @@ async fn upsert_token(app: &App, token: &str, body: &[u8]) -> Response<Vec<u8>> 
     };
 
     let expires_at = match &req.expires_at {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc)),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc)),
         None => None,
     };
 
@@ -326,7 +329,9 @@ async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> 
     };
 
     let expires_at = match &req.expires_at {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc)),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc)),
         None => None,
     };
 
@@ -492,10 +497,7 @@ pub async fn handle_api_http(
 
 // ---- Response writers ----
 
-async fn write_json_response(
-    session: &mut Session,
-    resp: Response<Vec<u8>>,
-) {
+async fn write_json_response(session: &mut Session, resp: Response<Vec<u8>>) {
     let status = resp.status().as_u16();
     let body = resp.body().clone();
     let content_type = resp
@@ -511,13 +513,17 @@ async fn write_json_response(
             return;
         }
     };
-    hdr.insert_header("Content-Type", content_type.as_bytes()).ok();
+    hdr.insert_header("Content-Type", content_type.as_bytes())
+        .ok();
 
     if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
         log::error!("failed to write response header: {}", e);
         return;
     }
-    if let Err(e) = session.write_response_body(Some(Bytes::from(body)), true).await {
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(body)), true)
+        .await
+    {
         log::error!("failed to write response body: {}", e);
     }
 }

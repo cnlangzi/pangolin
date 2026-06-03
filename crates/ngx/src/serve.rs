@@ -54,9 +54,7 @@ impl ServeHttp for AppHttp {
         // 404
         let mut resp = ResponseHeader::build(404, None).unwrap();
         resp.insert_header("Content-Type", "text/plain").ok();
-        let _ = http_session
-            .write_response_header(Box::new(resp))
-            .await;
+        let _ = http_session.write_response_header(Box::new(resp)).await;
         let _ = http_session
             .write_response_body(bytes::Bytes::from_static(b"Not found"), true)
             .await;

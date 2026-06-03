@@ -65,9 +65,7 @@ async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u1
     drop(conn);
 
     let token_rec = tokens.iter().find(|t| {
-        t.token == token
-            && t.enabled
-            && t.expires_at.map_or(true, |e| e > chrono::Utc::now())
+        t.token == token && t.enabled && t.expires_at.is_none_or(|e| e > chrono::Utc::now())
     });
 
     if token_rec.is_none() {
@@ -228,7 +226,7 @@ async fn handle_tun_ws(
         while let Some(msg) = rx.recv().await {
             // msg.body is the serialized TunnelResponseFrame JSON
             let ws_msg =
-                tungstenite::Message::Text(String::from_utf8(msg.body).unwrap_or_default().into());
+                tungstenite::Message::Text(String::from_utf8(msg.body).unwrap_or_default());
             if sender.send(ws_msg).await.is_err() {
                 break;
             }
@@ -256,7 +254,10 @@ async fn handle_tun_ws(
         let frame: Result<TunnelFrame, _> = serde_json::from_str(&text);
         match frame {
             Ok(TunnelFrame::Req(req_frame)) => {
-                debug!("tun {} → req {} {}", tun_name, req_frame.rid, req_frame.path);
+                debug!(
+                    "tun {} → req {} {}",
+                    tun_name, req_frame.rid, req_frame.path
+                );
 
                 // Build TunnelMessage and send to proxy for backend forwarding
                 // (In practice, proxy sends requests TO tun via tun_sessions,
