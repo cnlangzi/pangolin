@@ -49,8 +49,10 @@ lint: fmt-check clippy test
 	@echo "✓ all checks passed"
 
 # Build admin UI (tailwindcss).
+# CI runs `npm ci` first to install from lockfile; local dev can use `npm install` or skip.
 .PHONY: ui
 ui:
+	npm ci
 	npm run build
 
 # Full local CI mirror: fmt-check + clippy + test + build --release + ui.
