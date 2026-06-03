@@ -5,4 +5,4 @@
 //! both sides use identical structs.
 
 pub use pangolin_core::{TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
-    serialize_msgpack, deserialize_msgpack};
+    serialize_msgpack, serialize_frames, deserialize_msgpack};

@@ -106,6 +106,13 @@ pub fn serialize_msgpack<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, rmp_serd
     Ok(buf)
 }
 
+/// Serialize a slice of tunnel frames as a msgpack array.
+pub fn serialize_frames(frames: &[TunnelFrame]) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut buf = Vec::new();
+    frames.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+    Ok(buf)
+}
+
 /// Deserialize msgpack bytes to a struct using rmp-serde.
 pub fn deserialize_msgpack<T: serde::de::DeserializeOwned>(buf: &[u8]) -> Result<T, rmp_serde::decode::Error> {
     let mut de = rmp_serde::Deserializer::new(buf);

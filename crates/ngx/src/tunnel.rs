@@ -193,8 +193,26 @@ async fn handle_tun_ws(
 ) {
     let (ws_sender, mut ws_read) = ws.split();
 
-    // Channel for proxy → tun requests (delivers TunnelResponseFrame bytes)
+    // Channel for proxy → tun requests (delivers TunnelMessage with resp_tx)
     let (tx, mut rx) = mpsc::channel::<TunnelMessage>(100);
+
+    // Check for duplicate tun_name — reject if already registered
+    {
+        let sessions = app.tun_sessions.read().await;
+        if sessions.contains_key(&tun_name) {
+            log::warn!("duplicate tun_name '{}' rejected", tun_name);
+            let reject = serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
+                rid: String::new(),
+                status: 409,
+                headers: vec![],
+                body: b"tun name already registered".to_vec(),
+            }));
+            if let Err(e) = reject {
+                log::warn!("failed to send duplicate rejection: {}", e);
+            }
+            return;
+        }
+    }
 
     // Register this tun in App.tun_sessions
     {
@@ -206,7 +224,7 @@ async fn handle_tun_ws(
     // - Reads TunnelResponseFrame from tun over WS
     // - Routes it to the correct pending request via resp_tx
     // - Sends TunnelRequestFrame to tun when received from proxy
-    let pending = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>>::new()));
+    let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>>::new()));
 
     let pending_read = pending.clone();
     let write_task = tokio::spawn(async move {
@@ -215,7 +233,7 @@ async fn handle_tun_ws(
             // msg.body = serialized TunnelRequestFrame (msgpack)
             // Store resp_tx by rid so the read side can route the response
             {
-                let mut map = pending_read.lock().unwrap();
+                let mut map = pending_read.lock().await;
                 map.insert(msg.rid.clone(), msg.resp_tx);
             }
             let ws_msg = tungstenite::Message::Binary(msg.body);
@@ -240,7 +258,7 @@ async fn handle_tun_ws(
                     Ok(TunnelFrame::Res(resp_frame)) => {
                         debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
                         // Route response to the waiting proxy.rs via resp_tx
-                        let mut map = pending_ws.lock().unwrap();
+                        let mut map = pending_ws.lock().await;
                         if let Some(tx) = map.remove(&resp_frame.rid) {
                             let _ = tx.send(resp_frame);
                         } else {
@@ -276,7 +294,7 @@ async fn handle_tun_ws(
 
     // Drain pending map on disconnect (all pending requests get 504)
     {
-        let mut map = pending_ws.lock().unwrap();
+        let mut map = pending_ws.lock().await;
         for (_, tx) in map.drain() {
             let _ = tx.send(pangolin_core::TunnelResponseFrame {
                 rid: String::new(),

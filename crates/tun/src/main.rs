@@ -5,6 +5,8 @@ use clap::Parser;
 
 mod client;
 mod frame;
+#[cfg(test)]
+mod mock_ngx;
 
 use client::{Config, TunnelClient, validate_config};
 
