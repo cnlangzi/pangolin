@@ -1,37 +1,70 @@
-# 穿山甲 Rust 重写 — 整体进度
+# 穿山甲 Rust 重写 — 任务拆分
 
 ## 分支
 `fix/rust`
 
-## Phase 1: ngx (Gateway) 🔄 IN PROGRESS
-- [x] pangolin-core (1653行) — types/parse/index/db/config ✅
-- [x] proxy.rs — impl ProxyHttp ✅ (cargo check ✅)
-- [x] admin.rs — Admin API REST endpoints ✅
-- [x] serve.rs — impl ServeHttp ✅
-- [ ] tunnel.rs — **Tunnel WS 端点（3个编译错误）**
-- [ ] main.rs — **完整组装**
-- [ ] ACME Cert Manager — stub
-- [ ] 清理 17 个 warnings
+## 当前状态
+- Phase 1: ngx (Gateway) — 🔄 进行中
+- Phase 2: tun (Tunnel 客户端) — ❌ TODO
+- Phase 3: admin 后台 SSR + htmx — ❌ TODO
+- Phase 4: 测试（Pebble ACME）— ❌ TODO
 
-**阻塞**: tunnel.rs 编译错误
+## 任务文件
 
-## Phase 2: tun (Tunnel 客户端) ❌ TODO
-- 依赖 Phase 1 ngx tunnel WS 端点完成
+| 文件 | 说明 |
+|------|------|
+| `phase-1-ngx.md` | ngx 核心（proxy/admin/serve/tunnel/main/ACME） |
+| `phase-2-tun.md` | tun 客户端 |
+| `phase-3-admin.md` | admin 后台 SSR + htmx |
+| `phase-4-testing.md` | Pebble ACME 集成测试 |
 
-## Phase 3: admin 后台 SSR + htmx ❌ TODO
-- 不使用 Vue/React，纯 SSR + htmx + TailwindCSS
+## Phase 1 详细任务（当前进行中）
 
-## Phase 4: 测试 ❌ TODO
-- backend/tests 覆盖
-- Pebble (letsencrypt/pebble) 测试 cert autorenew
+### ngx main 组装
+- [ ] 配置加载（TOML → Config）
+- [ ] SQLite init + migrate
+- [ ] 索引构建（sites/domains/tokens → Indexes）
+- [ ] 三个服务注册（HTTP proxy / HTTP server / Tunnel WS）
+- [ ] TLS listener
+
+### Tunnel WS 端点
+- [ ] 独立 TcpListener（不用 pingora ServerSession）
+- [ ] WS 握手 + 子协议升级
+- [ ] 注册 frame 处理（tun 身份验证）
+- [ ] request/response frame 路由
+- [ ] 多 tun 并发管理
+
+### ACME Cert Manager
+- [ ] stub → 完整实现（instant-acme + rcgen）
+- [ ] 首次申请 + 泛域名支持
+- [ ] 续期检查（启动时 + 后台定时）
+- [ ] autorenew / manual 两种模式
+
+## 已完成
+- [x] pangolin-core (1653行) — types/parse/index/db/config
+- [x] proxy.rs — impl ProxyHttp
+- [x] admin.rs — Admin API REST endpoints
+- [x] serve.rs — impl ServeHttp
+- [x] pingora 升级 0.4 → 0.8.0（CI Rust 1.96 兼容）
+- [x] Makefile 重构（lint/build/ui/test-integration）
+- [x] CI 复用 Makefile，双绿灯（Rust build + UI build）
+
+## 当前阻塞项
+暂无
 
 ## 已提交 commit
 ```
-e2eb0e9 feat(ngx): tunnel WS endpoint for tun node connections
-202c1ac feat(ngx): implement core HTTP proxy with pingora 0.4
-09b76ac feat(core): pangolin-core — types, parsing, indexes, DB I/O, config
+2a2eb14 ci: remove integration job (no test code yet)
+e0f277a chore: upgrade pingora from 0.4 to 0.8.0
+c144fab ci: maximize Makefile reuse
+aeefad0 fix(Makefile): use cargo from PATH instead of hardcoded path
+fa69260 ci: reuse Makefile targets instead of inline cargo/npm commands
+9ea94f5 chore: add Makefile for local development
 ```
 
-## 当前阻塞项
-1. `tunnel.rs` 的 `into_text()` / `as_raw_fd` / `from_raw_fd` 错误
-2. main.rs 完整组装（配置加载、SQLite init、三个服务注册）
+## CI 状态
+| Job | 状态 |
+|-----|------|
+| Rust build + unit tests | ✅ |
+| Admin UI build | ✅ |
+| Integration tests | ⏭ 暂时跳过（无测试代码 + pebble 镜像不可用） |
