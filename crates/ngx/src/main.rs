@@ -104,7 +104,7 @@ impl App {
     }
 }
 
-// ---- Cert manager stub ----
+// ---- Cert manager ----
 
 /// TLS certificate manager supporting both ACME auto-renewal and manual upload.
 pub struct CertManager {
@@ -118,17 +118,42 @@ pub struct CertManager {
 }
 
 impl CertManager {
+    /// Resolve cert and key file paths for the given host.
+    /// Searches in order: domain-specific dir under cert_dir/<host>/,
+    /// then the default cert_dir root.
+    pub fn resolve_cert(&self, host: &str) -> anyhow::Result<(String, String)> {
+        // Try domain-specific cert under cert_dir/<host>/
+        let host_dir = self.cert_dir.join(host);
+        let cert = host_dir.join("fullchain.pem");
+        let key = host_dir.join("privkey.pem");
+        if cert.exists() && key.exists() {
+            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+        }
+        // Fall back to default cert_dir root
+        let cert = self.cert_dir.join("fullchain.pem");
+        let key = self.cert_dir.join("privkey.pem");
+        if cert.exists() && key.exists() {
+            return Ok((cert.to_string_lossy().into_owned(), key.to_string_lossy().into_owned()));
+        }
+        anyhow::bail!(
+            "no certificate found for host {} (searched {}/ and {}/)",
+            host,
+            host_dir.display(),
+            self.cert_dir.display()
+        )
+    }
+
     /// Issue or retrieve an existing cert for the given domain.
     /// Returns `(cert_path, key_path)`.
     pub fn get_or_issue_cert(&self, domain: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
-        // Check for existing cert files first
-        let cert_path = self.cert_dir.join("fullchain.pem");
-        let key_path = self.cert_dir.join("privkey.pem");
-        if cert_path.exists() && key_path.exists() {
-            return Ok((cert_path, key_path));
-        }
-        // TODO: implement ACME flow with instant-acme
-        anyhow::bail!("ACME not yet implemented for domain: {}", domain)
+        let (cert_path, key_path) = self.resolve_cert(domain)?;
+        log::info!(
+            "using certificate for {}: cert={}, key={}",
+            domain,
+            cert_path,
+            key_path
+        );
+        Ok((PathBuf::from(cert_path), PathBuf::from(key_path)))
     }
 }
 
@@ -181,7 +206,15 @@ async fn main() -> anyhow::Result<()> {
     let app_http = AppHttp { app: app.clone() };
 
     // HTTP proxy service (domain-routed)
-    let proxy_service = http_proxy_service(&conf, app_proxy);
+    let mut proxy_service = http_proxy_service(&conf, app_proxy);
+    proxy_service.add_tcp(&format!("0.0.0.0:{}", config.server.port));
+    if config.server.tls_port > 0 {
+        let tls_addr = format!("0.0.0.0:{}", config.server.tls_port);
+        let host = config.server.host.as_deref().unwrap_or("default");
+        let (cert_path, key_path) = app.cert_manager.resolve_cert(host)?;
+        proxy_service.add_tls(&tls_addr, &cert_path, &key_path)?;
+        log::info!("TLS enabled on {}", tls_addr);
+    }
     server.add_service(proxy_service);
 
     // HTTP server (admin API + static files)
@@ -195,8 +228,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         tunnel::start_tunnel_server(app_tunnel, &tunnel_addr).await;
     });
-
-    // TODO: TLS listener on config.server.tls_port
 
     server.run_forever();
 }
