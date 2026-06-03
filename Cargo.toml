@@ -17,7 +17,7 @@ repository = "https://github.com/cnlangzi/pangolin"
 
 [workspace.dependencies]
 # Web framework / proxy
-pingora = { version = "0.4", features = ["lb"] }
+pingora = { version = "0.8", features = ["lb"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
