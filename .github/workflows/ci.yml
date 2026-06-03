@@ -36,7 +36,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # make lint runs: fmt --check + clippy -D warnings + test
+      # Runs: fmt --check + clippy -D warnings + test
       - name: make lint
         run: make lint
 
@@ -82,8 +82,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-int-
 
-      - name: cargo test --features integration
-        run: cargo test --workspace --features integration
+      - name: make test-integration
+        run: make test-integration
 
   # ----------------------------------------------------------------
   # Admin UI build (tailwindcss)
@@ -100,7 +100,7 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      # make ui runs: npm ci + npm run build
+      # Runs: npm ci + npm run build
       - name: make ui
         run: make ui
 

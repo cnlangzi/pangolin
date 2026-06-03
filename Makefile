@@ -28,6 +28,12 @@ build-debug:
 test:
 	$(CARGO) test --workspace --lib --bins
 
+# Run integration tests (ACME with pebble).
+# Used by CI's integration job.
+.PHONY: test-integration
+test-integration:
+	$(CARGO) test --workspace --features integration
+
 # Run clippy with -D warnings (mirrors CI).
 .PHONY: clippy
 clippy:
@@ -60,3 +66,8 @@ ui:
 .PHONY: ci
 ci: fmt-check clippy test build ui
 	@echo "✓ full local CI passed"
+
+# Full CI including integration tests (requires pebble).
+.PHONY: ci-full
+ci-full: fmt-check clippy test test-integration build ui
+	@echo "✓ full CI (with integration) passed"
