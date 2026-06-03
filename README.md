@@ -607,10 +607,91 @@ file = "./pangolin.log" # 空字符串 = stdout
 - **HTTP 代理 / 服务框架**：[pingora](https://github.com/cloudflare/pingora)（Cloudflare 开源，Apache 2.0；提供 nginx 行为语义的 Rust 实现；生产环境已使用超 4 年，处理 4000 万+ req/s）
 - **异步运行时**：tokio（pingora 内置）
 - **WebSocket**：tokio-tungstenite（tun 节点侧）
+- **HTTP 客户端**：tun 侧用 `reqwest` 发 HTTP 请求到 backend（async，tokio 兼容）
 - **数据库**：rusqlite（同步，零依赖）或 sqlx（async，本项目用同步即可）
 - **TLS**：pingora 自带（OpenSSL / BoringSSL / s2n-tls / rustls 可选）
 - **证书**：pingora TLS + 外部 ACME 客户端（`instant-acme`）负责 Let's Encrypt 申请 / 续期
 - **配置**：serde + toml / yaml-rust
+
+---
+
+## 网络路径实现
+
+### Direct 路径（pingora 全链路接管）
+
+```
+客户端 HTTP → ngx (pingora ProxyHttp + upstream_peer) → backend HTTP
+```
+
+- `ProxyHttp::request_filter()` 不拦截，直接通过
+- `ProxyHttp::upstream_peer()` 返回 `HttpPeer`，pingora 自动处理连接池、keepalive、重试、HTTP 语义
+- 完全复用 pingora 的成熟 HTTP client 能力
+
+### Tunnel 路径（HTTP over WebSocket）
+
+**前提**：所有后端均为 HTTP，不支持其他协议。
+
+```
+客户端 HTTP → ngx (request_filter 拦截)
+                  → WebSocket frame (JSON) → tun
+                                              → reqwest HTTP → backend HTTP
+                  ← WebSocket frame (JSON) ←
+```
+
+
+ngx 和 tun 之间走 WebSocket（TCP），tun 用 `reqwest` 发 HTTP 请求到 backend。
+
+**为什么不走 ProxyHttp**：tunnel 路径的本质是"ngx 触达不到后端"，需要 tun 代发。pingora 的 `upstream_peer()` 无法处理 WebSocket relay，也不应该把 HTTP client 的职责放在 ngx 侧（tun 部署在内网，本来就应该由 tun 发 HTTP）。
+
+**Tunnel 帧格式**（JSON over WebSocket）：
+
+
+Request:
+```json
+{
+  "req_id": "uuid-v4",
+  "method": "GET",
+  "path": "/api/v1/users",
+  "headers": {"Host": "app.example.com", "Accept": "*/*"},
+  "body": ""
+}
+```
+
+Response:
+```json
+{
+  "req_id": "uuid-v4",
+  "status": 200,
+  "headers": {"Content-Type": "application/json"},
+  "body": "..."
+}
+```
+
+每个请求带 `req_id`，响应里带相同 `req_id`，客户端匹配。
+
+**ngx 侧**（`ProxyHttp::request_filter`）：
+- 查 `domainIndex` → `parse_backend`
+- direct → `return Ok(false)` → `upstream_peer()` 处理
+- tunnel → 序列化 HTTP frame → 发 WS frame 到 tun → 等待响应 frame → 写回 HTTP 客户端 → `return Ok(true)`
+
+**tun 侧**（独立进程）：
+- 连接 ngx 的 WS 端点，携带 token + name 完成注册
+- 接收 frame → `reqwest::Client` 发 HTTP 到 backend → 响应序列化 JSON → 发回 ngx
+- 多路复用：单个 WS 连接处理多个并发请求（通过 req_id 匹配）
+
+**为什么选 WebSocket over TCP 而不是 UDS**：
+
+
+| | WebSocket over TCP | UDS |
+|---|---|---|
+| 部署位置 | 任意网络（ngx 和 tun 可在不同机器） | 必须同主机 |
+| 延迟 | 多一层 WS framing（极小） | 最低（同主机内） |
+| 高并发 | 无特殊瓶颈 | 同主机资源竞争 |
+| 穿透性 | ✅ 可穿越防火墙/NAT | ❌ 仅本地 |
+| 水平扩展 | ✅ tun 可分布式部署 | ❌ 受限于单机 |
+
+穿山甲的 tunnel 用于"ngx 和后端网络不通"场景，tun 部署在客户内网，ngx 在公网。UDS 从一开始就走不通，WebSocket over TCP 是唯一可行解。
+
 
 ---
 

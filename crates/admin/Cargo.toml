@@ -1,0 +1,16 @@
+[package]
+name = "admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pangolin admin UI — SSR templates + htmx (no JS framework)"
+
+[lib]
+name = "admin"
+path = "src/lib.rs"
+
+[dependencies]
+askama = "0.12"
+serde.workspace = true
+tokio.workspace = true

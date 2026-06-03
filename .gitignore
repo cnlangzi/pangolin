@@ -1,16 +1,31 @@
-# Binaries
-cli
-ngx
-cmd/cli/sdk
-cmd/ngx/gateway
+# Rust build outputs
+/target
+**/*.rs.bk
+Cargo.lock.bak
 
-# Build outputs
-*.exe
-*.dll
-*.so
-*.dylib
-*.test
-*.o
+# Cargo registry / cache
+/.cargo
+
+# Node.js (for tailwindcss admin UI build)
+/node_modules
+/dist
+/assets/static/*.css
+/assets/static/*.js
+
+# Generated certs (test or runtime)
+/certs
+*.pem
+!testdata/**/*.pem
+
+# Test artifacts
+/coverage
+/test-results
+*.prof
+
+# Local config (overrides)
+/config.local.toml
+*.local.yaml
+*.local.yml
 
 # IDE
 .idea/
@@ -21,7 +36,3 @@ cmd/ngx/gateway
 # OS
 .DS_Store
 Thumbs.db
-
-# Local config
-*.local.yaml
-*.local.yml

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ----------------------------------------------------------------
+  # Rust build + test
+  # All steps reuse Makefile targets so local and CI stay in sync.
+  # ----------------------------------------------------------------
+  rust:
+    name: Rust build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Runs: fmt --check + clippy -D warnings + test
+      - name: make lint
+        run: make lint
+
+      - name: make build
+        run: make build
+
+      # make build-ui is called separately before `make ci-full` locally,
+      # not needed in CI since CSS artifact is committed to git.
+
+  # Note: Admin UI (tailwindcss) is built locally with `make build-ui`
+  # before starting the server. CSS is committed to the repo.
