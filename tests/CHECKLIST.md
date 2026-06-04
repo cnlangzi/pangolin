@@ -1,7 +1,7 @@
 # Pangolin Integration Tests — CHECKLIST
 
 > Last updated: 2026-06-04
-> Status: 65/65 core integration tests done ✅; 2 tunnel E2E remain
+> Status: 65/65 core + E2E integration tests done ✅; tunnel E2E remain
 > Run with: `cargo test --features integration --workspace`
 
 ---
@@ -105,7 +105,7 @@
 
 ---
 
-## Missing — E2E with Live ngx (2 tests)
+## Missing — E2E with Live ngx (1 test)
 
 ### Static File E2E (2)
 - [x] `e2e_direct_static_file` — GET `/index.html` → TCP proxy → `file:///tmp/static` → 200

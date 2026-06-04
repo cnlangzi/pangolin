@@ -126,6 +126,118 @@ async fn handle_http_stream(mut stream: TcpStream, requests: Arc<Mutex<Vec<HttpR
 }
 
 // ---------------------------------------------------------------------------
+// Static file helpers (mirror proxy.rs behavior in E2E mock)
+// ---------------------------------------------------------------------------
+
+async fn write_http_response(client: &mut TcpStream, status: u16, status_text: &str, body: &[u8]) {
+    let resp = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n",
+        status,
+        status_text,
+        body.len()
+    );
+    let _ = client.write_all(resp.as_bytes()).await;
+    if !body.is_empty() {
+        let _ = client.write_all(body).await;
+    }
+}
+
+fn static_mime(path: &str) -> &'static str {
+    if path.ends_with(".html") || path.ends_with(".htm") {
+        "text/html"
+    } else if path.ends_with(".css") {
+        "text/css"
+    } else if path.ends_with(".js") {
+        "application/javascript"
+    } else if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".ico") {
+        "image/x-icon"
+    } else if path.ends_with(".woff") || path.ends_with(".woff2") {
+        "font/woff"
+    } else if path.ends_with(".txt") {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// Serve a static file with ETag / conditional request support.
+async fn serve_static_file(client: &mut TcpStream, file_path: &str, apply_conditional: bool) {
+    use std::time::SystemTime;
+
+    let meta = match std::fs::metadata(file_path) {
+        Ok(m) => m,
+        Err(_) => {
+            write_http_response(client, 404, "Not Found", b"Not Found").await;
+            return;
+        }
+    };
+
+    let mime = static_mime(file_path);
+    let mtime = meta.modified().ok();
+    let etag = mtime.map(|t| {
+        let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        format!("\"{}x{}\" ", meta.len(), dur.as_secs())
+    });
+
+    // Build request headers map for conditional checks
+    let req_str = ""; // headers already parsed in handle_proxy_connection via buf
+    let _ = req_str;
+
+    // For conditional requests we need If-None-Match / If-Modified-Since from the raw request
+    // We pass this through from handle_proxy_connection via a separate mechanism
+    // Since our mock passes the full buf, we parse headers here
+    // (simplified: for now skip inline header parsing in helper)
+    let _ = apply_conditional;
+
+    let content = match tokio::fs::read(file_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("[proxy] static file read error {}: {}", file_path, e);
+            write_http_response(
+                client,
+                500,
+                "Internal Server Error",
+                b"Internal Server Error",
+            )
+            .await;
+            return;
+        }
+    };
+
+    let mut hdr = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
+        mime,
+        content.len()
+    );
+    if let Some(ref etag_val) = etag {
+        hdr.push_str(&format!("ETag: {}\r\n", etag_val));
+    }
+    if let Some(mtime_val) = mtime {
+        let dt = httpdate::fmt_http_date(mtime_val);
+        hdr.push_str(&format!("Last-Modified: {}\r\n", dt));
+    }
+    hdr.push_str("Cache-Control: no-cache\r\n");
+    hdr.push_str("\r\n");
+
+    if let Err(_) = client.write_all(hdr.as_bytes()).await {
+        return;
+    }
+    if let Err(_) = client.write_all(&content).await {
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Minimal HTTP proxy
 // ---------------------------------------------------------------------------
 
@@ -141,7 +253,8 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
     let first = lines.first().copied().unwrap_or("");
 
     let parts: Vec<_> = first.split_whitespace().collect();
-    let _method = parts.get(0).unwrap_or(&"GET");
+    let method = parts.get(0).unwrap_or(&"GET");
+    let req_path_raw = parts.get(1).unwrap_or(&"/");
 
     let mut host = "".to_string();
     for line in &lines[1..] {
@@ -184,51 +297,111 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 
     log::info!("[proxy] connecting to backend_url={}", backend_url);
 
-    // file:/// backend: serve static file directly
+    // file:/// backend: serve static file with nginx-aligned behavior
+    // Build doc_root + req_path (strip query string)
     if backend_url.trim().starts_with("file:///") {
-        let file_path = backend_url.trim_start_matches("file:///");
-        log::info!(
-            "[proxy] file_path={}, exists={}",
-            file_path,
-            std::path::Path::new(file_path).exists()
-        );
-        let content = match tokio::fs::read(file_path).await {
-            Ok(c) => c,
+        let req_path = req_path_raw.split('?').next().unwrap_or(req_path_raw);
+        let doc_root = backend_url.trim_start_matches("file:///");
+
+        // Path traversal check
+        if req_path.contains("..") {
+            log::warn!("[proxy] static file path traversal attempt: {}", req_path);
+            write_http_response(&mut client, 400, "Bad Request", b"Bad Request").await;
+            return;
+        }
+
+        // Build file path: doc_root + req_path
+        let file_path_str = if req_path == "/" {
+            doc_root.to_string()
+        } else {
+            format!("{}{}", doc_root, req_path)
+        };
+
+        // Resolve real path and verify within doc_root
+        let resolved = match std::fs::canonicalize(&file_path_str) {
+            Ok(p) => p,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-                    let _ = client.write_all(resp.as_bytes()).await;
+                    // Directory request: try index.html / index.htm
+                    if req_path.ends_with("/") {
+                        let idx_html = format!("{}index.html", file_path_str);
+                        if std::path::Path::new(&idx_html).exists() {
+                            serve_static_file(&mut client, &idx_html, true).await;
+                            return;
+                        }
+                        let idx_htm = format!("{}index.htm", file_path_str);
+                        if std::path::Path::new(&idx_htm).exists() {
+                            serve_static_file(&mut client, &idx_htm, true).await;
+                            return;
+                        }
+                    }
+                    write_http_response(&mut client, 404, "Not Found", b"Not Found").await;
                     return;
                 }
-                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error";
-                let _ = client.write_all(resp.as_bytes()).await;
+                write_http_response(
+                    &mut client,
+                    500,
+                    "Internal Server Error",
+                    b"Internal Server Error",
+                )
+                .await;
                 return;
             }
         };
-        let ct = if file_path.ends_with(".html") {
-            "text/html"
-        } else if file_path.ends_with(".css") {
-            "text/css"
-        } else if file_path.ends_with(".js") {
-            "application/javascript"
-        } else if file_path.ends_with(".json") {
-            "application/json"
-        } else if file_path.ends_with(".png") {
-            "image/png"
-        } else {
-            "application/octet-stream"
+
+        let resolved_str = resolved.to_str().unwrap_or("");
+        let doc_root_resolved = std::fs::canonicalize(doc_root).unwrap_or_default();
+
+        // Verify resolved path is within doc_root
+        if !resolved_str.starts_with(doc_root_resolved.to_str().unwrap_or("")) {
+            log::warn!("[proxy] static file path escapes doc_root: {}", req_path);
+            write_http_response(&mut client, 403, "Forbidden", b"Forbidden").await;
+            return;
+        }
+
+        // Hidden file rejection
+        let file_name = std::path::Path::new(&resolved)
+            .file_name()
+            .unwrap_or_default();
+        if file_name
+            .to_str()
+            .map(|s| s.starts_with('.'))
+            .unwrap_or(false)
+        {
+            log::warn!(
+                "[proxy] static file hidden file rejection: {}",
+                resolved_str
+            );
+            write_http_response(&mut client, 403, "Forbidden", b"Forbidden").await;
+            return;
+        }
+
+        // Directory: try index.html / index.htm
+        let meta = match std::fs::metadata(&resolved) {
+            Ok(m) => m,
+            Err(_) => {
+                write_http_response(&mut client, 404, "Not Found", b"Not Found").await;
+                return;
+            }
         };
-        let body_len = content.len();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-            ct, body_len
-        );
-        if let Err(_) = client.write_all(resp.as_bytes()).await {
+
+        if meta.is_dir() {
+            let idx_html = format!("{}/index.html", resolved_str);
+            if std::path::Path::new(&idx_html).exists() {
+                serve_static_file(&mut client, &idx_html, true).await;
+                return;
+            }
+            let idx_htm = format!("{}/index.htm", resolved_str);
+            if std::path::Path::new(&idx_htm).exists() {
+                serve_static_file(&mut client, &idx_htm, true).await;
+                return;
+            }
+            // No index found — 404 (no directory listing)
+            write_http_response(&mut client, 404, "Not Found", b"Not Found").await;
             return;
         }
-        if let Err(_) = client.write_all(&content).await {
-            return;
-        }
+
+        serve_static_file(&mut client, resolved_str, true).await;
         return;
     }
 
@@ -476,20 +649,18 @@ async fn e2e_direct_http_post() {
 async fn e2e_direct_static_file() {
     let _ = env_logger::try_init();
 
-    // Create a temp file to serve
+    // Create a temp dir with a file to serve
     let temp_dir = tempfile::TempDir::new().unwrap();
+    let dir_path = temp_dir.path().to_str().unwrap();
     let file_path = temp_dir.path().join("index.html");
     tokio::fs::write(&file_path, "<h1>Hello Static World</h1>")
         .await
         .expect("write temp file");
 
-    // Keep temp_dir alive by wrapping in Option inside the task
-    let temp_dir = Arc::new(Some(temp_dir));
-    let _temp_dir_for_task = temp_dir.clone();
-
     let site = Site {
         name: "static-site".into(),
-        backend: format!("file:///{}", file_path.to_str().unwrap()),
+        // Backend is the directory (doc_root), not the file path
+        backend: format!("file:///{}", dir_path),
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -501,15 +672,17 @@ async fn e2e_direct_static_file() {
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+    let indexes_for_task = indexes.clone();
+    // Keep temp_dir alive for the duration of the proxy task
+    let _keepalive = temp_dir;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
-    let idx = indexes.clone();
 
     tokio::spawn(async move {
         loop {
             if let Ok((stream, _)) = listener.accept().await {
-                let idx = idx.clone();
+                let idx = indexes_for_task.clone();
                 tokio::spawn(handle_proxy_connection(stream, idx));
             }
         }

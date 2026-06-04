@@ -217,58 +217,121 @@ impl ProxyHttp for AppProxy {
                 Ok(true)
             }
         } else if url.starts_with("file:///") {
-            // Static file serving: short-circuit, serve file directly
-            let file_path = url.trim_start_matches("file://");
-            let content = match tokio::fs::read(file_path).await {
-                Ok(c) => c,
+            // Static file serving (file:///doc_root/...)
+            // nginx对齐: path traversal防护 + 隐藏文件拒绝 + 目录索引(index.html/h) + 条件请求
+            // Note: `path` (from uri.path()) has query string already stripped.
+            let doc_root = url.trim_start_matches("file://").to_string();
+            let req_path = path.as_str();
+
+            // Build the file system path
+            let file_path_str = if req_path == "/" {
+                doc_root.clone()
+            } else {
+                format!("{}{}", doc_root, req_path)
+            };
+
+            // Path traversal check: reject any ".." segment
+            if req_path.contains("..") {
+                warn!("static file path traversal attempt: {}", req_path);
+                let _ = session.respond_error(400).await;
+                return Ok(true);
+            }
+
+            // Resolve real path and verify it stays within doc_root
+            let resolved = match std::fs::canonicalize(&file_path_str) {
+                Ok(p) => p,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        error!("static file not found: {}", file_path);
+                        // Try index.html / index.htm for directory request
+                        if req_path.ends_with("/") {
+                            let idx_path = format!("{}index.html", file_path_str);
+                            if std::path::Path::new(&idx_path).exists() {
+                                let idx_resolved = std::fs::canonicalize(&idx_path).unwrap();
+                                let idx_meta = std::fs::metadata(&idx_resolved).unwrap();
+                                serve_static_file(
+                                    session,
+                                    idx_resolved.to_str().unwrap(),
+                                    idx_meta,
+                                    false,
+                                )
+                                .await?;
+                                return Ok(true);
+                            }
+                            let idx_htm_path = format!("{}index.htm", file_path_str);
+                            if std::path::Path::new(&idx_htm_path).exists() {
+                                let idx_meta = std::fs::metadata(&idx_htm_path).unwrap();
+                                serve_static_file(session, &idx_htm_path, idx_meta, false).await?;
+                                return Ok(true);
+                            }
+                        }
                         let _ = session.respond_error(404).await;
                         return Ok(true);
                     }
-                    error!("static file read error {}: {}", file_path, e);
+                    error!("static file canonicalize error {}: {}", file_path_str, e);
                     let _ = session.respond_error(500).await;
                     return Ok(true);
                 }
             };
-            let mut hdr = match ResponseHeader::build(200, None) {
-                Ok(h) => h,
-                Err(e) => {
-                    error!("failed to build response header: {}", e);
-                    let _ = session.respond_error(500).await;
-                    return Ok(true);
-                }
-            };
-            let ct = if file_path.ends_with(".html") {
-                "text/html"
-            } else if file_path.ends_with(".css") {
-                "text/css"
-            } else if file_path.ends_with(".js") {
-                "application/javascript"
-            } else if file_path.ends_with(".json") {
-                "application/json"
-            } else if file_path.ends_with(".png") {
-                "image/png"
-            } else if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") {
-                "image/jpeg"
-            } else if file_path.ends_with(".svg") {
-                "image/svg+xml"
-            } else {
-                "application/octet-stream"
-            };
-            hdr.insert_header("Content-Type", ct.as_bytes()).ok();
-            if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
-                error!("failed to write response header: {}", e);
-                let _ = session.respond_error(500).await;
+
+            let resolved_str = resolved.to_str().unwrap();
+            let doc_root_resolved = std::fs::canonicalize(&doc_root).unwrap();
+
+            // Verify resolved path is within doc_root
+            if !resolved_str.starts_with(doc_root_resolved.to_str().unwrap()) {
+                warn!(
+                    "static file path escapes doc_root: {} (resolved: {})",
+                    req_path, resolved_str
+                );
+                let _ = session.respond_error(403).await;
                 return Ok(true);
             }
-            if let Err(e) = session
-                .write_response_body(Some(Bytes::from(content)), true)
-                .await
+
+            // Hidden file rejection
+            let file_name = std::path::Path::new(&resolved)
+                .file_name()
+                .unwrap_or_default();
+            if file_name
+                .to_str()
+                .map(|s| s.starts_with('.'))
+                .unwrap_or(false)
             {
-                error!("failed to write response body: {}", e);
+                warn!("static file hidden file rejection: {}", resolved_str);
+                let _ = session.respond_error(403).await;
+                return Ok(true);
             }
+
+            let meta = match std::fs::metadata(&resolved) {
+                Ok(m) => m,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        let _ = session.respond_error(404).await;
+                    } else {
+                        let _ = session.respond_error(500).await;
+                    }
+                    return Ok(true);
+                }
+            };
+
+            // Directory request: try index.html/h first
+            if meta.is_dir() {
+                let idx_html = format!("{}/index.html", resolved_str);
+                let idx_htm = format!("{}/index.htm", resolved_str);
+                if std::path::Path::new(&idx_html).exists() {
+                    let idx_meta = std::fs::metadata(&idx_html).unwrap();
+                    serve_static_file(session, &idx_html, idx_meta, true).await?;
+                    return Ok(true);
+                }
+                if std::path::Path::new(&idx_htm).exists() {
+                    let idx_meta = std::fs::metadata(&idx_htm).unwrap();
+                    serve_static_file(session, &idx_htm, idx_meta, true).await?;
+                    return Ok(true);
+                }
+                // No index found — 404 (no directory listing)
+                let _ = session.respond_error(404).await;
+                return Ok(true);
+            }
+
+            serve_static_file(session, resolved_str, meta, true).await?;
             return Ok(true);
         } else {
             // Direct path: continue to upstream_peer (return Ok(false))
@@ -361,4 +424,125 @@ impl ProxyHttp for AppProxy {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Serve a static file with MIME type, ETag, and Last-Modified support.
+/// Handles If-None-Match (ETag) and If-Modified-Since for conditional responses.
+async fn serve_static_file(
+    session: &mut Session,
+    file_path: &str,
+    meta: std::fs::Metadata,
+    apply_conditional: bool,
+) -> Result<()> {
+    use std::time::SystemTime;
+
+    let mime = mime_guess::from_path(file_path)
+        .first_or_octet_stream()
+        .to_string();
+
+    // Build ETag from mtime + size (like nginx)
+    let mtime = meta.modified().ok();
+    let etag = mtime.map(|t| {
+        let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        format!("\"{}x{}\"", meta.len(), dur.as_secs())
+    });
+
+    let req_header = session.req_header();
+
+    // Conditional request: check If-None-Match
+    if apply_conditional {
+        if let Some(etag_val) = &etag {
+            if let Some(inm) = req_header.headers.get("If-None-Match") {
+                if let Ok(inm_str) = std::str::from_utf8(inm.as_bytes()) {
+                    if inm_str == etag_val.as_str() || inm_str == "*" {
+                        // ETag match → 304 Not Modified
+                        let mut hdr = match ResponseHeader::build(304, None) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                error!("failed to build 304 response header: {}", e);
+                                return Ok(());
+                            }
+                        };
+                        hdr.insert_header("ETag", etag_val.as_bytes()).ok();
+                        hdr.insert_header("Content-Type", mime.as_bytes()).ok();
+                        let _ = session.write_response_header(Box::new(hdr), true).await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // If-Modified-Since (used when ETag is not available)
+        if let Some(mtime_val) = mtime {
+            if let Some(ims) = req_header.headers.get("If-Modified-Since") {
+                if let Ok(ims_str) = std::str::from_utf8(ims.as_bytes()) {
+                    if let Ok(ims_dt) = httpdate::parse_http_date(ims_str) {
+                        if mtime_val <= ims_dt {
+                            let mut hdr = match ResponseHeader::build(304, None) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    error!("failed to build 304 response header: {}", e);
+                                    return Ok(());
+                                }
+                            };
+                            let dt = httpdate::fmt_http_date(mtime_val);
+                            hdr.insert_header("Last-Modified", dt.as_bytes()).ok();
+                            let _ = session.write_response_header(Box::new(hdr), true).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Read file content
+    let content = match tokio::fs::read(file_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("static file read error {}: {}", file_path, e);
+            let _ = session.respond_error(500).await;
+            return Ok(());
+        }
+    };
+
+    let mut hdr = match ResponseHeader::build(200, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("failed to build response header: {}", e);
+            let _ = session.respond_error(500).await;
+            return Ok(());
+        }
+    };
+
+    hdr.insert_header("Content-Type", mime.as_bytes()).ok();
+    hdr.insert_header("Content-Length", content.len().to_string().as_bytes())
+        .ok();
+
+    if let Some(etag_val) = &etag {
+        hdr.insert_header("ETag", etag_val.as_bytes()).ok();
+    }
+
+    if let Some(mtime_val) = mtime {
+        let dt = httpdate::fmt_http_date(mtime_val);
+        hdr.insert_header("Last-Modified", dt.as_bytes()).ok();
+    }
+
+    // Cache-Control: no-cache to match nginx default for static files
+    hdr.insert_header("Cache-Control", "no-cache").ok();
+
+    if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
+        error!("failed to write response header: {}", e);
+        let _ = session.respond_error(500).await;
+        return Ok(());
+    }
+
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(content)), true)
+        .await
+    {
+        error!("failed to write response body: {}", e);
+    }
+
+    Ok(())
 }
