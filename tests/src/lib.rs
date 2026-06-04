@@ -36,6 +36,9 @@ mod path_prefix;
 #[cfg(feature = "integration")]
 mod e2e;
 
+#[cfg(feature = "integration")]
+mod reload_indexes;
+
 // Force ring as crypto provider for tests (same pattern as acme.rs in ngx crate).
 #[cfg(feature = "integration")]
 #[ctor::ctor]
