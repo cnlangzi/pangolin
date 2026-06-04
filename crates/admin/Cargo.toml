@@ -4,13 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Pangolin admin UI — SSR templates + htmx (no JS framework)"
+description = "Pangolin admin UI — SSR + htmx"
 
 [lib]
 name = "admin"
 path = "src/lib.rs"
 
+
+
 [dependencies]
+pangolin-core = { path = "../pangolin-core", features = ["rt"] }
 askama = "0.12"
-serde.workspace = true
+serde = { workspace = true }
 tokio.workspace = true
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+cookie = "0.18"
+rand = "0.8"
+hex = "0.4"
+urlencoding = "2"
+chrono = { workspace = true }
+rusqlite = { workspace = true }

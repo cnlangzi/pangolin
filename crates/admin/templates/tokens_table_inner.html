@@ -1,0 +1,67 @@
+<div class="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+  <table class="hidden md:table table-auto w-full">
+    <thead class="bg-slate-50 border-b border-slate-200">
+      <tr>
+        <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Token</th>
+        <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Status</th>
+        <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Created</th>
+        <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Expires</th>
+        <th class="text-right px-4 py-3"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      {% for token in tokens %}
+      <tr id="token-{{ token.token }}" class="hover:bg-slate-50 transition-colors">
+        <td class="px-4 py-3"><code class="text-sm text-slate-700 bg-slate-100 px-2 py-0.5 rounded">{{ token.token }}</code></td>
+        <td class="px-4 py-3">
+          {% if token.enabled %}
+          <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700">active</span>
+          {% else %}
+          <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 line-through">disabled</span>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-slate-500">{{ token.created_at.format("%Y-%m-%d") }}</td>
+        <td class="px-4 py-3 text-sm text-slate-500">{% if let Some(e) = token.expires_at %}{{ e.format("%Y-%m-%d") }}{% else %}never{% endif %}</td>
+        <td class="px-4 py-3">
+          <div class="flex items-center justify-end gap-1">
+            <button hx-delete="/admin/api/tokens"
+              hx-vals='{"token": "{{ token.token }}", "_csrf": "__CSRF__"}'
+              hx-confirm="Delete token {{ token.token }}?"
+              hx-swap="delete"
+              class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 transition-colors"
+              title="Delete">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
+            </button>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 text-sm">No tokens yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="block md:hidden divide-y divide-slate-100">
+    {% for token in tokens %}
+    <div class="p-4">
+      <div class="flex items-center justify-between mb-2">
+        <code class="text-xs text-slate-700 bg-slate-100 px-2 py-0.5 rounded">{{ token.token }}</code>
+        {% if token.enabled %}
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700">active</span>
+        {% else %}
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 text-slate-400 line-through">disabled</span>
+        {% endif %}
+      </div>
+      <div class="text-xs text-slate-500 mb-3">Created {{ token.created_at.format("%Y-%m-%d") }} · Expires {% if let Some(e) = token.expires_at %}{{ e.format("%Y-%m-%d") }}{% else %}never{% endif %}</div>
+      <button hx-delete="/admin/api/tokens"
+        hx-vals='{"token": "{{ token.token }}", "_csrf": "__CSRF__"}'
+        hx-confirm="Delete token {{ token.token }}?"
+        class="w-full text-center text-sm text-red-500 hover:text-red-600 border border-red-100 hover:bg-red-50 rounded-lg py-1.5 transition-colors">
+        Delete
+      </button>
+    </div>
+    {% else %}
+    <div class="p-8 text-center text-slate-400 text-sm">No tokens yet.</div>
+    {% endfor %}
+  </div>
+</div>

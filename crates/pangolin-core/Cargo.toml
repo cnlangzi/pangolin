@@ -16,3 +16,8 @@ thiserror.workspace = true
 chrono.workspace = true
 rmp-serde.workspace = true
 flate2.workspace = true
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+rt = ["tokio/rt"]

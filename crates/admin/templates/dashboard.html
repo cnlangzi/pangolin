@@ -1,0 +1,117 @@
+{# dashboard.html — full standalone page #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard — Pangolin</title>
+<link href="/admin/app.css?v=__CSS_HASH__" rel="stylesheet">
+<script src="https://unpkg.com/htmx.org@1.9.0"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+</style>
+</head>
+<body class="bg-slate-100 min-h-screen font-sans">
+
+<header class="sticky top-0 z-50 bg-pangolin-slate border-b border-pangolin-zinc shadow-sm">
+  <div class="flex items-center justify-between px-4 py-3">
+    <a href="/admin/" class="flex items-center gap-2.5 text-white font-bold text-lg">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-pangolin-accent flex items-center justify-center shadow">
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      </div>
+      <span class="hidden sm:inline">Pangolin</span>
+    </a>
+    <nav class="hidden md:flex items-center gap-0.5">
+      <a href="/admin/" class="nav-link nav-link-active">Dashboard</a>
+      <a href="/admin/sites" class="nav-link">Sites</a>
+      <a href="/admin/domains" class="nav-link">Domains</a>
+      <a href="/admin/tun" class="nav-link">Tunnels</a>
+      <a href="/admin/tokens" class="nav-link">Tokens</a>
+      <a href="/admin/certs" class="nav-link">Certs</a>
+    </nav>
+    <div class="flex items-center gap-2">
+      <form method="POST" action="/admin/logout" class="hidden md:block">
+        <button type="submit" class="text-pangolin-silver hover:text-white text-sm transition-colors px-3 py-1.5 rounded hover:bg-slate-700">Sign out</button>
+      </form>
+      <button id="menu-toggle" class="md:hidden text-pangolin-silver hover:text-white p-1">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+    </div>
+  </div>
+  <nav id="mobile-nav" class="hidden md:hidden border-t border-pangolin-zinc px-4 py-3 space-y-1">
+    <a href="/admin/" class="mobile-nav-link mobile-nav-link-active">Dashboard</a>
+    <a href="/admin/sites" class="mobile-nav-link">Sites</a>
+    <a href="/admin/domains" class="mobile-nav-link">Domains</a>
+    <a href="/admin/tun" class="mobile-nav-link">Tunnels</a>
+    <a href="/admin/tokens" class="mobile-nav-link">Tokens</a>
+    <a href="/admin/certs" class="mobile-nav-link">Certs</a>
+    <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
+      <button type="submit" class="mobile-nav-link text-red-400 hover:text-red-300 w-full text-left">Sign out</button>
+    </form>
+  </nav>
+</header>
+
+<main class="px-4 py-6 md:px-6 md:py-6 max-w-7xl mx-auto">
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold text-slate-900">Dashboard</h1>
+    <p class="text-slate-500 text-sm mt-1">System overview and resource counts</p>
+  </div>
+
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 md:gap-4 mb-8">
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-slate-900">{{ site_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Sites</div>
+    </div>
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-slate-900">{{ domain_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Domains</div>
+    </div>
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-brand-600">{{ online_tun_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Online Tunnels</div>
+    </div>
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-slate-700">{{ total_tun_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Total Tunnels</div>
+    </div>
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-slate-900">{{ token_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Tokens</div>
+    </div>
+    <div class="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+      <div class="text-2xl font-bold text-slate-900">{{ cert_count }}</div>
+      <div class="text-xs text-slate-500 mt-1">Certs</div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+    <a href="/admin/sites" class="bg-white hover:bg-brand-50 rounded-xl p-4 border border-slate-200 shadow-sm flex flex-col items-center justify-center gap-2 transition-colors">
+      <svg class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6z"/></svg>
+      <span class="text-sm font-medium text-slate-700">Sites</span>
+    </a>
+    <a href="/admin/domains" class="bg-white hover:bg-brand-50 rounded-xl p-4 border border-slate-200 shadow-sm flex flex-col items-center justify-center gap-2 transition-colors">
+      <svg class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
+      <span class="text-sm font-medium text-slate-700">Domains</span>
+    </a>
+    <a href="/admin/tun" class="bg-white hover:bg-brand-50 rounded-xl p-4 border border-slate-200 shadow-sm flex flex-col items-center justify-center gap-2 transition-colors">
+      <svg class="w-7 h-7 text-pangolin-accent" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0"/></svg>
+      <span class="text-sm font-medium text-slate-700">Tunnels</span>
+    </a>
+    <a href="/admin/tokens" class="bg-white hover:bg-brand-50 rounded-xl p-4 border border-slate-200 shadow-sm flex flex-col items-center justify-center gap-2 transition-colors">
+      <svg class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z"/></svg>
+      <span class="text-sm font-medium text-slate-700">Tokens</span>
+    </a>
+    <a href="/admin/certs" class="bg-white hover:bg-brand-50 rounded-xl p-4 border border-slate-200 shadow-sm flex flex-col items-center justify-center gap-2 transition-colors">
+      <svg class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.763c-1.615 1.115-3.174 1.872-4.68 2.238z"/></svg>
+      <span class="text-sm font-medium text-slate-700">Certs</span>
+    </a>
+  </div>
+</main>
+
+<div id="toast" class="fixed bottom-4 right-4 z-50"></div>
+<script>
+document.getElementById('menu-toggle').addEventListener('click', function() { document.getElementById('mobile-nav').classList.toggle('hidden'); });
+document.body.addEventListener('htmx:afterSwap', function(e) { if (e.detail.target.id === 'toast') { setTimeout(function() { e.detail.target.innerHTML = ''; }, 4000); } });
+</script>
+</body>
+</html>

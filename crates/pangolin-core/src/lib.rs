@@ -16,6 +16,7 @@
 //!
 //! See `README.md` for the design rationale.
 
+pub mod app;
 pub mod compress;
 pub mod config;
 pub mod db;
@@ -25,6 +26,8 @@ pub mod normalize;
 pub mod parse;
 pub mod types;
 
+pub use app::{App, CertManager, TunnelMessage};
+pub use config::Config;
 pub use error::{PangolinError, Result};
 pub use index::{lookup_site, Indexes};
 pub use parse::{
