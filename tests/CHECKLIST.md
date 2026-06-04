@@ -1,7 +1,7 @@
 # Pangolin Integration Tests — CHECKLIST
 
 > Last updated: 2026-06-04
-> Status: 65/65 tests done — ALL COMPLETE ✅
+> Status: 65/65 core integration tests done ✅; 2 tunnel E2E remain
 > Run with: `cargo test --features integration --workspace`
 
 ---
@@ -105,7 +105,7 @@
 
 ---
 
-## Missing — E2E with Live ngx (1 test)
+## Missing — E2E with Live ngx (2 tests)
 
 ### Static File E2E (2)
 - [x] `e2e_direct_static_file` — GET `/index.html` → TCP proxy → `file:///tmp/static` → 200
@@ -123,10 +123,14 @@
 ## E2E Execution Plan
 
 ### Phase A: Static File E2E ✅
-`e2e_direct_static_file` + `e2e_direct_static_file_not_found` implemented via minimal TCP proxy + file:// URL handler.
+- `e2e_direct_static_file` — GET /index.html via TCP proxy → file:/// backend → 200
+- `e2e_direct_static_file_not_found` — missing file → 404
 
-### Phase B: Tunnel E2E
-Start tunnel server + tun client + mock backend → full tunnel routing test.
+### Phase B: Tunnel E2E (remaining)
+- `e2e_tunnel_full` — ngx WS tunnel + tun client + backend → 200
+- `validate_token_expired_active` — tunnel auth with expired token → 401
+  - proxy_tunnel (5 tests) already cover tun client + MockNgx WS at unit level
+  - Full E2E requires real proxy + tunnel + backend running
 
 ---
 
@@ -145,3 +149,5 @@ Start tunnel server + tun client + mock backend → full tunnel routing test.
 cargo test --features integration --workspace
 cargo test --features integration -p pangolin-integration-tests e2e
 ```
+
+
