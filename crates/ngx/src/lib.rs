@@ -3,6 +3,12 @@
 #![allow(dead_code)]
 
 pub mod acme;
+pub mod admin_api; // local JSON API (crates/ngx/src/admin_api.rs)
+pub mod proxy;
+pub mod serve;
 
-// NOTE: admin, config, proxy, serve, tunnel are binary-only internal modules.
-// They are not public API. Tests should only depend on pub items in acme.
+// Re-export shared types so they are accessible as `crate::App` etc.
+pub use pangolin_core::{App, TunnelMessage, CertManager};
+
+// Re-export the external admin UI crate as `crate::admin` for serve.rs.
+pub use ::admin as admin;

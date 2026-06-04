@@ -2,16 +2,13 @@
   "name": "pangolin-admin",
   "version": "0.2.0",
   "private": true,
-  "description": "Pangolin admin UI assets (tailwindcss JIT, htmx)",
+  "description": "Pangolin admin UI assets (tailwindcss JIT)",
   "scripts": {
-    "build": "tailwindcss -i ./assets/css/input.css -o ./assets/static/style.css --minify",
-    "watch": "tailwindcss -i ./assets/css/input.css -o ./assets/static/style.css --watch",
-    "clean": "rm -rf assets/static/style.css"
+    "build": "tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify",
+    "watch": "tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --watch",
+    "clean": "rm -rf assets/app.css"
   },
   "devDependencies": {
     "tailwindcss": "^3.4.0"
-  },
-  "dependencies": {
-    "htmx.org": "^1.9.0"
   }
 }

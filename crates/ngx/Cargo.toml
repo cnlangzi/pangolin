@@ -15,10 +15,12 @@ name = "ngx"
 path = "src/main.rs"
 
 [dependencies]
-pangolin-core = { path = "../pangolin-core" }
+pangolin-core = { path = "../pangolin-core", features = ["rt"] }
+admin = { path = "../admin" }
 pingora.workspace = true
 pingora-core = "0.8"
 rusqlite.workspace = true
+http-body = "1"
 async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true

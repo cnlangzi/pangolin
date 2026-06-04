@@ -16,7 +16,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
 use tokio::time::{timeout, Duration};
 
-use crate::{admin, App, TunnelMessage};
+use crate::{admin_api, App, TunnelMessage};
 
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
@@ -40,7 +40,7 @@ impl ProxyHttp for AppProxy {
         // Admin API: short-circuit, don't proxy
         if path.starts_with("/api/") {
             debug!("Admin API request: {}", path);
-            admin::handle_api_request(session, &self.app, &path, &method).await?;
+            admin_api::handle_api_request(session, &self.app, &path, &method).await?;
             return Ok(true);
         }
 
