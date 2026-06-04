@@ -19,6 +19,9 @@ mod admin_api;
 mod admin_reload;
 
 #[cfg(feature = "integration")]
+mod admin_delete;
+
+#[cfg(feature = "integration")]
 mod auth;
 
 #[cfg(feature = "integration")]
