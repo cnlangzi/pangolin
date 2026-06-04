@@ -1,7 +1,7 @@
 # E2E Integration Test Checklist
 
 > Pangolin reverse proxy integration test suite.
-> Run with: `cargo test --features integration` (requires Pebble on port 14000 for ACME tests).
+> Run with: `cargo test --features integration --workspace` (requires Pebble on port 14000 for ACME tests).
 
 ## Coverage Summary
 
@@ -112,20 +112,7 @@
 
 ---
 
-## Test Architecture
-
-```
-tests/
-├── acme.rs              # ACME cert issue/renewal (Pebble)
-├── routing.rs           # Domain routing + backend parsing
-├── proxy_direct.rs      # Direct path (http/https/file)
-├── proxy_tunnel.rs      # Tunnel path (ws forwarding)
-├── admin_api.rs         # Admin REST API
-├── auth.rs              # Token validation + tun auth
-└── errors.rs            # Error handling + edge cases
-```
-
-### Environment Requirements
+## Environment Requirements
 
 | Service | Port | Purpose |
 |---------|------|---------|
@@ -134,24 +121,48 @@ tests/
 | tun (mock) | dynamic | Tunnel client (in-process mock) |
 | backend (mock) | 9090 | Test HTTP server |
 
-### Running Tests
+---
+
+## Running Tests
 
 ```bash
 # All integration tests (requires Pebble)
-cargo test --features integration -p ngx
+cargo test --features integration --workspace
 
 # Single test
-cargo test --features integration -p ngx routing_exact_domain
+cargo test --features integration routing_exact_domain
 
 # With coverage
-cargo llvm-cov --features integration --html
+cargo llvm-cov --features integration --workspace --html
 ```
 
-### Adding New Tests
+---
 
-1. Add test function to appropriate file in `crates/ngx/tests/`
-2. Gate with `#[cfg(feature = "integration")]`
-3. Use `mock_ngx::start_ngx()` for ngx server
-4. Use `mock_backend()` for fake backend
-5. Use `assert_response()` helper for assertions
-6. Update this checklist
+## File Layout
+
+```
+tests/
+├── CHECKLIST.md          # This file
+├── routing.rs           # Domain routing + backend parsing
+├── proxy_direct.rs      # Direct path (http/https/file)
+├── proxy_tunnel.rs      # Tunnel path (ws forwarding)
+├── admin_api.rs         # Admin REST API
+├── auth.rs              # Token validation + tun auth
+└── errors.rs            # Error handling + edge cases
+
+# ACME tests (currently in ngx crate, to be migrated):
+#   crates/ngx/tests/acme.rs
+#   crates/ngx/tests/pebble-root.pem
+```
+
+---
+
+## Adding New Tests
+
+1. Add test function to `tests/` directory, gated with `#[cfg(feature = "integration")]`
+2. Use `mock_ngx::start_ngx()` to start ngx server
+3. Use `mock_backend()` to spin up a fake HTTP backend
+4. Use `assert_response()` helper for standard assertions
+5. Use `httpx::Client` or `reqwest` for making requests
+6. Update the coverage table above (check off the item)
+7. Commit and push; CI runs integration tests automatically
