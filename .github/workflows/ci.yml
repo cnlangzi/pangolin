@@ -5,9 +5,8 @@ on:
     branches: [main]
 
 # Cancel in-progress runs when the same PR gets a new push.
-# Use PR number as group key so push events don't cancel PR runs and vice versa.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 env:
@@ -16,10 +15,10 @@ env:
 
 jobs:
   # ----------------------------------------------------------------
-  # Rust build + unit tests
+  # Build: fmt + clippy + cargo build (no tests)
   # ----------------------------------------------------------------
-  rust:
-    name: Rust build + unit tests
+  build:
+    name: Build (lint + compile)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,10 +47,38 @@ jobs:
         run: make build
 
   # ----------------------------------------------------------------
-  # Integration tests — ACME with Pebble
+  # Unit tests (no integration feature)
   # ----------------------------------------------------------------
-  integration:
-    name: ACME integration tests (Pebble)
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+  # ----------------------------------------------------------------
+  # E2E integration tests — requires Pebble ACME server
+  # ----------------------------------------------------------------
+  e2e:
+    name: E2E integration tests (Pebble)
     runs-on: ubuntu-latest
     services:
       pebble:
@@ -82,10 +109,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-integration-
+            ${{ runner.os }}-cargo-
 
       - name: Add hosts entry for localhost.test
         run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
 
-      - name: make test-integration
-        run: make test-integration
+      - name: Run E2E integration tests
+        run: cargo test --workspace --features integration
