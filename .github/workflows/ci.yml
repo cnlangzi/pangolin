@@ -4,13 +4,18 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-progress runs when a new commit is pushed to the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
   # ----------------------------------------------------------------
-  # Rust build + test
+  # Rust build + unit tests
   # All steps reuse Makefile targets so local and CI stay in sync.
   # ----------------------------------------------------------------
   rust:
@@ -50,8 +55,6 @@ jobs:
   integration:
     name: ACME integration tests (Pebble)
     runs-on: ubuntu-latest
-    # Only run on PRs to avoid wasting resources.
-    if: ${{ github.event_name == 'pull_request' }}
     services:
       pebble:
         image: ghcr.io/letsencrypt/pebble:latest
