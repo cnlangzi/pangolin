@@ -10,6 +10,10 @@ description = "Pangolin tunnel node (tun) — connects to ngx, proxies customer 
 name = "tun"
 path = "src/main.rs"
 
+[lib]
+name = "tun"
+path = "src/lib.rs"
+
 [dependencies]
 tokio.workspace = true
 tokio-tungstenite.workspace = true
