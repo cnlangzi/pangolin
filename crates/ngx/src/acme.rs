@@ -232,16 +232,17 @@ impl AcmeClient {
 
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
+        // CN = first domain (required, even though SAN is what browsers check)
         params
             .distinguished_name
             .push(DnType::CommonName, domains[0].as_str());
+        // SAN = ALL domains (including first) so Pebble matches order identifiers
         params.subject_alt_names = domains
             .iter()
-            .skip(1)
             .map(|d| SanType::DnsName(d.as_str().try_into().unwrap()))
             .collect();
 
-        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?;
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der().to_vec();
         let key_pem = key_pair.serialize_pem();

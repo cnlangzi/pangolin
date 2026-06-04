@@ -676,6 +676,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d2301688392eb071b0bf1a37be05c469d3cc4dbbd95df672fe28ab021e6a096"
+dependencies = [
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "daemonize"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1869,6 +1879,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "ctor",
  "env_logger",
  "flate2",
  "futures-util",
@@ -2073,6 +2084,30 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "pangolin-integration-tests"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "ctor",
+ "env_logger",
+ "futures-util",
+ "http-body-util",
+ "log",
+ "ngx",
+ "pangolin-core",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tun",
 ]
 
 [[package]]

@@ -4,17 +4,21 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel in-progress runs when the same PR gets a new push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
   # ----------------------------------------------------------------
-  # Rust build + test
-  # All steps reuse Makefile targets so local and CI stay in sync.
+  # Build: fmt + clippy + cargo build (no tests)
   # ----------------------------------------------------------------
-  rust:
-    name: Rust build + unit tests
+  build:
+    name: Build (lint + compile)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,15 +40,79 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Runs: fmt --check + clippy -D warnings + test
       - name: make lint
         run: make lint
 
       - name: make build
         run: make build
 
-      # make build-ui is called separately before `make ci-full` locally,
-      # not needed in CI since CSS artifact is committed to git.
+  # ----------------------------------------------------------------
+  # Unit tests (no integration feature)
+  # ----------------------------------------------------------------
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-  # Note: Admin UI (tailwindcss) is built locally with `make build-ui`
-  # before starting the server. CSS is committed to the repo.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+  # ----------------------------------------------------------------
+  # E2E integration tests — requires Pebble ACME server
+  # ----------------------------------------------------------------
+  e2e:
+    name: E2E integration tests (Pebble)
+    runs-on: ubuntu-latest
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        ports:
+          - "14000:14000"
+          - "5001:5001"
+          - "15000:15000"
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_LISTEN: "0.0.0.0:14000"
+          PEBBLE_WFE_OVERRIDE_DNS: "127.0.0.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Add hosts entry for localhost.test
+        run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
+
+      - name: Run E2E integration tests
+        run: cargo test --workspace --features integration
