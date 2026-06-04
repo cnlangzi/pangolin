@@ -1,4 +1,4 @@
-//! Built-in mock ngx server for unit testing.
+//! Built-in test WebSocket server for unit testing.
 //!
 //! Simulates a minimal ngx server that:
 //!   - Accepts WS connections at a given port
@@ -7,10 +7,10 @@
 //!   - Stores received requests for inspection by tests
 //!
 //! Usage in tests:
-//!   let mock = MockNgx::start().await;
-//!   // spawn tun client connected to mock.addr()
-//!   // mock.expect_request(...).await;
-//!   mock.shutdown().await;
+//!   let server = TestWsServer::start().await;
+//!   // spawn tun client connected to server.addr()
+//!   // server.expect_request(...).await;
+//!   server.shutdown().await;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,14 +27,14 @@ use crate::frame::{
     TunnelResponseFrame,
 };
 
-pub struct MockNgx {
+pub struct TestWsServer {
     addr: String,
     requests: Arc<Mutex<Vec<TunnelRequestFrame>>>,
     /// Signalled true to tell the accept loop to shut down.
     shutdown_flag: Arc<AtomicBool>,
 }
 
-impl MockNgx {
+impl TestWsServer {
     /// Start a mock ngx server on a random available port.
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -157,9 +157,9 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     #[tokio::test]
-    async fn test_mock_ngx_basic() {
-        let mock = MockNgx::start().await;
-        let addr = mock.addr();
+    async fn test_ws_server_basic() {
+        let server = TestWsServer::start().await;
+        let addr = server.addr();
 
         // Connect a "tun" client
         let ws_url = format!("ws://{}/tunnel?token=test&name=testnode", addr);
@@ -201,11 +201,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Check mock received the request
-        let reqs = mock.get_requests().await;
+        let reqs = server.get_requests().await;
         assert_eq!(reqs.len(), 1, "mock should have received 1 request");
         assert_eq!(reqs[0].rid, "test-1");
         assert_eq!(reqs[0].path, "/api/test");
 
-        mock.shutdown().await;
+        server.shutdown().await;
     }
 }

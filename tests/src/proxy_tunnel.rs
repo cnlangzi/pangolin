@@ -2,8 +2,8 @@
 //!
 //! Covers: tests/CHECKLIST.md → Tunnel Path (5 tests)
 //!
-//! Tests use MockNgx (built-in mock WS server from tun crate) to simulate
-//! the ngx side of the tunnel protocol. The tun client connects to MockNgx
+//! Tests use TestWsServer (built-in mock WS server from tun crate) to simulate
+//! the ngx side of the tunnel protocol. The tun client connects to TestWsServer
 //! via WS, and we verify request/response routing.
 
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite};
 use futures_util::{SinkExt, StreamExt};
 
-use tun::mock_ngx::MockNgx;
+use tun::test_ws_server::TestWsServer;
 use tun::frame::{
     serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
 };
@@ -48,11 +48,11 @@ async fn start_hanging_backend() -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// tunnel_basic — MockNgx receives a valid WS tunnel frame with correct rid + path
+/// tunnel_basic — TestWsServer receives a valid WS tunnel frame with correct rid + path
 #[tokio::test]
 async fn tunnel_basic() {
-    let mock = MockNgx::start().await;
-    let addr = mock.addr();
+    let server = TestWsServer::start().await;
+    let addr = server.addr();
 
     let ws_url = format!("ws://{}/tunnel?token=test&name=testnode", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("connect");
@@ -84,13 +84,13 @@ async fn tunnel_basic() {
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let requests = mock.get_requests().await;
+    let requests = server.get_requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].rid, "tunnel-req-1");
     assert_eq!(requests[0].path, "/api/users");
     assert_eq!(requests[0].method, "GET");
 
-    mock.shutdown().await;
+    server.shutdown().await;
 }
 
 /// tunnel_offline — WS connect to invalid ngx addr → connection refused / error
@@ -100,11 +100,11 @@ async fn tunnel_offline() {
     assert!(result.is_err(), "connecting to offline server should fail");
 }
 
-/// tunnel_concurrent — two concurrent tunnel frames → MockNgx records both with correct rids
+/// tunnel_concurrent — two concurrent tunnel frames → TestWsServer records both with correct rids
 #[tokio::test]
 async fn tunnel_concurrent() {
-    let mock = MockNgx::start().await;
-    let addr = mock.addr();
+    let server = TestWsServer::start().await;
+    let addr = server.addr();
 
     let ws_url = format!("ws://{}/tunnel?token=test&name=testnode", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("connect");
@@ -133,21 +133,21 @@ async fn tunnel_concurrent() {
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let requests = mock.get_requests().await;
+    let requests = server.get_requests().await;
     assert_eq!(requests.len(), 2);
 
     let rids: Vec<_> = requests.iter().map(|r| r.rid.clone()).collect();
     assert!(rids.contains(&"req-a".into()));
     assert!(rids.contains(&"req-b".into()));
 
-    mock.shutdown().await;
+    server.shutdown().await;
 }
 
 /// tunnel_multi — one WS connection, frames for different req_ids (simulating multi-site)
 #[tokio::test]
 async fn tunnel_multi() {
-    let mock = MockNgx::start().await;
-    let addr = mock.addr();
+    let server = TestWsServer::start().await;
+    let addr = server.addr();
 
     let ws_url = format!("ws://{}/tunnel?token=test&name=testnode", addr);
     let (mut ws, _) = connect_async(&ws_url).await.expect("connect");
@@ -182,14 +182,14 @@ async fn tunnel_multi() {
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let requests = mock.get_requests().await;
+    let requests = server.get_requests().await;
     assert_eq!(requests.len(), 5, "should have 5 total requests from 2 sites");
 
     let paths: Vec<_> = requests.iter().map(|r| r.path.clone()).collect();
     assert!(paths.contains(&"/site-a/0".into()));
     assert!(paths.contains(&"/site-b/0".into()));
 
-    mock.shutdown().await;
+    server.shutdown().await;
 }
 
 /// tunnel_timeout — reqwest HTTP client hits hanging backend → reqwest returns error
