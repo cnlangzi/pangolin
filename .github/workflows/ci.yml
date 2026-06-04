@@ -43,8 +43,51 @@ jobs:
       - name: make build
         run: make build
 
-      # make build-ui is called separately before `make ci-full` locally,
-      # not needed in CI since CSS artifact is committed to git.
+  # ----------------------------------------------------------------
+  # Integration tests — ACME with Pebble (letsencrypt/pebble:latest)
+  # Runs only on PRs; requires Docker for the Pebble service container.
+  # ----------------------------------------------------------------
+  integration:
+    name: ACME integration tests (Pebble)
+    runs-on: ubuntu-latest
+    # Only run on PRs to avoid wasting resources.
+    if: ${{ github.event_name == 'pull_request' }}
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        container-name: pebble
+        ports:
+          - "14000:14000"   # ACME endpoint
+          - "5001:5001"     # pebble-challtestsrv (not used but exposed)
+          - "15000:15000"   # pebble-challtestsrv alt port
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_LISTEN: "0.0.0.0:14000"
+          PEBBLE_WFE_OVERRIDE_DNS: "127.0.0.1"
+    steps:
+      - uses: actions/checkout@v4
 
-  # Note: Admin UI (tailwindcss) is built locally with `make build-ui`
-  # before starting the server. CSS is committed to the repo.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-integration-
+
+      # Resolve localhost.test → 127.0.0.1 so Pebble VA can reach the challenge server.
+      - name: Add hosts entry for localhost.test
+        run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
+
+      # make test-integration runs: cargo test --workspace --features integration
+      - name: make test-integration
+        run: make test-integration
