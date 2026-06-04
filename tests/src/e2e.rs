@@ -135,7 +135,7 @@ async fn write_http_response(
     status_text: &str,
     body: &[u8],
 ) {
-    let resp = format(
+    let resp = format!(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n",
         status,
         status_text,
@@ -222,9 +222,8 @@ async fn serve_static_file(client: &mut TcpStream, file_path: &str, apply_condit
         hdr.push_str(&format!("ETag: {}\r\n", etag_val));
     }
     if let Some(mtime_val) = mtime {
-        if let Ok(dt) = httpdate::fmt_http_date(mtime_val) {
-            hdr.push_str(&format!("Last-Modified: {}\r\n", dt));
-        }
+        let dt = httpdate::fmt_http_date(mtime_val);
+        hdr.push_str(&format!("Last-Modified: {}\r\n", dt));
     }
     hdr.push_str("Cache-Control: no-cache\r\n");
     hdr.push_str("\r\n");

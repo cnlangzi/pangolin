@@ -462,7 +462,7 @@ async fn serve_static_file(
             if let Some(ims) = req_header.headers.get("If-Modified-Since") {
                 if let Ok(ims_str) = std::str::from_utf8(ims.as_bytes()) {
                     if let Ok(ims_dt) = httpdate::parse_http_date(ims_str) {
-                        if mtime_val <= SystemTime::from(ims_dt) {
+                        if mtime_val <= ims_dt {
                             let mut hdr = match ResponseHeader::build(304, None) {
                                 Ok(h) => h,
                                 Err(e) => {
