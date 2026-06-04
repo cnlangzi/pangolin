@@ -49,7 +49,8 @@ impl ServeHttp for AppHttp {
         // JSON API routes (handled by the local mod admin_api)
         if path.starts_with("/api/") {
             debug!("HTTP admin API: {} {}", method, path);
-            return crate::admin_api::handle_api_http(http_session, &self.app, &path, &method).await;
+            return crate::admin_api::handle_api_http(http_session, &self.app, &path, &method)
+                .await;
         }
 
         // Root

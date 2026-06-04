@@ -50,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
-    let config = Config::from_file(&args.config)
-        .map_err(|e| anyhow::anyhow!("config error: {}", e))?;
+    let config =
+        Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager {
@@ -63,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
         renew_check_interval_hours: config.cert.renew_check_interval_hours,
         renew_max_retries: config.cert.renew_max_retries,
     };
-    let app = Arc::new(pangolin_core::App::new(&db_path, config.clone(), cert_manager)?);
+    let app = Arc::new(pangolin_core::App::new(
+        &db_path,
+        config.clone(),
+        cert_manager,
+    )?);
 
     log::info!(
         "Pangolin ngx {} starting on port {}",

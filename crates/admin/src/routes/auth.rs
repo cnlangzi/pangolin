@@ -2,9 +2,9 @@
 //!
 //! Sessions are in-memory in `SessionStore`. Cookie is `HttpOnly; SameSite=Strict`.
 
+use bytes::Bytes as Buf;
 use http::{Response, StatusCode};
 use http_body_util::Full;
-use bytes::Bytes as Buf;
 
 use crate::state::{
     make_csrf_cookie, make_logout_cookie, make_logout_csrf_cookie, make_session_cookie,
@@ -36,8 +36,12 @@ pub async fn handle_login(
         let pair = pair.replace("%40", "@");
         if let Some((k, v)) = pair.split_once('=') {
             match k {
-                "username" => form_username = urlencoding::decode(v).unwrap_or_default().to_string(),
-                "password" => form_password = urlencoding::decode(v).unwrap_or_default().to_string(),
+                "username" => {
+                    form_username = urlencoding::decode(v).unwrap_or_default().to_string()
+                }
+                "password" => {
+                    form_password = urlencoding::decode(v).unwrap_or_default().to_string()
+                }
                 "next" => form_next = urlencoding::decode(v).unwrap_or_default().to_string(),
                 _ => {}
             }
@@ -61,7 +65,8 @@ pub async fn handle_login(
         return Ok(resp);
     }
 
-    let error_html = r#"<p class="text-red-400 text-sm mb-4 font-medium">Invalid username or password</p>"#;
+    let error_html =
+        r#"<p class="text-red-400 text-sm mb-4 font-medium">Invalid username or password</p>"#;
     let body = LOGIN_HTML
         .replace("{{next}}", "")
         .replace("{{error}}", error_html);

@@ -1,11 +1,11 @@
 //! Certs route — GET /admin/certs.
 
-use std::sync::Arc;
 use askama::Template;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
-use bytes::Bytes;
 
 use crate::App;
 
@@ -23,7 +23,16 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
     drop(db);
     let now = chrono::Utc::now();
-    ok_html(crate::render_with_assets_and_csrf(crate::templates::CertsTemplate { certs, active_nav: "certs", now: &now }.render().unwrap(), csrf))
+    ok_html(crate::render_with_assets_and_csrf(
+        crate::templates::CertsTemplate {
+            certs,
+            active_nav: "certs",
+            now: &now,
+        }
+        .render()
+        .unwrap(),
+        csrf,
+    ))
 }
 
 pub async fn render_form_new(csrf: &str) -> http::Result<Response<Full<Bytes>>> {
@@ -74,14 +83,22 @@ pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<
     ok_html(rows.join(""))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let cert_file = params.get("cert_file").cloned().unwrap_or_default();
     let key_file = params.get("key_file").cloned().unwrap_or_default();
     let expires_at = params.get("expires_at").and_then(|s| {
-        if s.is_empty() { None } else {
-            chrono::DateTime::parse_from_str(&format!("{}T00:00:00Z", s), "%Y-%m-%dT%H:%M:%SZ").ok().map(|dt| dt.with_timezone(&chrono::Utc))
+        if s.is_empty() {
+            None
+        } else {
+            chrono::DateTime::parse_from_str(&format!("{}T00:00:00Z", s), "%Y-%m-%dT%H:%M:%SZ")
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
         }
     });
 

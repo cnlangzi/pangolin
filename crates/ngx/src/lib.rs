@@ -8,7 +8,7 @@ pub mod proxy;
 pub mod serve;
 
 // Re-export shared types so they are accessible as `crate::App` etc.
-pub use pangolin_core::{App, TunnelMessage, CertManager};
+pub use pangolin_core::{App, CertManager, TunnelMessage};
 
 // Re-export the external admin UI crate as `crate::admin` for serve.rs.
-pub use ::admin as admin;
+pub use ::admin;

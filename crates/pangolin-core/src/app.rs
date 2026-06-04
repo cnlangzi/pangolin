@@ -24,8 +24,7 @@ pub struct App {
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
     pub ws_path: String,
     /// Active tunnel sessions: tun_name → sender channel
-    pub tun_sessions:
-        Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<TunnelMessage>>>>,
+    pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<TunnelMessage>>>>,
     /// TLS cert manager (ACME + manual upload)
     pub cert_manager: CertManager,
 }

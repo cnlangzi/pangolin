@@ -16,15 +16,15 @@
 //! All routes are registered in `routes/mod.rs`. This lib re-exports the
 //! `App` type from `pangolin-core` for convenience.
 
+pub mod app;
 pub mod routes;
 pub mod state;
 pub mod templates;
-pub mod app;
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{Response, StatusCode, header};
+use http::{header, Response, StatusCode};
 use http_body_util::Full;
 
 pub use app::App;
@@ -55,12 +55,14 @@ pub async fn handle(
         } else {
             format!("/admin/login?next={}", urlencoding::encode(next))
         };
-        let mut resp = Response::new(Full::new(Bytes::from(format!("Redirecting to {}", location))));
+        let mut resp = Response::new(Full::new(Bytes::from(format!(
+            "Redirecting to {}",
+            location
+        ))));
         *resp.status_mut() = StatusCode::FOUND;
         resp.headers_mut().insert(
             header::LOCATION,
-            header::HeaderValue::from_str(&location)
-                .map_err(http::Error::from)?,
+            header::HeaderValue::from_str(&location).map_err(http::Error::from)?,
         );
         return Ok(resp);
     }
@@ -70,10 +72,7 @@ pub async fn handle(
     // Skip CSRF for login (no session yet) and logout (CSRF is part of auth).
     let is_login = path == "/admin/login" || path == "/admin/login/";
     let is_logout = path == "/admin/logout";
-    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
-        && !is_login
-        && !is_logout
-    {
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !is_login && !is_logout {
         let session_token_str = session_token.as_deref().unwrap_or("");
         let csrf_from_form = query_param_opt(&body, "_csrf");
         let csrf_from_cookie = cookie_header.and_then(state::parse_csrf_cookie);
@@ -99,39 +98,25 @@ pub async fn handle(
     };
 
     let res: Response<Full<Bytes>> = match path {
-        "" | "dashboard" => {
-            routes::dashboard::render(&app, &csrf_token).await?
-        }
-        "sites" => {
-            routes::sites::render(&app, &csrf_token).await?
-        }
-        "domains" => {
-            routes::domains::render(&app, &csrf_token).await?
-        }
-        "tun" => {
-            routes::tun::render(&app, &csrf_token).await?
-        }
-        "tokens" => {
-            routes::tokens::render(&app, &csrf_token).await?
-        }
-        "certs" => {
-            routes::certs::render(&app, &csrf_token).await?
-        }
+        "" | "dashboard" => routes::dashboard::render(&app, &csrf_token).await?,
+        "sites" => routes::sites::render(&app, &csrf_token).await?,
+        "domains" => routes::domains::render(&app, &csrf_token).await?,
+        "tun" => routes::tun::render(&app, &csrf_token).await?,
+        "tokens" => routes::tokens::render(&app, &csrf_token).await?,
+        "certs" => routes::certs::render(&app, &csrf_token).await?,
         // htmx partials (return HTML fragments)
-        "api/sites" if method == "GET" => {
-            routes::sites::render_table(&app, &csrf_token).await?
-        }
-        "api/sites/new" => {
-            routes::sites::render_form_new(&app, &csrf_token).await?
-        }
+        "api/sites" if method == "GET" => routes::sites::render_table(&app, &csrf_token).await?,
+        "api/sites/new" => routes::sites::render_form_new(&app, &csrf_token).await?,
         "api/sites/edit" => {
-            routes::sites::render_form_edit(&app, query_param_opt(&body, "name"), &csrf_token).await?
+            routes::sites::render_form_edit(&app, query_param_opt(&body, "name"), &csrf_token)
+                .await?
         }
         "api/sites" if method == "POST" => {
             routes::sites::handle_create(&app, &body, &csrf_token).await?
         }
         "api/sites" if method == "PUT" => {
-            routes::sites::handle_update(&app, query_param_opt(&body, "name"), &body, &csrf_token).await?
+            routes::sites::handle_update(&app, query_param_opt(&body, "name"), &body, &csrf_token)
+                .await?
         }
         "api/sites" if method == "DELETE" => {
             routes::sites::handle_delete(&app, query_param_opt(&body, "name"), &csrf_token).await?
@@ -143,26 +128,20 @@ pub async fn handle(
             routes::domains::handle_create(&app, &body, &csrf_token).await?
         }
         "api/domains" if method == "DELETE" => {
-            routes::domains::handle_delete(&app, query_param_opt(&body, "domain"), &csrf_token).await?
+            routes::domains::handle_delete(&app, query_param_opt(&body, "domain"), &csrf_token)
+                .await?
         }
-        "api/tokens" if method == "GET" => {
-            routes::tokens::render_table(&app, &csrf_token).await?
-        }
-        "api/tokens/new" => {
-            routes::tokens::render_form_new(&app, &csrf_token).await?
-        }
+        "api/tokens" if method == "GET" => routes::tokens::render_table(&app, &csrf_token).await?,
+        "api/tokens/new" => routes::tokens::render_form_new(&app, &csrf_token).await?,
         "api/tokens" if method == "POST" => {
             routes::tokens::handle_create(&app, &body, &csrf_token).await?
         }
         "api/tokens" if method == "DELETE" => {
-            routes::tokens::handle_delete(&app, query_param_opt(&body, "token"), &csrf_token).await?
+            routes::tokens::handle_delete(&app, query_param_opt(&body, "token"), &csrf_token)
+                .await?
         }
-        "api/certs" if method == "GET" => {
-            routes::certs::render_table(&app, &csrf_token).await?
-        }
-        "api/certs/new" => {
-            routes::certs::render_form_new(&csrf_token).await?
-        }
+        "api/certs" if method == "GET" => routes::certs::render_table(&app, &csrf_token).await?,
+        "api/certs/new" => routes::certs::render_form_new(&csrf_token).await?,
         "api/certs" if method == "POST" => {
             routes::certs::handle_create(&app, &body, &csrf_token).await?
         }
@@ -206,10 +185,7 @@ pub fn render_with_csrf(html: String, csrf: &str) -> String {
     // Escape the CSRF token for safe inclusion in HTML attribute values.
     // Hex-encoded tokens only contain [0-9a-f] so escaping is a no-op, but
     // we still apply minimal sanitisation for defence in depth.
-    let safe: String = csrf
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
+    let safe: String = csrf.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     html.replace("__CSRF__", &safe)
 }
 
@@ -231,12 +207,10 @@ pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full
 
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
-    body_str
-        .split('&')
-        .find_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            (k == key).then_some(urlencoding::decode(v).ok()?.to_string())
-        })
+    body_str.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(urlencoding::decode(v).ok()?.to_string())
+    })
 }
 
 fn not_found() -> Response<Full<Bytes>> {

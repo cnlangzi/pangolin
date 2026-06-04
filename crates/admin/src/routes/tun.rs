@@ -1,11 +1,11 @@
 //! Tunnels route — GET /admin/tun (read-only).
 
-use std::sync::Arc;
 use askama::Template;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
-use bytes::Bytes;
 
 use crate::App;
 
@@ -21,5 +21,13 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let db = app.db.lock().await;
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     drop(db);
-    ok_html(crate::render_with_assets_and_csrf(crate::templates::TunnelsTemplate { tuns, active_nav: "tun" }.render().unwrap(), csrf))
+    ok_html(crate::render_with_assets_and_csrf(
+        crate::templates::TunnelsTemplate {
+            tuns,
+            active_nav: "tun",
+        }
+        .render()
+        .unwrap(),
+        csrf,
+    ))
 }

@@ -1,7 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 use std::path::Path;
 
 /// Computes a short hash of the CSS file at compile time.

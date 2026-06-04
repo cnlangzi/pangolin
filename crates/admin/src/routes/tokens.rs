@@ -1,11 +1,11 @@
 //! Tokens route — GET /admin/tokens (+ CRUD).
 
-use std::sync::Arc;
 use askama::Template;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
-use bytes::Bytes;
 
 use crate::App;
 
@@ -22,7 +22,15 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let db = app.db.lock().await;
     let tokens = pangolin_core::db::list_tokens(&db).unwrap_or_default();
     drop(db);
-    ok_html(crate::render_with_assets_and_csrf(crate::templates::TokensTemplate { tokens, active_nav: "tokens" }.render().unwrap(), csrf))
+    ok_html(crate::render_with_assets_and_csrf(
+        crate::templates::TokensTemplate {
+            tokens,
+            active_nav: "tokens",
+        }
+        .render()
+        .unwrap(),
+        csrf,
+    ))
 }
 
 pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
@@ -75,18 +83,29 @@ pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<
 }
 
 pub async fn render_form_new(_app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
-    let html = crate::templates::TokenFormTemplate { token: None, error: None }
-        .render()
-        .unwrap();
+    let html = crate::templates::TokenFormTemplate {
+        token: None,
+        error: None,
+    }
+    .render()
+    .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let token = params.get("token").cloned().unwrap_or_default();
     let expires_at = params.get("expires_at").and_then(|s| {
-        if s.is_empty() { None } else {
-            chrono::DateTime::parse_from_str(&format!("{}T00:00:00Z", s), "%Y-%m-%dT%H:%M:%SZ").ok().map(|dt| dt.with_timezone(&chrono::Utc))
+        if s.is_empty() {
+            None
+        } else {
+            chrono::DateTime::parse_from_str(&format!("{}T00:00:00Z", s), "%Y-%m-%dT%H:%M:%SZ")
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
         }
     });
 
@@ -94,7 +113,11 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         return render_form_with_error(None, "Token name is required", csrf);
     }
     if !pangolin_core::is_valid_tun_name(&token) {
-        return render_form_with_error(None, "Token name must be lowercase letters, digits, or hyphens (1-32 chars)", csrf);
+        return render_form_with_error(
+            None,
+            "Token name must be lowercase letters, digits, or hyphens (1-32 chars)",
+            csrf,
+        );
     }
 
     let t = pangolin_core::types::Token {
@@ -117,14 +140,25 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     }
 }
 
-fn render_form_with_error(token: Option<pangolin_core::types::Token>, error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
-    let html = crate::templates::TokenFormTemplate { token, error: Some(error) }
-        .render()
-        .unwrap();
+fn render_form_with_error(
+    token: Option<pangolin_core::types::Token>,
+    error: &str,
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    let html = crate::templates::TokenFormTemplate {
+        token,
+        error: Some(error),
+    }
+    .render()
+    .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_delete(app: &Arc<App>, token: Option<String>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(
+    app: &Arc<App>,
+    token: Option<String>,
+    _csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let token = match token {
         Some(t) if !t.is_empty() => t,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing token</p>"##.to_string()),
@@ -138,8 +172,13 @@ pub async fn handle_delete(app: &Arc<App>, token: Option<String>, _csrf: &str) -
             app.reload_indexes().await;
             ok_html(r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-slate-700 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Token deleted</div></div>"##.to_string())
         }
-        Ok(false) => ok_html(r##"<p class="text-red-500 text-sm">Token not found</p>"##.to_string()),
-        Err(e) => ok_html(format!(r##"<p class="text-red-500 text-sm">Error: {}</p>"##, e)),
+        Ok(false) => {
+            ok_html(r##"<p class="text-red-500 text-sm">Token not found</p>"##.to_string())
+        }
+        Err(e) => ok_html(format!(
+            r##"<p class="text-red-500 text-sm">Error: {}</p>"##,
+            e
+        )),
     }
 }
 

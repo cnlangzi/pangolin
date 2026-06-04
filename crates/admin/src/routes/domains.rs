@@ -1,11 +1,11 @@
 //! Domains route — GET /admin/domains.
 
-use std::sync::Arc;
 use askama::Template;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
-use bytes::Bytes;
 
 use crate::App;
 
@@ -23,7 +23,16 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     drop(db);
-    ok_html(crate::render_with_assets_and_csrf(crate::templates::DomainsTemplate { domains, sites, active_nav: "domains" }.render().unwrap(), csrf))
+    ok_html(crate::render_with_assets_and_csrf(
+        crate::templates::DomainsTemplate {
+            domains,
+            sites,
+            active_nav: "domains",
+        }
+        .render()
+        .unwrap(),
+        csrf,
+    ))
 }
 
 pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
@@ -60,7 +69,11 @@ pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<
     ok_html(rows.join(""))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let site_name = params.get("site_name").cloned().unwrap_or_default();
@@ -72,7 +85,12 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         return render_form_with_error(app, "Please select a site", csrf).await;
     }
     if !pangolin_core::is_valid_domain(&domain) {
-        return render_form_with_error(app, "Invalid domain format (use example.com, no scheme)", csrf).await;
+        return render_form_with_error(
+            app,
+            "Invalid domain format (use example.com, no scheme)",
+            csrf,
+        )
+        .await;
     }
 
     let d = pangolin_core::types::Domain {
@@ -95,17 +113,28 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     }
 }
 
-async fn render_form_with_error(app: &Arc<App>, error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+async fn render_form_with_error(
+    app: &Arc<App>,
+    error: &str,
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     drop(db);
-    let html = crate::templates::DomainFormTemplate { sites, error: Some(error) }
-        .render()
-        .unwrap();
+    let html = crate::templates::DomainFormTemplate {
+        sites,
+        error: Some(error),
+    }
+    .render()
+    .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_delete(app: &Arc<App>, domain: Option<String>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(
+    app: &Arc<App>,
+    domain: Option<String>,
+    _csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
     let domain = match domain {
         Some(d) if !d.is_empty() => d,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing domain</p>"##.to_string()),
@@ -119,8 +148,13 @@ pub async fn handle_delete(app: &Arc<App>, domain: Option<String>, _csrf: &str) 
             app.reload_indexes().await;
             ok_html(r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-slate-700 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Domain deleted</div></div>"##.to_string())
         }
-        Ok(false) => ok_html(r##"<p class="text-red-500 text-sm">Domain not found</p>"##.to_string()),
-        Err(e) => ok_html(format!(r##"<p class="text-red-500 text-sm">Error: {}</p>"##, e)),
+        Ok(false) => {
+            ok_html(r##"<p class="text-red-500 text-sm">Domain not found</p>"##.to_string())
+        }
+        Err(e) => ok_html(format!(
+            r##"<p class="text-red-500 text-sm">Error: {}</p>"##,
+            e
+        )),
     }
 }
 

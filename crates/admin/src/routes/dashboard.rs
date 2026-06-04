@@ -1,14 +1,14 @@
 //! Dashboard route — GET /admin/
 
-use std::sync::Arc;
 use askama::Template;
+use std::sync::Arc;
 
-use http_body_util::Full;
 use bytes::Bytes;
 use http::Response;
+use http_body_util::Full;
 
-use crate::App;
 use crate::templates::DashboardTemplate;
+use crate::App;
 
 fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
@@ -38,5 +38,8 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         cert_count: certs.len(),
     };
 
-    ok_html(crate::render_with_assets_and_csrf(dashboard.render().unwrap(), csrf))
+    ok_html(crate::render_with_assets_and_csrf(
+        dashboard.render().unwrap(),
+        csrf,
+    ))
 }
