@@ -67,6 +67,7 @@ time = "0.3"
 
 # Utilities
 bytes = "1"
+httpdate = "1"
 
 [dev-dependencies]
 tempfile = "3"
