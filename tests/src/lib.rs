@@ -4,6 +4,9 @@
 mod routing;
 
 #[cfg(feature = "integration")]
+mod backend;
+
+#[cfg(feature = "integration")]
 mod proxy_direct;
 
 #[cfg(feature = "integration")]
@@ -24,11 +27,12 @@ mod wildcard;
 #[cfg(feature = "integration")]
 mod path_prefix;
 
-// Placeholder modules so workspace builds before tests are written.
-// Each will be implemented as we work through the checklist.
-
+// Force ring as crypto provider for tests (same pattern as acme.rs in ngx crate).
 #[cfg(feature = "integration")]
-mod _stub {
-    // These modules are empty stubs — replace with real tests.
-    // They exist so `cargo build --workspace` passes before we start.
+#[ctor::ctor]
+fn init_crypto() {
+    use rustls::crypto::ring;
+    let provider = ring::default_provider();
+    rustls::crypto::CryptoProvider::install_default(provider)
+        .expect("install ring as default crypto provider");
 }
