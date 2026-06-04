@@ -216,7 +216,62 @@ impl ProxyHttp for AppProxy {
                 let _ = session.respond_error(503).await;
                 Ok(true)
             }
+        } else if url.starts_with("file:///") {
+            // Static file serving: short-circuit, serve file directly
+            let file_path = url.trim_start_matches("file://");
+            let content = match tokio::fs::read(file_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        error!("static file not found: {}", file_path);
+                        let _ = session.respond_error(404).await;
+                        return Ok(true);
+                    }
+                    error!("static file read error {}: {}", file_path, e);
+                    let _ = session.respond_error(500).await;
+                    return Ok(true);
+                }
+            };
+            let mut hdr = match ResponseHeader::build(200, None) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("failed to build response header: {}", e);
+                    let _ = session.respond_error(500).await;
+                    return Ok(true);
+                }
+            };
+            let ct = if file_path.ends_with(".html") {
+                "text/html"
+            } else if file_path.ends_with(".css") {
+                "text/css"
+            } else if file_path.ends_with(".js") {
+                "application/javascript"
+            } else if file_path.ends_with(".json") {
+                "application/json"
+            } else if file_path.ends_with(".png") {
+                "image/png"
+            } else if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") {
+                "image/jpeg"
+            } else if file_path.ends_with(".svg") {
+                "image/svg+xml"
+            } else {
+                "application/octet-stream"
+            };
+            hdr.insert_header("Content-Type", ct.as_bytes()).ok();
+            if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
+                error!("failed to write response header: {}", e);
+                let _ = session.respond_error(500).await;
+                return Ok(true);
+            }
+            if let Err(e) = session
+                .write_response_body(Some(Bytes::from(content)), true)
+                .await
+            {
+                error!("failed to write response body: {}", e);
+            }
+            return Ok(true);
         } else {
+
             // Direct path: continue to upstream_peer (return Ok(false))
             debug!("Direct proxy: {} → {}", host, url);
             Ok(false)

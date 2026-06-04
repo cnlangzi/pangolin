@@ -179,17 +179,63 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 
     log::info!("[proxy] connecting to backend_url={}", backend_url);
 
+
+    // file:/// backend: serve static file directly
+    if backend_url.trim().starts_with("file:///") {
+        let file_path = backend_url.trim_start_matches("file:///");
+        log::info!("[proxy] file_path={}, exists={}", file_path, std::path::Path::new(file_path).exists());
+        let content = match tokio::fs::read(file_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+                    let _ = client.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error";
+                let _ = client.write_all(resp.as_bytes()).await;
+                return;
+            }
+        };
+        let ct = if file_path.ends_with(".html") {
+            "text/html"
+        } else if file_path.ends_with(".css") {
+            "text/css"
+        } else if file_path.ends_with(".js") {
+            "application/javascript"
+        } else if file_path.ends_with(".json") {
+            "application/json"
+        } else if file_path.ends_with(".png") {
+            "image/png"
+        } else {
+            "application/octet-stream"
+        };
+        let body_len = content.len();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+            ct, body_len
+        );
+        if let Err(_) = client.write_all(resp.as_bytes()).await {
+            return;
+        }
+        if let Err(_) = client.write_all(&content).await {
+            return;
+        }
+        return;
+    }
+
+
+
     let (backend_host, backend_port) = match MockHttpBackend::parse_http_url(&backend_url) {
         Some((h, p)) => (h, p),
         None => {
-            log::info!("[proxy] backend URL parse failed");
             let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\nBad Gateway";
             let _ = client.write_all(resp.as_bytes()).await;
             return;
         }
     };
 
-    log::info!("[proxy] connecting to {}:{}", backend_host, backend_port);
+    log::info!("[proxy] TCP connecting to {}:{}", backend_host, backend_port);
 
     let mut backend = match TcpStream::connect(format!("{}:{}", backend_host, backend_port)).await {
         Ok(s) => s,
@@ -412,4 +458,121 @@ async fn e2e_direct_http_post() {
     assert!(!reqs.is_empty());
     assert_eq!(reqs[0].method, "POST");
     assert_eq!(reqs[0].path, "/submit");
+}
+/// e2e_direct_static_file — GET /index.html → file:/// backend → 200 + content
+///
+/// Tests the file:/// static file serving path in request_filter.
+#[tokio::test]
+async fn e2e_direct_static_file() {
+    let _ = env_logger::try_init();
+
+    // Create a temp file to serve
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("index.html");
+    tokio::fs::write(&file_path, "<h1>Hello Static World</h1>")
+        .await
+        .expect("write temp file");
+
+    // Keep temp_dir alive by wrapping in Option inside the task
+    let temp_dir = Arc::new(Some(temp_dir));
+    let _temp_dir_for_task = temp_dir.clone();
+
+    let site = Site {
+        name: "static-site".into(),
+        backend: format!("file:///{}", file_path.to_str().unwrap()),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let domain = Domain {
+        domain: "static.example.com".into(),
+        site_name: "static-site".into(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let idx = indexes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let idx = idx.clone();
+                tokio::spawn(handle_proxy_connection(stream, idx));
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/index.html", proxy_port);
+    let resp = client
+        .get(&url)
+        .header("Host", "static.example.com")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body = resp.text().await.expect("read body");
+    assert!(body.contains("Hello Static World"));
+}
+
+/// e2e_direct_static_file_not_found — file not found → 404
+#[tokio::test]
+async fn e2e_direct_static_file_not_found() {
+    let _ = env_logger::try_init();
+
+    let site = Site {
+        name: "static-missing".into(),
+        backend: "file:///tmp/does_not_exist_xyz123.txt".to_string(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let domain = Domain {
+        domain: "missing.example.com".into(),
+        site_name: "static-missing".into(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let idx = indexes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let idx = idx.clone();
+                tokio::spawn(handle_proxy_connection(stream, idx));
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/index.html", proxy_port);
+    let resp = client
+        .get(&url)
+        .header("Host", "missing.example.com")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status().as_u16(), 404);
 }
