@@ -76,3 +76,63 @@ integration:
 - `cargo test --features integration` 在 CI 和本地都能通过
 - 所有 ACME 申请和续期流程被测试覆盖
 - CI integration job 绿
+
+---
+
+# Phase 5: 客户端协议支持（TODO）
+
+## 目标
+支持客户端→ngx 的多种协议类型，包括常规 CDN 场景：HTTP/1.1、HTTPS、HTTP/2、WebSocket、gRPC。
+
+## 前置依赖
+- Phase 1 ngx HTTP/1.1 proxy 完成
+- Phase 1/2 ngx-tun tunnel 完成
+
+## 协议支持矩阵
+
+| 协议 | 客户端→ngx | ngx→tun | tun→backend | 优先级 |
+|------|-----------|---------|-------------|--------|
+| HTTP/1.1 | ✅ 已支持 | ✅ msgpack/WS | ✅ HTTP/1.1 | P0 |
+| HTTPS | ✅ TLS | — | — | P0 |
+| WebSocket | ❌ 需实现 (426) | ✅ | — | P1 |
+| HTTP/2 (TLS h2) | ⚠️ 需配置 ALPN | ❌ WS 不传 h2 | ❌ reqwest h1 only | P2 |
+| gRPC | ❌ 不支持 | ❌ 不支持 | ❌ 不支持 | P3 |
+| HTTP/3 (QUIC) | ❌ 不支持 | ❌ 不支持 | ❌ 不支持 | P3 |
+
+## 实现要点
+
+### WebSocket 客户端支持
+- proxy.rs 检测 `Upgrade: websocket` header
+- 调用 `session.upgrade()` 建立 WS 连接
+- WS 路由：直接代理到 backend，或通过 tunnel 转发到远程 tun
+
+### HTTP/2 (TLS) 支持
+- TLS listener 配置 ALPN h2
+- pingora `http_proxy_service` 本身支持 H2Session，需正确配置 TLS
+- ngx→tun 之间仍是 msgpack/WS，不受影响
+
+### gRPC / HTTP/2 ngx→backend
+- 识别 `content-type: application/grpc` 请求
+- 使用支持 HTTP/2 的客户端（如 `h2` crate）
+- reqwest 仅支持 HTTP/1.1，无法满足需求
+
+## 分阶段实施
+
+### Phase 5.1: WebSocket（优先）
+- 实现 WS 升级检测和代理
+- 支持客户端 WS → ngx → backend 直连
+- 不经过 tunnel，保持简单
+
+### Phase 5.2: HTTP/2 TLS listener
+- 配置 TLS ALPN 支持 h2
+- 测试 h2 客户端连接
+
+### Phase 5.3: gRPC 支持
+- HTTP/2 路由识别
+- h2 客户端 proxy
+- tunnel 支持 h2 帧转发（更复杂）
+
+## 验收
+- HTTP/1.1、HTTPS、WebSocket 客户端请求正常处理
+- HTTP/2 TLS h2 握手成功
+- gRPC 请求能正确路由（Phase 5.3 完成后）

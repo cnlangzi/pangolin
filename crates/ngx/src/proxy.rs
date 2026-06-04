@@ -7,11 +7,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http::header::{HeaderName, HeaderValue};
 use log::{debug, error, info, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
+use tokio::time::{timeout, Duration};
 
 use crate::{admin, App, TunnelMessage};
 
@@ -92,29 +95,132 @@ impl ProxyHttp for AppProxy {
                         .unwrap()
                         .as_nanos()
                 );
-                let body = format!("{} {}\nHost: {}", method, path, host);
-                let msg = TunnelMessage {
-                    rid,
-                    body: body.into_bytes(),
-                    last: true,
+
+                // Build full request frame with all headers and body.
+                // read_body returns a borrow; we must copy data before getting req_header.
+                let body_bytes = {
+                    match session.read_body_or_idle(false).await {
+                        Ok(Some(data)) => data.to_vec(),
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            error!("failed to read request body: {}", e);
+                            let _ = session.respond_error(400).await;
+                            return Ok(true);
+                        }
+                    }
                 };
-                if sender.send(msg).await.is_err() {
-                    warn!("Tun {} disconnected", tun_name);
-                    let _ = session.respond_error(503).await;
-                } else {
-                    let _ = session.respond_error(200).await;
+
+                let req_header = session.req_header();
+                let mut headers: Vec<(String, String)> = Vec::new();
+                for (k, v) in &req_header.headers {
+                    headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
                 }
-                return Ok(true);
+
+                let req_frame = pangolin_core::TunnelRequestFrame {
+                    rid: rid.clone(),
+                    method: method.clone(),
+                    path: req_header.uri.to_string(),
+                    headers,
+                    body: body_bytes,
+                };
+
+                let buf = match pangolin_core::serialize_msgpack(&req_frame) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("failed to serialize request: {}", e);
+                        let _ = session.respond_error(500).await;
+                        return Ok(true);
+                    }
+                };
+
+                // Create oneshot channel to receive response
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+                let msg = TunnelMessage {
+                    rid: rid.clone(),
+                    body: buf,
+                    resp_tx,
+                };
+
+                // Send request and wait for response (with timeout)
+                let response = async {
+                    sender.send(msg).await.map_err(|_| "tun disconnected")?;
+                    resp_rx.await.map_err(|_| "response channel closed")
+                };
+
+                match timeout(Duration::from_secs(60), response).await {
+                    Ok(Ok(response_frame)) => {
+                        // Got response from tun — write it to client
+                        debug!(
+                            "tunnel response {} bytes for rid {}",
+                            response_frame.body.len(),
+                            rid
+                        );
+
+                        // Build pingora response from the frame
+                        let mut resp = http::Response::builder().status(response_frame.status);
+                        for (k, v) in response_frame.headers.iter() {
+                            if let (Ok(name), Ok(value)) = (
+                                HeaderName::from_bytes(k.as_bytes()),
+                                HeaderValue::from_str(v.as_str()),
+                            ) {
+                                resp = resp.header(name, value);
+                            }
+                        }
+                        let body = response_frame.body;
+
+                        // Write response header
+                        let status = response_frame.status;
+                        let mut hdr = match ResponseHeader::build(status, None) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                error!("failed to build response header: {}", e);
+                                let _ = session.respond_error(500).await;
+                                return Ok(true);
+                            }
+                        };
+                        for (k, v) in response_frame.headers.iter() {
+                            if let (Ok(name), Ok(value)) = (
+                                HeaderName::from_bytes(k.as_bytes()),
+                                HeaderValue::from_str(v.as_str()),
+                            ) {
+                                hdr.insert_header(name, value).ok();
+                            }
+                        }
+                        if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
+                            error!("failed to write tunnel response header: {}", e);
+                            let _ = session.respond_error(500).await;
+                            return Ok(true);
+                        }
+                        if let Err(e) = session
+                            .write_response_body(Some(Bytes::from(body)), true)
+                            .await
+                        {
+                            error!("failed to write tunnel response body: {}", e);
+                        }
+                        Ok(true)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("tunnel send error: {}", e);
+                        let _ = session.respond_error(503).await;
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        warn!("tunnel timeout for tun {}", tun_name);
+                        let _ = session.respond_error(504).await;
+                        Ok(true)
+                    }
+                }
             } else {
                 warn!("Tun {} not online", tun_name);
                 let _ = session.respond_error(503).await;
-                return Ok(true);
+                Ok(true)
             }
+        } else {
+            // Direct path: continue to upstream_peer (return Ok(false))
+            debug!("Direct proxy: {} → {}", host, url);
+            Ok(false)
         }
-
-        // Direct path: continue to upstream_peer (return Ok(false))
-        debug!("Direct proxy: {} → {}", host, url);
-        Ok(false)
     }
 
     /// Select the upstream peer based on the site backend URL.
