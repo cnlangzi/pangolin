@@ -10,11 +10,12 @@ use bytes::Bytes;
 use crate::App;
 
 fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
-    Ok(Response::builder()
+    let resp = Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
-        .unwrap())
+        .expect("response builder for 200 OK should not fail");
+    Ok(resp)
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {

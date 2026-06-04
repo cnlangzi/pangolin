@@ -19,6 +19,7 @@ struct SessionData {
     expiry: Instant,
     /// CSRF token for this session (separate from session token)
     csrf: String,
+    #[allow(dead_code)]
     /// Username for audit logging
     username: String,
 }

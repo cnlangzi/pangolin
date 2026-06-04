@@ -11,11 +11,11 @@ use crate::App;
 use crate::templates::DashboardTemplate;
 
 fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
-    Response::builder()
+    Ok(Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
-        .map_err(|e| e)
+        .expect("response builder for 200 OK should not fail"))
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {

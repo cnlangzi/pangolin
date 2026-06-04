@@ -220,11 +220,13 @@ pub fn render_with_assets_and_csrf(html: String, csrf: &str) -> String {
 
 /// Build a 200 OK HTML response with the standard asset URL and CSRF substitutions.
 pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
-    Response::builder()
+    let bytes = render_with_assets_and_csrf(body, csrf);
+    let resp = Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(render_with_assets_and_csrf(body, csrf))))
-        .map_err(|e| e)
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap();
+    Ok(resp)
 }
 
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
