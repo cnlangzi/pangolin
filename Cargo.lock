@@ -2098,6 +2098,7 @@ dependencies = [
  "ngx",
  "pangolin-core",
  "reqwest 0.12.28",
+ "rusqlite",
  "rustls",
  "tempfile",
  "tokio",
