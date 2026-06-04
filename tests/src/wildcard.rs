@@ -2,9 +2,9 @@
 //!
 //! Covers: tests/CHECKLIST.md → Wildcard Routing (3 tests)
 
+use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, Site, Token};
-use chrono::Utc;
 
 fn make_site(name: &str, backend: &str) -> Site {
     Site {
@@ -86,8 +86,14 @@ fn wildcard_invalid_rejected() {
     use pangolin_core::is_valid_domain;
 
     // Multi-layer wildcard should be invalid
-    assert!(!is_valid_domain("*.*.example.com"), "multi-layer wildcard invalid");
-    assert!(!is_valid_domain("foo.*.example.com"), "mid-domain wildcard invalid");
+    assert!(
+        !is_valid_domain("*.*.example.com"),
+        "multi-layer wildcard invalid"
+    );
+    assert!(
+        !is_valid_domain("foo.*.example.com"),
+        "mid-domain wildcard invalid"
+    );
 
     // Valid forms
     assert!(is_valid_domain("*.example.com"));

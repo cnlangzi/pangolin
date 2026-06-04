@@ -4,11 +4,11 @@
 //!
 //! Tests error paths: not found, invalid request, upstream error simulation.
 
-use std::collections::HashMap;
-use pangolin_core::index::{lookup_site, Indexes};
-use pangolin_core::types::{Domain, Site, Token};
-use pangolin_core::parse::{parse_backend, ParseError};
 use chrono::Utc;
+use pangolin_core::index::{lookup_site, Indexes};
+use pangolin_core::parse::{parse_backend, ParseError};
+use pangolin_core::types::{Domain, Site, Token};
+use std::collections::HashMap;
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
     let tokens = vec![];
@@ -54,10 +54,16 @@ fn error_invalid_backend() {
 
     // Invalid scheme
     assert!(parse_backend("httpx://x.com").is_err());
-    assert!(matches!(parse_backend("httpx://x.com").unwrap_err(), ParseError::UnsupportedScheme(_)));
+    assert!(matches!(
+        parse_backend("httpx://x.com").unwrap_err(),
+        ParseError::UnsupportedScheme(_)
+    ));
 
     // Digit-only tun name
-    assert!(matches!(parse_backend("123:http://x.com").unwrap_err(), ParseError::InvalidTunName(_)));
+    assert!(matches!(
+        parse_backend("123:http://x.com").unwrap_err(),
+        ParseError::InvalidTunName(_)
+    ));
 }
 
 /// error_domain_disabled — disabled domain → excluded from index lookup

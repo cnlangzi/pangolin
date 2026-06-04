@@ -10,10 +10,10 @@
 //! ngx server process and is covered in the integration test suite
 //! with the actual test infrastructure.
 
+use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::parse::parse_backend;
 use pangolin_core::types::{Domain, Site, Token};
-use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Index helper
@@ -116,7 +116,10 @@ fn direct_path_prefix() {
 
     let (tun, url) = parse_backend("http://127.0.0.1:8080/api").unwrap();
     assert_eq!(tun, "");
-    assert!(url.ends_with("/api"), "backend URL should contain /api prefix");
+    assert!(
+        url.ends_with("/api"),
+        "backend URL should contain /api prefix"
+    );
 
     // The path prefix in the URL is what ngx uses for forwarding
     let site = result.unwrap();

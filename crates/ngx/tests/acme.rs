@@ -1,3 +1,4 @@
+#![allow(unused)]
 //! ACME integration test using Pebble (local ACME test server).
 //!
 //! Start Pebble:
@@ -188,7 +189,10 @@ async fn acme_issue_certificate() {
     assert!(cert_pem.contains("-----BEGIN CERTIFICATE-----"));
     // The SAN is in the DER binary, not visible as plain text in base64 output.
     // We trust the ACME flow (Pebble validated HTTP-01) and verify the cert is parseable.
-    assert!(cert_pem.contains("-----END CERTIFICATE-----"), "invalid PEM");
+    assert!(
+        cert_pem.contains("-----END CERTIFICATE-----"),
+        "invalid PEM"
+    );
 
     let key_pem = std::fs::read_to_string(&key_path).expect("read key");
     assert!(key_pem.contains("-----BEGIN PRIVATE KEY-----"));

@@ -14,10 +14,10 @@
 //! These tests verify Indexes domain routing + parse_backend extraction.
 //! The actual path-rewriting happens in ngx proxy; we test the upstream logic.
 
+use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::parse::parse_backend;
 use pangolin_core::types::{Domain, Site, Token};
-use chrono::Utc;
 
 fn make_site(name: &str, backend: &str) -> Site {
     Site {

@@ -10,9 +10,9 @@
 //! This is the fastest approach: no server process needed, pure unit-style
 //! integration test of the routing logic.
 
+use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, Site, Token};
-use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Helper: build indexes with a single site + domain

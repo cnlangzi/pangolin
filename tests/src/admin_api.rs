@@ -5,10 +5,10 @@
 //! Tests the DB layer directly (db::list_sites, upsert_site, etc.)
 //! without requiring a running HTTP server.
 
-use std::sync::Arc;
-use tempfile::TempDir;
 use chrono::Utc;
 use rusqlite::Connection;
+use std::sync::Arc;
+use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::types::{Cert, Domain, Site, Token, Tun};

@@ -97,7 +97,12 @@ async fn handle_http_stream(mut stream: TcpStream, requests: Arc<Mutex<Vec<HttpR
     let mut host = "unknown".to_string();
     for line in &lines[1..] {
         if line.to_lowercase().starts_with("host:") {
-            host = line.split(':').nth(1).unwrap_or("unknown").trim().to_string();
+            host = line
+                .split(':')
+                .nth(1)
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
             break;
         }
     }
@@ -179,11 +184,14 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 
     log::info!("[proxy] connecting to backend_url={}", backend_url);
 
-
     // file:/// backend: serve static file directly
     if backend_url.trim().starts_with("file:///") {
         let file_path = backend_url.trim_start_matches("file:///");
-        log::info!("[proxy] file_path={}, exists={}", file_path, std::path::Path::new(file_path).exists());
+        log::info!(
+            "[proxy] file_path={}, exists={}",
+            file_path,
+            std::path::Path::new(file_path).exists()
+        );
         let content = match tokio::fs::read(file_path).await {
             Ok(c) => c,
             Err(e) => {
@@ -224,8 +232,6 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
         return;
     }
 
-
-
     let (backend_host, backend_port) = match MockHttpBackend::parse_http_url(&backend_url) {
         Some((h, p)) => (h, p),
         None => {
@@ -235,7 +241,11 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
         }
     };
 
-    log::info!("[proxy] TCP connecting to {}:{}", backend_host, backend_port);
+    log::info!(
+        "[proxy] TCP connecting to {}:{}",
+        backend_host,
+        backend_port
+    );
 
     let mut backend = match TcpStream::connect(format!("{}:{}", backend_host, backend_port)).await {
         Ok(s) => s,

@@ -71,7 +71,10 @@ fn backend_tunnel_file() {
 fn backend_unsupported_scheme() {
     let result = parse_backend("mailto:foo@bar.com");
     assert!(result.is_err(), "mailto should be unsupported");
-    assert!(matches!(result.unwrap_err(), ParseError::UnsupportedScheme(_)));
+    assert!(matches!(
+        result.unwrap_err(),
+        ParseError::UnsupportedScheme(_)
+    ));
 
     let result = parse_backend("ftp://x.com");
     assert!(result.is_err(), "ftp should be unsupported");

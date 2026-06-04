@@ -2,10 +2,10 @@
 //!
 //! Covers: tests/CHECKLIST.md → Token Auth (7 tests, up from 5)
 
+use chrono::Utc;
+use rusqlite::Connection;
 use std::sync::Arc;
 use tempfile::TempDir;
-use rusqlite::Connection;
-use chrono::Utc;
 
 use pangolin_core::db;
 use pangolin_core::index::Indexes;

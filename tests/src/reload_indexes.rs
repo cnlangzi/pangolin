@@ -3,11 +3,11 @@
 //! Covers: tests/E2E_PLAN.md → reload_indexes_triggered
 //! Directly tests App::reload_indexes() method behavior.
 
-use std::sync::Arc;
-use std::path::PathBuf;
-use tempfile::TempDir;
-use rusqlite::Connection;
 use chrono::Utc;
+use rusqlite::Connection;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::types::{Domain, Site, Token};
@@ -81,7 +81,10 @@ async fn reload_indexes_triggered() {
     {
         let idx = app.indexes.read().await;
         let found = pangolin_core::index::lookup_site(&idx, "new-site.example.com");
-        assert!(found.is_some(), "site should be routable after reload_indexes");
+        assert!(
+            found.is_some(),
+            "site should be routable after reload_indexes"
+        );
         assert_eq!(found.unwrap().name, "new-site");
     }
 }
@@ -182,8 +185,8 @@ async fn reload_indexes_no_change_is_idempotent() {
 
     // Get first index state
     let idx1 = app.indexes.read().await;
-    let site1_name = pangolin_core::index::lookup_site(&idx1, "stable-site.com")
-        .map(|s| s.name.clone());
+    let site1_name =
+        pangolin_core::index::lookup_site(&idx1, "stable-site.com").map(|s| s.name.clone());
     let token_count = idx1.token.len();
     drop(idx1);
 
@@ -191,8 +194,8 @@ async fn reload_indexes_no_change_is_idempotent() {
     app.reload_indexes().await;
 
     let idx2 = app.indexes.read().await;
-    let site2_name = pangolin_core::index::lookup_site(&idx2, "stable-site.com")
-        .map(|s| s.name.clone());
+    let site2_name =
+        pangolin_core::index::lookup_site(&idx2, "stable-site.com").map(|s| s.name.clone());
     assert_eq!(idx2.token.len(), token_count);
     assert_eq!(site1_name, site2_name, "index should be unchanged");
 }

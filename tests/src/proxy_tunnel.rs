@@ -8,16 +8,14 @@
 
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite};
-use futures_util::{SinkExt, StreamExt};
 
+use tun::frame::{serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame};
 use tun::test_ws_server::TestWsServer;
-use tun::frame::{
-    serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
-};
 
 // ---------------------------------------------------------------------------
 // Hanging backend server (for timeout tests)
@@ -70,7 +68,10 @@ async fn tunnel_basic() {
     };
 
     let send_buf = serialize_msgpack(&TunnelFrame::Req(req.clone())).unwrap();
-    ws_sender.send(tungstenite::Message::Binary(send_buf.into())).await.unwrap();
+    ws_sender
+        .send(tungstenite::Message::Binary(send_buf.into()))
+        .await
+        .unwrap();
 
     // Simulate backend responding
     let resp_buf = serialize_msgpack(&TunnelFrame::Res(TunnelResponseFrame {
@@ -78,8 +79,12 @@ async fn tunnel_basic() {
         status: 200,
         headers: vec![("Content-Type".into(), "application/json".into())],
         body: b"{\"ok\":true}".to_vec(),
-    })).unwrap();
-    ws_sender.send(tungstenite::Message::Binary(resp_buf.into())).await.unwrap();
+    }))
+    .unwrap();
+    ws_sender
+        .send(tungstenite::Message::Binary(resp_buf.into()))
+        .await
+        .unwrap();
 
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -127,8 +132,12 @@ async fn tunnel_concurrent() {
 
     let buf_a = serialize_msgpack(&TunnelFrame::Req(req_a)).unwrap();
     let buf_b = serialize_msgpack(&TunnelFrame::Req(req_b)).unwrap();
-    let _ = ws_sender.send(tungstenite::Message::Binary(buf_a.into())).await;
-    let _ = ws_sender.send(tungstenite::Message::Binary(buf_b.into())).await;
+    let _ = ws_sender
+        .send(tungstenite::Message::Binary(buf_a.into()))
+        .await;
+    let _ = ws_sender
+        .send(tungstenite::Message::Binary(buf_b.into()))
+        .await;
 
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -163,7 +172,9 @@ async fn tunnel_multi() {
             body: vec![],
         };
         let buf = serialize_msgpack(&TunnelFrame::Req(req)).unwrap();
-        let _ = ws_sender.send(tungstenite::Message::Binary(buf.into())).await;
+        let _ = ws_sender
+            .send(tungstenite::Message::Binary(buf.into()))
+            .await;
     }
 
     // Site B: 2 requests
@@ -176,14 +187,20 @@ async fn tunnel_multi() {
             body: vec![],
         };
         let buf = serialize_msgpack(&TunnelFrame::Req(req)).unwrap();
-        let _ = ws_sender.send(tungstenite::Message::Binary(buf.into())).await;
+        let _ = ws_sender
+            .send(tungstenite::Message::Binary(buf.into()))
+            .await;
     }
 
     ws_sender.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let requests = server.get_requests().await;
-    assert_eq!(requests.len(), 5, "should have 5 total requests from 2 sites");
+    assert_eq!(
+        requests.len(),
+        5,
+        "should have 5 total requests from 2 sites"
+    );
 
     let paths: Vec<_> = requests.iter().map(|r| r.path.clone()).collect();
     assert!(paths.contains(&"/site-a/0".into()));

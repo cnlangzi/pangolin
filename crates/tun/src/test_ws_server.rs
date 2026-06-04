@@ -23,8 +23,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{accept_async, tungstenite};
 
 use crate::frame::{
-    deserialize_msgpack, serialize_msgpack, TunnelFrame, TunnelRequestFrame,
-    TunnelResponseFrame,
+    deserialize_msgpack, serialize_msgpack, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
 };
 
 pub struct TestWsServer {
@@ -94,6 +93,7 @@ impl TestWsServer {
     }
 
     /// Wait for at least `n` requests to be received.
+    #[allow(dead_code)]
     pub async fn wait_for_requests(&self, n: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

@@ -5,9 +5,9 @@
 //! Tests that DELETE removes resources from DB.
 //! Direct DB-level tests (the HTTP routing is tested in admin_api).
 
-use tempfile::TempDir;
-use rusqlite::Connection;
 use chrono::Utc;
+use rusqlite::Connection;
+use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::types::{Domain, Site, Token, Tun};

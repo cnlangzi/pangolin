@@ -271,7 +271,6 @@ impl ProxyHttp for AppProxy {
             }
             return Ok(true);
         } else {
-
             // Direct path: continue to upstream_peer (return Ok(false))
             debug!("Direct proxy: {} → {}", host, url);
             Ok(false)

@@ -6,9 +6,9 @@
 //! This is the critical hot-path: an admin API POST creates data, indexes reload,
 //! and subsequent requests route to the new site.
 
-use tempfile::TempDir;
-use rusqlite::Connection;
 use chrono::Utc;
+use rusqlite::Connection;
+use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::index::Indexes;
@@ -169,7 +169,11 @@ fn admin_reload_token() {
     db::upsert_token(&conn, &token).unwrap();
 
     let indexes = build_indexes(&conn);
-    assert_eq!(indexes.token.get("reload-token"), Some(&true), "enabled token should be active");
+    assert_eq!(
+        indexes.token.get("reload-token"),
+        Some(&true),
+        "enabled token should be active"
+    );
 
     // Disable token
     let mut updated = token.clone();
@@ -177,10 +181,18 @@ fn admin_reload_token() {
     db::upsert_token(&conn, &updated).unwrap();
 
     let indexes = build_indexes(&conn);
-    assert_eq!(indexes.token.get("reload-token"), Some(&false), "disabled token should be inactive");
+    assert_eq!(
+        indexes.token.get("reload-token"),
+        Some(&false),
+        "disabled token should be inactive"
+    );
 
     // Delete token
     db::delete_token(&conn, "reload-token").unwrap();
     let indexes = build_indexes(&conn);
-    assert_eq!(indexes.token.get("reload-token"), None, "deleted token should be absent");
+    assert_eq!(
+        indexes.token.get("reload-token"),
+        None,
+        "deleted token should be absent"
+    );
 }

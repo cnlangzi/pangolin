@@ -98,10 +98,7 @@ async fn handle_http_with_headers(
 
     // Return 200 with header echo
     let body = "OK";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
-        body
-    );
+    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", body);
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
