@@ -16,6 +16,9 @@ mod proxy_tunnel;
 mod admin_api;
 
 #[cfg(feature = "integration")]
+mod admin_reload;
+
+#[cfg(feature = "integration")]
 mod auth;
 
 #[cfg(feature = "integration")]
