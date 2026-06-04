@@ -39,6 +39,9 @@ mod e2e;
 #[cfg(feature = "integration")]
 mod reload_indexes;
 
+#[cfg(feature = "integration")]
+mod upstream_host;
+
 // Force ring as crypto provider for tests (same pattern as acme.rs in ngx crate).
 #[cfg(feature = "integration")]
 #[ctor::ctor]

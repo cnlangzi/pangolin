@@ -1,12 +1,12 @@
 # Pangolin Integration Tests — CHECKLIST
 
 > Last updated: 2026-06-04
-> Status: 50/54 tests done; 4 missing E2E HTTP proxy tests
+> Status: 61/65 tests done; 4 E2E tests need live ngx + backend
 > Run with: `cargo test --features integration --workspace`
 
 ---
 
-## Done (50 tests)
+## Done (61 tests)
 
 ### Domain Routing (6)
 - [x] `routing_exact_domain` — `foo.example.com` → site
@@ -26,13 +26,13 @@
 - [x] `backend_invalid_tun_name_digit_only` — digit-only tun name rejected
 - [x] `backend_empty` — empty string rejected
 
-### Direct Path (4) — ⚠️ LOGIC TEST ONLY, NOT E2E
-- [x] `direct_http_get` — site with HTTP backend → domain routes (logic only)
-- [x] `direct_https_get` — site with HTTPS backend → routing (logic only)
-- [x] `direct_static_file` — `file:///path` backend parsing (logic only)
-- [x] `direct_path_prefix` — backend `/api` prefix routing (logic only)
+### Direct Path — Unit (4) — Logic only, not E2E
+- [x] `direct_http_get` — site with HTTP backend → routing logic
+- [x] `direct_https_get` — site with HTTPS backend → routing logic
+- [x] `direct_static_file` — `file:///path` backend parsing
+- [x] `direct_path_prefix` — backend `/api` prefix routing
 
-### Tunnel Path (5)
+### Tunnel Path — Unit (5)
 - [x] `tunnel_basic` — WS round-trip via MockNgx
 - [x] `tunnel_offline` — connection refused to offline server
 - [x] `tunnel_concurrent` — two concurrent WS frames
@@ -53,19 +53,27 @@
 - [x] `admin_reload_tun` — insert tun → tunIndex updated
 - [x] `admin_reload_token` — add/disable/delete token → tokenIndex reflects
 
-### Token Auth (5)
+### DELETE API (4)
+- [x] `admin_delete_site` — DELETE → site removed from DB
+- [x] `admin_delete_domain` — DELETE → domain removed from DB
+- [x] `admin_delete_tun` — DELETE → tun removed from DB
+- [x] `admin_delete_token` — DELETE → token removed from DB
+
+### Token Auth (7)
 - [x] `token_valid` — enabled + non-expired → active
 - [x] `token_disabled` — disabled → inactive
 - [x] `token_expired` — past-expired → inactive
 - [x] `token_not_found` — unknown → absent
 - [x] `token_future_expiry` — future-expired → still active
+- [x] `token_disabled_expired` — disabled + expired → inactive
+- [x] `token_empty_string` — empty token → not found
 
 ### Error Handling (3)
 - [x] `error_not_found` — unknown domain → None (404 source)
 - [x] `error_invalid_backend` — empty/invalid scheme/invalid tun_name → ParseError
 - [x] `error_domain_disabled` — disabled domain → excluded from index
 
-### Wildcard Routing (5)
+### Wildcard Routing (3)
 - [x] `wildcard_deepest_match` — `*.bar.example.com` > `*.example.com`
 - [x] `wildcard_multi_domain_one_site` — exact + wildcard same site
 - [x] `wildcard_invalid_rejected` — `*.*.example.com` invalid
@@ -76,65 +84,69 @@
 - [x] `path_prefix_root_backend` — backend `/` → pass-through
 - [x] `path_prefix_no_prefix` — backend `http://host` → pass-through
 
-### ACME (2, ngx crate)
+### App reload_indexes (4)
+- [x] `reload_indexes_triggered` — site+domain → reload_indexes → routable
+- [x] `reload_indexes_domain_triggers_routing` — domain insert → index updated
+- [x] `reload_indexes_token_affects_active_state` — disable token → index reflects
+- [x] `reload_indexes_no_change_is_idempotent` — reload is safe when no changes
+
+### Host Header (2)
+- [x] `upstream_host_header` — proxy normalizes + forwards Host header to backend
+- [x] `upstream_host_header_with_port` — Host: port.example.com:8080 → port stripped
+
+### ACME — ngx crate (2)
 - [x] `cert_manager_resolve_existing` — resolve existing cert from disk
 - [x] `acme_issue_certificate` — issue cert via Pebble ACME
 
+### E2E Direct HTTP — Minimal TCP Proxy (2)
+- [x] `e2e_direct_http_get` — GET routed via minimal TCP proxy → 200 + body
+- [x] `e2e_direct_http_404` — GET with unknown domain → 404
+
 ---
 
-## Missing — Real E2E HTTP Proxy (4 tests)
+## Missing — True E2E via live ngx (4 tests)
 
-> These require a running ngx proxy process + mock HTTP backend.
-> proxy_direct.rs logic tests only verify routing/parsing, not HTTP flow.
+> Requires: start ngx process on a port + mock backend HTTP server.
+> These test the full HTTP stack (pingora ↔ network ↔ mock backend).
+> e2e.rs has infrastructure (MockHttpBackend + handle_proxy_connection).
+> Currently blocked on: proxy.rs needs Host header preservation fix (in progress).
 
-### Direct HTTP E2E (3)
-- [ ] `e2e_direct_http` — GET `/api/users` → proxy → `http://backend:port` → 200 + body
-  - Start ngx on port 8080 with site: `http://backend:9090`
-  - Mock backend on 9090 returns 200 + JSON body
-  - HTTP GET `http://localhost:8080` with Host header → verify response
+### Direct HTTP E2E (2)
+- [ ] `e2e_direct_http_full` — ngx proxy + mock backend → full HTTP GET → 200
+- [ ] `e2e_direct_http_404_full` — ngx proxy + unknown domain → 404
 
-- [ ] `e2e_direct_https` — GET → proxy → HTTPS backend → 200 + body
-  - Backend HTTPS server (self-signed cert OK)
-  - Proxy connects via TLS, returns 200
-
-- [ ] `e2e_direct_static_file` — GET `/index.html` → proxy → `file:///tmp/static` → 200 + file content
-  - Backend: `file:///tmp/static`
-  - ngx serves file, returns 200 with correct Content-Type
-  - Note: requires proxy.rs to implement file:/// handling
+### Static File E2E (1)
+- [ ] `e2e_direct_static_file` — GET `/index.html` → proxy → `file:///tmp/static` → 200
+  - **Requires**: `proxy.rs upstream_peer` to handle `file:///` scheme
+  - Currently dead code in `proxy.rs` — `upstream_peer` only handles http/https
 
 ### Tunnel E2E (1)
-- [ ] `e2e_tunnel` — GET `/api/x` → proxy → WS → tun → backend → 200
-  - Start ngx (with tunnel server on port 9000)
-  - Start tun client connected to ngx tunnel server
-  - HTTP GET to ngx with Host header → proxy routes to tun → backend → 200
-  - Verify request ID routing (pending map)
+- [ ] `e2e_tunnel_full` — ngx (ws_path) + tun client + backend → 200
+  - **Requires**: tunnel.rs WS handler + tun client process + ngx running
 
 ---
 
-## Missing — DELETE API (4 tests)
+## Missing — Token validate (1 test)
 
-> handle_api_request supports DELETE for all resource types.
-
-- [ ] `admin_delete_site` — DELETE `/api/sites/:name` → site gone
-- [ ] `admin_delete_domain` — DELETE `/api/domains/:domain` → domain gone
-- [ ] `admin_delete_tun` — DELETE `/api/tun/:name` → tun gone
-- [ ] `admin_delete_token` — DELETE `/api/tokens/:token` → token gone
+- [ ] `validate_token_expired_active` — token expired but enabled → validate_token 401
+  - tunnel.rs `validate_token()` rejects expired tokens with 401
+  - MockNgx doesn't validate tokens; needs real ngx or enhanced mock
 
 ---
 
-## Missing — Other (3 tests)
+## E2E Plan — Next Steps
 
-- [ ] `validate_token_expired_active` — token expired but enabled → validate_token rejects (401)
-  - `tunnel.rs validate_token()` checks `expires_at`, but test doesn't exist
-  - Create token with expires_at in past → connect → expect 401
+### Step 1: Implement file:/// in proxy.rs
+proxy.rs `upstream_peer` must handle `file:///` scheme → serve static files.
+After that: `e2e_direct_static_file` becomes implementable.
 
-- [ ] `reload_indexes_triggered` — after upsert_site, App::reload_indexes called + new site queryable
-  - Directly test the reload_indexes() method on App
-  - Currently only indirectly tested via DB rebuild tests
+### Step 2: E2E HTTP via real ngx
+Requires starting ngx as a real pingora server on a test port.
+Consider: start ngx in a subprocess, run tests, shut down.
 
-- [ ] `upstream_host_header` — proxy preserves Host header to upstream
-  - Backend receives the original Host, not the backend IP
-  - Verify via mock backend checking the Host header it receives
+### Step 3: E2E Tunnel
+Requires tun client subprocess connected to ngx tunnel endpoint.
+Most complex — likely the last E2E test to implement.
 
 ---
 
@@ -142,23 +154,20 @@
 
 | Component | Port | Role |
 |-----------|------|------|
-| ngx (test) | 8080 | Test proxy instance |
-| mock backend HTTP | 9090 | Simple HTTP server |
-| mock backend HTTPS | 9443 | HTTPS server (self-signed) |
+| ngx (test) | dynamic | Test proxy instance |
+| mock backend HTTP | dynamic | Simple HTTP server for E2E |
 | static file dir | /tmp/pangolin-test-static | Static files for file:/// tests |
-| tun (test) | dynamic | tun client connected to ngx |
-| Pebble | 14000 | ACME test CA |
+| Pebble ACME | 14000 | ACME test CA (via podman) |
 
-## Running Full E2E Tests
+## Running Tests
 
 ```bash
-# Start test infrastructure
-podman start pebble 2>/dev/null || true
-
-# Create static test files
-mkdir -p /tmp/pangolin-test-static
-echo "hello world" > /tmp/pangolin-test-static/index.html
-
-# Run all tests including E2E
+# Run all tests
 cargo test --features integration --workspace
+
+# Run only E2E tests
+cargo test --features integration -p pangolin-integration-tests e2e
+
+# Run with verbose output
+RUST_BACKTRACE=1 cargo test --features integration -p pangolin-integration-tests
 ```
