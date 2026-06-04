@@ -6,9 +6,10 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel in-progress runs when a new commit is pushed to the same ref.
+# Cancel in-progress runs when the same PR gets a new push.
+# Use PR number as group key so push events don't cancel PR runs and vice versa.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -18,7 +19,6 @@ env:
 jobs:
   # ----------------------------------------------------------------
   # Rust build + unit tests
-  # All steps reuse Makefile targets so local and CI stay in sync.
   # ----------------------------------------------------------------
   rust:
     name: Rust build + unit tests
@@ -43,7 +43,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Runs: fmt --check + clippy -D warnings + test
       - name: make lint
         run: make lint
 
@@ -51,8 +50,7 @@ jobs:
         run: make build
 
   # ----------------------------------------------------------------
-  # Integration tests — ACME with Pebble (letsencrypt/pebble:latest)
-  # Runs only when integration feature is available (on PR and branch pushes).
+  # Integration tests — ACME with Pebble
   # ----------------------------------------------------------------
   integration:
     name: ACME integration tests (Pebble)
@@ -60,11 +58,10 @@ jobs:
     services:
       pebble:
         image: ghcr.io/letsencrypt/pebble:latest
-        container-name: pebble
         ports:
-          - "14000:14000"   # ACME endpoint
-          - "5001:5001"     # pebble-challtestsrv (not used but exposed)
-          - "15000:15000"   # pebble-challtestsrv alt port
+          - "14000:14000"
+          - "5001:5001"
+          - "15000:15000"
         env:
           PEBBLE_VA_NOSLEEP: "1"
           PEBBLE_VA_ALWAYS_VALID: "1"
@@ -89,10 +86,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-integration-
 
-      # Resolve localhost.test → 127.0.0.1 so Pebble VA can reach the challenge server.
       - name: Add hosts entry for localhost.test
         run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
 
-      # make test-integration runs: cargo test --workspace --features integration
       - name: make test-integration
         run: make test-integration
