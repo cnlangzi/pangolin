@@ -32,7 +32,7 @@ pub async fn render_form_new(csrf: &str) -> http::Result<Response<Full<Bytes>>> 
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
     drop(db);

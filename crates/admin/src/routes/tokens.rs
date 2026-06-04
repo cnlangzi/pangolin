@@ -24,7 +24,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     ok_html(crate::render_with_assets_and_csrf(crate::templates::TokensTemplate { tokens, active_nav: "tokens" }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tokens = pangolin_core::db::list_tokens(&db).unwrap_or_default();
     drop(db);
@@ -66,7 +66,7 @@ pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<F
   </td>
 </tr>"##,
             t.token, t.token, status_class, status_text,
-            t.created_at.format("%Y-%m-%d").to_string(), expires_str,
+            t.created_at.format("%Y-%m-%d"), expires_str,
             t.token, t.token
         )
     }).collect();
@@ -123,7 +123,7 @@ fn render_form_with_error(token: Option<pangolin_core::types::Token>, error: &st
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_delete(app: &Arc<App>, token: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(app: &Arc<App>, token: Option<String>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let token = match token {
         Some(t) if !t.is_empty() => t,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing token</p>"##.to_string()),

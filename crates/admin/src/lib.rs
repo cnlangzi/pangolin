@@ -40,7 +40,7 @@ pub async fn handle(
     body: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
     // ── Auth check ──────────────────────────────────────────────────
-    let parsed_cookie = cookie_header.and_then(|h| state::parse_session_cookie(h));
+    let parsed_cookie = cookie_header.and_then(state::parse_session_cookie);
     let session_token = match parsed_cookie {
         Some(t) if sessions.validate(&t).await => Some(t),
         _ => None,
@@ -76,7 +76,7 @@ pub async fn handle(
     {
         let session_token_str = session_token.as_deref().unwrap_or("");
         let csrf_from_form = query_param_opt(&body, "_csrf");
-        let csrf_from_cookie = cookie_header.and_then(|h| state::parse_csrf_cookie(h));
+        let csrf_from_cookie = cookie_header.and_then(state::parse_csrf_cookie);
         let csrf = csrf_from_form.or(csrf_from_cookie);
         match csrf {
             Some(t) if sessions.verify_csrf(session_token_str, &t).await => {}
@@ -224,7 +224,7 @@ pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(render_with_assets_and_csrf(body, csrf))))
-        .map_err(|e| e.into())
+        .map_err(|e| e)
 }
 
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {

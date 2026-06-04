@@ -15,7 +15,7 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
-        .map_err(|e| e.into())
+        .map_err(|e| e)
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {

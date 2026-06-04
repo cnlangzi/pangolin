@@ -158,7 +158,7 @@ pub async fn handle_update(app: &Arc<App>, name: Option<String>, body: &[u8], cs
     }
 }
 
-pub async fn handle_delete(app: &Arc<App>, name: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(app: &Arc<App>, name: Option<String>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {

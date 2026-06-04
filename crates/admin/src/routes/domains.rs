@@ -25,7 +25,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     ok_html(crate::render_with_assets_and_csrf(crate::templates::DomainsTemplate { domains, sites, active_nav: "domains" }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     drop(db);
@@ -104,7 +104,7 @@ async fn render_form_with_error(app: &Arc<App>, error: &str, csrf: &str) -> http
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_delete(app: &Arc<App>, domain: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(app: &Arc<App>, domain: Option<String>, _csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let domain = match domain {
         Some(d) if !d.is_empty() => d,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing domain</p>"##.to_string()),
