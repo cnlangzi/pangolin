@@ -17,16 +17,22 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
     drop(db);
     let now = chrono::Utc::now();
-    let body = crate::templates::CertsTemplate { certs, active_nav: "certs", now: &now }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(crate::templates::CertsTemplate { certs, active_nav: "certs", now: &now }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_form_new(csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = crate::templates::CertFormTemplate { error: None }
+        .render()
+        .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
     drop(db);
@@ -67,7 +73,7 @@ pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>>
     ok_html(rows.join(""))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let cert_file = params.get("cert_file").cloned().unwrap_or_default();
@@ -78,8 +84,14 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
         }
     });
 
-    if domain.is_empty() || cert_file.is_empty() || key_file.is_empty() {
-        return ok_html(r##"<p class="text-red-500 text-sm">Domain, cert_file, and key_file are required</p>"##.to_string());
+    if domain.is_empty() {
+        return render_form_with_error("Domain is required", csrf);
+    }
+    if cert_file.is_empty() {
+        return render_form_with_error("Certificate file path is required", csrf);
+    }
+    if key_file.is_empty() {
+        return render_form_with_error("Key file path is required", csrf);
     }
 
     let c = pangolin_core::types::Cert {
@@ -98,8 +110,15 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
         Ok(()) => {
             ok_html(r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Cert added</div></div>"##.to_string())
         }
-        Err(e) => ok_html(format!(r##"<p class="text-red-500 text-sm">Error: {}</p>"##, e)),
+        Err(e) => render_form_with_error(&format!("Database error: {}", e), csrf),
     }
+}
+
+fn render_form_with_error(error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = crate::templates::CertFormTemplate { error: Some(error) }
+        .render()
+        .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
 fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {

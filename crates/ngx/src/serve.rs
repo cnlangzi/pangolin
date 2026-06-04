@@ -78,6 +78,28 @@ impl ServeHttp for AppHttp {
 }
 
 /// Serve admin UI by delegating to the external admin crate.
+fn serve_css() -> http::Response<Vec<u8>> {
+    // Read the CSS file at runtime from `assets/app.css` relative to the
+    // current working directory. This lets ops rebuild CSS without recompiling
+    // the binary (`npm run build` regenerates `assets/app.css`).
+    //
+    // If the file is not found (e.g. running from a different working
+    // directory), fall back to the compile-time embed so the UI still works.
+    let css = std::fs::read("assets/app.css")
+        .or_else(|_| std::fs::read("../assets/app.css"))
+        .or_else(|_| std::fs::read("../../assets/app.css"))
+        .unwrap_or_else(|_| {
+            // Fallback: embedded at build time.
+            include_str!("../../../assets/app.css").as_bytes().to_vec()
+        });
+
+    http::Response::builder()
+        .status(200)
+        .header("Content-Type", "text/css; charset=utf-8")
+        .header("Cache-Control", "no-cache, must-revalidate")
+        .body(css)
+        .unwrap()
+}
 async fn serve_admin_ui(
     http_session: &mut ServerSession,
     app: &Arc<App>,
@@ -87,13 +109,7 @@ async fn serve_admin_ui(
 ) -> http::Response<Vec<u8>> {
     // Static CSS file
     if path == "/admin/app.css" || path == "/admin/assets/app.css" {
-        let css = include_str!("../../../assets/app.css");
-        return http::Response::builder()
-            .status(200)
-            .header("Content-Type", "text/css; charset=utf-8")
-            .header("Cache-Control", "public, max-age=3600")
-            .body(css.as_bytes().to_vec())
-            .unwrap();
+        return serve_css();
     }
 
     // Get cookie header

@@ -6,7 +6,10 @@ use http::{Response, StatusCode};
 use http_body_util::Full;
 use bytes::Bytes as Buf;
 
-use crate::state::{make_session_cookie, make_logout_cookie, SessionStore};
+use crate::state::{
+    make_csrf_cookie, make_logout_cookie, make_logout_csrf_cookie, make_session_cookie,
+    SessionStore,
+};
 use crate::App;
 
 /// Serve the login page HTML.
@@ -42,7 +45,7 @@ pub async fn handle_login(
     }
 
     if form_username == app.config.admin.username && form_password == app.config.admin.password {
-        let token = sessions.create_session(&form_username).await;
+        let (token, csrf) = sessions.create_session(&form_username).await;
         let redirect_to = if form_next.is_empty() {
             "/admin/".to_string()
         } else {
@@ -52,6 +55,7 @@ pub async fn handle_login(
             .status(StatusCode::FOUND)
             .header("Location", &redirect_to)
             .header("Set-Cookie", make_session_cookie(&token))
+            .header("Set-Cookie", make_csrf_cookie(&csrf))
             .body(Full::new(Buf::from("Redirecting...")))
             .unwrap();
         return Ok(resp);
@@ -75,6 +79,7 @@ pub async fn handle_logout(
         .status(StatusCode::FOUND)
         .header("Location", "/admin/login")
         .header("Set-Cookie", make_logout_cookie())
+        .header("Set-Cookie", make_logout_csrf_cookie())
         .body(Full::new(Buf::from("Redirecting...")))
         .unwrap();
     Ok(resp)

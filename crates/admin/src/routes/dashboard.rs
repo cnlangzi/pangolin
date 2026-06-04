@@ -18,7 +18,7 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .map_err(|e| e.into())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
@@ -38,5 +38,5 @@ pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
         cert_count: certs.len(),
     };
 
-    ok_html(dashboard.render().unwrap())
+    ok_html(crate::render_with_assets_and_csrf(dashboard.render().unwrap(), csrf))
 }

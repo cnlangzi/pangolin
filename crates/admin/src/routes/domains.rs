@@ -17,16 +17,15 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     drop(db);
-    let body = crate::templates::DomainsTemplate { domains, sites, active_nav: "domains" }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(crate::templates::DomainsTemplate { domains, sites, active_nav: "domains" }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     drop(db);
@@ -60,16 +59,19 @@ pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>>
     ok_html(rows.join(""))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let site_name = params.get("site_name").cloned().unwrap_or_default();
 
-    if domain.is_empty() || site_name.is_empty() {
-        return ok_html(r##"<p class="text-red-500 text-sm">Domain and site are required</p>"##.to_string());
+    if domain.is_empty() {
+        return render_form_with_error(app, "Domain name is required", csrf).await;
+    }
+    if site_name.is_empty() {
+        return render_form_with_error(app, "Please select a site", csrf).await;
     }
     if !pangolin_core::is_valid_domain(&domain) {
-        return ok_html(r##"<p class="text-red-500 text-sm">Invalid domain format</p>"##.to_string());
+        return render_form_with_error(app, "Invalid domain format (use example.com, no scheme)", csrf).await;
     }
 
     let d = pangolin_core::types::Domain {
@@ -88,11 +90,21 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
             app.reload_indexes().await;
             ok_html(r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Domain created</div></div>"##.to_string())
         }
-        Err(e) => ok_html(format!(r##"<p class="text-red-500 text-sm">Error: {}</p>"##, e)),
+        Err(e) => render_form_with_error(app, &format!("Database error: {}", e), csrf).await,
     }
 }
 
-pub async fn handle_delete(app: &Arc<App>, domain: Option<String>) -> http::Result<Response<Full<Bytes>>> {
+async fn render_form_with_error(app: &Arc<App>, error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let db = app.db.lock().await;
+    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    drop(db);
+    let html = crate::templates::DomainFormTemplate { sites, error: Some(error) }
+        .render()
+        .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+pub async fn handle_delete(app: &Arc<App>, domain: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let domain = match domain {
         Some(d) if !d.is_empty() => d,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing domain</p>"##.to_string()),

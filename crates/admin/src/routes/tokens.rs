@@ -17,15 +17,14 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tokens = pangolin_core::db::list_tokens(&db).unwrap_or_default();
     drop(db);
-    let body = crate::templates::TokensTemplate { tokens, active_nav: "tokens" }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(crate::templates::TokensTemplate { tokens, active_nav: "tokens" }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tokens = pangolin_core::db::list_tokens(&db).unwrap_or_default();
     drop(db);
@@ -74,28 +73,14 @@ pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>>
     ok_html(rows.join(""))
 }
 
-pub async fn render_form_new(_app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
-    let body = r##"<form method="POST" action="/admin/api/tokens" class="space-y-4">
-  <div>
-    <label class="block text-sm font-medium text-slate-700 mb-1">Token</label>
-    <input type="text" name="token" required placeholder="my-token-key"
-      class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500">
-    <p class="text-xs text-slate-500 mt-1">Lowercase letters, numbers, hyphens. 1 to 32 chars.</p>
-  </div>
-  <div>
-    <label class="block text-sm font-medium text-slate-700 mb-1">Expires at (optional)</label>
-    <input type="date" name="expires_at"
-      class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500">
-  </div>
-  <div class="flex gap-2 pt-2">
-    <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg">Create</button>
-    <button type="button" hx-get="/admin/api/tokens" hx-target="#modal-body" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium rounded-lg">Cancel</button>
-  </div>
-</form>"##.to_string();
-    ok_html(body)
+pub async fn render_form_new(_app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = crate::templates::TokenFormTemplate { token: None, error: None }
+        .render()
+        .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let token = params.get("token").cloned().unwrap_or_default();
     let expires_at = params.get("expires_at").and_then(|s| {
@@ -105,10 +90,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
     });
 
     if token.is_empty() {
-        return ok_html(r##"<p class="text-red-500 text-sm">Token name is required</p>"##.to_string());
+        return render_form_with_error(None, "Token name is required", csrf);
     }
     if !pangolin_core::is_valid_tun_name(&token) {
-        return ok_html(r##"<p class="text-red-500 text-sm">Invalid token name format</p>"##.to_string());
+        return render_form_with_error(None, "Token name must be lowercase letters, digits, or hyphens (1-32 chars)", csrf);
     }
 
     let t = pangolin_core::types::Token {
@@ -127,11 +112,18 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
             app.reload_indexes().await;
             ok_html(r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Token created</div></div>"##.to_string())
         }
-        Err(e) => ok_html(format!(r##"<p class="text-red-500 text-sm">Error: {}</p>"##, e)),
+        Err(e) => render_form_with_error(None, &format!("Database error: {}", e), csrf),
     }
 }
 
-pub async fn handle_delete(app: &Arc<App>, token: Option<String>) -> http::Result<Response<Full<Bytes>>> {
+fn render_form_with_error(token: Option<pangolin_core::types::Token>, error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = crate::templates::TokenFormTemplate { token, error: Some(error) }
+        .render()
+        .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+pub async fn handle_delete(app: &Arc<App>, token: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let token = match token {
         Some(t) if !t.is_empty() => t,
         _ => return ok_html(r##"<p class="text-red-500 text-sm">Missing token</p>"##.to_string()),

@@ -27,7 +27,7 @@
         <td class="px-4 py-3">
           <div class="flex items-center justify-end gap-1">
             <button hx-delete="/admin/api/certs"
-              hx-vals='{"id": "{{ cert.domain }}"}'
+              hx-vals='{"id": "{{ cert.domain }}", "_csrf": "__CSRF__"}'
               hx-confirm="Delete cert for {{ cert.domain }}?"
               hx-swap="delete"
               class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 transition-colors"
@@ -60,7 +60,7 @@
       </div>
       <div class="text-xs text-slate-500 mb-3">Expires {% if let Some(e) = cert.expires_at %}{{ e.format("%Y-%m-%d") }}{% else %}never{% endif %}</div>
       <button hx-delete="/admin/api/certs"
-        hx-vals='{"id": "{{ cert.domain }}"}'
+        hx-vals='{"id": "{{ cert.domain }}", "_csrf": "__CSRF__"}'
         hx-confirm="Delete cert for {{ cert.domain }}?"
         class="w-full text-center text-sm text-red-500 hover:text-red-600 border border-red-100 hover:bg-red-50 rounded-lg py-1.5 transition-colors">
         Delete

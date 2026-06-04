@@ -18,30 +18,27 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let body = SitesTemplate { sites, active_nav: "sites" }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(SitesTemplate { sites, active_nav: "sites" }.render().unwrap(), csrf))
 }
 
-pub async fn render_table(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let body = SitesTableTemplate { sites }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(SitesTableTemplate { sites }.render().unwrap(), csrf))
 }
 
-pub async fn render_form_new(_app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
-    let body = SiteFormTemplate {
+pub async fn render_form_new(_app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    ok_html(crate::render_with_assets_and_csrf(SiteFormTemplate {
         site: None,
         action: "create",
         error: None,
-    }.render().unwrap();
-    ok_html(body)
+    }.render().unwrap(), csrf))
 }
 
-pub async fn render_form_edit(app: &Arc<App>, name: Option<String>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_form_edit(app: &Arc<App>, name: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -54,24 +51,24 @@ pub async fn render_form_edit(app: &Arc<App>, name: Option<String>) -> http::Res
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let site = sites.into_iter().find(|s| s.name == name);
     drop(db);
-    let body = SiteFormTemplate {
+    ok_html(crate::render_with_assets_and_csrf(SiteFormTemplate {
         site,
         action: "update",
         error: None,
-    }.render().unwrap();
-    ok_html(body)
+    }.render().unwrap(), csrf))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
     let backend = params.get("backend").cloned().unwrap_or_default();
 
-    if name.is_empty() || backend.is_empty() {
-        return ok_html(r#"<p class="text-red-500 text-sm">Name and backend are required</p>"#.to_string());
+    // Field-level validation: return the form with the error inline.
+    if name.is_empty() {
+        return render_form_with_error(None, "Site name is required", csrf);
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
-        return ok_html(format!(r#"<p class="text-red-500 text-sm">Invalid backend: {}</p>"#, e));
+        return render_form_with_error(None, &format!("Invalid backend: {}", e), csrf);
     }
 
     let site = pangolin_core::types::Site {
@@ -89,16 +86,33 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8]) -> http::Result<Response
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            let body = SitesTableTemplate {
-                sites: vec![site.clone()],
-            }.render().unwrap();
-            ok_html(format!(r##"<tr hx-swap-oob="true" id="tunnel-{}">{}</tr>"##, site.name, body))
+            // Return the new row as OOB swap + a success toast.
+            let row = SitesTableTemplate { sites: vec![site.clone()] }
+                .render()
+                .unwrap();
+            let toast = r##"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Site created</div></div>"##;
+            ok_html(format!(
+                r##"<div hx-swap-oob="true" id="form-result"></div><tr hx-swap-oob="afterbegin:#sites-tbody">{}</tr>{}"##,
+                row, toast
+            ))
         }
-        Err(e) => ok_html(format!(r#"<p class="text-red-500 text-sm">Error: {}</p>"#, e)),
+        Err(e) => render_form_with_error(None, &format!("Database error: {}", e), csrf),
     }
 }
 
-pub async fn handle_update(app: &Arc<App>, name: Option<String>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
+/// Render the site form with an inline error message.
+fn render_form_with_error(site: Option<pangolin_core::types::Site>, error: &str, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = SiteFormTemplate {
+        site,
+        action: "create",
+        error: Some(error),
+    }
+    .render()
+    .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+pub async fn handle_update(app: &Arc<App>, name: Option<String>, body: &[u8], csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -111,10 +125,16 @@ pub async fn handle_update(app: &Arc<App>, name: Option<String>, body: &[u8]) ->
     let backend = params.get("backend").cloned().unwrap_or_default();
 
     if backend.is_empty() {
-        return ok_html(r#"<p class="text-red-500 text-sm">Backend is required</p>"#.to_string());
+        return render_form_with_error(Some(pangolin_core::types::Site {
+            name: name.clone(),
+            backend: String::new(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }), "Backend is required", csrf);
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
-        return ok_html(format!(r#"<p class="text-red-500 text-sm">Invalid backend: {}</p>"#, e));
+        return render_form_with_error(None, &format!("Invalid backend: {}", e), csrf);
     }
 
     let site = pangolin_core::types::Site {
@@ -134,11 +154,11 @@ pub async fn handle_update(app: &Arc<App>, name: Option<String>, body: &[u8]) ->
             app.reload_indexes().await;
             ok_html(r#"<div id="toast" class="fixed bottom-4 right-4 z-50"><div class="bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg text-sm">Site updated</div></div>"#.to_string())
         }
-        Err(e) => ok_html(format!(r#"<p class="text-red-500 text-sm">Error: {}</p>"#, e)),
+        Err(e) => render_form_with_error(None, &format!("Database error: {}", e), csrf),
     }
 }
 
-pub async fn handle_delete(app: &Arc<App>, name: Option<String>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn handle_delete(app: &Arc<App>, name: Option<String>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {

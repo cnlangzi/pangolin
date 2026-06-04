@@ -17,10 +17,9 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     drop(db);
-    let body = crate::templates::TunnelsTemplate { tuns, active_nav: "tun" }.render().unwrap();
-    ok_html(body)
+    ok_html(crate::render_with_assets_and_csrf(crate::templates::TunnelsTemplate { tuns, active_nav: "tun" }.render().unwrap(), csrf))
 }

@@ -40,9 +40,11 @@ pub async fn handle(
     body: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
     // ── Auth check ──────────────────────────────────────────────────
-    let session_token = cookie_header
-        .and_then(|h| state::parse_session_cookie(h))
-        .filter(|t| sessions.is_valid(t));
+    let parsed_cookie = cookie_header.and_then(|h| state::parse_session_cookie(h));
+    let session_token = match parsed_cookie {
+        Some(t) if sessions.validate(&t).await => Some(t),
+        _ => None,
+    };
 
     let is_auth_page = path == "/admin/login" || path == "/admin/login/";
 
@@ -64,72 +66,105 @@ pub async fn handle(
     }
 
     // ── Route dispatch ───────────────────────────────────────────────
+    // ── CSRF check on mutating methods ──────────────────────────────
+    // Skip CSRF for login (no session yet) and logout (CSRF is part of auth).
+    let is_login = path == "/admin/login" || path == "/admin/login/";
+    let is_logout = path == "/admin/logout";
+    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        && !is_login
+        && !is_logout
+    {
+        let session_token_str = session_token.as_deref().unwrap_or("");
+        let csrf_from_form = query_param_opt(&body, "_csrf");
+        let csrf_from_cookie = cookie_header.and_then(|h| state::parse_csrf_cookie(h));
+        let csrf = csrf_from_form.or(csrf_from_cookie);
+        match csrf {
+            Some(t) if sessions.verify_csrf(session_token_str, &t).await => {}
+            _ => {
+                return Ok(forbidden_response(
+                    "CSRF token missing or invalid. Please reload the page and try again.",
+                ));
+            }
+        }
+    }
+
     let path = path.trim_start_matches("/admin").trim_start_matches('/');
+
+    // Look up the CSRF token for the current session (if any). For unauthenticated
+    // requests (login page), this is empty.
+    let csrf_token: String = if let Some(ref st) = session_token {
+        sessions.csrf_for(st).await.unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let res: Response<Full<Bytes>> = match path {
         "" | "dashboard" => {
-            routes::dashboard::render(&app).await?
+            routes::dashboard::render(&app, &csrf_token).await?
         }
         "sites" => {
-            routes::sites::render(&app).await?
+            routes::sites::render(&app, &csrf_token).await?
         }
         "domains" => {
-            routes::domains::render(&app).await?
+            routes::domains::render(&app, &csrf_token).await?
         }
         "tun" => {
-            routes::tun::render(&app).await?
+            routes::tun::render(&app, &csrf_token).await?
         }
         "tokens" => {
-            routes::tokens::render(&app).await?
+            routes::tokens::render(&app, &csrf_token).await?
         }
         "certs" => {
-            routes::certs::render(&app).await?
+            routes::certs::render(&app, &csrf_token).await?
         }
         // htmx partials (return HTML fragments)
         "api/sites" if method == "GET" => {
-            routes::sites::render_table(&app).await?
+            routes::sites::render_table(&app, &csrf_token).await?
         }
         "api/sites/new" => {
-            routes::sites::render_form_new(&app).await?
+            routes::sites::render_form_new(&app, &csrf_token).await?
         }
         "api/sites/edit" => {
-            routes::sites::render_form_edit(&app, query_param_opt(&body, "name")).await?
+            routes::sites::render_form_edit(&app, query_param_opt(&body, "name"), &csrf_token).await?
         }
         "api/sites" if method == "POST" => {
-            routes::sites::handle_create(&app, &body).await?
+            routes::sites::handle_create(&app, &body, &csrf_token).await?
         }
         "api/sites" if method == "PUT" => {
-            routes::sites::handle_update(&app, query_param_opt(&body, "name"), &body).await?
+            routes::sites::handle_update(&app, query_param_opt(&body, "name"), &body, &csrf_token).await?
         }
         "api/sites" if method == "DELETE" => {
-            routes::sites::handle_delete(&app, query_param_opt(&body, "name")).await?
+            routes::sites::handle_delete(&app, query_param_opt(&body, "name"), &csrf_token).await?
         }
         "api/domains" if method == "GET" => {
-            routes::domains::render_table(&app).await?
+            routes::domains::render_table(&app, &csrf_token).await?
         }
         "api/domains" if method == "POST" => {
-            routes::domains::handle_create(&app, &body).await?
+            routes::domains::handle_create(&app, &body, &csrf_token).await?
         }
         "api/domains" if method == "DELETE" => {
-            routes::domains::handle_delete(&app, query_param_opt(&body, "domain")).await?
+            routes::domains::handle_delete(&app, query_param_opt(&body, "domain"), &csrf_token).await?
         }
         "api/tokens" if method == "GET" => {
-            routes::tokens::render_table(&app).await?
+            routes::tokens::render_table(&app, &csrf_token).await?
         }
         "api/tokens/new" => {
-            routes::tokens::render_form_new(&app).await?
+            routes::tokens::render_form_new(&app, &csrf_token).await?
         }
         "api/tokens" if method == "POST" => {
-            routes::tokens::handle_create(&app, &body).await?
+            routes::tokens::handle_create(&app, &body, &csrf_token).await?
         }
         "api/tokens" if method == "DELETE" => {
-            routes::tokens::handle_delete(&app, query_param_opt(&body, "token")).await?
+            routes::tokens::handle_delete(&app, query_param_opt(&body, "token"), &csrf_token).await?
         }
         "api/certs" if method == "GET" => {
-            routes::certs::render_table(&app).await?
+            routes::certs::render_table(&app, &csrf_token).await?
+        }
+        "api/certs/new" => {
+            routes::certs::render_form_new(&csrf_token).await?
         }
         "api/certs" if method == "POST" => {
-            routes::certs::handle_create(&app, &body).await?
+            routes::certs::handle_create(&app, &body, &csrf_token).await?
         }
         // Auth
         "login" => {
@@ -154,6 +189,44 @@ fn query_param(body: &[u8], key: &str) -> String {
     query_param_opt(body, key).unwrap_or_default()
 }
 
+/// CSS content hash for cache-busting. Computed at build time by `build.rs`
+/// from `assets/app.css` and embedded as a `?v=<hash>` query parameter.
+pub const CSS_HASH: &str = env!("APP_CSS_HASH");
+
+/// Substitute the `__CSS_HASH__` placeholder in rendered HTML with the build-time
+/// CSS hash. Used to prevent browser caching of stale CSS after rebuilds.
+pub fn render_with_assets(html: String) -> String {
+    html.replace("__CSS_HASH__", CSS_HASH)
+}
+
+/// Substitute the `__CSRF__` placeholder in rendered HTML with the user's
+/// session CSRF token. Templates use this to embed a hidden field in every
+/// POST/PUT/DELETE form, enabling CSRF protection on mutating actions.
+pub fn render_with_csrf(html: String, csrf: &str) -> String {
+    // Escape the CSRF token for safe inclusion in HTML attribute values.
+    // Hex-encoded tokens only contain [0-9a-f] so escaping is a no-op, but
+    // we still apply minimal sanitisation for defence in depth.
+    let safe: String = csrf
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    html.replace("__CSRF__", &safe)
+}
+
+/// Apply both asset URL and CSRF placeholder substitution.
+pub fn render_with_assets_and_csrf(html: String, csrf: &str) -> String {
+    render_with_csrf(render_with_assets(html), csrf)
+}
+
+/// Build a 200 OK HTML response with the standard asset URL and CSRF substitutions.
+pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(render_with_assets_and_csrf(body, csrf))))
+        .map_err(|e| e.into())
+}
+
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
     body_str
@@ -171,6 +244,23 @@ fn not_found() -> Response<Full<Bytes>> {
         .body(Full::new(Bytes::from(
             r#"<div class="p-6 text-slate-500">Page not found</div>"#,
         )))
+        .unwrap()
+}
+
+/// Return a 403 Forbidden response with a brief explanation.
+fn forbidden_response(message: &str) -> Response<Full<Bytes>> {
+    let body = format!(
+        r#"<div class="p-6 max-w-md"><div class="bg-red-50 border border-red-200 rounded-lg p-4">
+            <h2 class="text-red-800 font-semibold mb-1">403 Forbidden</h2>
+            <p class="text-red-700 text-sm">{}</p>
+            <a href="/admin/" class="text-sm text-red-700 underline mt-2 inline-block">← Back to dashboard</a>
+        </div></div>"#,
+        message
+    );
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
 

@@ -1,11 +1,10 @@
-{# sites_table.html — full standalone page #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sites — Pangolin</title>
-<link href="/admin/app.css?v=ea33fba4" rel="stylesheet">
+<title>Tokens — Pangolin</title>
+<link href="/admin/app.css?v=__CSS_HASH__" rel="stylesheet">
 <script src="https://unpkg.com/htmx.org@1.9.0"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -23,10 +22,10 @@
     </a>
     <nav class="hidden md:flex items-center gap-0.5">
       <a href="/admin/" class="nav-link">Dashboard</a>
-      <a href="/admin/sites" class="nav-link nav-link-active">Sites</a>
+      <a href="/admin/sites" class="nav-link">Sites</a>
       <a href="/admin/domains" class="nav-link">Domains</a>
       <a href="/admin/tun" class="nav-link">Tunnels</a>
-      <a href="/admin/tokens" class="nav-link">Tokens</a>
+      <a href="/admin/tokens" class="nav-link nav-link-active">Tokens</a>
       <a href="/admin/certs" class="nav-link">Certs</a>
     </nav>
     <div class="flex items-center gap-2">
@@ -40,10 +39,10 @@
   </div>
   <nav id="mobile-nav" class="hidden md:hidden border-t border-pangolin-zinc px-4 py-3 space-y-1">
     <a href="/admin/" class="mobile-nav-link">Dashboard</a>
-    <a href="/admin/sites" class="mobile-nav-link mobile-nav-link-active">Sites</a>
+    <a href="/admin/sites" class="mobile-nav-link">Sites</a>
     <a href="/admin/domains" class="mobile-nav-link">Domains</a>
     <a href="/admin/tun" class="mobile-nav-link">Tunnels</a>
-    <a href="/admin/tokens" class="mobile-nav-link">Tokens</a>
+    <a href="/admin/tokens" class="mobile-nav-link mobile-nav-link-active">Tokens</a>
     <a href="/admin/certs" class="mobile-nav-link">Certs</a>
     <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
       <button type="submit" class="mobile-nav-link text-red-400 hover:text-red-300 w-full text-left">Sign out</button>
@@ -54,21 +53,21 @@
 <main class="px-4 py-6 md:px-6 md:py-6 max-w-7xl mx-auto">
   <div class="mb-6 flex items-center justify-between">
     <div>
-      <h1 class="text-2xl font-bold text-slate-900">Sites</h1>
-      <p class="text-slate-500 text-sm mt-1">Configure upstream backends and their route rules</p>
+      <h1 class="text-2xl font-bold text-slate-900">Tokens</h1>
+      <p class="text-slate-500 text-sm mt-1">API tokens for tunnel node authentication</p>
     </div>
-    <button hx-get="/admin/api/sites/new" hx-target="#modal-body" class="hidden md:inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg transition-colors">
+    <button hx-get="/admin/api/tokens/new" hx-target="#modal-body" class="hidden md:inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg transition-colors">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-      New site
+      New token
     </button>
   </div>
-  <button hx-get="/admin/api/sites/new" hx-target="#modal-body" class="md:hidden mb-4 inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg w-full justify-center">
+  <button hx-get="/admin/api/tokens/new" hx-target="#modal-body" class="md:hidden mb-4 inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg w-full justify-center">
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-    New site
+    New token
   </button>
 
-  <div id="sites-table">
-    {% include "sites_table_inner.html" %}
+  <div id="tokens-table">
+    {% include "tokens_table_inner.html" %}
   </div>
 
   <dialog id="modal" class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end md:items-center justify-center p-4 w-full">
