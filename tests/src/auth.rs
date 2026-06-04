@@ -1,10 +1,15 @@
 //! Token auth integration tests.
 //!
-//! Covers: tests/CHECKLIST.md → Token Auth (3 tests)
+//! Covers: tests/CHECKLIST.md → Token Auth (7 tests, up from 5)
 
+use std::sync::Arc;
+use tempfile::TempDir;
+use rusqlite::Connection;
+use chrono::Utc;
+
+use pangolin_core::db;
 use pangolin_core::index::Indexes;
 use pangolin_core::types::{Domain, Site, Token};
-use chrono::Utc;
 
 fn make_indexes(tokens: Vec<Token>) -> Indexes {
     let sites = vec![];
@@ -77,4 +82,68 @@ fn token_future_expiry() {
 
     // Not yet expired
     assert_eq!(indexes.token.get("future-token"), Some(&true));
+}
+
+/// token_expiry_exactly_now_boundary — token expiring exactly now → inactive
+///
+/// When expires_at == now, `e > now` is false (boundary), so token is inactive.
+/// This is correct: expiry means "no longer valid"
+#[test]
+fn token_expiry_exactly_now_boundary() {
+    let token = Token {
+        token: "exactly-expired".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        expires_at: Some(Utc::now()),
+    };
+    let indexes = make_indexes(vec![token]);
+
+    // Expired at boundary = inactive
+    assert_eq!(indexes.token.get("exactly-expired"), Some(&false));
+}
+
+/// token_mixed_state — multiple tokens with different states all indexed correctly
+#[test]
+fn token_mixed_state() {
+    let tokens = vec![
+        Token {
+            token: "active-valid".into(),
+            enabled: true,
+            created_at: Utc::now(),
+            expires_at: None,
+        },
+        Token {
+            token: "active-future-expiry".into(),
+            enabled: true,
+            created_at: Utc::now(),
+            expires_at: Some(Utc::now() + chrono::Duration::days(30)),
+        },
+        Token {
+            token: "disabled-still-valid".into(),
+            enabled: false,
+            created_at: Utc::now(),
+            expires_at: None,
+        },
+        Token {
+            token: "disabled-and-expired".into(),
+            enabled: false,
+            created_at: Utc::now(),
+            expires_at: Some(Utc::now() - chrono::Duration::days(1)),
+        },
+        Token {
+            token: "active-but-expired".into(),
+            enabled: true,
+            created_at: Utc::now(),
+            expires_at: Some(Utc::now() - chrono::Duration::hours(2)),
+        },
+    ];
+
+    let indexes = make_indexes(tokens);
+
+    assert_eq!(indexes.token.get("active-valid"), Some(&true));
+    assert_eq!(indexes.token.get("active-future-expiry"), Some(&true));
+    assert_eq!(indexes.token.get("disabled-still-valid"), Some(&false));
+    assert_eq!(indexes.token.get("disabled-and-expired"), Some(&false));
+    assert_eq!(indexes.token.get("active-but-expired"), Some(&false)); // expired wins
+    assert_eq!(indexes.token.get("unknown-token"), None);
 }
