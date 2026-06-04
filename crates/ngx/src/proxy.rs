@@ -248,7 +248,13 @@ impl ProxyHttp for AppProxy {
                             if std::path::Path::new(&idx_path).exists() {
                                 let idx_resolved = std::fs::canonicalize(&idx_path).unwrap();
                                 let idx_meta = std::fs::metadata(&idx_resolved).unwrap();
-                                serve_static_file(session, idx_resolved.to_str().unwrap(), idx_meta, false).await?;
+                                serve_static_file(
+                                    session,
+                                    idx_resolved.to_str().unwrap(),
+                                    idx_meta,
+                                    false,
+                                )
+                                .await?;
                                 return Ok(true);
                             }
                             let idx_htm_path = format!("{}index.htm", file_path_str);
@@ -272,14 +278,23 @@ impl ProxyHttp for AppProxy {
 
             // Verify resolved path is within doc_root
             if !resolved_str.starts_with(doc_root_resolved.to_str().unwrap()) {
-                warn!("static file path escapes doc_root: {} (resolved: {})", req_path, resolved_str);
+                warn!(
+                    "static file path escapes doc_root: {} (resolved: {})",
+                    req_path, resolved_str
+                );
                 let _ = session.respond_error(403).await;
                 return Ok(true);
             }
 
             // Hidden file rejection
-            let file_name = std::path::Path::new(&resolved).file_name().unwrap_or_default();
-            if file_name.to_str().map(|s| s.starts_with('.')).unwrap_or(false) {
+            let file_name = std::path::Path::new(&resolved)
+                .file_name()
+                .unwrap_or_default();
+            if file_name
+                .to_str()
+                .map(|s| s.starts_with('.'))
+                .unwrap_or(false)
+            {
                 warn!("static file hidden file rejection: {}", resolved_str);
                 let _ = session.respond_error(403).await;
                 return Ok(true);
@@ -501,7 +516,8 @@ async fn serve_static_file(
     };
 
     hdr.insert_header("Content-Type", mime.as_bytes()).ok();
-    hdr.insert_header("Content-Length", content.len().to_string().as_bytes()).ok();
+    hdr.insert_header("Content-Length", content.len().to_string().as_bytes())
+        .ok();
 
     if let Some(etag_val) = &etag {
         hdr.insert_header("ETag", etag_val.as_bytes()).ok();

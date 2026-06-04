@@ -129,12 +129,7 @@ async fn handle_http_stream(mut stream: TcpStream, requests: Arc<Mutex<Vec<HttpR
 // Static file helpers (mirror proxy.rs behavior in E2E mock)
 // ---------------------------------------------------------------------------
 
-async fn write_http_response(
-    client: &mut TcpStream,
-    status: u16,
-    status_text: &str,
-    body: &[u8],
-) {
+async fn write_http_response(client: &mut TcpStream, status: u16, status_text: &str, body: &[u8]) {
     let resp = format!(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n\r\n",
         status,
@@ -208,7 +203,13 @@ async fn serve_static_file(client: &mut TcpStream, file_path: &str, apply_condit
         Ok(c) => c,
         Err(e) => {
             log::error!("[proxy] static file read error {}: {}", file_path, e);
-            write_http_response(client, 500, "Internal Server Error", b"Internal Server Error").await;
+            write_http_response(
+                client,
+                500,
+                "Internal Server Error",
+                b"Internal Server Error",
+            )
+            .await;
             return;
         }
     };
@@ -337,7 +338,13 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
                     write_http_response(&mut client, 404, "Not Found", b"Not Found").await;
                     return;
                 }
-                write_http_response(&mut client, 500, "Internal Server Error", b"Internal Server Error").await;
+                write_http_response(
+                    &mut client,
+                    500,
+                    "Internal Server Error",
+                    b"Internal Server Error",
+                )
+                .await;
                 return;
             }
         };
@@ -353,9 +360,18 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
         }
 
         // Hidden file rejection
-        let file_name = std::path::Path::new(&resolved).file_name().unwrap_or_default();
-        if file_name.to_str().map(|s| s.starts_with('.')).unwrap_or(false) {
-            log::warn!("[proxy] static file hidden file rejection: {}", resolved_str);
+        let file_name = std::path::Path::new(&resolved)
+            .file_name()
+            .unwrap_or_default();
+        if file_name
+            .to_str()
+            .map(|s| s.starts_with('.'))
+            .unwrap_or(false)
+        {
+            log::warn!(
+                "[proxy] static file hidden file rejection: {}",
+                resolved_str
+            );
             write_http_response(&mut client, 403, "Forbidden", b"Forbidden").await;
             return;
         }
