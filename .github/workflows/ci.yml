@@ -1,12 +1,14 @@
 name: CI
 
 on:
+  push:
+    branches: [main, feat/**]
   pull_request:
     branches: [main]
 
-# Cancel in-progress runs when a new commit is pushed to the same PR.
+# Cancel in-progress runs when a new commit is pushed to the same ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -50,7 +52,7 @@ jobs:
 
   # ----------------------------------------------------------------
   # Integration tests — ACME with Pebble (letsencrypt/pebble:latest)
-  # Runs only on PRs; requires Docker for the Pebble service container.
+  # Runs only when integration feature is available (on PR and branch pushes).
   # ----------------------------------------------------------------
   integration:
     name: ACME integration tests (Pebble)
