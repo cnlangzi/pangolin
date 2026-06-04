@@ -1,0 +1,415 @@
+//! E2E HTTP proxy integration tests.
+//!
+//! Run with: `cargo test --features integration -p pangolin-integration-tests e2e`
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+
+use pangolin_core::index::{lookup_site, Indexes};
+use pangolin_core::types::{Domain, Site};
+
+// ---------------------------------------------------------------------------
+// Mock HTTP backend
+// ---------------------------------------------------------------------------
+
+struct MockHttpBackend {
+    addr: String,
+    requests: Arc<Mutex<Vec<HttpRequest>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    host: String,
+}
+
+impl MockHttpBackend {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_spawn = requests.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let reqs = requests_for_spawn.clone();
+                        tokio::spawn(handle_http_stream(stream, reqs));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            requests,
+            handle,
+        }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    async fn get_requests(&self) -> Vec<HttpRequest> {
+        self.requests.lock().await.clone()
+    }
+
+    fn parse_http_url(url: &str) -> Option<(&str, u16)> {
+        let url = url.strip_prefix("http://")?;
+        let mut parts = url.split(':');
+        let host = parts.next()?;
+        let port: u16 = parts.next().unwrap_or("80").parse().ok()?;
+        Some((host, port))
+    }
+}
+
+impl Drop for MockHttpBackend {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn handle_http_stream(mut stream: TcpStream, requests: Arc<Mutex<Vec<HttpRequest>>>) {
+    let mut buf = [0u8; 8192];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+
+    let request_str = String::from_utf8_lossy(&buf[..n]);
+    let lines: Vec<_> = request_str.lines().collect();
+    let first = lines.first().copied().unwrap_or("");
+
+    let parts: Vec<_> = first.split_whitespace().collect();
+    let method = parts.get(0).unwrap_or(&"GET");
+    let path = parts.get(1).unwrap_or(&"/");
+
+    let mut host = "unknown".to_string();
+    for line in &lines[1..] {
+        if line.to_lowercase().starts_with("host:") {
+            host = line.split(':').nth(1).unwrap_or("unknown").trim().to_string();
+            break;
+        }
+    }
+
+    requests.lock().await.push(HttpRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        host: host.clone(),
+    });
+
+    let body = format!(
+        "{{\"method\":\"{}\",\"path\":\"{}\",\"host\":\"{}\"}}",
+        method, path, host
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal HTTP proxy
+// ---------------------------------------------------------------------------
+
+async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
+    let mut buf = [0u8; 16384];
+    let n = match client.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+
+    let request_str = String::from_utf8_lossy(&buf[..n]).to_string();
+    let lines: Vec<_> = request_str.lines().collect();
+    let first = lines.first().copied().unwrap_or("");
+
+    let parts: Vec<_> = first.split_whitespace().collect();
+    let _method = parts.get(0).unwrap_or(&"GET");
+
+    let mut host = "".to_string();
+    for line in &lines[1..] {
+        if line.to_lowercase().starts_with("host:") {
+            host = line.split(':').nth(1).unwrap_or("").trim().to_string();
+            break;
+        }
+    }
+
+    let host = pangolin_core::normalize::normalize_host(&host);
+    log::info!("[proxy] host={}, buf_len={}", host, n);
+
+    let site = match lookup_site(&indexes, &host) {
+        Some(s) => s.clone(),
+        None => {
+            log::info!("[proxy] site not found for host={}", host);
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+            let _ = client.write_all(resp.as_bytes()).await;
+            return;
+        }
+    };
+
+    log::info!("[proxy] site={}, backend={}", site.name, site.backend);
+
+    let (tun_name, backend_url) = match pangolin_core::parse::parse_backend(&site.backend) {
+        Ok((t, u)) => (t, u),
+        Err(e) => {
+            log::info!("[proxy] backend parse error: {:?}", e);
+            let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\nBad Gateway";
+            let _ = client.write_all(resp.as_bytes()).await;
+            return;
+        }
+    };
+
+    if !tun_name.is_empty() {
+        let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nTunnel not implemented";
+        let _ = client.write_all(resp.as_bytes()).await;
+        return;
+    }
+
+    log::info!("[proxy] connecting to backend_url={}", backend_url);
+
+    let (backend_host, backend_port) = match MockHttpBackend::parse_http_url(&backend_url) {
+        Some((h, p)) => (h, p),
+        None => {
+            log::info!("[proxy] backend URL parse failed");
+            let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\nBad Gateway";
+            let _ = client.write_all(resp.as_bytes()).await;
+            return;
+        }
+    };
+
+    log::info!("[proxy] connecting to {}:{}", backend_host, backend_port);
+
+    let mut backend = match TcpStream::connect(format!("{}:{}", backend_host, backend_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("[proxy] backend connect error: {}", e);
+            let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 13\r\n\r\nBad Gateway";
+            let _ = client.write_all(resp.as_bytes()).await;
+            return;
+        }
+    };
+
+    log::info!("[proxy] connected to backend, forwarding request");
+
+    if let Err(e) = backend.write_all(&buf[..n]).await {
+        log::warn!("[proxy] backend write error: {}", e);
+        return;
+    }
+
+    let mut resp_buf = [0u8; 16384];
+    loop {
+        match backend.read(&mut resp_buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if client.write_all(&resp_buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
+    let tokens = vec![];
+    Indexes::build(sites, domains, &tokens, chrono::Utc::now())
+}
+
+/// e2e_direct_http_get — HTTP GET through proxy → 200 + JSON body
+#[tokio::test]
+async fn e2e_direct_http_get() {
+    let _ = env_logger::try_init();
+
+    let backend = MockHttpBackend::start().await;
+    log::info!("backend started on {}", backend.addr());
+
+    let site = Site {
+        name: "http-site".into(),
+        backend: format!("http://{}", backend.addr()),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let domain = Domain {
+        domain: "api.example.com".into(),
+        site_name: "http-site".into(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    log::info!("proxy on port {}", proxy_port);
+    let idx = indexes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let idx = idx.clone();
+                tokio::spawn(handle_proxy_connection(stream, idx));
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/api/users", proxy_port);
+    log::info!("requesting {}", url);
+    let resp = client
+        .get(&url)
+        .header("Host", "api.example.com")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    log::info!("response status: {}", resp.status().as_u16());
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body_bytes = resp.bytes().await.expect("should read body");
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    log::info!("body: {}", body_str);
+
+    assert!(body_str.contains("GET"));
+    assert!(body_str.contains("/api/users"));
+    assert!(body_str.contains("api.example.com"));
+
+    let reqs = backend.get_requests().await;
+    assert!(!reqs.is_empty());
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/api/users");
+    assert_eq!(reqs[0].host, "api.example.com");
+}
+
+/// e2e_direct_http_404 — unknown domain → proxy returns 404, backend not hit
+#[tokio::test]
+async fn e2e_direct_http_404() {
+    let _ = env_logger::try_init();
+
+    let backend = MockHttpBackend::start().await;
+
+    let site = Site {
+        name: "other-site".into(),
+        backend: format!("http://{}", backend.addr()),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let domain = Domain {
+        domain: "other.example.com".into(),
+        site_name: "other-site".into(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let idx = indexes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let idx = idx.clone();
+                tokio::spawn(handle_proxy_connection(stream, idx));
+            }
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/", proxy_port);
+    let resp = client
+        .get(&url)
+        .header("Host", "unknown.example.com")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let reqs = backend.get_requests().await;
+    assert!(reqs.is_empty());
+}
+
+/// e2e_direct_http_post — POST with JSON body through proxy → 200 + body echoed
+#[tokio::test]
+async fn e2e_direct_http_post() {
+    let _ = env_logger::try_init();
+
+    let backend = MockHttpBackend::start().await;
+
+    let site = Site {
+        name: "post-site".into(),
+        backend: format!("http://{}", backend.addr()),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let domain = Domain {
+        domain: "post.example.com".into(),
+        site_name: "post-site".into(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let idx = indexes.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let idx = idx.clone();
+                tokio::spawn(handle_proxy_connection(stream, idx));
+            }
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/submit", proxy_port);
+    let resp = client
+        .post(&url)
+        .header("Host", "post.example.com")
+        .json(&serde_json::json!({"name": "test", "value": 42}))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let reqs = backend.get_requests().await;
+    assert!(!reqs.is_empty());
+    assert_eq!(reqs[0].method, "POST");
+    assert_eq!(reqs[0].path, "/submit");
+}

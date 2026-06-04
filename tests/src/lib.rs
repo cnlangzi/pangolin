@@ -33,6 +33,9 @@ mod wildcard;
 #[cfg(feature = "integration")]
 mod path_prefix;
 
+#[cfg(feature = "integration")]
+mod e2e;
+
 // Force ring as crypto provider for tests (same pattern as acme.rs in ngx crate).
 #[cfg(feature = "integration")]
 #[ctor::ctor]
