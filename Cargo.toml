@@ -6,6 +6,7 @@ members = [
     "crates/tun",
     "crates/admin",
     "crates/pangolin-cli",
+    "tests",
 ]
 
 [workspace.package]

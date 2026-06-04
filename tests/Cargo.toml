@@ -1,0 +1,34 @@
+[package]
+name = "pangolin-integration-tests"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.96"
+
+[lib]
+name = "pangolin_integration_tests"
+path = "src/lib.rs"
+
+[dependencies]
+# Core crates
+pangolin-core = { path = "../crates/pangolin-core" }
+ngx = { path = "../crates/ngx" }
+tun = { path = "../crates/tun" }
+
+# Test infra
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+tempfile = "3"
+http-body-util = "0.1"
+bytes = "1"
+
+# Async / ws
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
+
+# Crypto provider init + time
+ctor = "0.1"
+chrono = "0.4"
+rustls = "0.23.40"
+
+[features]
+integration = []
