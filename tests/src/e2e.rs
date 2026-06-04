@@ -633,20 +633,18 @@ async fn e2e_direct_http_post() {
 async fn e2e_direct_static_file() {
     let _ = env_logger::try_init();
 
-    // Create a temp file to serve
+    // Create a temp dir with a file to serve
     let temp_dir = tempfile::TempDir::new().unwrap();
+    let dir_path = temp_dir.path().to_str().unwrap();
     let file_path = temp_dir.path().join("index.html");
     tokio::fs::write(&file_path, "<h1>Hello Static World</h1>")
         .await
         .expect("write temp file");
 
-    // Keep temp_dir alive by wrapping in Option inside the task
-    let temp_dir = Arc::new(Some(temp_dir));
-    let _temp_dir_for_task = temp_dir.clone();
-
     let site = Site {
         name: "static-site".into(),
-        backend: format!("file:///{}", file_path.to_str().unwrap()),
+        // Backend is the directory (doc_root), not the file path
+        backend: format!("file:///{}", dir_path),
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -658,15 +656,17 @@ async fn e2e_direct_static_file() {
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
+    let indexes_for_task = indexes.clone();
+    // Keep temp_dir alive for the duration of the proxy task
+    let _keepalive = temp_dir;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
-    let idx = indexes.clone();
 
     tokio::spawn(async move {
         loop {
             if let Ok((stream, _)) = listener.accept().await {
-                let idx = idx.clone();
+                let idx = indexes_for_task.clone();
                 tokio::spawn(handle_proxy_connection(stream, idx));
             }
         }
