@@ -14,15 +14,15 @@ use pangolin_core::types::{Domain, Site, Token};
 use pangolin_core::{App, CertManager};
 
 fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
-    CertManager {
-        enabled: false,
-        cert_dir: cert_dir.clone(),
-        email: String::new(),
-        acme_directory: String::new(),
-        renew_threshold_days: 30,
-        renew_check_interval_hours: 24,
-        renew_max_retries: 3,
-    }
+    CertManager::new(
+        false,
+        cert_dir.clone(),
+        String::new(),
+        String::new(),
+        30,
+        24,
+        3,
+    )
 }
 
 fn make_test_app(dir: &tempfile::TempDir) -> Arc<App> {

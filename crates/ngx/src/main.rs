@@ -54,15 +54,15 @@ async fn main() -> anyhow::Result<()> {
         Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
 
     let db_path = PathBuf::from("pangolin.db");
-    let cert_manager = CertManager {
-        enabled: config.cert.autorenew,
-        cert_dir: PathBuf::from(&config.cert.cert_dir),
-        email: config.cert.email.clone(),
-        acme_directory: config.cert.acme_directory.clone(),
-        renew_threshold_days: config.cert.renew_threshold_days,
-        renew_check_interval_hours: config.cert.renew_check_interval_hours,
-        renew_max_retries: config.cert.renew_max_retries,
-    };
+    let cert_manager = CertManager::new(
+        config.cert.autorenew,
+        PathBuf::from(&config.cert.cert_dir),
+        config.cert.email.clone(),
+        config.cert.acme_directory.clone(),
+        config.cert.renew_threshold_days,
+        config.cert.renew_check_interval_hours,
+        config.cert.renew_max_retries,
+    );
     let app = Arc::new(pangolin_core::App::new(
         &db_path,
         config.clone(),
@@ -96,8 +96,12 @@ async fn main() -> anyhow::Result<()> {
             .cert_manager
             .resolve_cert(host)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        proxy_service.add_tls(&tls_addr, &cert_path, &key_path)?;
-        log::info!("TLS enabled on {}", tls_addr);
+        let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path)
+            .map_err(|e| anyhow::anyhow!("TLS settings error: {}", e))?;
+        // Enable HTTP/2 with ALPN (h2 preferred, http/1.1 fallback)
+        tls_settings.enable_h2();
+        proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
+        log::info!("TLS enabled with HTTP/2 ALPN on {}", tls_addr);
     }
     server.add_service(proxy_service);
 

@@ -352,6 +352,8 @@ pub struct CertManager {
     pub renew_check_interval_hours: u32,
     pub renew_max_retries: u32,
     acme_client: RwLock<Option<Arc<AcmeClient>>>,
+    /// Runtime override for autorenew. If Some, overrides the config file setting.
+    runtime_autorenew_override: std::sync::Mutex<Option<bool>>,
 }
 
 impl CertManager {
@@ -374,12 +376,31 @@ impl CertManager {
             renew_check_interval_hours,
             renew_max_retries,
             acme_client: RwLock::new(None),
+            runtime_autorenew_override: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Returns whether autorenew is currently enabled.
+    /// Checks the runtime override first, then falls back to the config setting.
+    pub fn is_autorenew_enabled(&self) -> bool {
+        let override_val = *self.runtime_autorenew_override.lock().unwrap();
+        override_val.unwrap_or(self.enabled)
+    }
+
+    /// Set the runtime autorenew override.
+    /// Pass None to clear the override and use the config setting.
+    pub fn set_autorenew_override(&self, enabled: Option<bool>) {
+        *self.runtime_autorenew_override.lock().unwrap() = enabled;
+    }
+
+    /// Get the current autorenew setting (returns the override if set, otherwise the config value).
+    pub fn get_autorenew_setting(&self) -> Option<bool> {
+        *self.runtime_autorenew_override.lock().unwrap()
     }
 
     /// Initialize ACME client if autorenew is enabled.
     pub async fn init(&self) -> anyhow::Result<()> {
-        if !self.enabled {
+        if !self.is_autorenew_enabled() {
             return Ok(());
         }
         let client = Arc::new(
@@ -434,7 +455,7 @@ impl CertManager {
 
     /// Start background renewal task for given domains.
     pub async fn start_renewal(&self, domains: Vec<String>) {
-        if !self.enabled {
+        if !self.is_autorenew_enabled() {
             return;
         }
         if let Some(client) = self.acme_client.read().await.as_ref() {
