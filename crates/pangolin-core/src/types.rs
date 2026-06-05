@@ -93,7 +93,7 @@ pub struct TunnelResponseFrame {
 
 /// Unified tunnel frame (request or response or WS relay).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 pub enum TunnelFrame {
     Req(TunnelRequestFrame),
     Res(TunnelResponseFrame),

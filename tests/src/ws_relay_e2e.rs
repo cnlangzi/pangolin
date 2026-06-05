@@ -49,19 +49,55 @@ impl MockWsBackend {
             Ok(ws) => ws,
             Err(_) => return,
         };
-        let (sender, mut reader) = ws.split();
-        let mut sender = sender;
-        while let Some(msg) = reader.next().await {
-            match msg {
-                Ok(tungstenite::Message::Text(t)) => {
-                    let _ = sender.send(tungstenite::Message::Text(t)).await;
+        let (mut sender, mut reader) = ws.split();
+
+        // Read first frame — if it's a WsStart, respond with 101, then relay.
+        let first_msg = reader.next().await;
+        let Some(msg) = first_msg else { return };
+        let msg = match msg {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        match msg {
+            tungstenite::Message::Binary(buf) => {
+                // Try to parse as msgpack TunnelFrame (internally tagged).
+                let decompressed = pangolin_core::compress::deflate_decode(&buf)
+                    .unwrap_or_else(|_| buf.to_vec());
+                match pangolin_core::deserialize_msgpack::<pangolin_core::TunnelFrame>(&decompressed) {
+                    Ok(pangolin_core::TunnelFrame::WsStart { rid, path }) => {
+                        log::info!("MockBackend: WsStart rid={} path={}", rid, path);
+                        // Send 101 response (not compressed).
+                        let resp = pangolin_core::TunnelResponseFrame {
+                            rid,
+                            status: 101,
+                            headers: vec![],
+                            body: path.into_bytes(),
+                        };
+                        let resp_frame = pangolin_core::TunnelFrame::Res(resp);
+                        if let Ok(buf) = pangolin_core::serialize_msgpack(&resp_frame) {
+                            let _ = sender.send(tungstenite::Message::Binary(buf.into())).await;
+                        }
+                        // Bidirectional relay: frames pass through as-is.
+                        loop {
+                            match reader.next().await {
+                                Some(Ok(msg)) => {
+                                    let should_close = matches!(msg, tungstenite::Message::Close(_) | tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_));
+                                    if sender.send(msg).await.is_err() || should_close {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    _ => {
+                        // Not WsStart — fall through to normal echo.
+                        let _ = sender.send(tungstenite::Message::Binary(buf.clone())).await;
+                    }
                 }
-                Ok(tungstenite::Message::Binary(d)) => {
-                    let _ = sender.send(tungstenite::Message::Binary(d)).await;
-                }
-                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
-                _ => {}
             }
+            _ => {}
         }
     }
 }
