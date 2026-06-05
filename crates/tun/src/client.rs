@@ -228,8 +228,55 @@ impl TunnelClient {
                             log::warn!("unexpected response frame from ngx");
                         }
                         Ok(TunnelFrame::WsStart { rid, path }) => {
-                            // TODO: implement WS relay start
-                            log::debug!("WsStart rid={} path={}", rid, path);
+                            // WS relay: ngx requests that we connect to a backend and relay WS frames.
+                            // path contains the full backend URL to connect to (e.g., "http://host:port/path").
+                            // We send Res{status:101, body: "host:port"} back to ngx, then relay frames.
+                            log::info!("WsStart rid={} path={}", rid, path);
+
+                            let ws_sender = ws_sender.clone();
+                            let rid = rid.clone();
+                            let path = path.clone();
+
+                            tokio::spawn(async move {
+                                // Parse backend URL from path.
+                                // path format: "http://host:port/path" or just "/path" (implies localhost).
+                                let backend_url = if path.starts_with("http://") || path.starts_with("https://") {
+                                    path.clone()
+                                } else {
+                                    // Default to localhost:8080 for testing
+                                    format!("http://127.0.0.1:8080{}", path)
+                                };
+
+                                let backend_host = backend_url.trim_start_matches("http://")
+                                    .trim_start_matches("https://");
+                                let ws_url = format!("ws://{}", backend_host);
+                                log::info!("connecting to backend WS: {}", ws_url);
+
+                                match tokio_tungstenite::connect_async(&ws_url).await {
+                                    Ok((_ws_backend, _)) => {
+                                        log::info!("WS connected to backend: {}", ws_url);
+                                        // Send success response to ngx with host:port.
+                                        let addr = backend_host.to_string();
+                                        let resp = pangolin_core::TunnelResponseFrame {
+                                            rid,
+                                            status: 101,
+                                            headers: vec![],
+                                            body: addr.as_bytes().to_vec(),
+                                        };
+                                        let resp_frame = pangolin_core::TunnelFrame::Res(resp);
+                                        if let Ok(encoded) = pangolin_core::serialize_msgpack(&resp_frame) {
+                                            let compressed = pangolin_core::compress::deflate_encode(&encoded);
+                                            let msg = tungstenite::Message::Binary(compressed.into());
+                                            let mut sender = ws_sender.lock().await;
+                                            let _ = sender.send(msg).await;
+                                        }
+                                        // TODO: bidirectional WS frame relay (client ↔ backend)
+                                    }
+                                    Err(e) => {
+                                        log::warn!("WS connect to backend {} failed: {}", ws_url, e);
+                                    }
+                                }
+                            });
                         }
                         Ok(TunnelFrame::WsEnd { rid }) => {
                             // TODO: implement WS relay end

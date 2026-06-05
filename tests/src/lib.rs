@@ -51,3 +51,6 @@ fn init_crypto() {
     rustls::crypto::CryptoProvider::install_default(provider)
         .expect("install ring as default crypto provider");
 }
+
+#[cfg(feature = "integration")]
+mod ws_relay_e2e;

@@ -10,6 +10,7 @@
 //!
 //! Transport: MessagePack binary frames (not JSON).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -234,6 +235,12 @@ async fn handle_tun_ws(
         ),
     >::new()));
 
+    // Pending WS relay: rid → resp_tx for WsStart frames (separate from HTTP proxy pending).
+    let pending_ws = Arc::new(tokio::sync::Mutex::new(HashMap::<
+        String,
+        tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
+    >::new()));
+
     // Background task: clean up expired pending entries every 30s
     let pending_clean = pending.clone();
     tokio::spawn(async move {
@@ -274,14 +281,14 @@ async fn handle_tun_ws(
     // - Req frames from tun: unhandled (architecture is proxy → tun)
     // - Res frames from tun: route to pending request via resp_tx
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
-    let pending_ws = pending.clone();
+    let pending_read = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
     while let Some(_msg) = ws_read.next().await {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
                 // Clean up pending entries older than 120s
                 let now = std::time::Instant::now();
-                let mut map = pending_ws.lock().await;
+                let mut map = pending_read.lock().await;
                 map.retain(|_, (_, inserted)| {
                     now.duration_since(*inserted).as_secs() < 120
                 });
@@ -301,15 +308,29 @@ async fn handle_tun_ws(
                             }
                             Ok(TunnelFrame::Res(resp_frame)) => {
                                 debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
-                                let mut map = pending_ws.lock().await;
-                                if let Some((tx, _)) = map.remove(&resp_frame.rid) {
+                                // Route: WS relay (pending_ws) vs HTTP proxy (pending)
+                                if let Some(tx) = pending_ws.lock().await.remove(&resp_frame.rid) {
                                     let _ = tx.send(resp_frame);
                                 } else {
-                                    warn!("no pending request for rid {}", resp_frame.rid);
+                                    let mut map = pending.lock().await;
+                                    if let Some((tx, _)) = map.remove(&resp_frame.rid) {
+                                        let _ = tx.send(resp_frame);
+                                    } else {
+                                        warn!("no pending request for rid {}", resp_frame.rid);
+                                    }
                                 }
                             }
                             Ok(TunnelFrame::WsStart { rid, path }) => {
                                 debug!("tun {} WsStart rid={} path={}", tun_name, rid, path);
+                                // proxy.rs stored resp_tx in pending (even for ws- rids).
+                                // Retrieve it and move to pending_ws for WS relay routing.
+                                let tx = {
+                                    let mut p = pending.lock().await;
+                                    p.remove(&rid).map(|(t, _)| t)
+                                };
+                                if let Some(tx) = tx {
+                                    pending_ws.lock().await.insert(rid.clone(), tx);
+                                }
                             }
                             Ok(TunnelFrame::WsEnd { rid }) => {
                                 debug!("tun {} WsEnd rid={}", tun_name, rid);
@@ -346,10 +367,23 @@ async fn handle_tun_ws(
         }
     }
 
-    // Drain pending map on disconnect (all pending requests get 504)
+    // Drain pending maps on disconnect (all pending requests get 504)
+    // Drain HTTP proxy pending
+    {
+        let mut map = pending.lock().await;
+        for (_, (tx, _)) in map.drain() {
+            let _ = tx.send(pangolin_core::TunnelResponseFrame {
+                rid: String::new(),
+                status: 504,
+                headers: vec![],
+                body: b"tunnel disconnected".to_vec(),
+            });
+        }
+    }
+    // Drain WS relay pending
     {
         let mut map = pending_ws.lock().await;
-        for (_, (tx, _)) in map.drain() {
+        for (_, tx) in map.drain() {
             let _ = tx.send(pangolin_core::TunnelResponseFrame {
                 rid: String::new(),
                 status: 504,

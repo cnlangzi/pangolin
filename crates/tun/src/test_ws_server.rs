@@ -135,8 +135,18 @@ impl TestWsServer {
                             // tun sent a response to our request
                         }
                         Ok(TunnelFrame::WsStart { rid, path }) => {
-                            // TODO: implement WS relay start
-                            log::debug!("mock ngx WsStart rid={} path={}", rid, path);
+                            // Mock ngx WS relay: respond with 101 + backend address.
+                            log::info!("mock ngx WsStart rid={} path={}", rid, path);
+                            let resp = TunnelResponseFrame {
+                                rid,
+                                status: 101,
+                                headers: vec![],
+                                body: path.into_bytes(),
+                            };
+                            let resp_frame = TunnelFrame::Res(resp);
+                            if let Ok(buf) = serialize_msgpack(&resp_frame) {
+                                let _ = ws_sender.send(tungstenite::Message::Binary(buf.into())).await;
+                            }
                         }
                         Ok(TunnelFrame::WsEnd { rid }) => {
                             // TODO: implement WS relay end
