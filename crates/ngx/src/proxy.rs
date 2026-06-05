@@ -60,7 +60,6 @@ impl ProxyHttp for AppProxy {
             let indexes = self.app.indexes.read().await;
             let tun_name = pangolin_core::index::lookup_site(&indexes, host)
                 .and_then(|s| {
-                    let (_, _url) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
                     let (tn, _) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
                     if tn.is_empty() {
                         None
@@ -419,7 +418,9 @@ impl ProxyHttp for AppProxy {
             }
         } else if url.starts_with("file:///") {
             // Static file serving (file:///doc_root/...)
-            let doc_root = url.trim_start_matches("file://").to_string();
+            let doc_root = pangolin_core::parse::file_url_to_path(&url)
+                .unwrap_or(&url)
+                .to_string();
             let req_path = path.as_str();
 
             // Build the file system path

@@ -283,6 +283,8 @@ async fn handle_tun_ws(
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_read = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Skip first immediate tick to avoid cleaning an empty/fresh map
+    let _ = cleanup_ticker.tick().await;
     while let Some(_msg) = ws_read.next().await {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
@@ -334,6 +336,7 @@ async fn handle_tun_ws(
                             }
                             Ok(TunnelFrame::WsEnd { rid }) => {
                                 debug!("tun {} WsEnd rid={}", tun_name, rid);
+                                pending_ws.lock().await.remove(&rid);
                             }
                             Err(e) => {
                                 warn!("malformed tunnel frame from {}: {}", tun_name, e);
