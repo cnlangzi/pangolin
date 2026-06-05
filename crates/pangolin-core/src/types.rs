@@ -98,9 +98,14 @@ pub enum TunnelFrame {
     Req(TunnelRequestFrame),
     Res(TunnelResponseFrame),
     /// Start a WebSocket relay session: ngx → tun.
-    WsStart { rid: String, path: String },
+    WsStart {
+        rid: String,
+        path: String,
+    },
     /// End a WebSocket relay session: ngx → tun.
-    WsEnd { rid: String },
+    WsEnd {
+        rid: String,
+    },
 }
 
 /// Serialize a struct to msgpack bytes using rmp-serde.

@@ -41,7 +41,10 @@ impl MockWsBackend {
             }
         });
 
-        Self { _addr: addr, handle }
+        Self {
+            _addr: addr,
+            handle,
+        }
     }
 
     async fn handle_one(stream: tokio::net::TcpStream) {
@@ -62,9 +65,11 @@ impl MockWsBackend {
         match msg {
             tungstenite::Message::Binary(buf) => {
                 // Try to parse as msgpack TunnelFrame (internally tagged).
-                let decompressed = pangolin_core::compress::deflate_decode(&buf)
-                    .unwrap_or_else(|_| buf.to_vec());
-                match pangolin_core::deserialize_msgpack::<pangolin_core::TunnelFrame>(&decompressed) {
+                let decompressed =
+                    pangolin_core::compress::deflate_decode(&buf).unwrap_or_else(|_| buf.to_vec());
+                match pangolin_core::deserialize_msgpack::<pangolin_core::TunnelFrame>(
+                    &decompressed,
+                ) {
                     Ok(pangolin_core::TunnelFrame::WsStart { rid, path }) => {
                         log::info!("MockBackend: WsStart rid={} path={}", rid, path);
                         // Send 101 response (not compressed).
@@ -82,7 +87,12 @@ impl MockWsBackend {
                         loop {
                             match reader.next().await {
                                 Some(Ok(msg)) => {
-                                    let should_close = matches!(msg, tungstenite::Message::Close(_) | tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_));
+                                    let should_close = matches!(
+                                        msg,
+                                        tungstenite::Message::Close(_)
+                                            | tungstenite::Message::Ping(_)
+                                            | tungstenite::Message::Pong(_)
+                                    );
                                     if sender.send(msg).await.is_err() || should_close {
                                         break;
                                     }
@@ -194,7 +204,11 @@ async fn tunnel_ws_relay_start() {
         }
     }
 
-    assert!(got_101, "tun should respond with 101 to WsStart (rid={})", rid);
+    assert!(
+        got_101,
+        "tun should respond with 101 to WsStart (rid={})",
+        rid
+    );
 
     drop(ws_sender);
     tun_handle.abort();

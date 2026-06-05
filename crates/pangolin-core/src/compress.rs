@@ -11,8 +11,8 @@ pub fn deflate_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     comp.compress(data, &mut out, FlushCompress::Finish)
         .unwrap();
-    // For very small inputs, flate2 may produce0 bytes; in that case use raw data
-       if out.is_empty() && !data.is_empty() {
+    // For very small inputs, flate2 may produce 0 bytes; in that case use raw data
+    if out.is_empty() && !data.is_empty() {
         out.extend_from_slice(data);
     }
     out

@@ -106,7 +106,7 @@ impl TunnelClient {
     ) -> Result<()> {
         let (ws_sender, mut ws_read) = ws.split();
         let pending = self.pending.clone();
-let name = self.config.name.clone();
+        let name = self.config.name.clone();
         let http_client = self.http_client.clone();
 
         // Arc-wrapped sender so multiple concurrent request handlers can send
@@ -231,9 +231,10 @@ let name = self.config.name.clone();
                             // WS relay: ngx requests that we connect to a backend.
                             // ngx expects 101 response via the msgpack channel (pending_ws map).
                             log::info!("WsStart rid={} path={}", rid, path);
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<TunnelResponseFrame>();
+                            let (resp_tx, _resp_rx) =
+                                tokio::sync::oneshot::channel::<TunnelResponseFrame>();
                             tokio::spawn(async move {
-                                Self::handle_ws_start(rid, path, resp_tx, resp_rx).await;
+                                Self::handle_ws_start(rid, path, resp_tx).await;
                             });
                         }
                         Ok(TunnelFrame::WsEnd { rid }) => {
@@ -310,12 +311,10 @@ let name = self.config.name.clone();
         Ok(())
     }
 
-
     async fn handle_ws_start(
         rid: String,
         path: String,
         resp_tx: tokio::sync::oneshot::Sender<TunnelResponseFrame>,
-        resp_rx: tokio::sync::oneshot::Receiver<TunnelResponseFrame>,
     ) {
         // Parse backend URL from path.
         // path format: "http://host:port/path" or just "/path" (implies localhost).
@@ -325,7 +324,8 @@ let name = self.config.name.clone();
             format!("http://127.0.0.1:8080{}", path)
         };
 
-        let backend_host = backend_url.trim_start_matches("http://")
+        let backend_host = backend_url
+            .trim_start_matches("http://")
             .trim_start_matches("https://");
         let ws_url = format!("ws://{}", backend_host);
         log::info!("connecting to backend WS: {}", ws_url);
@@ -333,8 +333,6 @@ let name = self.config.name.clone();
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((_ws_backend, _)) => {
                 log::info!("WS connected to backend: {}", ws_url);
-                // Wait for ngx to confirm connection established, then send 101 via batch.
-                let _ = resp_rx.await;
                 let addr = backend_host.to_string();
                 let resp = TunnelResponseFrame {
                     rid,
@@ -343,8 +341,6 @@ let name = self.config.name.clone();
                     body: addr.into_bytes(),
                 };
                 let _ = resp_tx.send(resp);
-                // Note: bidirectional WS frame relay (client <-> backend) is handled
-                // entirely by ngx in the relay task. tun's job here is done.
             }
             Err(e) => {
                 log::warn!("WS connect to backend {} failed: {}", ws_url, e);

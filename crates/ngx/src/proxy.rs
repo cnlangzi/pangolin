@@ -88,12 +88,14 @@ impl ProxyHttp for AppProxy {
                 }
                 if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol") {
                     if let Ok(v) = std::str::from_utf8(protocols.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Protocol", v.as_bytes()).ok();
+                        hdr.insert_header("Sec-WebSocket-Protocol", v.as_bytes())
+                            .ok();
                     }
                 }
                 if let Some(version) = session.get_header("Sec-WebSocket-Version") {
                     if let Ok(v) = std::str::from_utf8(version.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Version", v.as_bytes()).ok();
+                        hdr.insert_header("Sec-WebSocket-Version", v.as_bytes())
+                            .ok();
                     }
                 }
                 session.write_response_header(Box::new(hdr), false).await?;
@@ -128,20 +130,21 @@ impl ProxyHttp for AppProxy {
                         .as_nanos()
                 );
                 tokio::spawn(async move {
-                    use tokio_tungstenite::{connect_async, WebSocketStream};
                     use futures_util::{SinkExt, StreamExt};
-                    
+                    use tokio_tungstenite::{connect_async, WebSocketStream};
+
                     use tokio_tungstenite::tungstenite::Message;
 
                     // Establish connection to backend through tunnel.
                     // First, send WsStart to tunnel via existing msgpack channel.
-                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<pangolin_core::TunnelResponseFrame>();
+                    let (resp_tx, resp_rx) =
+                        tokio::sync::oneshot::channel::<pangolin_core::TunnelResponseFrame>();
                     let ws_start_frame = pangolin_core::TunnelFrame::WsStart {
                         rid: rid.clone(),
                         path: path.clone(),
                     };
-                    let start_body = pangolin_core::serialize_msgpack(&ws_start_frame)
-                        .unwrap_or_default();
+                    let start_body =
+                        pangolin_core::serialize_msgpack(&ws_start_frame).unwrap_or_default();
                     let msg = TunnelMessage {
                         rid: rid.clone(),
                         body: start_body,
@@ -178,12 +181,8 @@ impl ProxyHttp for AppProxy {
 
                     // Wrap our stream in a tokio_tungstenite WebSocketStream.
                     let (client_ws_sender, mut client_ws_read) = {
-                        let ws_stream = WebSocketStream::from_raw_socket(
-                            stream,
-                            Role::Server,
-                            None,
-                        )
-                        .await;
+                        let ws_stream =
+                            WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
                         ws_stream.split()
                     };
 
@@ -253,11 +252,13 @@ impl ProxyHttp for AppProxy {
                     // Send WsEnd to tunnel.
                     let ws_end = pangolin_core::TunnelFrame::WsEnd { rid };
                     let end_body = pangolin_core::serialize_msgpack(&ws_end).unwrap_or_default();
-                    let _ = sender.send(TunnelMessage {
-                        rid: "ws-end".into(),
-                        body: end_body,
-                        resp_tx: tokio::sync::oneshot::channel().0,
-                    }).await;
+                    let _ = sender
+                        .send(TunnelMessage {
+                            rid: "ws-end".into(),
+                            body: end_body,
+                            resp_tx: tokio::sync::oneshot::channel().0,
+                        })
+                        .await;
                 });
 
                 return Ok(true);

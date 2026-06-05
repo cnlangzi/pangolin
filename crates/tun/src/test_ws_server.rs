@@ -35,8 +35,8 @@ pub struct TestWsServer {
     shutdown_flag: Arc<AtomicBool>,
     /// Pending WS relay: rid -> broadcast sender for 101 response.
     /// Multiple subscribers (tun + test client) can receive the same 101.
-    pending_ws:
-        Arc<Mutex<HashMap<String, broadcast::Sender<TunnelResponseFrame>>>>,
+    #[allow(dead_code)]
+    pending_ws: Arc<Mutex<HashMap<String, broadcast::Sender<TunnelResponseFrame>>>>,
 }
 
 impl TestWsServer {
@@ -126,31 +126,23 @@ impl TestWsServer {
         requests: Arc<Mutex<Vec<TunnelRequestFrame>>>,
         pending_ws: Arc<Mutex<HashMap<String, broadcast::Sender<TunnelResponseFrame>>>>,
     ) -> Result<()> {
-        
         let ws = accept_async(stream).await?;
         let (mut ws_sender, mut ws_read) = ws.split();
-        
 
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(tungstenite::Message::Binary(buf)) => {
-                    
                     // ngx sends DEFLATE-compressed frames; decompress first, fall back to raw.
-                    let decompressed = deflate_decode(&buf).unwrap_or_else(|_| {
-                        
-                        buf.to_vec()
-                    });
-                    
+                    let decompressed = deflate_decode(&buf).unwrap_or_else(|_| buf.to_vec());
+
                     match deserialize_msgpack::<TunnelFrame>(&decompressed) {
                         Ok(TunnelFrame::Req(req)) => {
                             requests.lock().await.push(req);
                         }
-                        Ok(TunnelFrame::Res(r)) => {
-                            
+                        Ok(TunnelFrame::Res(_r)) => {
                             // tun sent a response to our request
                         }
                         Ok(TunnelFrame::WsStart { rid, path }) => {
-                            
                             // Mock ngx WS relay:
                             // 1. Connect to backend (path)
                             // 2. Forward WsStart to backend (compressed msgpack), wait for 101
@@ -159,7 +151,8 @@ impl TestWsServer {
 
                             let backend_url = format!(
                                 "ws://{}",
-                                path.trim_start_matches("http://").trim_start_matches("https://")
+                                path.trim_start_matches("http://")
+                                    .trim_start_matches("https://")
                             );
 
                             // Create broadcast channel for this rid
@@ -173,8 +166,10 @@ impl TestWsServer {
                             match tokio_tungstenite::connect_async(&backend_url).await {
                                 Ok((mut backend_ws, _)) => {
                                     // Send WsStart to backend (compressed, matching real data-plane)
-                                    let ws_start_frame =
-                                        TunnelFrame::WsStart { rid: rid.clone(), path: path.clone() };
+                                    let ws_start_frame = TunnelFrame::WsStart {
+                                        rid: rid.clone(),
+                                        path: path.clone(),
+                                    };
                                     if let Ok(buf) = serialize_msgpack(&ws_start_frame) {
                                         let compressed = deflate_encode(&buf);
                                         let _ = backend_ws
@@ -189,64 +184,62 @@ impl TestWsServer {
 
                                     while tokio::time::Instant::now() < deadline {
                                         tokio::time::sleep(Duration::from_millis(50)).await;
-                                        if let Some(msg) = backend_ws.next().await {
-                                            if let Ok(tungstenite::Message::Binary(buf)) = msg {
-                                                let decompressed = deflate_decode(&buf)
-                                                    .unwrap_or_else(|_| buf.to_vec());
-                                                if let Ok(TunnelFrame::Res(r)) =
-                                                    deserialize_msgpack::<TunnelFrame>(&decompressed)
-                                                {
-                                                    if r.status == 101 {
-                                                        got_101 = true;
-                                                        let body_addr =
-                                                            String::from_utf8_lossy(&r.body)
-                                                                .to_string();
-                                                        log::info!(
-                                                            "mock ngx: backend 101, addr={}",
-                                                            body_addr
-                                                        );
+                                        if let Some(Ok(tungstenite::Message::Binary(buf))) =
+                                            backend_ws.next().await
+                                        {
+                                            let decompressed = deflate_decode(&buf)
+                                                .unwrap_or_else(|_| buf.to_vec());
+                                            if let Ok(TunnelFrame::Res(r)) =
+                                                deserialize_msgpack::<TunnelFrame>(&decompressed)
+                                            {
+                                                if r.status == 101 {
+                                                    got_101 = true;
+                                                    let body_addr =
+                                                        String::from_utf8_lossy(&r.body)
+                                                            .to_string();
+                                                    log::info!(
+                                                        "mock ngx: backend 101, addr={}",
+                                                        body_addr
+                                                    );
 
-                                                        // Broadcast 101 to all subscribers
-                                                        let resp = TunnelResponseFrame {
+                                                    // Broadcast 101 to all subscribers
+                                                    let resp = TunnelResponseFrame {
+                                                        rid: rid.clone(),
+                                                        status: 101,
+                                                        headers: vec![],
+                                                        body: body_addr.into_bytes(),
+                                                    };
+                                                    {
+                                                        let p = pending_ws.lock().await;
+                                                        if let Some(tx) = p.get(&rid) {
+                                                            let _ = tx.send(resp);
+                                                        }
+                                                    }
+
+                                                    // Also send 101 to this test client connection
+                                                    let resp_frame =
+                                                        TunnelFrame::Res(TunnelResponseFrame {
                                                             rid: rid.clone(),
                                                             status: 101,
                                                             headers: vec![],
-                                                            body: body_addr.into_bytes(),
-                                                        };
-                                                        {
-                                                            let p = pending_ws.lock().await;
-                                                            if let Some(tx) = p.get(&rid) {
-                                                                let _ = tx.send(resp);
-                                                            }
-                                                        }
-
-                                                        // Also send 101 to this test client connection
-                                                        let resp_frame =
-                                                            TunnelFrame::Res(TunnelResponseFrame {
-                                                                rid: rid.clone(),
-                                                                status: 101,
-                                                                headers: vec![],
-                                                                body: path.clone().into_bytes(),
-                                                            });
-                                                        if let Ok(buf) = serialize_msgpack(&resp_frame)
-                                                        {
-                                                            let _ = ws_sender
-                                                                .send(tungstenite::Message::Binary(
-                                                                    buf.into(),
-                                                                ))
-                                                                .await;
-                                                        }
-                                                        break;
+                                                            body: path.clone().into_bytes(),
+                                                        });
+                                                    if let Ok(buf) = serialize_msgpack(&resp_frame)
+                                                    {
+                                                        let _ = ws_sender
+                                                            .send(tungstenite::Message::Binary(
+                                                                buf.into(),
+                                                            ))
+                                                            .await;
                                                     }
+                                                    break;
                                                 }
                                             }
                                         }
                                     }
 
                                     if !got_101 {
-                                        log::warn!(
-                                            "mock ngx: backend did not respond with 101"
-                                        );
+                                        log::warn!("mock ngx: backend did not respond with 101");
                                     }
                                 }
                                 Err(e) => {
@@ -265,7 +258,6 @@ impl TestWsServer {
                             }
                         }
                         Ok(TunnelFrame::WsEnd { rid }) => {
-                            
                             log::debug!("mock ngx WsEnd rid={}", rid);
                         }
                         Err(e) => {
