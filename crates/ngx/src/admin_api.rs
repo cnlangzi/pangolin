@@ -321,7 +321,11 @@ async fn list_certs(app: &App) -> Response<Vec<u8>> {
 
 async fn list_events(app: &App) -> Response<Vec<u8>> {
     let events = app.get_recent_events(20);
-    json_ok(serde_json::to_vec(&events).unwrap().as_slice())
+    let body = match serde_json::to_vec(&events) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize events: {}", e)),
+    };
+    json_ok(body.as_slice())
 }
 
 // ---- Cert Settings ----
@@ -337,7 +341,11 @@ async fn get_cert_settings(app: &App) -> Response<Vec<u8>> {
         autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
         autorenew_override: app.cert_manager.get_autorenew_setting(),
     };
-    json_ok(serde_json::to_vec(&settings).unwrap().as_slice())
+    let body = match serde_json::to_vec(&settings) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
+    };
+    json_ok(body.as_slice())
 }
 
 async fn update_cert_settings(app: &App, body: &[u8]) -> Response<Vec<u8>> {
@@ -358,7 +366,11 @@ async fn update_cert_settings(app: &App, body: &[u8]) -> Response<Vec<u8>> {
         autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
         autorenew_override: app.cert_manager.get_autorenew_setting(),
     };
-    json_ok(serde_json::to_vec(&settings).unwrap().as_slice())
+    let body = match serde_json::to_vec(&settings) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
+    };
+    json_ok(body.as_slice())
 }
 
 async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> {

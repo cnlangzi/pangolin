@@ -156,7 +156,8 @@ impl CertManager {
         *self.runtime_autorenew_override.lock().unwrap() = enabled;
     }
 
-    /// Get the current autorenew setting (returns the override if set, otherwise the config value).
+    /// Get the current autorenew override value, if set.
+    /// Returns `Some(true)` if override is enabled, `Some(false)` if disabled, or `None` if no override is set.
     pub fn get_autorenew_setting(&self) -> Option<bool> {
         *self.runtime_autorenew_override.lock().unwrap()
     }

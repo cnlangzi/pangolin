@@ -99,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
         let mut tls_settings =
             pingora::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path)
                 .map_err(|e| anyhow::anyhow!("TLS settings error: {}", e))?;
+        // Validate cert/key are loadable before passing to add_tls_with_settings
+        // (add_tls_with_settings returns () and defers errors to build-time panic)
+        let _ = tls_settings.build();
         // Enable HTTP/2 with ALPN (h2 preferred, http/1.1 fallback)
         tls_settings.enable_h2();
         proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
