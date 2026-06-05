@@ -167,19 +167,6 @@ async fn handle_client(
         return Ok(());
     }
 
-    // Pre-check for duplicate name (early rejection before WebSocket handshake overhead)
-    // Note: The definitive check-and-insert happens atomically in handle_tun_ws
-    {
-        let sessions = app.tun_sessions.read().await;
-        if sessions.contains_key(name) {
-            warn!(
-                "tunnel: name {} already registered, rejecting duplicate",
-                name
-            );
-            return Ok(());
-        }
-    }
-
     let tun_name = name.to_string();
     mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected", tun_name);
@@ -244,25 +231,6 @@ async fn handle_tun_ws(
         tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
     >::new()));
 
-    // Background task: clean up expired pending entries every 30s
-    let pending_clean = pending.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-        // Skip first immediate tick
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let now = std::time::Instant::now();
-            let mut map = pending_clean.lock().await;
-            let before = map.len();
-            map.retain(|_, (_, inserted)| now.duration_since(*inserted).as_secs() < 120);
-            let removed = before.saturating_sub(map.len());
-            if removed > 0 {
-                debug!("cleaned {} expired pending requests", removed);
-            }
-        }
-    });
-
     let pending_read = pending.clone();
     let write_task = tokio::spawn(async move {
         let mut sender = ws_sender;
@@ -286,8 +254,6 @@ async fn handle_tun_ws(
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_read = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    // Skip first immediate tick to avoid cleaning an empty/fresh map
-    let _ = cleanup_ticker.tick().await;
     while let Some(_msg) = ws_read.next().await {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
