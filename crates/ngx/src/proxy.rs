@@ -15,6 +15,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
 use tokio::time::{timeout, Duration};
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 use crate::{admin_api, App, TunnelMessage};
 
@@ -44,12 +45,250 @@ impl ProxyHttp for AppProxy {
             return Ok(true);
         }
 
-        // WebSocket tunnel path: handle via tunnel
-        if path == self.app.ws_path {
-            info!("WebSocket tunnel request, upgrading connection");
-            // TODO: handle WS upgrade to tunnel handler
-            let _ = session.respond_error(426).await;
-            return Ok(true);
+        // WebSocket upgrade detection: check Upgrade header
+        let is_ws_upgrade = session.is_upgrade_req();
+
+        // WebSocket upgrade detected — determine routing and handle accordingly.
+        // Direct WS: return Ok(false) and let pingora's proxy_to_h1_upstream handle 101 upgrade.
+        // Tunnel WS: write 101, extract stream, relay through tunnel msgpack channel.
+        if is_ws_upgrade && path == self.app.ws_path {
+            // Determine if this is a tunnel WS (host has tun_name) or direct WS.
+            let host = session
+                .get_header("Host")
+                .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+                .unwrap_or("");
+            let indexes = self.app.indexes.read().await;
+            let tun_name = pangolin_core::index::lookup_site(&indexes, host)
+                .and_then(|s| {
+                    let (_, _url) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
+                    let (tn, _) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
+                    if tn.is_empty() {
+                        None
+                    } else {
+                        Some(tn)
+                    }
+                })
+                .unwrap_or_default();
+            drop(indexes);
+
+            if !tun_name.is_empty() {
+                // Tunnel WS: relay through existing tun session.
+                // 1. Write 101 Switching Protocols to client.
+                // 2. Extract stream via into_inner().
+                // 3. Send WsStart to tun, relay frames bidirectionally.
+                // 4. Send WsEnd when done.
+                info!("Tunnel WS relay: {} → tun {}", host, tun_name);
+                let mut hdr = ResponseHeader::build(101, None).unwrap();
+                hdr.insert_header("Upgrade", "websocket").unwrap();
+                hdr.insert_header("Connection", "Upgrade").unwrap();
+                // Copy relevant headers from original request
+                if let Some(sec_key) = session.get_header("Sec-WebSocket-Key") {
+                    if let Ok(v) = std::str::from_utf8(sec_key.as_bytes()) {
+                        hdr.insert_header("Sec-WebSocket-Key", v.as_bytes()).ok();
+                    }
+                }
+                if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol") {
+                    if let Ok(v) = std::str::from_utf8(protocols.as_bytes()) {
+                        hdr.insert_header("Sec-WebSocket-Protocol", v.as_bytes()).ok();
+                    }
+                }
+                if let Some(version) = session.get_header("Sec-WebSocket-Version") {
+                    if let Ok(v) = std::str::from_utf8(version.as_bytes()) {
+                        hdr.insert_header("Sec-WebSocket-Version", v.as_bytes()).ok();
+                    }
+                }
+                session.write_response_header(Box::new(hdr), false).await?;
+
+                // Extract stream using take_stream() from our patched pingora fork.
+                // This takes &mut self (not ownership), making it safe for request_filter use.
+                // After this, the session is inert — we return Ok(true) immediately,
+                // so pingora's finish() sees an empty stream and handles it safely.
+                let stream = {
+                    let h1 = session.as_http1_mut().expect("not HTTP/1 session");
+                    h1.take_stream()
+                };
+
+                // Get or check tunnel sender.
+                let sender = {
+                    let sessions = self.app.tun_sessions.read().await;
+                    sessions.get(&tun_name).cloned()
+                };
+                let Some(sender) = sender else {
+                    warn!("Tun {} not online for WS relay", tun_name);
+                    return Ok(true);
+                };
+
+                // Spawn bidirectional relay task.
+                // We cannot capture session across await (Session is !Send), but we extracted
+                // the stream before the await, so this is safe: stream is owned by 'static task.
+                let rid = format!(
+                    "ws-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                );
+                tokio::spawn(async move {
+                    use tokio_tungstenite::{connect_async, WebSocketStream};
+                    use futures_util::{SinkExt, StreamExt};
+                    
+                    use tokio_tungstenite::tungstenite::Message;
+
+                    // Establish connection to backend through tunnel.
+                    // First, send WsStart to tunnel via existing msgpack channel.
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<pangolin_core::TunnelResponseFrame>();
+                    let ws_start_frame = pangolin_core::TunnelFrame::WsStart {
+                        rid: rid.clone(),
+                        path: path.clone(),
+                    };
+                    let start_body = pangolin_core::serialize_msgpack(&ws_start_frame)
+                        .unwrap_or_default();
+                    let msg = TunnelMessage {
+                        rid: rid.clone(),
+                        body: start_body,
+                        resp_tx,
+                    };
+                    if sender.send(msg).await.is_err() {
+                        return;
+                    }
+                    // Wait for tunnel to establish backend connection.
+                    let backend_addr = match resp_rx.await {
+                        Ok(resp) if resp.status == 101 => {
+                            // resp.body contains "host:port" of backend
+                            String::from_utf8_lossy(&resp.body).to_string()
+                        }
+                        Ok(resp) => {
+                            error!("tunnel WS start failed: status {}", resp.status);
+                            return;
+                        }
+                        Err(_) => {
+                            error!("tunnel WS start: no response");
+                            return;
+                        }
+                    };
+
+                    // Connect to backend WebSocket.
+                    let backend_url = format!("ws://{}", backend_addr);
+                    let (ws_outbound, _) = match connect_async(&backend_url).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("WS connect to backend {} failed: {}", backend_addr, e);
+                            return;
+                        }
+                    };
+
+                    // Wrap our stream in a tokio_tungstenite WebSocketStream.
+                    let (client_ws_sender, mut client_ws_read) = {
+                        let ws_stream = WebSocketStream::from_raw_socket(
+                            stream,
+                            Role::Server,
+                            None,
+                        )
+                        .await;
+                        ws_stream.split()
+                    };
+
+                    // Bidirectional relay: client ↔ backend.
+                    let (mut out_sender, mut out_read) = ws_outbound.split();
+                    let mut client_sender = client_ws_sender;
+
+                    loop {
+                        tokio::select! {
+                            // Client → Backend
+                            msg = client_ws_read.next() => {
+                                match msg {
+                                    Some(Ok(Message::Binary(data))) => {
+                                        let frame = pangolin_core::TunnelFrame::Req(
+                                            pangolin_core::TunnelRequestFrame {
+                                                rid: rid.clone(),
+                                                method: "WS".into(),
+                                                path: "".into(),
+                                                headers: vec![],
+                                                body: data.as_ref().to_vec(),
+                                            },
+                                        );
+                                        let encoded = pangolin_core::serialize_msgpack(&frame)
+                                            .unwrap_or_default();
+                                        if out_sender.send(Message::Binary(encoded.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(Message::Text(data))) => {
+                                        let frame = pangolin_core::TunnelFrame::Req(
+                                            pangolin_core::TunnelRequestFrame {
+                                                rid: rid.clone(),
+                                                method: "WS".into(),
+                                                path: "".into(),
+                                                headers: vec![],
+                                                body: data.as_str().as_bytes().to_vec(),
+                                            },
+                                        );
+                                        let encoded = pangolin_core::serialize_msgpack(&frame)
+                                            .unwrap_or_default();
+                                        if out_sender.send(Message::Binary(encoded.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        let _ = out_sender.send(Message::Close(None)).await;
+                                        break;
+                                    }
+                                    Some(Ok(Message::Ping(d))) => {
+                                        if out_sender.send(Message::Pong(d)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                                    Some(Err(e)) => {
+                                        error!("client WS read error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Backend → Client
+                            msg = out_read.next() => {
+                                match msg {
+                                    Some(Ok(Message::Binary(data))) => {
+                                        if let Ok(pangolin_core::TunnelFrame::Req(req)) =
+                                            pangolin_core::deserialize_msgpack::<pangolin_core::TunnelFrame>(&data)
+                                        {
+                                            let _ = client_sender.send(Message::Binary(req.body.into())).await;
+                                        }
+                                    }
+                                    Some(Ok(Message::Text(t))) => {
+                                        let _ = client_sender.send(Message::Text(t)).await;
+                                    }
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        let _ = client_sender.send(Message::Close(None)).await;
+                                        break;
+                                    }
+                                    Some(Ok(Message::Ping(d))) => {
+                                        let _ = client_sender.send(Message::Pong(d)).await;
+                                    }
+                                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                                    Some(Err(e)) => {
+                                        error!("backend WS read error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Send WsEnd to tunnel.
+                    let ws_end = pangolin_core::TunnelFrame::WsEnd { rid };
+                    let end_body = pangolin_core::serialize_msgpack(&ws_end).unwrap_or_default();
+                    let _ = sender.send(TunnelMessage {
+                        rid: "ws-end".into(),
+                        body: end_body,
+                        resp_tx: tokio::sync::oneshot::channel().0,
+                    }).await;
+                });
+
+                return Ok(true);
+            }
+            // Direct WS: let pingora handle the 101 upgrade.
+            return Ok(false);
         }
 
         // Look up site by Host header
@@ -97,7 +336,6 @@ impl ProxyHttp for AppProxy {
                 );
 
                 // Build full request frame with all headers and body.
-                // read_body returns a borrow; we must copy data before getting req_header.
                 let body_bytes = {
                     match session.read_body_or_idle(false).await {
                         Ok(Some(data)) => data.to_vec(),
@@ -157,19 +395,6 @@ impl ProxyHttp for AppProxy {
                             rid
                         );
 
-                        // Build pingora response from the frame
-                        let mut resp = http::Response::builder().status(response_frame.status);
-                        for (k, v) in response_frame.headers.iter() {
-                            if let (Ok(name), Ok(value)) = (
-                                HeaderName::from_bytes(k.as_bytes()),
-                                HeaderValue::from_str(v.as_str()),
-                            ) {
-                                resp = resp.header(name, value);
-                            }
-                        }
-                        let body = response_frame.body;
-
-                        // Write response header
                         let status = response_frame.status;
                         let mut hdr = match ResponseHeader::build(status, None) {
                             Ok(h) => h,
@@ -193,7 +418,7 @@ impl ProxyHttp for AppProxy {
                             return Ok(true);
                         }
                         if let Err(e) = session
-                            .write_response_body(Some(Bytes::from(body)), true)
+                            .write_response_body(Some(Bytes::from(response_frame.body)), true)
                             .await
                         {
                             error!("failed to write tunnel response body: {}", e);
@@ -218,8 +443,6 @@ impl ProxyHttp for AppProxy {
             }
         } else if url.starts_with("file:///") {
             // Static file serving (file:///doc_root/...)
-            // nginx对齐: path traversal防护 + 隐藏文件拒绝 + 目录索引(index.html/h) + 条件请求
-            // Note: `path` (from uri.path()) has query string already stripped.
             let doc_root = url.trim_start_matches("file://").to_string();
             let req_path = path.as_str();
 

@@ -16,6 +16,22 @@ rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/cnlangzi/pangolin"
 
+# Use our forked pingora with as_http1_mut() patch for WebSocket upgrades
+# Branch: pangolin — tracks upstream releases, contains our custom API additions
+[patch.crates-io]
+pingora = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-core = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-proxy = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-error = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-http = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-pool = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-runtime = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-timeout = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-lru = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-load-balancing = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-cache = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+pingora-header-serde = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
+
 [workspace.dependencies]
 # Web framework / proxy
 pingora = { version = "0.8", features = ["lb"] }

@@ -308,6 +308,12 @@ async fn handle_tun_ws(
                                     warn!("no pending request for rid {}", resp_frame.rid);
                                 }
                             }
+                            Ok(TunnelFrame::WsStart { rid, path }) => {
+                                debug!("tun {} WsStart rid={} path={}", tun_name, rid, path);
+                            }
+                            Ok(TunnelFrame::WsEnd { rid }) => {
+                                debug!("tun {} WsEnd rid={}", tun_name, rid);
+                            }
                             Err(e) => {
                                 warn!("malformed tunnel frame from {}: {}", tun_name, e);
                             }

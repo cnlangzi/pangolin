@@ -134,6 +134,14 @@ impl TestWsServer {
                         Ok(TunnelFrame::Res(_)) => {
                             // tun sent a response to our request
                         }
+                        Ok(TunnelFrame::WsStart { rid, path }) => {
+                            // TODO: implement WS relay start
+                            log::debug!("mock ngx WsStart rid={} path={}", rid, path);
+                        }
+                        Ok(TunnelFrame::WsEnd { rid }) => {
+                            // TODO: implement WS relay end
+                            log::debug!("mock ngx WsEnd rid={}", rid);
+                        }
                         Err(e) => {
                             log::warn!("mock ngx malformed frame: {}", e);
                         }

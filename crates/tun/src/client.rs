@@ -227,6 +227,14 @@ impl TunnelClient {
                         Ok(TunnelFrame::Res(_)) => {
                             log::warn!("unexpected response frame from ngx");
                         }
+                        Ok(TunnelFrame::WsStart { rid, path }) => {
+                            // TODO: implement WS relay start
+                            log::debug!("WsStart rid={} path={}", rid, path);
+                        }
+                        Ok(TunnelFrame::WsEnd { rid }) => {
+                            // TODO: implement WS relay end
+                            log::debug!("WsEnd rid={}", rid);
+                        }
                         Err(e) => {
                             log::warn!("malformed frame from ngx: {}", e);
                         }
