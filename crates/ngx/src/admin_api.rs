@@ -482,7 +482,7 @@ pub async fn handle_api_request(
 
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
-    _http_session: &mut ServerSession,
+    http_session: &mut ServerSession,
     app: &App,
     path: &str,
     method: &str,
@@ -537,7 +537,11 @@ pub async fn handle_api_http(
         }
         ("certs", "PUT") => {
             if parts.len() >= 2 && parts[1] == "settings" {
-                update_cert_settings(app, &[]).await
+                let body = match read_body_http(http_session).await {
+                    Ok(b) => b,
+                    Err(resp) => return resp,
+                };
+                update_cert_settings(app, &body).await
             } else {
                 json_error(400, "PUT requires /api/certs/settings")
             }

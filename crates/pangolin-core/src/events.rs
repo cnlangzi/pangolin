@@ -104,8 +104,12 @@ mod tests {
     #[test]
     fn event_buffer_basic_push_get() {
         let buffer = EventBuffer::new();
-        buffer.push(Event::new(EventType::TunConnected { name: "office".into() }));
-        buffer.push(Event::new(EventType::TunDisconnected { name: "home".into() }));
+        buffer.push(Event::new(EventType::TunConnected {
+            name: "office".into(),
+        }));
+        buffer.push(Event::new(EventType::TunDisconnected {
+            name: "home".into(),
+        }));
 
         let events = buffer.get_all();
         assert_eq!(events.len(), 2);
@@ -125,7 +129,9 @@ mod tests {
         let buffer = EventBuffer::new();
         // Add more than MAX_EVENTS events
         for i in 0..(MAX_EVENTS + 10) {
-            buffer.push(Event::new(EventType::Info { message: format!("event-{}", i) }));
+            buffer.push(Event::new(EventType::Info {
+                message: format!("event-{}", i),
+            }));
         }
 
         let events = buffer.get_all();
@@ -141,7 +147,9 @@ mod tests {
     fn event_buffer_get_recent() {
         let buffer = EventBuffer::new();
         for i in 0..10 {
-            buffer.push(Event::new(EventType::Info { message: format!("event-{}", i) }));
+            buffer.push(Event::new(EventType::Info {
+                message: format!("event-{}", i),
+            }));
         }
 
         let recent = buffer.get_recent(3);
@@ -150,7 +158,9 @@ mod tests {
 
     #[test]
     fn event_serialization() {
-        let event = Event::new(EventType::TunConnected { name: "office".into() });
+        let event = Event::new(EventType::TunConnected {
+            name: "office".into(),
+        });
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"TunConnected\""));
         assert!(json.contains("\"name\":\"office\""));

@@ -45,7 +45,8 @@ impl ServeHttp for AppHttp {
             let body = serde_json::to_vec(&serde_json::json!({
                 "status": "ok",
                 "version": pangolin_core::VERSION
-            })).unwrap();
+            }))
+            .unwrap();
             let mut resp = ResponseHeader::build(200, None).unwrap();
             resp.insert_header("Content-Type", "application/json").ok();
             let _ = http_session.write_response_header(Box::new(resp)).await;

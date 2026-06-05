@@ -54,3 +54,6 @@ fn init_crypto() {
 
 #[cfg(feature = "integration")]
 mod ws_relay_e2e;
+
+#[cfg(feature = "integration")]
+mod feat_tests;

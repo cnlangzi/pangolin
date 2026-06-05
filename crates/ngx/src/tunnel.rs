@@ -183,7 +183,9 @@ async fn handle_client(
     let tun_name = name.to_string();
     mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected", tun_name);
-    app.add_event(pangolin_core::EventType::TunConnected { name: tun_name.clone() });
+    app.add_event(pangolin_core::EventType::TunConnected {
+        name: tun_name.clone(),
+    });
 
     handle_tun_ws(app, ws_stream, tun_name).await;
     Ok(())
@@ -208,12 +210,13 @@ async fn handle_tun_ws(
         match sessions.entry(tun_name.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 log::warn!("duplicate tun_name '{}' rejected", tun_name);
-                let reject = serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
-                    rid: String::new(),
-                    status: 409,
-                    headers: vec![],
-                    body: b"tun name already registered".to_vec(),
-                }));
+                let reject =
+                    serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
+                        rid: String::new(),
+                        status: 409,
+                        headers: vec![],
+                        body: b"tun name already registered".to_vec(),
+                    }));
                 if let Err(e) = reject {
                     log::warn!("failed to send duplicate rejection: {}", e);
                 }
@@ -402,5 +405,7 @@ async fn handle_tun_ws(
     mark_tun_offline(&app, &tun_name).await;
     app.unregister_tun(&tun_name).await;
     info!("tun {} disconnected", tun_name);
-    app.add_event(pangolin_core::EventType::TunDisconnected { name: tun_name.clone() });
+    app.add_event(pangolin_core::EventType::TunDisconnected {
+        name: tun_name.clone(),
+    });
 }
