@@ -79,17 +79,6 @@ impl EventBuffer {
         events.iter().rev().cloned().collect()
     }
 
-    /// Get events newer than a given timestamp (for incremental polling).
-    pub fn get_since(&self, since: DateTime<Utc>) -> Vec<Event> {
-        let events = self.events.lock().unwrap();
-        events
-            .iter()
-            .rev()
-            .filter(|e| e.timestamp > since)
-            .cloned()
-            .collect()
-    }
-
     /// Get the most recent N events.
     pub fn get_recent(&self, n: usize) -> Vec<Event> {
         let events = self.events.lock().unwrap();
