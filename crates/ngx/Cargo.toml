@@ -69,6 +69,10 @@ time = "0.3"
 bytes = "1"
 httpdate = "1"
 
+# WebSocket
+sha1 = "0.10"
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 bytes = "1"

@@ -317,28 +317,42 @@ impl TunnelClient {
         resp_tx: tokio::sync::oneshot::Sender<TunnelResponseFrame>,
     ) {
         // Parse backend URL from path.
-        // path format: "http://host:port/path" or just "/path" (implies localhost).
-        let backend_url = if path.starts_with("http://") || path.starts_with("https://") {
+        // path format: "http://host:port/path", "https://...", "ws://...", "wss://..."
+        // or just "/path" (implies http://localhost:8080).
+        let backend_url = if path.starts_with("http://")
+            || path.starts_with("https://")
+            || path.starts_with("ws://")
+            || path.starts_with("wss://")
+        {
             path.clone()
         } else {
             format!("http://127.0.0.1:8080{}", path)
         };
 
+        // Determine scheme: wss:// if original was https:// or wss://, otherwise ws://
+        let ws_scheme = if backend_url.starts_with("https://") || backend_url.starts_with("wss://")
+        {
+            "wss"
+        } else {
+            "ws"
+        };
         let backend_host = backend_url
             .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        let ws_url = format!("ws://{}", backend_host);
+            .trim_start_matches("https://")
+            .trim_start_matches("ws://")
+            .trim_start_matches("wss://");
+        let ws_url = format!("{}://{}", ws_scheme, backend_host);
         log::info!("connecting to backend WS: {}", ws_url);
 
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((_ws_backend, _)) => {
                 log::info!("WS connected to backend: {}", ws_url);
-                let addr = backend_host.to_string();
+                // Send the full URL (with scheme) so ngx can use correct ws/wss
                 let resp = TunnelResponseFrame {
                     rid,
                     status: 101,
                     headers: vec![],
-                    body: addr.into_bytes(),
+                    body: ws_url.into_bytes(),
                 };
                 let _ = resp_tx.send(resp);
             }

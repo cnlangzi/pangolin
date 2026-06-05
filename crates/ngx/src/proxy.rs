@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use log::{debug, error, info, warn};
@@ -14,10 +15,22 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
+use sha1::Digest;
+use sha1::Sha1;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use crate::{admin_api, App, TunnelMessage};
+
+/// RFC 6454 Sec-WebSocket-Accept computation.
+/// Takes the Sec-WebSocket-Key value and returns the correct Accept response.
+fn compute_ws_accept(key: &str) -> Option<String> {
+    const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut sha = Sha1::new();
+    sha.update(format!("{}{}", key.trim(), MAGIC).as_bytes());
+    let hash = sha.finalize();
+    Some(base64::engine::general_purpose::STANDARD.encode(hash))
+}
 
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
@@ -80,10 +93,13 @@ impl ProxyHttp for AppProxy {
                 let mut hdr = ResponseHeader::build(101, None).unwrap();
                 hdr.insert_header("Upgrade", "websocket").unwrap();
                 hdr.insert_header("Connection", "Upgrade").unwrap();
-                // Copy relevant headers from original request
+                // Compute Sec-WebSocket-Accept per RFC 6454
                 if let Some(sec_key) = session.get_header("Sec-WebSocket-Key") {
-                    if let Ok(v) = std::str::from_utf8(sec_key.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Key", v.as_bytes()).ok();
+                    if let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes()) {
+                        if let Some(accept) = compute_ws_accept(key_str) {
+                            hdr.insert_header("Sec-WebSocket-Accept", accept.as_bytes())
+                                .ok();
+                        }
                     }
                 }
                 if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol") {
@@ -169,9 +185,8 @@ impl ProxyHttp for AppProxy {
                         }
                     };
 
-                    // Connect to backend WebSocket.
-                    let backend_url = format!("ws://{}", backend_addr);
-                    let (ws_outbound, _) = match connect_async(&backend_url).await {
+                    // Connect to backend WebSocket (URL now includes ws:// or wss:// scheme).
+                    let (ws_outbound, _) = match connect_async(&backend_addr).await {
                         Ok(c) => c,
                         Err(e) => {
                             error!("WS connect to backend {} failed: {}", backend_addr, e);
