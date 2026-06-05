@@ -3,14 +3,18 @@
 //! Tests the complete WS relay flow: ngx → tun → backend WS echo server.
 //!
 //! Run with: `cargo test --features integration -p pangolin-integration-tests ws_relay`
+//!
+//! ## Architecture
+//!
+//! Control plane (tested here):
+//!   ngx sends WsStart to tun → tun connects to backend → tun responds 101 + address
+//!
+//! Data plane (not tested here - requires full ngx relay):
+//!   ngx connects directly to backend → relays frames client ↔ backend
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tokio_tungstenite::{accept_async, tungstenite};
 
 use pangolin_core::compress::{deflate_decode, deflate_encode};
 use pangolin_core::{deserialize_msgpack, serialize_msgpack, TunnelFrame};
@@ -27,7 +31,7 @@ struct MockWsBackend {
 
 impl MockWsBackend {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
         let handle = tokio::spawn(async move {
@@ -48,6 +52,8 @@ impl MockWsBackend {
     }
 
     async fn handle_one(stream: tokio::net::TcpStream) {
+        use tokio_tungstenite::{accept_async, tungstenite};
+
         let ws = match accept_async(stream).await {
             Ok(ws) => ws,
             Err(_) => return,
@@ -84,20 +90,15 @@ impl MockWsBackend {
                             let _ = sender.send(tungstenite::Message::Binary(buf.into())).await;
                         }
                         // Bidirectional relay: frames pass through as-is.
-                        loop {
-                            match reader.next().await {
-                                Some(Ok(msg)) => {
-                                    let should_close = matches!(
-                                        msg,
-                                        tungstenite::Message::Close(_)
-                                            | tungstenite::Message::Ping(_)
-                                            | tungstenite::Message::Pong(_)
-                                    );
-                                    if sender.send(msg).await.is_err() || should_close {
-                                        break;
-                                    }
-                                }
-                                _ => break,
+                        while let Some(Ok(msg)) = reader.next().await {
+                            let should_close = matches!(
+                                msg,
+                                tungstenite::Message::Close(_)
+                                    | tungstenite::Message::Ping(_)
+                                    | tungstenite::Message::Pong(_)
+                            );
+                            if sender.send(msg).await.is_err() || should_close {
+                                break;
                             }
                         }
                     }
@@ -170,7 +171,7 @@ async fn tunnel_ws_relay_start() {
     let encoded = serialize_msgpack(&ws_start).unwrap();
     let compressed = deflate_encode(&encoded);
     ws_sender
-        .send(tungstenite::Message::Binary(compressed.into()))
+        .send(tokio_tungstenite::tungstenite::Message::Binary(compressed.into()))
         .await
         .unwrap();
 
@@ -182,7 +183,7 @@ async fn tunnel_ws_relay_start() {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         match ws_read.next().await {
-            Some(Ok(tungstenite::Message::Binary(buf))) => {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(buf))) => {
                 let buf_vec = buf.to_vec();
                 let buf = match deflate_decode(&buf_vec) {
                     Ok(d) => d,
@@ -199,7 +200,7 @@ async fn tunnel_ws_relay_start() {
                     }
                 }
             }
-            Some(Ok(tungstenite::Message::Close(_))) | None => break,
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
             _ => {}
         }
     }
