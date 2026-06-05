@@ -198,34 +198,13 @@ impl ProxyHttp for AppProxy {
                             msg = client_ws_read.next() => {
                                 match msg {
                                     Some(Ok(Message::Binary(data))) => {
-                                        let frame = pangolin_core::TunnelFrame::Req(
-                                            pangolin_core::TunnelRequestFrame {
-                                                rid: rid.clone(),
-                                                method: "WS".into(),
-                                                path: "".into(),
-                                                headers: vec![],
-                                                body: data.as_ref().to_vec(),
-                                            },
-                                        );
-                                        let encoded = pangolin_core::serialize_msgpack(&frame)
-                                            .unwrap_or_default();
-                                        if out_sender.send(Message::Binary(encoded.into())).await.is_err() {
+                                        // Forward raw WS frame to backend (no msgpack wrapping).
+                                        if out_sender.send(Message::Binary(data)).await.is_err() {
                                             break;
                                         }
                                     }
                                     Some(Ok(Message::Text(data))) => {
-                                        let frame = pangolin_core::TunnelFrame::Req(
-                                            pangolin_core::TunnelRequestFrame {
-                                                rid: rid.clone(),
-                                                method: "WS".into(),
-                                                path: "".into(),
-                                                headers: vec![],
-                                                body: data.as_str().as_bytes().to_vec(),
-                                            },
-                                        );
-                                        let encoded = pangolin_core::serialize_msgpack(&frame)
-                                            .unwrap_or_default();
-                                        if out_sender.send(Message::Binary(encoded.into())).await.is_err() {
+                                        if out_sender.send(Message::Text(data)).await.is_err() {
                                             break;
                                         }
                                     }
@@ -249,11 +228,8 @@ impl ProxyHttp for AppProxy {
                             msg = out_read.next() => {
                                 match msg {
                                     Some(Ok(Message::Binary(data))) => {
-                                        if let Ok(pangolin_core::TunnelFrame::Req(req)) =
-                                            pangolin_core::deserialize_msgpack::<pangolin_core::TunnelFrame>(&data)
-                                        {
-                                            let _ = client_sender.send(Message::Binary(req.body.into())).await;
-                                        }
+                                        // Forward raw WS frame to client (no msgpack parsing).
+                                        let _ = client_sender.send(Message::Binary(data)).await;
                                     }
                                     Some(Ok(Message::Text(t))) => {
                                         let _ = client_sender.send(Message::Text(t)).await;
