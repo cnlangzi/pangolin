@@ -337,4 +337,3 @@ fn parse_cert_expiry(pem_str: &str) -> anyhow::Result<DateTime<Utc>> {
     let not_after = cert.tbs_certificate.validity.not_after.timestamp();
     DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
 }
-
