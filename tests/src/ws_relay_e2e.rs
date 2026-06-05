@@ -171,7 +171,9 @@ async fn tunnel_ws_relay_start() {
     let encoded = serialize_msgpack(&ws_start).unwrap();
     let compressed = deflate_encode(&encoded);
     ws_sender
-        .send(tokio_tungstenite::tungstenite::Message::Binary(compressed.into()))
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            compressed.into(),
+        ))
         .await
         .unwrap();
 
