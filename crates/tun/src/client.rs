@@ -227,6 +227,20 @@ impl TunnelClient {
                         Ok(TunnelFrame::Res(_)) => {
                             log::warn!("unexpected response frame from ngx");
                         }
+                        Ok(TunnelFrame::WsStart { rid, path }) => {
+                            // WS relay: ngx requests that we connect to a backend.
+                            // ngx expects 101 response via the msgpack channel (pending_ws map).
+                            log::info!("WsStart rid={} path={}", rid, path);
+                            let (resp_tx, _resp_rx) =
+                                tokio::sync::oneshot::channel::<TunnelResponseFrame>();
+                            tokio::spawn(async move {
+                                Self::handle_ws_start(rid, path, resp_tx).await;
+                            });
+                        }
+                        Ok(TunnelFrame::WsEnd { rid }) => {
+                            // TODO: implement WS relay end
+                            log::debug!("WsEnd rid={}", rid);
+                        }
                         Err(e) => {
                             log::warn!("malformed frame from ngx: {}", e);
                         }
@@ -295,6 +309,57 @@ impl TunnelClient {
             .await
             .map_err(|_| anyhow::anyhow!("batch channel closed"))?;
         Ok(())
+    }
+
+    async fn handle_ws_start(
+        rid: String,
+        path: String,
+        resp_tx: tokio::sync::oneshot::Sender<TunnelResponseFrame>,
+    ) {
+        // Parse backend URL from path.
+        // path format: "http://host:port/path", "https://...", "ws://...", "wss://..."
+        // or just "/path" (implies http://localhost:8080).
+        let backend_url = if path.starts_with("http://")
+            || path.starts_with("https://")
+            || path.starts_with("ws://")
+            || path.starts_with("wss://")
+        {
+            path.clone()
+        } else {
+            format!("http://127.0.0.1:8080{}", path)
+        };
+
+        // Determine scheme: wss:// if original was https:// or wss://, otherwise ws://
+        let ws_scheme = if backend_url.starts_with("https://") || backend_url.starts_with("wss://")
+        {
+            "wss"
+        } else {
+            "ws"
+        };
+        let backend_host = backend_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_start_matches("ws://")
+            .trim_start_matches("wss://");
+        let ws_url = format!("{}://{}", ws_scheme, backend_host);
+        log::info!("connecting to backend WS: {}", ws_url);
+
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((_ws_backend, _)) => {
+                log::info!("WS connected to backend: {}", ws_url);
+                // Send the full URL (with scheme) so ngx can use correct ws/wss
+                let resp = TunnelResponseFrame {
+                    rid,
+                    status: 101,
+                    headers: vec![],
+                    body: ws_url.into_bytes(),
+                };
+                let _ = resp_tx.send(resp);
+            }
+            Err(e) => {
+                log::warn!("WS connect to backend {} failed: {}", ws_url, e);
+            }
+        }
     }
 
     async fn proxy_request(

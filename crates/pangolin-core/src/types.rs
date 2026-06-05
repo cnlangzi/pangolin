@@ -91,12 +91,21 @@ pub struct TunnelResponseFrame {
     pub body: Vec<u8>,
 }
 
-/// Unified tunnel frame (request or response).
+/// Unified tunnel frame (request or response or WS relay).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 pub enum TunnelFrame {
     Req(TunnelRequestFrame),
     Res(TunnelResponseFrame),
+    /// Start a WebSocket relay session: ngx → tun.
+    WsStart {
+        rid: String,
+        path: String,
+    },
+    /// End a WebSocket relay session: ngx → tun.
+    WsEnd {
+        rid: String,
+    },
 }
 
 /// Serialize a struct to msgpack bytes using rmp-serde.
