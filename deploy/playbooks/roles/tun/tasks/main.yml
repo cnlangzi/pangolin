@@ -1,0 +1,56 @@
+---
+- name: Create pangolin user
+  become: true
+  user:
+    name: pangolin
+    system: yes
+    shell: /usr/sbin/nologin
+    home: /opt/pangolin
+    create_home: no
+    comment: "Pangolin Tunnel Service User"
+
+- name: Create workdir
+  become: true
+  file:
+    path: /opt/pangolin
+    state: directory
+    owner: pangolin
+    group: pangolin
+    mode: 0750
+
+- name: Upload tun binary
+  become: true
+  copy:
+    src: "{{ playbook_dir }}/../../build/output/pangolin-tun"
+    dest: /opt/pangolin/tun
+    owner: pangolin
+    group: pangolin
+    mode: 0755
+    backup: yes
+  notify: restart tun
+
+- name: Upload tun config
+  become: true
+  template:
+    src: tun.yml.j2
+    dest: /opt/pangolin/tun.yml
+    owner: pangolin
+    group: pangolin
+    mode: 0644
+  notify: restart tun
+
+- name: Upload tun systemd service
+  become: true
+  copy:
+    src: tun.service
+    dest: /etc/systemd/system/pangolin-tun.service
+  notify:
+    - reload systemd
+    - restart tun
+
+- name: Enable tun service
+  ansible.builtin.systemd_service:
+    name: pangolin-tun
+    enabled: true
+    masked: no
+    state: started

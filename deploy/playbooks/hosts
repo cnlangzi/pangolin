@@ -1,0 +1,18 @@
+[app]
+xiajie ansible_host=xiajie ansible_user=dayi ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+[app:vars]
+ansible_python_interpreter=auto_silent
+
+# ngx defaults
+ngx_port_http=8080
+ngx_port_https=8443
+ngx_log_level=info
+ngx_acme=false
+ngx_acme_email=
+
+# tun defaults
+tun_server=localhost:8080
+tun_token=
+tun_name=default
+tun_log_level=info
