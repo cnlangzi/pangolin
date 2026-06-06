@@ -9,23 +9,13 @@ COPY Cargo.toml Cargo.lock ./
 # Copy all crate sources
 COPY crates/ ./crates/
 
-# Pre-download dependencies (cached if Cargo.lock unchanged)
-RUN cargo fetch --locked 2>/dev/null || cargo fetch
-
-# Build ngx binary
+# Build ngx and tun in a single invocation to reuse compiled dependencies
 RUN --mount=type=cache,target=/usr/local/cargo/registry/cache \
     --mount=type=cache,target=/usr/local/cargo/registry/index \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/root/.cache/cargo \
-    cargo build --release -p ngx && \
-    mv target/release/ngx /pangolin-ngx
-
-# Build tun binary
-RUN --mount=type=cache,target=/usr/local/cargo/registry/cache \
-    --mount=type=cache,target=/usr/local/cargo/registry/index \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
-    --mount=type=cache,target=/root/.cache/cargo \
-    cargo build --release -p tun && \
+    cargo build --release -p ngx -p tun && \
+    mv target/release/ngx /pangolin-ngx && \
     mv target/release/tun /pangolin-tun
 
 # Verify binaries are built
