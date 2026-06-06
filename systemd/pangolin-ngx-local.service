@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/home/devin/code/pangolin
-ExecStart=/home/devin/code/pangolin/bin/ngx --conf /home/devin/code/pangolin/pangolin-ngx.yml
+ExecStart=/home/devin/code/pangolin/bin/pangolin-ngx --conf /home/devin/code/pangolin/pangolin-ngx.yml
 Restart=on-failure
 RestartSec=5s
 

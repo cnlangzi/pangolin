@@ -50,10 +50,12 @@ build: build-ngx build-tun
 build-ngx:
 	mkdir -p ./bin
 	$(CARGO) build --release -p ngx --out-dir ./bin
+	mv ./bin/ngx ./bin/pangolin-ngx
 
 build-tun:
 	mkdir -p ./bin
 	$(CARGO) build --release -p tun --out-dir ./bin
+	mv ./bin/tun ./bin/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun
