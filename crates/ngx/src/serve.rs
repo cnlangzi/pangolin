@@ -40,6 +40,20 @@ impl ServeHttp for AppHttp {
             return http::Response::builder().status(200).body(vec![]).unwrap();
         }
 
+        // Kubernetes-compatible health check endpoint with JSON response
+        if path == "/healthz" {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "version": pangolin_core::VERSION
+            }))
+            .unwrap();
+            return http::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .unwrap();
+        }
+
         // Admin UI routes (use the external admin crate)
         if path.starts_with("/admin") {
             debug!("HTTP admin UI: {} {}", method, path);

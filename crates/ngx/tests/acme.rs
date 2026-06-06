@@ -214,7 +214,7 @@ async fn cert_manager_resolve_existing() {
 
     // enabled=false to skip ACME init (which requires Pebble TLS cert).
     // resolve_cert() is a pure local-filesystem operation, no ACME needed.
-    let cm = ngx::acme::CertManager::new(
+    let cm = ngx::CertManager::new(
         false,
         cert_dir_path.clone(),
         "test@example.com".to_string(),

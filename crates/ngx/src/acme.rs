@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use instant_acme::{Account, AccountCredentials, ChallengeType, Identifier, NewOrder, OrderStatus};
-use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 /// Account credentials file stored in cert_dir.
@@ -337,108 +336,4 @@ fn parse_cert_expiry(pem_str: &str) -> anyhow::Result<DateTime<Utc>> {
 
     let not_after = cert.tbs_certificate.validity.not_after.timestamp();
     DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
-}
-
-// ---- CertManager (exposed to main.rs) ----
-
-/// TLS certificate manager for ngx main.rs.
-/// Handles both ACME auto-renewal and manual file-based certs.
-pub struct CertManager {
-    pub enabled: bool,
-    pub cert_dir: PathBuf,
-    pub email: String,
-    pub acme_directory: String,
-    pub renew_threshold_days: u32,
-    pub renew_check_interval_hours: u32,
-    pub renew_max_retries: u32,
-    acme_client: RwLock<Option<Arc<AcmeClient>>>,
-}
-
-impl CertManager {
-    /// Create a new CertManager.
-    pub fn new(
-        enabled: bool,
-        cert_dir: PathBuf,
-        email: String,
-        acme_directory: String,
-        renew_threshold_days: u32,
-        renew_check_interval_hours: u32,
-        renew_max_retries: u32,
-    ) -> Self {
-        Self {
-            enabled,
-            cert_dir,
-            email,
-            acme_directory,
-            renew_threshold_days,
-            renew_check_interval_hours,
-            renew_max_retries,
-            acme_client: RwLock::new(None),
-        }
-    }
-
-    /// Initialize ACME client if autorenew is enabled.
-    pub async fn init(&self) -> anyhow::Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let client = Arc::new(
-            AcmeClient::new(
-                self.cert_dir.clone(),
-                self.email.clone(),
-                &self.acme_directory,
-                self.renew_threshold_days,
-                self.renew_check_interval_hours,
-            )
-            .await?,
-        );
-        *self.acme_client.write().await = Some(client.clone());
-        Ok(())
-    }
-
-    /// Resolve cert and key paths for a given host.
-    pub fn resolve_cert(&self, host: &str) -> anyhow::Result<(String, String)> {
-        let host_dir = self.cert_dir.join(host);
-        let cert = host_dir.join("fullchain.pem");
-        let key = host_dir.join("privkey.pem");
-        if cert.exists() && key.exists() {
-            return Ok((
-                cert.to_string_lossy().into_owned(),
-                key.to_string_lossy().into_owned(),
-            ));
-        }
-        let cert = self.cert_dir.join("fullchain.pem");
-        let key = self.cert_dir.join("privkey.pem");
-        if cert.exists() && key.exists() {
-            return Ok((
-                cert.to_string_lossy().into_owned(),
-                key.to_string_lossy().into_owned(),
-            ));
-        }
-        anyhow::bail!(
-            "no certificate found for host {} (searched {}/ and {}/)",
-            host,
-            host_dir.display(),
-            self.cert_dir.display()
-        )
-    }
-
-    /// Issue or retrieve a certificate for the given domain.
-    pub async fn get_or_issue_cert(&self, domain: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
-        let client = self.acme_client.read().await;
-        let client = client
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ACME client not initialized (autorenew=false?)"))?;
-        client.issue_cert(&[domain.to_string()]).await
-    }
-
-    /// Start background renewal task for given domains.
-    pub async fn start_renewal(&self, domains: Vec<String>) {
-        if !self.enabled {
-            return;
-        }
-        if let Some(client) = self.acme_client.read().await.as_ref() {
-            client.clone().start_background_renewal(domains);
-        }
-    }
 }

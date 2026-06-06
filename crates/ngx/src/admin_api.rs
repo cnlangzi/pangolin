@@ -13,6 +13,7 @@
 //!   PUT/DELETE /api/tokens/:token
 //!   GET/POST   /api/certs
 //!   DELETE     /api/certs/:domain
+//!   GET        /api/events
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -316,6 +317,62 @@ async fn list_certs(app: &App) -> Response<Vec<u8>> {
     }
 }
 
+// ---- Events ----
+
+async fn list_events(app: &App) -> Response<Vec<u8>> {
+    let events = app.get_recent_events(20);
+    let body = match serde_json::to_vec(&events) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize events: {}", e)),
+    };
+    json_ok(body.as_slice())
+}
+
+// ---- Cert Settings ----
+
+#[derive(serde::Serialize)]
+struct CertSettings {
+    autorenew_enabled: bool,
+    autorenew_override: Option<bool>,
+}
+
+async fn get_cert_settings(app: &App) -> Response<Vec<u8>> {
+    let settings = CertSettings {
+        autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
+        autorenew_override: app.cert_manager.get_autorenew_setting(),
+    };
+    let body = match serde_json::to_vec(&settings) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
+    };
+    json_ok(body.as_slice())
+}
+
+async fn update_cert_settings(app: &App, body: &[u8]) -> Response<Vec<u8>> {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        autorenew: Option<bool>,
+    }
+    let req: Req = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("invalid JSON: {}", e)),
+    };
+
+    // Set the runtime override. If autorenew is Some(bool), it overrides the config.
+    // If autorenew is None, we clear the override (use config value).
+    app.cert_manager.set_autorenew_override(req.autorenew);
+
+    let settings = CertSettings {
+        autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
+        autorenew_override: app.cert_manager.get_autorenew_setting(),
+    };
+    let body = match serde_json::to_vec(&settings) {
+        Ok(b) => b,
+        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
+    };
+    json_ok(body.as_slice())
+}
+
 async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> {
     #[derive(serde::Deserialize)]
     struct Req {
@@ -437,7 +494,7 @@ pub async fn handle_api_request(
 
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
-    _http_session: &mut ServerSession,
+    http_session: &mut ServerSession,
     app: &App,
     path: &str,
     method: &str,
@@ -483,7 +540,24 @@ pub async fn handle_api_http(
             }
         }
         // Certs
-        ("certs", "GET") => list_certs(app).await,
+        ("certs", "GET") => {
+            if parts.len() >= 2 && parts[1] == "settings" {
+                get_cert_settings(app).await
+            } else {
+                list_certs(app).await
+            }
+        }
+        ("certs", "PUT") => {
+            if parts.len() >= 2 && parts[1] == "settings" {
+                let body = match read_body_http(http_session).await {
+                    Ok(b) => b,
+                    Err(resp) => return resp,
+                };
+                update_cert_settings(app, &body).await
+            } else {
+                json_error(400, "PUT requires /api/certs/settings")
+            }
+        }
         ("certs", "POST") => {
             if parts.len() >= 2 {
                 upsert_cert(app, parts[1], &[]).await
@@ -491,6 +565,8 @@ pub async fn handle_api_http(
                 json_error(400, "POST requires domain in path")
             }
         }
+        // Events
+        ("events", "GET") => list_events(app).await,
         _ => json_error(404, "not found"),
     }
 }

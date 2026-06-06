@@ -21,6 +21,7 @@ pub mod compress;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod events;
 pub mod index;
 pub mod normalize;
 pub mod parse;
@@ -29,6 +30,7 @@ pub mod types;
 pub use app::{App, CertManager, TunnelMessage};
 pub use config::Config;
 pub use error::{PangolinError, Result};
+pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{lookup_site, Indexes};
 pub use parse::{
     detect_scheme, file_url_to_path, is_valid_domain, is_valid_tun_name, matches_tun_name_charset,

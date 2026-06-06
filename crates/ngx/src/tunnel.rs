@@ -65,14 +65,13 @@ async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u1
 /// Mark a tun as online in the DB.
 async fn mark_tun_online(app: &App, tun_name: &str) {
     let conn = app.db.lock().await;
-    let tuns = match pangolin_core::db::list_tuns(&conn) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    if let Some(mut tun) = tuns.into_iter().find(|t| t.name == tun_name) {
-        tun.online = true;
-        let _ = pangolin_core::db::upsert_tun(&conn, &tun);
-    }
+    let _ = pangolin_core::db::set_tun_online(&conn, tun_name, true);
+}
+
+/// Mark a tun as offline in the DB.
+async fn mark_tun_offline(app: &App, tun_name: &str) {
+    let conn = app.db.lock().await;
+    let _ = pangolin_core::db::set_tun_online(&conn, tun_name, false);
 }
 
 // ---- Main tunnel server ----
@@ -168,21 +167,12 @@ async fn handle_client(
         return Ok(());
     }
 
-    // Check for duplicate registration
-    {
-        let sessions = app.tun_sessions.read().await;
-        if sessions.contains_key(name) {
-            warn!(
-                "tunnel: name {} already registered, rejecting duplicate",
-                name
-            );
-            return Ok(());
-        }
-    }
-
     let tun_name = name.to_string();
     mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected", tun_name);
+    app.add_event(pangolin_core::EventType::TunConnected {
+        name: tun_name.clone(),
+    });
 
     handle_tun_ws(app, ws_stream, tun_name).await;
     Ok(())
@@ -201,28 +191,28 @@ async fn handle_tun_ws(
     // Channel for proxy → tun requests (delivers TunnelMessage with resp_tx)
     let (tx, mut rx) = mpsc::channel::<TunnelMessage>(100);
 
-    // Check for duplicate tun_name — reject if already registered
-    {
-        let sessions = app.tun_sessions.read().await;
-        if sessions.contains_key(&tun_name) {
-            log::warn!("duplicate tun_name '{}' rejected", tun_name);
-            let reject = serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
-                rid: String::new(),
-                status: 409,
-                headers: vec![],
-                body: b"tun name already registered".to_vec(),
-            }));
-            if let Err(e) = reject {
-                log::warn!("failed to send duplicate rejection: {}", e);
-            }
-            return;
-        }
-    }
-
-    // Register this tun in App.tun_sessions
+    // Check for duplicate tun_name — reject if already registered (atomic via entry API)
     {
         let mut sessions = app.tun_sessions.write().await;
-        sessions.insert(tun_name.clone(), tx);
+        match sessions.entry(tun_name.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                log::warn!("duplicate tun_name '{}' rejected", tun_name);
+                let reject =
+                    serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
+                        rid: String::new(),
+                        status: 409,
+                        headers: vec![],
+                        body: b"tun name already registered".to_vec(),
+                    }));
+                if let Err(e) = reject {
+                    log::warn!("failed to send duplicate rejection: {}", e);
+                }
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(tx);
+            }
+        }
     }
 
     // Pending requests: rid → (resp_tx, insertion_time)
@@ -240,25 +230,6 @@ async fn handle_tun_ws(
         String,
         tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
     >::new()));
-
-    // Background task: clean up expired pending entries every 30s
-    let pending_clean = pending.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-        // Skip first immediate tick
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let now = std::time::Instant::now();
-            let mut map = pending_clean.lock().await;
-            let before = map.len();
-            map.retain(|_, (_, inserted)| now.duration_since(*inserted).as_secs() < 120);
-            let removed = before.saturating_sub(map.len());
-            if removed > 0 {
-                debug!("cleaned {} expired pending requests", removed);
-            }
-        }
-    });
 
     let pending_read = pending.clone();
     let write_task = tokio::spawn(async move {
@@ -283,8 +254,6 @@ async fn handle_tun_ws(
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_read = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    // Skip first immediate tick to avoid cleaning an empty/fresh map
-    let _ = cleanup_ticker.tick().await;
     while let Some(_msg) = ws_read.next().await {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
@@ -398,7 +367,11 @@ async fn handle_tun_ws(
 
     write_task.abort();
 
-    // Unregister on disconnect
+    // Mark offline in DB and unregister from memory
+    mark_tun_offline(&app, &tun_name).await;
     app.unregister_tun(&tun_name).await;
     info!("tun {} disconnected", tun_name);
+    app.add_event(pangolin_core::EventType::TunDisconnected {
+        name: tun_name.clone(),
+    });
 }
