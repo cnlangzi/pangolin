@@ -51,13 +51,13 @@ build: build-ngx build-tun
 
 build-ngx:
 	mkdir -p $(OUT_DIR)
-	$(CARGO) build --release -p ngx --out-dir $(OUT_DIR)
-	mv $(OUT_DIR)/ngx $(OUT_DIR)/pangolin-ngx
+	$(CARGO) build --release -p ngx
+	mv ./target/release/ngx $(OUT_DIR)/pangolin-ngx
 
 build-tun:
 	mkdir -p $(OUT_DIR)
-	$(CARGO) build --release -p tun --out-dir $(OUT_DIR)
-	mv $(OUT_DIR)/tun $(OUT_DIR)/pangolin-tun
+	$(CARGO) build --release -p tun
+	mv ./target/release/tun $(OUT_DIR)/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun
