@@ -7,7 +7,7 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug clean lint test test-integration fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
@@ -18,12 +18,14 @@ help:
 	@echo "  make debian        # Build base Docker image"
 	@echo ""
 	@echo "=== Local Run ==="
-	@echo "  make start-ngx     # Build + start ngx (systemd)"
-	@echo "  make start-tun     # Build + start tun (systemd)"
-	@echo "  make stop-ngx      # Stop ngx"
-	@echo "  make stop-tun      # Stop tun"
-	@echo "  make status-ngx    # Check ngx status"
-	@echo "  make status-tun    # Check tun status"
+	@echo "  make start-ngx     # Build + run ./bin/pangolin-ngx (foreground, no sudo)"
+	@echo "  make start-tun     # Build + run ./bin/pangolin-tun (foreground, no sudo)"
+	@echo "  make install-ngx   # Install + start ngx as systemd service (sudo)"
+	@echo "  make install-tun   # Install + start tun as systemd service (sudo)"
+	@echo "  make stop-ngx      # Stop ngx systemd service"
+	@echo "  make stop-tun      # Stop tun systemd service"
+	@echo "  make status-ngx    # Check ngx systemd status"
+	@echo "  make status-tun    # Check tun systemd status"
 	@echo ""
 	@echo "=== Deploy ==="
 	@echo "  make play          # Deploy ngx + tun"
@@ -36,7 +38,7 @@ help:
 	@echo "  make fmt-check     # Check formatting"
 	@echo "  make clippy        # Lint"
 	@echo "  make test          # Unit tests"
-	@echo "  make test-integration  # Integration tests"
+	@echo "  make test-e2e      # E2E tests (Pebble ACME)"
 	@echo "  make lint          # fmt + clippy + test"
 	@echo "  make ci            # full local CI"
 
@@ -89,7 +91,7 @@ clippy:
 test:
 	$(CARGO) test --workspace --lib --bins
 
-test-integration:
+test-e2e:
 	$(CARGO) test --workspace --features integration
 
 lint: fmt-check clippy test
@@ -98,8 +100,8 @@ lint: fmt-check clippy test
 ci: fmt-check clippy test build
 	@echo "✓ full local CI passed"
 
-ci-full: fmt-check clippy test test-integration build build-dist
-	@echo "✓ full CI (with integration) passed"
+ci-full: fmt-check clippy test test-e2e build build-dist
+	@echo "✓ full CI (with e2e) passed"
 
 # ── Deploy ───────────────────────────────────────────────────────────────────
 
@@ -111,21 +113,33 @@ play-ngx:
 play-tun:
 	cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
 
-# ── Local Run (systemd) ───────────────────────────────────────────────────────
+# ── Local Run (no sudo) ───────────────────────────────────────────────────────
+# Run the locally-built binary directly. Foreground — Ctrl-C to stop.
+# No sudo, no systemd. For a daemon-mode install see install-* below.
 
 start-ngx: build-ngx
+	./bin/pangolin-ngx
+
+start-tun: build-tun
+	./bin/pangolin-tun
+
+# ── Install as systemd service (needs sudo) ──────────────────────────────────
+
+install-ngx: build-ngx
 	sudo cp ./systemd/pangolin-ngx-local.service /etc/systemd/system/pangolin-ngx.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable pangolin-ngx
 	sudo systemctl restart pangolin-ngx
-	@echo "ngx started"
+	@echo "ngx installed and started"
 
-start-tun: build-tun
+install-tun: build-tun
 	sudo cp ./systemd/pangolin-tun-local.service /etc/systemd/system/pangolin-tun.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable pangolin-tun
 	sudo systemctl restart pangolin-tun
-	@echo "tun started"
+	@echo "tun installed and started"
+
+# ── Stop / status (operates on the systemd service installed by install-*) ───
 
 stop-ngx:
 	sudo systemctl stop pangolin-ngx || true
