@@ -45,17 +45,19 @@ help:
 setup:
 	$(RUSTUP) toolchain install $(TOOLCHAIN) --profile minimal --component rustfmt --component clippy
 
+OUT_DIR ?= ./bin
+
 build: build-ngx build-tun
 
 build-ngx:
-	mkdir -p ./bin
-	$(CARGO) build --release -p ngx --out-dir ./bin
-	mv ./bin/ngx ./bin/pangolin-ngx
+	mkdir -p $(OUT_DIR)
+	$(CARGO) build --release -p ngx --out-dir $(OUT_DIR)
+	mv $(OUT_DIR)/ngx $(OUT_DIR)/pangolin-ngx
 
 build-tun:
-	mkdir -p ./bin
-	$(CARGO) build --release -p tun --out-dir ./bin
-	mv ./bin/tun ./bin/pangolin-tun
+	mkdir -p $(OUT_DIR)
+	$(CARGO) build --release -p tun --out-dir $(OUT_DIR)
+	mv $(OUT_DIR)/tun $(OUT_DIR)/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun
