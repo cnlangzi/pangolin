@@ -1,0 +1,10 @@
+---
+- name: Deploy Pangolin tun (Tunnel Client)
+  hosts: tun
+  become: true
+  environment:
+    ansible_ssh_common_args: "-o ServerAliveInterval=60"
+
+  roles:
+    - role: tun
+      when: inventory_hostname in groups.tun

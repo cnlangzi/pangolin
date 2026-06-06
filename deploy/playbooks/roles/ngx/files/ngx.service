@@ -1,0 +1,20 @@
+[Unit]
+Description=Pangolin Gateway (ngx)
+After=network.target
+
+[Service]
+Type=simple
+User=pangolin
+Group=pangolin
+WorkingDirectory=/opt/pangolin
+ExecStart=/opt/pangolin/ngx --conf /opt/pangolin/ngx.yml
+ExecReload=/bin/kill -SIGUSR2 $MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

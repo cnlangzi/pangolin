@@ -1,0 +1,10 @@
+---
+- name: Deploy Pangolin ngx (Gateway)
+  hosts: ngx
+  become: true
+  environment:
+    ansible_ssh_common_args: "-o ServerAliveInterval=60"
+
+  roles:
+    - role: ngx
+      when: inventory_hostname in groups.ngx
