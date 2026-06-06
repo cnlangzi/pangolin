@@ -16,7 +16,7 @@
     state: directory
     owner: pangolin
     group: pangolin
-    mode: 0755
+    mode: 0750
 
 - name: Upload tun binary
   become: true
