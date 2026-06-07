@@ -72,7 +72,7 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminConfig {
     /// TCP address the admin HTTP server binds to. Default
-    /// `127.0.0.1:9090` (loopback only — admin UI/API is not meant to
+    /// `127.0.0.1:9081` (loopback only — admin UI/API is not meant to
     /// be exposed on the public proxy port).
     #[serde(default = "default_admin_addr")]
     pub addr: String,
@@ -83,7 +83,7 @@ pub struct AdminConfig {
 }
 
 fn default_admin_addr() -> String {
-    "127.0.0.1:9090".into()
+    "127.0.0.1:9081".into()
 }
 fn default_admin_username() -> String {
     "admin".into()

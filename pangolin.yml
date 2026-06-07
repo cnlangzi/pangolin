@@ -25,4 +25,4 @@ log:
   level: debug
 
 admin:
-  addr: 127.0.0.1:9090
+  addr: 127.0.0.1:9081
