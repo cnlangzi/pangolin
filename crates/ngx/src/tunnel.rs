@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite};

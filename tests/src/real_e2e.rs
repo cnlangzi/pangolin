@@ -163,7 +163,12 @@ async fn real_e2e_admin_endpoint() {
 
     let url = ngx.admin_url("/api/sites");
     let resp = reqwest::get(&url).await.expect("GET /api/sites");
-    assert_eq!(resp.status(), 200, "admin returned non-200: {}", ngx.log_string());
+    assert_eq!(
+        resp.status(),
+        200,
+        "admin returned non-200: {}",
+        ngx.log_string()
+    );
     let body: serde_json::Value = resp.json().await.expect("parse JSON");
     assert!(body.is_array(), "expected array, got: {}", body);
     assert_eq!(body.as_array().unwrap().len(), 0, "expected empty sites");
@@ -238,10 +243,21 @@ async fn real_e2e_tunnel_full() {
         .send()
         .await
         .expect("GET /api/tun");
-    assert_eq!(resp.status(), 200, "admin /api/tun non-200: {}", ngx.log_string());
+    assert_eq!(
+        resp.status(),
+        200,
+        "admin /api/tun non-200: {}",
+        ngx.log_string()
+    );
     let body: serde_json::Value = resp.json().await.expect("parse JSON");
     let arr = body.as_array().expect("array response");
-    assert_eq!(arr.len(), 1, "expected 1 tun, got {}: {}", arr.len(), serde_json::to_string(&body).unwrap());
+    assert_eq!(
+        arr.len(),
+        1,
+        "expected 1 tun, got {}: {}",
+        arr.len(),
+        serde_json::to_string(&body).unwrap()
+    );
     let entry = &arr[0];
     assert_eq!(entry["name"], "office");
     assert_eq!(entry["enabled"], true);

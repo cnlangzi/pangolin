@@ -363,7 +363,12 @@ impl TunProcess {
         // tunnel server listens), not the admin port.
         let server = format!("127.0.0.1:{}", ngx.tunnel_port);
         let mut cmd = Command::new(&bin);
-        cmd.arg("--server").arg(&server).arg("--name").arg(name).arg("--token").arg(token);
+        cmd.arg("--server")
+            .arg(&server)
+            .arg("--name")
+            .arg(name)
+            .arg("--token")
+            .arg(token);
         cmd.kill_on_drop(true);
         let (child, log) = spawn_with_log_capture(cmd);
 
