@@ -91,7 +91,12 @@ clippy:
 test:
 	$(CARGO) test --workspace --lib --bins
 
-test-e2e:
+# Real-binary e2e tests require the ngx + tun binaries at
+# target/release/{ngx,tun}, so depend on `build` to ensure they exist.
+# The 65 lib-level tests under tests/src/* still run (and dominate the
+# test count); the new real-binary tests live in tests/src/real_e2e.rs
+# and only run when both binaries are present.
+test-e2e: build
 	$(CARGO) test --workspace --features integration
 
 lint: fmt-check clippy test

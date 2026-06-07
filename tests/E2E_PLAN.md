@@ -3,6 +3,16 @@
 > These tests require a running ngx proxy process + mock HTTP/S backend.
 > Run with: `cargo test --features integration -p pangolin-integration-tests e2e`
 
+> **2026-06-07 update**: A new `tests/src/real_e2e.rs` module adds 4
+> tests that spawn **real `pangolin-ngx` and `pangolin-tun`
+> subprocesses** via the `tests/src/harness.rs` wrapper. This
+> complements (does not replace) the in-process tests below. The
+> in-process approach is retained for the 65+ lib-level tests because
+> it is fast and pinpoints failures; the real-binary approach is
+> reserved for tests that require the actual binary CLI surface and
+> end-to-end signal/port/TLS/WS behavior. See
+> `tests/CHECKLIST.md` "Phase C" for details.
+
 ---
 
 ## Strategy

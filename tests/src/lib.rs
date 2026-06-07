@@ -57,3 +57,12 @@ mod ws_relay_e2e;
 
 #[cfg(feature = "integration")]
 mod feat_tests;
+
+// Real-binary e2e tests. These spawn `pangolin-ngx` and `pangolin-tun`
+// as subprocesses; require the binaries at `target/release/{ngx,tun}`.
+// Prerequisite: `make build` (or `cargo build --release -p ngx -p tun`).
+#[cfg(feature = "integration")]
+mod harness;
+
+#[cfg(feature = "integration")]
+mod real_e2e;

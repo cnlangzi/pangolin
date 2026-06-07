@@ -1,8 +1,9 @@
 # Pangolin Integration Tests — CHECKLIST
 
-> Last updated: 2026-06-04
-> Status: 65/65 core + E2E integration tests done ✅; tunnel E2E remain
+> Last updated: 2026-06-07
+> Status: 65/65 core + E2E integration tests done ✅; 4 real-binary e2e tests added ✅
 > Run with: `cargo test --features integration --workspace`
+> Real-binary tests require: `make build` (or `cargo build --release -p ngx -p tun`)
 
 ---
 
@@ -112,9 +113,10 @@
 - [x] `e2e_direct_static_file_not_found` — file not found → 404
 
 ### Tunnel E2E (1)
-- [ ] `e2e_tunnel_full` — ngx WS tunnel + tun client + backend → 200
-  - Requires: tunnel server + tun client subprocess + ngx running
-  - Most complex — likely the last E2E test
+- [x] `e2e_tunnel_full` — ngx WS tunnel + tun client + backend → 200
+  - Implemented as `real_e2e_tunnel_full` in `tests/src/real_e2e.rs`,
+    launching real `pangolin-ngx` + `pangolin-tun` binaries via the
+    `harness` module.
   - tunnel.rs `validate_token()` checks expiry, returns 401
   - MockNgx doesn't do token validation; needs tunnel server + tun client
 
@@ -126,11 +128,25 @@
 - `e2e_direct_static_file` — GET /index.html via TCP proxy → file:/// backend → 200
 - `e2e_direct_static_file_not_found` — missing file → 404
 
-### Phase B: Tunnel E2E (remaining)
+### Phase B: Tunnel E2E ✅
 - `e2e_tunnel_full` — ngx WS tunnel + tun client + backend → 200
 - `validate_token_expired_active` — tunnel auth with expired token → 401
   - proxy_tunnel (5 tests) already cover tun client + MockNgx WS at unit level
   - Full E2E requires real proxy + tunnel + backend running
+
+### Phase C: Real-binary e2e (production-like) ✅ (2026-06-07)
+- `tests/src/harness.rs` — RAII wrappers (`NgxProcess`, `TunProcess`)
+  that spawn real `pangolin-ngx` and `pangolin-tun` subprocesses with
+  per-test ports, per-test certs, and per-test config.
+- `tests/src/real_e2e.rs` — 4 tests:
+  - [x] `real_e2e_admin_endpoint` — GET `/api/sites` on a live
+    `pangolin-ngx` returns 200 + `[]`
+  - [x] `real_e2e_static_file` — `file:///` backend serves a static
+    file through the real proxy
+  - [x] `real_e2e_tunnel_full` — real `ngx` + real `tun` + mock HTTP
+    backend; GET through the tunnel returns the backend's response
+  - [x] `real_e2e_tunnel_token_rejected` — `tun` with an expired token
+    fails auth and the connection is closed
 
 ---
 

@@ -115,9 +115,14 @@ fn main() -> anyhow::Result<()> {
     }
     server.add_service(proxy_service);
 
-    // HTTP server (admin API + static files)
-    let http_server: Service<_> =
+    // HTTP server (admin API + static files). Bound to the admin
+    // address from config — historically this service was added
+    // without `add_tcp`, which made the admin API unreachable. See
+    // `tests/src/real_e2e.rs::real_e2e_admin_endpoint` for the test
+    // that exercises this path.
+    let mut http_server =
         Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
+    http_server.add_tcp(&config.admin.addr);
     server.add_service(http_server);
 
     // Tunnel WebSocket server (independent TCP listener, runs as background task).

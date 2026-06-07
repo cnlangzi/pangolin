@@ -1932,6 +1932,7 @@ dependencies = [
  "log",
  "ngx",
  "pangolin-core",
+ "rcgen",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",

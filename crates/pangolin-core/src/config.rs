@@ -71,12 +71,20 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminConfig {
+    /// TCP address the admin HTTP server binds to. Default
+    /// `127.0.0.1:9090` (loopback only — admin UI/API is not meant to
+    /// be exposed on the public proxy port).
+    #[serde(default = "default_admin_addr")]
+    pub addr: String,
     #[serde(default = "default_admin_username")]
     pub username: String,
     #[serde(default = "default_admin_password")]
     pub password: String,
 }
 
+fn default_admin_addr() -> String {
+    "127.0.0.1:9090".into()
+}
 fn default_admin_username() -> String {
     "admin".into()
 }
@@ -87,6 +95,7 @@ fn default_admin_password() -> String {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
+            addr: default_admin_addr(),
             username: "admin".into(),
             password: "admin".into(),
         }
