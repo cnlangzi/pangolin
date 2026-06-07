@@ -42,5 +42,8 @@ env_logger = "0.11"
 sha1 = "0.10"
 base64 = "0.22"
 
+# Real-binary e2e harness: self-signed cert generation
+rcgen = "0.14"
+
 [features]
 integration = []

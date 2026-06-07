@@ -46,7 +46,7 @@
 - [x] admin.rs — Admin API REST endpoints
 - [x] serve.rs — impl ServeHttp
 - [x] pingora 升级 0.4 → 0.8.0（CI Rust 1.96 兼容）
-- [x] Makefile 重构（lint/build/ui/test-integration）
+- [x] Makefile 重构（lint/build/ui/test-e2e）
 - [x] CI 复用 Makefile，双绿灯（Rust build + UI build）
 
 ## 当前阻塞项

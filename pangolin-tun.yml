@@ -1,9 +1,0 @@
-# Local development config for pangolin-tun
-server: localhost:8080
-
-token: dev-token
-
-name: local-dev
-
-log:
-  level: debug

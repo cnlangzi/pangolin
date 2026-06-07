@@ -41,10 +41,10 @@ pub struct ServerConfig {
 }
 
 fn default_server_port() -> u16 {
-    8080
+    80
 }
 fn default_tls_port() -> u16 {
-    8443
+    443
 }
 fn default_server_host() -> Option<String> {
     None
@@ -59,8 +59,8 @@ fn default_tunnel_port() -> u16 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            port: 8080,
-            tls_port: 8443,
+            port: default_server_port(),
+            tls_port: default_tls_port(),
             ws_path: "/tunnel".into(),
             workers: None,
             tunnel_port: 9001,
@@ -71,12 +71,20 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminConfig {
+    /// TCP address the admin HTTP server binds to. Default
+    /// `127.0.0.1:9081` (loopback only — admin UI/API is not meant to
+    /// be exposed on the public proxy port).
+    #[serde(default = "default_admin_addr")]
+    pub addr: String,
     #[serde(default = "default_admin_username")]
     pub username: String,
     #[serde(default = "default_admin_password")]
     pub password: String,
 }
 
+fn default_admin_addr() -> String {
+    "127.0.0.1:9081".into()
+}
 fn default_admin_username() -> String {
     "admin".into()
 }
@@ -87,6 +95,7 @@ fn default_admin_password() -> String {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
+            addr: default_admin_addr(),
             username: "admin".into(),
             password: "admin".into(),
         }
@@ -190,16 +199,17 @@ impl Default for LogConfig {
 }
 
 impl Config {
-    /// Load from a TOML file. Missing optional sections are filled with defaults.
+    /// Load from a YAML file. Missing optional sections are filled
+    /// with defaults.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let s = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
         Self::from_str(&s)
     }
 
-    /// Parse from a TOML string (used in tests).
+    /// Parse from a YAML string (used in tests).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(PangolinError::Toml)
+        serde_yaml::from_str(s).map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
     }
 }
 
@@ -210,55 +220,55 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        assert_eq!(c.server.port, 8080);
-        assert_eq!(c.server.tls_port, 8443);
+        assert_eq!(c.server.port, 80);
+        assert_eq!(c.server.tls_port, 443);
         assert_eq!(c.server.ws_path, "/tunnel");
         assert!(c.cert.autorenew);
         assert_eq!(c.cert.renew_threshold_days, 30);
     }
 
     #[test]
-    fn parse_minimal_toml() {
+    fn parse_minimal_yaml() {
         let s = r#"
-            [server]
-            port = 9000
+            server:
+              port: 9000
         "#;
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.server.port, 9000);
         // others default
-        assert_eq!(c.server.tls_port, 8443);
+        assert_eq!(c.server.tls_port, 443);
         assert!(c.cert.autorenew);
     }
 
     #[test]
-    fn parse_full_toml() {
+    fn parse_full_yaml() {
         let s = r#"
-            [server]
-            port = 8080
-            tls_port = 8443
-            ws_path = "/tunnel"
-            workers = 4
+            server:
+              port: 80
+              tls_port: 443
+              ws_path: "/tunnel"
+              workers: 4
 
-            [admin]
-            username = "root"
-            password = "secret"
+            admin:
+              username: "root"
+              password: "secret"
 
-            [cache]
-            enabled = true
-            dir = "/var/cache/pangolin"
+            cache:
+              enabled: true
+              dir: "/var/cache/pangolin"
 
-            [cert]
-            email = "ops@example.com"
-            cert_dir = "/etc/pangolin/certs"
-            autorenew = false
-            acme_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
-            renew_threshold_days = 14
-            renew_check_interval_hours = 12
-            renew_max_retries = 5
+            cert:
+              email: "ops@example.com"
+              cert_dir: "/etc/pangolin/certs"
+              autorenew: false
+              acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
+              renew_threshold_days: 14
+              renew_check_interval_hours: 12
+              renew_max_retries: 5
 
-            [log]
-            level = "debug"
-            file = "/var/log/pangolin.log"
+            log:
+              level: "debug"
+              file: "/var/log/pangolin.log"
         "#;
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.server.workers, Some(4));
@@ -283,8 +293,8 @@ mod tests {
     #[test]
     fn autorenew_explicit_false() {
         let s = r#"
-            [cert]
-            autorenew = false
+            cert:
+              autorenew: false
         "#;
         let c = Config::from_str(s).unwrap();
         assert!(!c.cert.autorenew);

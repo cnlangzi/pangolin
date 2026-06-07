@@ -28,6 +28,11 @@ Cargo.lock.bak
 *.local.yaml
 *.local.yml
 
+# SQLite databases created at runtime by `pangolin-ngx` (e.g. from `make start-ngx`)
+/pangolin.db
+/pangolin.db-shm
+/pangolin.db-wal
+
 # IDE
 .idea/
 .vscode/

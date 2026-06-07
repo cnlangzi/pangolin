@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite};
@@ -111,39 +110,51 @@ pub async fn start_tunnel_server(app: Arc<App>, addr: &str) {
 /// Handle a single tunnel client: WebSocket upgrade, auth, then handle requests.
 async fn handle_client(
     app: Arc<App>,
-    mut tcp_stream: tokio::net::TcpStream,
+    tcp_stream: tokio::net::TcpStream,
     _client_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Peek to verify this is a GET /tunnel request
-    let mut peek_buf = [0u8; 64];
-    match tcp_stream.peek(&mut peek_buf).await {
+    // Peek to verify this is a GET /tunnel request, and to extract
+    // the token/name from the URL for auth. `peek` does NOT advance
+    // the read cursor (it's a `MSG_PEEK` under the hood), so the
+    // bytes are still available to `accept_async` below — we must
+    // NOT call `read` between peek and accept, or accept would see
+    // a truncated request and fail the WS handshake.
+    //
+    // Buffer size: 1024 is comfortably larger than any reasonable
+    // GET line (RFC 7230 §3.1.1 doesn't define a hard limit, but
+    // production auth tokens can be 64-128+ bytes). `peek` doesn't
+    // advance the cursor so reading a larger buffer is cheap.
+    let mut peek_buf = [0u8; 1024];
+    let peek_n = match tcp_stream.peek(&mut peek_buf).await {
         Ok(0) => return Ok(()),
-        Ok(n) => {
-            let peek_str = std::str::from_utf8(&peek_buf[..n]).unwrap_or("");
-            if !peek_str.starts_with("GET /tunnel") {
-                debug!("tunnel: non-GET or wrong path, closing");
-                return Ok(());
-            }
-        }
+        Ok(n) => n,
         Err(e) => {
             warn!("peek error: {}", e);
             return Ok(());
         }
+    };
+    let peek_str = std::str::from_utf8(&peek_buf[..peek_n]).unwrap_or("");
+    if !peek_str.starts_with("GET /tunnel") {
+        debug!("tunnel: non-GET or wrong path, closing");
+        return Ok(());
     }
 
-    // Consume peeked bytes
-    let mut drain_buf = [0u8; 64];
-    let _ = tcp_stream.read(&mut drain_buf).await;
-
-    // WebSocket handshake
+    // WebSocket handshake (reads the same bytes we peeked)
     let ws_stream = accept_async(tcp_stream).await?;
 
-    // Extract token & name from the HTTP request path
-    let peek_str = std::str::from_utf8(&peek_buf).unwrap_or("");
+    // Extract token & name from the URL. The request looks like
+    //   GET /tunnel?token=xxx&name=yyy HTTP/1.1\r\n...
+    // so the URL is the second whitespace-separated token. We strip
+    // the leading `/tunnel?` to get the raw query string.
+    //
+    // Note: re-derive `peek_str` from the sliced buffer (not the
+    // zero-padded whole buffer); `from_utf8` on `\0` padding would
+    // return Err and the URL parse would degrade to "".
+    let peek_str = std::str::from_utf8(&peek_buf[..peek_n]).unwrap_or("");
     let query = peek_str
-        .strip_prefix("GET /tunnel")
-        .and_then(|s| s.strip_prefix(" HTTP"))
-        .map(|s| s.trim())
+        .split_whitespace()
+        .nth(1)
+        .and_then(|url| url.strip_prefix("/tunnel?"))
         .unwrap_or("");
 
     let mut token = "";
