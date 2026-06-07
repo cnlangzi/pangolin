@@ -294,23 +294,9 @@ autorenew = false
         }
     }
 
-    /// The URL the public proxy is reachable on (HTTP, for tests that
-    /// don't exercise TLS). Always returns `127.0.0.1` so reqwest
-    /// doesn't try to DNS-resolve a fake domain like
-    /// `static.example.com` and connect to a public IP. The caller
-    /// must set the `Host` header explicitly via the `host_for()`
-    /// method below.
-    pub fn http_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.http_port)
-    }
-
-    /// The `Host` header value the proxy expects for routing. Pass
-    /// this to `reqwest::RequestBuilder::header("Host", ...)` so the
-    /// request actually routes to the seeded site.
-    pub fn host_for(&self, host: &str) -> String {
-        host.to_string()
-    }
-
+    /// Admin API URL. Always `127.0.0.1:port` (no host override
+    /// needed; admin routes by config's `[admin] addr`, not by the
+    /// `Host` header).
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.admin_port, path)
     }

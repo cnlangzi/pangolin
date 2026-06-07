@@ -120,7 +120,12 @@ async fn handle_client(
     // bytes are still available to `accept_async` below — we must
     // NOT call `read` between peek and accept, or accept would see
     // a truncated request and fail the WS handshake.
-    let mut peek_buf = [0u8; 64];
+    //
+    // Buffer size: 1024 is comfortably larger than any reasonable
+    // GET line (RFC 7230 §3.1.1 doesn't define a hard limit, but
+    // production auth tokens can be 64-128+ bytes). `peek` doesn't
+    // advance the cursor so reading a larger buffer is cheap.
+    let mut peek_buf = [0u8; 1024];
     let peek_n = match tcp_stream.peek(&mut peek_buf).await {
         Ok(0) => return Ok(()),
         Ok(n) => n,
@@ -142,7 +147,11 @@ async fn handle_client(
     //   GET /tunnel?token=xxx&name=yyy HTTP/1.1\r\n...
     // so the URL is the second whitespace-separated token. We strip
     // the leading `/tunnel?` to get the raw query string.
-    let peek_str = std::str::from_utf8(&peek_buf).unwrap_or("");
+    //
+    // Note: re-derive `peek_str` from the sliced buffer (not the
+    // zero-padded whole buffer); `from_utf8` on `\0` padding would
+    // return Err and the URL parse would degrade to "".
+    let peek_str = std::str::from_utf8(&peek_buf[..peek_n]).unwrap_or("");
     let query = peek_str
         .split_whitespace()
         .nth(1)
