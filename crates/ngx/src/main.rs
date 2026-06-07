@@ -44,8 +44,14 @@ struct Args {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// NOTE: we deliberately do NOT use `#[tokio::main]` here. pingora's
+// `Server::run_forever()` spins up its own tokio runtime internally;
+// wrapping `main` in a tokio runtime as well causes a
+// "Cannot start a runtime from within a runtime" panic. The tunnel
+// listener needs to run concurrently, so we spawn it on a dedicated
+// std::thread with its own current-thread runtime instead of
+// `tokio::spawn` (which would re-enter the outer runtime).
+fn main() -> anyhow::Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -114,12 +120,20 @@ async fn main() -> anyhow::Result<()> {
         Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
     server.add_service(http_server);
 
-    // Tunnel WebSocket server (independent TCP listener, runs as background task)
+    // Tunnel WebSocket server (independent TCP listener, runs as background task).
+    // See the note above on why this is `std::thread::spawn` + a dedicated
+    // current-thread runtime, not `tokio::spawn`.
     let app_tunnel = app.clone();
     let tunnel_addr = format!("127.0.0.1:{}", config.server.tunnel_port);
-    tokio::spawn(async move {
-        tunnel::start_tunnel_server(app_tunnel, &tunnel_addr).await;
-    });
+    std::thread::Builder::new()
+        .name("pangolin-tunnel".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tunnel runtime");
+            rt.block_on(tunnel::start_tunnel_server(app_tunnel, &tunnel_addr));
+        })?;
 
     server.run_forever();
 }

@@ -41,10 +41,10 @@ pub struct ServerConfig {
 }
 
 fn default_server_port() -> u16 {
-    8080
+    80
 }
 fn default_tls_port() -> u16 {
-    8443
+    443
 }
 fn default_server_host() -> Option<String> {
     None
@@ -59,8 +59,8 @@ fn default_tunnel_port() -> u16 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            port: 8080,
-            tls_port: 8443,
+            port: default_server_port(),
+            tls_port: default_tls_port(),
             ws_path: "/tunnel".into(),
             workers: None,
             tunnel_port: 9001,
@@ -210,8 +210,8 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        assert_eq!(c.server.port, 8080);
-        assert_eq!(c.server.tls_port, 8443);
+        assert_eq!(c.server.port, 80);
+        assert_eq!(c.server.tls_port, 443);
         assert_eq!(c.server.ws_path, "/tunnel");
         assert!(c.cert.autorenew);
         assert_eq!(c.cert.renew_threshold_days, 30);
@@ -226,7 +226,7 @@ mod tests {
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.server.port, 9000);
         // others default
-        assert_eq!(c.server.tls_port, 8443);
+        assert_eq!(c.server.tls_port, 443);
         assert!(c.cert.autorenew);
     }
 
@@ -234,8 +234,8 @@ mod tests {
     fn parse_full_toml() {
         let s = r#"
             [server]
-            port = 8080
-            tls_port = 8443
+            port = 80
+            tls_port = 443
             ws_path = "/tunnel"
             workers = 4
 

@@ -1,0 +1,28 @@
+# Local development config for ./bin/pangolin-ngx.
+# Auto-loaded because the binary's --config default is `pangolin.toml`.
+# All fields are optional — every section has #[serde(default)] in
+# crates/pangolin-core/src/config.rs. Override only what you need.
+#
+# Dev ports: 9080/9443 (non-privileged) so `make start-ngx` works
+# without sudo. The code defaults are 80/443 (privileged, production).
+# To use the production defaults, delete the [server] block below and
+# run with `sudo`.
+#
+# TLS note: the binary unconditionally requires a cert at
+# ./certs/default/{fullchain,privkey}.pem when tls_port > 0. Generate
+# one with:
+#   mkdir -p ./certs/default
+#   openssl req -x509 -newkey rsa:2048 -nodes \
+#     -keyout ./certs/default/privkey.pem \
+#     -out ./certs/default/fullchain.pem \
+#     -days 365 -subj "/CN=default"
+
+[server]
+port = 9080
+tls_port = 9443
+
+[log]
+level = "debug"
+
+[admin]
+addr = ":9090"
