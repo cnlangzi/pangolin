@@ -11,9 +11,6 @@ pub enum PangolinError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("toml: {0}")]
-    Toml(#[from] toml::de::Error),
-
     #[error("backend parse: {0}")]
     Parse(#[from] crate::parse::ParseError),
 

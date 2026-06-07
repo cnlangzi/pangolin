@@ -1,5 +1,5 @@
 # Local development config for ./bin/pangolin-ngx.
-# Auto-loaded because the binary's --config default is `pangolin.toml`.
+# Auto-loaded because the binary's --config default is `pangolin.yml`.
 # All fields are optional — every section has #[serde(default)] in
 # crates/pangolin-core/src/config.rs. Override only what you need.
 #
@@ -17,12 +17,12 @@
 #     -out ./certs/default/fullchain.pem \
 #     -days 365 -subj "/CN=default"
 
-[server]
-port = 9080
-tls_port = 9443
+server:
+  port: 9080
+  tls_port: 9443
 
-[log]
-level = "debug"
+log:
+  level: debug
 
-[admin]
-addr = ":9090"
+admin:
+  addr: 127.0.0.1:9090

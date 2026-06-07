@@ -199,16 +199,17 @@ impl Default for LogConfig {
 }
 
 impl Config {
-    /// Load from a TOML file. Missing optional sections are filled with defaults.
+    /// Load from a YAML file. Missing optional sections are filled
+    /// with defaults.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let s = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
         Self::from_str(&s)
     }
 
-    /// Parse from a TOML string (used in tests).
+    /// Parse from a YAML string (used in tests).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(PangolinError::Toml)
+        serde_yaml::from_str(s).map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
     }
 }
 
@@ -227,10 +228,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_minimal_toml() {
+    fn parse_minimal_yaml() {
         let s = r#"
-            [server]
-            port = 9000
+            server:
+              port: 9000
         "#;
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.server.port, 9000);
@@ -240,34 +241,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_full_toml() {
+    fn parse_full_yaml() {
         let s = r#"
-            [server]
-            port = 80
-            tls_port = 443
-            ws_path = "/tunnel"
-            workers = 4
+            server:
+              port: 80
+              tls_port: 443
+              ws_path: "/tunnel"
+              workers: 4
 
-            [admin]
-            username = "root"
-            password = "secret"
+            admin:
+              username: "root"
+              password: "secret"
 
-            [cache]
-            enabled = true
-            dir = "/var/cache/pangolin"
+            cache:
+              enabled: true
+              dir: "/var/cache/pangolin"
 
-            [cert]
-            email = "ops@example.com"
-            cert_dir = "/etc/pangolin/certs"
-            autorenew = false
-            acme_directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
-            renew_threshold_days = 14
-            renew_check_interval_hours = 12
-            renew_max_retries = 5
+            cert:
+              email: "ops@example.com"
+              cert_dir: "/etc/pangolin/certs"
+              autorenew: false
+              acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
+              renew_threshold_days: 14
+              renew_check_interval_hours: 12
+              renew_max_retries: 5
 
-            [log]
-            level = "debug"
-            file = "/var/log/pangolin.log"
+            log:
+              level: "debug"
+              file: "/var/log/pangolin.log"
         "#;
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.server.workers, Some(4));
@@ -292,8 +293,8 @@ mod tests {
     #[test]
     fn autorenew_explicit_false() {
         let s = r#"
-            [cert]
-            autorenew = false
+            cert:
+              autorenew: false
         "#;
         let c = Config::from_str(s).unwrap();
         assert!(!c.cert.autorenew);

@@ -215,22 +215,22 @@ impl NgxProcess {
 
         let config = format!(
             r#"
-[server]
-port = {http}
-tls_port = {tls}
-tunnel_port = {tunnel_port}
-host = "default"
+server:
+  port: {http}
+  tls_port: {tls}
+  tunnel_port: {tunnel_port}
+  host: default
 
-[log]
-level = "info"
+log:
+  level: info
 
-[admin]
-addr = "127.0.0.1:{admin}"
+admin:
+  addr: 127.0.0.1:{admin}
 
-[cert]
-cert_dir = "{cert_dir}"
-email = ""
-autorenew = false
+cert:
+  cert_dir: "{cert_dir}"
+  email: ""
+  autorenew: false
 "#,
             http = http_port,
             tls = tls_port,
@@ -238,11 +238,11 @@ autorenew = false
             admin = admin_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
         );
-        let config_path = tmpdir.path().join("pangolin.toml");
+        let config_path = tmpdir.path().join("pangolin.yml");
         // we keep the `cert_dir` in scope (above) so the test's Drop
         // impl that points at the cert path doesn't race the tmpdir
         // teardown. _cert_dir is a no-op; just suppress the warning.
-        std::fs::write(&config_path, config).expect("write pangolin.toml");
+        std::fs::write(&config_path, config).expect("write pangolin.yml");
 
         // The binary creates pangolin.db at runtime in CWD. We want
         // it in our tempdir so the test owns the DB lifecycle.

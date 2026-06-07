@@ -39,8 +39,8 @@ use pangolin_core::config::Config;
 #[command(name = "ngx")]
 #[command(about = "Pangolin gateway — public-facing HTTP/WebSocket proxy")]
 struct Args {
-    /// Path to config file (default: ./pangolin.toml)
-    #[arg(short, long, default_value = "pangolin.toml")]
+    /// Path to config file (default: ./pangolin.yml)
+    #[arg(short, long, default_value = "pangolin.yml")]
     config: PathBuf,
 }
 
