@@ -93,14 +93,17 @@ impl AdminClient {
         Ok(resp)
     }
 
-    /// DELETE an admin path. Params go in the body, not the URL — the
-    /// server reads entity identifiers (e.g. `name`, `domain`, `token`)
-    /// from the form body, and sending them as URL query params makes
-    /// the body empty, which combined with a missing Content-Length
-    /// hangs `read_body_or_idle` on the server until the idle timeout.
+    /// PUT to an admin path with form data.
+    pub async fn put_form(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client.put(&url).form(&form).send().await?;
+        Ok(resp)
+    }
+
+    /// DELETE an admin path with query parameters.
     pub async fn delete(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<Response> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.delete(&url).form(&query).send().await?;
+        let resp = self.client.delete(&url).query(&query).send().await?;
         Ok(resp)
     }
 

@@ -326,12 +326,11 @@ async fn sites_update() {
         .unwrap();
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
-        .post_form(
+        .put_form(
             "/admin/api/sites",
             &[
                 ("backend", "http://127.0.0.1:9090"),
                 ("name", "update-me"),
-                ("_action", "update"),
                 ("_csrf", &csrf2),
             ],
         )

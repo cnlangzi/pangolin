@@ -38,6 +38,7 @@ pub async fn handle(
     method: &str,
     cookie_header: Option<&str>,
     body: Bytes,
+    merged_params: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
     // ── Auth check ──────────────────────────────────────────────────
     let parsed_cookie = cookie_header.and_then(state::parse_session_cookie);
@@ -74,6 +75,7 @@ pub async fn handle(
     let is_logout = path == "/admin/logout";
     if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !is_login && !is_logout {
         let session_token_str = session_token.as_deref().unwrap_or("");
+        // CSRF token MUST come from the body only, not from URL query string
         let csrf_from_form = query_param_opt(&body, "_csrf");
         let csrf_from_cookie = cookie_header.and_then(state::parse_csrf_cookie);
         let csrf = csrf_from_form.or(csrf_from_cookie);
@@ -108,53 +110,72 @@ pub async fn handle(
         "api/sites" if method == "GET" => routes::sites::render_table(&app, &csrf_token).await?,
         "api/sites/new" => routes::sites::render_form_new(&app, &csrf_token).await?,
         "api/sites/edit" => {
-            routes::sites::render_form_edit(&app, query_param_opt(&body, "name"), &csrf_token)
-                .await?
+            routes::sites::render_form_edit(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+            )
+            .await?
         }
         "api/sites" if method == "POST" => {
-            routes::sites::handle_create(&app, &body, &csrf_token).await?
+            routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
         }
         "api/sites" if method == "PUT" => {
-            routes::sites::handle_update(&app, query_param_opt(&body, "name"), &body, &csrf_token)
-                .await?
+            routes::sites::handle_update(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &merged_params,
+                &csrf_token,
+            )
+            .await?
         }
         "api/sites" if method == "DELETE" => {
-            routes::sites::handle_delete(&app, query_param_opt(&body, "name"), &csrf_token).await?
+            routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
         }
         "api/domains" if method == "GET" => {
             routes::domains::render_table(&app, &csrf_token).await?
         }
         "api/domains" if method == "POST" => {
-            routes::domains::handle_create(&app, &body, &csrf_token).await?
+            routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
         "api/domains" if method == "DELETE" => {
-            routes::domains::handle_delete(&app, query_param_opt(&body, "domain"), &csrf_token)
-                .await?
+            routes::domains::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "domain"),
+                &csrf_token,
+            )
+            .await?
         }
         "api/tokens" if method == "GET" => routes::tokens::render_table(&app, &csrf_token).await?,
         "api/tokens/new" => routes::tokens::render_form_new(&app, &csrf_token).await?,
         "api/tokens" if method == "POST" => {
-            routes::tokens::handle_create(&app, &body, &csrf_token).await?
+            routes::tokens::handle_create(&app, &merged_params, &csrf_token).await?
         }
         "api/tokens" if method == "DELETE" => {
-            routes::tokens::handle_delete(&app, query_param_opt(&body, "token"), &csrf_token)
-                .await?
+            routes::tokens::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "token"),
+                &csrf_token,
+            )
+            .await?
         }
         "api/certs" if method == "GET" => routes::certs::render_table(&app, &csrf_token).await?,
         "api/certs/new" => routes::certs::render_form_new(&csrf_token).await?,
         "api/certs" if method == "POST" => {
-            routes::certs::handle_create(&app, &body, &csrf_token).await?
+            routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
         }
         // Auth
         "login" => {
             if method == "POST" {
-                routes::auth::handle_login(&app, sessions, &body).await?
+                routes::auth::handle_login(&app, sessions, &merged_params).await?
             } else {
-                routes::auth::render_login(query_param_opt(&body, "next").as_deref()).await?
+                routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref())
+                    .await?
             }
         }
         "logout" if method == "POST" => {
-            routes::auth::handle_logout(sessions, &session_token.unwrap(), &body).await?
+            routes::auth::handle_logout(sessions, &session_token.unwrap(), &merged_params).await?
         }
         _ => not_found(),
     };

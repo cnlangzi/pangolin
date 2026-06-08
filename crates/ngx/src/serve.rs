@@ -125,12 +125,17 @@ async fn serve_admin_ui(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Extract query string from URI
+    let query_string = http_session
+        .req_header()
+        .uri
+        .query()
+        .unwrap_or("")
+        .to_string();
+
     // Read body. Methods that *typically* carry a body (POST/PUT/PATCH)
-    // need read_body_or_idle; methods that don't (GET/HEAD) and methods
-    // where a body is *allowed but optional* and reqwest may omit the
-    // Content-Length (DELETE) all get an empty body — otherwise
-    // read_body_or_idle blocks on EOF for a body the client never
-    // promised to send, hanging the request until the idle timeout.
+    // need read_body_or_idle; methods that don't (GET/HEAD/DELETE) get
+    // an empty body to avoid hanging on read_body_or_idle.
     let body = if matches!(method, "GET" | "HEAD" | "DELETE") {
         vec![]
     } else {
@@ -140,8 +145,23 @@ async fn serve_admin_ui(
         }
     };
 
+    // Merge query string with body. For GET/HEAD/DELETE, body is empty
+    // so merged = query_string. For POST/PUT/PATCH with query params,
+    // merged = body + "&" + query_string.
+    let merged = if body.is_empty() {
+        query_string.as_bytes().to_vec()
+    } else if query_string.is_empty() {
+        body.clone()
+    } else {
+        let mut merged = body.clone();
+        merged.push(b'&');
+        merged.extend_from_slice(query_string.as_bytes());
+        merged
+    };
+
     // Delegate to the external admin UI crate
     let body_bytes = Bytes::from(body);
+    let merged_bytes = Bytes::from(merged);
     let resp = ::admin::handle(
         app.clone(),
         sessions,
@@ -149,6 +169,7 @@ async fn serve_admin_ui(
         method,
         cookie.as_deref(),
         body_bytes,
+        merged_bytes,
     )
     .await;
 
