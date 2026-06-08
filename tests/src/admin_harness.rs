@@ -17,6 +17,9 @@ impl AdminClient {
         let client = Client::builder()
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
+            // Don't auto-follow redirects — login (and most POSTs) need
+            // to observe the 302 status, not transparently follow it.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build reqwest client");
 
