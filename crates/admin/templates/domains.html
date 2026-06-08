@@ -10,13 +10,13 @@
       <h1 class="text-2xl font-bold text-slate-900">Domains</h1>
       <p class="text-slate-500 text-sm mt-1">Map domain names to upstream sites</p>
     </div>
-    <button data-on:click="@get('/admin/api/domains/new').then(() => document.getElementById('modal').showModal())"
+    <button data-on:click="@get('/admin/api/domains/new', '#modal-body').then(() => document.getElementById('modal').showModal())"
       class="hidden md:inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg transition-colors">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
       New domain
     </button>
   </div>
-  <button data-on:click="@get('/admin/api/domains/new').then(() => document.getElementById('modal').showModal())"
+  <button data-on:click="@get('/admin/api/domains/new', '#modal-body').then(() => document.getElementById('modal').showModal())"
     class="md:hidden mb-4 inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg w-full justify-center">
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
     New domain

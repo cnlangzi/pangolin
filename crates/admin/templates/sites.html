@@ -12,7 +12,7 @@
       <p class="text-gray-600 dark:text-gray-400 text-sm md:text-base mt-1">Configure upstream backends and their route rules</p>
     </div>
     <button
-      data-on:click="@get('/admin/api/sites/new').then(() => document.getElementById('modal').showModal())"
+      data-on:click="@get('/admin/api/sites/new', '#modal-body').then(() => document.getElementById('modal').showModal())"
       class="btn-accent w-full sm:w-auto">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/>

@@ -25,7 +25,7 @@
         <td class="px-4 py-3 text-sm text-slate-500">{{ site.updated_at.format("%Y-%m-%d") }}</td>
         <td class="px-4 py-3">
           <div class="flex items-center justify-end gap-1">
-            <button data-on:click="@get('/admin/api/sites/edit?name={{ site.name }}').then(() => document.getElementById('modal').showModal())"
+            <button data-on:click="@get('/admin/api/sites/edit?name={{ site.name }}', '#modal-body').then(() => document.getElementById('modal').showModal())"
               class="text-slate-400 hover:text-brand-600 p-1.5 rounded hover:bg-brand-50 transition-colors"
               title="Edit">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z"/></svg>
@@ -55,7 +55,7 @@
       </div>
       <code class="text-xs text-slate-600 bg-slate-100 px-2 py-0.5 rounded font-mono">{{ site.backend }}</code>
       <div class="flex gap-1 mt-3">
-        <button data-on:click="@get('/admin/api/sites/edit?name={{ site.name }}').then(() => document.getElementById('modal').showModal())"
+        <button data-on:click="@get('/admin/api/sites/edit?name={{ site.name }}', '#modal-body').then(() => document.getElementById('modal').showModal())"
           class="flex-1 text-center text-sm text-brand-600 hover:text-brand-700 border border-brand-200 hover:bg-brand-50 rounded-lg py-1.5 transition-colors">Edit</button>
         <button data-on:click="if (!confirm('Delete site {{ site.name }}?')) return; @delete('/admin/api/sites?name={{ site.name }}&_csrf=__CSRF__')"
           class="flex-1 text-center text-sm text-red-500 hover:text-red-600 border border-red-100 hover:bg-red-50 rounded-lg py-1.5 transition-colors">Delete</button>
