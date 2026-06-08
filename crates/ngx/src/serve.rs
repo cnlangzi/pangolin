@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use log::debug;
 use pingora::apps::http_app::ServeHttp;
-use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
 
 use crate::App;
@@ -31,13 +30,11 @@ impl ServeHttp for AppHttp {
 
         // Health check
         if path == "/health" || path == "/ping" {
-            let mut resp = ResponseHeader::build(200, None).unwrap();
-            resp.insert_header("Content-Type", "text/plain").ok();
-            let _ = http_session.write_response_header(Box::new(resp)).await;
-            let _ = http_session
-                .write_response_body(bytes::Bytes::new(), true)
-                .await;
-            return http::Response::builder().status(200).body(vec![]).unwrap();
+            return http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(vec![])
+                .unwrap();
         }
 
         // Kubernetes-compatible health check endpoint with JSON response
@@ -67,23 +64,16 @@ impl ServeHttp for AppHttp {
                 .await;
         }
 
-        // Root
+        // Root — redirect to admin login
         if path == "/" {
-            let body = b"Pangolin ngx running".to_vec();
             return http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/plain")
-                .body(body)
+                .status(302)
+                .header("Location", "/admin/login")
+                .body(vec![])
                 .unwrap();
         }
 
         // 404
-        let mut resp = ResponseHeader::build(404, None).unwrap();
-        resp.insert_header("Content-Type", "text/plain").ok();
-        let _ = http_session.write_response_header(Box::new(resp)).await;
-        let _ = http_session
-            .write_response_body(bytes::Bytes::from_static(b"Not found"), true)
-            .await;
         http::Response::builder()
             .status(404)
             .header("Content-Type", "text/plain")
@@ -135,10 +125,16 @@ async fn serve_admin_ui(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body
-    let body = match http_session.read_body_or_idle(false).await {
-        Ok(Some(b)) => b.to_vec(),
-        _ => vec![],
+    // Read body (only for methods that typically carry one; GET/HEAD have no body
+    // and calling read_body_or_idle on them hangs because there's no Content-Length
+    // or Transfer-Encoding to signal EOF)
+    let body = if matches!(method, "GET" | "HEAD") {
+        vec![]
+    } else {
+        match http_session.read_body_or_idle(false).await {
+            Ok(Some(b)) => b.to_vec(),
+            _ => vec![],
+        }
     };
 
     // Delegate to the external admin UI crate

@@ -16,12 +16,13 @@ tun = { path = "../crates/tun" }
 
 # Test infra
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json", "cookies"] }
 tempfile = "3"
 http-body-util = "0.1"
 bytes = "1"
 httpdate = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+scraper = "0.20"
 
 # Async / ws
 futures-util = "0.3"

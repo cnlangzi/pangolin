@@ -65,4 +65,10 @@ mod feat_tests;
 mod harness;
 
 #[cfg(feature = "integration")]
+mod admin_harness;
+
+#[cfg(feature = "integration")]
 mod real_e2e;
+
+#[cfg(feature = "integration")]
+mod admin_ui_e2e;

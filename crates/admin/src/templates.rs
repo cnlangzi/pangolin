@@ -4,17 +4,27 @@ use askama::Template;
 use chrono::{DateTime, Utc};
 use pangolin_core::types::{Cert, Domain, Site, Token, Tun};
 
+// ─── Login ──────────────────────────────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "login.html")]
+pub struct LoginTemplate<'a> {
+    pub next: &'a str,
+    pub error: &'a str,
+}
+
 // ─── Dashboard ──────────────────────────────────────────────────────────────────
 
 #[derive(Template)]
 #[template(path = "dashboard.html")]
-pub struct DashboardTemplate {
+pub struct DashboardTemplate<'a> {
     pub site_count: usize,
     pub domain_count: usize,
     pub online_tun_count: usize,
     pub total_tun_count: usize,
     pub token_count: usize,
     pub cert_count: usize,
+    pub active_nav: &'a str,
 }
 
 // ─── Sites ─────────────────────────────────────────────────────────────────────
@@ -28,8 +38,9 @@ pub struct SitesTemplate<'a> {
 
 #[derive(Template)]
 #[template(path = "sites_table.html")]
-pub struct SitesTableTemplate {
+pub struct SitesTableTemplate<'a> {
     pub sites: Vec<Site>,
+    pub active_nav: &'a str,
 }
 
 #[derive(Template)]

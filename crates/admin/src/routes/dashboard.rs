@@ -36,6 +36,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         total_tun_count: tuns.len(),
         token_count: tokens.len(),
         cert_count: certs.len(),
+        active_nav: "dashboard",
     };
 
     ok_html(crate::render_with_assets_and_csrf(
