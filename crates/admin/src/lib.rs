@@ -76,9 +76,11 @@ pub async fn handle(
     if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !is_login && !is_logout {
         let session_token_str = session_token.as_deref().unwrap_or("");
         // CSRF token MUST come from the body only, not from URL query string
-        let csrf_from_form = query_param_opt(&body, "_csrf");
-        let csrf_from_cookie = cookie_header.and_then(state::parse_csrf_cookie);
-        let csrf = csrf_from_form.or(csrf_from_cookie);
+        // CSRF must come from the request body only (the _csrf hidden
+        // field injected into every form). Cookie-only is NOT accepted:
+        // the browser sends cookies automatically on any cross-origin
+        // request, so falling back to the cookie defeats the protection.
+        let csrf = query_param_opt(&body, "_csrf");
         match csrf {
             Some(t) if sessions.verify_csrf(session_token_str, &t).await => {}
             _ => {
