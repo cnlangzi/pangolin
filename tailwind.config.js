@@ -8,37 +8,55 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        // Pangolin brand: deep slate sidebar + electric blue accent
-        brand: {
-          50:  '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3b82f6', // primary blue
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
+        // Pangolin VI: 极简黑白 + 琥珀橙强调色
+        accent: {
+          50:  '#FFFBEB',
+          100: '#FEF3C7',
+          200: '#FDE68A',
+          300: '#FCD34D',
+          400: '#FBBF24',
+          500: '#F59E0B', // 主强调色 - 琥珀橙
+          600: '#D97706',
+          700: '#B45309',
+          800: '#92400E',
+          900: '#78350F',
         },
-        pangolin: {
-          slate:   '#0f172a', // sidebar bg — very dark slate
-          steel:   '#1e293b', // sidebar card bg
-          zinc:    '#334155', // sidebar border
-          silver:  '#94a3b8', // muted text
-          white:   '#f8fafc', // sidebar text
-          accent:  '#06b6d4', // cyan — tunnel/connection accent
-          success: '#22c55e', // online
-          warning: '#f59e0b', // expiring soon
-          danger:  '#ef4444', // error/offline/delete
-          info:    '#3b82f6', // link/active
-        },
+        // 功能色
+        success: '#10B981',
+        warning: '#F59E0B',
+        danger:  '#EF4444',
+        info:    '#F59E0B',
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+        sans: [
+          'system-ui',
+          '-apple-system',
+          'BlinkMacSystemFont',
+          '"Segoe UI"',
+          'Roboto',
+          '"Helvetica Neue"',
+          'Arial',
+          '"Noto Sans"',
+          'sans-serif',
+          '"Apple Color Emoji"',
+          '"Segoe UI Emoji"',
+          '"Segoe UI Symbol"',
+          '"Noto Color Emoji"',
+        ],
+        mono: [
+          'ui-monospace',
+          'SFMono-Regular',
+          '"SF Mono"',
+          'Monaco',
+          'Menlo',
+          'Consolas',
+          '"Liberation Mono"',
+          '"Courier New"',
+          'monospace',
+        ],
       },
     },
   },
   plugins: [],
+  darkMode: 'media', // 支持系统深色模式
 }

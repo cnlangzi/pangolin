@@ -7,13 +7,14 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
+	@echo "  make build-css     # Build admin UI CSS (Tailwind)"
 	@echo "  make build-dist    # Docker build, export to build/output/"
 	@echo "  make debian        # Build base Docker image"
 	@echo ""
@@ -64,6 +65,11 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
+build-css:
+	@echo "Building admin UI CSS..."
+	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found. Please install Node.js"; exit 1; }
+	npm run build
+
 build-dist: debian dist
 
 debian:
@@ -99,6 +105,9 @@ test:
 test-e2e: build
 	$(CARGO) test --workspace --features integration
 
+test-admin-e2e: build
+	$(CARGO) test -p pangolin-integration-tests --features integration admin_ui_e2e
+
 lint: fmt-check clippy test
 	@echo "✓ all checks passed"
 
@@ -122,7 +131,7 @@ play-tun:
 # Run the locally-built binary directly. Foreground — Ctrl-C to stop.
 # No sudo, no systemd. For a daemon-mode install see install-* below.
 
-start-ngx: build-ngx
+start-ngx: build-css build-ngx
 	./bin/pangolin-ngx
 
 start-tun: build-tun
@@ -130,7 +139,7 @@ start-tun: build-tun
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
-install-ngx: build-ngx
+install-ngx: build-css build-ngx
 	sudo cp ./systemd/pangolin-ngx-local.service /etc/systemd/system/pangolin-ngx.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable pangolin-ngx
