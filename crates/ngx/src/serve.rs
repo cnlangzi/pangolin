@@ -125,10 +125,13 @@ async fn serve_admin_ui(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body (only for methods that typically carry one; GET/HEAD have no body
-    // and calling read_body_or_idle on them hangs because there's no Content-Length
-    // or Transfer-Encoding to signal EOF)
-    let body = if matches!(method, "GET" | "HEAD") {
+    // Read body. Methods that *typically* carry a body (POST/PUT/PATCH)
+    // need read_body_or_idle; methods that don't (GET/HEAD) and methods
+    // where a body is *allowed but optional* and reqwest may omit the
+    // Content-Length (DELETE) all get an empty body — otherwise
+    // read_body_or_idle blocks on EOF for a body the client never
+    // promised to send, hanging the request until the idle timeout.
+    let body = if matches!(method, "GET" | "HEAD" | "DELETE") {
         vec![]
     } else {
         match http_session.read_body_or_idle(false).await {
