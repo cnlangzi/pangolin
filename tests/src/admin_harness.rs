@@ -29,7 +29,8 @@ impl AdminClient {
     /// Login with username/password. Stores session cookie in the client.
     pub async fn login(&self, username: &str, password: &str) -> anyhow::Result<()> {
         // GET login page to get initial state (not strictly needed, but realistic)
-        let login_page = self.client
+        let login_page = self
+            .client
             .get(&format!("{}/admin/login", self.base_url))
             .send()
             .await?;
@@ -39,7 +40,8 @@ impl AdminClient {
         }
 
         // POST credentials
-        let resp = self.client
+        let resp = self
+            .client
             .post(&format!("{}/admin/login", self.base_url))
             .form(&[("username", username), ("password", password)])
             .send()
@@ -70,11 +72,7 @@ impl AdminClient {
     /// DELETE an admin path with query params.
     pub async fn delete(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<Response> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client
-            .delete(&url)
-            .query(&query)
-            .send()
-            .await?;
+        let resp = self.client.delete(&url).query(&query).send().await?;
         Ok(resp)
     }
 
@@ -94,9 +92,9 @@ impl AdminClient {
         let sel = Selector::parse(selector)
             .map_err(|e| anyhow::anyhow!("Invalid selector '{}': {:?}", selector, e))?;
 
-        let found = doc.select(&sel).any(|el| {
-            el.text().collect::<String>().contains(text)
-        });
+        let found = doc
+            .select(&sel)
+            .any(|el| el.text().collect::<String>().contains(text));
 
         if !found {
             anyhow::bail!(

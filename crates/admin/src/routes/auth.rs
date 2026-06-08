@@ -20,9 +20,9 @@ pub async fn render_login(next: Option<&str>) -> http::Result<Response<Full<Buf>
         next: next.unwrap_or(""),
         error: "",
     };
-    let html = tmpl.render().unwrap_or_else(|e| {
-        format!("Template error: {}", e)
-    });
+    let html = tmpl
+        .render()
+        .unwrap_or_else(|e| format!("Template error: {}", e));
     crate::ok_html_with_csrf(html, "")
 }
 
@@ -76,9 +76,9 @@ pub async fn handle_login(
         next: "",
         error: error_html,
     };
-    let html = tmpl.render().unwrap_or_else(|e| {
-        format!("Template error: {}", e)
-    });
+    let html = tmpl
+        .render()
+        .unwrap_or_else(|e| format!("Template error: {}", e));
     crate::ok_html_with_csrf(html, "")
 }
 
