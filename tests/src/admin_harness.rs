@@ -1,9 +1,19 @@
 //! Admin UI test harness — wraps NgxProcess with login/session helpers.
 
+use std::time::Duration;
+
 use reqwest::{Client, Response};
 use scraper::{Html, Selector};
 
 use crate::harness::NgxProcess;
+
+/// Per-request timeout for every AdminClient call. The local run completes
+/// in well under 1s per request; on contended CI runners we've seen
+/// individual requests hang for minutes (one 30s request, multiplied
+/// across a parallel test runner, can blow past the whole e2e budget).
+/// 10s is generous for a single in-process handler and short enough
+/// that one slow test fails fast instead of blocking the whole suite.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Admin test client with session management.
 pub struct AdminClient {
@@ -19,6 +29,11 @@ impl AdminClient {
         Client::builder()
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
+            // Bound every request — a hung TCP connect or read would
+            // otherwise keep the test thread alive past the e2e
+            // job's overall timeout.
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(REQUEST_TIMEOUT)
             // Don't auto-follow redirects — login (and most POSTs) need
             // to observe the 302 status, not transparently follow it.
             .redirect(reqwest::redirect::Policy::none())

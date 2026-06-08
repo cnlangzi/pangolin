@@ -160,25 +160,35 @@ async fn acme_issue_certificate() {
 
     let http_client = build_acme_client(PEBBLE_ROOT_CA).expect("build HTTP client");
 
-    let client = Arc::new(
-        ngx::acme::AcmeClient::with_http_client(
-            Box::new(AcmeHttpClient(http_client)),
-            cert_dir_path.clone(),
-            "test@example.com".to_string(),
-            acme_dir,
-            7,
-            24,
-        )
-        .await
-        .expect("ACME client init"),
-    );
+    // Top-level 60s cap on the entire ACME flow — both client init
+    // (Pebble directory fetch + account registration) and the
+    // certificate issue itself. Without this, if Pebble is slow
+    // to start or the runner is contended, the test hangs the
+    // whole e2e job until the CI timeout fires.
+    let test_future = async {
+        let client = Arc::new(
+            ngx::acme::AcmeClient::with_http_client(
+                Box::new(AcmeHttpClient(http_client)),
+                cert_dir_path.clone(),
+                "test@example.com".to_string(),
+                acme_dir,
+                7,
+                24,
+            )
+            .await
+            .expect("ACME client init"),
+        );
 
-    // Issue a certificate for localhost.test
-    let domains = vec!["localhost.test".to_string()];
-    let result = timeout(Duration::from_secs(60), client.issue_cert(&domains))
+        // Issue a certificate for localhost.test
+        let domains = vec!["localhost.test".to_string()];
+        client
+            .issue_cert(&domains)
+            .await
+            .expect("ACME issue failed")
+    };
+    let result = timeout(Duration::from_secs(60), test_future)
         .await
-        .expect("ACME issue timed out")
-        .expect("ACME issue failed");
+        .expect("ACME test timed out after 60s");
 
     let (cert_path, key_path) = result;
     assert!(cert_path.exists(), "cert file not created");
