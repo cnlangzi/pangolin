@@ -5,20 +5,13 @@
 //!
 //! Prerequisites: `make build` (or `cargo build --release -p ngx -p tun`)
 
-use reqwest::redirect::Policy;
-
 use crate::admin_harness::AdminClient;
 use crate::harness::{init_pangolin_db, NgxProcess};
 
 // ── helper ──────────────────────────────────────────────────────────────────
 
 fn new_client_no_redirect() -> reqwest::Client {
-    reqwest::Client::builder()
-        .cookie_store(true)
-        .redirect(Policy::none())
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("build no-redirect client")
+    AdminClient::build_http_client()
 }
 
 async fn start_ngx() -> NgxProcess {

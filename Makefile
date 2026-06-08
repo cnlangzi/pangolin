@@ -68,7 +68,16 @@ build-debug:
 build-css:
 	@echo "Building admin UI CSS..."
 	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found. Please install Node.js"; exit 1; }
-	npm run build
+	@# Skip rebuild when the bundled CSS is newer than every source it was built from.
+	@if [ -f assets/app.css ] && \
+	   [ assets/app.css -nt assets/tailwindcss.css ] && \
+	   [ assets/app.css -nt tailwind.config.js ] && \
+	   [ assets/app.css -nt package.json ] && \
+	   [ -z "$$(find crates/admin/templates -name '*.html' -newer assets/app.css 2>/dev/null)" ]; then \
+	    echo "  up to date, skipping"; \
+	else \
+	    npm run build; \
+	fi
 
 build-dist: debian dist
 

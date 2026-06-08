@@ -27,7 +27,8 @@
           <div class="flex items-center justify-end gap-1">
             <button data-on:click="@get('/admin/api/sites/edit?name={{ site.name }}', '#modal-body').then(() => document.getElementById('modal').showModal())"
               class="text-slate-400 hover:text-brand-600 p-1.5 rounded hover:bg-brand-50 transition-colors"
-              title="Edit">
+              title="Edit"
+              aria-label="Edit {{ site.name }}">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z"/></svg>
             </button>
             <button data-on:click="if (!confirm('Delete site {{ site.name }}?')) return; @delete('/admin/api/sites?name={{ site.name }}&_csrf=__CSRF__').then(() => document.getElementById('site-{{ site.name }}').remove())"

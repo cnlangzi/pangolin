@@ -12,17 +12,23 @@ pub struct AdminClient {
 }
 
 impl AdminClient {
-    /// Create a new admin client for the given ngx process.
-    pub fn new(ngx: &NgxProcess) -> Self {
-        let client = Client::builder()
+    /// Build the shared reqwest client used by `AdminClient`.
+    /// Public so tests that need a raw client (e.g. unauth redirect
+    /// tests) don't have to duplicate this builder.
+    pub fn build_http_client() -> Client {
+        Client::builder()
             .cookie_store(true)
             .danger_accept_invalid_certs(true)
             // Don't auto-follow redirects — login (and most POSTs) need
             // to observe the 302 status, not transparently follow it.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("build reqwest client");
+            .expect("build reqwest client")
+    }
 
+    /// Create a new admin client for the given ngx process.
+    pub fn new(ngx: &NgxProcess) -> Self {
+        let client = Self::build_http_client();
         Self {
             client,
             base_url: format!("http://127.0.0.1:{}", ngx.admin_port),

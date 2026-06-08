@@ -38,7 +38,6 @@ pub async fn handle_login(
     let mut form_next = String::new();
 
     for pair in body_str.split('&') {
-        let pair = pair.replace("%40", "@");
         if let Some((k, v)) = pair.split_once('=') {
             match k {
                 "username" => {

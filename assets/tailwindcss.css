@@ -169,7 +169,7 @@
     @apply badge bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300;
   }
 
-  /* 导航链接 */
+  /* 导航链接 — 共享样式 + 移动/桌面布局修饰 */
   .nav-link {
     @apply px-3 py-2 rounded-lg text-sm font-medium text-gray-300 transition-colors;
     @apply hover:text-white hover:bg-gray-800;
@@ -180,12 +180,7 @@
   }
 
   .mobile-nav-link {
-    @apply block px-3 py-2 rounded-lg text-sm font-medium text-gray-300 transition-colors;
-    @apply hover:text-white hover:bg-gray-800;
-  }
-
-  .mobile-nav-link-active {
-    @apply text-white bg-gray-800;
+    @apply block;
   }
 
   /* Alert 组件 */
@@ -250,21 +245,10 @@
   .spinner {
     @apply inline-block w-8 h-8 border-4 border-accent-200 border-t-accent-500 rounded-full animate-spin;
   }
-
-  .spinner-sm {
-    @apply w-4 h-4 border-2;
-  }
-
-  .spinner-lg {
-    @apply w-12 h-12 border-4;
-  }
 }
 
 @layer utilities {
   /* 自定义工具类 */
-  .text-balance {
-    text-wrap: balance;
-  }
 
   .scrollbar-thin {
     scrollbar-width: thin;
