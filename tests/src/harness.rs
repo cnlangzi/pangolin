@@ -24,6 +24,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 /// Path to the workspace's `target/release/` directory. Both binaries
 /// are expected to be there — the Makefile's `build` target produces
@@ -135,14 +136,18 @@ pub fn init_pangolin_db(path: &Path) {
 }
 
 /// Capture child stdout+stderr into a shared `Vec<u8>` so failing tests
-/// can dump the binary's log output.
-fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>) {
+/// can dump the binary's log output. Returns the `JoinHandle`s of the
+/// reader tasks so `NgxProcess::drop` can `abort()` them — otherwise
+/// they keep the tokio runtime alive after the test process tries to
+/// exit, and `cargo test` hangs indefinitely.
+fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>, Vec<JoinHandle<()>>) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn child process");
     let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut handles = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let log = log.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut buf = [0u8; 4096];
             loop {
@@ -152,11 +157,11 @@ fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>) {
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
     if let Some(stderr) = child.stderr.take() {
         let log = log.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut buf = [0u8; 4096];
             loop {
@@ -166,9 +171,9 @@ fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>) {
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
-    (child, log)
+    (child, log, handles)
 }
 
 /// RAII handle for a running `pangolin-ngx` subprocess. On drop, the
@@ -182,6 +187,11 @@ pub struct NgxProcess {
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub log: Arc<Mutex<Vec<u8>>>,
+    // tokio tasks draining the child's stdout/stderr into `log`. We
+    // hold the JoinHandles so Drop can `abort()` them — otherwise they
+    // outlive the test process and keep the tokio runtime (and thus
+    // `cargo test`) alive forever.
+    log_tasks: Vec<JoinHandle<()>>,
     // Hold the tempdir so it isn't dropped (and deleted) before the
     // child finishes using it.
     _tmpdir: TempDir,
@@ -272,7 +282,7 @@ cert:
         // failures surface useful proxy/lookup debug logs.
         cmd.env("RUST_LOG", "debug");
         cmd.kill_on_drop(true);
-        let (child, log) = spawn_with_log_capture(cmd);
+        let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
         // The HTTP port is the most reliable readiness signal —
         // pingora logs "Server starting" then binds listeners shortly
@@ -283,6 +293,7 @@ cert:
 
         Self {
             child: Some(child),
+            log_tasks,
             http_port,
             tls_port,
             tunnel_port,
@@ -309,6 +320,16 @@ cert:
 
 impl Drop for NgxProcess {
     fn drop(&mut self) {
+        // Abort the log-reader tasks first. They hold references to
+        // the child's stdout/stderr pipes, so if we let the runtime
+        // shut down with them still alive the test process hangs
+        // forever. The child is already being killed below, so
+        // aborting them is safe — any data not yet drained is lost,
+        // and a 1h CI hang is much worse than a missing log line.
+        for h in self.log_tasks.drain(..) {
+            h.abort();
+        }
+
         let Some(mut child) = self.child.take() else {
             return;
         };
@@ -338,6 +359,7 @@ pub struct TunProcess {
     pub child: Option<Child>,
     pub name: String,
     pub log: Arc<Mutex<Vec<u8>>>,
+    log_tasks: Vec<JoinHandle<()>>,
 }
 
 impl TunProcess {
@@ -370,7 +392,7 @@ impl TunProcess {
             .arg("--token")
             .arg(token);
         cmd.kill_on_drop(true);
-        let (child, log) = spawn_with_log_capture(cmd);
+        let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
         // Tun's own "connected to ngx" log is the cleanest readiness
         // signal. We poll the log buffer for up to 5s rather than
@@ -399,6 +421,7 @@ impl TunProcess {
             child: Some(child),
             name: name.to_string(),
             log,
+            log_tasks,
         }
     }
 
@@ -409,6 +432,13 @@ impl TunProcess {
 
 impl Drop for TunProcess {
     fn drop(&mut self) {
+        // Same rationale as NgxProcess::drop: abort the detached
+        // log-reader tasks so they don't keep the runtime alive after
+        // we kill the child.
+        for h in self.log_tasks.drain(..) {
+            h.abort();
+        }
+
         let Some(mut child) = self.child.take() else {
             return;
         };
