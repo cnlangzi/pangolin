@@ -143,20 +143,10 @@ pub async fn handle_update(
     let backend = params.get("backend").cloned().unwrap_or_default();
 
     if backend.is_empty() {
-        return render_edit_page_with_error(
-            app,
-            &name,
-            "Backend is required",
-            csrf,
-        );
+        return render_edit_page_with_error(app, &name, "Backend is required", csrf);
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
-        return render_edit_page_with_error(
-            app,
-            &name,
-            &format!("Invalid backend: {}", e),
-            csrf,
-        );
+        return render_edit_page_with_error(app, &name, &format!("Invalid backend: {}", e), csrf);
     }
 
     let site = pangolin_core::types::Site {

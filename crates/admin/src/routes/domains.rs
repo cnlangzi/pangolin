@@ -90,9 +90,7 @@ pub async fn handle_create(
             app.reload_indexes().await;
             Ok(redirect_response("/admin/domains"))
         }
-        Err(e) => {
-            render_create_page_with_error(app, &format!("Database error: {}", e), csrf).await
-        }
+        Err(e) => render_create_page_with_error(app, &format!("Database error: {}", e), csrf).await,
     }
 }
 

@@ -153,7 +153,10 @@ async fn sites_new_page_is_full_page() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     // Full page: should have <html>, base layout, and a back-link to /admin/sites
-    assert!(body.contains("<html"), "new site page should be a full HTML page");
+    assert!(
+        body.contains("<html"),
+        "new site page should be a full HTML page"
+    );
     assert!(
         body.contains("Back to sites"),
         "new site page should have a 'Back to sites' link"
@@ -301,10 +304,7 @@ async fn sites_edit_page_prefilled() {
         .await
         .unwrap();
 
-    let resp = client
-        .get("/admin/sites/edit?name=edit-me")
-        .await
-        .unwrap();
+    let resp = client.get("/admin/sites/edit?name=edit-me").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -425,10 +425,7 @@ async fn sites_delete_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
 
     let resp = client
-        .post_form(
-            "/admin/sites/delete",
-            &[("name", "nonexistent")],
-        )
+        .post_form("/admin/sites/delete", &[("name", "nonexistent")])
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
@@ -494,7 +491,13 @@ async fn sites_create_full_ui_flow() {
     client.login("admin", "admin").await.unwrap();
 
     // 1. Sites page renders a "New site" link.
-    let sites_page = client.get("/admin/sites").await.unwrap().text().await.unwrap();
+    let sites_page = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
         sites_page.contains("New site"),
         "sites page should expose a 'New site' link"
@@ -548,7 +551,13 @@ async fn sites_create_full_ui_flow() {
     );
 
     // 4. The site now appears in the sites list.
-    let list_after = client.get("/admin/sites").await.unwrap().text().await.unwrap();
+    let list_after = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
         list_after.contains("ui-flow-site"),
         "newly created site 'ui-flow-site' should appear in the sites list"
@@ -595,7 +604,13 @@ async fn sites_create_full_ui_flow_unique_names() {
         );
     }
 
-    let list = client.get("/admin/sites").await.unwrap().text().await.unwrap();
+    let list = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(list.contains("flow-a"), "flow-a should be in list");
     assert!(list.contains("flow-b"), "flow-b should be in list");
 }
@@ -975,7 +990,10 @@ async fn certs_new_page_is_full_page() {
     let resp = client.get("/admin/certs/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("<html"), "new cert page should be a full HTML page");
+    assert!(
+        body.contains("<html"),
+        "new cert page should be a full HTML page"
+    );
     client
         .assert_selector_exists(&body, "input[name=domain]")
         .unwrap();
@@ -1016,7 +1034,10 @@ async fn certs_list_page_renders() {
     let resp = client.get("/admin/certs").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Certs") || body.contains("Certificates"), "page should contain cert heading");
+    assert!(
+        body.contains("Certs") || body.contains("Certificates"),
+        "page should contain cert heading"
+    );
 }
 
 #[tokio::test]

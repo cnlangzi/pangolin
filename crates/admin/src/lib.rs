@@ -106,13 +106,19 @@ pub async fn handle(
     let res: Response<Full<Bytes>> = match path {
         "" | "dashboard" => routes::dashboard::render(&app, &csrf_token).await?,
         "sites" if method == "GET" => routes::sites::render(&app, &csrf_token).await?,
-        "sites/new" if method == "GET" => routes::sites::render_create_page(&app, &csrf_token).await?,
+        "sites/new" if method == "GET" => {
+            routes::sites::render_create_page(&app, &csrf_token).await?
+        }
         "sites/new" if method == "POST" => {
             routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
         }
         "sites/edit" if method == "GET" => {
-            routes::sites::render_edit_page(&app, query_param_opt(&merged_params, "name"), &csrf_token)
-                .await?
+            routes::sites::render_edit_page(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+            )
+            .await?
         }
         "sites/edit" if method == "POST" => {
             routes::sites::handle_update(
@@ -124,12 +130,8 @@ pub async fn handle(
             .await?
         }
         "sites/delete" if method == "POST" => {
-            routes::sites::handle_delete(
-                &app,
-                query_param_opt(&merged_params, "name"),
-                &csrf_token,
-            )
-            .await?
+            routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
         }
         "domains" if method == "GET" => routes::domains::render(&app, &csrf_token).await?,
         "domains/new" if method == "GET" => {
