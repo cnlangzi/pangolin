@@ -1,6 +1,7 @@
 # Build outputs
 /bin/
 /target
+/build/output
 **/*.rs.bk
 Cargo.lock.bak
 
