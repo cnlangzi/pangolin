@@ -140,4 +140,11 @@ jobs:
         run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
 
       - name: Run E2E tests
+        # 15-minute hard cap. Local runs finish in ~7 min; a 60-min
+        # hang (the previous run) means a tokio spawn is keeping
+        # the test runtime alive, and the only way to recover is
+        # to kill the step. `make test-e2e` builds release binaries
+        # first, so we pad the budget to cover a cold cache (~10 min
+        # build + ~5 min test).
+        timeout-minutes: 15
         run: make test-e2e

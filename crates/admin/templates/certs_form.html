@@ -28,7 +28,7 @@
     <div id="form-result">{% if let Some(e) = error %}<p class="text-sm text-red-600 mt-2 flex items-start gap-1.5"><svg class="w-4 h-4 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg><span>{{ e }}</span></p>{% endif %}</div>
     <div class="flex gap-2 pt-2">
       <button type="submit" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold rounded-lg">Save</button>
-      <button type="button" hx-get="/admin/api/certs" hx-target="#modal-body" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium rounded-lg">Cancel</button>
+      <button type="button" data-on:click="@get('/admin/api/certs').then(() => document.getElementById('modal').close())" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium rounded-lg">Cancel</button>
     </div>
   </form>
 </div>

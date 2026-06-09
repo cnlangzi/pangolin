@@ -36,7 +36,12 @@ pub async fn render_table(app: &Arc<App>, csrf: &str) -> http::Result<Response<F
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     ok_html(crate::render_with_assets_and_csrf(
-        SitesTableTemplate { sites }.render().unwrap(),
+        SitesTableTemplate {
+            sites,
+            active_nav: "sites",
+        }
+        .render()
+        .unwrap(),
         csrf,
     ))
 }
@@ -120,6 +125,7 @@ pub async fn handle_create(
             // Return the new row as OOB swap + a success toast.
             let row = SitesTableTemplate {
                 sites: vec![site.clone()],
+                active_nav: "sites",
             }
             .render()
             .unwrap();

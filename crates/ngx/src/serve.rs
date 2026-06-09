@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use log::debug;
 use pingora::apps::http_app::ServeHttp;
-use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
 
 use crate::App;
@@ -31,13 +30,11 @@ impl ServeHttp for AppHttp {
 
         // Health check
         if path == "/health" || path == "/ping" {
-            let mut resp = ResponseHeader::build(200, None).unwrap();
-            resp.insert_header("Content-Type", "text/plain").ok();
-            let _ = http_session.write_response_header(Box::new(resp)).await;
-            let _ = http_session
-                .write_response_body(bytes::Bytes::new(), true)
-                .await;
-            return http::Response::builder().status(200).body(vec![]).unwrap();
+            return http::Response::builder()
+                .status(200)
+                .header("Content-Type", "text/plain")
+                .body(vec![])
+                .unwrap();
         }
 
         // Kubernetes-compatible health check endpoint with JSON response
@@ -67,23 +64,16 @@ impl ServeHttp for AppHttp {
                 .await;
         }
 
-        // Root
+        // Root — redirect to admin login
         if path == "/" {
-            let body = b"Pangolin ngx running".to_vec();
             return http::Response::builder()
-                .status(200)
-                .header("Content-Type", "text/plain")
-                .body(body)
+                .status(302)
+                .header("Location", "/admin/login")
+                .body(vec![])
                 .unwrap();
         }
 
         // 404
-        let mut resp = ResponseHeader::build(404, None).unwrap();
-        resp.insert_header("Content-Type", "text/plain").ok();
-        let _ = http_session.write_response_header(Box::new(resp)).await;
-        let _ = http_session
-            .write_response_body(bytes::Bytes::from_static(b"Not found"), true)
-            .await;
         http::Response::builder()
             .status(404)
             .header("Content-Type", "text/plain")
@@ -135,14 +125,43 @@ async fn serve_admin_ui(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body
-    let body = match http_session.read_body_or_idle(false).await {
-        Ok(Some(b)) => b.to_vec(),
-        _ => vec![],
+    // Extract query string from URI
+    let query_string = http_session
+        .req_header()
+        .uri
+        .query()
+        .unwrap_or("")
+        .to_string();
+
+    // Read body. Methods that *typically* carry a body (POST/PUT/PATCH)
+    // need read_body_or_idle; methods that don't (GET/HEAD/DELETE) get
+    // an empty body to avoid hanging on read_body_or_idle.
+    let body = if matches!(method, "GET" | "HEAD" | "DELETE") {
+        vec![]
+    } else {
+        match http_session.read_body_or_idle(false).await {
+            Ok(Some(b)) => b.to_vec(),
+            _ => vec![],
+        }
+    };
+
+    // Merge query string with body. For GET/HEAD/DELETE, body is empty
+    // so merged = query_string. For POST/PUT/PATCH with query params,
+    // merged = body + "&" + query_string.
+    let merged = if body.is_empty() {
+        query_string.as_bytes().to_vec()
+    } else if query_string.is_empty() {
+        body.clone()
+    } else {
+        let mut merged = body.clone();
+        merged.push(b'&');
+        merged.extend_from_slice(query_string.as_bytes());
+        merged
     };
 
     // Delegate to the external admin UI crate
     let body_bytes = Bytes::from(body);
+    let merged_bytes = Bytes::from(merged);
     let resp = ::admin::handle(
         app.clone(),
         sessions,
@@ -150,6 +169,7 @@ async fn serve_admin_ui(
         method,
         cookie.as_deref(),
         body_bytes,
+        merged_bytes,
     )
     .await;
 

@@ -1,0 +1,96 @@
+{# base.html — base layout for all admin pages #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}Pangolin{% endblock %}</title>
+<link href="/admin/app.css?v=__CSS_HASH__" rel="stylesheet">
+<script type="module" src="https://cdn.jsdelivr.net/npm/@starfederation/datastar"></script>
+</head>
+<body class="bg-white dark:bg-black min-h-screen font-sans antialiased">
+
+<header class="sticky top-0 z-50 bg-black dark:bg-white border-b border-gray-800 dark:border-gray-200 shadow-sm">
+  <div class="flex items-center justify-between px-4 py-3 max-w-7xl mx-auto">
+    <a href="/admin/" class="flex items-center gap-2.5 text-white dark:text-black font-bold text-lg">
+      <div class="w-9 h-9 rounded-xl bg-accent-500 flex items-center justify-center shadow-lg">
+        <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+          <path d="M2 17l10 5 10-5"/>
+          <path d="M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <span class="hidden sm:inline">Pangolin</span>
+    </a>
+    <nav class="hidden lg:flex items-center gap-1">
+      <a href="/admin/" class="nav-link {% if active_nav == "dashboard" %}nav-link-active{% endif %}">Dashboard</a>
+      <a href="/admin/sites" class="nav-link {% if active_nav == "sites" %}nav-link-active{% endif %}">Sites</a>
+      <a href="/admin/domains" class="nav-link {% if active_nav == "domains" %}nav-link-active{% endif %}">Domains</a>
+      <a href="/admin/tun" class="nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
+      <a href="/admin/tokens" class="nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
+      <a href="/admin/certs" class="nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
+    </nav>
+    <div class="flex items-center gap-2">
+      <form method="POST" action="/admin/logout" class="hidden lg:block">
+        <input type="hidden" name="_csrf" value="__CSRF__">
+        <button type="submit" class="text-gray-400 hover:text-white dark:hover:text-black text-sm transition-colors px-3 py-2 rounded-lg hover:bg-gray-800 dark:hover:bg-gray-100">
+          Sign out
+        </button>
+      </form>
+      <button id="menu-toggle" class="lg:hidden text-gray-400 hover:text-white dark:hover:text-black p-2 rounded-lg hover:bg-gray-800 dark:hover:bg-gray-100 transition-colors">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+  <nav id="mobile-nav" class="hidden lg:hidden border-t border-gray-800 dark:border-gray-200 px-4 py-3 space-y-1">
+    <a href="/admin/" class="mobile-nav-link nav-link {% if active_nav == "dashboard" %}nav-link-active{% endif %}">Dashboard</a>
+    <a href="/admin/sites" class="mobile-nav-link nav-link {% if active_nav == "sites" %}nav-link-active{% endif %}">Sites</a>
+    <a href="/admin/domains" class="mobile-nav-link nav-link {% if active_nav == "domains" %}nav-link-active{% endif %}">Domains</a>
+    <a href="/admin/tun" class="mobile-nav-link nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
+    <a href="/admin/tokens" class="mobile-nav-link nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
+    <a href="/admin/certs" class="mobile-nav-link nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
+    <form method="POST" action="/admin/logout" class="pt-2 border-t border-gray-700 dark:border-gray-300 mt-2">
+      <input type="hidden" name="_csrf" value="__CSRF__">
+      <button type="submit" class="mobile-nav-link nav-link text-danger hover:text-red-600 w-full text-left">
+        Sign out
+      </button>
+    </form>
+  </nav>
+</header>
+
+{% block content %}{% endblock %}
+
+{# Modal dialog (used by forms) #}
+<dialog id="modal" class="rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 p-0 backdrop:bg-black/75 max-w-2xl w-full">
+  <div id="modal-body"></div>
+</dialog>
+
+{# Toast notifications #}
+<div id="toast" class="fixed bottom-4 right-4 z-50 max-w-sm"></div>
+
+<script>
+document.getElementById('menu-toggle').addEventListener('click', function() {
+  document.getElementById('mobile-nav').classList.toggle('hidden');
+});
+</script>
+
+</body>
+</html>
+
+{# Reusable macros #}
+
+{# Status badge (enabled/disabled) #}
+{% macro status_badge(enabled) %}
+{% if enabled %}
+<span class="badge-success">Enabled</span>
+{% else %}
+<span class="badge-gray">Disabled</span>
+{% endif %}
+{% endmacro %}
+
+{# CSRF hidden input #}
+{% macro csrf_input() %}
+<input type="hidden" name="_csrf" value="__CSRF__">
+{% endmacro %}
