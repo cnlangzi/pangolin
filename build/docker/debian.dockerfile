@@ -1,4 +1,4 @@
-FROM debian:12-slim AS pangolin-debian
+FROM debian:13-slim AS pangolin-debian
 
 # Install Rust toolchain and build essentials
 RUN apt-get update -y && \
