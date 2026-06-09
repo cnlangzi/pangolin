@@ -1,12 +1,12 @@
-[app]
+[ngx]
 xiajie ansible_host=xiajie ansible_user=dayi ansible_ssh_private_key_file=~/.ssh/id_rsa
 
-[app:vars]
+[ngx:vars]
 ansible_python_interpreter=auto_silent
 
 # ngx defaults
-ngx_port_http=8080
-ngx_port_https=8443
+ngx_port_http=80
+ngx_port_https=443
 ngx_log_level=info
 ngx_acme=false
 ngx_acme_email=
