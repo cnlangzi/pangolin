@@ -6,7 +6,7 @@ ansible_python_interpreter=auto_silent
 
 # ngx defaults
 ngx_port_http=80
-ngx_port_https=443
+ngx_port_https=0
 ngx_log_level=info
 ngx_acme=false
 ngx_acme_email=

@@ -1,30 +1,58 @@
 # Local development config for ./bin/pangolin-ngx.
 # Auto-loaded because the binary's --config default is `pangolin.yml`.
-# All fields are optional — every section has #[serde(default)] in
-# crates/pangolin-core/src/config.rs. Override only what you need.
 #
-# Dev ports: 9080/9443 (non-privileged) so `make start-ngx` works
-# without sudo. The code defaults are 80/443 (privileged, production).
-# To use the production defaults, delete the [server] block below and
-# run with `sudo`.
+# Every field is optional — all sections have `#[serde(default)]` in
+# crates/pangolin-core/src/config.rs. This file lists every field
+# explicitly so that:
+#   (a) schema drift is impossible (the file mirrors Config 1:1)
+#   (b) new contributors see all knobs without reading the Rust source
 #
-# TLS note: the binary unconditionally requires a cert at
-# ./certs/default/{fullchain,privkey}.pem when tls_port > 0. Generate
-# one with:
+# Dev ports are non-privileged (9080/9443) so `make start-ngx` works
+# without sudo. Production defaults are 80/443 (privileged) — see
+# README "全局配置" for the per-field documentation.
+#
+# ── TLS setup for local dev ──────────────────────────────────────────────
+# When `server.tls_port > 0` the binary requires a cert at
+# `./certs/default/{fullchain,privkey}.pem`. Generate one with:
+#
 #   mkdir -p ./certs/default
 #   openssl req -x509 -newkey rsa:2048 -nodes \
 #     -keyout ./certs/default/privkey.pem \
 #     -out ./certs/default/fullchain.pem \
 #     -days 365 -subj "/CN=default"
+#
+# For HTTP-only dev, set `tls_port: 0` below.
+# ─────────────────────────────────────────────────────────────────────────
 
 server:
-  port: 9080
-  tls_port: 9443
-
-log:
-  level: debug
+  port: 9080              # HTTP listen port
+  tls_port: 9443          # HTTPS listen port; 0 = disable TLS entirely
+  host: null              # virtual host for per-domain cert resolution
+                         # (null = "default" → ./certs/default/...)
+  ws_path: /tunnel        # WebSocket endpoint for tun clients
+  workers: null           # pingora worker count; null = auto (CPU count)
+  tunnel_port: 9001       # WS listener for tun nodes (loopback only)
 
 admin:
-  addr: 127.0.0.1:9081
+  addr: 127.0.0.1:9081    # admin UI/API bind addr (loopback recommended)
   username: admin
   password: admin
+
+cache:
+  enabled: false          # response cache (pingora proxy_cache)
+  dir: ./cache            # cache storage dir
+
+cert:
+  email: ""               # ACME registration email
+  cert_dir: ./certs       # where CertManager looks for {fullchain,privkey}.pem
+  autorenew: false        # ⚠ MUST be false for dev — true would try
+                         # Let's Encrypt on every restart and fail
+                         # (no public IP, no DNS, clock skew, etc.)
+  acme_directory: https://acme-v02.api.letsencrypt.org/directory
+  renew_threshold_days: 30
+  renew_check_interval_hours: 6
+  renew_max_retries: 3
+
+log:
+  level: debug            # env_logger filter: trace|debug|info|warn|error
+  file: ""                # log file path; "" = stderr only
