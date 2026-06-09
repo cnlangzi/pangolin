@@ -57,9 +57,20 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-# Also copy .cargo/ if it exists (vendored config, custom registries).
-# `.dockerignore` already excludes node_modules / target / docs / etc.
-RUN cargo chef prepare --recipe-path recipe.json
+# `cargo chef prepare` invokes `cargo metadata`, which still touches
+# the crates.io index and any git deps — without these cache mounts
+# the index would be re-downloaded on every build.  Sharing the
+# exact same paths (and `sharing=locked`) as the cooker/builder
+# stages means all three stages see the same on-disk cache.
+#
+# NOTE: this project has no `.cargo/config.toml`; if you add one
+# (e.g. to point at a private registry), insert
+#     COPY .cargo .cargo
+# before this RUN so the config is in scope for the resolution.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
+    cargo chef prepare --recipe-path recipe.json
 
 # ── Stage C: cook all third-party dependencies ─────────────────────────────
 FROM pangolin-chef AS cooker
