@@ -50,8 +50,18 @@ setup:
 
 OUT_DIR ?= ./bin
 
-build: build-ngx build-tun
+build:
+	mkdir -p $(OUT_DIR)
+	# Single cargo invocation for both binaries so the shared crates
+	# (pangolin-core, admin, pingora, …) are compiled and linked
+	# exactly once, not twice.  Two separate `cargo build` calls
+	# re-link every shared crate.
+	$(CARGO) build --release -p ngx -p tun
+	mv ./target/release/ngx $(OUT_DIR)/pangolin-ngx
+	mv ./target/release/tun $(OUT_DIR)/pangolin-tun
 
+# Individual binary targets for callers that want only one.  These
+# each run their own cargo invocation, so they re-link shared deps.
 build-ngx:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx

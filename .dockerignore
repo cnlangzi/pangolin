@@ -1,0 +1,55 @@
+# Build outputs (rebuilt inside the container)
+target/
+bin/
+build/output/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local cargo cache / sccache
+.cargo/
+
+# Node.js (admin UI is built on the host, not inside the image)
+node_modules/
+dist/
+assets/static/*.css
+assets/static/*.js
+package-lock.json
+
+# Generated / runtime artifacts
+certs/
+*.pem
+!testdata/**/*.pem
+*.db
+*.db-shm
+*.db-wal
+coverage/
+test-results/
+*.prof
+
+# Local config overrides
+config.local.toml
+*.local.yaml
+*.local.yml
+pangolin.yml
+
+# VCS metadata
+.git/
+.gitignore
+.gitattributes
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Documentation / planning (not needed to compile)
+docs/
+wip/
+tasks/
+*.md
+README.md
+
+# This very file
+.dockerignore

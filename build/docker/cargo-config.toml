@@ -1,0 +1,24 @@
+# cargo configuration for the Docker build environment.
+#
+# This file is COPY'd into /usr/local/cargo/config.toml by dist.dockerfile,
+# so it only takes effect inside the container — local dev on macOS / Linux
+# is unaffected.
+#
+# Two performance wins, both standard Rust+Docker recipes:
+#
+#  1. sccache wraps rustc and caches the output of every `rustc` invocation
+#     keyed by its inputs.  The cache is mounted at /root/.cache/sccache
+#     in dist.dockerfile, so cached compilations survive across `docker
+#     build` runs AND across CI jobs.
+#
+#  2. mold is a drop-in replacement for ld that is 2-5× faster on debug
+#     links and dramatically faster on release LTO links.  We invoke it
+#     through clang's `-fuse-ld=mold` flag, which is the standard recipe
+#     in the Rust performance guide.
+
+[build]
+rustc-wrapper = "/usr/bin/sccache"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
