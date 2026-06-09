@@ -61,6 +61,26 @@ pub struct DomainFormTemplate<'a> {
     pub sites: Vec<Site>,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// When set, the site dropdown is pre-selected to this value (used when creating from a site sub-page).
+    pub preselected_site: Option<String>,
+    /// Flattened preselected site name for template convenience.
+    pub preselected_site_name: Option<String>,
+}
+
+impl<'a> DomainFormTemplate<'a> {
+    /// Returns true if the given site name matches the preselected site.
+    /// This is a helper to avoid Option<String> == String comparisons in templates.
+    pub fn is_site_preselected(&self, site_name: &str) -> bool {
+        self.preselected_site_name.as_deref() == Some(site_name)
+    }
+}
+
+#[derive(Template)]
+#[template(path = "site_domains.html")]
+pub struct SiteDomainsTemplate {
+    pub site: Site,
+    pub domains: Vec<Domain>,
+    pub sites: Vec<Site>,
 }
 
 // ─── Tunnels ────────────────────────────────────────────────────────────────────

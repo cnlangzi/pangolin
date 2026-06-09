@@ -63,6 +63,7 @@ async fn reload_indexes_triggered() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
 
@@ -103,6 +104,7 @@ async fn reload_indexes_domain_triggers_routing() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
     app.reload_indexes().await;
@@ -179,6 +181,7 @@ async fn reload_indexes_no_change_is_idempotent() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
     app.reload_indexes().await;

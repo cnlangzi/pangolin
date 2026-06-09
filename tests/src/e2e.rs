@@ -474,6 +474,7 @@ async fn e2e_direct_http_get() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "api.example.com".into(),
@@ -545,6 +546,7 @@ async fn e2e_direct_http_404() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "other.example.com".into(),
@@ -599,6 +601,7 @@ async fn e2e_direct_http_post() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "post.example.com".into(),
@@ -664,6 +667,7 @@ async fn e2e_direct_static_file() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "static.example.com".into(),
@@ -720,6 +724,7 @@ async fn e2e_direct_static_file_not_found() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "missing.example.com".into(),

@@ -1203,3 +1203,289 @@ async fn nav_active_state_per_page() {
         );
     }
 }
+
+// ── §32 — Site domains sub-page: page renders with correct content ───────────
+
+#[tokio::test]
+async fn site_domains_subpage_renders() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "subpage-test-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Create two domains for this site
+    let domains_page = client
+        .get("/admin/domains")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/domains/new",
+            &[
+                ("domain", "subdomain1.example.com"),
+                ("site_name", "subpage-test-site"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+    client
+        .post_form(
+            "/admin/domains/new",
+            &[
+                ("domain", "subdomain2.example.com"),
+                ("site_name", "subpage-test-site"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Visit the site-specific domains sub-page
+    let resp = client
+        .get("/admin/site/subpage-test-site/domains")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+
+    // Should contain both domains
+    assert!(
+        body.contains("subdomain1.example.com"),
+        "subpage should list subdomain1"
+    );
+    assert!(
+        body.contains("subdomain2.example.com"),
+        "subpage should list subdomain2"
+    );
+    // Should show the site name in breadcrumb/header
+    assert!(
+        body.contains("subpage-test-site"),
+        "subpage should show the site name"
+    );
+}
+
+// ── §33 — Site domains sub-page: domain count link in sites table ───────────
+
+#[tokio::test]
+async fn site_domains_count_link_in_sites_table() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site with one domain
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "count-link-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let domains_page = client
+        .get("/admin/domains")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/domains/new",
+            &[
+                ("domain", "countlink.test.example.com"),
+                ("site_name", "count-link-test"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Sites table should have a link with the domain count
+    let sites_body = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Should contain a link to the site domains sub-page
+    assert!(
+        sites_body.contains("/admin/site/count-link-test/domains"),
+        "sites table should have a link to site-specific domains sub-page"
+    );
+}
+
+// ── §34 — Site domains sub-page: unauthenticated redirects ──────────────────
+
+#[tokio::test]
+async fn site_domains_subpage_unauth_redirects() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/admin/site/test-site/domains"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        loc.contains("/admin/login"),
+        "unauthenticated request should redirect to login, got: {}",
+        loc
+    );
+}
+
+// ── §35 — Site domains sub-page: site-specific domain table via HTMX ─────────
+
+#[tokio::test]
+async fn site_domains_api_table_for_site() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site and a domain
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "hx-table-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let domains_page = client
+        .get("/admin/domains")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/domains/new",
+            &[
+                ("domain", "hx-test.example.com"),
+                ("site_name", "hx-table-test"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // HTMX endpoint should return only the table rows
+    let resp = client
+        .get("/admin/site/hx-table-test/api/domains")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("hx-test.example.com"),
+        "HTMX table should contain the domain"
+    );
+    // Should NOT contain the base HTML wrapper
+    assert!(
+        !body.contains("<html"),
+        "HTMX response should not be a full page"
+    );
+}
+
+// ── §36 — Site domains sub-page: pre-selected site in new domain modal ───────
+
+#[tokio::test]
+async fn site_domains_new_modal_preselected() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "preselect-test-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Open the new domain modal from the site sub-page
+    let resp = client
+        .get("/admin/site/preselect-test-site/api/domains/new")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+
+    // The site dropdown should have "preselect-test-site" selected
+    assert!(
+        body.contains("selected"),
+        "modal should have a site pre-selected"
+    );
+    assert!(
+        body.contains("preselect-test-site"),
+        "modal should contain the preselected site name"
+    );
+}

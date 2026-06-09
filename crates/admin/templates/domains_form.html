@@ -31,7 +31,7 @@
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         <option value="">Select a site...</option>
         {% for site in sites %}
-        <option value="{{ site.name }}">{{ site.name }} — {{ site.backend }}</option>
+        <option value="{{ site.name }}"{% if self.is_site_preselected(site.name) %} selected{% endif %}>{{ site.name }} — {{ site.backend }}</option>
         {% endfor %}
       </select>
     </div>

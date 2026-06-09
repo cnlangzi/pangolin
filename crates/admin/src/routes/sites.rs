@@ -96,6 +96,7 @@ pub async fn handle_create(
                 enabled: true,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                domain_count: 0,
             }),
             &format!("Invalid backend: {}", e),
             csrf,
@@ -108,6 +109,7 @@ pub async fn handle_create(
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
 
     let db = app.db.lock().await;
@@ -155,6 +157,7 @@ pub async fn handle_update(
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
 
     let db = app.db.lock().await;
@@ -217,6 +220,7 @@ fn render_edit_page_with_error(
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let html = SiteFormTemplate {
         site: Some(stub),

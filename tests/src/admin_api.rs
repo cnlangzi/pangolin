@@ -32,6 +32,7 @@ fn admin_sites_crud() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
 
     // Create
@@ -71,6 +72,7 @@ fn admin_domains_crud() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 
@@ -211,6 +213,7 @@ fn admin_reload_indexes() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 

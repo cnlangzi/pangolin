@@ -48,6 +48,7 @@ fn admin_reload_site() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 
@@ -73,6 +74,7 @@ fn admin_reload_domain() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 
@@ -116,6 +118,7 @@ fn admin_reload_tun() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 

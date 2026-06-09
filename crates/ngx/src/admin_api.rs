@@ -98,6 +98,7 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
         enabled: req.enabled.unwrap_or(true),
         created_at: now,
         updated_at: now,
+        domain_count: 0,
     };
 
     let conn = app.db.lock().await;
