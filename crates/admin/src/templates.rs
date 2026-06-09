@@ -37,18 +37,12 @@ pub struct SitesTemplate<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "sites_table.html")]
-pub struct SitesTableTemplate<'a> {
-    pub sites: Vec<Site>,
-    pub active_nav: &'a str,
-}
-
-#[derive(Template)]
 #[template(path = "site_form.html")]
 pub struct SiteFormTemplate<'a> {
     pub site: Option<Site>,
     pub action: &'a str,
     pub error: Option<&'a str>,
+    pub active_nav: &'a str,
 }
 
 // ─── Domains ───────────────────────────────────────────────────────────────────
@@ -66,6 +60,7 @@ pub struct DomainsTemplate<'a> {
 pub struct DomainFormTemplate<'a> {
     pub sites: Vec<Site>,
     pub error: Option<&'a str>,
+    pub active_nav: &'a str,
 }
 
 // ─── Tunnels ────────────────────────────────────────────────────────────────────
@@ -91,6 +86,7 @@ pub struct TokensTemplate<'a> {
 pub struct TokenFormTemplate<'a> {
     pub token: Option<Token>,
     pub error: Option<&'a str>,
+    pub active_nav: &'a str,
 }
 
 // ─── Certs ─────────────────────────────────────────────────────────────────────
@@ -107,4 +103,5 @@ pub struct CertsTemplate<'a> {
 #[template(path = "certs_form.html")]
 pub struct CertFormTemplate<'a> {
     pub error: Option<&'a str>,
+    pub active_nav: &'a str,
 }

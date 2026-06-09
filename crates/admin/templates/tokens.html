@@ -1,28 +1,21 @@
-{# tokens.html — extends base layout #}
 {% extends "base.html" %}
 
 {% block title %}Tokens — Pangolin{% endblock %}
 
 {% block content %}
-<main class="px-4 py-6 md:px-6 md:py-6 max-w-7xl mx-auto">
-  <div class="mb-6 flex items-center justify-between">
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl font-bold text-slate-900">Tokens</h1>
-      <p class="text-slate-500 text-sm mt-1">API tokens for tunnel node authentication</p>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Tokens</h1>
+      <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">API tokens for tunnel node authentication</p>
     </div>
-    <button data-on:click="@get('/admin/api/tokens/new', '#modal-body').then(() => document.getElementById('modal').showModal())"
-      class="hidden md:inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg transition-colors">
+    <a href="/admin/tokens/new" class="btn-accent w-full sm:w-auto">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
       New token
-    </button>
+    </a>
   </div>
-  <button data-on:click="@get('/admin/api/tokens/new', '#modal-body').then(() => document.getElementById('modal').showModal())"
-    class="md:hidden mb-4 inline-flex items-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium rounded-lg w-full justify-center">
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-    New token
-  </button>
 
-  <div id="tokens-table">
+  <div id="tokens-table" class="scrollbar-thin">
     {% include "tokens_table_inner.html" %}
   </div>
 </main>

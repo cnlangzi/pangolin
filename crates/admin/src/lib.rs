@@ -105,26 +105,16 @@ pub async fn handle(
 
     let res: Response<Full<Bytes>> = match path {
         "" | "dashboard" => routes::dashboard::render(&app, &csrf_token).await?,
-        "sites" => routes::sites::render(&app, &csrf_token).await?,
-        "domains" => routes::domains::render(&app, &csrf_token).await?,
-        "tun" => routes::tun::render(&app, &csrf_token).await?,
-        "tokens" => routes::tokens::render(&app, &csrf_token).await?,
-        "certs" => routes::certs::render(&app, &csrf_token).await?,
-        // htmx partials (return HTML fragments)
-        "api/sites" if method == "GET" => routes::sites::render_table(&app, &csrf_token).await?,
-        "api/sites/new" => routes::sites::render_form_new(&app, &csrf_token).await?,
-        "api/sites/edit" => {
-            routes::sites::render_form_edit(
-                &app,
-                query_param_opt(&merged_params, "name"),
-                &csrf_token,
-            )
-            .await?
-        }
-        "api/sites" if method == "POST" => {
+        "sites" if method == "GET" => routes::sites::render(&app, &csrf_token).await?,
+        "sites/new" if method == "GET" => routes::sites::render_create_page(&app, &csrf_token).await?,
+        "sites/new" if method == "POST" => {
             routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "api/sites" if method == "PUT" => {
+        "sites/edit" if method == "GET" => {
+            routes::sites::render_edit_page(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
+        }
+        "sites/edit" if method == "POST" => {
             routes::sites::handle_update(
                 &app,
                 query_param_opt(&merged_params, "name"),
@@ -133,17 +123,22 @@ pub async fn handle(
             )
             .await?
         }
-        "api/sites" if method == "DELETE" => {
-            routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
-                .await?
+        "sites/delete" if method == "POST" => {
+            routes::sites::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+            )
+            .await?
         }
-        "api/domains" if method == "GET" => {
-            routes::domains::render_table(&app, &csrf_token).await?
+        "domains" if method == "GET" => routes::domains::render(&app, &csrf_token).await?,
+        "domains/new" if method == "GET" => {
+            routes::domains::render_create_page(&app, &csrf_token).await?
         }
-        "api/domains" if method == "POST" => {
+        "domains/new" if method == "POST" => {
             routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "api/domains" if method == "DELETE" => {
+        "domains/delete" if method == "POST" => {
             routes::domains::handle_delete(
                 &app,
                 query_param_opt(&merged_params, "domain"),
@@ -151,12 +146,15 @@ pub async fn handle(
             )
             .await?
         }
-        "api/tokens" if method == "GET" => routes::tokens::render_table(&app, &csrf_token).await?,
-        "api/tokens/new" => routes::tokens::render_form_new(&app, &csrf_token).await?,
-        "api/tokens" if method == "POST" => {
+        "tun" => routes::tun::render(&app, &csrf_token).await?,
+        "tokens" if method == "GET" => routes::tokens::render(&app, &csrf_token).await?,
+        "tokens/new" if method == "GET" => {
+            routes::tokens::render_create_page(&app, &csrf_token).await?
+        }
+        "tokens/new" if method == "POST" => {
             routes::tokens::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "api/tokens" if method == "DELETE" => {
+        "tokens/delete" if method == "POST" => {
             routes::tokens::handle_delete(
                 &app,
                 query_param_opt(&merged_params, "token"),
@@ -164,10 +162,18 @@ pub async fn handle(
             )
             .await?
         }
-        "api/certs" if method == "GET" => routes::certs::render_table(&app, &csrf_token).await?,
-        "api/certs/new" => routes::certs::render_form_new(&csrf_token).await?,
-        "api/certs" if method == "POST" => {
+        "certs" if method == "GET" => routes::certs::render(&app, &csrf_token).await?,
+        "certs/new" if method == "GET" => routes::certs::render_create_page(&csrf_token).await?,
+        "certs/new" if method == "POST" => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
+        }
+        "certs/delete" if method == "POST" => {
+            routes::certs::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "domain"),
+                &csrf_token,
+            )
+            .await?
         }
         // Auth
         "login" => {
@@ -245,6 +251,15 @@ fn not_found() -> Response<Full<Bytes>> {
         .body(Full::new(Bytes::from(
             r#"<div class="p-6 text-slate-500">Page not found</div>"#,
         )))
+        .unwrap()
+}
+
+/// Return a 302 Found redirect to the given path.
+pub fn redirect_response(location: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .body(Full::new(Bytes::new()))
         .unwrap()
 }
 
