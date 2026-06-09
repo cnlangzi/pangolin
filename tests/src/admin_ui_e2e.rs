@@ -27,6 +27,7 @@ async fn unauth_redirect_dashboard() {
     for path in &[
         "/admin/",
         "/admin/sites",
+        "/admin/sites/new",
         "/admin/domains",
         "/admin/tun",
         "/admin/tokens",
@@ -135,24 +136,40 @@ async fn sites_list_empty() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("Sites"), "missing Sites heading");
+    assert!(
+        body.contains("New site"),
+        "sites page should expose a 'New site' link"
+    );
 }
 
-// ── §7 — Sites new form modal ────────────────────────────────────────────────
+// ── §7 — Sites new page (full page, not a modal) ─────────────────────────────
 
 #[tokio::test]
-async fn sites_new_form_modal() {
+async fn sites_new_page_is_full_page() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
-    let resp = client.get("/admin/api/sites/new").await.unwrap();
+    let resp = client.get("/admin/sites/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
+    // Full page: should have <html>, base layout, and a back-link to /admin/sites
+    assert!(
+        body.contains("<html"),
+        "new site page should be a full HTML page"
+    );
+    assert!(
+        body.contains("Back to sites"),
+        "new site page should have a 'Back to sites' link"
+    );
     client
         .assert_selector_exists(&body, "input[name=backend]")
         .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=name]")
+        .unwrap();
 }
 
-// ── §8 — Sites create (valid) ────────────────────────────────────────────────
+// ── §8 — Sites create (valid) → 302 redirect ────────────────────────────────
 
 #[tokio::test]
 async fn sites_create_valid() {
@@ -161,7 +178,7 @@ async fn sites_create_valid() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -171,7 +188,7 @@ async fn sites_create_valid() {
 
     let resp = client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "test-site"),
@@ -180,10 +197,21 @@ async fn sites_create_valid() {
         )
         .await
         .unwrap();
-    assert!(
-        resp.status().as_u16() < 400,
-        "create site should succeed, got {}",
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create site should redirect, got {}",
         resp.status()
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        loc.contains("/admin/sites"),
+        "create should redirect to /admin/sites, got: {}",
+        loc
     );
 }
 
@@ -196,7 +224,7 @@ async fn sites_create_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
     let resp = client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "test-site"),
@@ -221,7 +249,7 @@ async fn sites_create_invalid_backend() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -231,7 +259,7 @@ async fn sites_create_invalid_backend() {
 
     let resp = client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "notaurl"),
                 ("name", "test-site"),
@@ -242,22 +270,22 @@ async fn sites_create_invalid_backend() {
         .unwrap();
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("invalid backend") || body.contains("Invalid"),
+        body.contains("Invalid backend") || body.contains("invalid backend"),
         "expected validation error for bad backend"
     );
 }
 
-// ── §11 — Sites edit form ────────────────────────────────────────────────────
+// ── §11 — Sites edit page (prefilled) ────────────────────────────────────────
 
 #[tokio::test]
-async fn sites_edit_form_prefilled() {
+async fn sites_edit_page_prefilled() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    // First create a site
+    // Create a site first
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -266,7 +294,7 @@ async fn sites_edit_form_prefilled() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "edit-me"),
@@ -276,18 +304,19 @@ async fn sites_edit_form_prefilled() {
         .await
         .unwrap();
 
-    let resp = client
-        .get("/admin/api/sites/edit?name=edit-me")
-        .await
-        .unwrap();
+    let resp = client.get("/admin/sites/edit?name=edit-me").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Edit site"),
+        "edit page should be titled 'Edit site'"
+    );
     client
         .assert_selector_exists(&body, "input[name=backend]")
         .unwrap();
 }
 
-// ── §12 — Sites update ───────────────────────────────────────────────────────
+// ── §12 — Sites update → 302 redirect ────────────────────────────────────────
 
 #[tokio::test]
 async fn sites_update() {
@@ -297,7 +326,7 @@ async fn sites_update() {
 
     // Create
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -306,7 +335,7 @@ async fn sites_update() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "update-me"),
@@ -318,7 +347,7 @@ async fn sites_update() {
 
     // Update
     let page2 = client
-        .get("/admin/api/sites/edit?name=update-me")
+        .get("/admin/sites/edit?name=update-me")
         .await
         .unwrap()
         .text()
@@ -326,8 +355,8 @@ async fn sites_update() {
         .unwrap();
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
-        .put_form(
-            "/admin/api/sites",
+        .post_form(
+            "/admin/sites/edit?name=update-me",
             &[
                 ("backend", "http://127.0.0.1:9090"),
                 ("name", "update-me"),
@@ -336,10 +365,15 @@ async fn sites_update() {
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "update should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "update should redirect, got {}",
+        resp.status()
+    );
 }
 
-// ── §13 — Sites delete (with CSRF) ──────────────────────────────────────────
+// ── §13 — Sites delete (with CSRF) → 302 redirect ────────────────────────────
 
 #[tokio::test]
 async fn sites_delete_with_csrf() {
@@ -348,7 +382,7 @@ async fn sites_delete_with_csrf() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -357,7 +391,7 @@ async fn sites_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "delete-me"),
@@ -368,13 +402,18 @@ async fn sites_delete_with_csrf() {
         .unwrap();
 
     let resp = client
-        .delete(
-            "/admin/api/sites",
+        .post_form(
+            "/admin/sites/delete",
             &[("name", "delete-me"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "delete should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "delete should redirect, got {}",
+        resp.status()
+    );
 }
 
 // ── §14 — Sites delete without CSRF → 403 ───────────────────────────────────
@@ -386,19 +425,13 @@ async fn sites_delete_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
 
     let resp = client
-        .delete(
-            "/admin/api/sites",
-            &[
-                ("name", "nonexistent"),
-                // no _csrf
-            ],
-        )
+        .post_form("/admin/sites/delete", &[("name", "nonexistent")])
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
 }
 
-// ── §15 — Sites DB verification after delete ─────────────────────────────────
+// ── §15 — Sites delete verified in list ─────────────────────────────────────
 
 #[tokio::test]
 async fn sites_delete_verified_in_list() {
@@ -407,7 +440,7 @@ async fn sites_delete_verified_in_list() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -416,7 +449,7 @@ async fn sites_delete_verified_in_list() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "verify-delete"),
@@ -427,8 +460,8 @@ async fn sites_delete_verified_in_list() {
         .unwrap();
 
     client
-        .delete(
-            "/admin/api/sites",
+        .post_form(
+            "/admin/sites/delete",
             &[("name", "verify-delete"), ("_csrf", &csrf)],
         )
         .await
@@ -442,6 +475,146 @@ async fn sites_delete_verified_in_list() {
     );
 }
 
+// ── §8.5 — Full "New site" UI flow ───────────────────────────────────────────
+//
+// Exercises the same path the user clicks in the browser:
+//   1. GET /admin/sites → confirm the "New site" link is present (a <a>, not a button).
+//   2. GET /admin/sites/new → confirm the full-page form is rendered (with
+//      the fields the user types into: name, backend, _csrf).
+//   3. POST /admin/sites/new with valid data → 302 redirect.
+//   4. GET /admin/sites → confirm the new site row is in the list.
+
+#[tokio::test]
+async fn sites_create_full_ui_flow() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // 1. Sites page renders a "New site" link.
+    let sites_page = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        sites_page.contains("New site"),
+        "sites page should expose a 'New site' link"
+    );
+    assert!(
+        sites_page.contains("href=\"/admin/sites/new\""),
+        "sites page should link to /admin/sites/new (not open a modal)"
+    );
+
+    // 2. Clicking the link loads a full-page form.
+    let new_form = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        new_form.contains("<html"),
+        "/admin/sites/new should be a full HTML page (not a modal fragment)"
+    );
+    client
+        .assert_selector_exists(&new_form, "input[name=backend]")
+        .expect("new-site form should contain a backend input");
+    client
+        .assert_selector_exists(&new_form, "input[name=name]")
+        .expect("new-site form should contain a name input");
+    client
+        .assert_selector_exists(&new_form, "input[name=_csrf]")
+        .expect("new-site form should embed a CSRF token");
+
+    let csrf = client.csrf_token(&new_form).expect("extract CSRF token");
+
+    // 3. Submit the form → 302 redirect to /admin/sites.
+    let resp = client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "ui-flow-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create should redirect, got {}",
+        resp.status()
+    );
+
+    // 4. The site now appears in the sites list.
+    let list_after = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        list_after.contains("ui-flow-site"),
+        "newly created site 'ui-flow-site' should appear in the sites list"
+    );
+    assert!(
+        list_after.contains("http://127.0.0.1:8080"),
+        "the backend URL should be shown in the sites list row"
+    );
+}
+
+#[tokio::test]
+async fn sites_create_full_ui_flow_unique_names() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    for site_name in &["flow-a", "flow-b"] {
+        let form = client
+            .get("/admin/sites/new")
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let csrf = client.csrf_token(&form).unwrap_or_default();
+
+        let resp = client
+            .post_form(
+                "/admin/sites/new",
+                &[
+                    ("backend", "http://127.0.0.1:8080"),
+                    ("name", site_name),
+                    ("_csrf", &csrf),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "create '{}' should redirect, got {}",
+            site_name,
+            resp.status()
+        );
+    }
+
+    let list = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list.contains("flow-a"), "flow-a should be in list");
+    assert!(list.contains("flow-b"), "flow-b should be in list");
+}
+
 // ── §16-19 — Domains full cycle ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -452,7 +625,7 @@ async fn domains_create_and_list() {
 
     // Create a site first (domain needs a site_name)
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -461,7 +634,7 @@ async fn domains_create_and_list() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "mysite"),
@@ -482,7 +655,7 @@ async fn domains_create_and_list() {
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
         .post_form(
-            "/admin/api/domains",
+            "/admin/domains/new",
             &[
                 ("domain", "example.com"),
                 ("site_name", "mysite"),
@@ -491,7 +664,12 @@ async fn domains_create_and_list() {
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "domain create should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "domain create should redirect, got {}",
+        resp.status()
+    );
 
     // Verify in list
     let list = client
@@ -512,7 +690,7 @@ async fn domains_create_no_csrf_forbidden() {
 
     let resp = client
         .post_form(
-            "/admin/api/domains",
+            "/admin/domains/new",
             &[
                 ("domain", "example.com"),
                 ("site_name", "mysite"),
@@ -532,7 +710,7 @@ async fn domains_delete_with_csrf() {
 
     // Setup: site + domain
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -541,7 +719,7 @@ async fn domains_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "sitefordomain"),
@@ -552,7 +730,7 @@ async fn domains_delete_with_csrf() {
         .unwrap();
     client
         .post_form(
-            "/admin/api/domains",
+            "/admin/domains/new",
             &[
                 ("domain", "delete-me.com"),
                 ("site_name", "sitefordomain"),
@@ -563,13 +741,18 @@ async fn domains_delete_with_csrf() {
         .unwrap();
 
     let resp = client
-        .delete(
-            "/admin/api/domains",
+        .post_form(
+            "/admin/domains/delete",
             &[("domain", "delete-me.com"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "domain delete should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "domain delete should redirect, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -579,7 +762,7 @@ async fn domains_delete_verified_removed() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/api/sites/new")
+        .get("/admin/sites/new")
         .await
         .unwrap()
         .text()
@@ -588,7 +771,7 @@ async fn domains_delete_verified_removed() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/sites",
+            "/admin/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "site2"),
@@ -599,7 +782,7 @@ async fn domains_delete_verified_removed() {
         .unwrap();
     client
         .post_form(
-            "/admin/api/domains",
+            "/admin/domains/new",
             &[
                 ("domain", "gone.com"),
                 ("site_name", "site2"),
@@ -609,8 +792,8 @@ async fn domains_delete_verified_removed() {
         .await
         .unwrap();
     client
-        .delete(
-            "/admin/api/domains",
+        .post_form(
+            "/admin/domains/delete",
             &[("domain", "gone.com"), ("_csrf", &csrf)],
         )
         .await
@@ -647,12 +830,17 @@ async fn tokens_create_and_list() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     let resp = client
         .post_form(
-            "/admin/api/tokens",
+            "/admin/tokens/new",
             &[("token", "mytoken123"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "token create should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "token create should redirect, got {}",
+        resp.status()
+    );
 
     let list = client
         .get("/admin/tokens")
@@ -671,7 +859,7 @@ async fn tokens_create_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
 
     let resp = client
-        .post_form("/admin/api/tokens", &[("token", "mytoken123")])
+        .post_form("/admin/tokens/new", &[("token", "mytoken123")])
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
@@ -693,20 +881,25 @@ async fn tokens_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/tokens",
+            "/admin/tokens/new",
             &[("token", "del-token"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
 
     let resp = client
-        .delete(
-            "/admin/api/tokens",
+        .post_form(
+            "/admin/tokens/delete",
             &[("token", "del-token"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
-    assert!(resp.status().as_u16() < 400, "token delete should succeed");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "token delete should redirect, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -725,14 +918,14 @@ async fn tokens_delete_verified_removed() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/api/tokens",
+            "/admin/tokens/new",
             &[("token", "gone-token"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
     client
-        .delete(
-            "/admin/api/tokens",
+        .post_form(
+            "/admin/tokens/delete",
             &[("token", "gone-token"), ("_csrf", &csrf)],
         )
         .await
@@ -770,7 +963,7 @@ async fn certs_create_and_list() {
 
     let resp = client
         .post_form(
-            "/admin/api/certs",
+            "/admin/certs/new",
             &[
                 ("domain", "testcert.example.com"),
                 ("cert_file", "/tmp/test.pem"),
@@ -780,22 +973,35 @@ async fn certs_create_and_list() {
         )
         .await
         .unwrap();
-    // May succeed or return validation error; just shouldn't be 4xx due to CSRF/auth
-    assert!(resp.status().as_u16() != 403, "should not be CSRF error");
-    assert!(resp.status().as_u16() != 401, "should not be auth error");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "cert create should redirect, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
-async fn certs_new_form_has_required_fields() {
+async fn certs_new_page_is_full_page() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let resp = client.get("/admin/api/certs/new").await.unwrap();
+    let resp = client.get("/admin/certs/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<html"),
+        "new cert page should be a full HTML page"
+    );
     client
         .assert_selector_exists(&body, "input[name=domain]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=cert_file]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=key_file]")
         .unwrap();
 }
 
@@ -807,7 +1013,7 @@ async fn certs_create_no_csrf_forbidden() {
 
     let resp = client
         .post_form(
-            "/admin/api/certs",
+            "/admin/certs/new",
             &[
                 ("domain", "test.example.com"),
                 ("cert_file", "/tmp/cert.pem"),
@@ -828,7 +1034,52 @@ async fn certs_list_page_renders() {
     let resp = client.get("/admin/certs").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Certs"), "page should contain 'Certs'");
+    assert!(
+        body.contains("Certs") || body.contains("Certificates"),
+        "page should contain cert heading"
+    );
+}
+
+#[tokio::test]
+async fn certs_delete_with_csrf() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/admin/certs")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/certs/new",
+            &[
+                ("domain", "delete-cert.example.com"),
+                ("cert_file", "/tmp/cert.pem"),
+                ("key_file", "/tmp/key.pem"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .post_form(
+            "/admin/certs/delete",
+            &[("domain", "delete-cert.example.com"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "cert delete should redirect, got {}",
+        resp.status()
+    );
 }
 
 // ── §28 — Tunnels read-only page ─────────────────────────────────────────────

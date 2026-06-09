@@ -284,12 +284,20 @@ cert:
         cmd.kill_on_drop(true);
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
-        // The HTTP port is the most reliable readiness signal —
-        // pingora logs "Server starting" then binds listeners shortly
-        // after. 5s is plenty for a warm cache; if the binary fails to
-        // boot (bad config, panic), we'll see it in the captured log
-        // via the panic message from `wait_for_port`.
-        wait_for_port(http_port, Duration::from_secs(5)).await;
+        // Wait for all four listeners to bind before returning. The
+        // HTTP port is the most reliable readiness signal — pingora
+        // logs "Server starting" then binds listeners shortly after.
+        // We must also wait for `admin_port` (and the others) because
+        // tests that exercise the admin API call `ngx.admin_url(...)`
+        // immediately after `start_ngx()`, and hitting a port that the
+        // binary hasn't `bind()`'d yet surfaces as a flaky
+        // "Connection reset by peer" error. 5s per port is plenty for
+        // a warm cache; if the binary fails to boot (bad config,
+        // panic), we'll see it in the captured log via the panic
+        // message from `wait_for_port`.
+        for &port in &[http_port, tls_port, tunnel_port, admin_port] {
+            wait_for_port(port, Duration::from_secs(5)).await;
+        }
 
         Self {
             child: Some(child),
