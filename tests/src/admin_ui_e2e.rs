@@ -1481,11 +1481,7 @@ async fn site_domains_new_modal_preselected() {
 
     // The site dropdown should have "preselect-test-site" selected
     assert!(
-        body.contains("selected"),
-        "modal should have a site pre-selected"
-    );
-    assert!(
-        body.contains("preselect-test-site"),
-        "modal should contain the preselected site name"
+        body.contains(r#"<option value="preselect-test-site" selected"#),
+        "Expected preselected site option to be selected in the domains modal"
     );
 }

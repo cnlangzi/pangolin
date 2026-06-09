@@ -115,7 +115,7 @@ pub async fn render_table_for_site(
                 r##"<tr id="domain-{}" class="border-b border-slate-100 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
   <td class="py-3 px-3"><span class="font-mono text-sm text-slate-800 dark:text-slate-100">{}</span></td>
   <td class="py-3 px-3">
-    <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full {} dark:{} {}"</span>
+    <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full {} {} {}">{}</span>
   </td>
   <td class="py-3 px-3">
     <div class="flex items-center gap-1">
@@ -144,6 +144,7 @@ pub async fn render_table_for_site(
                     "dark:bg-slate-700 dark:text-slate-500"
                 },
                 if d.enabled { "" } else { "line-through" },
+                if d.enabled { "enabled" } else { "disabled" },
                 d.domain,
                 d.domain
             )
