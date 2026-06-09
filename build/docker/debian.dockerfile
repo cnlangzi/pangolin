@@ -1,6 +1,14 @@
 FROM debian:13-slim AS pangolin-debian
 
 # Install Rust toolchain and build essentials
+#
+#  - cmake / libssl-dev / pkg-config: native deps pulled in transitively
+#    (e.g. libz-ng-sys, openssl-sys).
+#  - sccache: shared compiler cache (mounted at /root/.cache/sccache in
+#    the dist.dockerfile so artefacts survive `docker build` runs).
+#  - clang + mold: mold is a drop-in ld replacement; the dist.dockerfile
+#    configures Rust to invoke it via clang's `-fuse-ld=mold` so release
+#    linking drops from ~30s to ~3s on a cold cache.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -9,9 +17,13 @@ RUN apt-get update -y && \
         git \
         gcc \
         g++ \
+        clang \
         make \
+        cmake \
+        mold \
         pkg-config \
         libssl-dev \
+        sccache \
         && rm -rf /var/lib/apt/lists/*
 
 # Install Rust 1.96 (minimal profile, just for building)

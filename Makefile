@@ -49,18 +49,32 @@ setup:
 	$(RUSTUP) toolchain install $(TOOLCHAIN) --profile minimal --component rustfmt --component clippy
 
 OUT_DIR ?= ./bin
+# Respect $CARGO_TARGET_DIR (cargo itself defaults to ./target when
+# unset) so CI builds that relocate the target dir still produce
+# binaries that the `mv` steps below can find.
+CARGO_TARGET_DIR ?= ./target
 
-build: build-ngx build-tun
+build:
+	mkdir -p $(OUT_DIR)
+	# Single cargo invocation for both binaries so the shared crates
+	# (pangolin-core, admin, pingora, …) are compiled and linked
+	# exactly once, not twice.  Two separate `cargo build` calls
+	# re-link every shared crate.
+	$(CARGO) build --release -p ngx -p tun
+	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
+	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
+# Individual binary targets for callers that want only one.  These
+# each run their own cargo invocation, so they re-link shared deps.
 build-ngx:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
-	mv ./target/release/ngx $(OUT_DIR)/pangolin-ngx
+	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
 
 build-tun:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p tun
-	mv ./target/release/tun $(OUT_DIR)/pangolin-tun
+	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun

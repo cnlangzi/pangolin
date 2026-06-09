@@ -29,14 +29,14 @@
     backup: yes
   notify: restart tun
 
-- name: Upload tun config
+- name: Upload tun env file
   become: true
   template:
-    src: tun.yml.j2
-    dest: /opt/pangolin/tun.yml
+    src: tun.env.j2
+    dest: /opt/pangolin/tun.env
     owner: pangolin
     group: pangolin
-    mode: 0644
+    mode: 0600
   notify: restart tun
 
 - name: Upload tun systemd service
