@@ -192,6 +192,7 @@ mod tests {
             enabled: true,
             created_at: now,
             updated_at: now,
+            domain_count: 0,
         }
     }
 
@@ -330,6 +331,7 @@ mod tests {
             enabled: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            domain_count: 0,
         }];
         let domains = vec![make_domain("app.example.com", "app")];
         let idx = Indexes::build(sites, domains, &[], Utc::now());

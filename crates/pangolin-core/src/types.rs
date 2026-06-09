@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Site (sites table). name is the primary key.
+/// domain_count is a denormalised count populated at list-time for UI convenience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Site {
     pub name: String,
@@ -15,6 +16,9 @@ pub struct Site {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Denormalised domain count for the sites table UI. Not stored in DB.
+    #[serde(default)]
+    pub domain_count: usize,
 }
 
 /// Domain (domains table). domain is the primary key.
@@ -142,6 +146,7 @@ mod tests {
             enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            domain_count: 0,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Site = serde_json::from_str(&json).unwrap();

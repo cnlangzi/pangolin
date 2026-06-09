@@ -25,6 +25,7 @@ fn make_site(name: &str, backend: &str) -> Site {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     }
 }
 

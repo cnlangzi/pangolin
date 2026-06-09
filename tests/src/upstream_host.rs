@@ -223,6 +223,7 @@ async fn upstream_host_header() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "api.example.com".into(),
@@ -296,6 +297,7 @@ async fn upstream_host_header_with_port() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        domain_count: 0,
     };
     let domain = Domain {
         domain: "port.example.com".into(),

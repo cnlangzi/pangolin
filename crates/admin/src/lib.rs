@@ -189,7 +189,41 @@ pub async fn handle(
         "logout" if method == "POST" => {
             routes::auth::handle_logout(sessions, &session_token.unwrap(), &merged_params).await?
         }
-        _ => not_found(),
+        // ── Site-specific sub-pages ─────────────────────────────────────
+        _ => {
+            // Prefix-based dispatch for: site/{name}/domains, site/{name}/api/domains, etc.
+            if let Some(rest) = path.strip_prefix("site/") {
+                if let Some((site_name, suffix)) = rest.split_once('/') {
+                    match suffix {
+                        "domains" => {
+                            routes::domains::render_for_site(&app, site_name, &csrf_token).await?
+                        }
+                        "api/domains" if method == "GET" => {
+                            routes::domains::render_table_for_site(&app, site_name, &csrf_token)
+                                .await?
+                        }
+                        "api/domains" if method == "POST" => {
+                            routes::domains::handle_create(&app, &merged_params, &csrf_token)
+                                .await?
+                        }
+                        "api/domains/new" => {
+                            routes::domains::api_render_form_new(
+                                &app,
+                                site_name,
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        _ => not_found(),
+                    }
+                } else {
+                    not_found()
+                }
+            } else {
+                not_found()
+            }
+        }
     };
 
     Ok(res)

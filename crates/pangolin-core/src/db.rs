@@ -42,9 +42,14 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn list_sites(conn: &Connection) -> rusqlite::Result<Vec<Site>> {
     let mut stmt = conn.prepare(
-        "SELECT name, backend, enabled, created_at, updated_at FROM sites ORDER BY name",
+        "SELECT s.name, s.backend, s.enabled, s.created_at, s.updated_at,
+                COUNT(d.domain) as domain_count
+         FROM sites s
+         LEFT JOIN domains d ON d.site_name = s.name
+         GROUP BY s.name, s.backend, s.enabled, s.created_at, s.updated_at
+         ORDER BY s.name",
     )?;
-    let rows = stmt.query_map([], row_to_site)?;
+    let rows = stmt.query_map([], row_to_site_with_count)?;
     rows.collect()
 }
 
@@ -251,6 +256,24 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
         enabled: enabled != 0,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
+        domain_count: 0,
+    })
+}
+
+fn row_to_site_with_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
+    let name: String = row.get(0)?;
+    let backend: String = row.get(1)?;
+    let enabled: i32 = row.get(2)?;
+    let created_at: String = row.get(3)?;
+    let updated_at: String = row.get(4)?;
+    let domain_count: i32 = row.get(5)?;
+    Ok(Site {
+        name,
+        backend,
+        enabled: enabled != 0,
+        created_at: parse_dt(&created_at)?,
+        updated_at: parse_dt(&updated_at)?,
+        domain_count: domain_count as usize,
     })
 }
 
@@ -352,6 +375,7 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
         let back = get_site(&conn, "app").unwrap().unwrap();
@@ -369,6 +393,7 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            domain_count: 0,
         };
         upsert_site(&conn, &s1).unwrap();
         let s2 = Site {
@@ -392,6 +417,7 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
         assert!(delete_site(&conn, "app").unwrap());
@@ -407,6 +433,7 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
         let d = Domain {
@@ -430,6 +457,7 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
         let d = Domain {

@@ -31,6 +31,7 @@ fn admin_delete_site() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 
@@ -54,6 +55,7 @@ fn admin_delete_domain() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
 
