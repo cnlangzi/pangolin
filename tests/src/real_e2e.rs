@@ -401,6 +401,165 @@ impl Drop for EchoBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inspecting mock backend: parses full request (method/path/query/headers/
+// body) and returns a JSON echo.  Used by the per-feature forwarding tests
+// below to make precise assertions on what the proxy actually delivered.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct RecordedRequest {
+    method: String,
+    path: String,
+    query: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+struct InspectingBackend {
+    addr: String,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl InspectingBackend {
+    async fn start() -> Self {
+        Self::start_with(200, "application/json", b"{}").await
+    }
+
+    async fn start_with(default_status: u16, default_ct: &str, default_body: &[u8]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs_for_task = requests.clone();
+        let default_ct = default_ct.to_string();
+        let default_body = default_body.to_vec();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let reqs = reqs_for_task.clone();
+                let default_ct = default_ct.clone();
+                let default_body = default_body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    // Read until we've seen the end-of-headers marker,
+                    // then up to Content-Length more bytes for the body.
+                    let mut accumulated = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                accumulated.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&accumulated) {
+                                    break pos;
+                                }
+                                if accumulated.len() > 64 * 1024 {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    let head_str = String::from_utf8_lossy(&accumulated[..header_end]).into_owned();
+                    let mut lines = head_str.split("\r\n");
+                    let request_line = lines.next().unwrap_or("");
+                    let mut req_parts = request_line.split_whitespace();
+                    let method = req_parts.next().unwrap_or("").to_string();
+                    let full_path = req_parts.next().unwrap_or("").to_string();
+                    let (path, query) = match full_path.find('?') {
+                        Some(i) => (full_path[..i].to_string(), full_path[i + 1..].to_string()),
+                        None => (full_path.clone(), String::new()),
+                    };
+                    let mut headers: Vec<(String, String)> = Vec::new();
+                    let mut content_length: usize = 0;
+                    for line in lines {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            let k = k.trim().to_string();
+                            let v = v.trim().to_string();
+                            if k.eq_ignore_ascii_case("content-length") {
+                                content_length = v.parse().unwrap_or(0);
+                            }
+                            headers.push((k, v));
+                        }
+                    }
+                    // Now read the body.
+                    let already_have = accumulated.len() - (header_end + 4);
+                    let mut body = accumulated.split_off(header_end + 4);
+                    while body.len() < content_length {
+                        let need = content_length - body.len();
+                        match stream.read(&mut tmp).await {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n.min(need)]),
+                            Err(_) => break,
+                        }
+                    }
+                    reqs.lock().await.push(RecordedRequest {
+                        method: method.clone(),
+                        path: path.clone(),
+                        query: query.clone(),
+                        headers: headers.clone(),
+                        body: body.clone(),
+                    });
+                    // Response — just an echo JSON for the default case.
+                    let reason = match default_status {
+                        200 => "OK",
+                        201 => "Created",
+                        204 => "No Content",
+                        301 => "Moved Permanently",
+                        302 => "Found",
+                        400 => "Bad Request",
+                        401 => "Unauthorized",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        500 => "Internal Server Error",
+                        502 => "Bad Gateway",
+                        _ => "Status",
+                    };
+                    let status_line = format!("HTTP/1.1 {} {}\r\n", default_status, reason);
+                    let headers_out = format!(
+                        "Content-Type: {ct}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                        ct = default_ct,
+                        len = default_body.len()
+                    );
+                    let _ = stream.write_all(status_line.as_bytes()).await;
+                    let _ = stream.write_all(headers_out.as_bytes()).await;
+                    let _ = stream.write_all(&default_body).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            requests,
+            handle,
+        }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    async fn seen(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+impl Drop for InspectingBackend {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Regression: the proxy must forward arbitrary HTTP methods to the
 /// configured upstream without filtering.  The `/api/*` prefix is
 /// reserved on the *admin* port (9081); on the *proxy* port (80) the
@@ -476,4 +635,452 @@ async fn real_e2e_proxy_forwards_all_methods_on_api_path() {
         assert_eq!(seen[i].0, *method, "request {i} method mismatch");
         assert_eq!(seen[i].1, *path, "request {i} path mismatch");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Comprehensive proxy forwarding tests.
+// ---------------------------------------------------------------------------
+
+/// Request body must be forwarded byte-exact.  POST with a JSON
+/// payload, PUT with a larger body — both must reach the upstream
+/// unchanged.  A regression here would silently corrupt API calls.
+#[tokio::test]
+async fn real_e2e_proxy_forwards_request_body() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "body-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "body.test", "body-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Two payloads of different sizes (the second is larger than
+    // the typical single-read buffer to verify Content-Length-driven
+    // body read works).
+    let small = br#"{"name":"alice","age":30}"#;
+    let large = vec![b'X'; 64 * 1024]; // 64 KiB of 'X'
+
+    for (method, body) in [("POST", &small[..]), ("PUT", &large[..])] {
+        let (status, _resp_body) = raw_request(
+            &addr,
+            "body.test",
+            method,
+            "/api/items",
+            body,
+        )
+        .await;
+        assert_eq!(status, 200, "{method} with body expected 200, got {status}");
+    }
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 2, "backend expected 2 requests, saw {}", seen.len());
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].body, small, "POST body must reach backend byte-exact");
+    assert_eq!(seen[1].method, "PUT");
+    assert_eq!(seen[1].body, large, "PUT body must reach backend byte-exact");
+}
+
+/// Query strings must survive the proxy intact.  Real APIs rely on
+/// `?a=1&b=2` for filtering, pagination, search, etc.
+#[tokio::test]
+async fn real_e2e_proxy_preserves_query_string() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "q-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "q.test", "q-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _) = raw_request(
+        &addr,
+        "q.test",
+        "GET",
+        "/api/items?limit=10&offset=20&q=hello%20world&tag=a%26b",
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/api/items", "path part must be split off");
+    assert_eq!(
+        seen[0].query, "limit=10&offset=20&q=hello%20world&tag=a%26b",
+        "query string must survive proxy byte-exact (incl. URL encoding and &)"
+    );
+}
+
+/// The user's *original* suspicion for the frtpilot 404: cookies
+/// and auth headers not surviving the proxy.  Verify both pass
+/// through unchanged.
+#[tokio::test]
+async fn real_e2e_proxy_forwards_authorization_and_cookies() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "auth-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "auth.test", "auth-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Use a low-level raw request so we can set Cookie + Authorization
+    // headers exactly.  raw_request doesn't take headers, so we
+    // hand-write the wire bytes here.
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
+    let req = concat!(
+        "GET /api/profile HTTP/1.1\r\n",
+        "Host: auth.test\r\n",
+        "Connection: close\r\n",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature\r\n",
+        "Cookie: session=abc123; theme=dark\r\n",
+        "X-Api-Key: sk-test-1234567890\r\n",
+        "\r\n",
+    );
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    use tokio::io::AsyncReadExt;
+    stream.read_to_end(&mut buf).await.expect("read");
+    let _status_line = String::from_utf8_lossy(&buf[..buf.len().min(64)]).into_owned();
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1);
+
+    // Pull specific headers from the recorded request and check
+    // they were forwarded byte-exact.
+    let h = |name: &str| -> String {
+        seen[0]
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        h("Authorization"),
+        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+        "Authorization must pass through byte-exact"
+    );
+    assert_eq!(
+        h("Cookie"),
+        "session=abc123; theme=dark",
+        "Cookie header must pass through byte-exact"
+    );
+    assert_eq!(h("X-Api-Key"), "sk-test-1234567890");
+}
+
+/// The core feature of pangolin: the proxy routes by `Host` header.
+/// Spin up TWO backends, register TWO domains, and verify that
+/// requests to each domain land at the right backend (and not
+/// the other one).
+#[tokio::test]
+async fn real_e2e_proxy_routes_hosts_to_different_backends() {
+    let backend_a = InspectingBackend::start().await;
+    let backend_b = InspectingBackend::start().await;
+
+    let a_addr = backend_a.addr().to_string();
+    let b_addr = backend_b.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "site-a", &format!("http://{a_addr}"));
+        seed_domain(&conn, "a.example.com", "site-a");
+        seed_site(&conn, "site-b", &format!("http://{b_addr}"));
+        seed_domain(&conn, "b.example.com", "site-b");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Request to a.example.com → backend_a only.
+    let (status_a, _) = raw_request(&addr, "a.example.com", "GET", "/", b"").await;
+    assert_eq!(status_a, 200);
+    // Request to b.example.com → backend_b only.
+    let (status_b, _) = raw_request(&addr, "b.example.com", "GET", "/", b"").await;
+    assert_eq!(status_b, 200);
+
+    let seen_a = backend_a.seen().await;
+    let seen_b = backend_b.seen().await;
+    assert_eq!(seen_a.len(), 1, "backend_a should see exactly 1 request");
+    assert_eq!(seen_b.len(), 1, "backend_b should see exactly 1 request");
+    assert_eq!(seen_a[0].path, "/");
+    assert_eq!(seen_b[0].path, "/");
+}
+
+/// 5xx and 4xx responses from the upstream must propagate to the
+/// client unchanged.  A common bug is the proxy swallowing 5xx
+/// and returning 200, which masks real backend failures.
+#[tokio::test]
+async fn real_e2e_proxy_propagates_backend_error_codes() {
+    for (status, reason) in [(401, "Unauthorized"), (403, "Forbidden"), (500, "Internal Server Error"), (502, "Bad Gateway"), (404, "Not Found")] {
+        let body = format!("{{\"error\":\"{reason}\"}}");
+        let backend = InspectingBackend::start_with(status, "application/json", body.as_bytes()).await;
+
+        let ngx = NgxProcess::start(|db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "err-site", &format!("http://{}", backend.addr()));
+            seed_domain(&conn, "err.test", "err-site");
+        })
+        .await;
+
+        let addr = format!("127.0.0.1:{}", ngx.http_port);
+        let (got_status, got_body) = raw_request(&addr, "err.test", "GET", "/api/whatever", b"").await;
+        assert_eq!(got_status, status, "expected {status} from backend, got {got_status}");
+        assert_eq!(got_body, body, "expected backend body to be forwarded unchanged");
+    }
+}
+
+/// A reverse proxy should add `X-Forwarded-For` (and ideally
+/// `X-Forwarded-Proto`) so the upstream can log the real client
+/// IP.  If pangolin fails to add this, the upstream only sees
+/// 127.0.0.1 (its local proxy peer) — log analysis becomes
+/// useless.
+///
+/// **STATUS: known unimplemented feature.**  Grep finds zero
+/// references to X-Forwarded-For / X-Real-IP / X-Forwarded-Proto
+/// anywhere in `crates/`.  This test is `#[ignore]`'d so the rest
+/// of the suite stays green, but the body stays runnable so the
+/// future contributor who implements this can simply remove the
+/// `#[ignore]` attribute and get a real regression check.
+///
+/// When implementing: the natural place is
+/// `AppProxy::upstream_peer` in `crates/ngx/src/proxy.rs` —
+/// modify the `HttpPeer` builder (or use pingora's
+/// `proxy_set_header`-equivalent) to inject
+/// `X-Forwarded-For: <client_ip>` before forwarding.
+#[tokio::test]
+#[ignore = "known unimplemented feature — see comment for implementation guidance"]
+async fn real_e2e_proxy_adds_x_forwarded_for() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "xff-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "xff.test", "xff-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // We don't control the local source IP from the test client
+    // (it'll be 127.0.0.1 by definition), but we can verify the
+    // header is PRESENT and contains a syntactically valid IP.
+    let (status, _) = raw_request(&addr, "xff.test", "GET", "/api/x", b"").await;
+    assert_eq!(status, 200);
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1);
+    let xff = seen[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Forwarded-For"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        !xff.is_empty(),
+        "X-Forwarded-For must be added by the proxy, but it was missing. headers: {:?}",
+        seen[0].headers
+    );
+    // The header should contain at least one IP-looking token.
+    assert!(
+        xff.split(',').any(|tok| tok.trim().parse::<std::net::IpAddr>().is_ok()),
+        "X-Forwarded-For value must contain at least one parseable IP, got: {xff:?}"
+    );
+}
+
+/// Response headers from the upstream must reach the client
+/// unchanged.  Backend sets `X-Backend-Marker`, client must
+/// receive it.  Important for things like `Set-Cookie`, CORS,
+/// rate-limit headers, custom API headers.
+#[tokio::test]
+async fn real_e2e_proxy_forwards_response_headers() {
+    // We need a backend that returns CUSTOM headers, not the
+    // canned ones InspectingBackend sends.  Write a tiny one-off
+    // backend here.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Drain the request, ignore it.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await;
+            let body = b"{\"ok\":true}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {len}\r\n\
+                 X-Backend-Marker: backend-says-hi\r\n\
+                 X-RateLimit-Remaining: 42\r\n\
+                 Set-Cookie: backend_cookie=abc; Path=/\r\n\
+                 Connection: close\r\n\r\n",
+                len = body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "hdr-site", &format!("http://{addr}"));
+        seed_domain(&conn, "hdr.test", "hdr-site");
+    })
+    .await;
+
+    let proxy_addr = format!("127.0.0.1:{}", ngx.http_port);
+    // Read the full response headers + body.
+    let mut stream = TcpStream::connect(&proxy_addr).await.expect("connect");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = "GET /api/x HTTP/1.1\r\nHost: hdr.test\r\nConnection: close\r\n\r\n";
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    let response = String::from_utf8_lossy(&buf).into_owned();
+
+    // Each marker header must appear verbatim (case-insensitive).
+    assert!(
+        response.to_lowercase().contains("x-backend-marker: backend-says-hi"),
+        "X-Backend-Marker must be forwarded, full response:\n{response}"
+    );
+    assert!(
+        response.to_lowercase().contains("x-ratelimit-remaining: 42"),
+        "X-RateLimit-Remaining must be forwarded"
+    );
+    assert!(
+        response.to_lowercase().contains("set-cookie: backend_cookie=abc"),
+        "Set-Cookie must be forwarded (this was part of the user's original concern)"
+    );
+
+    handle.abort();
+}
+
+/// CORS preflight (OPTIONS with `Origin` + `Access-Control-Request-*`
+/// headers) must reach the upstream so it can answer with the right
+/// CORS response headers.  If the proxy intercepts OPTIONS, every
+/// cross-origin browser call fails.
+#[tokio::test]
+async fn real_e2e_proxy_forwards_cors_preflight() {
+    // One-off backend that replies to OPTIONS with CORS headers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let first = String::from_utf8_lossy(&buf).into_owned();
+                let is_options = first.starts_with("OPTIONS ");
+                let body = b"";
+                let (status, reason) = if is_options { ("204", "No Content") } else { ("200", "OK") };
+                let cors_headers = if is_options {
+                    "Access-Control-Allow-Origin: https://app.example.com\r\n\
+                     Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n\
+                     Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key\r\n\
+                     Access-Control-Max-Age: 86400\r\n"
+                } else {
+                    "Access-Control-Allow-Origin: https://app.example.com\r\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\n{cors}Content-Length: {len}\r\nConnection: close\r\n\r\n",
+                    cors = cors_headers,
+                    len = body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "cors-site", &format!("http://{addr}"));
+        seed_domain(&conn, "cors.test", "cors-site");
+    })
+    .await;
+
+    let proxy_addr = format!("127.0.0.1:{}", ngx.http_port);
+    let mut stream = TcpStream::connect(&proxy_addr).await.expect("connect");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = "OPTIONS /api/widgets HTTP/1.1\r\n\
+               Host: cors.test\r\n\
+               Connection: close\r\n\
+               Origin: https://app.example.com\r\n\
+               Access-Control-Request-Method: POST\r\n\
+               Access-Control-Request-Headers: Content-Type, Authorization\r\n\r\n";
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    let response = String::from_utf8_lossy(&buf).into_owned().to_lowercase();
+
+    assert!(
+        response.contains("204 no content"),
+        "OPTIONS preflight should get 204, got:\n{response}"
+    );
+    assert!(
+        response.contains("access-control-allow-origin: https://app.example.com"),
+        "CORS Allow-Origin from upstream must be forwarded"
+    );
+    assert!(
+        response.contains("access-control-allow-methods:"),
+        "CORS Allow-Methods must be forwarded"
+    );
+    assert!(
+        response.contains("access-control-allow-headers:") &&
+            response.contains("authorization") &&
+            response.contains("x-api-key"),
+        "CORS Allow-Headers must be forwarded with all requested headers"
+    );
+
+    handle.abort();
+}
+
+/// When the configured upstream is unreachable (port closed /
+/// connection refused), the proxy must return 502 Bad Gateway
+/// rather than 200 (with empty body) or 500 (with a stack trace).
+/// 502 is the standard "upstream gone" response code.
+#[tokio::test]
+async fn real_e2e_proxy_returns_502_when_backend_unreachable() {
+    // Bind a listener, capture its port, immediately drop the
+    // listener so the port is closed.  The proxy will then get
+    // ECONNREFUSED when it tries to dial the configured backend.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "dead-site", &format!("http://{dead_addr}"));
+        seed_domain(&conn, "dead.test", "dead-site");
+    })
+    .await;
+
+    let proxy_addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _body) = raw_request(&proxy_addr, "dead.test", "GET", "/api/foo", b"").await;
+    assert_eq!(
+        status, 502,
+        "expected 502 Bad Gateway when upstream is unreachable, got {status}. ngx log:\n{}",
+        ngx.log_string()
+    );
 }
