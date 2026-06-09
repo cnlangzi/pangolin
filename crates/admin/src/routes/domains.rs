@@ -175,14 +175,6 @@ pub async fn api_render_form_new(
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
-    let body_str = std::str::from_utf8(body).ok()?;
-    body_str.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then_some(urlencoding::decode(v).ok()?.to_string())
-    })
-}
-
 pub async fn handle_create(
     app: &Arc<App>,
     body: &[u8],
