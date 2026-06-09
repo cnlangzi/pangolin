@@ -37,7 +37,7 @@ pub async fn handle(
     path: &str,
     method: &str,
     cookie_header: Option<&str>,
-    body: Bytes,
+    _body: Bytes,
     merged_params: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
     // ── Auth check ──────────────────────────────────────────────────
@@ -76,11 +76,13 @@ pub async fn handle(
     if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !is_login && !is_logout {
         let session_token_str = session_token.as_deref().unwrap_or("");
         // CSRF token MUST come from the body only, not from URL query string
-        // CSRF must come from the request body only (the _csrf hidden
-        // field injected into every form). Cookie-only is NOT accepted:
-        // the browser sends cookies automatically on any cross-origin
-        // request, so falling back to the cookie defeats the protection.
-        let csrf = query_param_opt(&body, "_csrf");
+        // CSRF token is read from merged_params (body + URL query string
+        // combined). For POST/PUT/PATCH it comes from the hidden _csrf field
+        // in the form body. For DELETE it comes from the URL query string
+        // (since DELETE body is skipped in serve.rs to avoid idle-hang).
+        // The browser cannot forge query string parameters cross-origin
+        // (SameSite=Strict cookies block cross-origin requests anyway).
+        let csrf = query_param_opt(&merged_params, "_csrf");
         match csrf {
             Some(t) if sessions.verify_csrf(session_token_str, &t).await => {}
             _ => {
