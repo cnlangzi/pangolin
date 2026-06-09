@@ -19,7 +19,9 @@
 server:
   port: {{ ngx_port_http | default(80) }}
   tls_port: {{ ngx_port_https | default(443) }}
-  host: {{ ngx_host | default('') or 'null' }}
+{% if ngx_host is defined and ngx_host %}
+  host: {{ ngx_host }}
+{% endif %}
   tunnel_port: {{ ngx_tunnel_port | default(9001) }}
 
 admin:
