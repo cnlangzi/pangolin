@@ -425,13 +425,21 @@ async fn real_e2e_proxy_forwards_all_methods_on_api_path() {
     let addr = format!("127.0.0.1:{}", ngx.http_port);
 
     // All five core HTTP verbs, each on a /api/ path.  The proxy
-    // must let every one through to the upstream.
+    // must let every one through to the upstream.  We also cover
+    // HEAD (cache validation, file-size probes) and OPTIONS (CORS
+    // preflight, fired on every cross-origin fetch in modern web
+    // apps) — the latter in particular was a real bug source for
+    // the frtpilot integration: OPTIONS to /api/* would have been
+    // swallowed by the admin handler pre-fix, breaking every
+    // cross-origin call from the browser.
     let cases: &[(&str, &str)] = &[
         ("GET", "/api/foo"),
         ("POST", "/api/channels/weixin/qr/start"),
         ("PUT", "/api/items/42"),
         ("DELETE", "/api/items/42"),
         ("PATCH", "/api/items/42"),
+        ("HEAD", "/api/foo"),
+        ("OPTIONS", "/api/channels/weixin/qr/start"),
     ];
 
     for (method, path) in cases {
@@ -443,14 +451,18 @@ async fn real_e2e_proxy_forwards_all_methods_on_api_path() {
         );
         // Backend must have actually received the request (proves
         // the request reached the upstream, not just the proxy).
-        let expected_body = format!("{{\"method\":\"{method}\",\"path\":\"{path}\"}}");
-        assert_eq!(
-            body, expected_body,
-            "backend didn't echo back method+path correctly"
-        );
+        // HEAD responses are required by RFC 9110 §15.3.2 to have
+        // no body, so we skip the body assertion for that one.
+        if *method != "HEAD" {
+            let expected_body = format!("{{\"method\":\"{method}\",\"path\":\"{path}\"}}");
+            assert_eq!(
+                body, expected_body,
+                "backend didn't echo back method+path correctly for {method} {path}"
+            );
+        }
     }
 
-    // Sanity: the backend saw all five requests, with the right
+    // Sanity: the backend saw all requests, with the right
     // (method, path) pairs.
     let seen = backend.seen().await;
     assert_eq!(
