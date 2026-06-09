@@ -15,13 +15,10 @@
 //!   DELETE     /api/certs/:domain
 //!   GET        /api/events
 
-use bytes::Bytes;
 use chrono::Utc;
 use http::Response;
 use log::{debug, warn};
-use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
-use pingora::proxy::Session;
 
 use crate::App;
 use pangolin_core::{
@@ -115,20 +112,6 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 }
 
-async fn delete_site(app: &App, name: &str) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::delete_site(&conn, name) {
-        Ok(true) => {
-            drop(conn);
-            app.reload_indexes().await;
-            debug!("deleted site: {}", name);
-            json_ok(b"{\"ok\":true}".as_slice())
-        }
-        Ok(false) => json_error(404, "site not found"),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
 // ---- Domains ----
 
 async fn list_domains(app: &App) -> Response<Vec<u8>> {
@@ -169,20 +152,6 @@ async fn upsert_domain(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>
             debug!("upserted domain: {}", domain);
             json_created(serde_json::to_vec(&d).unwrap().as_slice())
         }
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
-async fn delete_domain(app: &App, domain: &str) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::delete_domain(&conn, domain) {
-        Ok(true) => {
-            drop(conn);
-            app.reload_indexes().await;
-            debug!("deleted domain: {}", domain);
-            json_ok(b"{\"ok\":true}".as_slice())
-        }
-        Ok(false) => json_error(404, "domain not found"),
         Err(e) => json_error(500, &format!("db error: {}", e)),
     }
 }
@@ -232,20 +201,6 @@ async fn upsert_tun(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 }
 
-async fn delete_tun(app: &App, name: &str) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::delete_tun(&conn, name) {
-        Ok(true) => {
-            drop(conn);
-            app.reload_indexes().await;
-            debug!("deleted tun: {}", name);
-            json_ok(b"{\"ok\":true}".as_slice())
-        }
-        Ok(false) => json_error(404, "tun not found"),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
 // ---- Tokens ----
 
 async fn list_tokens(app: &App) -> Response<Vec<u8>> {
@@ -289,20 +244,6 @@ async fn upsert_token(app: &App, token: &str, body: &[u8]) -> Response<Vec<u8>> 
             debug!("upserted token: {}", token);
             json_created(serde_json::to_vec(&t).unwrap().as_slice())
         }
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
-async fn delete_token(app: &App, token: &str) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::delete_token(&conn, token) {
-        Ok(true) => {
-            drop(conn);
-            app.reload_indexes().await;
-            debug!("deleted token: {}", token);
-            json_ok(b"{\"ok\":true}".as_slice())
-        }
-        Ok(false) => json_error(404, "token not found"),
         Err(e) => json_error(500, &format!("db error: {}", e)),
     }
 }
@@ -410,88 +351,6 @@ async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> 
     }
 }
 
-async fn delete_cert(app: &App, domain: &str) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::delete_cert(&conn, domain) {
-        Ok(true) => {
-            debug!("deleted cert: {}", domain);
-            json_ok(b"{\"ok\":true}".as_slice())
-        }
-        Ok(false) => json_error(404, "cert not found"),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
-// ---- Main router for proxy session (PUT/DELETE :name paths) ----
-
-/// Handle a REST API request from the proxy path (PUT/DELETE with :name in path).
-pub async fn handle_api_request(
-    session: &mut Session,
-    app: &App,
-    path: &str,
-    method: &str,
-) -> pingora::Result<()> {
-    let parts: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
-    if parts.len() < 2 {
-        let _ = session.respond_error(400).await;
-        return Ok(());
-    }
-
-    let resource = parts[0];
-    let name = parts[1];
-    let body = match session.read_body_or_idle(false).await {
-        Ok(Some(b)) => b.to_vec(),
-        Ok(None) => vec![],
-        Err(_) => {
-            let _ = session.respond_error(400).await;
-            return Ok(());
-        }
-    };
-
-    match (resource, method) {
-        ("sites", "PUT") => {
-            let resp = upsert_site(app, name, &body).await;
-            write_json_response(session, resp).await;
-        }
-        ("sites", "DELETE") => {
-            let resp = delete_site(app, name).await;
-            write_json_response(session, resp).await;
-        }
-        ("domains", "PUT") => {
-            let resp = upsert_domain(app, name, &body).await;
-            write_json_response(session, resp).await;
-        }
-        ("domains", "DELETE") => {
-            let resp = delete_domain(app, name).await;
-            write_json_response(session, resp).await;
-        }
-        ("tun", "PUT") => {
-            let resp = upsert_tun(app, name, &body).await;
-            write_json_response(session, resp).await;
-        }
-        ("tun", "DELETE") => {
-            let resp = delete_tun(app, name).await;
-            write_json_response(session, resp).await;
-        }
-        ("tokens", "PUT") => {
-            let resp = upsert_token(app, name, &body).await;
-            write_json_response(session, resp).await;
-        }
-        ("tokens", "DELETE") => {
-            let resp = delete_token(app, name).await;
-            write_json_response(session, resp).await;
-        }
-        ("certs", "DELETE") => {
-            let resp = delete_cert(app, name).await;
-            write_json_response(session, resp).await;
-        }
-        _ => {
-            let _ = session.respond_error(404).await;
-        }
-    }
-    Ok(())
-}
-
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
     http_session: &mut ServerSession,
@@ -568,38 +427,5 @@ pub async fn handle_api_http(
         // Events
         ("events", "GET") => list_events(app).await,
         _ => json_error(404, "not found"),
-    }
-}
-
-// ---- Response writers ----
-
-async fn write_json_response(session: &mut Session, resp: Response<Vec<u8>>) {
-    let status = resp.status().as_u16();
-    let body = resp.body().clone();
-    let content_type = resp
-        .headers()
-        .get("Content-Type")
-        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-        .unwrap_or("application/json");
-
-    let mut hdr = match ResponseHeader::build(status, None) {
-        Ok(h) => h,
-        Err(e) => {
-            log::error!("failed to build response header: {}", e);
-            return;
-        }
-    };
-    hdr.insert_header("Content-Type", content_type.as_bytes())
-        .ok();
-
-    if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
-        log::error!("failed to write response header: {}", e);
-        return;
-    }
-    if let Err(e) = session
-        .write_response_body(Some(Bytes::from(body)), true)
-        .await
-    {
-        log::error!("failed to write response body: {}", e);
     }
 }

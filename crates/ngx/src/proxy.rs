@@ -20,7 +20,7 @@ use sha1::Sha1;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::protocol::Role;
 
-use crate::{admin_api, App, TunnelMessage};
+use crate::{App, TunnelMessage};
 
 /// RFC 6454 Sec-WebSocket-Accept computation.
 /// Takes the Sec-WebSocket-Key value and returns the correct Accept response.
@@ -43,20 +43,23 @@ impl ProxyHttp for AppProxy {
 
     fn new_ctx(&self) -> Self::CTX {}
 
-    /// Request filter — short-circuit for admin API, static files, or tunnel routes.
+    /// Request filter — short-circuit for tunnel WebSocket routes only.
+    ///
+    /// The proxy is **transparent** with respect to the request URI:
+    /// whatever `Host` maps to which `Site` (per the domains table)
+    /// gets the request, including any path the upstream serves
+    /// under `/api/...`.  The admin API lives on a *separate* HTTP
+    /// server bound to a different port (see `HttpServer` /
+    /// `handle_api_http`); the proxy port must never short-circuit
+    /// `/api/*` paths, or any backend whose public surface also
+    /// lives under `/api/` (e.g. frtpilot's
+    /// `POST /api/channels/weixin/qr/start`) would 404 through the
+    /// proxy while returning 200 directly.
     ///
     /// Returns `Ok(true)` if we handled the response locally (no upstream proxy).
     /// Returns `Ok(false)` to continue to `upstream_peer`.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
-        let method = session.req_header().method.as_str().to_string();
-
-        // Admin API: short-circuit, don't proxy
-        if path.starts_with("/api/") {
-            debug!("Admin API request: {}", path);
-            admin_api::handle_api_request(session, &self.app, &path, &method).await?;
-            return Ok(true);
-        }
 
         // WebSocket upgrade detection: check Upgrade header
         let is_ws_upgrade = session.is_upgrade_req();
@@ -340,6 +343,7 @@ impl ProxyHttp for AppProxy {
                 };
 
                 let req_header = session.req_header();
+                let method = req_header.method.as_str().to_string();
                 let mut headers: Vec<(String, String)> = Vec::new();
                 for (k, v) in &req_header.headers {
                     headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
