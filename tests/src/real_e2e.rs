@@ -604,7 +604,8 @@ async fn real_e2e_proxy_forwards_all_methods_on_api_path() {
     for (method, path) in cases {
         let (status, body) = raw_request(&addr, "echo.test", method, path, b"").await;
         assert_eq!(
-            status, 200,
+            status,
+            200,
             "{method} {path} expected 200, got {status} (body={body:?}). ngx log:\n{}",
             ngx.log_string()
         );
@@ -665,23 +666,28 @@ async fn real_e2e_proxy_forwards_request_body() {
     let large = vec![b'X'; 64 * 1024]; // 64 KiB of 'X'
 
     for (method, body) in [("POST", &small[..]), ("PUT", &large[..])] {
-        let (status, _resp_body) = raw_request(
-            &addr,
-            "body.test",
-            method,
-            "/api/items",
-            body,
-        )
-        .await;
+        let (status, _resp_body) =
+            raw_request(&addr, "body.test", method, "/api/items", body).await;
         assert_eq!(status, 200, "{method} with body expected 200, got {status}");
     }
 
     let seen = backend.seen().await;
-    assert_eq!(seen.len(), 2, "backend expected 2 requests, saw {}", seen.len());
+    assert_eq!(
+        seen.len(),
+        2,
+        "backend expected 2 requests, saw {}",
+        seen.len()
+    );
     assert_eq!(seen[0].method, "POST");
-    assert_eq!(seen[0].body, small, "POST body must reach backend byte-exact");
+    assert_eq!(
+        seen[0].body, small,
+        "POST body must reach backend byte-exact"
+    );
     assert_eq!(seen[1].method, "PUT");
-    assert_eq!(seen[1].body, large, "PUT body must reach backend byte-exact");
+    assert_eq!(
+        seen[1].body, large,
+        "PUT body must reach backend byte-exact"
+    );
 }
 
 /// Query strings must survive the proxy intact.  Real APIs rely on
@@ -825,9 +831,16 @@ async fn real_e2e_proxy_routes_hosts_to_different_backends() {
 /// and returning 200, which masks real backend failures.
 #[tokio::test]
 async fn real_e2e_proxy_propagates_backend_error_codes() {
-    for (status, reason) in [(401, "Unauthorized"), (403, "Forbidden"), (500, "Internal Server Error"), (502, "Bad Gateway"), (404, "Not Found")] {
+    for (status, reason) in [
+        (401, "Unauthorized"),
+        (403, "Forbidden"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+        (404, "Not Found"),
+    ] {
         let body = format!("{{\"error\":\"{reason}\"}}");
-        let backend = InspectingBackend::start_with(status, "application/json", body.as_bytes()).await;
+        let backend =
+            InspectingBackend::start_with(status, "application/json", body.as_bytes()).await;
 
         let ngx = NgxProcess::start(|db_path| {
             init_pangolin_db(db_path);
@@ -838,9 +851,16 @@ async fn real_e2e_proxy_propagates_backend_error_codes() {
         .await;
 
         let addr = format!("127.0.0.1:{}", ngx.http_port);
-        let (got_status, got_body) = raw_request(&addr, "err.test", "GET", "/api/whatever", b"").await;
-        assert_eq!(got_status, status, "expected {status} from backend, got {got_status}");
-        assert_eq!(got_body, body, "expected backend body to be forwarded unchanged");
+        let (got_status, got_body) =
+            raw_request(&addr, "err.test", "GET", "/api/whatever", b"").await;
+        assert_eq!(
+            got_status, status,
+            "expected {status} from backend, got {got_status}"
+        );
+        assert_eq!(
+            got_body, body,
+            "expected backend body to be forwarded unchanged"
+        );
     }
 }
 
@@ -897,7 +917,8 @@ async fn real_e2e_proxy_adds_x_forwarded_for() {
     );
     // The header should contain at least one IP-looking token.
     assert!(
-        xff.split(',').any(|tok| tok.trim().parse::<std::net::IpAddr>().is_ok()),
+        xff.split(',')
+            .any(|tok| tok.trim().parse::<std::net::IpAddr>().is_ok()),
         "X-Forwarded-For value must contain at least one parseable IP, got: {xff:?}"
     );
 }
@@ -955,15 +976,21 @@ async fn real_e2e_proxy_forwards_response_headers() {
 
     // Each marker header must appear verbatim (case-insensitive).
     assert!(
-        response.to_lowercase().contains("x-backend-marker: backend-says-hi"),
+        response
+            .to_lowercase()
+            .contains("x-backend-marker: backend-says-hi"),
         "X-Backend-Marker must be forwarded, full response:\n{response}"
     );
     assert!(
-        response.to_lowercase().contains("x-ratelimit-remaining: 42"),
+        response
+            .to_lowercase()
+            .contains("x-ratelimit-remaining: 42"),
         "X-RateLimit-Remaining must be forwarded"
     );
     assert!(
-        response.to_lowercase().contains("set-cookie: backend_cookie=abc"),
+        response
+            .to_lowercase()
+            .contains("set-cookie: backend_cookie=abc"),
         "Set-Cookie must be forwarded (this was part of the user's original concern)"
     );
 
@@ -992,7 +1019,11 @@ async fn real_e2e_proxy_forwards_cors_preflight() {
                 let first = String::from_utf8_lossy(&buf).into_owned();
                 let is_options = first.starts_with("OPTIONS ");
                 let body = b"";
-                let (status, reason) = if is_options { ("204", "No Content") } else { ("200", "OK") };
+                let (status, reason) = if is_options {
+                    ("204", "No Content")
+                } else {
+                    ("200", "OK")
+                };
                 let cors_headers = if is_options {
                     "Access-Control-Allow-Origin: https://app.example.com\r\n\
                      Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS\r\n\
@@ -1046,9 +1077,9 @@ async fn real_e2e_proxy_forwards_cors_preflight() {
         "CORS Allow-Methods must be forwarded"
     );
     assert!(
-        response.contains("access-control-allow-headers:") &&
-            response.contains("authorization") &&
-            response.contains("x-api-key"),
+        response.contains("access-control-allow-headers:")
+            && response.contains("authorization")
+            && response.contains("x-api-key"),
         "CORS Allow-Headers must be forwarded with all requested headers"
     );
 
@@ -1079,7 +1110,8 @@ async fn real_e2e_proxy_returns_502_when_backend_unreachable() {
     let proxy_addr = format!("127.0.0.1:{}", ngx.http_port);
     let (status, _body) = raw_request(&proxy_addr, "dead.test", "GET", "/api/foo", b"").await;
     assert_eq!(
-        status, 502,
+        status,
+        502,
         "expected 502 Bad Gateway when upstream is unreachable, got {status}. ngx log:\n{}",
         ngx.log_string()
     );
