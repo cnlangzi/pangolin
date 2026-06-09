@@ -23,7 +23,13 @@ server:
   tunnel_port: {{ ngx_tunnel_port | default(9001) }}
 
 admin:
-  addr: {{ ngx_admin_addr | default('127.0.0.1:9081') }}
+  # Bind on all IPv4 interfaces — deploys need remote management.
+  # The Rust default (127.0.0.1:9081) is intentionally loopback for
+  # local dev; we override it here.  Must be a standard socket addr
+  # (`0.0.0.0:9081` or `127.0.0.1:9081`) — pingora rejects bare `:port`.
+  # If the host has no firewall, restrict 9081 via ufw/iptables or
+  # set ngx_admin_addr in hosts.
+  addr: {{ ngx_admin_addr | default('0.0.0.0:9081') }}
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}
 
