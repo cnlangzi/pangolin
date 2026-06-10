@@ -991,3 +991,72 @@ impl AcmeState {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Service integration
+// ---------------------------------------------------------------------------
+
+/// Long-running ACME renewal loop, run by `runtime::Service`.
+pub struct AcmeService {
+    state: Arc<AcmeState>,
+}
+
+impl AcmeService {
+    /// Build the service. The initial DNS provider load and startup
+    /// cert scan happen inside [`Service::run`] so that any failure
+    /// aborts process startup (fail-fast) rather than being logged
+    /// and ignored.
+    pub fn new(state: Arc<AcmeState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::Service for AcmeService {
+    fn name(&self) -> &'static str {
+        "acme"
+    }
+
+    async fn run(&self, ctx: crate::runtime::ServiceContext) -> anyhow::Result<()> {
+        let app = ctx.app.clone();
+        let state = self.state.clone();
+        let interval_hours = app.config.acme.renew_check_interval_hours.max(1);
+
+        // Initial load + scan. Errors here fail startup.
+        state
+            .reload(&app)
+            .await
+            .map_err(|e| anyhow::anyhow!("acme initial reload: {e}"))?;
+        state.ensure_certs(&app).await;
+
+        let interval = std::time::Duration::from_secs(interval_hours as u64 * 3600);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; skip it to avoid running
+        // the scan twice at startup.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                // Bias toward shutdown so a Ctrl-C during a long
+                // renewal check doesn't have to wait for the next
+                // tick boundary.
+                biased;
+                _ = ctx.shutdown.cancelled() => {
+                    log::info!("ACME: shutdown requested, exiting renewal loop");
+                    return Ok(());
+                }
+                _ = ticker.tick() => {
+                    log::info!("ACME: periodic renewal scan (interval={}h)", interval_hours);
+                }
+                _ = app.dns_change_notify.notified() => {
+                    log::info!("ACME: DNS config changed, reloading and re-scanning");
+                    if let Err(e) = state.reload(&app).await {
+                        log::error!("acme reload after notify: {e}");
+                    }
+                }
+            }
+            state.ensure_certs(&app).await;
+        }
+    }
+}

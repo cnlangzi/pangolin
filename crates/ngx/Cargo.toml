@@ -30,6 +30,7 @@ rusqlite.workspace = true
 http-body = "1"
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

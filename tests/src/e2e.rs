@@ -13,6 +13,66 @@ use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, HostMode, Site};
 
 // ---------------------------------------------------------------------------
+// Raw TCP HTTP request helper
+//
+// reqwest 0.12+ ignores user-supplied `Host` headers (it always sets
+// `Host` from the URL's authority), which makes it useless for testing
+// virtual-host routing against a proxy. Send the request over a raw
+// `TcpStream` so the `Host` header we set is the one the proxy sees.
+// ---------------------------------------------------------------------------
+
+async fn send_raw_request(
+    proxy_port: u16,
+    method: &str,
+    host_header: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect to proxy");
+
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n",
+        method = method,
+        path = path,
+        host_header = host_header,
+    );
+    if !body.is_empty() {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        req.push_str("Content-Type: application/json\r\n");
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await.expect("write req");
+    if !body.is_empty() {
+        stream.write_all(body).await.expect("write body");
+    }
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read resp");
+
+    // Parse "HTTP/1.1 NNN ..." from the status line.
+    let status_line = String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    // Strip headers; return only the body.
+    let body = if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        buf[idx + 4..].to_vec()
+    } else {
+        Vec::new()
+    };
+    (code, body)
+}
+
+// ---------------------------------------------------------------------------
 // Mock HTTP backend
 // ---------------------------------------------------------------------------
 
@@ -504,28 +564,13 @@ async fn e2e_direct_http_get() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let (status, body_bytes) =
+        send_raw_request(proxy_port, "GET", "api.example.com", "/api/users", b"").await;
+    log::info!("response status: {}", status);
+    assert_eq!(status, 200);
 
-    let url = format!("http://127.0.0.1:{}/api/users", proxy_port);
-    log::info!("requesting {}", url);
-    let resp = client
-        .get(&url)
-        .header("Host", "api.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    log::info!("response status: {}", resp.status().as_u16());
-
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body_bytes = resp.bytes().await.expect("should read body");
     let body_str = String::from_utf8_lossy(&body_bytes);
     log::info!("body: {}", body_str);
-
     assert!(body_str.contains("GET"));
     assert!(body_str.contains("/api/users"));
     assert!(body_str.contains("api.example.com"));
@@ -636,21 +681,11 @@ async fn e2e_direct_http_post() {
         }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/submit", proxy_port);
-    let resp = client
-        .post(&url)
-        .header("Host", "post.example.com")
-        .json(&serde_json::json!({"name": "test", "value": 42}))
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
+    let body =
+        serde_json::to_vec(&serde_json::json!({"name": "test", "value": 42})).expect("encode body");
+    let (status, _) =
+        send_raw_request(proxy_port, "POST", "post.example.com", "/submit", &body).await;
+    assert_eq!(status, 200);
 
     let reqs = backend.get_requests().await;
     assert!(!reqs.is_empty());
@@ -710,22 +745,10 @@ async fn e2e_direct_static_file() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/index.html", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "static.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body = resp.text().await.expect("read body");
+    let (status, body_bytes) =
+        send_raw_request(proxy_port, "GET", "static.example.com", "/index.html", b"").await;
+    assert_eq!(status, 200);
+    let body = String::from_utf8_lossy(&body_bytes);
     assert!(body.contains("Hello Static World"));
 }
 

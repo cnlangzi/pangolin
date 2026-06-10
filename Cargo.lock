@@ -2004,6 +2004,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "urlencoding",
  "uuid",
  "x509-parser 0.15.1",
@@ -3901,6 +3902,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
