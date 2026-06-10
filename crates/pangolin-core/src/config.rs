@@ -367,4 +367,22 @@ mod tests {
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.acme.key_type, "rsa");
     }
+
+    #[test]
+    fn pangolin_yml_section_headings_match_config_struct() {
+        // Regression: PR-1 renamed Config::cert → Config::acme but the YAML
+        // section header in pangolin.yml was left as `cert:` for one commit,
+        // causing the operator's config to be silently ignored (no error,
+        // just defaults). This test pins the section name against the
+        // shipping pangolin.yml so a future rename can't drift again.
+        let yml = include_str!("../../../pangolin.yml");
+        let c: Config = serde_yaml::from_str(yml).expect("pangolin.yml must parse");
+        // acme.email is "" in the dev example; default email is "" too,
+        // so the only signal that the section was actually read is the
+        // acme_directory override.
+        assert_eq!(
+            c.acme.acme_directory, "https://acme-v02.api.letsencrypt.org/directory",
+            "acme.acme_directory from yml should be honored"
+        );
+    }
 }

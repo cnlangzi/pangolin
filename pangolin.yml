@@ -45,7 +45,7 @@ cache:
   enabled: false          # response cache (pingora proxy_cache)
   dir: ./cache            # cache storage dir
 
-cert:
+acme:
   email: ""               # ACME registration email
   cert_dir: ./certs       # where CertManager looks for host blobs
                          # (autocert DirCache native layout: {host} or {host}+rsa)

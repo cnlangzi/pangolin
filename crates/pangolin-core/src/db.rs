@@ -24,7 +24,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
 
-/// All five CREATE TABLE statements, idempotent.
+/// All CREATE TABLE statements, idempotent.
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Open a connection with sensible defaults (WAL, foreign keys on).
