@@ -194,6 +194,16 @@ pub struct DnsProvider {
     pub updated_at: DateTime<Utc>,
 }
 
+/// ACME challenge type chosen for a SAN identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChallengeType {
+    /// HTTP-01: write a challenge file under `./certs/.well-known/acme-challenge/<token>`.
+    Http01,
+    /// DNS-01: create a `_acme-challenge.<domain>` TXT record via the
+    /// associated DNS provider.
+    Dns01,
+}
+
 /// Result of `parse_backend` — what kind of upstream this site is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendKind {

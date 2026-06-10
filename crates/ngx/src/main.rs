@@ -89,6 +89,16 @@ fn main() -> anyhow::Result<()> {
         config.server.port
     );
 
+    // Build ACME state: load DNS providers from DB, run startup scan,
+    // start the background renewal loop.
+    let acme_state = std::sync::Arc::new(crate::acme::AcmeState::empty());
+    // Build ACME state: the initial DNS provider load + startup cert
+    // scan run inside start_background_loop's prelude (pingora owns the
+    // tokio runtime, so main() stays sync).
+    let acme_state = std::sync::Arc::new(crate::acme::AcmeState::empty());
+    // Background renew loop (also handles the initial reload + scan).
+    acme_state.clone().start_background_loop(app.clone());
+
     // Build pingora server
     let mut server = Server::new(None)?;
     server.bootstrap();

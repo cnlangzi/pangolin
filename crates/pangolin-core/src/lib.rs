@@ -27,7 +27,7 @@ pub mod normalize;
 pub mod parse;
 pub mod types;
 
-pub use app::{App, CertManager, TunnelMessage};
+pub use app::{plan_issuance, App, CertManager, DnsIndex, IssuancePlan, TunnelMessage};
 pub use config::Config;
 pub use error::{PangolinError, Result};
 pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};
@@ -37,8 +37,8 @@ pub use parse::{
     parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
 };
 pub use types::{
-    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, DnsProvider,
-    DnsProviderKind, Domain, Site, Token, Tun, TunnelFrame, TunnelRequestFrame,
+    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, ChallengeType,
+    DnsProvider, DnsProviderKind, Domain, Site, Token, Tun, TunnelFrame, TunnelRequestFrame,
     TunnelResponseFrame,
 };
 

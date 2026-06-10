@@ -438,6 +438,179 @@ impl AcmeClient {
         }
     }
 
+    /// v2 entry point: issue a cert executing a per-identifier `IssuancePlan`.
+    ///
+    /// For each SAN in `domains`, the plan picks the challenge type. The
+    /// `dns_providers` registry is consulted (by provider name) for the
+    /// DNS-01 challenges — so a multi-provider deployment can mix them
+    /// per SAN. (Current code path: all DNS-01 SANs share the single
+    /// provider named in `plan.dns_provider_name`; future work can extend
+    /// to per-SAN provider lookup if needed.)
+    pub async fn issue_with_plan(
+        &self,
+        domains: &[String],
+        plan: &pangolin_core::IssuancePlan,
+        dns_providers: &std::collections::HashMap<String, Arc<dyn DnsProvider>>,
+    ) -> Result<Vec<(PathBuf, PathBuf)>> {
+        if plan.challenges.is_empty() {
+            anyhow::bail!("issue_with_plan called with empty plan (auto_issue=false?)");
+        }
+        if domains.len() != plan.challenges.len() {
+            anyhow::bail!(
+                "domains/plan length mismatch: {} vs {}",
+                domains.len(),
+                plan.challenges.len()
+            );
+        }
+
+        log::info!(
+            "ACME v2: issuing cert for {:?} via plan {} entries",
+            domains,
+            plan.challenges.len()
+        );
+
+        // Build identifier list (must match domains ordering).
+        let identifiers: Vec<Identifier> =
+            domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
+        let new_order = NewOrder {
+            identifiers: &identifiers,
+        };
+        let mut order = self.account.new_order(&new_order).await?;
+        log::info!("ACME order created: {}", order.url());
+
+        let authorizations = order.authorizations().await?;
+        log::info!("authorizations count: {}", authorizations.len());
+
+        // Pick the DNS provider once for the whole order. (All DNS-01
+        // SANs in the plan must reference the same provider; the planner
+        // enforces this since plan.dns_provider_name is singular.)
+        let dns_provider: Option<&Arc<dyn DnsProvider>> = plan
+            .dns_provider_name
+            .as_ref()
+            .and_then(|name| dns_providers.get(name));
+
+        for (i, auth) in authorizations.iter().enumerate() {
+            let identifier_str = match &auth.identifier {
+                Identifier::Dns(s) => s.clone(),
+            };
+            let (_, plan_ct) = plan
+                .challenges
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("plan missing entry for index {}", i))?;
+            // Map our plan's ChallengeType to instant_acme's ChallengeType.
+            let acme_ct = match plan_ct {
+                pangolin_core::ChallengeType::Dns01 => ChallengeType::Dns01,
+                pangolin_core::ChallengeType::Http01 => ChallengeType::Http01,
+            };
+
+            let challenge = auth
+                .challenges
+                .iter()
+                .find(|c| c.r#type == acme_ct && !c.token.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no {:?} challenge for {}", acme_ct, identifier_str)
+                })?;
+
+            match plan_ct {
+                pangolin_core::ChallengeType::Dns01 => {
+                    let p = dns_provider.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "plan requested DNS-01 for {} but provider '{:?}' not in registry",
+                            identifier_str,
+                            plan.dns_provider_name
+                        )
+                    })?;
+                    let key_auth = order.key_authorization(challenge).as_str().to_string();
+                    let txt_name = format!("_acme-challenge.{}", identifier_str);
+                    let txt_value = key_auth;
+                    let (zone, _zone_id) = p.find_zone(&identifier_str).await?;
+                    p.create_txt(&zone, &txt_name, &txt_value, 60).await?;
+                    log::info!(
+                        "DNS-01 challenge set: {} = {} (zone: {})",
+                        txt_name,
+                        txt_value,
+                        zone
+                    );
+                    let propagated =
+                        wait_for_txt_propagation(&txt_name, &txt_value, 120, 5).await?;
+                    if !propagated {
+                        log::warn!("DNS-01 TXT may not be fully propagated, proceeding");
+                    }
+                }
+                pangolin_core::ChallengeType::Http01 => {
+                    let key_auth = order.key_authorization(challenge).as_str().to_string();
+                    self.write_challenge(&challenge.token, &key_auth).await?;
+                }
+            }
+
+            order.set_challenge_ready(&challenge.url).await?;
+        }
+
+        // Poll until order is ready or invalid.
+        let mut retries = 0u8;
+        loop {
+            let state = order.state();
+            if state.status == OrderStatus::Ready {
+                break;
+            }
+            if state.status == OrderStatus::Invalid {
+                anyhow::bail!("ACME order invalid: {:?}", state.error);
+            }
+            if retries >= 10 {
+                anyhow::bail!("ACME order timeout waiting for ready");
+            }
+            sleep(Duration::from_secs(5)).await;
+            order.refresh().await?;
+            retries += 1;
+        }
+
+        // Generate CSR + finalize.
+        let (key_pem, csr_der) = self.generate_csr(domains)?;
+        order.finalize(&csr_der).await?;
+
+        // Poll for certificate.
+        let mut retries = 0u8;
+        let cert_chain_pem = loop {
+            if let Some(cert) = order.certificate().await? {
+                break cert;
+            }
+            if retries >= 30 {
+                anyhow::bail!("ACME order timeout waiting for certificate");
+            }
+            sleep(Duration::from_secs(5)).await;
+            retries += 1;
+        };
+
+        // Build blob content.
+        let blob = build_blob(&key_pem, &cert_chain_pem);
+
+        // Write one blob per SAN (identical content), including the literal
+        // `*.example.com` filename for wildcard certs.
+        let mut written = Vec::new();
+        for domain in domains {
+            let filename = blob_filename(domain, self.key_type);
+            let path = self.cert_dir.join(&filename);
+            write_file_0600(&path, blob.as_bytes())
+                .await
+                .with_context(|| format!("write blob for {}", domain))?;
+            log::info!("ACME blob written: {}", path.display());
+            written.push((path.clone(), path));
+        }
+
+        // Cleanup HTTP-01 challenge files.
+        for auth in &authorizations {
+            if let Some(c) = auth
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::Http01 && !c.token.is_empty())
+            {
+                self.remove_challenge(&c.token).await;
+            }
+        }
+
+        Ok(written)
+    }
+
     /// Check expiry of existing cert and renew if within threshold.
     /// Returns all (cert_path, key_path) pairs written.
     pub async fn check_and_renew(
@@ -581,5 +754,236 @@ mod tests {
         let blob = build_blob(key_pem, cert_pem);
         assert!(blob.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
         assert!(blob.contains("-----BEGIN CERTIFICATE-----"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AcmeState — runtime ACME orchestration (v2)
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+use pangolin_core::{App, Domain};
+
+/// Runtime state for ACME: holds the `Arc<dyn DnsProvider>` registry (loaded
+/// from the `dns_providers` table) and exposes the startup scan + renew loop.
+///
+/// One `AcmeState` is built in `main()` after the `App` is constructed and
+/// shared via `Arc<AcmeState>`. The registry is rebuilt on `reload()` after
+/// any admin write (DNS provider add/edit/delete, domain add/edit).
+pub struct AcmeState {
+    /// DNS provider instances: name → trait object. The trait object
+    /// is what's needed to call `create_txt` / `find_zone` at issuance time.
+    pub dns_providers: RwLock<HashMap<String, Arc<dyn DnsProvider>>>,
+    /// The AcmeClient. Built lazily on first issuance; reused for renew.
+    pub client: RwLock<Option<Arc<AcmeClient>>>,
+}
+
+impl AcmeState {
+    /// Create an empty state (no DNS providers yet, no client). Call
+    /// `reload(app)` to populate from the DB.
+    pub fn empty() -> Self {
+        Self {
+            dns_providers: RwLock::new(HashMap::new()),
+            client: RwLock::new(None),
+        }
+    }
+
+    /// Rebuild the DNS provider registry from the DB. Cheap — re-reads
+    /// the `dns_providers` table and re-constructs trait objects.
+    pub async fn reload(&self, app: &App) -> anyhow::Result<()> {
+        let conn = app.db.lock().await;
+        let providers = pangolin_core::db::list_dns_providers(&conn).unwrap_or_default();
+        drop(conn);
+
+        let mut new_registry = HashMap::new();
+        for p in providers.iter().filter(|p| p.enabled) {
+            match crate::dns::from_kind_config(p.kind, &p.config) {
+                Ok(provider) => {
+                    new_registry.insert(p.name.clone(), provider);
+                }
+                Err(e) => {
+                    log::error!(
+                        "skipping dns_provider '{}' (kind={}): {}",
+                        p.name,
+                        p.kind,
+                        e
+                    );
+                    app.add_event(pangolin_core::EventType::CertIssuanceSkipped {
+                        domain: p.name.clone(),
+                        reason: format!("dns provider factory error: {e}"),
+                    });
+                }
+            }
+        }
+        *self.dns_providers.write().await = new_registry;
+        Ok(())
+    }
+
+    /// Build the AcmeClient (if not already built) and return an Arc clone.
+    pub async fn client(&self, app: &App) -> anyhow::Result<Arc<AcmeClient>> {
+        if let Some(c) = self.client.read().await.as_ref() {
+            return Ok(c.clone());
+        }
+        let mut guard = self.client.write().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let dns_provider = {
+            let reg = self.dns_providers.read().await;
+            // Pick the first registered provider as the "default" for the
+            // AcmeClient. (The v2 path actually uses the per-plan registry
+            // lookup; this single provider is only here for the legacy
+            // issue_cert() entry point used in tests.)
+            reg.values().next().cloned()
+        };
+        let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
+        let key_type = match app.config.acme.key_type.as_str() {
+            "rsa" => KeyType::Rsa,
+            _ => KeyType::Ecdsa,
+        };
+        let client = AcmeClient::new(
+            cert_dir,
+            app.config.acme.email.clone(),
+            &app.config.acme.acme_directory,
+            app.config.acme.renew_threshold_days,
+            app.config.acme.renew_check_interval_hours,
+            key_type,
+            dns_provider,
+        )
+        .await?;
+        let arc = Arc::new(client);
+        *guard = Some(arc.clone());
+        Ok(arc)
+    }
+
+    /// Enumerate `domains` with `auto_issue=true` and ensure a cert blob
+    /// exists on disk. If a cert exists, check expiry and renew if within
+    /// threshold. If it doesn't exist, issue fresh.
+    pub async fn ensure_certs(&self, app: &App) {
+        let conn = app.db.lock().await;
+        let domains = pangolin_core::db::list_domains(&conn).unwrap_or_default();
+        let dns_index_snapshot = app.dns_index.read().await.clone();
+        let dns_index = dns_index_snapshot;
+        drop(conn);
+
+        for d in domains
+            .iter()
+            .filter(|d| d.enabled && d.auto_issue)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Err(e) = self.ensure_one(app, &d, &dns_index).await {
+                log::error!("ensure_certs({}): {}", d.domain, e);
+                app.add_event(pangolin_core::EventType::CertIssuanceSkipped {
+                    domain: d.domain.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
+    async fn ensure_one(
+        &self,
+        app: &App,
+        domain: &Domain,
+        dns_index: &pangolin_core::DnsIndex,
+    ) -> anyhow::Result<()> {
+        // Build the SAN list: for a wildcard, include the base domain too
+        // (browsers won't trust a `*.example.com` cert without the base).
+        let sans: Vec<String> = if let Some(base) = domain.domain.strip_prefix("*.") {
+            vec![base.to_string(), domain.domain.clone()]
+        } else {
+            vec![domain.domain.clone()]
+        };
+
+        let plan = match pangolin_core::plan_issuance(&sans, domain, dns_index) {
+            Ok(p) => p,
+            Err(e) => {
+                // Wildcard without DNS association: log + skip; the
+                // operator must associate a provider or disable auto_issue.
+                log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
+                return Ok(());
+            }
+        };
+
+        // Check existing cert.
+        let cert_path = app.cert_manager.cert_dir.join(&sans[0]);
+        let needs_issue = if cert_path.exists() {
+            match parse_blob_expiry(&tokio::fs::read_to_string(&cert_path).await?) {
+                Ok(expiry) => {
+                    let days = (expiry - chrono::Utc::now()).num_days();
+                    days <= app.config.acme.renew_threshold_days as i64
+                }
+                Err(_) => true,
+            }
+        } else {
+            true
+        };
+
+        if !needs_issue {
+            return Ok(());
+        }
+
+        let client = self.client(app).await?;
+        let dns_providers = self.dns_providers.read().await.clone();
+        log::info!(
+            "issuing cert for {:?} (plan: {} entries, provider: {:?})",
+            sans,
+            plan.challenges.len(),
+            plan.dns_provider_name
+        );
+        let _ = client.issue_with_plan(&sans, &plan, &dns_providers).await?;
+        app.add_event(pangolin_core::EventType::CertIssued {
+            domain: domain.domain.clone(),
+        });
+        Ok(())
+    }
+
+    /// Start the background renewal loop. Returns immediately; the loop
+    /// runs until the process exits.
+    ///
+    /// Before entering the loop, this does one initial reload (load DNS
+    /// providers from DB) and one startup cert scan so that any
+    /// previously-issued certs that are missing on disk get re-issued
+    /// without waiting for the first periodic tick.
+    ///
+    /// The steady-state loop ticks on two triggers:
+    ///   1. Periodic interval (`renew_check_interval_hours`).
+    ///   2. `app.dns_change_notify` — fired by `App::reload_indexes` when
+    ///      the admin writes a new DNS provider or updates a domain's
+    ///      auto_issue / dns_provider fields.
+    pub fn start_background_loop(self: Arc<Self>, app: Arc<App>) {
+        let interval_hours = app.config.acme.renew_check_interval_hours.max(1);
+        let state = self;
+        tokio::spawn(async move {
+            // Initial load + scan before entering the loop.
+            if let Err(e) = state.reload(&app).await {
+                log::error!("acme initial reload: {}", e);
+            }
+            state.ensure_certs(&app).await;
+
+            let interval = std::time::Duration::from_secs(interval_hours as u64 * 3600);
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; skip it to avoid running
+            // the scan twice at startup.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        log::info!("ACME: periodic renewal scan (interval={}h)", interval_hours);
+                    }
+                    _ = app.dns_change_notify.notified() => {
+                        log::info!("ACME: DNS config changed, reloading and re-scanning");
+                        if let Err(e) = state.reload(&app).await {
+                            log::error!("acme reload after notify: {}", e);
+                        }
+                    }
+                }
+                state.ensure_certs(&app).await;
+            }
+        });
     }
 }
