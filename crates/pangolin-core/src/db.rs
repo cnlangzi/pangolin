@@ -1,4 +1,8 @@
-//! SQLite schema and load functions.
+//! SQLite schema and migration functions.
+//!
+//! Schema is managed by the `refinery` embedded migration system:
+//!   migrations/V{version}__{name}.sql  →  compiled and run at startup
+//!   schema_version table               →  tracks applied migrations
 //!
 //! Five tables, all with TEXT primary keys (natural keys, no surrogate ids):
 //!   sites     (name PK, backend, enabled, created_at, updated_at)
@@ -10,16 +14,15 @@
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
 
+use std::error::Error;
 use std::path::Path;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
+use crate::embedded_migrations::run_migrations;
 use crate::types::{Cert, Domain, Site, Token, Tun};
-
-/// All five CREATE TABLE statements, idempotent.
-pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Open a connection with sensible defaults (WAL, foreign keys on).
 pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
@@ -33,9 +36,10 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Apply the schema. Safe to call on every startup.
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
+/// Run pending refinery migrations. Safe to call on every startup —
+/// already-applied migrations are skipped (tracked in schema_version table).
+pub fn migrate(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
+    run_migrations(conn)
 }
 
 // ---- Site CRUD ----
@@ -391,9 +395,9 @@ mod tests {
     use crate::types::{Domain, HostMode, Site, Token, Tun};
 
     fn make_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        migrate(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         conn
     }
 
@@ -403,9 +407,9 @@ mod tests {
 
     #[test]
     fn schema_applies_idempotently() {
-        let conn = make_conn();
-        // Calling migrate again should be a no-op (CREATE IF NOT EXISTS).
-        migrate(&conn).unwrap();
+        let mut conn = make_conn();
+        // Calling migrate again should be a no-op (refinery skips applied migrations).
+        migrate(&mut conn).unwrap();
     }
 
     #[test]

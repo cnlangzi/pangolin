@@ -118,20 +118,15 @@ pub fn gen_self_signed(sans: &[&str], host: &str, cert_dir: &Path) -> PathBuf {
     blob_path
 }
 
-/// The pangolin SQLite schema. Mirrors `crates/pangolin-core/src/schema.sql`.
-/// Inlined here so the e2e harness doesn't need to depend on
-/// `pangolin-core`'s internals.
-const SCHEMA_SQL: &str = include_str!("../../crates/pangolin-core/src/schema.sql");
-
 /// Create a fresh `pangolin.db` at `path` with the standard schema
-/// applied. The test then opens the same path with rusqlite to insert
-/// sites/domains/tokens before the binary starts.
+/// applied via refinery migrations. The test then opens the same path
+/// with rusqlite to insert sites/domains/tokens before the binary starts.
 pub fn init_pangolin_db(path: &Path) {
     if path.exists() {
         std::fs::remove_file(path).expect("remove existing pangolin.db");
     }
-    let conn = rusqlite::Connection::open(path).expect("open pangolin.db for seeding");
-    conn.execute_batch(SCHEMA_SQL).expect("apply schema");
+    let mut conn = pangolin_core::db::open(path).expect("open pangolin.db");
+    pangolin_core::db::migrate(&mut conn).expect("run migrations");
 }
 
 /// Capture child stdout+stderr into a shared `Vec<u8>` so failing tests

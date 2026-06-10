@@ -8,6 +8,7 @@ description = "Pangolin core: types, parsing, in-memory indexes (no pingora dep)
 
 [dependencies]
 rusqlite.workspace = true
+refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
