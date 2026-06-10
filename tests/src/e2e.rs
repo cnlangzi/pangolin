@@ -746,8 +746,6 @@ async fn e2e_direct_static_file_not_found() {
         name: "static-missing".into(),
         backend: "file:///tmp/does_not_exist_xyz123.txt".to_string(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
