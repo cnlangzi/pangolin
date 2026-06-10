@@ -21,8 +21,8 @@ use pangolin_core::types::{Domain, HostMode, Site, Token};
 fn temp_conn() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("test.db");
-    let conn = Connection::open(&db_path).unwrap();
-    db::migrate(&conn).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
+    db::migrate(&mut conn).unwrap();
     (dir, conn)
 }
 
