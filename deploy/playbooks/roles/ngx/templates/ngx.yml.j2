@@ -11,6 +11,14 @@
 # clients connect into. Other features (admin UI, response cache,
 # ACME certs, logging) each have their own sub-section.
 #
+# v2 ACME (PR #23) removed the global `cert.autorenew` toggle.
+# Auto-issuance is now controlled **per-domain** via the
+# `domains.auto_issue` column in the database, and the DNS provider
+# used for DNS-01 challenges is set per-domain via `domains.dns_provider`
+# (referencing a row in the `dns_providers` table, managed in the
+# admin UI under "DNS Providers"). See docs/configuration.md and the
+# v2 design doc for the full model.
+#
 #   port                  HTTP listen port (default 80)
 #   tls_port              HTTPS listen port; set 0 to disable TLS entirely
 #   host                  virtual host used to resolve per-domain cert
@@ -19,8 +27,11 @@
 #   tunnel.port           WS listener for tun clients (default 9001)
 #   tunnel.ws_path        WS endpoint path (default "/tunnel")
 #   admin.*               admin UI bind addr + basic-auth creds
-#   cert.cert_dir         where CertManager looks for fullchain.pem / privkey.pem
-#   cert.autorenew        ACME auto-issue + renew (false = manual upload only)
+#   acme.cert_dir         where CertManager looks for cert blobs
+#                         (autocert DirCache native layout: {host} or
+#                         {host}+rsa; no `default` fallback in v2)
+#   acme.acme_directory   ACME directory URL (LE staging for testing)
+#   acme.key_type         "ecdsa" (default) or "rsa"
 #   log.level             env_logger filter (trace|debug|info|warn|error)
 
 # ── Proxy listen (top level) ────────────────────────────────────────────
@@ -46,10 +57,17 @@ admin:
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}
 
-cert:
+acme:
   email: {{ ngx_acme_email | default('') }}
-  cert_dir: /opt/pangolin/certs
-  autorenew: {{ ngx_acme | default(false) | string | lower }}
+  cert_dir: {{ ngx_acme_cert_dir | default('/opt/pangolin/certs') }}
+  acme_directory: {{ ngx_acme_directory | default('https://acme-v02.api.letsencrypt.org/directory') }}
+  renew_threshold_days: {{ ngx_acme_renew_threshold_days | default(30) }}
+  renew_check_interval_hours: {{ ngx_acme_renew_check_interval_hours | default(6) }}
+  renew_max_retries: {{ ngx_acme_renew_max_retries | default(3) }}
+  key_type: {{ ngx_acme_key_type | default('ecdsa') }}
+  # v2: no `autorenew` field. Per-domain `auto_issue` is managed via
+  # the admin UI / `domains` table. The legacy `ngx_acme` host var
+  # is preserved for inventory compatibility but no longer mapped.
 
 log:
   level: {{ ngx_log_level | default('info') }}
