@@ -223,6 +223,8 @@ async fn upstream_host_header() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: pangolin_core::types::HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {
@@ -297,6 +299,8 @@ async fn upstream_host_header_with_port() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: pangolin_core::types::HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {

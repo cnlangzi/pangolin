@@ -42,11 +42,11 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn list_sites(conn: &Connection) -> rusqlite::Result<Vec<Site>> {
     let mut stmt = conn.prepare(
-        "SELECT s.name, s.backend, s.enabled, s.created_at, s.updated_at,
+        "SELECT s.name, s.backend, s.enabled, s.host_mode, s.host_custom, s.created_at, s.updated_at,
                 COUNT(d.domain) as domain_count
          FROM sites s
          LEFT JOIN domains d ON d.site_name = s.name
-         GROUP BY s.name, s.backend, s.enabled, s.created_at, s.updated_at
+         GROUP BY s.name, s.backend, s.enabled, s.host_mode, s.host_custom, s.created_at, s.updated_at
          ORDER BY s.name",
     )?;
     let rows = stmt.query_map([], row_to_site_with_count)?;
@@ -55,23 +55,27 @@ pub fn list_sites(conn: &Connection) -> rusqlite::Result<Vec<Site>> {
 
 pub fn get_site(conn: &Connection, name: &str) -> rusqlite::Result<Option<Site>> {
     let mut stmt = conn.prepare(
-        "SELECT name, backend, enabled, created_at, updated_at FROM sites WHERE name = ?1",
+        "SELECT name, backend, enabled, host_mode, host_custom, created_at, updated_at FROM sites WHERE name = ?1",
     )?;
     stmt.query_row(params![name], row_to_site).optional()
 }
 
 pub fn upsert_site(conn: &Connection, site: &Site) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO sites (name, backend, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET
             backend = excluded.backend,
             enabled = excluded.enabled,
+            host_mode = excluded.host_mode,
+            host_custom = excluded.host_custom,
             updated_at = excluded.updated_at",
         params![
             site.name,
             site.backend,
             site.enabled as i32,
+            site.host_mode.to_string(),
+            site.host_custom,
             site.created_at.to_rfc3339(),
             site.updated_at.to_rfc3339(),
         ],
@@ -248,12 +252,16 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
     let name: String = row.get(0)?;
     let backend: String = row.get(1)?;
     let enabled: i32 = row.get(2)?;
-    let created_at: String = row.get(3)?;
-    let updated_at: String = row.get(4)?;
+    let host_mode: String = row.get(3)?;
+    let host_custom: Option<String> = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
     Ok(Site {
         name,
         backend,
         enabled: enabled != 0,
+        host_mode: host_mode.parse().unwrap_or_default(),
+        host_custom,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
         domain_count: 0,
@@ -264,13 +272,17 @@ fn row_to_site_with_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
     let name: String = row.get(0)?;
     let backend: String = row.get(1)?;
     let enabled: i32 = row.get(2)?;
-    let created_at: String = row.get(3)?;
-    let updated_at: String = row.get(4)?;
-    let domain_count: i32 = row.get(5)?;
+    let host_mode: String = row.get(3)?;
+    let host_custom: Option<String> = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    let domain_count: i32 = row.get(7)?;
     Ok(Site {
         name,
         backend,
         enabled: enabled != 0,
+        host_mode: host_mode.parse().unwrap_or_default(),
+        host_custom,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
         domain_count: domain_count as usize,
@@ -346,7 +358,7 @@ fn parse_dt_opt(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Domain, Site, Token, Tun};
+    use crate::types::{Domain, HostMode, Site, Token, Tun};
 
     fn make_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -375,6 +387,8 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
@@ -393,6 +407,8 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         upsert_site(&conn, &s1).unwrap();
@@ -417,6 +433,8 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
@@ -433,6 +451,8 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();
@@ -457,6 +477,8 @@ mod tests {
             enabled: true,
             created_at: dt("2026-01-01T00:00:00+00:00"),
             updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         upsert_site(&conn, &s).unwrap();

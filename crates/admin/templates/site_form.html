@@ -44,6 +44,30 @@
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">http://... or tun_name:http://...</p>
     </div>
 
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
+      <select name="host_mode" id="host-mode"
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+        hx-get="/admin/sites/host-custom-field" hx-target="#host-custom-wrapper" hx-swap="innerHTML">
+        <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
+        <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
+        <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
+      </select>
+    </div>
+
+    <div id="host-custom-wrapper">
+      {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
+        <input type="text" name="host_custom" id="host-custom"
+          value="{% if let Some(hc) = s.host_custom %}{{ hc }}{% endif %}"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+          placeholder="e.g. internal.example.com">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
+      </div>
+      {% endif %}{% endif %}
+    </div>
+
     {% if let Some(e) = error %}
     <div class="alert-error text-sm">
       <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">

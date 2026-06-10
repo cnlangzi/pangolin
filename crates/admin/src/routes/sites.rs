@@ -9,6 +9,7 @@ use http_body_util::Full;
 
 use crate::templates::{SiteFormTemplate, SitesTemplate};
 use crate::{redirect_response, App};
+use pangolin_core::types::{HostMode, Site};
 
 fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
@@ -90,12 +91,14 @@ pub async fn handle_create(
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
         return render_create_page_with_error(
-            Some(pangolin_core::types::Site {
+            Some(Site {
                 name,
                 backend,
                 enabled: true,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                host_mode: HostMode::Passthrough,
+                host_custom: None,
                 domain_count: 0,
             }),
             &format!("Invalid backend: {}", e),
@@ -103,12 +106,14 @@ pub async fn handle_create(
         );
     }
 
-    let site = pangolin_core::types::Site {
+    let site = Site {
         name: name.clone(),
         backend,
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
 
@@ -143,6 +148,11 @@ pub async fn handle_update(
     };
     let params = parse_form(body);
     let backend = params.get("backend").cloned().unwrap_or_default();
+    let host_mode = params
+        .get("host_mode")
+        .and_then(|v| v.parse::<HostMode>().ok())
+        .unwrap_or(HostMode::Passthrough);
+    let host_custom = params.get("host_custom").cloned().filter(|v| !v.is_empty());
 
     if backend.is_empty() {
         return render_edit_page_with_error(app, &name, "Backend is required", csrf);
@@ -151,12 +161,14 @@ pub async fn handle_update(
         return render_edit_page_with_error(app, &name, &format!("Invalid backend: {}", e), csrf);
     }
 
-    let site = pangolin_core::types::Site {
+    let site = Site {
         name: name.clone(),
         backend,
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode,
+        host_custom,
         domain_count: 0,
     };
 
@@ -214,12 +226,14 @@ fn render_edit_page_with_error(
     // Re-render the edit page with the existing backend value (we don't
     // have the original row here without a DB lookup, so just show the
     // error message). In practice users will fix and resubmit.
-    let stub = pangolin_core::types::Site {
+    let stub = Site {
         name: name.to_string(),
         backend: String::new(),
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let html = SiteFormTemplate {

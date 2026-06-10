@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::index::Indexes;
-use pangolin_core::types::{Domain, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site, Token};
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -48,6 +48,8 @@ fn admin_reload_site() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
@@ -74,6 +76,8 @@ fn admin_reload_domain() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
@@ -118,6 +122,8 @@ fn admin_reload_tun() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();

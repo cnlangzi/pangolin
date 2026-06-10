@@ -23,7 +23,7 @@ use pingora::protocols::http::ServerSession;
 use crate::App;
 use pangolin_core::{
     db, is_valid_domain, is_valid_tun_name, parse_backend,
-    types::{Cert, Domain, Site, Token, Tun},
+    types::{Cert, Domain, HostMode, Site, Token, Tun},
 };
 
 // ---- JSON response helpers ----
@@ -80,6 +80,8 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     struct Req {
         backend: String,
         enabled: Option<bool>,
+        host_mode: Option<String>,
+        host_custom: Option<String>,
     }
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -92,12 +94,20 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 
     let now = Utc::now();
+    let host_mode = req
+        .host_mode
+        .as_deref()
+        .unwrap_or("passthrough")
+        .parse()
+        .unwrap_or(HostMode::Passthrough);
     let site = Site {
         name: name.to_string(),
         backend: req.backend,
         enabled: req.enabled.unwrap_or(true),
         created_at: now,
         updated_at: now,
+        host_mode,
+        host_custom: req.host_custom,
         domain_count: 0,
     };
 

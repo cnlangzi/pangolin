@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use pangolin_core::index::{lookup_site, Indexes};
-use pangolin_core::types::{Domain, Site};
+use pangolin_core::types::{Domain, HostMode, Site};
 
 // ---------------------------------------------------------------------------
 // Mock HTTP backend
@@ -474,6 +474,8 @@ async fn e2e_direct_http_get() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {
@@ -546,6 +548,8 @@ async fn e2e_direct_http_404() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {
@@ -601,6 +605,8 @@ async fn e2e_direct_http_post() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {
@@ -667,6 +673,8 @@ async fn e2e_direct_static_file() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {
@@ -724,6 +732,8 @@ async fn e2e_direct_static_file_not_found() {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     let domain = Domain {

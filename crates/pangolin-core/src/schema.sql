@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS sites (
     name        TEXT PRIMARY KEY,            -- business name, e.g. 'customer-web'
     backend     TEXT NOT NULL,               -- '[tun_name:]url'
     enabled     INTEGER NOT NULL DEFAULT 1,
+    host_mode   TEXT NOT NULL DEFAULT 'passthrough',  -- backend|passthrough|custom
+    host_custom TEXT,                         -- custom Host value when host_mode=custom
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

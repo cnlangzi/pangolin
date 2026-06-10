@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Cert, Domain, Site, Token, Tun};
+use pangolin_core::types::{Cert, Domain, HostMode, Site, Token, Tun};
 
 fn temp_conn() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
@@ -32,6 +32,8 @@ fn admin_sites_crud() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
 
@@ -72,6 +74,8 @@ fn admin_domains_crud() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
@@ -213,6 +217,8 @@ fn admin_reload_indexes() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
