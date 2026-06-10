@@ -51,7 +51,6 @@ flate2.workspace = true
 futures-util.workspace = true
 
 # TLS / ACME
-rcgen.workspace = true
 instant-acme = "0.7"
 rustls = "0.23.40"
 pem = "3"
@@ -65,6 +64,13 @@ mime_guess = "2"
 openssl = "0.10"
 time = "0.3"
 
+# DNS-01 challenge
+hickory-resolver = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
 # Utilities
 bytes = "1"
 httpdate = "1"
@@ -72,6 +78,7 @@ httpdate = "1"
 # WebSocket
 sha1 = "0.10"
 base64 = "0.22"
+urlencoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -353,6 +353,11 @@ async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> 
         key_file: req.key_file,
         expires_at,
         created_at: Utc::now(),
+        sans: vec![],
+        source: "manual".to_string(),
+        acme_dns_provider: None,
+        acme_account_id: None,
+        issued_at: 0,
     };
 
     let conn = app.db.lock().await;

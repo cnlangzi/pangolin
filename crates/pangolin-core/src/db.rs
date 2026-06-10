@@ -215,7 +215,8 @@ pub fn delete_token(conn: &Connection, token: &str) -> rusqlite::Result<bool> {
 
 pub fn list_certs(conn: &Connection) -> rusqlite::Result<Vec<Cert>> {
     let mut stmt = conn.prepare(
-        "SELECT domain, cert_file, key_file, expires_at, created_at
+        "SELECT domain, cert_file, key_file, expires_at, created_at,
+                sans, source, acme_dns_provider, acme_account_id, issued_at
          FROM certs ORDER BY domain",
     )?;
     let rows = stmt.query_map([], row_to_cert)?;
@@ -223,19 +224,31 @@ pub fn list_certs(conn: &Connection) -> rusqlite::Result<Vec<Cert>> {
 }
 
 pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
+    let sans_json = serde_json::to_string(&cert.sans).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
-        "INSERT INTO certs (domain, cert_file, key_file, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO certs (domain, cert_file, key_file, expires_at, created_at,
+                             sans, source, acme_dns_provider, acme_account_id, issued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(domain) DO UPDATE SET
             cert_file = excluded.cert_file,
             key_file = excluded.key_file,
-            expires_at = excluded.expires_at",
+            expires_at = excluded.expires_at,
+            sans = excluded.sans,
+            source = excluded.source,
+            acme_dns_provider = excluded.acme_dns_provider,
+            acme_account_id = excluded.acme_account_id,
+            issued_at = excluded.issued_at",
         params![
             cert.domain,
             cert.cert_file,
             cert.key_file,
             cert.expires_at.map(|t| t.to_rfc3339()),
             cert.created_at.to_rfc3339(),
+            sans_json,
+            cert.source,
+            cert.acme_dns_provider,
+            cert.acme_account_id,
+            cert.issued_at,
         ],
     )?;
     Ok(())
@@ -342,12 +355,23 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
     let key_file: String = row.get(2)?;
     let expires_at: Option<String> = row.get(3)?;
     let created_at: String = row.get(4)?;
+    let sans_json: String = row.get(5)?;
+    let source: String = row.get(6)?;
+    let acme_dns_provider: Option<String> = row.get(7)?;
+    let acme_account_id: Option<String> = row.get(8)?;
+    let issued_at: i64 = row.get(9)?;
+    let sans: Vec<String> = serde_json::from_str(&sans_json).unwrap_or_default();
     Ok(Cert {
         domain,
         cert_file,
         key_file,
         expires_at: expires_at.as_deref().and_then(parse_dt_opt),
         created_at: parse_dt(&created_at)?,
+        sans,
+        source,
+        acme_dns_provider,
+        acme_account_id,
+        issued_at,
     })
 }
 
@@ -541,10 +565,16 @@ mod tests {
             key_file: "/etc/ssl/example.com.key".into(),
             expires_at: Some(dt("2026-12-31T00:00:00+00:00")),
             created_at: dt("2026-01-01T00:00:00+00:00"),
+            sans: vec!["example.com".into(), "www.example.com".into()],
+            source: "manual".into(),
+            acme_dns_provider: None,
+            acme_account_id: None,
+            issued_at: 0,
         };
         upsert_cert(&conn, &c).unwrap();
         let list = list_certs(&conn).unwrap();
         assert_eq!(list.len(), 1);
+        assert_eq!(list[0].sans, vec!["example.com", "www.example.com"]);
         assert!(delete_cert(&conn, "example.com").unwrap());
     }
 }

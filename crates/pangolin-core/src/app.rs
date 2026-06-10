@@ -115,6 +115,8 @@ pub struct CertManager {
     pub renew_threshold_days: u32,
     pub renew_check_interval_hours: u32,
     pub renew_max_retries: u32,
+    /// Private key type: "ecdsa" or "rsa".
+    pub key_type: String,
     /// Runtime override for autorenew. If Some, overrides the config file setting.
     /// This allows dynamic toggling without restarting.
     runtime_autorenew_override: std::sync::Mutex<Option<bool>>,
@@ -122,6 +124,7 @@ pub struct CertManager {
 
 impl CertManager {
     /// Create a new CertManager with the given settings.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         enabled: bool,
         cert_dir: PathBuf,
@@ -130,6 +133,7 @@ impl CertManager {
         renew_threshold_days: u32,
         renew_check_interval_hours: u32,
         renew_max_retries: u32,
+        key_type: String,
     ) -> Self {
         Self {
             enabled,
@@ -139,6 +143,7 @@ impl CertManager {
             renew_threshold_days,
             renew_check_interval_hours,
             renew_max_retries,
+            key_type,
             runtime_autorenew_override: std::sync::Mutex::new(None),
         }
     }
@@ -162,33 +167,43 @@ impl CertManager {
         *self.runtime_autorenew_override.lock().unwrap()
     }
 
+    #[allow(clippy::doc_lazy_continuation)]
     /// Resolve cert and key file paths for the given host.
-    /// Searches in order: domain-specific dir under cert_dir/<host>/,
-    /// then the default cert_dir root.
+    /// Search order for autocert blob layout:
+    ///   1. cert_dir/{host}          (ECDSA blob)
+    ///   2. cert_dir/{host}+rsa      (RSA blob)
+    ///   3. cert_dir/default        (fallback for unspecified host)
+    ///   Returns (blob_path, blob_path) — blob is a combined key+cert file for tls.X509KeyPair.
     pub fn resolve_cert(&self, host: &str) -> crate::Result<(String, String)> {
-        // Try domain-specific cert under cert_dir/<host>/
-        let host_dir = self.cert_dir.join(host);
-        let cert = host_dir.join("fullchain.pem");
-        let key = host_dir.join("privkey.pem");
-        if cert.exists() && key.exists() {
+        // Try ECDSA blob first
+        let ecdsa_blob = self.cert_dir.join(host);
+        if ecdsa_blob.exists() {
             return Ok((
-                cert.to_string_lossy().into_owned(),
-                key.to_string_lossy().into_owned(),
+                ecdsa_blob.to_string_lossy().into_owned(),
+                ecdsa_blob.to_string_lossy().into_owned(),
             ));
         }
-        // Fall back to default cert_dir root
-        let cert = self.cert_dir.join("fullchain.pem");
-        let key = self.cert_dir.join("privkey.pem");
-        if cert.exists() && key.exists() {
+        // Try RSA blob
+        let rsa_blob = self.cert_dir.join(format!("{}+rsa", host));
+        if rsa_blob.exists() {
             return Ok((
-                cert.to_string_lossy().into_owned(),
-                key.to_string_lossy().into_owned(),
+                rsa_blob.to_string_lossy().into_owned(),
+                rsa_blob.to_string_lossy().into_owned(),
+            ));
+        }
+        // Fall back to default blob
+        let default_blob = self.cert_dir.join("default");
+        if default_blob.exists() {
+            return Ok((
+                default_blob.to_string_lossy().into_owned(),
+                default_blob.to_string_lossy().into_owned(),
             ));
         }
         Err(crate::PangolinError::Config(format!(
-            "no certificate found for host {} (searched {}/ and {}/)",
+            "no certificate found for host {} (searched {}/ and {}/+rsa and {}/default)",
             host,
-            host_dir.display(),
+            self.cert_dir.display(),
+            self.cert_dir.display(),
             self.cert_dir.display()
         )))
     }
@@ -217,6 +232,7 @@ impl Default for CertManager {
             renew_threshold_days: 30,
             renew_check_interval_hours: 6,
             renew_max_retries: 3,
+            key_type: "ecdsa".into(),
             runtime_autorenew_override: std::sync::Mutex::new(None),
         }
     }
@@ -244,6 +260,7 @@ mod tests {
             30,
             6,
             3,
+            "ecdsa".into(),
         );
         // Config says disabled, but we override to enable
         cm.set_autorenew_override(Some(true));
@@ -261,6 +278,7 @@ mod tests {
             30,
             6,
             3,
+            "ecdsa".into(),
         );
         // Config says enabled, but we override to disable
         cm.set_autorenew_override(Some(false));
@@ -278,6 +296,7 @@ mod tests {
             30,
             6,
             3,
+            "ecdsa".into(),
         );
         // Override to disable
         cm.set_autorenew_override(Some(false));

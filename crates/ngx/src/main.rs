@@ -6,6 +6,7 @@
 
 mod acme;
 mod admin_api;
+mod dns;
 mod proxy;
 mod serve;
 mod tunnel;
@@ -31,6 +32,7 @@ use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 
+use crate::dns::DnsProvider;
 use pangolin_core::config::Config;
 
 // ---- CLI entry point ----
@@ -42,6 +44,53 @@ struct Args {
     /// Path to config file (default: ./pangolin.yml)
     #[arg(short, long, default_value = "pangolin.yml")]
     config: PathBuf,
+}
+
+/// Build a DNS provider from the cert.dns config section.
+fn build_dns_provider(
+    dns_config: &pangolin_core::config::DnsConfig,
+) -> anyhow::Result<Arc<dyn DnsProvider>> {
+    match dns_config.provider.as_str() {
+        "cloudflare" => {
+            let token = &dns_config.cloudflare.api_token;
+            if token.is_empty() {
+                anyhow::bail!("cloudflare.api_token is required for DNS-01 cloudflare provider");
+            }
+            Ok(
+                Arc::new(crate::dns::CloudflareDnsProvider::new(token.clone()))
+                    as Arc<dyn DnsProvider>,
+            )
+        }
+        "aliyun" => {
+            let ak_id = &dns_config.aliyun.access_key_id;
+            let ak_secret = &dns_config.aliyun.access_key_secret;
+            if ak_id.is_empty() || ak_secret.is_empty() {
+                anyhow::bail!("aliyun.access_key_id and access_key_secret are required for DNS-01 aliyun provider");
+            }
+            Ok(Arc::new(crate::dns::AliyunDnsProvider::new(
+                ak_id.clone(),
+                ak_secret.clone(),
+                dns_config.aliyun.region.clone(),
+            )) as Arc<dyn DnsProvider>)
+        }
+        "tencent" => {
+            let secret_id = &dns_config.tencent.secret_id;
+            let secret_key = &dns_config.tencent.secret_key;
+            if secret_id.is_empty() || secret_key.is_empty() {
+                anyhow::bail!(
+                    "tencent.secret_id and secret_key are required for DNS-01 tencent provider"
+                );
+            }
+            Ok(Arc::new(crate::dns::TencentDnsProvider::new(
+                secret_id.clone(),
+                secret_key.clone(),
+            )) as Arc<dyn DnsProvider>)
+        }
+        p => anyhow::bail!(
+            "unknown DNS provider: {}. Valid: cloudflare, aliyun, tencent",
+            p
+        ),
+    }
 }
 
 // NOTE: we deliberately do NOT use `#[tokio::main]` here. pingora's
@@ -68,6 +117,7 @@ fn main() -> anyhow::Result<()> {
         config.cert.renew_threshold_days,
         config.cert.renew_check_interval_hours,
         config.cert.renew_max_retries,
+        config.cert.key_type.clone(),
     );
     let app = Arc::new(pangolin_core::App::new(
         &db_path,
@@ -80,6 +130,13 @@ fn main() -> anyhow::Result<()> {
         pangolin_core::VERSION,
         config.server.port
     );
+
+    // Build DNS provider if configured
+    let _dns_provider: Option<Arc<dyn DnsProvider>> = if !config.cert.dns.provider.is_empty() {
+        Some(build_dns_provider(&config.cert.dns)?)
+    } else {
+        None
+    };
 
     // Build pingora server
     let mut server = Server::new(None)?;
@@ -98,20 +155,22 @@ fn main() -> anyhow::Result<()> {
     if config.server.tls_port > 0 {
         let tls_addr = format!("0.0.0.0:{}", config.server.tls_port);
         let host = config.server.host.as_deref().unwrap_or("default");
-        let (cert_path, key_path) = app
+        // Blob path: combined key+cert PEM, used as both cert and key argument
+        let (blob_path, _) = app
             .cert_manager
             .resolve_cert(host)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut tls_settings =
-            pingora::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path)
+            pingora::listeners::tls::TlsSettings::intermediate(&blob_path, &blob_path)
                 .map_err(|e| anyhow::anyhow!("TLS settings error: {}", e))?;
-        // Validate cert/key are loadable before passing to add_tls_with_settings
-        // (add_tls_with_settings returns () and defers errors to build-time panic)
         let _ = tls_settings.build();
-        // Enable HTTP/2 with ALPN (h2 preferred, http/1.1 fallback)
         tls_settings.enable_h2();
         proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
-        log::info!("TLS enabled with HTTP/2 ALPN on {}", tls_addr);
+        log::info!(
+            "TLS enabled with HTTP/2 ALPN on {} (blob: {})",
+            tls_addr,
+            blob_path
+        );
     }
     server.add_service(proxy_service);
 

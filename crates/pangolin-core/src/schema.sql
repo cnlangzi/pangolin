@@ -38,9 +38,14 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 
 CREATE TABLE IF NOT EXISTS certs (
-    domain        TEXT PRIMARY KEY,           -- 1:1 with domain
-    cert_file     TEXT NOT NULL,
-    key_file      TEXT NOT NULL,
-    expires_at    TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    domain            TEXT PRIMARY KEY,           -- 1:1 with domain (may be a SAN, e.g. www.example.com)
+    cert_file         TEXT NOT NULL,             -- path to blob file (key+cert combined)
+    key_file          TEXT NOT NULL,             -- path to blob file (same as cert_file in blob layout)
+    expires_at        TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    sans              TEXT NOT NULL DEFAULT '[]',        -- JSON array of SANs
+    source            TEXT NOT NULL DEFAULT 'manual',     -- 'acme' | 'manual'
+    acme_dns_provider TEXT,                              -- cloudflare | aliyun | tencent
+    acme_account_id   TEXT,                              -- ACME account URL or id
+    issued_at         INTEGER NOT NULL DEFAULT 0          -- Unix timestamp seconds
 );

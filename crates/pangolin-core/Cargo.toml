@@ -20,4 +20,4 @@ tokio = { workspace = true, optional = true }
 
 [features]
 default = []
-rt = ["tokio/rt"]
+rt = ["tokio/rt", "tokio/sync"]
