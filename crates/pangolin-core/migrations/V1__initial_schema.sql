@@ -1,11 +1,11 @@
--- Pangolin SQLite schema. Mirrors README.md "数据模型" section.
+-- Pangolin SQLite schema V1: initial release
 -- All five tables use TEXT primary keys (natural keys, no surrogate ids).
 -- No intermediate tables (tun_domains was removed; site.backend prefix
 -- is the single source of truth for routing).
 
 CREATE TABLE IF NOT EXISTS sites (
     name        TEXT PRIMARY KEY,            -- business name, e.g. 'customer-web'
-    backend     TEXT NOT NULL,               -- '[tun_name:]url'
+    backend TEXT NOT NULL,               -- '[tun_name:]url'
     enabled     INTEGER NOT NULL DEFAULT 1,
     host_mode   TEXT NOT NULL DEFAULT 'passthrough',  -- backend|passthrough|custom
     host_custom TEXT,                         -- custom Host value when host_mode=custom

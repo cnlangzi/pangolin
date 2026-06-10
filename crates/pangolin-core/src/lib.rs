@@ -20,6 +20,7 @@ pub mod app;
 pub mod compress;
 pub mod config;
 pub mod db;
+pub(crate) mod embedded_migrations;
 pub mod error;
 pub mod events;
 pub mod index;
@@ -40,9 +41,6 @@ pub use types::{
     deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, Domain, Site,
     Token, Tun, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
 };
-
-/// Re-export the schema SQL for tests and migrations.
-pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Library version, e.g. for admin templates and log lines.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
