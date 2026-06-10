@@ -188,6 +188,100 @@ CREATE TABLE certs (
 
 ---
 
+## 数据库迁移
+
+Schema 使用 [refinery](https://docs.rs/refinery/latest/refinery/) 管理，采用 embedded SQL migration 模式。
+
+### 工作原理
+
+- Migration 文件放在 `crates/pangolin-core/migrations/` 目录
+- 文件命名格式：`V{version}__{name}.sql`，如 `V1__initial_schema.sql`、`V2__add_new_column.sql`
+- `embed_migrations!("migrations")` 宏在编译时收集所有 migration 文件
+- 启动时 `db::migrate()` 调用 `refinery::Runner` 自动执行 pending 的 migrations
+- `schema_version` 表由 refinery 自动创建和维护，记录哪些 migration 已经执行过
+
+### 如何添加新 migration
+
+**Step 1：确定下一个版本号**
+
+查看现有的 migration 文件，确认当前最大版本号：
+
+```bash
+ls crates/pangolin-core/migrations/
+# V1__initial_schema.sql  → 当前最新是 V1
+```
+
+**Step 2：编写新的 migration 文件**
+
+```bash
+# 创建 V2__add_new_column.sql
+cat > crates/pangolin-core/migrations/V2__add_new_column.sql << 'EOF'
+-- Add new_field to sites table
+ALTER TABLE sites ADD COLUMN new_field TEXT;
+EOF
+```
+
+**命名规则：**
+- `V{version}` — 版本号，必须单调递增（V1 → V2 → V3...）
+- `__{name}` — 双下划线分隔，name 描述这个 migration 的目的
+- `.sql` 后缀 — 仅支持 SQL 文件（不用 Rust module 格式）
+
+**Step 3：提交**
+
+```bash
+git add crates/pangolin-core/migrations/V2__add_new_column.sql
+git commit -m "feat(db): V2 add_new_column"
+git push
+gh pr create  # 或手动在 GitHub 创建 PR
+```
+
+### 约束
+
+- **每个 migration 必须可重复执行**（幂等性）。使用 `IF NOT EXISTS`、`CREATE INDEX IF NOT EXISTS` 等。
+- **不要修改已发布的 migration 文件** — 只能新增，不能修改历史版本。
+- **Migration 一旦合入 main 分支，不要在同一个 migration 里同时做 DDL 和数据迁移**。如需数据迁移，使用 separate migration。
+
+### 常见操作示例
+
+**添加新表：**
+```sql
+-- migrations/V3__create_audit_log.sql
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    action     TEXT NOT NULL,
+    actor      TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+```
+
+**给现有表添加列：**
+```sql
+-- migrations/V4__add_audit_to_sites.sql
+ALTER TABLE sites ADD COLUMN last_audit_at TEXT;
+```
+
+**创建索引：**
+```sql
+-- migrations/V5__index_tokens_expires.sql
+CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires_at);
+```
+
+### 启动时 migration 自动运行
+
+```rust
+// crates/pangolin-core/src/app.rs
+let mut conn = db::open(db_path.as_ref())?;
+db::migrate(&mut conn)?;  // 自动执行所有 pending migrations
+```
+
+**幂等性保证：** 如果 migration V1 已经执行过，再次调用 `db::migrate()` 不会重复执行 V1。refinery 会跳过已 applied 的版本。
+
+### 如果 migration 失败怎么办
+
+Refinery 默认在第一个失败的 migration 处中止，不会继续执行后续 migrations。修复后重新启动即可。
+
+---
+
 ## 核心规则
 
 ### 泛域名匹配（请求路由时，Devin 方案：单 map + key 变形）

@@ -27,8 +27,8 @@ fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
 
 fn make_test_app(dir: &tempfile::TempDir) -> Arc<App> {
     let db_path = dir.path().join("test.db");
-    let conn = Connection::open(&db_path).unwrap();
-    db::migrate(&conn).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
+    db::migrate(&mut conn).unwrap();
 
     let cert_dir = dir.path().join("certs");
     let cert_manager = make_cert_manager(&cert_dir);

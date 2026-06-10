@@ -1,4 +1,8 @@
-//! SQLite schema and load functions.
+//! SQLite schema and migration functions.
+//!
+//! Schema is managed by the `refinery` embedded migration system:
+//!   migrations/V{version}__{name}.sql  →  compiled and run at startup
+//!   schema_version table               →  tracks applied migrations
 //!
 //! Six tables, all with TEXT primary keys (natural keys, no surrogate ids):
 //!   sites         (name PK, backend, enabled, ...)
@@ -22,11 +26,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
+use crate::embedded_migrations::run_migrations;
 use crate::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
-
-/// All CREATE TABLE statements, idempotent.
-pub const SCHEMA_SQL: &str = include_str!("schema.sql");
-
 /// Open a connection with sensible defaults (WAL, foreign keys on).
 pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
@@ -39,9 +40,10 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Apply the schema. Safe to call on every startup.
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
+/// Run pending refinery migrations. Safe to call on every startup —
+/// already-applied migrations are skipped (tracked in schema_version table).
+pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
+    run_migrations(conn)
 }
 
 // ---- Site CRUD ----
@@ -479,9 +481,9 @@ mod tests {
     use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Token, Tun};
 
     fn make_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        migrate(&conn).unwrap();
+        migrate(&mut conn).unwrap();
         conn
     }
 
@@ -491,9 +493,66 @@ mod tests {
 
     #[test]
     fn schema_applies_idempotently() {
-        let conn = make_conn();
-        // Calling migrate again should be a no-op (CREATE IF NOT EXISTS).
-        migrate(&conn).unwrap();
+        let mut conn = make_conn();
+        // Calling migrate again should be a no-op (refinery skips applied migrations).
+        migrate(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn schema_version_table_tracks_applied_migrations() {
+        let mut conn = make_conn();
+        // refinery creates a `schema_version` table — verify it's there
+        // and lists V1 as applied.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
+                r.get(0)
+            })
+            .expect("refinery_schema_history must exist after migrate()");
+        assert_eq!(count, 1, "expected exactly 1 applied migration (V1)");
+
+        let version: i32 = conn
+            .query_row(
+                "SELECT version FROM refinery_schema_history LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version column present");
+        assert_eq!(version, 1, "applied migration must be V1");
+    }
+
+    #[test]
+    fn domains_v2_columns_exist_after_migrate() {
+        // Regression: V1 (post-merge) must include the v2 columns on
+        // `domains` (auto_issue, dns_provider) and the dns_providers
+        // table. If a future refactor accidentally drops them, this
+        // test catches it.
+        let mut conn = make_conn();
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(domains)")
+            .expect("PRAGMA domains");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            cols.contains(&"auto_issue".to_string()),
+            "domains.auto_issue missing: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"dns_provider".to_string()),
+            "domains.dns_provider missing: {cols:?}"
+        );
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dns_providers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "dns_providers table must exist post-migrate");
     }
 
     #[test]

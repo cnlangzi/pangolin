@@ -14,6 +14,9 @@ pub enum PangolinError {
     #[error("backend parse: {0}")]
     Parse(#[from] crate::parse::ParseError),
 
+    #[error("migration: {0}")]
+    Migration(#[from] refinery::Error),
+
     #[error("not found: {0}")]
     NotFound(String),
 

@@ -184,8 +184,8 @@ fn cert_settings_override_clear() {
 fn tun_online_offline_db() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("test.db");
-    let conn = Connection::open(&db_path).unwrap();
-    db::migrate(&conn).unwrap();
+    let mut conn = Connection::open(&db_path).unwrap();
+    db::migrate(&mut conn).unwrap();
 
     // Insert a tun
     let tun = Tun {

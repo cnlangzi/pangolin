@@ -191,8 +191,8 @@ impl App {
         config: Config,
         cert_manager: CertManager,
     ) -> crate::Result<Self> {
-        let conn = db::open(db_path.as_ref())?;
-        db::migrate(&conn)?;
+        let mut conn = db::open(db_path.as_ref())?;
+        db::migrate(&mut conn)?;
 
         let sites = db::list_sites(&conn)?;
         let domains = db::list_domains(&conn)?;
