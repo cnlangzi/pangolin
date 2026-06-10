@@ -133,8 +133,12 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, String)> {
     Ok((key_part, cert_part))
 }
 
-/// Build a `TlsSettings` configured with the SNI callback. Caller
-/// still needs to call `enable_h2()` if HTTP/2 is desired.
+/// Build a `TlsSettings` configured with the SNI callback.
+///
+/// HTTP/2 is enabled on the TLS listener so modern clients (browsers,
+/// curl) get multiplexing, header compression, and the rest of the
+/// H2 wins. The H1↔H2 conversion between client and backend happens
+/// inside pingora's `HttpProxy`.
 pub fn build_sni_settings(
     cert_dir: std::path::PathBuf,
 ) -> anyhow::Result<pingora::listeners::tls::TlsSettings> {

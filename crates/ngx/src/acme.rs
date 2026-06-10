@@ -651,27 +651,6 @@ impl AcmeClient {
 
         Ok(None)
     }
-
-    /// Start background renewal loop.
-    pub fn start_background_renewal(self: Arc<Self>, domains: Vec<String>) {
-        let client = self;
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(3600 * client.renew_check_interval_hours as u64);
-            loop {
-                log::info!("ACME renewal check for {:?}", domains);
-                match client.check_and_renew(&domains).await {
-                    Ok(Some(certs)) => {
-                        log::info!("ACME renewal succeeded for {:?}", domains);
-                        let _ = certs;
-                        // TODO: restart pangolin-ngx via systemctl to reload TLS
-                    }
-                    Ok(None) => log::info!("ACME cert still valid"),
-                    Err(e) => log::error!("ACME renewal failed: {}", e),
-                }
-                sleep(interval).await;
-            }
-        });
-    }
 }
 
 /// Parse certificate expiry from a blob (key_pem + cert chain).
@@ -943,52 +922,6 @@ impl AcmeState {
             domain: domain.domain.clone(),
         });
         Ok(())
-    }
-
-    /// Start the background renewal loop. Returns immediately; the loop
-    /// runs until the process exits.
-    ///
-    /// Before entering the loop, this does one initial reload (load DNS
-    /// providers from DB) and one startup cert scan so that any
-    /// previously-issued certs that are missing on disk get re-issued
-    /// without waiting for the first periodic tick.
-    ///
-    /// The steady-state loop ticks on two triggers:
-    ///   1. Periodic interval (`renew_check_interval_hours`).
-    ///   2. `app.dns_change_notify` — fired by `App::reload_indexes` when
-    ///      the admin writes a new DNS provider or updates a domain's
-    ///      auto_issue / dns_provider fields.
-    pub fn start_background_loop(self: Arc<Self>, app: Arc<App>) {
-        let interval_hours = app.config.acme.renew_check_interval_hours.max(1);
-        let state = self;
-        tokio::spawn(async move {
-            // Initial load + scan before entering the loop.
-            if let Err(e) = state.reload(&app).await {
-                log::error!("acme initial reload: {}", e);
-            }
-            state.ensure_certs(&app).await;
-
-            let interval = std::time::Duration::from_secs(interval_hours as u64 * 3600);
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick fires immediately; skip it to avoid running
-            // the scan twice at startup.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        log::info!("ACME: periodic renewal scan (interval={}h)", interval_hours);
-                    }
-                    _ = app.dns_change_notify.notified() => {
-                        log::info!("ACME: DNS config changed, reloading and re-scanning");
-                        if let Err(e) = state.reload(&app).await {
-                            log::error!("acme reload after notify: {}", e);
-                        }
-                    }
-                }
-                state.ensure_certs(&app).await;
-            }
-        });
     }
 }
 

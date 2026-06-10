@@ -168,7 +168,18 @@ fn main() -> anyhow::Result<()> {
 /// run it with a `TokenShutdownSignalWatch` so a single shared
 /// shutdown token drives the whole process.
 fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> anyhow::Result<()> {
-    let mut server = Server::new(None)?;
+    // pingora's default `grace_period_seconds` is 300s (5 minutes) —
+    // far too long for a Ctrl-C exit. We shorten it to 5s and also
+    // cap the per-runtime shutdown timeout to 5s. The services have
+    // already drained by the time we get here (host runtime sees
+    // shutdown.cancelled() and exits), so pingora only needs a
+    // moment to drop its runtimes.
+    let conf = pingora::server::configuration::ServerConf {
+        grace_period_seconds: Some(5),
+        graceful_shutdown_timeout_seconds: Some(5),
+        ..Default::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();
 
     let conf = server.configuration.clone();

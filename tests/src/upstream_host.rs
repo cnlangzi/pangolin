@@ -16,39 +16,12 @@ use tokio::sync::Mutex;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, Site};
 
-// Raw TCP HTTP request helper. reqwest 0.12+ ignores user-supplied
-// `Host` headers (it always sets `Host` from the URL authority), so we
-// open a TcpStream directly to control the header precisely.
-async fn send_raw_request(proxy_port: u16, host_header: &str, path: &str) -> (u16, Vec<u8>) {
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
-        .await
-        .expect("connect to proxy");
-
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n",
-        path = path,
-        host_header = host_header,
-    );
-    stream.write_all(req.as_bytes()).await.expect("write req");
-
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("read resp");
-
-    let status_line = String::from_utf8_lossy(&buf)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-
-    // The proxy returns the backend's response unchanged, including
-    // its headers. We return the entire raw response for the caller to
-    // parse so they can inspect headers / body as needed.
-    (code, buf)
+// Raw TCP HTTP request helper. Delegates to the shared
+// `harness::raw_request` so the connect/read timeouts and Host-header
+// handling live in one place.
+async fn send_raw_request(proxy_port: u16, host_header: &str, path: &str) -> (u16, String) {
+    let addr = format!("127.0.0.1:{proxy_port}");
+    crate::harness::raw_request(&addr, host_header, "GET", path, b"").await
 }
 
 // ---------------------------------------------------------------------------

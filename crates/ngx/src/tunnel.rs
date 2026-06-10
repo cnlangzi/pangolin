@@ -104,18 +104,15 @@ pub async fn start_tunnel_server(
             accept = listener.accept() => {
                 match accept {
                     Ok((tcp_stream, client_addr)) => {
+                        // Per-conn tasks are aborted wholesale on
+                        // runtime shutdown; dropping `tcp_stream`
+                        // closes the socket, so no per-conn shutdown
+                        // select is needed (and it would risk
+                        // cancelling `handle_client` mid-`app.db.lock().await`).
                         let app = app.clone();
-                        let stop = shutdown.clone();
                         tokio::spawn(async move {
-                            tokio::select! {
-                                r = handle_client(app, tcp_stream, client_addr) => {
-                                    if let Err(e) = r {
-                                        warn!("client {} error: {}", client_addr, e);
-                                    }
-                                }
-                                _ = stop.cancelled() => {
-                                    // Dropping the stream here closes the conn.
-                                }
+                            if let Err(e) = handle_client(app, tcp_stream, client_addr).await {
+                                warn!("client {} error: {}", client_addr, e);
                             }
                         });
                     }

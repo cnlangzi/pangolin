@@ -23,13 +23,11 @@ use tokio::sync::Mutex;
 use crate::harness::{init_pangolin_db, NgxProcess, TunProcess};
 
 /// Issue a raw HTTP/1.1 GET to `addr` with the given `Host` header,
-/// returning the response body. This bypasses reqwest entirely so
-/// we have full control over the `Host` header (reqwest 0.12 makes
-/// it nearly impossible to override the auto-derived Host value
-/// when the URL is a numeric IP — see reqwest#686). The proxy
-/// routes by Host, so getting this right is critical.
+/// returning the response body. Wrapper around the shared
+/// `harness::raw_request` — see that helper for why we bypass
+/// reqwest (it ignores user-supplied `Host` headers in 0.12+).
 async fn raw_get(addr: &str, host: &str, path: &str) -> (u16, String) {
-    raw_request(addr, host, "GET", path, &[]).await
+    crate::harness::raw_request(addr, host, "GET", path, &[]).await
 }
 
 /// Issue a raw HTTP/1.1 request with a caller-chosen method.
@@ -40,29 +38,7 @@ async fn raw_request(
     path: &str,
     body: &[u8],
 ) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to proxy");
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\nAccept: */*\r\nContent-Length: {len}\r\n\r\n",
-        len = body.len()
-    );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .expect("write request head");
-    if !body.is_empty() {
-        stream.write_all(body).await.expect("write body");
-    }
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await.expect("read response");
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    let status = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    (status, body)
+    crate::harness::raw_request(addr, host, method, path, body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,4 +1091,175 @@ async fn real_e2e_proxy_returns_502_when_backend_unreachable() {
         "expected 502 Bad Gateway when upstream is unreachable, got {status}. ngx log:\n{}",
         ngx.log_string()
     );
+}
+
+/// Regression test for the HTTP/2 host-lookup fix.
+///
+/// HTTP/2 clients don't send the `Host` header — the equivalent
+/// is the `:authority` pseudo-header, which the proxy must fall
+/// back to when looking up the site. Without that fallback the
+/// proxy returns 404 for every H2 request, even when the SNI and
+/// the backend route are otherwise correct.
+///
+/// Strategy:
+/// 1. Generate a fresh self-signed ECDSA cert (won't expire, no
+///    dependency on the workspace's `yaitoo.cn` Let's Encrypt
+///    cert which would expire and break this test later).
+/// 2. Seed a site mapping for the cert's CN and start the real
+///    `pangolin-ngx` binary with the cert blob in place.
+/// 3. `curl --http2 --http2-prior-knowledge` over TLS+SNI so the
+///    request goes out as native H2, exercising the
+///    `host_from_session` fallback path.
+/// 4. Assert the response status + body match what the backend
+///    returned, proving the proxy routed by `:authority`, not by
+///    an empty `Host`.
+#[tokio::test]
+async fn real_e2e_h2_authority_fallback() {
+    use std::process::Stdio;
+
+    // Backend that responds 200 OK with a known marker body.
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap().to_string();
+    let backend_handle = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if let Ok((mut stream, _)) = backend_listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = b"h2-authority-fallback";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "h2-site", &format!("http://{backend_addr}"));
+            // Domain matches the SNI we'll use in the curl request.
+            seed_domain(&conn, "h2test.local", "h2-site");
+        }
+    })
+    .await;
+
+    // Generate a fresh self-signed ECDSA cert for `h2test.local`.
+    // Using ECDSA (not the harness's RSA default) because some
+    // local LibreSSL/openssl builds reject the rcgen RSA cert
+    // (an unrelated toolchain quirk that we sidestep by using
+    // the same ECDSA algorithm path that the production cert
+    // pipeline uses). Generated fresh per run → never expires.
+    let cert_dir = ngx.cert_dir();
+    let cert_path = cert_dir.join("h2test.local");
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "/tmp/h2test.key",
+            "-out",
+            "/tmp/h2test.crt",
+            "-days",
+            "36500",
+            "-subj",
+            "/CN=h2test.local",
+        ])
+        .status()
+        .expect("spawn openssl to generate cert");
+    assert!(status.success(), "openssl cert generation failed");
+    // Convert to the autocert DirCache blob layout: key PEM
+    // first, then cert chain. The TLS callback's `split_blob`
+    // requires this order.
+    let key = std::fs::read_to_string("/tmp/h2test.key").expect("read key");
+    let crt = std::fs::read_to_string("/tmp/h2test.crt").expect("read crt");
+    std::fs::write(
+        &cert_path,
+        format!("{}\n{}", key.trim_end(), crt.trim_end()),
+    )
+    .expect("write cert blob");
+    eprintln!(
+        "h2 test setup: cert_path={} size={}",
+        cert_path.display(),
+        std::fs::metadata(&cert_path).map(|m| m.len()).unwrap_or(0)
+    );
+
+    // `curl --http2 --http2-prior-knowledge` to actually exercise
+    // the H2 client framing. `--resolve` overrides DNS so we
+    // don't write to /etc/hosts. `--insecure` skips cert
+    // verification (the cert is self-signed; the test is about
+    // routing, not TLS).
+    //
+    // `env_remove` strips HTTPS_PROXY/HTTP_PROXY so the user's
+    // outbound proxy env vars don't intercept the connection.
+    let url = format!("https://h2test.local:{}/path", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--http2")
+        .arg("--http2-prior-knowledge") // skip H1→H2 upgrade
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("--resolve")
+        .arg(format!("h2test.local:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn curl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // curl's `--write-out` line and the response body are both
+    // written to stdout, with no separator, so the combined
+    // string looks like `h2-authority-fallbackHTTP_CODE:200`.
+    // Split on the marker; everything before is the body,
+    // everything from the marker to the end is the curl metadata.
+    let (body, meta) = stdout
+        .split_once("HTTP_CODE:")
+        .unwrap_or_else(|| {
+            panic!(
+                "curl did not emit HTTP_CODE marker. exit={:?}\nstdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+                output.status,
+                ngx.log_string()
+            )
+        });
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    let body = body.to_string();
+    assert_eq!(
+        status, 200,
+        "expected 200 OK from backend via H2, got {status}.\nbody: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        stdout.contains("h2-authority-fallback"),
+        "expected backend marker body, got: {stdout}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    backend_handle.abort();
 }

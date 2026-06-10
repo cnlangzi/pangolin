@@ -4,11 +4,11 @@
 //! The gateway is composed of several long-running services that share
 //! an `Arc<App>`:
 //!
-//! * `AcmeService`     — periodic cert renewal + initial scan
-//! * `TunnelService`   — WebSocket listener for tun nodes
-//! * `PingoraService`  — HTTP proxy + admin API (runs on a dedicated
-//!   std::thread because pingora owns its own tokio runtime; we don't
-//!   try to integrate it with our host runtime)
+//! * `AcmeService`   — periodic cert renewal + initial scan
+//! * `TunnelService` — WebSocket listener for tun nodes
+//! * pingora (driven by `run_pingora` in `main.rs`) — HTTP proxy +
+//!   admin API. pingora owns its own tokio runtime, so it lives on
+//!   a dedicated `std::thread` rather than the host runtime.
 //!
 //! All non-pingora services run on a single host tokio runtime and
 //! observe a shared [`CancellationToken`] for coordinated shutdown.
@@ -51,12 +51,20 @@ pub trait Service: Send + Sync + 'static {
     async fn run(&self, ctx: ServiceContext) -> anyhow::Result<()>;
 }
 
-/// Build the multi-thread host runtime and run `f` to completion on it.
+/// Build the host runtime and run `f` to completion on it.
+///
+/// The host runtime drives only the long-lived non-pingora services
+/// (ACME renewal loop, tunnel accept loop) plus a couple of signal
+/// handler tasks. None of them are CPU-bound and the work is
+/// dominated by network I/O, so two worker threads is plenty —
+/// `num_cpus` (the `new_multi_thread` default) would just park a
+/// herd of idle OS threads.
 pub fn block_on_host<F>(f: F) -> F::Output
 where
     F: Future,
 {
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .thread_name("pangolin-host")
         .build()
@@ -125,15 +133,24 @@ impl ShutdownSignalWatch for TokenShutdownSignalWatch {
 /// Spawn `svc.run(ctx)` on the current (host) runtime and return the
 /// join handle. The service is consumed because the spawned task
 /// requires `'static`.
+///
+/// If the service returns `Err`, the shared shutdown token is
+/// cancelled so the failure cascades through the existing shutdown
+/// plumbing (host drain + pingora's `TokenShutdownSignalWatch`).
+/// The error is logged and the join handle resolves to `Ok(())` —
+/// the caller in `main` is expected to check that the process
+/// actually shut down cleanly (it will, because of the cascade).
 pub fn spawn_service(
     svc: Box<dyn Service>,
     ctx: ServiceContext,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let name = svc.name();
     info!("starting service: {name}");
+    let shutdown = ctx.shutdown.clone();
     tokio::spawn(async move {
         if let Err(e) = svc.run(ctx).await {
-            warn!("service {name} returned error: {e}");
+            warn!("service {name} returned error: {e}; cancelling shutdown");
+            shutdown.cancel();
         }
         Ok(())
     })
