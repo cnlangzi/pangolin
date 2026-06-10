@@ -692,15 +692,32 @@ impl ProxyHttp for AppProxy {
 
 /// Extract the host part from a backend URL (e.g. "http://1.2.3.4:80" -> "1.2.3.4").
 /// Handles the [tun_name:]url format by stripping the optional tun_name prefix.
+///
+/// Scheme detection: if "://" appears before the first ":", the text before "://"
+/// is the URL scheme (http/https), NOT a tun_name. Only when "://" is absent
+/// does the code check if the prefix looks like a tun_name.
 fn extract_host_from_backend(backend: &str) -> Option<String> {
-    let url = if let Some(pos) = backend.find(':') {
+    // Detect scheme vs tun_name: "://" means it's a URL scheme, not a tun_name prefix
+    let url = if let Some(scheme_pos) = backend.find("://") {
+        // "://" found — text before it is the scheme (http/https); strip scheme
+        let after_scheme = &backend[scheme_pos + 3..];
+        Some(after_scheme)
+    } else if let Some(pos) = backend.find(':') {
         let (prefix, rest) = backend.split_at(pos);
-        // If the part before ':' is all lowercase alphanumeric+hyphen/underscore, it's a tun_name
-        // Otherwise it's the scheme separator in the URL itself
+        // No "://" found — check if prefix looks like a tun_name (all lowercase alphanum)
         if prefix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
-            rest.strip_prefix(':').and_then(|u| u.strip_prefix("http://").or_else(|| u.strip_prefix("https://")))
+            // tun_name: strip "prefix:" then scheme
+            let after_tun = rest.strip_prefix(':')?;
+            if let Some(scheme_stripped) = after_tun.strip_prefix("http://") {
+                Some(scheme_stripped)
+            } else if let Some(scheme_stripped) = after_tun.strip_prefix("https://") {
+                Some(scheme_stripped)
+            } else {
+                None // no http/https scheme after tun_name
+            }
         } else {
-            backend.strip_prefix("http://").or_else(|| backend.strip_prefix("https://"))
+            // Not a tun_name pattern, and no "://" — can't extract host
+            None
         }
     } else {
         None

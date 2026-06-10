@@ -241,3 +241,105 @@ fn admin_reload_indexes() {
     assert!(result.is_some());
     assert_eq!(result.unwrap().name, "reload-test");
 }
+
+/// admin_site_host_mode_backend — host_mode=backend is stored and retrieved
+#[test]
+fn admin_site_host_mode_backend() {
+    let (_dir, conn) = temp_conn();
+
+    let site = Site {
+        name: "backend-site".into(),
+        backend: "http://192.168.1.100:8080".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        host_mode: HostMode::Backend,
+        host_custom: None,
+        domain_count: 0,
+    };
+    db::upsert_site(&conn, &site).unwrap();
+
+    let sites = db::list_sites(&conn).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].host_mode, HostMode::Backend);
+    assert!(sites[0].host_custom.is_none());
+}
+
+/// admin_site_host_mode_custom — host_mode=custom with host_custom value is stored
+#[test]
+fn admin_site_host_mode_custom() {
+    let (_dir, conn) = temp_conn();
+
+    let site = Site {
+        name: "custom-site".into(),
+        backend: "http://127.0.0.1:8080".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        host_mode: HostMode::Custom,
+        host_custom: Some("internal.example.com".into()),
+        domain_count: 0,
+    };
+    db::upsert_site(&conn, &site).unwrap();
+
+    let sites = db::list_sites(&conn).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].host_mode, HostMode::Custom);
+    assert_eq!(sites[0].host_custom.as_deref(), Some("internal.example.com"));
+}
+
+/// admin_site_host_mode_passthrough — passthrough (default) round-trips
+#[test]
+fn admin_site_host_mode_passthrough() {
+    let (_dir, conn) = temp_conn();
+
+    let site = Site {
+        name: "passthrough-site".into(),
+        backend: "http://127.0.0.1:8080".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
+        domain_count: 0,
+    };
+    db::upsert_site(&conn, &site).unwrap();
+
+    let sites = db::list_sites(&conn).unwrap();
+    assert_eq!(sites[0].host_mode, HostMode::Passthrough);
+}
+
+/// admin_site_host_mode_update — updating host_mode persists correctly
+#[test]
+fn admin_site_host_mode_update() {
+    let (_dir, conn) = temp_conn();
+
+    let initial = Site {
+        name: "update-site".into(),
+        backend: "http://127.0.0.1:8080".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
+        domain_count: 0,
+    };
+    db::upsert_site(&conn, &initial).unwrap();
+
+    let updated = Site {
+        name: "update-site".into(),
+        backend: "http://127.0.0.1:8080".into(),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        host_mode: HostMode::Custom,
+        host_custom: Some("updated.example.com".into()),
+        domain_count: 0,
+    };
+    db::upsert_site(&conn, &updated).unwrap();
+
+    let sites = db::list_sites(&conn).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].host_mode, HostMode::Custom);
+    assert_eq!(sites[0].host_custom.as_deref(), Some("updated.example.com"));
+}

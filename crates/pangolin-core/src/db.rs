@@ -252,15 +252,18 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
     let name: String = row.get(0)?;
     let backend: String = row.get(1)?;
     let enabled: i32 = row.get(2)?;
-    let host_mode: String = row.get(3)?;
+    let host_mode_raw: String = row.get(3)?;
     let host_custom: Option<String> = row.get(4)?;
     let created_at: String = row.get(5)?;
     let updated_at: String = row.get(6)?;
+    let host_mode: crate::types::HostMode = host_mode_raw
+        .parse()
+        .map_err(|_| rusqlite::Error::InvalidParameterName(format!("invalid host_mode: {}", host_mode_raw)))?;
     Ok(Site {
         name,
         backend,
         enabled: enabled != 0,
-        host_mode: host_mode.parse().unwrap_or_default(),
+        host_mode,
         host_custom,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
@@ -272,16 +275,19 @@ fn row_to_site_with_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
     let name: String = row.get(0)?;
     let backend: String = row.get(1)?;
     let enabled: i32 = row.get(2)?;
-    let host_mode: String = row.get(3)?;
+    let host_mode_raw: String = row.get(3)?;
     let host_custom: Option<String> = row.get(4)?;
     let created_at: String = row.get(5)?;
     let updated_at: String = row.get(6)?;
     let domain_count: i32 = row.get(7)?;
+    let host_mode: crate::types::HostMode = host_mode_raw
+        .parse()
+        .map_err(|_| rusqlite::Error::InvalidParameterName(format!("invalid host_mode: {}", host_mode_raw)))?;
     Ok(Site {
         name,
         backend,
         enabled: enabled != 0,
-        host_mode: host_mode.parse().unwrap_or_default(),
+        host_mode,
         host_custom,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,

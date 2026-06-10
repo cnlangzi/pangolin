@@ -94,12 +94,17 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 
     let now = Utc::now();
-    let host_mode = req
+    let host_mode = match req
         .host_mode
         .as_deref()
         .unwrap_or("passthrough")
         .parse()
-        .unwrap_or(HostMode::Passthrough);
+    {
+        Ok(mode) => mode,
+        Err(_) => {
+            return json_error(400, "invalid value for `host_mode` (expected: backend, passthrough, custom)");
+        }
+    };
     let site = Site {
         name: name.to_string(),
         backend: req.backend,
