@@ -420,15 +420,16 @@ domains:
 - 单域名 `app.example.com` → 申请 `app.example.com`
 - 用 `instant-acme` 客户端走 ACME 协议
 
-**续期规则**（受 `cert.autorenew` 控制，详见「全局配置」一节）：
+**续期规则**（v2 ACME，PR #23 取消全局 `cert.autorenew` 开关）：
 
-- `autorenew = true`（默认）：启动时扫 `certs` 表，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
-- `autorenew = false`：完全跳过 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
+- **per-domain `auto_issue`**：是否为某个域名走 ACME 自动申请 + 续期，存于 `domains` 表的 `auto_issue` 列，admin UI 可改
+- **`auto_issue = true`（针对某个域名）**：启动时扫该域名对应的 cert，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
+- **`auto_issue = false`（默认）**：完全跳过该域名的 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
 
 **适用场景**：
 
-- `autorenew = true`：公网部署，Let's Encrypt 可访问
-- `autorenew = false`：ngx 部署在内网无法被 Let's Encrypt 访问，需要 admin 手动管 cert；或企业用自有 CA 签发 cert
+- 某个域 `auto_issue = true`：公网域名，Let's Encrypt 可访问
+- 某个域 `auto_issue = false`：内网域名，ngx 无法被 Let's Encrypt 访问，需 admin 手动管 cert；或企业用自有 CA 签发 cert
 
 
 ---
@@ -691,14 +692,17 @@ cache:
   enabled: true
   dir: ./cache
 
-cert:
+# v2 (PR #23): 全局 `cert.autorenew` 取消。
+# 是否走 ACME 由 `domains.auto_issue` (DB) 逐域名控制。
+# [acme] 段只放运行期调参。
+acme:
   email: "admin@yourdomain.com"   # ACME 注册邮箱
-  cert_dir: "./certs"             # 证书落盘目录
-  autorenew: true                 # 是否自动续期(+ 首次申请),默认 true
+  cert_dir: "./certs"             # cert blob 落盘目录(autocert native 布局)
   acme_directory: "https://acme-v02.api.letsencrypt.org/directory"
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3
+  key_type: "ecdsa"               # ecdsa | rsa
 
 log:
   level: "info"          # trace | debug | info | warn | error
@@ -723,12 +727,14 @@ log:
 
 ### 关键配置项说明
 
-- `ngx.yml: cert.autorenew`:**总开关**,决定是否走 ACME 流程
-  - `true`(默认,公网部署):启动时申请缺失 cert + 定期续期
-  - `false`(内网部署,ngx 无法被 Let's Encrypt 访问):完全跳过 ACME,admin 通过 `POST /api/certs` 手动上传 cert
-- `ngx.yml: cert.acme_directory`:可指向 staging 测玴
+- `domains.auto_issue` (DB,per-domain):**单域名 ACME 开关**。v2 不再有全局 `cert.autorenew`。
+  - `true`:该域名启动时申请 cert(如缺失)+ 定期续期
+  - `false`(默认,新行):完全跳过该域名的 ACME,admin 通过 `POST /api/certs` 手动上传 cert
+- `domains.dns_provider` (DB,per-domain):指向 `dns_providers` 表中某行,设置后该域名走 DNS-01 挑战(**`*.example.com` 通配必须**)。空字符串走 HTTP-01。
+- `ngx.yml: acme.acme_directory`:可指向 LE staging 测试
 - `ngx.yml: workers`:pingora 推荐设为 CPU 核数
 - `tun.yml: name` 约束与 ngx 端 `tun.name` 主键一致,过不了校验则启动 fail
+- 详细字段表、dev / production / multi-tun 实战示例、gotchas:见 `docs/configuration.md`
 
 **后续**:未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
 
