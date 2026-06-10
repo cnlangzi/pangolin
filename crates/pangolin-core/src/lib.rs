@@ -20,7 +20,7 @@ pub mod app;
 pub mod compress;
 pub mod config;
 pub mod db;
-pub mod embedded_migrations;
+pub(crate) mod embedded_migrations;
 pub mod error;
 pub mod events;
 pub mod index;
