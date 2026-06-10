@@ -81,37 +81,64 @@ default.
 | `enabled`  | `bool`    | `false`    | no       | Master switch for `pingora` response cache. |
 | `dir`      | `string`  | `./cache`  | no       | On-disk cache directory. Absolute path recommended in production. |
 
-### `[cert]` — ACME certificates
+### `[acme]` — ACME operational config (v2)
 
-The gateway can run in two certificate modes:
+> **v2 (PR #23) removed the global `cert.autorenew` toggle.** Whether
+> a given domain gets ACME auto-issuance is now controlled by
+> `domains.auto_issue` in the `domains` table, and the DNS provider
+> used for DNS-01 challenges is set per-domain via
+> `domains.dns_provider` (referencing a row in the `dns_providers`
+> table, managed in the admin UI under **DNS Providers**). The
+> `[acme]` section here only holds operational tuning for the
+> issuance + renew pipeline.
 
-- **ACME mode** (`autorenew: true`, the default): first-time issue +
-  automatic renew via Let's Encrypt.
-- **Manual mode** (`autorenew: false`): skip ACME entirely. Operators
-  upload cert + key via `POST /api/certs`.
+Two certificate modes coexist at runtime:
 
-| Field                          | Type     | Default                                              | Required | Notes |
-| ------------------------------ | -------- | ---------------------------------------------------- | -------- | ----- |
-| `email`                        | `string` | `""`                                                 | yes if `autorenew=true` | ACME registration contact. |
-| `cert_dir`                     | `string` | `./certs`                                            | no       | Where `CertManager` reads `{fullchain,privkey}.pem` from. |
-| `autorenew`                    | `bool`   | `true`                                               | no       | Master toggle. **Set `false` for intranet / dev deployments** that have no public DNS or port 80. |
-| `acme_directory`               | `string` | `https://acme-v02.api.letsencrypt.org/directory`    | no       | Point to LE staging for testing. |
-| `renew_threshold_days`         | `u32`    | `30`                                                 | no       | Renew when remaining validity ≤ this. |
-| `renew_check_interval_hours`   | `u32`    | `6`                                                  | no       | Background renew check cadence. |
-| `renew_max_retries`            | `u32`    | `3`                                                  | no       | Per-renewal retry budget before giving up until next check. |
-| `key_type`                     | `string` | `ecdsa`                                              | no       | `ecdsa` (P-256) or `rsa`. ECDSA is faster and smaller; choose `rsa` only for legacy clients. |
-| `dns.provider`                 | `string` | `""`                                                 | no       | `cloudflare` / `aliyun` / `tencent`. Set to enable **DNS-01** challenge (required for wildcards). |
-| `dns.cloudflare.api_token`     | `string` | `""`                                                 | required when `dns.provider=cloudflare` | Cloudflare API token with `Zone:DNS:Edit`. |
-| `dns.aliyun.access_key_id`     | `string` | `""`                                                 | required when `dns.provider=aliyun` | Aliyun RAM access key id. |
-| `dns.aliyun.access_key_secret` | `string` | `""`                                                 | required when `dns.provider=aliyun` | Aliyun RAM access key secret. |
-| `dns.aliyun.region`            | `string` | `""`                                                 | no       | Optional; default `cn-hangzhou`. |
-| `dns.tencent.secret_id`        | `string` | `""`                                                 | required when `dns.provider=tencent` | Tencent Cloud secret id. |
-| `dns.tencent.secret_key`       | `string` | `""`                                                 | required when `dns.provider=tencent` | Tencent Cloud secret key. |
+- **ACME mode** (per-domain `auto_issue = true`): first-time issue +
+  automatic renew via Let's Encrypt. The `[acme]` settings below
+  apply to all such domains.
+- **Manual mode** (per-domain `auto_issue = false`, the default for
+  new rows): skip ACME entirely. Operators upload cert + key via
+  `POST /api/certs`.
 
-> **HTTP-01 vs DNS-01**: leave `dns.provider` empty to use HTTP-01
-> (simple, requires port 80 reachable from Let's Encrypt). Set it to
-> use DNS-01 (required for `*.example.com` wildcards, and works
-> without port 80).
+| Field                        | Type     | Default                                              | Required | Notes |
+| ---------------------------- | -------- | ---------------------------------------------------- | -------- | ----- |
+| `email`                      | `string` | `""`                                                 | yes if any domain has `auto_issue = true` | ACME registration contact. |
+| `cert_dir`                   | `string` | `./certs`                                            | no       | Where `CertManager` reads autocert DirCache blobs from: `{host}` (ECDSA) or `{host}+rsa` (RSA). **No `default` blob fallback in v2** — each host you serve TLS for needs its own blob. |
+| `acme_directory`             | `string` | `https://acme-v02.api.letsencrypt.org/directory`    | no       | Point to LE staging for testing. |
+| `renew_threshold_days`       | `u32`    | `30`                                                 | no       | Renew when remaining validity ≤ this. |
+| `renew_check_interval_hours` | `u32`    | `6`                                                  | no       | Background renew check cadence. |
+| `renew_max_retries`          | `u32`    | `3`                                                  | no       | Per-renewal retry budget before giving up until next check. |
+| `key_type`                   | `string` | `ecdsa`                                              | no       | `ecdsa` (P-256) or `rsa`. ECDSA is faster and smaller; choose `rsa` only for legacy clients. |
+
+> **HTTP-01 vs DNS-01** is **per-domain** in v2: each domain's
+> `dns_provider` column decides which challenge type to use (empty →
+> HTTP-01, set → DNS-01 with that provider's credentials). The
+> DNS provider credentials themselves are stored in the
+> `dns_providers` table — they are **not** in `ngx.yml`.
+
+### `domains` table (DB) — per-domain auto-issuance
+
+These columns control per-domain cert behaviour and live in SQLite,
+not `ngx.yml`. They are managed via the admin UI or the
+`/api/domains` endpoints.
+
+| Column         | Type      | Default  | Notes |
+| -------------- | --------- | -------- | ----- |
+| `auto_issue`   | `bool`    | `false`  | When `true`, the gateway issues + renews a cert for this domain via ACME. When `false`, the cert is expected to be present on disk in `cert_dir` (manual upload) and the gateway will not contact the CA. |
+| `dns_provider` | `string`  | `""`     | Optional FK to a row in `dns_providers`. If set, DNS-01 challenge is used with that provider's credentials (required for `*.example.com` wildcards). If empty, HTTP-01 is used. |
+
+### `dns_providers` table (DB) — DNS provider credentials
+
+DNS provider credentials are **not** in `ngx.yml` in v2. They are
+managed in the admin UI under **DNS Providers** and stored in the
+`dns_providers` table:
+
+| Column         | Type     | Notes |
+| -------------- | -------- | ----- |
+| `name`         | `string` | Display name. |
+| `kind`         | `string` | `cloudflare` / `aliyun` / `tencent`. |
+| `api_token` / `access_key_id`+`access_key_secret` / `secret_id`+`secret_key` | `string` | Provider-specific credential fields. Stored in plaintext in SQLite; restrict DB file permissions and disk access. |
 
 ### `[log]`
 
@@ -164,8 +191,11 @@ admin:
 cache:
   enabled: false
 
-cert:
-  autorenew: false      # ⚠ MUST be false for dev — no public IP / DNS
+# v2: no `autorenew` field here. Per-domain `auto_issue` is in the DB;
+# leave every row's auto_issue=false for local dev so we never hit
+# Let's Encrypt on every restart. The `[acme]` section only holds
+# operational tuning.
+acme:
   email: ""
   cert_dir: ./certs
 
@@ -213,15 +243,17 @@ cache:
   enabled: true
   dir: /var/cache/pangolin
 
-cert:
+acme:
   email: "ops@example.com"
   cert_dir: /etc/pangolin/certs
-  autorenew: true                     # first-time issue + renew
   acme_directory: https://acme-v02.api.letsencrypt.org/directory
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3
   key_type: ecdsa
+  # v2: per-domain `auto_issue` is set in the DB for each domain this
+  # gateway serves. In production, enable auto_issue for the public
+  # domain(s) and leave it off for internal-only ones.
 
 log:
   level: info
@@ -294,12 +326,14 @@ in a site then routes traffic through the `home` tun.
 - **Port 80/443 require root or `CAP_NET_BIND_SERVICE`.** Dev ports
   (`9080`/`9443`) sidestep this. The shipped `ngx.yml` uses dev ports
   for that reason — change to `80`/`443` in production.
-- **`autorenew: true` in dev** will spam Let's Encrypt on every
-  restart (clock skew, no public IP, no DNS, etc.). Always `false` on
-  a laptop, always `true` in production with a real domain.
-- **Empty `dns.provider`** keeps HTTP-01. To issue a wildcard
-  (`*.example.com`) you **must** set `dns.provider` — HTTP-01 cannot
-  validate wildcards.
+- **`auto_issue = true` in dev** will spam Let's Encrypt on every
+  restart (clock skew, no public IP, no DNS, etc.). Always leave the
+  per-domain `auto_issue` flag `false` on a laptop. In production
+  flip it to `true` for the public-facing domains only.
+- **Wildcards require DNS-01.** HTTP-01 cannot validate
+  `*.example.com` — set the domain's `dns_provider` in the DB to
+  point at a `dns_providers` row whose credentials can add the
+  `_acme-challenge` TXT record for the zone.
 - **`name` validation runs at load time.** A typo (`Office` with
   uppercase, `12345` all-digit) refuses to start with a clear error
   message — no silent fallback to an empty name.
