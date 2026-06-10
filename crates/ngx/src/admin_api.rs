@@ -335,7 +335,7 @@ async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> 
 
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
-    http_session: &mut ServerSession,
+    _http_session: &mut ServerSession,
     app: &App,
     path: &str,
     method: &str,

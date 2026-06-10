@@ -155,7 +155,7 @@ pub async fn handle_update(
     app: &Arc<App>,
     name: Option<String>,
     body: &[u8],
-    csrf: &str,
+    _csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
     let Some(name) = name else {
         return Ok(crate::not_found());
@@ -280,7 +280,7 @@ fn error_response(msg: &str) -> Response<Full<Bytes>> {
         .expect("400 response builder is infallible")
 }
 
-fn http_error_response_unused() {}
+fn _http_error_response_unused_marker() {}
 
 fn is_valid_dns_name(s: &str) -> bool {
     !s.is_empty()

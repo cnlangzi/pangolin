@@ -481,8 +481,11 @@ mod tests {
     use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Token, Tun};
 
     fn make_conn() -> Connection {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // migrate() takes &mut, so we need a mutable binding here even
+        // though we never mutate the binding itself after.
+        let mut conn = conn;
         migrate(&mut conn).unwrap();
         conn
     }
@@ -500,6 +503,7 @@ mod tests {
 
     #[test]
     fn schema_version_table_tracks_applied_migrations() {
+        #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `schema_version` table — verify it's there
         // and lists V1 as applied.
@@ -526,6 +530,7 @@ mod tests {
         // `domains` (auto_issue, dns_provider) and the dns_providers
         // table. If a future refactor accidentally drops them, this
         // test catches it.
+        #[allow(unused_mut)]
         let mut conn = make_conn();
 
         let mut stmt = conn

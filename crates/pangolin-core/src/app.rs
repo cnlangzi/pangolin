@@ -315,12 +315,14 @@ impl CertManager {
     }
 
     /// Resolve cert and key file paths for the given host.
+    ///
     /// Search order for autocert blob layout:
-    ///   1. cert_dir/{host}          (ECDSA blob)
-    ///   2. cert_dir/{host}+rsa      (RSA blob)
+    ///   1. `cert_dir/{host}` (ECDSA blob)
+    ///   2. `cert_dir/{host}+rsa` (RSA blob)
+    ///
     /// There is no `cert_dir/default` fallback — each host must have its own
     /// blob on disk; otherwise the SNI handshake for that host fails.
-    /// Returns (blob_path, blob_path) — blob is a combined key+cert file.
+    /// Returns `(blob_path, blob_path)` — the blob is a combined key+cert file.
     pub fn resolve_cert(&self, host: &str) -> crate::Result<(String, String)> {
         // Try ECDSA blob first
         let ecdsa_blob = self.cert_dir.join(host);

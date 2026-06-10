@@ -695,6 +695,10 @@ fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
 }
 
+// The `mod tests` block below sits before some non-test items (the
+// `AcmeState` impl was added in PR-2 after the tests block originally
+// appeared). Rather than reshuffle the file, suppress the lint.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
