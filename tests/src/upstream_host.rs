@@ -16,6 +16,14 @@ use tokio::sync::Mutex;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, Site};
 
+// Raw TCP HTTP request helper. Delegates to the shared
+// `harness::raw_request` so the connect/read timeouts and Host-header
+// handling live in one place.
+async fn send_raw_request(proxy_port: u16, host_header: &str, path: &str) -> (u16, String) {
+    let addr = format!("127.0.0.1:{proxy_port}");
+    crate::harness::raw_request(&addr, host_header, "GET", path, b"").await
+}
+
 // ---------------------------------------------------------------------------
 // Mock HTTP backend that records received Host headers
 // ---------------------------------------------------------------------------
@@ -231,6 +239,8 @@ async fn upstream_host_header() {
         domain: "api.example.com".into(),
         site_name: "host-test-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -255,15 +265,8 @@ async fn upstream_host_header() {
         .build()
         .unwrap();
 
-    let url = format!("http://127.0.0.1:{}/test", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "api.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
+    let (status, _resp_bytes) = send_raw_request(proxy_port, "api.example.com", "/test").await;
+    assert_eq!(status, 200);
 
     // Check what headers the backend received
     let headers = backend.get_headers().await;
@@ -307,6 +310,8 @@ async fn upstream_host_header_with_port() {
         domain: "port.example.com".into(),
         site_name: "port-test-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -332,15 +337,9 @@ async fn upstream_host_header_with_port() {
         .unwrap();
 
     // Request with port in Host header
-    let url = format!("http://127.0.0.1:{}/test", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "port.example.com:8080")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
+    let (status, _resp_bytes) =
+        send_raw_request(proxy_port, "port.example.com:8080", "/test").await;
+    assert_eq!(status, 200);
 
     let headers = backend.get_headers().await;
     let host_header = headers.iter().find(|(n, _)| n.to_lowercase() == "host");

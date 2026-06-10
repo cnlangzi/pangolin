@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
@@ -81,6 +81,58 @@ pub fn free_port() -> u16 {
     let port = listener.local_addr().expect("local_addr").port();
     drop(listener);
     port
+}
+
+/// Issue a raw HTTP/1.1 request to `addr` with a caller-chosen
+/// `Host` header, returning `(status, body)`. Bypasses reqwest
+/// entirely — reqwest 0.12+ ignores user-supplied `Host` headers
+/// (it always sets `Host` from the URL authority), which makes it
+/// useless for testing virtual-host routing.
+///
+/// Both the connect and the read are guarded by a 5 s timeout so a
+/// hung proxy (panic, deadlock, unreachable upstream) fails the
+/// test instead of blocking the whole suite.
+pub async fn raw_request(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
+    let timeout = Duration::from_secs(5);
+
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .expect("connect to addr (5s timeout)")
+        .expect("connect to addr");
+
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\nAccept: */*\r\nContent-Length: {len}\r\n\r\n",
+        len = body.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request head");
+    if !body.is_empty() {
+        stream.write_all(body).await.expect("write body");
+    }
+
+    let mut buf = Vec::new();
+    tokio::time::timeout(timeout, stream.read_to_end(&mut buf))
+        .await
+        .expect("read response (5s timeout)")
+        .expect("read response");
+
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
 }
 
 /// Async readiness check — keep trying `TcpStream::connect` until
@@ -233,10 +285,10 @@ log:
 admin:
   addr: 127.0.0.1:{admin}
 
-cert:
+acme:
   cert_dir: "{cert_dir}"
   email: ""
-  autorenew: false
+  # v2: no global autorenew — per-domain auto_issue lives in the DB
 "#,
             http = http_port,
             tls = tls_port,
@@ -314,6 +366,26 @@ cert:
     /// `Host` header).
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.admin_port, path)
+    }
+
+    /// Cert directory used by the running `pangolin-ngx`. SNI
+    /// callback loads blobs from here. Use [`gen_self_signed`] to
+    /// install a per-host cert before connecting with TLS+SNI.
+    pub fn cert_dir(&self) -> PathBuf {
+        // The cert dir lives in the tempdir next to ngx.yml.
+        // We can't plumb a typed field through `start` without
+        // breaking every test, so derive it from the config we
+        // wrote. Cheap and unambiguous.
+        let cfg = std::fs::read_to_string(&self.config_path).expect("read ngx.yml");
+        for line in cfg.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("cert_dir:") {
+                let p = rest.trim().trim_matches('"').trim_matches('\'');
+                if !p.is_empty() {
+                    return PathBuf::from(p);
+                }
+            }
+        }
+        panic!("cert_dir not found in ngx.yml")
     }
 
     /// Drain the captured log into a String for diagnostic asserts.

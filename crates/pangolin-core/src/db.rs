@@ -4,15 +4,21 @@
 //!   migrations/V{version}__{name}.sql  →  compiled and run at startup
 //!   schema_version table               →  tracks applied migrations
 //!
-//! Five tables, all with TEXT primary keys (natural keys, no surrogate ids):
-//!   sites     (name PK, backend, enabled, created_at, updated_at)
-//!   domains   (domain PK, site_name, enabled, created_at) FK→sites.name
-//!   tun       (name PK, enabled, online, registered_at, last_seen_at)
-//!   tokens    (token PK, enabled, created_at, expires_at)
-//!   certs     (domain PK, cert_file, key_file, expires_at, created_at)
+//! Six tables, all with TEXT primary keys (natural keys, no surrogate ids):
+//!   sites         (name PK, backend, enabled, ...)
+//!   domains       (domain PK, site_name, enabled, auto_issue, dns_provider, created_at) FK→sites.name
+//!   tun           (name PK, enabled, online, registered_at, last_seen_at)
+//!   tokens        (token PK, enabled, created_at, expires_at)
+//!   certs         (domain PK, cert_file, key_file, expires_at, created_at, sans, source, ...)
+//!   dns_providers (name PK, kind, enabled, config, created_at, updated_at)
 //!
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
+//!
+//! `domains.dns_provider` is a logical FK to `dns_providers.name`, not enforced
+//! at SQL level (no `REFERENCES`). The application code is responsible for
+//! keeping the link consistent — in particular, deleting a provider is done
+//! transactionally with a `SET NULL` on the referencing domains.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -21,8 +27,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::embedded_migrations::run_migrations;
-use crate::types::{Cert, Domain, Site, Token, Tun};
-
+use crate::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
 /// Open a connection with sensible defaults (WAL, foreign keys on).
 pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
@@ -94,15 +99,17 @@ pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 // ---- Domain CRUD ----
 
 pub fn list_domains(conn: &Connection) -> rusqlite::Result<Vec<Domain>> {
-    let mut stmt =
-        conn.prepare("SELECT domain, site_name, enabled, created_at FROM domains ORDER BY domain")?;
+    let mut stmt = conn.prepare(
+        "SELECT domain, site_name, enabled, auto_issue, dns_provider, created_at
+         FROM domains ORDER BY domain",
+    )?;
     let rows = stmt.query_map([], row_to_domain)?;
     rows.collect()
 }
 
 pub fn list_domains_for_site(conn: &Connection, site_name: &str) -> rusqlite::Result<Vec<Domain>> {
     let mut stmt = conn.prepare(
-        "SELECT domain, site_name, enabled, created_at
+        "SELECT domain, site_name, enabled, auto_issue, dns_provider, created_at
          FROM domains WHERE site_name = ?1 ORDER BY domain",
     )?;
     let rows = stmt.query_map(params![site_name], row_to_domain)?;
@@ -111,15 +118,19 @@ pub fn list_domains_for_site(conn: &Connection, site_name: &str) -> rusqlite::Re
 
 pub fn upsert_domain(conn: &Connection, domain: &Domain) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO domains (domain, site_name, enabled, created_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO domains (domain, site_name, enabled, auto_issue, dns_provider, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(domain) DO UPDATE SET
             site_name = excluded.site_name,
-            enabled = excluded.enabled",
+            enabled = excluded.enabled,
+            auto_issue = excluded.auto_issue,
+            dns_provider = excluded.dns_provider",
         params![
             domain.domain,
             domain.site_name,
             domain.enabled as i32,
+            domain.auto_issue as i32,
+            domain.dns_provider,
             domain.created_at.to_rfc3339(),
         ],
     )?;
@@ -262,6 +273,58 @@ pub fn delete_cert(conn: &Connection, domain: &str) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+// ---- DNS provider CRUD ----
+
+pub fn list_dns_providers(conn: &Connection) -> rusqlite::Result<Vec<DnsProvider>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, kind, enabled, config, created_at, updated_at
+         FROM dns_providers ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], row_to_dns_provider)?;
+    rows.collect()
+}
+
+pub fn get_dns_provider(conn: &Connection, name: &str) -> rusqlite::Result<Option<DnsProvider>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, kind, enabled, config, created_at, updated_at
+         FROM dns_providers WHERE name = ?1",
+    )?;
+    stmt.query_row(params![name], row_to_dns_provider)
+        .optional()
+}
+
+pub fn upsert_dns_provider(conn: &Connection, p: &DnsProvider) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO dns_providers (name, kind, enabled, config, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(name) DO UPDATE SET
+            kind = excluded.kind,
+            enabled = excluded.enabled,
+            config = excluded.config,
+            updated_at = excluded.updated_at",
+        params![
+            p.name,
+            p.kind.to_string(),
+            p.enabled as i32,
+            p.config,
+            p.created_at.to_rfc3339(),
+            p.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a DNS provider. Returns the number of rows affected (always 0 or 1).
+///
+/// Callers are responsible for transactionally clearing `domains.dns_provider`
+/// references *before* this is called — we do not use SQL-level ON DELETE
+/// SET NULL (the schema has no SQL FK on purpose). The admin route handler
+/// does this in a transaction.
+pub fn delete_dns_provider(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute("DELETE FROM dns_providers WHERE name = ?1", params![name])?;
+    Ok(n > 0)
+}
+
 // ---- Row mappers ----
 
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
@@ -315,12 +378,36 @@ fn row_to_domain(row: &rusqlite::Row<'_>) -> rusqlite::Result<Domain> {
     let domain: String = row.get(0)?;
     let site_name: String = row.get(1)?;
     let enabled: i32 = row.get(2)?;
-    let created_at: String = row.get(3)?;
+    let auto_issue: i32 = row.get(3)?;
+    let dns_provider: Option<String> = row.get(4)?;
+    let created_at: String = row.get(5)?;
     Ok(Domain {
         domain,
         site_name,
         enabled: enabled != 0,
+        auto_issue: auto_issue != 0,
+        dns_provider,
         created_at: parse_dt(&created_at)?,
+    })
+}
+
+fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider> {
+    let name: String = row.get(0)?;
+    let kind_raw: String = row.get(1)?;
+    let enabled: i32 = row.get(2)?;
+    let config: String = row.get(3)?;
+    let created_at: String = row.get(4)?;
+    let updated_at: String = row.get(5)?;
+    let kind: crate::types::DnsProviderKind = kind_raw.parse().map_err(|_| {
+        rusqlite::Error::InvalidParameterName(format!("invalid dns provider kind: {}", kind_raw))
+    })?;
+    Ok(DnsProvider {
+        name,
+        kind,
+        enabled: enabled != 0,
+        config,
+        created_at: parse_dt(&created_at)?,
+        updated_at: parse_dt(&updated_at)?,
     })
 }
 
@@ -391,11 +478,14 @@ fn parse_dt_opt(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Domain, HostMode, Site, Token, Tun};
+    use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Token, Tun};
 
     fn make_conn() -> Connection {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // migrate() takes &mut, so we need a mutable binding here even
+        // though we never mutate the binding itself after.
+        let mut conn = conn;
         migrate(&mut conn).unwrap();
         conn
     }
@@ -409,6 +499,65 @@ mod tests {
         let mut conn = make_conn();
         // Calling migrate again should be a no-op (refinery skips applied migrations).
         migrate(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn schema_version_table_tracks_applied_migrations() {
+        #[allow(unused_mut)]
+        let mut conn = make_conn();
+        // refinery creates a `schema_version` table — verify it's there
+        // and lists V1 as applied.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
+                r.get(0)
+            })
+            .expect("refinery_schema_history must exist after migrate()");
+        assert_eq!(count, 1, "expected exactly 1 applied migration (V1)");
+
+        let version: i32 = conn
+            .query_row(
+                "SELECT version FROM refinery_schema_history LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version column present");
+        assert_eq!(version, 1, "applied migration must be V1");
+    }
+
+    #[test]
+    fn domains_v2_columns_exist_after_migrate() {
+        // Regression: V1 (post-merge) must include the v2 columns on
+        // `domains` (auto_issue, dns_provider) and the dns_providers
+        // table. If a future refactor accidentally drops them, this
+        // test catches it.
+        #[allow(unused_mut)]
+        let mut conn = make_conn();
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(domains)")
+            .expect("PRAGMA domains");
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            cols.contains(&"auto_issue".to_string()),
+            "domains.auto_issue missing: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"dns_provider".to_string()),
+            "domains.dns_provider missing: {cols:?}"
+        );
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='dns_providers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "dns_providers table must exist post-migrate");
     }
 
     #[test]
@@ -493,6 +642,8 @@ mod tests {
             domain: "app.example.com".into(),
             site_name: "app".into(),
             enabled: true,
+            auto_issue: false,
+            dns_provider: None,
             created_at: dt("2026-01-01T00:00:00+00:00"),
         };
         upsert_domain(&conn, &d).unwrap();
@@ -519,6 +670,8 @@ mod tests {
             domain: "app.example.com".into(),
             site_name: "app".into(),
             enabled: true,
+            auto_issue: false,
+            dns_provider: None,
             created_at: dt("2026-01-01T00:00:00+00:00"),
         };
         upsert_domain(&conn, &d).unwrap();
@@ -579,5 +732,122 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].sans, vec!["example.com", "www.example.com"]);
         assert!(delete_cert(&conn, "example.com").unwrap());
+    }
+
+    #[test]
+    fn domain_with_auto_issue_and_dns_provider() {
+        let conn = make_conn();
+        upsert_site(
+            &conn,
+            &Site {
+                name: "app".into(),
+                backend: "http://x:80".into(),
+                enabled: true,
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+                updated_at: dt("2026-01-01T00:00:00+00:00"),
+                host_mode: HostMode::Passthrough,
+                host_custom: None,
+                domain_count: 0,
+            },
+        )
+        .unwrap();
+        upsert_domain(
+            &conn,
+            &Domain {
+                domain: "*.example.com".into(),
+                site_name: "app".into(),
+                enabled: true,
+                auto_issue: true,
+                dns_provider: Some("main-cf".into()),
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+            },
+        )
+        .unwrap();
+        let d = list_domains(&conn).unwrap();
+        assert_eq!(d.len(), 1);
+        assert!(d[0].auto_issue);
+        assert_eq!(d[0].dns_provider.as_deref(), Some("main-cf"));
+    }
+
+    #[test]
+    fn domain_default_auto_issue_is_false() {
+        let conn = make_conn();
+        upsert_site(
+            &conn,
+            &Site {
+                name: "app".into(),
+                backend: "http://x:80".into(),
+                enabled: true,
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+                updated_at: dt("2026-01-01T00:00:00+00:00"),
+                host_mode: HostMode::Passthrough,
+                host_custom: None,
+                domain_count: 0,
+            },
+        )
+        .unwrap();
+        // Insert without specifying auto_issue/dns_provider.
+        upsert_domain(
+            &conn,
+            &Domain {
+                domain: "foo.example.com".into(),
+                site_name: "app".into(),
+                enabled: true,
+                auto_issue: false,
+                dns_provider: None,
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+            },
+        )
+        .unwrap();
+        let d = list_domains(&conn).unwrap();
+        assert!(!d[0].auto_issue);
+        assert!(d[0].dns_provider.is_none());
+    }
+
+    #[test]
+    fn dns_provider_upsert_and_list() {
+        let conn = make_conn();
+        let p = DnsProvider {
+            name: "main-cf".into(),
+            kind: DnsProviderKind::Cloudflare,
+            enabled: true,
+            config: r#"{"api_token":"abc"}"#.into(),
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+            updated_at: dt("2026-01-01T00:00:00+00:00"),
+        };
+        upsert_dns_provider(&conn, &p).unwrap();
+        let back = get_dns_provider(&conn, "main-cf").unwrap().unwrap();
+        assert_eq!(back.kind, DnsProviderKind::Cloudflare);
+        assert_eq!(back.config, r#"{"api_token":"abc"}"#);
+        let list = list_dns_providers(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+
+        // Update kind + config.
+        let mut p2 = p.clone();
+        p2.kind = DnsProviderKind::Aliyun;
+        p2.config = r#"{"access_key_id":"x","access_key_secret":"y"}"#.into();
+        p2.updated_at = dt("2026-02-01T00:00:00+00:00");
+        upsert_dns_provider(&conn, &p2).unwrap();
+        let back = get_dns_provider(&conn, "main-cf").unwrap().unwrap();
+        assert_eq!(back.kind, DnsProviderKind::Aliyun);
+        assert_eq!(back.updated_at, dt("2026-02-01T00:00:00+00:00"));
+        // created_at preserved.
+        assert_eq!(back.created_at, dt("2026-01-01T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn dns_provider_delete() {
+        let conn = make_conn();
+        let p = DnsProvider {
+            name: "main-cf".into(),
+            kind: DnsProviderKind::Cloudflare,
+            enabled: true,
+            config: "{}".into(),
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+            updated_at: dt("2026-01-01T00:00:00+00:00"),
+        };
+        upsert_dns_provider(&conn, &p).unwrap();
+        assert!(delete_dns_provider(&conn, "main-cf").unwrap());
+        assert!(!delete_dns_provider(&conn, "main-cf").unwrap());
     }
 }

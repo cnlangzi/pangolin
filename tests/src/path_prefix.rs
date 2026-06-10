@@ -37,6 +37,8 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
         domain: domain.to_string(),
         site_name: site_name.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     }
 }

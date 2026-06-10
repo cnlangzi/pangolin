@@ -37,6 +37,7 @@ pingora-header-serde = { git = "https://github.com/cnlangzi/pingora", branch = "
 pingora = { version = "0.8", features = ["lb"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tokio-tungstenite = "0.29"
 
 # WebSocket
@@ -77,6 +78,7 @@ base64 = "0.22"
 
 # Test (ACME test server pebble)
 wiremock = "0.6"
+tempfile = "3"
 
 # Build profile
 [profile.release]

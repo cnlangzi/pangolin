@@ -13,6 +13,25 @@ use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::types::{Domain, HostMode, Site};
 
 // ---------------------------------------------------------------------------
+// Raw TCP HTTP request helper. We bypass reqwest because reqwest
+// 0.12+ ignores user-supplied `Host` headers (it always sets `Host`
+// from the URL's authority), which makes it useless for testing
+// virtual-host routing. The shared `harness::raw_request` handles
+// 5s connect/read timeouts and returns `(status, body_as_string)`.
+// ---------------------------------------------------------------------------
+
+async fn send_raw_request(
+    proxy_port: u16,
+    method: &str,
+    host_header: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
+    let addr = format!("127.0.0.1:{proxy_port}");
+    crate::harness::raw_request(&addr, host_header, method, path, body).await
+}
+
+// ---------------------------------------------------------------------------
 // Mock HTTP backend
 // ---------------------------------------------------------------------------
 
@@ -482,6 +501,8 @@ async fn e2e_direct_http_get() {
         domain: "api.example.com".into(),
         site_name: "http-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -502,28 +523,12 @@ async fn e2e_direct_http_get() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let (status, body_str) =
+        send_raw_request(proxy_port, "GET", "api.example.com", "/api/users", b"").await;
+    log::info!("response status: {}", status);
+    assert_eq!(status, 200);
 
-    let url = format!("http://127.0.0.1:{}/api/users", proxy_port);
-    log::info!("requesting {}", url);
-    let resp = client
-        .get(&url)
-        .header("Host", "api.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    log::info!("response status: {}", resp.status().as_u16());
-
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body_bytes = resp.bytes().await.expect("should read body");
-    let body_str = String::from_utf8_lossy(&body_bytes);
     log::info!("body: {}", body_str);
-
     assert!(body_str.contains("GET"));
     assert!(body_str.contains("/api/users"));
     assert!(body_str.contains("api.example.com"));
@@ -556,6 +561,8 @@ async fn e2e_direct_http_404() {
         domain: "other.example.com".into(),
         site_name: "other-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -573,20 +580,9 @@ async fn e2e_direct_http_404() {
         }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "unknown.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 404);
+    let (status, _body) =
+        send_raw_request(proxy_port, "GET", "unknown.example.com", "/", b"").await;
+    assert_eq!(status, 404);
 
     let reqs = backend.get_requests().await;
     assert!(reqs.is_empty());
@@ -613,6 +609,8 @@ async fn e2e_direct_http_post() {
         domain: "post.example.com".into(),
         site_name: "post-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -630,21 +628,11 @@ async fn e2e_direct_http_post() {
         }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/submit", proxy_port);
-    let resp = client
-        .post(&url)
-        .header("Host", "post.example.com")
-        .json(&serde_json::json!({"name": "test", "value": 42}))
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
+    let body =
+        serde_json::to_vec(&serde_json::json!({"name": "test", "value": 42})).expect("encode body");
+    let (status, _) =
+        send_raw_request(proxy_port, "POST", "post.example.com", "/submit", &body).await;
+    assert_eq!(status, 200);
 
     let reqs = backend.get_requests().await;
     assert!(!reqs.is_empty());
@@ -681,6 +669,8 @@ async fn e2e_direct_static_file() {
         domain: "static.example.com".into(),
         site_name: "static-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -702,22 +692,9 @@ async fn e2e_direct_static_file() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/index.html", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "static.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body = resp.text().await.expect("read body");
+    let (status, body) =
+        send_raw_request(proxy_port, "GET", "static.example.com", "/index.html", b"").await;
+    assert_eq!(status, 200);
     assert!(body.contains("Hello Static World"));
 }
 
@@ -740,6 +717,8 @@ async fn e2e_direct_static_file_not_found() {
         domain: "missing.example.com".into(),
         site_name: "static-missing".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -759,18 +738,7 @@ async fn e2e_direct_static_file_not_found() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let url = format!("http://127.0.0.1:{}/index.html", proxy_port);
-    let resp = client
-        .get(&url)
-        .header("Host", "missing.example.com")
-        .send()
-        .await
-        .expect("request should succeed");
-
-    assert_eq!(resp.status().as_u16(), 404);
+    let (status, _body) =
+        send_raw_request(proxy_port, "GET", "missing.example.com", "/index.html", b"").await;
+    assert_eq!(status, 404);
 }

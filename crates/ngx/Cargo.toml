@@ -23,12 +23,14 @@ integration = []
 [dependencies]
 pangolin-core = { path = "../pangolin-core", features = ["rt"] }
 admin = { path = "../admin" }
-pingora.workspace = true
+pingora = { workspace = true, features = ["openssl"] }
 pingora-core = "0.8"
+pingora-openssl = "0.8"
 rusqlite.workspace = true
 http-body = "1"
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

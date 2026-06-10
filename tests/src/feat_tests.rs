@@ -14,10 +14,10 @@ use pangolin_core::db;
 use pangolin_core::types::{Site, Token, Tun};
 use pangolin_core::{App, CertManager, EventType};
 
-/// Create a test CertManager with autorenew disabled.
+/// Create a test CertManager. (v2: per-domain `auto_issue` replaced the
+/// old global `enabled` autorenew flag, so the first arg is gone.)
 fn make_cert_manager() -> CertManager {
     CertManager::new(
-        false,
         std::path::PathBuf::from("/tmp/test-certs"),
         "test@example.com".into(),
         "https://acme.example.com/directory".into(),
@@ -121,58 +121,6 @@ fn event_serde() {
     let json = serde_json::to_string(&events[0]).unwrap();
     assert!(json.contains("\"type\":\"TunConnected\""));
     assert!(json.contains("\"name\":\"office\""));
-}
-
-// ---------------------------------------------------------------------------
-// CertManager runtime override tests
-// ---------------------------------------------------------------------------
-
-/// cert_settings_default — default state uses config value
-#[test]
-fn cert_settings_default() {
-    let (_dir, app) = make_test_app();
-    // CertManager is created with enabled=false
-    assert!(!app.cert_manager.is_autorenew_enabled());
-    assert!(app.cert_manager.get_autorenew_setting().is_none());
-}
-
-/// cert_settings_override_enable — override enables autorenew when config is disabled
-#[test]
-fn cert_settings_override_enable() {
-    let (_dir, app) = make_test_app();
-    app.cert_manager.set_autorenew_override(Some(true));
-    assert!(app.cert_manager.is_autorenew_enabled());
-    assert_eq!(app.cert_manager.get_autorenew_setting(), Some(true));
-}
-
-/// cert_settings_override_disable — override disables autorenew when config is enabled
-#[test]
-fn cert_settings_override_disable() {
-    let cm = CertManager::new(
-        true, // enabled in config
-        std::path::PathBuf::from("/tmp"),
-        "test@example.com".into(),
-        "https://acme.example.com/directory".into(),
-        30,
-        6,
-        3,
-        "ecdsa".into(),
-    );
-    cm.set_autorenew_override(Some(false));
-    assert!(!cm.is_autorenew_enabled());
-    assert_eq!(cm.get_autorenew_setting(), Some(false));
-}
-
-/// cert_settings_override_clear — clearing override falls back to config
-#[test]
-fn cert_settings_override_clear() {
-    let (_dir, app) = make_test_app();
-    app.cert_manager.set_autorenew_override(Some(false));
-    assert!(!app.cert_manager.is_autorenew_enabled());
-    app.cert_manager.set_autorenew_override(None);
-    // Config says disabled (enabled=false in make_cert_manager)
-    assert!(!app.cert_manager.is_autorenew_enabled());
-    assert!(app.cert_manager.get_autorenew_setting().is_none());
 }
 
 // ---------------------------------------------------------------------------

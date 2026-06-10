@@ -285,14 +285,15 @@ impl ProxyHttp for AppProxy {
             return Ok(false);
         }
 
-        // Look up site by Host header
-        let host = session
-            .get_header("Host")
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .unwrap_or("");
+        // Look up site by Host header. HTTP/2 clients don't send
+        // `Host` — the equivalent is the `:authority` pseudo-header,
+        // which pingora exposes via the request URI's `authority`
+        // field. Fall back to it when `Host` is absent so H2
+        // clients (browsers, modern curl) route correctly.
+        let host = host_from_session(session);
 
         let indexes = self.app.indexes.read().await;
-        let site = match pangolin_core::index::lookup_site(&indexes, host) {
+        let site = match pangolin_core::index::lookup_site(&indexes, &host) {
             Some(s) => s.clone(),
             None => {
                 debug!("No site found for host: {}", host);
@@ -566,13 +567,10 @@ impl ProxyHttp for AppProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let host = session
-            .get_header("Host")
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .unwrap_or("");
+        let host = host_from_session(session);
 
         let indexes = self.app.indexes.read().await;
-        let site = match pangolin_core::index::lookup_site(&indexes, host) {
+        let site = match pangolin_core::index::lookup_site(&indexes, &host) {
             Some(s) => s.clone(),
             None => {
                 error!("No site for host: {}", host);
@@ -629,13 +627,10 @@ impl ProxyHttp for AppProxy {
         upstream: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let original_host = session
-            .get_header("Host")
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .unwrap_or("");
+        let original_host = host_from_session(session);
 
         let indexes = self.app.indexes.read().await;
-        let site = match pangolin_core::index::lookup_site(&indexes, original_host) {
+        let site = match pangolin_core::index::lookup_site(&indexes, &original_host) {
             Some(s) => s.clone(),
             None => {
                 // Fall back to passthrough
@@ -692,6 +687,26 @@ impl ProxyHttp for AppProxy {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Extract the effective host from the request, preferring the
+/// `Host` header but falling back to the HTTP/2 `:authority`
+/// pseudo-header (which pingora exposes via the request URI's
+/// authority). Returns an empty string if neither is present.
+fn host_from_session(session: &Session) -> String {
+    session
+        .get_header("Host")
+        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            session
+                .req_header()
+                .uri
+                .authority()
+                .map(|a| a.as_str().to_string())
+        })
+        .unwrap_or_default()
 }
 
 /// Extract the host part from a backend URL (e.g. "http://1.2.3.4:80" -> "1.2.3.4").

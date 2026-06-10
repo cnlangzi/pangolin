@@ -77,33 +77,77 @@ async fn mark_tun_offline(app: &App, tun_name: &str) {
 
 /// Start the tunnel WebSocket server on the given address.
 /// Runs as an independent background task alongside pingora.
-pub async fn start_tunnel_server(app: Arc<App>, addr: &str) {
-    let addr: SocketAddr = addr.parse().expect("invalid tunnel server address");
+pub async fn start_tunnel_server(
+    app: Arc<App>,
+    addr: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid tunnel server address {addr:?}: {e}"))?;
 
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("failed to bind tunnel server on {}: {}", addr, e);
-            return;
-        }
-    };
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind tunnel server on {addr}: {e}"))?;
 
     info!("tunnel server listening on {}", addr);
 
     loop {
-        match listener.accept().await {
-            Ok((tcp_stream, client_addr)) => {
-                let app = app.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(app, tcp_stream, client_addr).await {
-                        warn!("client {} error: {}", client_addr, e);
-                    }
-                });
+        tokio::select! {
+            // Bias toward shutdown so a Ctrl-C during a slow accept
+            // doesn't have to wait for the next connection.
+            biased;
+            _ = shutdown.cancelled() => {
+                info!("tunnel: shutdown requested, stopping accept loop");
+                return Ok(());
             }
-            Err(e) => {
-                error!("accept error: {}", e);
+            accept = listener.accept() => {
+                match accept {
+                    Ok((tcp_stream, client_addr)) => {
+                        // Per-conn tasks are aborted wholesale on
+                        // runtime shutdown; dropping `tcp_stream`
+                        // closes the socket, so no per-conn shutdown
+                        // select is needed (and it would risk
+                        // cancelling `handle_client` mid-`app.db.lock().await`).
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(app, tcp_stream, client_addr).await {
+                                warn!("client {} error: {}", client_addr, e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("accept error: {}", e);
+                    }
+                }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service integration
+// ---------------------------------------------------------------------------
+
+/// Long-running tunnel WebSocket listener, run by `runtime::Service`.
+pub struct TunnelService {
+    addr: String,
+}
+
+impl TunnelService {
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self { addr: addr.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::Service for TunnelService {
+    fn name(&self) -> &'static str {
+        "tunnel"
+    }
+
+    async fn run(&self, ctx: crate::runtime::ServiceContext) -> anyhow::Result<()> {
+        start_tunnel_server(ctx.app, &self.addr, ctx.shutdown).await
     }
 }
 

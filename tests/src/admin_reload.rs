@@ -87,6 +87,8 @@ fn admin_reload_domain() {
         domain: "new.example.com".into(),
         site_name: "domain-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
@@ -133,6 +135,8 @@ fn admin_reload_tun() {
         domain: "tun.example.com".into(),
         site_name: "tun-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();

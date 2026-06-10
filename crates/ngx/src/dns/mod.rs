@@ -3,11 +3,13 @@
 //! Implementations: Cloudflare, Aliyun DNS, Tencent DNSPod.
 
 use base64::Engine;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use hickory_resolver::TokioAsyncResolver;
+use pangolin_core::DnsProviderKind;
 
 /// Trait for DNS providers that can create/delete TXT records.
 #[async_trait]
@@ -548,5 +550,72 @@ pub async fn wait_for_txt_propagation(
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+/// Build a DNS provider from a kind + plaintext JSON config blob (read from
+/// the `dns_providers` table). Returns Err on unknown kind or unparseable
+/// config. The caller is responsible for surfacing the error to the admin UI
+/// (e.g. via the events log).
+pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<dyn DnsProvider>> {
+    let v: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|e| anyhow!("invalid dns provider config JSON: {e}"))?;
+    match kind {
+        DnsProviderKind::Cloudflare => {
+            let token = v
+                .get("api_token")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("cloudflare config missing 'api_token'"))?
+                .to_string();
+            if token.is_empty() {
+                return Err(anyhow!("cloudflare 'api_token' is empty"));
+            }
+            Ok(Arc::new(CloudflareDnsProvider::new(token)))
+        }
+        DnsProviderKind::Aliyun => {
+            let ak_id = v
+                .get("access_key_id")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("aliyun config missing 'access_key_id'"))?
+                .to_string();
+            let ak_secret = v
+                .get("access_key_secret")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("aliyun config missing 'access_key_secret'"))?
+                .to_string();
+            let region = v
+                .get("region")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ak_id.is_empty() || ak_secret.is_empty() {
+                return Err(anyhow!(
+                    "aliyun access_key_id and access_key_secret must be non-empty"
+                ));
+            }
+            Ok(Arc::new(AliyunDnsProvider::new(ak_id, ak_secret, region)))
+        }
+        DnsProviderKind::Tencent => {
+            let secret_id = v
+                .get("secret_id")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("tencent config missing 'secret_id'"))?
+                .to_string();
+            let secret_key = v
+                .get("secret_key")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("tencent config missing 'secret_key'"))?
+                .to_string();
+            if secret_id.is_empty() || secret_key.is_empty() {
+                return Err(anyhow!(
+                    "tencent secret_id and secret_key must be non-empty"
+                ));
+            }
+            Ok(Arc::new(TencentDnsProvider::new(secret_id, secret_key)))
+        }
     }
 }

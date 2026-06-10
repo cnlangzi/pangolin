@@ -155,6 +155,8 @@ async fn upsert_domain(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>
         domain: domain.to_string(),
         site_name: req.site_name,
         enabled: req.enabled.unwrap_or(true),
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
 
@@ -284,49 +286,10 @@ async fn list_events(app: &App) -> Response<Vec<u8>> {
 }
 
 // ---- Cert Settings ----
-
-#[derive(serde::Serialize)]
-struct CertSettings {
-    autorenew_enabled: bool,
-    autorenew_override: Option<bool>,
-}
-
-async fn get_cert_settings(app: &App) -> Response<Vec<u8>> {
-    let settings = CertSettings {
-        autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
-        autorenew_override: app.cert_manager.get_autorenew_setting(),
-    };
-    let body = match serde_json::to_vec(&settings) {
-        Ok(b) => b,
-        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
-    };
-    json_ok(body.as_slice())
-}
-
-async fn update_cert_settings(app: &App, body: &[u8]) -> Response<Vec<u8>> {
-    #[derive(serde::Deserialize)]
-    struct Req {
-        autorenew: Option<bool>,
-    }
-    let req: Req = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {}", e)),
-    };
-
-    // Set the runtime override. If autorenew is Some(bool), it overrides the config.
-    // If autorenew is None, we clear the override (use config value).
-    app.cert_manager.set_autorenew_override(req.autorenew);
-
-    let settings = CertSettings {
-        autorenew_enabled: app.cert_manager.is_autorenew_enabled(),
-        autorenew_override: app.cert_manager.get_autorenew_setting(),
-    };
-    let body = match serde_json::to_vec(&settings) {
-        Ok(b) => b,
-        Err(e) => return json_error(500, &format!("failed to serialize settings: {}", e)),
-    };
-    json_ok(body.as_slice())
-}
+//
+// In v2 there is no global ACME on/off toggle. Per-domain `auto_issue` in the
+// `domains` table controls auto-issuance. The cert-settings GET/PUT API has
+// been removed.
 
 async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> {
     #[derive(serde::Deserialize)]
@@ -372,7 +335,7 @@ async fn upsert_cert(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> 
 
 /// Handle a REST API request from the HTTP server (GET/POST with collection path).
 pub async fn handle_api_http(
-    http_session: &mut ServerSession,
+    _http_session: &mut ServerSession,
     app: &App,
     path: &str,
     method: &str,
@@ -418,24 +381,7 @@ pub async fn handle_api_http(
             }
         }
         // Certs
-        ("certs", "GET") => {
-            if parts.len() >= 2 && parts[1] == "settings" {
-                get_cert_settings(app).await
-            } else {
-                list_certs(app).await
-            }
-        }
-        ("certs", "PUT") => {
-            if parts.len() >= 2 && parts[1] == "settings" {
-                let body = match read_body_http(http_session).await {
-                    Ok(b) => b,
-                    Err(resp) => return resp,
-                };
-                update_cert_settings(app, &body).await
-            } else {
-                json_error(400, "PUT requires /api/certs/settings")
-            }
-        }
+        ("certs", "GET") => list_certs(app).await,
         ("certs", "POST") => {
             if parts.len() >= 2 {
                 upsert_cert(app, parts[1], &[]).await

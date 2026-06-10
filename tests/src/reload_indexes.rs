@@ -15,7 +15,6 @@ use pangolin_core::{App, CertManager};
 
 fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
     CertManager::new(
-        false,
         cert_dir.clone(),
         String::new(),
         String::new(),
@@ -74,6 +73,8 @@ async fn reload_indexes_triggered() {
         domain: "new-site.example.com".into(),
         site_name: "new-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&*app.db.lock().await, &domain).unwrap();
@@ -125,6 +126,8 @@ async fn reload_indexes_domain_triggers_routing() {
         domain: "mydomain.example.com".into(),
         site_name: "routing-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&*app.db.lock().await, &domain).unwrap();
