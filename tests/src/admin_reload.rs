@@ -46,6 +46,8 @@ fn admin_reload_site() {
         name: "new-site".into(),
         backend: "http://127.0.0.1:9000".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -74,6 +76,8 @@ fn admin_reload_domain() {
         name: "domain-site".into(),
         backend: "http://127.0.0.1:8080".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -87,6 +91,8 @@ fn admin_reload_domain() {
         domain: "new.example.com".into(),
         site_name: "domain-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
@@ -120,6 +126,8 @@ fn admin_reload_tun() {
         name: "tun-site".into(),
         backend: "office:http://192.168.1.100:8080".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -133,6 +141,8 @@ fn admin_reload_tun() {
         domain: "tun.example.com".into(),
         site_name: "tun-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
@@ -172,6 +182,8 @@ fn admin_reload_token() {
     let token = Token {
         token: "reload-token".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     };

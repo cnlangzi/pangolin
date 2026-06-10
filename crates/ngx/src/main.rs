@@ -32,7 +32,6 @@ use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 
-use crate::dns::DnsProvider;
 use pangolin_core::config::Config;
 
 // ---- CLI entry point ----
@@ -46,52 +45,12 @@ struct Args {
     config: PathBuf,
 }
 
-/// Build a DNS provider from the cert.dns config section.
-fn build_dns_provider(
-    dns_config: &pangolin_core::config::DnsConfig,
-) -> anyhow::Result<Arc<dyn DnsProvider>> {
-    match dns_config.provider.as_str() {
-        "cloudflare" => {
-            let token = &dns_config.cloudflare.api_token;
-            if token.is_empty() {
-                anyhow::bail!("cloudflare.api_token is required for DNS-01 cloudflare provider");
-            }
-            Ok(
-                Arc::new(crate::dns::CloudflareDnsProvider::new(token.clone()))
-                    as Arc<dyn DnsProvider>,
-            )
-        }
-        "aliyun" => {
-            let ak_id = &dns_config.aliyun.access_key_id;
-            let ak_secret = &dns_config.aliyun.access_key_secret;
-            if ak_id.is_empty() || ak_secret.is_empty() {
-                anyhow::bail!("aliyun.access_key_id and access_key_secret are required for DNS-01 aliyun provider");
-            }
-            Ok(Arc::new(crate::dns::AliyunDnsProvider::new(
-                ak_id.clone(),
-                ak_secret.clone(),
-                dns_config.aliyun.region.clone(),
-            )) as Arc<dyn DnsProvider>)
-        }
-        "tencent" => {
-            let secret_id = &dns_config.tencent.secret_id;
-            let secret_key = &dns_config.tencent.secret_key;
-            if secret_id.is_empty() || secret_key.is_empty() {
-                anyhow::bail!(
-                    "tencent.secret_id and secret_key are required for DNS-01 tencent provider"
-                );
-            }
-            Ok(Arc::new(crate::dns::TencentDnsProvider::new(
-                secret_id.clone(),
-                secret_key.clone(),
-            )) as Arc<dyn DnsProvider>)
-        }
-        p => anyhow::bail!(
-            "unknown DNS provider: {}. Valid: cloudflare, aliyun, tencent",
-            p
-        ),
-    }
-}
+// DNS providers in v2 are stored in the `dns_providers` SQLite table and
+// loaded into the App's in-memory index at startup; the per-domain
+// `dns_provider` column on `domains` decides which provider to use at
+// issuance time. The `build_dns_provider` helper from PR #20 (which read
+// the global `cert.dns.*` YAML section) has been removed; the equivalent
+// wiring now lives in PR-2 (issuance pipeline) under `App::dns_providers`.
 
 // NOTE: we deliberately do NOT use `#[tokio::main]` here. pingora's
 // `Server::run_forever()` spins up its own tokio runtime internally;
@@ -110,14 +69,13 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager::new(
-        config.cert.autorenew,
-        PathBuf::from(&config.cert.cert_dir),
-        config.cert.email.clone(),
-        config.cert.acme_directory.clone(),
-        config.cert.renew_threshold_days,
-        config.cert.renew_check_interval_hours,
-        config.cert.renew_max_retries,
-        config.cert.key_type.clone(),
+        PathBuf::from(&config.acme.cert_dir),
+        config.acme.email.clone(),
+        config.acme.acme_directory.clone(),
+        config.acme.renew_threshold_days,
+        config.acme.renew_check_interval_hours,
+        config.acme.renew_max_retries,
+        config.acme.key_type.clone(),
     );
     let app = Arc::new(pangolin_core::App::new(
         &db_path,
@@ -130,13 +88,6 @@ fn main() -> anyhow::Result<()> {
         pangolin_core::VERSION,
         config.server.port
     );
-
-    // Build DNS provider if configured
-    let _dns_provider: Option<Arc<dyn DnsProvider>> = if !config.cert.dns.provider.is_empty() {
-        Some(build_dns_provider(&config.cert.dns)?)
-    } else {
-        None
-    };
 
     // Build pingora server
     let mut server = Server::new(None)?;

@@ -205,6 +205,8 @@ pub async fn handle_create(
         domain,
         site_name,
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
 

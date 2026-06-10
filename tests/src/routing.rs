@@ -23,6 +23,8 @@ fn make_site(name: &str, backend: &str) -> Site {
         name: name.to_string(),
         backend: backend.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -36,6 +38,8 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
         domain: domain.to_string(),
         site_name: site_name.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     }
 }
@@ -44,6 +48,8 @@ fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
     let tokens = vec![Token {
         token: "test-token".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     }];

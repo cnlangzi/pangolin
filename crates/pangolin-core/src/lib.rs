@@ -37,8 +37,9 @@ pub use parse::{
     parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
 };
 pub use types::{
-    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, Domain, Site,
-    Token, Tun, TunnelFrame, TunnelRequestFrame, TunnelResponseFrame,
+    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, DnsProvider,
+    DnsProviderKind, Domain, Site, Token, Tun, TunnelFrame, TunnelRequestFrame,
+    TunnelResponseFrame,
 };
 
 /// Re-export the schema SQL for tests and migrations.

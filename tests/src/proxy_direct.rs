@@ -24,6 +24,8 @@ fn make_site(name: &str, backend: &str) -> Site {
         name: name.to_string(),
         backend: backend.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -42,6 +44,8 @@ fn make_site_with_host_mode(
         name: name.to_string(),
         backend: backend.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode,
@@ -55,6 +59,8 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
         domain: domain.to_string(),
         site_name: site_name.to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     }
 }

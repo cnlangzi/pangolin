@@ -472,6 +472,8 @@ async fn e2e_direct_http_get() {
         name: "http-site".into(),
         backend: format!("http://{}", backend.addr()),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -482,6 +484,8 @@ async fn e2e_direct_http_get() {
         domain: "api.example.com".into(),
         site_name: "http-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -546,6 +550,8 @@ async fn e2e_direct_http_404() {
         name: "other-site".into(),
         backend: format!("http://{}", backend.addr()),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -556,6 +562,8 @@ async fn e2e_direct_http_404() {
         domain: "other.example.com".into(),
         site_name: "other-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -603,6 +611,8 @@ async fn e2e_direct_http_post() {
         name: "post-site".into(),
         backend: format!("http://{}", backend.addr()),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -613,6 +623,8 @@ async fn e2e_direct_http_post() {
         domain: "post.example.com".into(),
         site_name: "post-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -671,6 +683,8 @@ async fn e2e_direct_static_file() {
         // Backend is the directory (doc_root), not the file path
         backend: format!("file:///{}", dir_path),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -681,6 +695,8 @@ async fn e2e_direct_static_file() {
         domain: "static.example.com".into(),
         site_name: "static-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -730,6 +746,8 @@ async fn e2e_direct_static_file_not_found() {
         name: "static-missing".into(),
         backend: "file:///tmp/does_not_exist_xyz123.txt".to_string(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -740,6 +758,8 @@ async fn e2e_direct_static_file_not_found() {
         domain: "missing.example.com".into(),
         site_name: "static-missing".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));

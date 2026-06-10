@@ -204,6 +204,8 @@ mod tests {
             domain: domain.into(),
             site_name: site_name.into(),
             enabled: true,
+            auto_issue: false,
+            dns_provider: None,
             created_at: Utc::now(),
         }
     }
@@ -320,6 +322,8 @@ mod tests {
             domain: "app.example.com".into(),
             site_name: "app".into(),
             enabled: false,
+            auto_issue: false,
+            dns_provider: None,
             created_at: Utc::now(),
         }];
         let idx = Indexes::build(sites, domains, &[], Utc::now());

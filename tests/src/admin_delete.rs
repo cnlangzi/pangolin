@@ -29,6 +29,8 @@ fn admin_delete_site() {
         name: "to-delete".into(),
         backend: "http://127.0.0.1:8080".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -55,6 +57,8 @@ fn admin_delete_domain() {
         name: "my-site".into(),
         backend: "http://127.0.0.1:8080".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         host_mode: HostMode::Passthrough,
@@ -67,6 +71,8 @@ fn admin_delete_domain() {
         domain: "delete-me.example.com".into(),
         site_name: "my-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
@@ -111,6 +117,8 @@ fn admin_delete_token() {
     let token = Token {
         token: "del-token-xyz".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     };

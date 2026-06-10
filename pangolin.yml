@@ -12,14 +12,17 @@
 # README "全局配置" for the per-field documentation.
 #
 # ── TLS setup for local dev ──────────────────────────────────────────────
-# When `server.tls_port > 0` the binary requires a cert at
-# `./certs/default/{fullchain,privkey}.pem`. Generate one with:
+# In v2 there is no `default` blob fallback — each host you serve TLS
+# for needs its own blob at `./certs/{host}` (or `./certs/{host}+rsa`).
+# Easiest dev setup: use SNI to a single cert for everything. Generate
+# one for `localhost` with:
 #
-#   mkdir -p ./certs/default
+#   mkdir -p ./certs
 #   openssl req -x509 -newkey rsa:2048 -nodes \
-#     -keyout ./certs/default/privkey.pem \
-#     -out ./certs/default/fullchain.pem \
-#     -days 365 -subj "/CN=default"
+#     -keyout ./certs/localhost \
+#     -out ./certs/localhost \
+#     -days 365 -subj "/CN=localhost"
+#   (Note: the cert is a *combined* key+cert blob, not a dir.)
 #
 # For HTTP-only dev, set `tls_port: 0` below.
 # ─────────────────────────────────────────────────────────────────────────
@@ -44,27 +47,20 @@ cache:
 
 cert:
   email: ""               # ACME registration email
-  cert_dir: ./certs       # where CertManager looks for {fullchain,privkey}.pem
-  autorenew: false        # ⚠ MUST be false for dev — true would try
-                         # Let's Encrypt on every restart and fail
-                         # (no public IP, no DNS, clock skew, etc.)
+  cert_dir: ./certs       # where CertManager looks for host blobs
+                         # (autocert DirCache native layout: {host} or {host}+rsa)
+                         # v2 has NO `default` blob fallback — each host
+                         # must have its own cert on disk.
   acme_directory: https://acme-v02.api.letsencrypt.org/directory
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3
   key_type: ecdsa         # ecdsa | rsa (default: ecdsa)
-
-  # dns:
-  #   provider: cloudflare
-  #   cloudflare:
-  #     api_token: "${CF_API_TOKEN}"   # REQUIRED if dns.provider is set
-  #   # aliyun:
-  #   #   access_key_id: "${ALI_AK_ID}"
-  #   #   access_key_secret: "${ALI_AK_SECRET}"
-  #   #   region: ""                  # optional region (default: cn-hangzhou)
-  #   # tencent:
-  #   #   secret_id: "${TC_ID}"
-  #   #   secret_key: "${TC_KEY}"
+  # NOTE: in v2 there is no global `autorenew` toggle. Auto-issuance is
+  # controlled per-domain via `domains.auto_issue` in the database, and
+  # the DNS provider used for DNS-01 challenges is set per-domain via
+  # `domains.dns_provider` (referencing a row in the `dns_providers`
+  # table). See the v2 design doc for details.
 
 log:
   level: debug            # env_logger filter: trace|debug|info|warn|error

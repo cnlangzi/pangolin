@@ -433,7 +433,6 @@ async fn cert_manager_resolve_blob_ecdsa() {
     let cert_dir_path = cert_dir.path().to_path_buf();
 
     let cm = ngx::CertManager::new(
-        false, // enabled=false: skip ACME init
         cert_dir_path.clone(),
         TEST_EMAIL.to_string(),
         ACME_DIR.to_string(),
@@ -459,7 +458,6 @@ async fn cert_manager_resolve_blob_falls_back_to_rsa() {
     let cert_dir_path = cert_dir.path().to_path_buf();
 
     let cm = ngx::CertManager::new(
-        false,
         cert_dir_path.clone(),
         TEST_EMAIL.to_string(),
         ACME_DIR.to_string(),
@@ -484,7 +482,6 @@ async fn cert_manager_resolve_blob_prefers_ecdsa_over_rsa() {
     let cert_dir_path = cert_dir.path().to_path_buf();
 
     let cm = ngx::CertManager::new(
-        false,
         cert_dir_path.clone(),
         TEST_EMAIL.to_string(),
         ACME_DIR.to_string(),
@@ -508,12 +505,13 @@ async fn cert_manager_resolve_blob_prefers_ecdsa_over_rsa() {
 }
 
 #[tokio::test]
-async fn cert_manager_resolve_blob_fallback_default() {
+async fn cert_manager_no_default_fallback_in_v2() {
+    // v2: there is no `default` blob fallback. Each host must have its own
+    // cert on disk; otherwise the SNI handshake for that host fails.
     let cert_dir = TempDir::new().expect("temp cert dir");
     let cert_dir_path = cert_dir.path().to_path_buf();
 
     let cm = ngx::CertManager::new(
-        false,
         cert_dir_path.clone(),
         TEST_EMAIL.to_string(),
         ACME_DIR.to_string(),
@@ -523,12 +521,14 @@ async fn cert_manager_resolve_blob_fallback_default() {
         "ecdsa".to_string(),
     );
 
-    // No host-specific blob, but `default` exists
+    // No host-specific blob, but `default` exists — should still error.
     std::fs::write(cert_dir_path.join("default"), "default-blob").unwrap();
 
-    let (cert, key) = cm
+    let err = cm
         .resolve_cert("unknown.example.com")
-        .expect("resolve default");
-    assert!(cert.ends_with("default"));
-    assert_eq!(key, cert);
+        .expect_err("missing host cert must error in v2");
+    assert!(
+        err.to_string().contains("no certificate found"),
+        "unexpected error: {err}"
+    );
 }

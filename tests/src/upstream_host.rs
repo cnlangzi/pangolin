@@ -221,6 +221,8 @@ async fn upstream_host_header() {
         name: "host-test-site".into(),
         backend: format!("http://{}", backend.addr()),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: pangolin_core::types::HostMode::Passthrough,
@@ -231,6 +233,8 @@ async fn upstream_host_header() {
         domain: "api.example.com".into(),
         site_name: "host-test-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -297,6 +301,8 @@ async fn upstream_host_header_with_port() {
         name: "port-test-site".into(),
         backend: format!("http://{}", backend.addr()),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode: pangolin_core::types::HostMode::Passthrough,
@@ -307,6 +313,8 @@ async fn upstream_host_header_with_port() {
         domain: "port.example.com".into(),
         site_name: "port-test-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));

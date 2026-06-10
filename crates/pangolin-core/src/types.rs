@@ -85,6 +85,15 @@ pub struct Domain {
     pub domain: String,
     pub site_name: String,
     pub enabled: bool,
+    /// If true, this domain is managed by ACME auto-issuance.
+    /// If false (default), the operator is expected to manage certs manually
+    /// (or the domain is HTTP-only). Wildcard domains must have this set to true.
+    #[serde(default)]
+    pub auto_issue: bool,
+    /// Name of the dns_providers row used to validate this domain (FQDN or base).
+    /// None = no DNS-01 association; ACME will fall back to HTTP-01 (wildcards fail).
+    #[serde(default)]
+    pub dns_provider: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -140,6 +149,49 @@ pub struct Cert {
 
 fn default_cert_source() -> String {
     "manual".to_string()
+}
+
+/// DNS provider kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProviderKind {
+    Cloudflare,
+    Aliyun,
+    Tencent,
+}
+
+impl std::str::FromStr for DnsProviderKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cloudflare" => Ok(DnsProviderKind::Cloudflare),
+            "aliyun" => Ok(DnsProviderKind::Aliyun),
+            "tencent" => Ok(DnsProviderKind::Tencent),
+            other => Err(format!("unknown dns provider kind: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for DnsProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DnsProviderKind::Cloudflare => f.write_str("cloudflare"),
+            DnsProviderKind::Aliyun => f.write_str("aliyun"),
+            DnsProviderKind::Tencent => f.write_str("tencent"),
+        }
+    }
+}
+
+/// DNS provider (dns_providers table). name is the primary key.
+/// `config` is a kind-specific JSON blob holding credentials in plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsProvider {
+    pub name: String,
+    pub kind: DnsProviderKind,
+    pub enabled: bool,
+    pub config: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Result of `parse_backend` — what kind of upstream this site is.
@@ -239,10 +291,40 @@ mod tests {
             domain: "app.example.com".into(),
             site_name: "customer-web".into(),
             enabled: true,
+            auto_issue: false,
+            dns_provider: None,
             created_at: Utc::now(),
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: Domain = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    #[test]
+    fn domain_dns_provider_roundtrip() {
+        let d = Domain {
+            domain: "*.example.com".into(),
+            site_name: "customer-web".into(),
+            enabled: true,
+            auto_issue: true,
+            dns_provider: Some("main-cf".into()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: Domain = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+        assert!(back.auto_issue);
+        assert_eq!(back.dns_provider.as_deref(), Some("main-cf"));
+    }
+
+    #[test]
+    fn dns_provider_kind_parses() {
+        let k: DnsProviderKind = "cloudflare".parse().unwrap();
+        assert_eq!(k, DnsProviderKind::Cloudflare);
+        let k: DnsProviderKind = "aliyun".parse().unwrap();
+        assert_eq!(k, DnsProviderKind::Aliyun);
+        let k: DnsProviderKind = "tencent".parse().unwrap();
+        assert_eq!(k, DnsProviderKind::Tencent);
+        assert!("nope".parse::<DnsProviderKind>().is_err());
     }
 }
