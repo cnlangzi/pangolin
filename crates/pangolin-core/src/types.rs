@@ -7,6 +7,41 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// How the Host header is set when proxying to the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HostMode {
+    /// Use the backend URL's host (IP or domain) as-is.
+    Backend,
+    /// Pass through the original Host header from the client.
+    #[default]
+    Passthrough,
+    /// Use a custom host value, and add X-Forwarded-Host with the original.
+    Custom,
+}
+
+impl std::fmt::Display for HostMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostMode::Backend => write!(f, "backend"),
+            HostMode::Passthrough => write!(f, "passthrough"),
+            HostMode::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl std::str::FromStr for HostMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "backend" => Ok(HostMode::Backend),
+            "passthrough" => Ok(HostMode::Passthrough),
+            "custom" => Ok(HostMode::Custom),
+            _ => Err(format!("unknown host_mode: {}", s)),
+        }
+    }
+}
+
 /// Site (sites table). name is the primary key.
 /// domain_count is a denormalised count populated at list-time for UI convenience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,9 +51,30 @@ pub struct Site {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// How to set the Host header when proxying to backend.
+    #[serde(default)]
+    pub host_mode: HostMode,
+    /// Custom host value (used when host_mode is Custom).
+    #[serde(default)]
+    pub host_custom: Option<String>,
     /// Denormalised domain count for the sites table UI. Not stored in DB.
     #[serde(default)]
     pub domain_count: usize,
+}
+
+impl Site {
+    /// Returns true if host_mode is Passthrough (default).
+    pub fn is_host_mode_passthrough(&self) -> bool {
+        self.host_mode == HostMode::Passthrough
+    }
+    /// Returns true if host_mode is Backend.
+    pub fn is_host_mode_backend(&self) -> bool {
+        self.host_mode == HostMode::Backend
+    }
+    /// Returns true if host_mode is Custom.
+    pub fn is_host_mode_custom(&self) -> bool {
+        self.host_mode == HostMode::Custom
+    }
 }
 
 /// Domain (domains table). domain is the primary key.
@@ -146,6 +202,8 @@ mod tests {
             enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         };
         let json = serde_json::to_string(&s).unwrap();

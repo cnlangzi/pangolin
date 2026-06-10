@@ -182,6 +182,7 @@ pub fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::HostMode;
     use chrono::Utc;
 
     fn make_site(name: &str, backend: &str) -> Site {
@@ -192,6 +193,8 @@ mod tests {
             enabled: true,
             created_at: now,
             updated_at: now,
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         }
     }
@@ -331,6 +334,8 @@ mod tests {
             enabled: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
             domain_count: 0,
         }];
         let domains = vec![make_domain("app.example.com", "app")];

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Domain, Site, Token, Tun};
+use pangolin_core::types::{Domain, HostMode, Site, Token, Tun};
 
 fn temp_conn() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
@@ -31,6 +31,8 @@ fn admin_delete_site() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();
@@ -55,6 +57,8 @@ fn admin_delete_domain() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&conn, &site).unwrap();

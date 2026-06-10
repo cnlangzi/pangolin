@@ -622,15 +622,63 @@ impl ProxyHttp for AppProxy {
         Ok(Box::new(peer))
     }
 
-    /// Preserve original Host header for upstream (important for vhosting).
+    /// Set Host header per site.host_mode, add X-Forwarded-Host when mode=custom.
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
         upstream: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(host) = session.get_header("Host") {
-            upstream.insert_header("Host", host).ok();
+        let original_host = session
+            .get_header("Host")
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .unwrap_or("");
+
+        let indexes = self.app.indexes.read().await;
+        let site = match pangolin_core::index::lookup_site(&indexes, original_host) {
+            Some(s) => s.clone(),
+            None => {
+                // Fall back to passthrough
+                if !original_host.is_empty() {
+                    upstream
+                        .insert_header("Host", original_host.as_bytes())
+                        .ok();
+                }
+                return Ok(());
+            }
+        };
+        drop(indexes);
+
+        let backend_host = extract_host_from_backend(&site.backend);
+
+        match site.host_mode {
+            pangolin_core::types::HostMode::Backend => {
+                // Use backend URL's host (IP or domain) as-is
+                if let Some(h) = backend_host {
+                    upstream.insert_header("Host", h.as_bytes()).ok();
+                }
+            }
+            pangolin_core::types::HostMode::Passthrough => {
+                // Pass through original Host header (default / legacy behavior)
+                if !original_host.is_empty() {
+                    upstream
+                        .insert_header("Host", original_host.as_bytes())
+                        .ok();
+                }
+            }
+            pangolin_core::types::HostMode::Custom => {
+                // Use custom Host, and add X-Forwarded-Host with the original
+                if let Some(ref custom) = site.host_custom {
+                    if !custom.is_empty() {
+                        upstream.insert_header("Host", custom.as_bytes()).ok();
+                    }
+                }
+                if !original_host.is_empty() {
+                    upstream
+                        .insert_header("X-Forwarded-Host", original_host.as_bytes())
+                        .ok();
+                }
+            }
         }
         Ok(())
     }
@@ -644,6 +692,41 @@ impl ProxyHttp for AppProxy {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Extract the host part from a backend URL (e.g. "http://1.2.3.4:80" -> "1.2.3.4").
+/// Handles the [tun_name:]url format by stripping the optional tun_name prefix.
+///
+/// Scheme detection: if "://" appears before the first ":", the text before "://"
+/// is the URL scheme (http/https), NOT a tun_name. Only when "://" is absent
+/// does the code check if the prefix looks like a tun_name.
+fn extract_host_from_backend(backend: &str) -> Option<String> {
+    // Detect scheme vs tun_name: "://" means it's a URL scheme, not a tun_name prefix
+    let url = if let Some(scheme_pos) = backend.find("://") {
+        // "://" found — text before it is the scheme (http/https); strip scheme
+        let after_scheme = &backend[scheme_pos + 3..];
+        Some(after_scheme)
+    } else if let Some(pos) = backend.find(':') {
+        let (prefix, rest) = backend.split_at(pos);
+        // No "://" found — check if prefix looks like a tun_name (all lowercase alphanum)
+        if prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            // tun_name: strip "prefix:" then scheme
+            let after_tun = rest.strip_prefix(':')?;
+            after_tun
+                .strip_prefix("http://")
+                .or_else(|| after_tun.strip_prefix("https://"))
+        } else {
+            // Not a tun_name pattern, and no "://" — can't extract host
+            None
+        }
+    } else {
+        None
+    }?;
+    let port_sep = url.find(':').unwrap_or(url.len());
+    Some(url[..port_sep].to_string())
 }
 
 /// Serve a static file with MIME type, ETag, and Last-Modified support.

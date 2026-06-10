@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
-use pangolin_core::types::{Domain, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site, Token};
 
 fn make_site(name: &str, backend: &str) -> Site {
     Site {
@@ -13,6 +13,8 @@ fn make_site(name: &str, backend: &str) -> Site {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Domain, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site, Token};
 use pangolin_core::{App, CertManager};
 
 fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
@@ -63,6 +63,8 @@ async fn reload_indexes_triggered() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
@@ -104,6 +106,8 @@ async fn reload_indexes_domain_triggers_routing() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
@@ -181,6 +185,8 @@ async fn reload_indexes_no_change_is_idempotent() {
         enabled: true,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        host_mode: HostMode::Passthrough,
+        host_custom: None,
         domain_count: 0,
     };
     db::upsert_site(&*app.db.lock().await, &site).unwrap();
