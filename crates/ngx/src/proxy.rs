@@ -640,7 +640,9 @@ impl ProxyHttp for AppProxy {
             None => {
                 // Fall back to passthrough
                 if !original_host.is_empty() {
-                    upstream.insert_header("Host", original_host.as_bytes()).ok();
+                    upstream
+                        .insert_header("Host", original_host.as_bytes())
+                        .ok();
                 }
                 return Ok(());
             }
@@ -659,7 +661,9 @@ impl ProxyHttp for AppProxy {
             pangolin_core::types::HostMode::Passthrough => {
                 // Pass through original Host header (default / legacy behavior)
                 if !original_host.is_empty() {
-                    upstream.insert_header("Host", original_host.as_bytes()).ok();
+                    upstream
+                        .insert_header("Host", original_host.as_bytes())
+                        .ok();
                 }
             }
             pangolin_core::types::HostMode::Custom => {
@@ -705,16 +709,15 @@ fn extract_host_from_backend(backend: &str) -> Option<String> {
     } else if let Some(pos) = backend.find(':') {
         let (prefix, rest) = backend.split_at(pos);
         // No "://" found — check if prefix looks like a tun_name (all lowercase alphanum)
-        if prefix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+        if prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
             // tun_name: strip "prefix:" then scheme
             let after_tun = rest.strip_prefix(':')?;
-            if let Some(scheme_stripped) = after_tun.strip_prefix("http://") {
-                Some(scheme_stripped)
-            } else if let Some(scheme_stripped) = after_tun.strip_prefix("https://") {
-                Some(scheme_stripped)
-            } else {
-                None // no http/https scheme after tun_name
-            }
+            after_tun
+                .strip_prefix("http://")
+                .or_else(|| after_tun.strip_prefix("https://"))
         } else {
             // Not a tun_name pattern, and no "://" — can't extract host
             None

@@ -285,7 +285,10 @@ fn admin_site_host_mode_custom() {
     let sites = db::list_sites(&conn).unwrap();
     assert_eq!(sites.len(), 1);
     assert_eq!(sites[0].host_mode, HostMode::Custom);
-    assert_eq!(sites[0].host_custom.as_deref(), Some("internal.example.com"));
+    assert_eq!(
+        sites[0].host_custom.as_deref(),
+        Some("internal.example.com")
+    );
 }
 
 /// admin_site_host_mode_passthrough — passthrough (default) round-trips

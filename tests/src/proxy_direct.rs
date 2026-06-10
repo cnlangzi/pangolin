@@ -220,7 +220,10 @@ fn host_mode_default() {
 /// host_mode_from_str — HostMode parses from string correctly
 #[test]
 fn host_mode_from_str() {
-    assert_eq!("passthrough".parse::<HostMode>().unwrap(), HostMode::Passthrough);
+    assert_eq!(
+        "passthrough".parse::<HostMode>().unwrap(),
+        HostMode::Passthrough
+    );
     assert_eq!("backend".parse::<HostMode>().unwrap(), HostMode::Backend);
     assert_eq!("custom".parse::<HostMode>().unwrap(), HostMode::Custom);
     assert!("invalid".parse::<HostMode>().is_err());
@@ -241,9 +244,7 @@ fn host_mode_display() {
 /// host_mode_helper_methods — Site helper methods reflect host_mode correctly
 #[test]
 fn host_mode_helper_methods() {
-    let passthrough = make_site_with_host_mode(
-        "x", "http://y", HostMode::Passthrough, None,
-    );
+    let passthrough = make_site_with_host_mode("x", "http://y", HostMode::Passthrough, None);
     assert!(passthrough.is_host_mode_passthrough());
     assert!(!passthrough.is_host_mode_backend());
     assert!(!passthrough.is_host_mode_custom());
@@ -353,7 +354,10 @@ fn host_mode_custom_sets_fixed_host() {
 
     let result = lookup_site(&indexes, "client.example.com").unwrap();
     assert_eq!(result.host_mode, HostMode::Custom);
-    assert_eq!(result.host_custom.as_deref(), Some("fixed.internal.example.com"));
+    assert_eq!(
+        result.host_custom.as_deref(),
+        Some("fixed.internal.example.com")
+    );
 }
 
 /// host_mode_custom_requires_host_custom_value — custom mode with empty value

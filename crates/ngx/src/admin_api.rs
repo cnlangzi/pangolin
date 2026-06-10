@@ -23,7 +23,7 @@ use pingora::protocols::http::ServerSession;
 use crate::App;
 use pangolin_core::{
     db, is_valid_domain, is_valid_tun_name, parse_backend,
-    types::{Cert, Domain, HostMode, Site, Token, Tun},
+    types::{Cert, Domain, Site, Token, Tun},
 };
 
 // ---- JSON response helpers ----
@@ -94,15 +94,13 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 
     let now = Utc::now();
-    let host_mode = match req
-        .host_mode
-        .as_deref()
-        .unwrap_or("passthrough")
-        .parse()
-    {
+    let host_mode = match req.host_mode.as_deref().unwrap_or("passthrough").parse() {
         Ok(mode) => mode,
         Err(_) => {
-            return json_error(400, "invalid value for `host_mode` (expected: backend, passthrough, custom)");
+            return json_error(
+                400,
+                "invalid value for `host_mode` (expected: backend, passthrough, custom)",
+            );
         }
     };
     let site = Site {
