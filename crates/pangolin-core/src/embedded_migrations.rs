@@ -18,6 +18,7 @@ pub mod embedded {
 /// This is called once at application startup. Refinery will create a
 /// `schema_version` table to track which migrations have been applied.
 /// Safe to call on every startup — already-applied migrations are skipped.
-pub fn run_migrations(conn: &mut rusqlite::Connection) -> Result<(), refinery::Error> {
-    embedded::migrations::runner().run(conn)
+pub fn run_migrations(conn: &mut rusqlite::Connection) -> crate::Result<()> {
+    embedded::migrations::runner().run(conn)?;
+    Ok(())
 }

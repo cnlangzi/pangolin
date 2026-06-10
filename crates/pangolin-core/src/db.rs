@@ -14,7 +14,6 @@
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
 
-use std::error::Error;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -38,7 +37,7 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
 
 /// Run pending refinery migrations. Safe to call on every startup —
 /// already-applied migrations are skipped (tracked in schema_version table).
-pub fn migrate(conn: &mut Connection) -> Result<(), Box<dyn Error>> {
+pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
     run_migrations(conn)
 }
 
