@@ -163,14 +163,14 @@ start-tun: build-tun
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
 install-ngx: build-css build-ngx
-	sudo cp ./systemd/pangolin-ngx-local.service /etc/systemd/system/pangolin-ngx.service
+	sudo cp ./deploy/playbooks/roles/ngx/files/ngx.service /etc/systemd/system/pangolin-ngx.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable pangolin-ngx
 	sudo systemctl restart pangolin-ngx
 	@echo "ngx installed and started"
 
 install-tun: build-tun
-	sudo cp ./systemd/pangolin-tun-local.service /etc/systemd/system/pangolin-tun.service
+	sudo cp ./deploy/playbooks/roles/tun/files/tun.service /etc/systemd/system/pangolin-tun.service
 	sudo systemctl daemon-reload
 	sudo systemctl enable pangolin-tun
 	sudo systemctl restart pangolin-tun
