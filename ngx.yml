@@ -1,5 +1,10 @@
-# Local development config for ./bin/pangolin-ngx.
-# Auto-loaded because the binary's --config default is `pangolin.yml`.
+# pangolin-ngx config (auto-loaded because the binary's --config
+# default is `ngx.yml`).
+#
+# The top level of this file IS the proxy config — there is no
+# `proxy:` wrapper. The `[tunnel]` sub-section is the WebSocket
+# endpoint that tun clients connect into. Other features (admin UI,
+# response cache, ACME certs, logging) each have their own sub-section.
 #
 # Every field is optional — all sections have `#[serde(default)]` in
 # crates/pangolin-core/src/config.rs. This file lists every field
@@ -12,7 +17,7 @@
 # README "全局配置" for the per-field documentation.
 #
 # ── TLS setup for local dev ──────────────────────────────────────────────
-# When `server.tls_port > 0` the binary requires a cert at
+# When `tls_port > 0` the binary requires a cert at
 # `./certs/default/{fullchain,privkey}.pem`. Generate one with:
 #
 #   mkdir -p ./certs/default
@@ -24,35 +29,38 @@
 # For HTTP-only dev, set `tls_port: 0` below.
 # ─────────────────────────────────────────────────────────────────────────
 
-server:
-  port: 9080              # HTTP listen port
-  tls_port: 9443          # HTTPS listen port; 0 = disable TLS entirely
-  host: null              # virtual host for per-domain cert resolution
-                         # (null = "default" → ./certs/default/...)
-  ws_path: /tunnel        # WebSocket endpoint for tun clients
-  workers: null           # pingora worker count; null = auto (CPU count)
-  tunnel_port: 9001       # WS listener for tun nodes (loopback only)
+# ── Proxy listen (top level: this file IS the proxy config) ──────────────
+port: 9080              # HTTP listen port
+tls_port: 9443          # HTTPS listen port; 0 = disable TLS entirely
+host: null              # virtual host for per-domain cert resolution
+                        # (null = "default" → ./certs/default/...)
+workers: null           # pingora worker count; null = auto (CPU count)
+
+# ── WebSocket endpoint for tun clients ───────────────────────────────────
+tunnel:
+  port: 9001            # WS listener for tun nodes (loopback only)
+  ws_path: /tunnel      # WebSocket path
 
 admin:
-  addr: 127.0.0.1:9081    # admin UI/API bind addr (loopback recommended)
+  addr: 127.0.0.1:9081  # admin UI/API bind addr (loopback recommended)
   username: admin
   password: admin
 
 cache:
-  enabled: false          # response cache (pingora proxy_cache)
-  dir: ./cache            # cache storage dir
+  enabled: false        # response cache (pingora proxy_cache)
+  dir: ./cache          # cache storage dir
 
 cert:
-  email: ""               # ACME registration email
-  cert_dir: ./certs       # where CertManager looks for {fullchain,privkey}.pem
-  autorenew: false        # ⚠ MUST be false for dev — true would try
-                         # Let's Encrypt on every restart and fail
-                         # (no public IP, no DNS, clock skew, etc.)
+  email: ""             # ACME registration email
+  cert_dir: ./certs     # where CertManager looks for {fullchain,privkey}.pem
+  autorenew: false      # ⚠ MUST be false for dev — true would try
+                        # Let's Encrypt on every restart and fail
+                        # (no public IP, no DNS, clock skew, etc.)
   acme_directory: https://acme-v02.api.letsencrypt.org/directory
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3
-  key_type: ecdsa         # ecdsa | rsa (default: ecdsa)
+  key_type: ecdsa       # ecdsa | rsa (default: ecdsa)
 
   # dns:
   #   provider: cloudflare
@@ -67,5 +75,5 @@ cert:
   #   #   secret_key: "${TC_KEY}"
 
 log:
-  level: debug            # env_logger filter: trace|debug|info|warn|error
-  file: ""                # log file path; "" = stderr only
+  level: debug          # env_logger filter: trace|debug|info|warn|error
+  file: ""              # log file path; "" = stderr only

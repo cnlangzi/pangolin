@@ -1,7 +1,15 @@
-//! Global configuration file. Maps to the [server] / [admin] / [cache] /
-//! [cert] / [log] sections in README.md "全局配置".
+//! Configuration for the `pangolin-ngx` gateway binary. Loaded from
+//! `ngx.yml` (see README.md "全局配置").
 //!
-//! Loaded from TOML, validated, and held in memory. Per README, fields
+//! The top level of `ngx.yml` is the gateway itself — the HTTP/HTTPS
+//! reverse-proxy listen sockets, plus a `[tunnel]` sub-section for the
+//! WebSocket endpoint that tun clients connect into. Other orthogonal
+//! features (admin UI, response cache, ACME certs, logging) live in
+//! their own sub-sections. Keeping the proxy fields at the top level
+//! (no `proxy:` wrapper) makes the obvious thing obvious: this file
+//! *is* the proxy config.
+//!
+//! Loaded from YAML, validated, and held in memory. Per README, fields
 //! like `cert.autorenew` are the gateway behavior toggle (e.g. intranet
 //! deployments disable ACME entirely).
 
@@ -10,11 +18,24 @@ use std::path::Path;
 
 use crate::error::{PangolinError, Result};
 
-/// Top-level config. Read once at startup, then passed by reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+/// Top-level config for the `pangolin-ngx` binary. Read once at startup,
+/// then passed by reference. The fields at the top level are the gateway
+/// (reverse-proxy) listen knobs; sub-sections cover other features.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    // ── Proxy listen (top level: this file IS the proxy config) ────────
+    #[serde(default = "default_proxy_port")]
+    pub port: u16,
+    #[serde(default = "default_tls_port")]
+    pub tls_port: u16,
+    #[serde(default = "default_proxy_host")]
+    pub host: Option<String>,
+    pub workers: Option<usize>,
+
+    // ── Sub-sections ───────────────────────────────────────────────────
+    /// WebSocket endpoint that tun (tunnel) clients connect into.
     #[serde(default)]
-    pub server: ServerConfig,
+    pub tunnel: TunnelConfig,
     #[serde(default)]
     pub admin: AdminConfig,
     #[serde(default)]
@@ -26,27 +47,22 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServerConfig {
-    #[serde(default = "default_server_port")]
+pub struct TunnelConfig {
+    /// WebSocket listen port for tun clients (loopback-only in production).
+    #[serde(default = "default_tunnel_port")]
     pub port: u16,
-    #[serde(default = "default_tls_port")]
-    pub tls_port: u16,
-    #[serde(default = "default_server_host")]
-    pub host: Option<String>,
+    /// WebSocket endpoint path (e.g. `/tunnel`).
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
-    pub workers: Option<usize>,
-    #[serde(default = "default_tunnel_port")]
-    pub tunnel_port: u16,
 }
 
-fn default_server_port() -> u16 {
+fn default_proxy_port() -> u16 {
     80
 }
 fn default_tls_port() -> u16 {
     443
 }
-fn default_server_host() -> Option<String> {
+fn default_proxy_host() -> Option<String> {
     None
 }
 fn default_ws_path() -> String {
@@ -56,15 +72,31 @@ fn default_tunnel_port() -> u16 {
     9001
 }
 
-impl Default for ServerConfig {
+impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            port: default_server_port(),
+            port: default_tunnel_port(),
+            ws_path: default_ws_path(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // Manual impl: `#[derive(Default)]` would zero out `port` /
+        // `tls_port` / `host` / `workers`, ignoring the documented
+        // defaults. The `#[serde(default = "...")]` attributes only
+        // fire on deserialize — they have no effect on `Default::default()`.
+        Self {
+            port: default_proxy_port(),
             tls_port: default_tls_port(),
-            ws_path: "/tunnel".into(),
+            host: default_proxy_host(),
             workers: None,
-            tunnel_port: 9001,
-            host: None,
+            tunnel: TunnelConfig::default(),
+            admin: AdminConfig::default(),
+            cache: CacheConfig::default(),
+            cert: CertConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -258,71 +290,73 @@ impl Config {
     /// Parse from a YAML string (used in tests).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        let expanded = Self::expand_env_vars(s);
+        let expanded = expand_env_vars(s);
         serde_yaml::from_str(&expanded)
             .map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
     }
+}
 
-    /// Expand ${VAR} and ${VAR:-default} placeholders from environment variables.
-    /// Missing required vars cause startup failure with a clear error.
-    fn expand_env_vars(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
+/// Expand `${VAR}` and `${VAR:-default}` placeholders from environment
+/// variables. Missing required vars cause startup failure with a clear
+/// error. Used by both the `ngx` config loader and the `tun` config
+/// loader (see `tun::config`), so it lives in the shared core crate.
+pub fn expand_env_vars(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
 
-        while let Some(ch) = chars.next() {
-            if ch == '$' && chars.peek() == Some(&'{') {
-                chars.next(); // consume '{'
-                let mut var_name = String::new();
-                let mut has_default = false;
-                let mut default_val = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var_name = String::new();
+            let mut has_default = false;
+            let mut default_val = String::new();
 
-                while let Some(&c) = chars.peek() {
-                    if c == '}' {
-                        chars.next(); // consume '}'
+            while let Some(&c) = chars.peek() {
+                if c == '}' {
+                    chars.next(); // consume '}'
+                    break;
+                }
+                if c == ':' {
+                    // Check for :- default syntax
+                    let mut peek = chars.clone();
+                    peek.next(); // skip ':'
+                    if peek.peek() == Some(&'-') {
+                        has_default = true;
+                        chars.next(); // consume ':'
+                        chars.next(); // consume '-'
+                        while let Some(&nc) = chars.peek() {
+                            if nc == '}' {
+                                chars.next();
+                                break;
+                            }
+                            default_val.push(nc);
+                            chars.next();
+                        }
                         break;
                     }
-                    if c == ':' {
-                        // Check for :- default syntax
-                        let mut peek = chars.clone();
-                        peek.next(); // skip ':'
-                        if peek.peek() == Some(&'-') {
-                            has_default = true;
-                            chars.next(); // consume ':'
-                            chars.next(); // consume '-'
-                            while let Some(&nc) = chars.peek() {
-                                if nc == '}' {
-                                    chars.next();
-                                    break;
-                                }
-                                default_val.push(nc);
-                                chars.next();
-                            }
-                            break;
-                        }
-                    }
-                    var_name.push(c);
-                    chars.next();
                 }
-
-                let env_val = std::env::var(&var_name);
-                match env_val {
-                    Ok(val) => result.push_str(&val),
-                    Err(_) if has_default => result.push_str(&default_val),
-                    Err(_) => {
-                        // Fail-fast: missing env var with no default
-                        eprintln!(
-                            "ERROR: config references ${{{}}} but the environment variable {} is not set",
-                            var_name, var_name
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                result.push(ch);
+                var_name.push(c);
+                chars.next();
             }
+
+            let env_val = std::env::var(&var_name);
+            match env_val {
+                Ok(val) => result.push_str(&val),
+                Err(_) if has_default => result.push_str(&default_val),
+                Err(_) => {
+                    // Fail-fast: missing env var with no default
+                    eprintln!(
+                        "ERROR: config references ${{{}}} but the environment variable {} is not set",
+                        var_name, var_name
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            result.push(ch);
         }
-        result
     }
+    result
 }
 
 #[cfg(test)]
@@ -332,9 +366,10 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        assert_eq!(c.server.port, 80);
-        assert_eq!(c.server.tls_port, 443);
-        assert_eq!(c.server.ws_path, "/tunnel");
+        assert_eq!(c.port, 80);
+        assert_eq!(c.tls_port, 443);
+        assert_eq!(c.tunnel.ws_path, "/tunnel");
+        assert_eq!(c.tunnel.port, 9001);
         assert!(c.cert.autorenew);
         assert_eq!(c.cert.renew_threshold_days, 30);
     }
@@ -342,24 +377,25 @@ mod tests {
     #[test]
     fn parse_minimal_yaml() {
         let s = r#"
-            server:
-              port: 9000
+            port: 9000
         "#;
         let c = Config::from_str(s).unwrap();
-        assert_eq!(c.server.port, 9000);
+        assert_eq!(c.port, 9000);
         // others default
-        assert_eq!(c.server.tls_port, 443);
+        assert_eq!(c.tls_port, 443);
         assert!(c.cert.autorenew);
     }
 
     #[test]
     fn parse_full_yaml() {
         let s = r#"
-            server:
-              port: 80
-              tls_port: 443
+            port: 80
+            tls_port: 443
+            workers: 4
+
+            tunnel:
+              port: 9001
               ws_path: "/tunnel"
-              workers: 4
 
             admin:
               username: "root"
@@ -383,7 +419,9 @@ mod tests {
               file: "/var/log/pangolin.log"
         "#;
         let c = Config::from_str(s).unwrap();
-        assert_eq!(c.server.workers, Some(4));
+        assert_eq!(c.workers, Some(4));
+        assert_eq!(c.tunnel.port, 9001);
+        assert_eq!(c.tunnel.ws_path, "/tunnel");
         assert_eq!(c.admin.username, "root");
         assert!(c.cache.enabled);
         assert!(!c.cert.autorenew);

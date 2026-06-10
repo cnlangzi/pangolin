@@ -41,8 +41,8 @@ use pangolin_core::config::Config;
 #[command(name = "ngx")]
 #[command(about = "Pangolin gateway — public-facing HTTP/WebSocket proxy")]
 struct Args {
-    /// Path to config file (default: ./pangolin.yml)
-    #[arg(short, long, default_value = "pangolin.yml")]
+    /// Path to config file (default: ./ngx.yml)
+    #[arg(short, long, default_value = "ngx.yml")]
     config: PathBuf,
 }
 
@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     log::info!(
         "Pangolin ngx {} starting on port {}",
         pangolin_core::VERSION,
-        config.server.port
+        config.port
     );
 
     // Build DNS provider if configured
@@ -151,10 +151,10 @@ fn main() -> anyhow::Result<()> {
 
     // HTTP proxy service (domain-routed)
     let mut proxy_service = http_proxy_service(&conf, app_proxy);
-    proxy_service.add_tcp(&format!("0.0.0.0:{}", config.server.port));
-    if config.server.tls_port > 0 {
-        let tls_addr = format!("0.0.0.0:{}", config.server.tls_port);
-        let host = config.server.host.as_deref().unwrap_or("default");
+    proxy_service.add_tcp(&format!("0.0.0.0:{}", config.port));
+    if config.tls_port > 0 {
+        let tls_addr = format!("0.0.0.0:{}", config.tls_port);
+        let host = config.host.as_deref().unwrap_or("default");
         // Blob path: combined key+cert PEM, used as both cert and key argument
         let (blob_path, _) = app
             .cert_manager
@@ -187,7 +187,7 @@ fn main() -> anyhow::Result<()> {
     // See the note above on why this is `std::thread::spawn` + a dedicated
     // current-thread runtime, not `tokio::spawn`.
     let app_tunnel = app.clone();
-    let tunnel_addr = format!("127.0.0.1:{}", config.server.tunnel_port);
+    let tunnel_addr = format!("127.0.0.1:{}", config.tunnel.port);
     std::thread::Builder::new()
         .name("pangolin-tunnel".to_string())
         .spawn(move || {

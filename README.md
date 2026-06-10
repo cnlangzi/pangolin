@@ -63,14 +63,14 @@ pangolin/
 **使用方式：**
 
 ```bash
-# ngx 主节点
-./ngx --port 8080
+# ngx 主节点(读 ./ngx.yml)
+./ngx
 
-# tun 隧道节点（客户内网）
-./tun --server gateway.example.com:8080 --token abc123
+# tun 隧道节点(客户内网,读 ./tun.yml)
+./tun
 
-# token 在 ngx 的 tokens 表里统一管理（admin 增删，热加载生效），
-# 多个 token 可共存。tun 启动时任意携带一个有效 token + name 即可连上。
+# token 在 ngx 的 tokens 表里统一管理(admin 增删,热加载生效),
+# 多个 token 可共存。tun.yml 任意携带一个有效 token + name 即可连上。
 ```
 
 无需 `--mode` 标志，二进制名 = 角色名。
@@ -472,7 +472,7 @@ domainIndex[app.example.com]  →  *Site
 ### 2. tun 启动流程
 
 ```
-tun 配置: --server gateway.com:8080 --token abc123 --name office
+tun 配置: ./tun.yml { server: gateway.com:8080, token: abc123, name: office }
     │
     ▼
 WS 连接 ngx，发 token + name
@@ -578,7 +578,7 @@ tun 开始代理这些域名的请求
    - site_name: customer-web
 
 5. 客户在内网部署 tun
-   ./tun --name office --server gateway.example.com:8080 --token <admin 给的 token>
+   ./tun   # 读 ./tun.yml(server/token/name)
 
 6. tun 启动 → WS 连 ngx → 发 token + name
    ngx 查 tokenIndex[token] → 验证 token 有效（内存，一次 map lookup）
@@ -658,52 +658,79 @@ office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴�
 
 ## 全局配置
 
-ngx 启动时读一个 TOML 配置文件。文件位置按优先级：
+ngx 和 tun 是两个独立的 binary,各读自己的 YAML 配置文件。文件位置按优先级(都可用 `--config` 覆盖):
 
-1. `--config /path/to/config.toml` 命令行参数
-2. `./config.toml`（当前目录）
-3. `/etc/pangolin/config.toml`（系统级）
+1. `./ngx.yml` / `./tun.yml`(当前目录)
+2. `/etc/pangolin/ngx.yml` / `/etc/pangolin/tun.yml`(系统级)
 
-**完整配置示例**：
+**职责分离**:`ngx.yml` 只关心网关本身(`[proxy]` 顶层字段 + `[tunnel]` 接入端点 + `[admin]`/`[cache]`/`[cert]`/`[log]` 子节);`tun.yml` 只关心 tun 客户端的连接信息(顶层 `server`/`token`/`name` + `[log]`)。两个文件之间**不共享任何字段**。
 
-```toml
-[server]
-port = 8080           # HTTP 监听端口
-tls_port = 8443       # HTTPS 监听端口
-ws_path = "/tunnel"   # tun WS 接入路径
-workers = 4           # tokio runtime worker 数（默认 = CPU 核数）
+**为什么拆分**:之前只有一个 `pangolin.yml`,`ws_path` / `tunnel_port` 这种 tunnel 相关字段和 `port` / `tls_port` 这种 proxy 字段混在同一个 `[server]` 段下,语义上不清晰。拆成两个文件后,文件本身就是角色声明,改哪个不传哪个一目了然。
 
-[admin]
-username = "admin"
-password = "***"      # 生产用 secret 管理器注入，不要明文进文件
+### `ngx.yml` — 网关配置
 
-[cache]
-enabled = true
-dir = "./cache"
+```yaml
+# ── Proxy listen (顶层就是 proxy,不加 proxy: 包装) ─────
+port: 80              # HTTP 监听端口
+tls_port: 443         # HTTPS 监听;0 = 完全关闭 TLS
+host: null            # per-domain cert 解析用的虚拟主机
+                      # (null = "default" → ./certs/default/...)
+workers: null         # pingora worker 数;null = CPU 核数
 
-[cert]
-email = "admin@yourdomain.com"   # ACME 注册邮箱
-cert_dir = "./certs"             # 证书落盘目录
-autorenew = true                  # 是否自动续期（+ 首次申请），默认 true
-acme_directory = "https://acme-v02.api.letsencrypt.org/directory"  # ACME 目录
-renew_threshold_days = 30         # 过期 < N 天触发续期
-renew_check_interval_hours = 6    # 后台续期检查周期
-renew_max_retries = 3             # 单次续期失败重试次数
+# ── WebSocket 接入端点(tun 客户端连这个) ─────────────
+tunnel:
+  port: 9001          # WS 监听端口(loopback only in production)
+  ws_path: /tunnel    # WS endpoint path
 
-[log]
-level = "info"          # trace | debug | info | warn | error
-file = "./pangolin.log" # 空字符串 = stdout
+admin:
+  addr: 127.0.0.1:9081  # admin UI/API 绑定(loopback 推荐)
+  username: admin
+  password: ***          # 生产用 secret 管理器注入,不要明文进文件
+
+cache:
+  enabled: true
+  dir: ./cache
+
+cert:
+  email: "admin@yourdomain.com"   # ACME 注册邮箱
+  cert_dir: "./certs"             # 证书落盘目录
+  autorenew: true                 # 是否自动续期(+ 首次申请),默认 true
+  acme_directory: "https://acme-v02.api.letsencrypt.org/directory"
+  renew_threshold_days: 30
+  renew_check_interval_hours: 6
+  renew_max_retries: 3
+
+log:
+  level: "info"          # trace | debug | info | warn | error
+  file: "./pangolin.log" # 空字符串 = stdout
 ```
 
-**关键配置项说明**：
+### `tun.yml` — 隧道客户端配置
 
-- `cert.autorenew`：**总开关**，决定是否走 ACME 流程
-  - `true`（默认，公网部署）：启动时申请缺失 cert + 定期续期
-  - `false`（内网部署，ngx 无法被 Let's Encrypt 访问）：完全跳过 ACME，admin 通过 `POST /api/certs` 手动上传 cert
-- `cert.acme_directory`：可指向 staging (`https://acme-staging-v02.api.letsencrypt.org/directory`) 测玴
-- `server.workers`：pingora 推荐设为 CPU 核数
+```yaml
+# ── 连接信息(顶层就是 tun 客户端,不加 connection: 包装) ─
+server: ngx.example.com:8080   # ngx 地址
+token: "${TUN_TOKEN}"         # 认证 token(用 env var 注入)
+name: office                  # tun 节点名;^[a-z0-9_-]+$, 1~32 字符,
+                              # 非纯数字
 
-**后续**：未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
+log:
+  level: "info"
+  file: ""                    # 空 = stderr
+```
+
+`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 推荐用 `${TUN_TOKEN}` 形式从环境变量注入,缺少变量且没有默认值时启动会 fail-fast。
+
+### 关键配置项说明
+
+- `ngx.yml: cert.autorenew`:**总开关**,决定是否走 ACME 流程
+  - `true`(默认,公网部署):启动时申请缺失 cert + 定期续期
+  - `false`(内网部署,ngx 无法被 Let's Encrypt 访问):完全跳过 ACME,admin 通过 `POST /api/certs` 手动上传 cert
+- `ngx.yml: cert.acme_directory`:可指向 staging 测玴
+- `ngx.yml: workers`:pingora 推荐设为 CPU 核数
+- `tun.yml: name` 约束与 ngx 端 `tun.name` 主键一致,过不了校验则启动 fail
+
+**后续**:未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
 
 ---
 

@@ -50,8 +50,8 @@ impl App {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             indexes: Arc::new(RwLock::new(indexes)),
+            ws_path: config.tunnel.ws_path.clone(),
             config,
-            ws_path: "/tunnel".to_string(),
             tun_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             cert_manager,
             events: Arc::new(EventBuffer::new()),

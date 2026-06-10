@@ -219,11 +219,13 @@ impl NgxProcess {
 
         let config = format!(
             r#"
-server:
-  port: {http}
-  tls_port: {tls}
-  tunnel_port: {tunnel_port}
-  host: default
+port: {http}
+tls_port: {tls}
+host: default
+
+tunnel:
+  port: {tunnel_port}
+  ws_path: /tunnel
 
 log:
   level: info
@@ -242,11 +244,11 @@ cert:
             admin = admin_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
         );
-        let config_path = tmpdir.path().join("pangolin.yml");
+        let config_path = tmpdir.path().join("ngx.yml");
         // we keep the `cert_dir` in scope (above) so the test's Drop
         // impl that points at the cert path doesn't race the tmpdir
         // teardown. _cert_dir is a no-op; just suppress the warning.
-        std::fs::write(&config_path, config).expect("write pangolin.yml");
+        std::fs::write(&config_path, config).expect("write ngx.yml");
 
         // The binary creates pangolin.db at runtime in CWD. We want
         // it in our tempdir so the test owns the DB lifecycle.
@@ -377,22 +379,33 @@ impl TunProcess {
                 bin.display()
             );
         }
-        // tun's `--server` is documented as `host:port` (e.g.
-        // `ngx.example.com:8080`); the binary naively formats
-        // `ws://{server}/tunnel?...`, so passing `http://...` would
-        // produce the malformed URL `ws://http://...`. Strip any
-        // scheme to keep tun happy.
-        //
-        // The address here is the **tunnel** port (where ngx's WS
-        // tunnel server listens), not the admin port.
+        // tun now reads its config from `tun.yml` (the old
+        // `--server` / `--name` / `--token` CLI args were removed
+        // when the configs were split). The address here is the
+        // **tunnel** port (where ngx's WS tunnel server listens),
+        // not the admin port.
         let server = format!("127.0.0.1:{}", ngx.tunnel_port);
+        let tun_config = format!(
+            r#"
+server: {server}
+name: {name}
+token: {token}
+log:
+  level: debug
+"#,
+            server = server,
+            name = name,
+            token = token,
+        );
+        let tmpdir = tempfile::tempdir().expect("tempdir for tun config");
+        let config_path = tmpdir.path().join("tun.yml");
+        std::fs::write(&config_path, &tun_config).expect("write tun.yml");
+        // keep tmpdir alive for the lifetime of the tun process; the
+        // child reads the config by path, so the file must persist.
+        let _tun_tmpdir = Box::leak(Box::new(tmpdir));
+
         let mut cmd = Command::new(&bin);
-        cmd.arg("--server")
-            .arg(&server)
-            .arg("--name")
-            .arg(name)
-            .arg("--token")
-            .arg(token);
+        cmd.arg("--config").arg(&config_path);
         cmd.kill_on_drop(true);
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 

@@ -1,0 +1,32 @@
+# pangolin-tun config (auto-loaded because the binary's --config
+# default is `tun.yml`).
+#
+# The top level of this file IS the tun client config — its connection
+# target, auth token, and node name. There is no `connection:` wrapper.
+# Only `[log]` is a sub-section, since the three connection fields are
+# siblings of equal weight.
+#
+# Every field is the equivalent of the previous CLI flags:
+#   --server <ADDR>  →  server: <ADDR>
+#   --token  <TOKEN> →  token:  <TOKEN>
+#   --name   <NAME>  →  name:   <NAME>
+#
+# Use a secret manager / env var for the token. The `${VAR}` syntax is
+# expanded at load time and fail-fast on missing required vars:
+#
+#   token: "${TUN_TOKEN}"
+#
+# Rules for `name` (validated at load):
+#   - matches ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore)
+#   - 1..=32 chars
+#   - non-purely-numeric (ngx uses a non-numeric name as the tun PK)
+
+# ── Connection (top level: this file IS the tun config) ─────────────────
+server: 127.0.0.1:9080     # ngx address to connect to
+token: "replace-me-with-a-real-token"
+name: office               # this tun's name (must match a tun in ngx's
+                           # `tun` table, or be auto-registered)
+
+log:
+  level: info              # env_logger filter: trace|debug|info|warn|error
+  file: ""                 # log file path; "" = stderr only
