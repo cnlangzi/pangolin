@@ -82,6 +82,8 @@ fn error_domain_disabled() {
         domain: "disabled.com".into(),
         site_name: "test-site".into(),
         enabled: false, // <-- disabled
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
 

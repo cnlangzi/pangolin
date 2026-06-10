@@ -46,8 +46,6 @@ fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
     let tokens = vec![Token {
         token: "test-token".into(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     }];

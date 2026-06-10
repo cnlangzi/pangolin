@@ -113,8 +113,6 @@ fn admin_delete_token() {
     let token = Token {
         token: "del-token-xyz".into(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     };

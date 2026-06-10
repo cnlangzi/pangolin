@@ -176,8 +176,6 @@ fn admin_reload_token() {
     let token = Token {
         token: "reload-token".into(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     };

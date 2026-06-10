@@ -147,8 +147,6 @@ fn admin_tokens_crud() {
     let token = Token {
         token: "secret-token-123".into(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     };
@@ -215,8 +213,6 @@ fn admin_reload_indexes() {
     let tokens = vec![Token {
         token: "tok".into(),
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
         created_at: Utc::now(),
         expires_at: None,
     }];
