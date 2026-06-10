@@ -28,6 +28,10 @@ pub enum EventType {
     DomainUpdated { domain: String, site: String },
     /// Generic info message.
     Info { message: String },
+    /// Certificate was issued for the first time (or after manual delete).
+    CertIssued { domain: String },
+    /// Auto-issuance was skipped for a domain (e.g. wildcard without DNS).
+    CertIssuanceSkipped { domain: String, reason: String },
 }
 
 /// A single event with timestamp.

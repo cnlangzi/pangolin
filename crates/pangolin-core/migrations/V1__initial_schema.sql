@@ -14,10 +14,12 @@ CREATE TABLE IF NOT EXISTS sites (
 );
 
 CREATE TABLE IF NOT EXISTS domains (
-    domain      TEXT PRIMARY KEY,            -- 'example.com' or '*.example.com'
-    site_name   TEXT NOT NULL,               -- references sites.name (logical FK)
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    domain       TEXT PRIMARY KEY,           -- 'example.com' or '*.example.com'
+    site_name    TEXT NOT NULL,              -- references sites.name (logical FK)
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    auto_issue   INTEGER NOT NULL DEFAULT 0, -- 0=manual cert, 1=ACME auto-issue
+    dns_provider TEXT,                       -- FK by name to dns_providers.name (no SQL FK; code-enforced)
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_domains_site ON domains(site_name);
@@ -48,4 +50,19 @@ CREATE TABLE IF NOT EXISTS certs (
     acme_dns_provider TEXT,                              -- cloudflare | aliyun | tencent
     acme_account_id   TEXT,                              -- ACME account URL or id
     issued_at         INTEGER NOT NULL DEFAULT 0          -- Unix timestamp seconds
+);
+
+-- DNS provider registry (v2): each row is one named DNS provider with credentials.
+-- `config` is a kind-specific JSON blob, e.g.
+--   cloudflare: {"api_token": "..."}
+--   aliyun:     {"access_key_id": "...", "access_key_secret": "...", "region": "..."}
+--   tencent:    {"secret_id": "...", "secret_key": "..."}
+-- Credentials are stored in plaintext at the operator's risk. See design doc.
+CREATE TABLE IF NOT EXISTS dns_providers (
+    name        TEXT PRIMARY KEY,                -- human-readable id, e.g. 'main-cf'
+    kind        TEXT NOT NULL,                   -- 'cloudflare' | 'aliyun' | 'tencent'
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    config      TEXT NOT NULL,                   -- JSON, kind-specific
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

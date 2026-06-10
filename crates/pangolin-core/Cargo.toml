@@ -22,3 +22,6 @@ tokio = { workspace = true, optional = true }
 [features]
 default = []
 rt = ["tokio/rt", "tokio/sync"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

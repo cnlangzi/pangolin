@@ -177,6 +177,32 @@ pub async fn handle(
             )
             .await?
         }
+        "dns" if method == "GET" => routes::dns::render(&app, &csrf_token).await?,
+        "dns/new" if method == "GET" => routes::dns::render_create_page(&app, &csrf_token).await?,
+        "dns/new" if method == "POST" => {
+            routes::dns::handle_create(&app, &merged_params, &csrf_token).await?
+        }
+        "dns/edit" if method == "GET" => {
+            routes::dns::render_edit_page(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+            )
+            .await?
+        }
+        "dns/edit" if method == "POST" => {
+            routes::dns::handle_update(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &merged_params,
+                &csrf_token,
+            )
+            .await?
+        }
+        "dns/delete" if method == "POST" => {
+            routes::dns::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
+        }
         // Auth
         "login" => {
             if method == "POST" {

@@ -1,14 +1,29 @@
 //! Pangolin gateway (ngx) — public-facing HTTP/WebSocket proxy.
 //!
-//! Two services share the same `Arc<pangolin_core::App>`:
-//!   - HTTP proxy via `http_proxy_service` + `impl ProxyHttp` for domain-routed proxying
-//!   - HTTP server via `HttpServer::new_app` + `impl ServeHttp` for admin API + static files
+//! Startup architecture (see also `runtime.rs`):
+//!
+//! 1. `main` is a synchronous function. It performs all blocking
+//!    initialization (config, DB, `App`, cert dir, `AcmeState`).
+//! 2. A single multi-thread tokio runtime ("host") is created and
+//!    drives:
+//!      - OS signal handlers (cancel a shared `CancellationToken`).
+//!      - `AcmeService`  — periodic cert renewal + initial scan.
+//!      - `TunnelService` — WebSocket listener for tun nodes.
+//! 3. pingora is built and run on a dedicated `std::thread`.
+//!    pingora cannot live on the host runtime because it owns its
+//!    own tokio runtime. Its shutdown is driven by the same
+//!    `CancellationToken` via `TokenShutdownSignalWatch`, so a single
+//!    SIGINT/SIGTERM stops the whole process.
+//! 4. After shutdown, host services drain, the host runtime
+//!    finishes, the pingora thread is joined, and `main` returns.
 
 mod acme;
 mod admin_api;
 mod dns;
 mod proxy;
+mod runtime;
 mod serve;
+mod tls;
 mod tunnel;
 
 pub use proxy::AppProxy;
@@ -29,11 +44,11 @@ use std::sync::Arc;
 use clap::Parser;
 use pingora::apps::http_app::HttpServer;
 use pingora::proxy::http_proxy_service;
-use pingora::server::Server;
+use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
 
-use crate::dns::DnsProvider;
 use pangolin_core::config::Config;
+use tokio_util::sync::CancellationToken;
 
 // ---- CLI entry point ----
 
@@ -46,62 +61,15 @@ struct Args {
     config: PathBuf,
 }
 
-/// Build a DNS provider from the cert.dns config section.
-fn build_dns_provider(
-    dns_config: &pangolin_core::config::DnsConfig,
-) -> anyhow::Result<Arc<dyn DnsProvider>> {
-    match dns_config.provider.as_str() {
-        "cloudflare" => {
-            let token = &dns_config.cloudflare.api_token;
-            if token.is_empty() {
-                anyhow::bail!("cloudflare.api_token is required for DNS-01 cloudflare provider");
-            }
-            Ok(
-                Arc::new(crate::dns::CloudflareDnsProvider::new(token.clone()))
-                    as Arc<dyn DnsProvider>,
-            )
-        }
-        "aliyun" => {
-            let ak_id = &dns_config.aliyun.access_key_id;
-            let ak_secret = &dns_config.aliyun.access_key_secret;
-            if ak_id.is_empty() || ak_secret.is_empty() {
-                anyhow::bail!("aliyun.access_key_id and access_key_secret are required for DNS-01 aliyun provider");
-            }
-            Ok(Arc::new(crate::dns::AliyunDnsProvider::new(
-                ak_id.clone(),
-                ak_secret.clone(),
-                dns_config.aliyun.region.clone(),
-            )) as Arc<dyn DnsProvider>)
-        }
-        "tencent" => {
-            let secret_id = &dns_config.tencent.secret_id;
-            let secret_key = &dns_config.tencent.secret_key;
-            if secret_id.is_empty() || secret_key.is_empty() {
-                anyhow::bail!(
-                    "tencent.secret_id and secret_key are required for DNS-01 tencent provider"
-                );
-            }
-            Ok(Arc::new(crate::dns::TencentDnsProvider::new(
-                secret_id.clone(),
-                secret_key.clone(),
-            )) as Arc<dyn DnsProvider>)
-        }
-        p => anyhow::bail!(
-            "unknown DNS provider: {}. Valid: cloudflare, aliyun, tencent",
-            p
-        ),
-    }
-}
+// DNS providers in v2 are stored in the `dns_providers` SQLite table and
+// loaded into the App's in-memory index at startup; the per-domain
+// `dns_provider` column on `domains` decides which provider to use at
+// issuance time. The `build_dns_provider` helper from PR #20 (which read
+// the global `cert.dns.*` YAML section) has been removed; the equivalent
+// wiring now lives in PR-2 (issuance pipeline) under `App::dns_providers`.
 
-// NOTE: we deliberately do NOT use `#[tokio::main]` here. pingora's
-// `Server::run_forever()` spins up its own tokio runtime internally;
-// wrapping `main` in a tokio runtime as well causes a
-// "Cannot start a runtime from within a runtime" panic. The tunnel
-// listener needs to run concurrently, so we spawn it on a dedicated
-// std::thread with its own current-thread runtime instead of
-// `tokio::spawn` (which would re-enter the outer runtime).
 fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    // ---- 1. Blocking init --------------------------------------------------
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
@@ -110,14 +78,13 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager::new(
-        config.cert.autorenew,
-        PathBuf::from(&config.cert.cert_dir),
-        config.cert.email.clone(),
-        config.cert.acme_directory.clone(),
-        config.cert.renew_threshold_days,
-        config.cert.renew_check_interval_hours,
-        config.cert.renew_max_retries,
-        config.cert.key_type.clone(),
+        PathBuf::from(&config.acme.cert_dir),
+        config.acme.email.clone(),
+        config.acme.acme_directory.clone(),
+        config.acme.renew_threshold_days,
+        config.acme.renew_check_interval_hours,
+        config.acme.renew_max_retries,
+        config.acme.key_type.clone(),
     );
     let app = Arc::new(pangolin_core::App::new(
         &db_path,
@@ -131,15 +98,88 @@ fn main() -> anyhow::Result<()> {
         config.server.port
     );
 
-    // Build DNS provider if configured
-    let _dns_provider: Option<Arc<dyn DnsProvider>> = if !config.cert.dns.provider.is_empty() {
-        Some(build_dns_provider(&config.cert.dns)?)
-    } else {
-        None
+    // Ensure the cert dir exists before any service starts.
+    let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
+    if !cert_dir.exists() {
+        std::fs::create_dir_all(&cert_dir)?;
+    }
+
+    // ---- 2. Build shared shutdown token ------------------------------------
+    let shutdown = CancellationToken::new();
+
+    // ---- 3. Build the ACME state. The actual DNS reload + initial
+    //         cert scan run inside `AcmeService::run`, so a startup
+    //         failure there fails the process (fail-fast).
+    let acme_state = Arc::new(crate::acme::AcmeState::empty());
+
+    // ---- 4. Build services -------------------------------------------------
+    let tunnel_addr = config.server.tunnel_port.to_string();
+
+    // ---- 5. Spawn pingora on its own std::thread ---------------------------
+    // pingora runs `server.run(args)`, which observes our
+    // `CancellationToken` via `TokenShutdownSignalWatch` for graceful
+    // shutdown. The thread closure owns its `App` and shutdown clones.
+    let pingora_thread = {
+        let app = app.clone();
+        let shutdown = shutdown.clone();
+        let config = config.clone();
+        std::thread::Builder::new()
+            .name("pangolin-pingora".to_string())
+            .spawn(move || run_pingora(app, config, shutdown))?
     };
 
-    // Build pingora server
-    let mut server = Server::new(None)?;
+    // ---- 6. Host runtime: signals + non-pingora services -------------------
+    let host_result = runtime::block_on_host(async move {
+        // OS signal handlers cancel the shared token.
+        runtime::install_signal_handlers(shutdown.clone());
+
+        // Build & start services (fail-fast on startup error).
+        let services: Vec<Box<dyn runtime::Service>> = vec![
+            Box::new(acme::AcmeService::new(acme_state)),
+            Box::new(tunnel::TunnelService::new(format!(
+                "127.0.0.1:{tunnel_addr}"
+            ))),
+        ];
+
+        let ctx = runtime::ServiceContext::new(app, shutdown.clone());
+
+        let mut handles = Vec::with_capacity(services.len());
+        for svc in services.into_iter() {
+            handles.push(runtime::spawn_service(svc, ctx.clone()));
+        }
+
+        // Block on shutdown.
+        ctx.shutdown.cancelled().await;
+        log::info!("shutdown signalled, draining host services");
+
+        runtime::drain_services(handles).await;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // ---- 7. Wait for pingora to finish ------------------------------------
+    if let Err(e) = pingora_thread.join() {
+        log::warn!("pingora thread panicked: {:?}", e);
+    }
+
+    host_result
+}
+
+/// Build the pingora `Server`, add the proxy + admin services, and
+/// run it with a `TokenShutdownSignalWatch` so a single shared
+/// shutdown token drives the whole process.
+fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> anyhow::Result<()> {
+    // pingora's default `grace_period_seconds` is 300s (5 minutes) —
+    // far too long for a Ctrl-C exit. We shorten it to 5s and also
+    // cap the per-runtime shutdown timeout to 5s. The services have
+    // already drained by the time we get here (host runtime sees
+    // shutdown.cancelled() and exits), so pingora only needs a
+    // moment to drop its runtimes.
+    let conf = pingora::server::configuration::ServerConf {
+        grace_period_seconds: Some(5),
+        graceful_shutdown_timeout_seconds: Some(5),
+        ..Default::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();
 
     let conf = server.configuration.clone();
@@ -149,54 +189,33 @@ fn main() -> anyhow::Result<()> {
         sessions: Arc::new(::admin::state::SessionStore::default()),
     };
 
-    // HTTP proxy service (domain-routed)
+    // HTTP proxy service (domain-routed).
     let mut proxy_service = http_proxy_service(&conf, app_proxy);
     proxy_service.add_tcp(&format!("0.0.0.0:{}", config.server.port));
     if config.server.tls_port > 0 {
         let tls_addr = format!("0.0.0.0:{}", config.server.tls_port);
-        let host = config.server.host.as_deref().unwrap_or("default");
-        // Blob path: combined key+cert PEM, used as both cert and key argument
-        let (blob_path, _) = app
-            .cert_manager
-            .resolve_cert(host)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let mut tls_settings =
-            pingora::listeners::tls::TlsSettings::intermediate(&blob_path, &blob_path)
-                .map_err(|e| anyhow::anyhow!("TLS settings error: {}", e))?;
-        let _ = tls_settings.build();
-        tls_settings.enable_h2();
+        // v2: SNI callback that loads per-host cert blobs on demand.
+        let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
+        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone())?;
         proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
         log::info!(
-            "TLS enabled with HTTP/2 ALPN on {} (blob: {})",
+            "TLS enabled (SNI) with HTTP/2 ALPN on {} (cert_dir: {})",
             tls_addr,
-            blob_path
+            cert_dir.display()
         );
     }
     server.add_service(proxy_service);
 
-    // HTTP server (admin API + static files). Bound to the admin
-    // address from config — historically this service was added
-    // without `add_tcp`, which made the admin API unreachable. See
-    // `tests/src/real_e2e.rs::real_e2e_admin_endpoint` for the test
-    // that exercises this path.
+    // Admin HTTP server (admin API + static files).
     let mut http_server = Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
     http_server.add_tcp(&config.admin.addr);
     server.add_service(http_server);
 
-    // Tunnel WebSocket server (independent TCP listener, runs as background task).
-    // See the note above on why this is `std::thread::spawn` + a dedicated
-    // current-thread runtime, not `tokio::spawn`.
-    let app_tunnel = app.clone();
-    let tunnel_addr = format!("127.0.0.1:{}", config.server.tunnel_port);
-    std::thread::Builder::new()
-        .name("pangolin-tunnel".to_string())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tunnel runtime");
-            rt.block_on(tunnel::start_tunnel_server(app_tunnel, &tunnel_addr));
-        })?;
-
-    server.run_forever();
+    // Drive pingora with our shared shutdown token.
+    let run_args = RunArgs {
+        shutdown_signal: Box::new(runtime::TokenShutdownSignalWatch { token: shutdown }),
+    };
+    server.run(run_args);
+    log::info!("pingora exited cleanly");
+    Ok(())
 }

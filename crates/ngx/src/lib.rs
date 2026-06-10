@@ -6,6 +6,7 @@ pub mod acme;
 pub mod admin_api; // local JSON API (crates/ngx/src/admin_api.rs)
 pub mod dns;
 pub mod proxy;
+pub mod runtime;
 pub mod serve;
 
 // Re-export shared types so they are accessible as `crate::App` etc.

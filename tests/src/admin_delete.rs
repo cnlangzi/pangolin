@@ -67,6 +67,8 @@ fn admin_delete_domain() {
         domain: "delete-me.example.com".into(),
         site_name: "my-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();

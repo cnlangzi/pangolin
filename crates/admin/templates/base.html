@@ -28,6 +28,7 @@
       <a href="/admin/tun" class="nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
       <a href="/admin/tokens" class="nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
       <a href="/admin/certs" class="nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
+      <a href="/admin/dns" class="nav-link {% if active_nav == "dns" %}nav-link-active{% endif %}">DNS</a>
     </nav>
     <div class="flex items-center gap-2">
       <form method="POST" action="/admin/logout" class="hidden lg:block">
@@ -50,6 +51,7 @@
     <a href="/admin/tun" class="mobile-nav-link nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
     <a href="/admin/tokens" class="mobile-nav-link nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
     <a href="/admin/certs" class="mobile-nav-link nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
+    <a href="/admin/dns" class="mobile-nav-link nav-link {% if active_nav == "dns" %}nav-link-active{% endif %}">DNS</a>
     <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
       <input type="hidden" name="_csrf" value="__CSRF__">
       <button type="submit" class="mobile-nav-link nav-link text-danger hover:text-red-400 w-full text-left">

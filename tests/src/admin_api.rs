@@ -85,6 +85,8 @@ fn admin_domains_crud() {
         domain: "app.example.com".into(),
         site_name: "my-site".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
@@ -232,6 +234,8 @@ fn admin_reload_indexes() {
         domain: "reload.example.com".into(),
         site_name: "reload-test".into(),
         enabled: true,
+        auto_issue: false,
+        dns_provider: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();
