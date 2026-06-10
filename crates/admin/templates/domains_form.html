@@ -36,6 +36,33 @@
       </select>
     </div>
 
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-auto-issue">Cert management</label>
+      <label class="inline-flex items-center gap-2">
+        <input type="checkbox" name="auto_issue" value="1" id="domain-auto-issue"
+          {% if auto_issue_checked %}checked{% endif %}
+          class="rounded border-slate-300 text-accent-600 focus:ring-accent-500">
+        <span class="text-sm text-slate-700 dark:text-slate-200">
+          Auto-issue cert via ACME
+          <span class="text-xs text-slate-500 dark:text-slate-400">(uncheck for manual upload; required for wildcard domains)</span>
+        </span>
+      </label>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-dns-provider">DNS provider (DNS-01 challenge)</label>
+      <select name="dns_provider" id="domain-dns-provider"
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <option value="">(none — use HTTP-01)</option>
+        {% for p in dns_providers %}
+        <option value="{{ p.name }}"{% if dns_provider_value == p.name %} selected{% endif %}>{{ p.name }} ({{ p.kind }})</option>
+        {% endfor %}
+      </select>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        Required for wildcard domains. Manage providers under <a href="/admin/dns" class="text-accent-600 dark:text-accent-400 hover:underline">DNS</a>.
+      </p>
+    </div>
+
     {% if let Some(e) = error %}
     <div class="alert-error text-sm">
       <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">

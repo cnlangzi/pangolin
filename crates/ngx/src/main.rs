@@ -9,6 +9,7 @@ mod admin_api;
 mod dns;
 mod proxy;
 mod serve;
+mod tls;
 mod tunnel;
 
 pub use proxy::AppProxy;
@@ -115,22 +116,21 @@ fn main() -> anyhow::Result<()> {
     proxy_service.add_tcp(&format!("0.0.0.0:{}", config.server.port));
     if config.server.tls_port > 0 {
         let tls_addr = format!("0.0.0.0:{}", config.server.tls_port);
-        let host = config.server.host.as_deref().unwrap_or("default");
-        // Blob path: combined key+cert PEM, used as both cert and key argument
-        let (blob_path, _) = app
-            .cert_manager
-            .resolve_cert(host)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let mut tls_settings =
-            pingora::listeners::tls::TlsSettings::intermediate(&blob_path, &blob_path)
-                .map_err(|e| anyhow::anyhow!("TLS settings error: {}", e))?;
-        let _ = tls_settings.build();
-        tls_settings.enable_h2();
+        // v2: SNI callback that loads per-host cert blobs on demand.
+        // The legacy `config.server.host` setting is ignored — the
+        // listener serves TLS for any host that has a matching blob at
+        // `{cert_dir}/{host}`. Hosts without a blob fail the handshake
+        // (unrecognized_name alert).
+        let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
+        if !cert_dir.exists() {
+            std::fs::create_dir_all(&cert_dir)?;
+        }
+        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone())?;
         proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
         log::info!(
-            "TLS enabled with HTTP/2 ALPN on {} (blob: {})",
+            "TLS enabled (SNI) with HTTP/2 ALPN on {} (cert_dir: {})",
             tls_addr,
-            blob_path
+            cert_dir.display()
         );
     }
     server.add_service(proxy_service);

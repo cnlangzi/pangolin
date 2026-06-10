@@ -23,8 +23,9 @@ integration = []
 [dependencies]
 pangolin-core = { path = "../pangolin-core", features = ["rt"] }
 admin = { path = "../admin" }
-pingora.workspace = true
+pingora = { workspace = true, features = ["openssl"] }
 pingora-core = "0.8"
+pingora-openssl = "0.8"
 rusqlite.workspace = true
 http-body = "1"
 async-trait.workspace = true

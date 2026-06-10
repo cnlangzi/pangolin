@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ form_title }} · Pangolin{% endblock %}
+{% block content %}
+<div class="max-w-2xl mx-auto px-4 py-8">
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ form_title }}</h1>
+    <p class="text-sm text-slate-600 dark:text-slate-400 mt-1">
+      Credentials are stored in plaintext in the
+      <code class="text-xs bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded">dns_providers.config</code>
+      column. Configure your provider's API token / AK/SK below.
+    </p>
+  </div>
+
+  {% if let Some(e) = error %}
+  <div class="mb-4 p-3 rounded-lg bg-rose-50 dark:bg-rose-900/30 border border-rose-200 dark:border-rose-800 text-sm text-rose-700 dark:text-rose-300">
+    {{ e }}
+  </div>
+  {% endif %}
+
+  <form method="POST" action="{{ action }}" class="space-y-5 bg-white dark:bg-slate-800 shadow-sm border border-slate-200 dark:border-slate-700 rounded-xl p-6">
+    <input type="hidden" name="_csrf" value="__CSRF__">
+
+    <div>
+      <label class="form-label" for="name">Name (id)</label>
+      <input id="name" name="name" type="text" required pattern="[a-z0-9_-]+"
+        value="{{ self.name_value() }}"
+        {% if is_edit %}readonly{% endif %}
+        placeholder="e.g. main-cf"
+        class="form-input font-mono">
+      <p class="form-hint">Lowercase letters, digits, underscore, dash. Used in <code>domains.dns_provider</code>.</p>
+    </div>
+
+    <div>
+      <label class="form-label" for="kind">Provider kind</label>
+      <select id="kind" name="kind" required class="form-input" {% if is_edit %}disabled{% endif %}>
+        <option value="cloudflare" {% if self.is_kind("cloudflare") %}selected{% endif %}>Cloudflare</option>
+        <option value="aliyun"     {% if self.is_kind("aliyun")     %}selected{% endif %}>Aliyun DNS</option>
+        <option value="tencent"    {% if self.is_kind("tencent")    %}selected{% endif %}>Tencent DNSPod</option>
+      </select>
+      <p class="form-hint">Cannot be changed after creation (credential fields differ per kind).</p>
+    </div>
+
+    <div>
+      <label class="form-label" for="enabled">Enabled</label>
+      <label class="inline-flex items-center gap-2 mt-1">
+        <input type="checkbox" name="enabled" value="1"
+          {% if self.enabled_checked() %}checked{% endif %}
+          class="rounded border-slate-300 text-accent-600 focus:ring-accent-500">
+        <span class="text-sm text-slate-700 dark:text-slate-300">Active in the issuance pipeline</span>
+      </label>
+    </div>
+
+    <div class="border-t border-slate-200 dark:border-slate-700 pt-5">
+      <h2 class="text-sm font-semibold text-slate-900 dark:text-slate-100 mb-3">Credentials (JSON)</h2>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        Each kind expects a different JSON shape:
+      </p>
+      <ul class="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3 list-disc pl-5 font-mono">
+        <li>cloudflare: <code>{"api_token":"..."}</code></li>
+        <li>aliyun: <code>{"access_key_id":"...","access_key_secret":"...","region":"cn-hangzhou"}</code></li>
+        <li>tencent: <code>{"secret_id":"...","secret_key":"..."}</code></li>
+      </ul>
+      <textarea name="config" required rows="6" class="form-input font-mono text-sm"
+        placeholder='{"api_token":"..."}'>{{ self.config_value() }}</textarea>
+    </div>
+
+    <div class="flex items-center justify-end gap-2 pt-3">
+      <a href="/admin/dns" class="btn-secondary">Cancel</a>
+      <button type="submit" class="btn-primary">{{ submit_label }}</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -39,13 +39,17 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
 pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
     drop(db);
     let html = DomainFormTemplate {
         sites,
+        dns_providers,
         error: None,
         active_nav: "domains",
         preselected_site: None,
         preselected_site_name: None,
+        dns_provider_value: String::new(),
+        auto_issue_checked: false,
     }
     .render()
     .unwrap();
@@ -163,13 +167,17 @@ pub async fn api_render_form_new(
 ) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
     drop(db);
     let html = DomainFormTemplate {
         sites,
+        dns_providers,
         error: None,
         active_nav: "domains",
         preselected_site: Some(site_name.to_string()),
         preselected_site_name: Some(site_name.to_string()),
+        dns_provider_value: String::new(),
+        auto_issue_checked: false,
     }
     .render()
     .unwrap();
@@ -184,6 +192,18 @@ pub async fn handle_create(
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let site_name = params.get("site_name").cloned().unwrap_or_default();
+    let auto_issue = params.get("auto_issue").map(|_| true).unwrap_or(false);
+    let dns_provider = params
+        .get("dns_provider")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let dns_provider = if dns_provider.is_empty() {
+        None
+    } else {
+        Some(dns_provider)
+    };
 
     if domain.is_empty() {
         return render_create_page_with_error(app, "Domain name is required", csrf, None).await;
@@ -200,13 +220,42 @@ pub async fn handle_create(
         )
         .await;
     }
+    // Wildcard domains must have a DNS association (DNS-01 is the only
+    // way to validate `*.example.com`).
+    if domain.starts_with("*.") && dns_provider.is_none() {
+        return render_create_page_with_error(
+            app,
+            "Wildcard domains require a DNS provider for DNS-01 validation. \
+             Add one under DNS first, then assign it to this domain.",
+            csrf,
+            None,
+        )
+        .await;
+    }
+    // If a DNS provider is referenced, verify it exists.
+    if let Some(ref name) = dns_provider {
+        let db = app.db.lock().await;
+        let exists = pangolin_core::db::get_dns_provider(&db, name)
+            .unwrap_or(None)
+            .is_some();
+        drop(db);
+        if !exists {
+            return render_create_page_with_error(
+                app,
+                &format!("DNS provider '{name}' does not exist; create it under DNS first"),
+                csrf,
+                None,
+            )
+            .await;
+        }
+    }
 
     let d = pangolin_core::types::Domain {
         domain,
         site_name,
         enabled: true,
-        auto_issue: false,
-        dns_provider: None,
+        auto_issue,
+        dns_provider,
         created_at: chrono::Utc::now(),
     };
 
@@ -233,13 +282,17 @@ async fn render_create_page_with_error(
 ) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
     drop(db);
     let html = DomainFormTemplate {
         sites,
+        dns_providers,
         error: Some(error),
         active_nav: "domains",
         preselected_site: preselected_site.map(String::from),
         preselected_site_name: preselected_site.map(String::from),
+        dns_provider_value: String::new(),
+        auto_issue_checked: false,
     }
     .render()
     .unwrap();
