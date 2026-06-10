@@ -306,6 +306,20 @@ domains:
 
 ### 证书管理
 
+**文件命名约定**（对齐 Go [`autocert.DirCache`](https://pkg.go.dev/golang.org/x/crypto/acme/autocert#DirCache) 的 `certKey.String()` 逻辑）：
+
+| 含义 | 文件名 | 内容 |
+|------|--------|------|
+| 默认 ECDSA cert+key blob（autocert 的 `KeyType::default`） | `{domain}` | SEC1 `EC PRIVATE KEY` + cert 链 |
+| RSA 变体（`key_type: rsa`） | `{domain}+rsa` | PKCS#1 `RSA PRIVATE KEY` + cert 链 |
+| 通配符（字面 `*`） | `*.example.com` | 同一个 blob |
+| 多 SAN 副本 | 每 SAN 一份同名 blob | 内容字节完全相同 |
+| ACME 账号 | `acme_account+key` | instant-acme `AccountCredentials` JSON |
+
+`{domain}` 不带 suffix 即 ECDSA（和 autocert 默认一致）；**不带 `+ecdsa` 标注**。所有 cert 文件 `0600` 权限（root 或运行用户）。和 `proxy mux` (`/usr/local/proxy/certs`) 字节级兼容，pangolin 写出的 cert  proxy mux 可直接读。
+
+> ⚠️ 通配符文件名包含 `*` 字符。**Shell 操作时必须加引号**：`rm -rf '*.example.com'`，否则 glob 展开会误删多 SAN 副本。
+
 **申请规则**：
 
 - 泛域名 `*.example.com` → 申请 `*.example.com` + `example.com`
