@@ -52,6 +52,19 @@ cert:
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3
+  key_type: ecdsa         # ecdsa | rsa (default: ecdsa)
+
+  # dns:
+  #   provider: cloudflare
+  #   cloudflare:
+  #     api_token: "${CF_API_TOKEN}"   # REQUIRED if dns.provider is set
+  #   # aliyun:
+  #   #   access_key_id: "${ALI_AK_ID}"
+  #   #   access_key_secret: "${ALI_AK_SECRET}"
+  #   #   region: ""                  # optional region (default: cn-hangzhou)
+  #   # tencent:
+  #   #   secret_id: "${TC_ID}"
+  #   #   secret_key: "${TC_KEY}"
 
 log:
   level: debug            # env_logger filter: trace|debug|info|warn|error

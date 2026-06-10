@@ -24,6 +24,7 @@ fn make_cert_manager() -> CertManager {
         30,
         6,
         3,
+        "ecdsa".into(),
     )
 }
 
@@ -155,6 +156,7 @@ fn cert_settings_override_disable() {
         30,
         6,
         3,
+        "ecdsa".into(),
     );
     cm.set_autorenew_override(Some(false));
     assert!(!cm.is_autorenew_enabled());

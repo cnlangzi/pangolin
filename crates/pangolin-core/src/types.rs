@@ -111,13 +111,35 @@ pub struct Token {
 }
 
 /// Certificate (certs table). domain is the primary key (1:1).
+/// In the new blob layout, cert_file == key_file (both point to the same blob path).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cert {
     pub domain: String,
+    /// Path to the blob file (key+cert combined). Equal to key_file.
     pub cert_file: String,
+    /// Path to the blob file (key+cert combined). Equal to cert_file.
     pub key_file: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// SAN list as JSON array string, e.g. `["example.com","www.example.com"]`.
+    #[serde(default)]
+    pub sans: Vec<String>,
+    /// Source: "acme" or "manual".
+    #[serde(default = "default_cert_source")]
+    pub source: String,
+    /// ACME DNS provider used for issuance (cloudflare|aliyun|tencent).
+    #[serde(default)]
+    pub acme_dns_provider: Option<String>,
+    /// ACME account identifier used for issuance.
+    #[serde(default)]
+    pub acme_account_id: Option<String>,
+    /// When the cert was issued (Unix timestamp seconds).
+    #[serde(default)]
+    pub issued_at: i64,
+}
+
+fn default_cert_source() -> String {
+    "manual".to_string()
 }
 
 /// Result of `parse_backend` — what kind of upstream this site is.

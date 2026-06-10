@@ -81,6 +81,11 @@ pub async fn handle_create(
         key_file,
         expires_at,
         created_at: chrono::Utc::now(),
+        sans: vec![],
+        source: "manual".to_string(),
+        acme_dns_provider: None,
+        acme_account_id: None,
+        issued_at: 0,
     };
 
     let db = app.db.lock().await;

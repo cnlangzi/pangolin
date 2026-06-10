@@ -4,6 +4,7 @@
 
 pub mod acme;
 pub mod admin_api; // local JSON API (crates/ngx/src/admin_api.rs)
+pub mod dns;
 pub mod proxy;
 pub mod serve;
 

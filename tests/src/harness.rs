@@ -102,21 +102,20 @@ async fn wait_for_port(port: u16, timeout: Duration) {
 }
 
 /// Generate a self-signed cert+key pair for the given SANs and write
-/// them as `fullchain.pem` and `privkey.pem` into `out_dir`. The
-/// format matches what `pangolin-ngx` expects (PEM-encoded cert +
-/// PEM-encoded private key, both in the same file structure as
-/// Let's Encrypt's `fullchain.pem` / `privkey.pem`).
-pub fn gen_self_signed(sans: &[&str], out_dir: &Path) -> (PathBuf, PathBuf) {
+/// them as a single autocert DirCache blob at `{cert_dir}/{host}`.
+/// The blob format is: key PEM first, then cert chain PEM (matches
+/// `acme.rs::build_blob` and Go's `autocert.DirCache` byte layout).
+pub fn gen_self_signed(sans: &[&str], host: &str, cert_dir: &Path) -> PathBuf {
     let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
     let cert_key = rcgen::generate_simple_self_signed(sans).expect("generate self-signed cert");
     let cert_pem = cert_key.cert.pem();
     let key_pem = cert_key.signing_key.serialize_pem();
 
-    let cert_path = out_dir.join("fullchain.pem");
-    let key_path = out_dir.join("privkey.pem");
-    std::fs::write(&cert_path, cert_pem).expect("write fullchain.pem");
-    std::fs::write(&key_path, key_pem).expect("write privkey.pem");
-    (cert_path, key_path)
+    // Autocert DirCache blob: key PEM first, then cert chain.
+    let blob = format!("{}\n{}\n", key_pem.trim_end(), cert_pem.trim_end());
+    let blob_path = cert_dir.join(host);
+    std::fs::write(&blob_path, blob).expect("write autocert blob");
+    blob_path
 }
 
 /// The pangolin SQLite schema. Mirrors `crates/pangolin-core/src/schema.sql`.
@@ -214,9 +213,9 @@ impl NgxProcess {
             .expect("create tempdir for ngx e2e");
         let data_dir = tmpdir.path().join("data");
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let cert_dir = tmpdir.path().join("certs").join("default");
-        std::fs::create_dir_all(&cert_dir).expect("mkdir certs/default");
-        gen_self_signed(&["localhost", "127.0.0.1"], &cert_dir);
+        let cert_dir = tmpdir.path().join("certs");
+        std::fs::create_dir_all(&cert_dir).expect("mkdir certs");
+        gen_self_signed(&["localhost", "127.0.0.1"], "default", &cert_dir);
 
         let http_port = free_port();
         let tls_port = free_port();

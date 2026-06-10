@@ -183,6 +183,11 @@ fn admin_certs_crud() {
         key_file: "/certs/example.com.key".into(),
         expires_at: Some(Utc::now()),
         created_at: Utc::now(),
+        sans: vec!["example.com".into()],
+        source: "manual".into(),
+        acme_dns_provider: None,
+        acme_account_id: None,
+        issued_at: 0,
     };
 
     // Create

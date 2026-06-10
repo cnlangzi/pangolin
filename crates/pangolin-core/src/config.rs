@@ -142,6 +142,53 @@ pub struct CertConfig {
     pub renew_check_interval_hours: u32,
     #[serde(default = "default_renew_max_retries")]
     pub renew_max_retries: u32,
+    /// Private key type for new certificates.
+    #[serde(default = "default_key_type")]
+    pub key_type: String,
+    /// DNS-01 challenge configuration. Present → DNS-01 mode (wildcard + no port 80).
+    /// Absent → HTTP-01 fallback.
+    #[serde(default)]
+    pub dns: DnsConfig,
+}
+
+fn default_key_type() -> String {
+    "ecdsa".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DnsConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub cloudflare: CloudflareDnsConfig,
+    #[serde(default)]
+    pub aliyun: AliyunDnsConfig,
+    #[serde(default)]
+    pub tencent: TencentDnsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CloudflareDnsConfig {
+    #[serde(default)]
+    pub api_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AliyunDnsConfig {
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub access_key_secret: String,
+    #[serde(default)]
+    pub region: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TencentDnsConfig {
+    #[serde(default)]
+    pub secret_id: String,
+    #[serde(default)]
+    pub secret_key: String,
 }
 
 fn default_cert_dir() -> String {
@@ -173,6 +220,8 @@ impl Default for CertConfig {
             renew_threshold_days: 30,
             renew_check_interval_hours: 6,
             renew_max_retries: 3,
+            key_type: default_key_type(),
+            dns: DnsConfig::default(),
         }
     }
 }
@@ -209,7 +258,70 @@ impl Config {
     /// Parse from a YAML string (used in tests).
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        serde_yaml::from_str(s).map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
+        let expanded = Self::expand_env_vars(s);
+        serde_yaml::from_str(&expanded)
+            .map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
+    }
+
+    /// Expand ${VAR} and ${VAR:-default} placeholders from environment variables.
+    /// Missing required vars cause startup failure with a clear error.
+    fn expand_env_vars(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '$' && chars.peek() == Some(&'{') {
+                chars.next(); // consume '{'
+                let mut var_name = String::new();
+                let mut has_default = false;
+                let mut default_val = String::new();
+
+                while let Some(&c) = chars.peek() {
+                    if c == '}' {
+                        chars.next(); // consume '}'
+                        break;
+                    }
+                    if c == ':' {
+                        // Check for :- default syntax
+                        let mut peek = chars.clone();
+                        peek.next(); // skip ':'
+                        if peek.peek() == Some(&'-') {
+                            has_default = true;
+                            chars.next(); // consume ':'
+                            chars.next(); // consume '-'
+                            while let Some(&nc) = chars.peek() {
+                                if nc == '}' {
+                                    chars.next();
+                                    break;
+                                }
+                                default_val.push(nc);
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                    var_name.push(c);
+                    chars.next();
+                }
+
+                let env_val = std::env::var(&var_name);
+                match env_val {
+                    Ok(val) => result.push_str(&val),
+                    Err(_) if has_default => result.push_str(&default_val),
+                    Err(_) => {
+                        // Fail-fast: missing env var with no default
+                        eprintln!(
+                            "ERROR: config references ${{{}}} but the environment variable {} is not set",
+                            var_name, var_name
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
     }
 }
 
@@ -298,5 +410,35 @@ mod tests {
         "#;
         let c = Config::from_str(s).unwrap();
         assert!(!c.cert.autorenew);
+    }
+
+    #[test]
+    fn dns_config_parsed() {
+        let s = r#"
+            cert:
+              dns:
+                provider: cloudflare
+                cloudflare:
+                  api_token: "${CF_API_TOKEN:-}"
+        "#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(c.cert.dns.provider, "cloudflare");
+        // With CF_API_TOKEN unset, the default empty string is used (has default)
+    }
+
+    #[test]
+    fn key_type_default_ecdsa() {
+        let c = Config::default();
+        assert_eq!(c.cert.key_type, "ecdsa");
+    }
+
+    #[test]
+    fn key_type_explicit_rsa() {
+        let s = r#"
+            cert:
+              key_type: rsa
+        "#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(c.cert.key_type, "rsa");
     }
 }
