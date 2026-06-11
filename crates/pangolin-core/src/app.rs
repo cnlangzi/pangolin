@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -196,10 +195,8 @@ impl App {
 
         let sites = db::list_sites(&conn)?;
         let domains = db::list_domains(&conn)?;
-        let tokens = db::list_tokens(&conn)?;
         let providers = db::list_dns_providers(&conn)?;
-        let now = Utc::now();
-        let indexes = Indexes::build(sites, domains.clone(), &tokens, now);
+        let indexes = Indexes::build(sites, domains.clone());
         let dns_index = DnsIndex::build(&providers, &domains);
 
         Ok(Self {
@@ -222,10 +219,8 @@ impl App {
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
         let domains = db::list_domains(&conn).unwrap_or_default();
-        let tokens = db::list_tokens(&conn).unwrap_or_default();
         let providers = db::list_dns_providers(&conn).unwrap_or_default();
-        let now = Utc::now();
-        let indexes = Indexes::build(sites, domains.clone(), &tokens, now);
+        let indexes = Indexes::build(sites, domains.clone());
         let dns_index = DnsIndex::build(&providers, &domains);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
@@ -381,6 +376,7 @@ impl Default for CertManager {
 mod tests {
     use super::*;
     use crate::types::{DnsProvider, DnsProviderKind, Domain};
+    use chrono::Utc;
     use std::fs;
 
     #[test]

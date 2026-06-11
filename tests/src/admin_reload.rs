@@ -30,7 +30,7 @@ fn build_indexes(conn: &Connection) -> Indexes {
     let sites = db::list_sites(conn).unwrap();
     let domains = db::list_domains(conn).unwrap();
     let tokens = db::list_tokens(conn).unwrap();
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// admin_reload_site — insert site → rebuild indexes → domain lookup finds it
@@ -105,7 +105,7 @@ fn admin_reload_domain() {
     let domains = db::list_domains(&conn).unwrap();
     let sites = db::list_sites(&conn).unwrap();
     let tokens = db::list_tokens(&conn).unwrap();
-    let indexes = Indexes::build(sites, domains, &tokens, Utc::now());
+    let indexes = Indexes::build(sites, domains);
 
     let result = pangolin_core::index::lookup_site(&indexes, "new.example.com");
     assert!(result.is_some());
@@ -155,7 +155,7 @@ fn admin_reload_tun() {
     let domains = db::list_domains(&conn).unwrap();
     let sites = db::list_sites(&conn).unwrap();
     let tokens = db::list_tokens(&conn).unwrap();
-    let indexes = Indexes::build(sites, domains, &tokens, Utc::now());
+    let indexes = Indexes::build(sites, domains);
 
     // Tun index should contain 'office' → site 'tun-site'
     let tun_entry = indexes.tun.get("office");

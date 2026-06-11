@@ -15,27 +15,36 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite};
 
+use crate::config::TunConfig;
 use crate::frame::{
     deflate_decode, deflate_encode, deserialize_msgpack, serialize_frames, TunnelFrame,
     TunnelRequestFrame, TunnelResponseFrame,
 };
 
-pub struct Config {
-    pub server: String,
-    pub token: String,
-    pub name: String,
-}
-
 struct PendingRequest;
 
+/// Outcome of a single connect + session cycle, used by [`TunnelClient::run`]
+/// to drive the reconnect loop. Distinguishing "we never got past the
+/// handshake" from "we connected and then the session ended" is what
+/// lets the loop reset the backoff only when a session actually ran.
+enum SessionOutcome {
+    /// WS handshake completed, then the session ended.
+    /// `Ok(())` = clean stream close; `Err(e)` = session errored
+    /// mid-flight (the underlying cause is logged, not surfaced).
+    EstablishedAndEnded(Result<()>),
+    /// Could not establish the WS connection at all (ngx offline,
+    /// DNS failure, auth rejection, …).
+    NeverConnected(anyhow::Error),
+}
+
 pub struct TunnelClient {
-    config: Config,
+    config: TunConfig,
     http_client: Client,
     pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
 }
 
 impl TunnelClient {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: TunConfig) -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
@@ -57,30 +66,74 @@ impl TunnelClient {
             self.config.server
         );
 
-        let mut reconnect_delay_secs: u64 = 1;
-        let max_delay_secs: u64 = 30;
+        // Reconnect policy:
+        //   - Never exit on a dropped session. ngx may restart, the
+        //     network may flap, or ngx may simply not be online yet
+        //     (e.g. a tun that boots before its gateway). Any of those
+        //     is recoverable; the operator controls lifecycle via
+        //     systemd, not via the tun's idea of "done".
+        //   - Exponential backoff with a 30s ceiling for connect
+        //     failures (ngx offline).
+        //   - Reset backoff to 1s after a session actually established
+        //     (got past the WS handshake). A network blip that drops a
+        //     healthy session should not leave us at 30s between every
+        //     subsequent reconnect.
+        //   - Small jitter (0..=500ms) so a fleet of tun clients
+        //     reconnecting after an ngx restart doesn't synchronize
+        //     their retries (thundering herd).
+        const INITIAL_BACKOFF_SECS: u64 = 1;
+        const MAX_BACKOFF_SECS: u64 = 30;
+        const MAX_JITTER_MS: u64 = 500;
+
+        let mut backoff_secs: u64 = INITIAL_BACKOFF_SECS;
 
         loop {
-            match self.connect_and_handle().await {
-                Ok(()) => {
-                    log::info!("tun {} disconnected normally", self.config.name);
-                    break;
+            let session_outcome = self.connect_and_handle().await;
+            match session_outcome {
+                SessionOutcome::EstablishedAndEnded(Ok(())) => {
+                    log::info!(
+                        "tun {} disconnected, will reconnect",
+                        self.config.name
+                    );
+                    // We got past the handshake, so a session ran.
+                    // Reset backoff — the next drop is a fresh event,
+                    // not a continuation of an outage.
+                    backoff_secs = INITIAL_BACKOFF_SECS;
                 }
-                Err(e) => {
+                SessionOutcome::EstablishedAndEnded(Err(e)) => {
+                    log::warn!(
+                        "tun {} session errored ({}), will reconnect",
+                        self.config.name,
+                        e
+                    );
+                    backoff_secs = INITIAL_BACKOFF_SECS;
+                }
+                SessionOutcome::NeverConnected(e) => {
                     log::error!(
-                        "tun {} connection error: {}, reconnecting in {}s",
+                        "tun {} connect error: {}, reconnecting in {}s",
                         self.config.name,
                         e,
-                        reconnect_delay_secs
+                        backoff_secs
                     );
-                    sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                    reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_delay_secs);
+                    // Backoff not reset — keep doubling up to the cap.
                 }
             }
+
+            let jitter_ms =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis() as u64).unwrap_or(0)
+                    % (MAX_JITTER_MS + 1);
+            sleep(Duration::from_millis(
+                backoff_secs * 1000 + jitter_ms,
+            ))
+            .await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
         }
     }
 
-    async fn connect_and_handle(&self) -> Result<()> {
+    /// One connect+session cycle. Returns whether the WebSocket
+    /// handshake ever completed, so the caller can decide whether
+    /// to reset the reconnect backoff.
+    async fn connect_and_handle(&self) -> SessionOutcome {
         let ws_url = format!(
             "ws://{}/tunnel?token={}&name={}",
             self.config.server, self.config.token, self.config.name
@@ -92,10 +145,16 @@ impl TunnelClient {
             self.config.server,
             self.config.name
         );
-        let (ws_stream, _) = connect_async(&ws_url).await?;
+        let (ws_stream, _) = match connect_async(&ws_url).await {
+            Ok(s) => s,
+            Err(e) => return SessionOutcome::NeverConnected(e.into()),
+        };
         log::info!("tun {} connected to ngx", self.config.name);
 
-        self.handle_stream(ws_stream).await
+        match self.handle_stream(ws_stream).await {
+            Ok(()) => SessionOutcome::EstablishedAndEnded(Ok(())),
+            Err(e) => SessionOutcome::EstablishedAndEnded(Err(e)),
+        }
     }
 
     async fn handle_stream(
@@ -418,35 +477,4 @@ impl TunnelClient {
             body,
         })
     }
-}
-
-/// Validate CLI arguments.
-pub fn validate_config(config: &Config) -> Result<()> {
-    if config.token.is_empty() {
-        anyhow::bail!("token must not be empty");
-    }
-    if config.name.is_empty() {
-        anyhow::bail!("name must not be empty");
-    }
-    // Must match ^[a-z0-9_-]+$ (1~32 chars, lowercase only, not purely numeric)
-    if config.name.len() > 32 {
-        anyhow::bail!("name must be at most 32 characters");
-    }
-    if !config
-        .name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-    {
-        anyhow::bail!(
-            "name '{}' must match ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore only)",
-            config.name
-        );
-    }
-    if config.name.chars().all(|c| c.is_ascii_digit()) {
-        anyhow::bail!("name '{}' cannot be purely numeric", config.name);
-    }
-    if config.server.is_empty() {
-        anyhow::bail!("server must not be empty");
-    }
-    Ok(())
 }

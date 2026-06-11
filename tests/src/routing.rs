@@ -49,7 +49,7 @@ fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
         created_at: Utc::now(),
         expires_at: None,
     }];
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 // ---------------------------------------------------------------------------

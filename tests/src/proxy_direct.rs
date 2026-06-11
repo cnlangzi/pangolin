@@ -63,7 +63,7 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
     let tokens = vec![];
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 // ---------------------------------------------------------------------------

@@ -16,8 +16,9 @@ mod frame;
 #[cfg(test)]
 mod test_ws_server;
 
-use client::{validate_config, Config as ClientConfig, TunnelClient};
+use client::TunnelClient;
 use config::TunConfig;
+use pangolin_core::init_logger;
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "tun")]
@@ -32,74 +33,10 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let tun_cfg = TunConfig::from_file(&args.config)?;
-
-    // env_logger is built once from the config's [log] section.
-    // If `log.file` is set, we tee stderr to that file; otherwise
-    // stderr only.
     init_logger(&tun_cfg.log);
 
-    // The wire client takes a small `Config` (the three connection
-    // fields). Mapping from TunConfig keeps the wire code unchanged.
-    let client_cfg = ClientConfig {
-        server: tun_cfg.server.clone(),
-        token: tun_cfg.token.clone(),
-        name: tun_cfg.name.clone(),
-    };
-    validate_config(&client_cfg)?;
-
-    log::info!(
-        "starting tun node: name={}, server={}",
-        client_cfg.name,
-        client_cfg.server
-    );
-
-    let client = TunnelClient::new(client_cfg);
+    let client = TunnelClient::new(tun_cfg);
     client.run().await;
 
     Ok(())
-}
-
-fn init_logger(log_cfg: &config::LogConfig) {
-    use std::io::Write;
-
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(log_cfg.level.as_str()),
-    );
-
-    if !log_cfg.file.is_empty() {
-        let path = log_cfg.file.clone();
-        // Open (or create) the log file. We don't rotate here — the
-        // expectation is that an external logrotate / journald unit
-        // handles retention. The file handle is leaked (env_logger
-        // owns it for the process lifetime) which is the documented
-        // pattern.
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                builder.target(env_logger::Target::Pipe(Box::new(file)));
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not open log file {}: {}; falling back to stderr",
-                    path, e
-                );
-            }
-        }
-    }
-
-    builder
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} [{}] [{}] {}",
-                chrono::Utc::now().to_rfc3339(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
 }

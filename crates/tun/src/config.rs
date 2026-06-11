@@ -5,12 +5,21 @@
 //! separate from `ngx.yml`: the two binaries share a protocol, not a
 //! process, and mixing their configs would hide which knob affects
 //! which surface.
+//!
+//! Loaded with `figment`: YAML provides the base, `TUN_*` env vars
+//! override. e.g. `TUN_TOKEN=…` wins over `tun.yml: token:`, and
+//! `TUN_LOG__LEVEL=debug` overrides `log.level` (the `__` is the
+//! nested-key separator). This replaces the old `${VAR}` text
+//! substitution scheme, which scanned the raw YAML text and could
+//! not tell a documentation example from a real value.
 
 use std::path::Path;
 
+use figment::providers::{Env, Format, Yaml};
+use figment::Figment;
 use serde::{Deserialize, Serialize};
 
-use pangolin_core::config::expand_env_vars;
+use pangolin_core::config::LogConfig;
 
 /// Top-level config for the `pangolin-tun` binary. Read once at startup.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -31,40 +40,22 @@ pub struct TunConfig {
     pub log: LogConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LogConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    #[serde(default)]
-    pub file: String,
-}
-
-fn default_log_level() -> String {
-    "info".into()
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            level: default_log_level(),
-            file: String::new(),
-        }
-    }
-}
-
 impl TunConfig {
-    /// Load from a YAML file. Missing optional sections default.
+    /// Load from a YAML file, with `TUN_*` env vars layered on top.
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         Self::from_str(&s)
     }
 
-    /// Parse from a YAML string (used in tests).
+    /// Parse from a YAML string (used in tests) with the same env
+    /// override as [`from_file`].
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        let expanded = expand_env_vars(s);
-        let cfg: Self =
-            serde_yaml::from_str(&expanded).map_err(|e| anyhow::anyhow!("tun.yml parse: {}", e))?;
+        let cfg: Self = Figment::new()
+            .merge(Yaml::string(s))
+            .merge(Env::prefixed("TUN_").split("__"))
+            .extract()
+            .map_err(|e| anyhow::anyhow!("tun.yml parse: {}", e))?;
         validate(&cfg)?;
         Ok(cfg)
     }
@@ -105,6 +96,14 @@ pub fn validate(c: &TunConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global, but cargo runs tests in parallel
+    // by default. Every test that touches TUN_TOKEN / TUN_LOG__LEVEL
+    // must hold this mutex for its full duration (set → load →
+    // assert → remove) so a parallel runner never sees a leaked
+    // value.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config_uses_empty_required_fields() {
@@ -120,6 +119,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_yaml() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = r#"
             server: gateway.local:8080
             token: "secret-abc"
@@ -134,16 +134,18 @@ mod tests {
 
     #[test]
     fn parse_full_yaml() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = r#"
             server: gateway.example.com:8443
-            token: "${TUN_TOKEN}"
+            token: file-token
             name: home
 
             log:
               level: debug
               file: "/var/log/pangolin-tun.log"
         "#;
-        // Set the env so the ${TUN_TOKEN} expansion succeeds.
+        // Env override beats the file value: TUN_TOKEN wins over
+        // `token: file-token`.
         std::env::set_var("TUN_TOKEN", "injected-token");
         let c = TunConfig::from_str(s).unwrap();
         std::env::remove_var("TUN_TOKEN");
@@ -152,6 +154,21 @@ mod tests {
         assert_eq!(c.name, "home");
         assert_eq!(c.log.level, "debug");
         assert_eq!(c.log.file, "/var/log/pangolin-tun.log");
+    }
+
+    #[test]
+    fn env_overrides_nested_log_level() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // TUN_LOG__LEVEL splits on `__` → `log.level`.
+        let s = r#"
+            server: x:1
+            token: t
+            name: office
+        "#;
+        std::env::set_var("TUN_LOG__LEVEL", "warn");
+        let c = TunConfig::from_str(s).unwrap();
+        std::env::remove_var("TUN_LOG__LEVEL");
+        assert_eq!(c.log.level, "warn");
     }
 
     #[test]
@@ -178,6 +195,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_token() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = r#"
             server: x:1
             token: ""

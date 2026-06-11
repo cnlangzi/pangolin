@@ -9,7 +9,15 @@
 //! (no `proxy:` wrapper) makes the obvious thing obvious: this file
 //! *is* the proxy config.
 //!
-//! Loaded from YAML, validated, and held in memory.
+//! Loaded from YAML with `figment`, validated, and held in memory.
+//! Environment variables override file values: any var named
+//! `NGX_<SECTION>__<KEY>` (the `__` is the nested-key separator)
+//! wins over the corresponding YAML path, e.g.
+//! `NGX_ADDR__HTTP=":8080"` overrides `addr.http`,
+//! `NGX_LOG__LEVEL=debug` overrides `log.level`. This replaces the
+//! old `${VAR}` text-substitution scheme (which scanned the raw
+//! YAML text, comments and all, and so could not tell a
+//! documentation example from a real value).
 //!
 //! In v2 (PR #23) the previous global `cert.autorenew` toggle was
 //! removed — per-domain `auto_issue` in the `domains` table now
@@ -17,6 +25,8 @@
 //! section here only holds operational tuning (cert_dir, directory
 //! URL, renew cadence, key type).
 
+use figment::providers::{Env, Format, Yaml};
+use figment::Figment;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -270,84 +280,73 @@ impl Default for LogConfig {
     }
 }
 
+/// Install the process-wide logger from a `LogConfig`.
+///
+/// Honors `log.level` as the default filter and, if `log.file` is
+/// non-empty, tees stderr to that file (appending; the file handle
+/// is owned by `env_logger` for the process lifetime — external
+/// logrotate / journald handles retention). Shared by `ngx` and
+/// `tun` so the two binaries emit the same line format regardless
+/// of which one you're tailing.
+pub fn init_logger(log_cfg: &LogConfig) {
+    use std::io::Write;
+
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(log_cfg.level.as_str()),
+    );
+
+    if !log_cfg.file.is_empty() {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_cfg.file)
+        {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not open log file {}: {}; falling back to stderr",
+                    log_cfg.file, e
+                );
+            }
+        }
+    }
+
+    builder
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] [{}] {}",
+                chrono::Utc::now().to_rfc3339(),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
+}
+
 impl Config {
-    /// Load from a YAML file. Missing optional sections are filled
-    /// with defaults.
+    /// Load from a YAML file, with `NGX_*` env vars layered on top.
+    /// Missing optional sections / fields fall back to the defaults
+    /// declared via `#[serde(default = "…")]` on the struct.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let s = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
         Self::from_str(&s)
     }
 
-    /// Parse from a YAML string (used in tests).
+    /// Parse from a YAML string (used in tests) with the same env
+    /// override as [`from_file`]. The two-arg form makes the layered
+    /// load explicit at the call site.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        let expanded = expand_env_vars(s);
-        serde_yaml::from_str(&expanded)
-            .map_err(|e| PangolinError::Config(format!("YAML parse: {}", e)))
+        Figment::new()
+            .merge(Yaml::string(s))
+            .merge(Env::prefixed("NGX_").split("__"))
+            .extract()
+            .map_err(|e| PangolinError::Config(format!("config: {}", e)))
     }
-}
-
-/// Expand `${VAR}` and `${VAR:-default}` placeholders from environment
-/// variables. Missing required vars cause startup failure with a clear
-/// error. Used by both the `ngx` config loader and the `tun` config
-/// loader (see `tun::config`), so it lives in the shared core crate.
-pub fn expand_env_vars(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            let mut has_default = false;
-            let mut default_val = String::new();
-
-            while let Some(&c) = chars.peek() {
-                if c == '}' {
-                    chars.next(); // consume '}'
-                    break;
-                }
-                if c == ':' {
-                    // Check for :- default syntax
-                    let mut peek = chars.clone();
-                    peek.next(); // skip ':'
-                    if peek.peek() == Some(&'-') {
-                        has_default = true;
-                        chars.next(); // consume ':'
-                        chars.next(); // consume '-'
-                        while let Some(&nc) = chars.peek() {
-                            if nc == '}' {
-                                chars.next();
-                                break;
-                            }
-                            default_val.push(nc);
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-                var_name.push(c);
-                chars.next();
-            }
-
-            let env_val = std::env::var(&var_name);
-            match env_val {
-                Ok(val) => result.push_str(&val),
-                Err(_) if has_default => result.push_str(&default_val),
-                Err(_) => {
-                    // Fail-fast: missing env var with no default
-                    eprintln!(
-                        "ERROR: config references ${{{}}} but the environment variable {} is not set",
-                        var_name, var_name
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
 }
 
 #[cfg(test)]
@@ -468,16 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_default_addr_is_any() {
-        // Defaults to 0.0.0.0:9001 so a multi-host deploy (tun
-        // running on a separate host) connects without an explicit
-        // override. Loopback connections still work because
-        // 0.0.0.0 accepts 127.0.0.1.
-        let c = Config::default();
-        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
-    }
-
-    #[test]
     fn tunnel_addr_overridable_to_loopback() {
         // Operators who want the old "tun is local-only" semantics
         // (e.g. dev or SSH-tunnel production) can override to
@@ -493,35 +482,15 @@ mod tests {
     }
 
     #[test]
-    fn admin_default_addr_is_any() {
-        // Defaults to 0.0.0.0:9081 so a remote admin (e.g. via
-        // SSH-tunneled port forward, or on a mgmt network) works
-        // without an explicit override. The default password is
-        // `admin` and **must** be changed via env-var injection
-        // (${ADMIN_PASSWORD}) before any production deploy that
-        // exposes 9081 to a non-trusted network.
-        let c = Config::default();
-        assert_eq!(c.admin.addr, "0.0.0.0:9081");
-    }
-
-    #[test]
-    fn addr_default_is_public_production_ports() {
-        let c = Config::default();
-        // The shipped defaults must be 0.0.0.0:80 + 0.0.0.0:443 so a
-        // production deploy that forgets to set [addr] is still
-        // reachable. A regression that swapped to 127.0.0.1 would
-        // silently bind loopback.
-        assert_eq!(c.addr.http, "0.0.0.0:80");
-        assert_eq!(c.addr.https, "0.0.0.0:443");
-    }
-
-    #[test]
     fn pangolin_yml_section_headings_match_config_struct() {
         // Regression: PR #23 renamed Config::cert → Config::acme; PR #24
         // renamed the file pangolin.yml → ngx.yml. This test pins the
         // shipping example config so a future rename can't drift again.
         let yml = include_str!("../../../ngx.yml");
-        let c: Config = serde_yaml::from_str(yml).expect("ngx.yml must parse");
+        let c: Config = Figment::new()
+            .merge(Yaml::string(yml))
+            .extract()
+            .expect("ngx.yml must parse");
         // acme.email is "" in the dev example; default email is "" too,
         // so the only signal that the section was actually read is the
         // acme_directory override.

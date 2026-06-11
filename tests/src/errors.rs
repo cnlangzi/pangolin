@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
     let tokens = vec![];
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// error_not_found — unknown domain → lookup returns None, ngx proxy returns 404

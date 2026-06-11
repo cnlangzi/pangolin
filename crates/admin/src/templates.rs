@@ -2,7 +2,7 @@
 
 use askama::Template;
 use chrono::{DateTime, Utc};
-use pangolin_core::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
+use pangolin_core::types::{Cert, DnsProvider, Domain, Site, Tun};
 
 // ─── Login ──────────────────────────────────────────────────────────────────────
 
@@ -22,7 +22,6 @@ pub struct DashboardTemplate<'a> {
     pub domain_count: usize,
     pub online_tun_count: usize,
     pub total_tun_count: usize,
-    pub token_count: usize,
     pub cert_count: usize,
     pub active_nav: &'a str,
 }
@@ -97,23 +96,6 @@ pub struct SiteDomainsTemplate {
 #[template(path = "tunnels.html")]
 pub struct TunnelsTemplate<'a> {
     pub tuns: Vec<Tun>,
-    pub active_nav: &'a str,
-}
-
-// ─── Tokens ────────────────────────────────────────────────────────────────────
-
-#[derive(Template)]
-#[template(path = "tokens.html")]
-pub struct TokensTemplate<'a> {
-    pub tokens: Vec<Token>,
-    pub active_nav: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "tokens_form.html")]
-pub struct TokenFormTemplate<'a> {
-    pub token: Option<Token>,
-    pub error: Option<&'a str>,
     pub active_nav: &'a str,
 }
 

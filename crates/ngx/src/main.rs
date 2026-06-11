@@ -48,6 +48,7 @@ use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
 
 use pangolin_core::config::Config;
+use pangolin_core::init_logger;
 use tokio_util::sync::CancellationToken;
 
 // ---- CLI entry point ----
@@ -70,11 +71,12 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     // ---- 1. Blocking init --------------------------------------------------
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let args = Args::parse();
     let config =
         Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
+    // Now that config is loaded, honor its `[log]` section for the
+    // process logger (shared with `tun`).
+    init_logger(&config.log);
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager::new(
@@ -113,13 +115,7 @@ fn main() -> anyhow::Result<()> {
     //         failure there fails the process (fail-fast).
     let acme_state = Arc::new(crate::acme::AcmeState::empty());
 
-    // ---- 4. Build services -------------------------------------------------
-    // tunnel.addr is a full host:port string (default 127.0.0.1:9001);
-    // operators set it to e.g. 0.0.0.0:9001 to accept tun clients on
-    // a different host.
-    let tunnel_addr = config.tunnel.addr.clone();
-
-    // ---- 5. Spawn pingora on its own std::thread ---------------------------
+    // ---- 4. Spawn pingora on its own std::thread ---------------------------
     // pingora runs `server.run(args)`, which observes our
     // `CancellationToken` via `TokenShutdownSignalWatch` for graceful
     // shutdown. The thread closure owns its `App` and shutdown clones.
@@ -132,7 +128,12 @@ fn main() -> anyhow::Result<()> {
             .spawn(move || run_pingora(app, config, shutdown))?
     };
 
-    // ---- 6. Host runtime: signals + non-pingora services -------------------
+    // ---- 5. Host runtime: signals + non-pingora services -------------------
+    // tunnel.addr is a full host:port string (default 0.0.0.0:9001);
+    // operators set it to e.g. 127.0.0.1:9001 to keep tun clients on
+    // this host only.
+    let tunnel_addr = config.tunnel.addr.clone();
+
     let host_result = runtime::block_on_host(async move {
         // OS signal handlers cancel the shared token.
         runtime::install_signal_handlers(shutdown.clone());
@@ -140,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         // Build & start services (fail-fast on startup error).
         let services: Vec<Box<dyn runtime::Service>> = vec![
             Box::new(acme::AcmeService::new(acme_state)),
-            Box::new(tunnel::TunnelService::new(tunnel_addr.clone())),
+            Box::new(tunnel::TunnelService::new(tunnel_addr)),
         ];
 
         let ctx = runtime::ServiceContext::new(app, shutdown.clone());
@@ -158,7 +159,7 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    // ---- 7. Wait for pingora to finish ------------------------------------
+    // ---- 6. Wait for pingora to finish ------------------------------------
     if let Err(e) = pingora_thread.join() {
         log::warn!("pingora thread panicked: {:?}", e);
     }
@@ -195,16 +196,15 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     let mut proxy_service = http_proxy_service(&conf, app_proxy);
     proxy_service.add_tcp(&config.addr.http);
     if config.addr.https != ":0" && !config.addr.https.is_empty() {
-        let tls_addr = config.addr.https.clone();
         // v2: SNI callback that loads per-host cert blobs on demand from
         // config.acme.cert_dir. The previous static-blob path with
         // "default" fallback was removed.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
         let tls_settings = crate::tls::build_sni_settings(cert_dir.clone())?;
-        proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
+        proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
         log::info!(
             "TLS enabled (SNI) with HTTP/2 ALPN on {} (cert_dir: {})",
-            tls_addr,
+            config.addr.https,
             cert_dir.display()
         );
     }
@@ -214,13 +214,6 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     let mut http_server = Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
     http_server.add_tcp(&config.admin.addr);
     server.add_service(http_server);
-
-    // The tunnel WebSocket listener is now a host-runtime Service
-    // (TunnelService), registered in `run_pingora`'s sibling block
-    // above. The previous PR #24-era std::thread::Builder + dedicated
-    // current-thread runtime was removed when PR #23 unified
-    // non-pingora services under the host runtime; keeping it here
-    // would race TunnelService for `config.tunnel.port` (EADDRINUSE).
 
     // Drive pingora with our shared shutdown token.
     let run_args = RunArgs {

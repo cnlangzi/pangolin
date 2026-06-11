@@ -23,7 +23,6 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
-    let tokens = pangolin_core::db::list_tokens(&db).unwrap_or_default();
     let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
     drop(db);
 
@@ -34,7 +33,6 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         domain_count: domains.len(),
         online_tun_count: online_tuns,
         total_tun_count: tuns.len(),
-        token_count: tokens.len(),
         cert_count: certs.len(),
         active_nav: "dashboard",
     };

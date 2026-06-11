@@ -11,11 +11,17 @@
 #   --token  <TOKEN> →  token:  <TOKEN>
 #   --name   <NAME>  →  name:   <NAME>
 #
-# The token is written directly in this file. Operators who prefer
-# to keep the token out of plain text can use the env-var expansion
-# form (`token: "${TUN_TOKEN}"`) and rely on the loader's fail-fast
-# behaviour when the var is unset, but it's not required — file
-# permissions (0600) on the config are the canonical protection.
+# Environment-variable override: any TUN_<KEY> env var wins over the
+# matching YAML path, with `__` as the nested-key separator. Examples:
+#   TUN_TOKEN=abc123              # overrides `token:`
+#   TUN_NAME=office               # overrides `name:`
+#   TUN_SERVER=gw.example.com:443 # overrides `server:`
+#   TUN_LOG__LEVEL=debug          # overrides `log.level`
+#   TUN_LOG__FILE=/var/log/tun.log
+# The loader is figment-based, so env override is value-level — the
+# YAML text is never re-scanned for `$VAR` placeholders. File
+# permissions (0600) on this file are the canonical protection for
+# the token.
 #
 # Rules for `name` (validated at load):
 #   - matches ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore)
@@ -23,10 +29,13 @@
 #   - non-purely-numeric (ngx uses a non-numeric name as the tun PK)
 
 # ── Connection (top level: this file IS the tun config) ─────────────────
-server: 127.0.0.1:9080     # ngx address to connect to
-token: "replace-me-with-a-real-token"
-name: office               # this tun's name (must match a tun in ngx's
-                           # `tun` table, or be auto-registered)
+server: 127.0.0.1:9001     # ngx address to connect to
+token: "dev"
+name: local               # this tun's name; admin must have already
+                           # created the matching (name, token) row
+                           # in ngx's `tun` table via POST /api/tun
+                           # (or the admin UI Tunnels page). The
+                           # server does NOT auto-register on connect.
 
 log:
   level: info              # env_logger filter: trace|debug|info|warn|error

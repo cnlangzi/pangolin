@@ -21,38 +21,72 @@ Both binaries follow the same lookup chain (overridable with
 The first file that exists wins; there is no merging. Missing files
 produce a clear startup error, not a silent default.
 
-## Environment variable expansion
+## Environment variable override
 
-Every value in both files is run through `expand_env_vars()` at load
-time. Two forms are supported:
+Both config files are loaded with `figment`, which means the YAML
+file is the base and any matching env var wins on top. Use this to
+keep secrets out of the file (run a tun on a separate host with a
+shared `TUN_TOKEN` env var) and to vary per-deploy values
+(listen ports, log levels) without editing the file.
 
-- `${VAR}` — required. Startup fails fast if `VAR` is unset.
-- `${VAR:-default}` — optional. Falls back to the literal `default`
-  if `VAR` is unset.
+Env-var name → config key mapping:
 
-The expansion applies to **values**, not keys. Use it for secrets
-(tokens, API keys) and for environment-specific values (host names,
-ports) — keep the YAML structure stable, vary the runtime data.
+- **Prefix**: `NGX_` for `ngx.yml`, `TUN_` for `tun.yml`. The prefix
+  is stripped before the rest of the name is interpreted.
+- **Nested keys**: a double underscore `__` is the nested-key
+  separator. `NGX_ADDR__HTTP` maps to `addr.http`,
+  `TUN_LOG__LEVEL` maps to `log.level`.
+- **Case**: env-var names are matched case-insensitively; the
+  resulting config key is lowercase.
+- **Type**: the env-var value is parsed through the same `serde`
+  path the YAML uses, so `TUN_LOG__LEVEL=debug` lands in `log.level`
+  as a `String`, and `NGX_WORKERS=4` lands in `workers` as `Option<usize>`.
+- **Unset env vars do nothing** — the YAML value stands. There is
+  no `${VAR}` substitution in the YAML text.
 
-```yaml
-# tun.yml — typical pattern (token written directly in the file)
-server: gateway.example.com:9001
-token: "your-tun-token-here"
-name: office
+The loader never scans YAML comments or text outside the parsed
+structure, so it is safe to write `${EXAMPLE}` in a comment.
+
+```bash
+# tun with token + name coming from env (server stays in the file)
+TUN_TOKEN=abc123 TUN_NAME=office ./pangolin-tun
+
+# ngx: override public port + log level without editing the file
+NGX_ADDR__HTTP=":8080" NGX_LOG__LEVEL=info ./pangolin-ngx
+
+# turn the HTTPS listener off entirely (HTTP-only mode)
+NGX_ADDR__HTTPS=":0" ./pangolin-ngx
+
+# nested overrides (note the `__` between section and key)
+NGX_ADMIN__PASSWORD=secret \
+NGX_ACME__CERT_DIR=/etc/certs \
+NGX_TUNNEL__ADDR=0.0.0.0:9001 ./pangolin-ngx
 ```
+
+### Why no `${VAR}` in the YAML
+
+Older pangolin versions scanned the raw YAML text for `${VAR}` and
+expanded it before parsing. That worked most of the time but blew
+up if a comment happened to contain `${EXAMPLE}` as documentation
+— the loader would try to look up `EXAMPLE` and fail. The
+`figment` loader only ever operates on parsed values, so the YAML
+text is never re-scanned and comments are inert. Use the `NGX_*` /
+`TUN_*` env-var names instead.
 
 ## `ngx.yml` — gateway configuration
 
 ### Top-level fields (the proxy itself)
 
 These live at the top of the file because the file *is* the proxy
-config. There is no `proxy:` wrapper.
+config. There is no `proxy:` wrapper. The two listen addresses
+are grouped under `[addr]`; the others stay at the top level
+because they apply to the whole file, not just one section.
 
 | Field         | Type            | Default      | Required | Notes |
 | ------------- | --------------- | ------------ | -------- | ----- |
-| `port`        | `u16`           | `80`         | no       | HTTP listen port. Set to `0` to disable plain-HTTP serving. |
-| `tls_port`    | `u16`           | `443`        | no       | HTTPS listen port. Set to `0` to disable TLS entirely. |
-| `host`        | `string \| null` | `null`      | no       | Per-domain cert resolution. `null` → virtual host `"default"`, which looks up certs at `./certs/default/`. |
+| `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Set to `":0"` to disable plain-HTTP serving entirely. |
+| `addr.https`  | `string`        | `0.0.0.0:443`| no       | Full `host:port` for the HTTPS listener. Set to `":0"` to disable TLS entirely. |
+| `host`        | `string \| null` | `null`      | no       | Per-domain cert resolution. `null` → virtual host `"default"`, which looks up certs at `./certs/default/`. Unrelated to `[addr]` — `host` selects the SNI fallback, not the bind address. |
 | `workers`     | `usize \| null` | `null`       | no       | `pingora` worker count. `null` → auto = number of CPU cores. |
 
 ### `[tunnel]` — WebSocket endpoint for tun clients
@@ -158,7 +192,7 @@ time and refuses to start on any violation.
 | Field      | Type     | Default | Required | Validation |
 | ---------- | -------- | ------- | -------- | ---------- |
 | `server`   | `string` | —       | **yes**  | Non-empty. Format `host:port` (or `ip:port`); the `port` must match `tunnel.port` in `ngx.yml`. |
-| `token`    | `string` | —       | **yes**  | Non-empty. Whitelisted in ngx's `tokens` table. Write the real token directly in this file. |
+| `token`    | `string` | —       | **yes**  | Non-empty. Matched against `tun.token` in the gateway's `tun` table (the v2 schema has no separate `tokens` table). Write the real token directly in this file, or override at runtime with `TUN_TOKEN=…` (see "Environment variable override" above). |
 | `name`     | `string` | —       | **yes**  | `^[a-z0-9_-]+$`, 1–32 chars, **not purely numeric**. The name is the tun's primary key on the ngx side; the validator refuses to start if the name collides with another online tun or violates the rule. |
 
 ### `[log]`

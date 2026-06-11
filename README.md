@@ -13,7 +13,7 @@
 | **site** | 站点（后端服务） | 配置 `backend`，指向具体服务 |
 | **domain** | 域名 | 关联到 site，外部访问入口 |
 | **tun_name** | 隧道节点名 | 文本名（如 `office`），用于 backend 字段路由到指定 tun |
-| **token** | 客户端 token | tokens 表里管理，tun 启动时携带，身份验证用 |
+| **token** | 客户端 token | tun 表里的 `token` 列(每个 tun 自带一份凭证) |
 | **backend** | 后端 URL | `[tun_name:]url` 格式 |
 
 ---
@@ -69,8 +69,11 @@ pangolin/
 # tun 隧道节点(客户内网,读 ./tun.yml)
 ./tun
 
-# token 在 ngx 的 tokens 表里统一管理(admin 增删,热加载生效),
-# 多个 token 可共存。tun.yml 任意携带一个有效 token + name 即可连上。
+# token 在 ngx 的 tun 表里统一管理(v2 起;tokens 表已合并进 tun)。
+# 流程:admin 先 POST /api/tun {name, token, ...} 显式建行(也可以在 admin UI "Tunnels" 页),
+# 然后把同一对 (name, token) 写到 tun.yml 里。
+# WS 握手时,服务器单条 SQL 校验,匹配 + enabled=1 才放行。
+# 不再有自动注册 —— tun 自己不能"随便带个 token 来就建身份"。
 ```
 
 无需 `--mode` 标志，二进制名 = 角色名。
@@ -150,30 +153,20 @@ CREATE TABLE domains (
 
 -- 隧道节点
 --   name: tun_name，文本名（backend 字段引用此值，例 'office'），主键
---   注意：
---     1. tun 与 domain 不需要中间表。domain 走哪个 tun 完全由 site.backend
---        决定（有无 tun_name: 前缀），ngx 通过 site 表 JOIN domains 表反查
---        得到 tun 应代理的 domain 列表。
---     2. token 不在 tun 表里。tun 启动时携带任意一个 tokens 表里的有效 token，
---        用 name 区分身份。token 与 tun 完全解耦。
+--   v2: `token` 列在本表里 —— 每个 tun 节点自带凭证。tun 首次
+--       连上时 WS 服务器会 (name, token) 一次性校验，自动注册。
+--       不再有独立的 tokens 表 / /api/tokens 端点。
 CREATE TABLE tun (
-    name      TEXT PRIMARY KEY,             -- tun_name（小写字母数字下划线短横线，1~32 字符）
-    enabled   INTEGER DEFAULT 1,
-    online    INTEGER DEFAULT 0,
+    name         TEXT PRIMARY KEY,          -- tun_name（小写字母数字下划线短横线，1~32 字符）
+    token        TEXT NOT NULL DEFAULT '',  -- 客户端 token（首次连入时由 WS 握手写入）
+    enabled      INTEGER DEFAULT 1,
+    online       INTEGER DEFAULT 0,
     registered_at DATETIME,
-    last_seen_at  DATETIME
+    last_seen_at  DATETIME,
+    expires_at    DATETIME                  -- token 过期(NULL = 永不过期)
 );
-
--- token 白名单
---   任何客户端（tun 节点、admin CLI、未来其他客户端）连接 ngx 时，
---   必须在 tokens 表里有对应 token（且 enabled=1、未过期）。
---   token 与 tun 解耦：tun 启动时用哪个有效 token 都行，用 name 区分身份。
-CREATE TABLE tokens (
-    token      TEXT PRIMARY KEY,            -- token 字符串本身
-    enabled    INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME                     -- NULL = 永不过期
-);
+-- 后续 token 轮换:UPDATE tun SET token='new' WHERE name='office'
+-- 后续停用某个节点:UPDATE tun SET enabled=0 WHERE name='office'
 
 -- 证书（Let's Encrypt 自动管理）
 --   domain: 域名，主键（一对一）
@@ -262,8 +255,9 @@ ALTER TABLE sites ADD COLUMN last_audit_at TEXT;
 
 **创建索引：**
 ```sql
--- migrations/V5__index_tokens_expires.sql
-CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires_at);
+-- migrations/V2__merge_tokens_into_tun.sql 已把 tokens 表合进 tun。
+-- 常用索引：
+CREATE INDEX IF NOT EXISTS idx_tun_token ON tun(token);    -- WS 握手 (name, token) 走 tun_token 索引
 ```
 
 ### 启动时 migration 自动运行
@@ -499,7 +493,7 @@ tun 开始代理这些域名的请求
 ./ngx --port 8080
     │
     ▼
-初始化 SQLite（sites/domains/tun/tokens/certs）
+初始化 SQLite（sites/domains/tun/certs）
     │
     ▼
 构建内存索引（启动时一次性）：
@@ -531,8 +525,7 @@ tun 开始代理这些域名的请求
 | PUT/DELETE | `/api/domains/:domain` | 更新/删除域名（domain 主键） |
 | GET/POST | `/api/tun` | tun 节点列表/新增 |
 | PUT/DELETE | `/api/tun/:name` | 更新/删除 tun（name 主键） |
-| GET/POST | `/api/tokens` | token 列表/新增 |
-| PUT/DELETE | `/api/tokens/:token` | 更新/删除 token（token 主键） |
+| GET/POST | `/api/tun` | tun 列表/新增(v2:`token` 字段作为 body 字段一起 POST) |
 | GET/POST | `/api/certs` | 证书列表/上传 |
 | DELETE | `/api/certs/:domain` | 删除证书（domain 主键） |
 
@@ -729,7 +722,37 @@ log:
   file: ""                    # 空 = stderr
 ```
 
-`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 字段直接写即可,不需要用 env 注入;如果想保密,把配置文件设 0600 权限(或用系统 secret 管理工具管理整个文件)。
+`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 字段直接写即可;如果想保密,可以:
+- 把配置文件设 0600 权限(或用系统 secret 管理工具管理整个文件);
+- **用环境变量覆盖**(见下):`TUN_TOKEN=…` 比 `tun.yml: token:` 优先。
+
+### 环境变量覆盖(YAML 上叠一层)
+
+两个配置文件都用 `figment` 加载,所以 env 变量可以在 YAML 之上**逐字段覆盖**。命名规则:
+
+- 前缀:`NGX_` 对应 `ngx.yml`,`TUN_` 对应 `tun.yml`。
+- 嵌套键分隔符:`__` (双下划线)。
+- 大小写:env 名按小写匹配到配置 key(`NGX_ADDR__HTTP` → `addr.http`)。
+
+例子:
+
+```bash
+# 共享 token 跑多个 tun(避免把 secret 写进 tun.yml)
+TUN_TOKEN=abc123 TUN_NAME=office ./tun
+
+# 改 ngx 监听端口 + 调日志等级
+NGX_ADDR__HTTP=":8080" NGX_LOG__LEVEL=info ./ngx
+
+# 关闭 ngx 的 TLS listener
+NGX_ADDR__HTTPS=":0" ./ngx
+
+# 嵌套字段
+NGX_ADMIN__PASSWORD=secret \
+NGX_ACME__CERT_DIR=/etc/certs \
+NGX_TUNNEL__ADDR=0.0.0.0:9001 ./ngx
+```
+
+未设置的 env 变量**不影响** YAML 值;loader 不会扫描 YAML 文本里的 `$VAR` 占位符,所以注释里写 `${EXAMPLE}` 也不会被误解析(替代了旧的 `expand_env_vars` 文本替换方案)。详细字段表见 `docs/configuration.md`。
 
 ### 关键配置项说明
 
@@ -883,13 +906,13 @@ type TunIndex = HashMap<String, Vec<Arc<Domain>>>;      // key: tun_name
 // tun 注册时用：所有 site（reload 时扫，建 tunIndex 用）
 type Sites = Vec<Arc<Site>>;
 
-// tun 注册时用：token 白名单（O(1) 验证）
-type TokenIndex = HashMap<String, bool>;                // key: token, value: enabled && !expired
+// v2: TokenIndex 已删除。WS 握手校验是单条 SQL
+//   `SELECT enabled, expires_at FROM tun WHERE name=? AND token=?`
+//   不再在内存里镜像 token 白名单。
 
 pub struct Indexes {
     pub domain: DomainIndex,
     pub tun: TunIndex,
-    pub token: TokenIndex,
     pub sites: Sites,
 }
 pub type SharedIndexes = Arc<RwLock<Indexes>>;

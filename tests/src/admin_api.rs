@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Cert, Domain, HostMode, Site, Token, Tun};
+use pangolin_core::types::{Cert, Domain, HostMode, Site, Tun};
 
 fn temp_conn() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
@@ -103,17 +103,20 @@ fn admin_domains_crud() {
     assert!(domains.is_empty());
 }
 
-/// admin_tun_crud — create, list, delete a tun node
+/// admin_tun_crud — create, list, delete a tun node (now also
+/// exercises the merged token column).
 #[test]
 fn admin_tun_crud() {
     let (_dir, conn) = temp_conn();
 
     let tun = Tun {
         name: "office".into(),
+        token: Some("secret-token-123".into()),
         enabled: true,
         online: false,
         registered_at: None,
         last_seen_at: None,
+        expires_at: None,
     };
 
     // Create
@@ -123,6 +126,7 @@ fn admin_tun_crud() {
     let tuns = db::list_tuns(&conn).unwrap();
     assert_eq!(tuns.len(), 1);
     assert_eq!(tuns[0].name, "office");
+    assert_eq!(tuns[0].token.as_deref(), Some("secret-token-123"));
 
     // Update online
     let mut updated = tun.clone();
@@ -139,39 +143,35 @@ fn admin_tun_crud() {
     assert!(tuns.is_empty());
 }
 
-/// admin_tokens_crud — create, list, delete a token
+/// admin_tun_auth — verify the (name, token) → enabled lookup that
+/// the WS server uses for first-contact auth. Replaces the
+/// pre-merge `admin_tokens_crud` test.
 #[test]
-fn admin_tokens_crud() {
+fn admin_tun_auth() {
     let (_dir, conn) = temp_conn();
+    db::upsert_tun(
+        &conn,
+        &Tun {
+            name: "office".into(),
+            token: Some("secret-token-123".into()),
+            enabled: true,
+            online: false,
+            registered_at: None,
+            last_seen_at: None,
+            expires_at: None,
+        },
+    )
+    .unwrap();
 
-    let token = Token {
-        token: "secret-token-123".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    };
+    // Match → enabled row
+    let r = db::auth_tun(&conn, "office", "secret-token-123").unwrap();
+    assert_eq!(r.map(|(e, _)| e), Some(true));
 
-    // Create
-    db::upsert_token(&conn, &token).unwrap();
+    // Wrong token → no row
+    assert!(db::auth_tun(&conn, "office", "wrong").unwrap().is_none());
 
-    // List
-    let tokens = db::list_tokens(&conn).unwrap();
-    assert_eq!(tokens.len(), 1);
-    assert_eq!(tokens[0].token, "secret-token-123");
-    assert!(tokens[0].enabled);
-
-    // Disable
-    let mut updated = token.clone();
-    updated.enabled = false;
-    db::upsert_token(&conn, &updated).unwrap();
-
-    let tokens = db::list_tokens(&conn).unwrap();
-    assert!(!tokens[0].enabled);
-
-    // Delete
-    db::delete_token(&conn, "secret-token-123").unwrap();
-    let tokens = db::list_tokens(&conn).unwrap();
-    assert!(tokens.is_empty());
+    // Wrong name → no row
+    assert!(db::auth_tun(&conn, "nope", "secret-token-123").unwrap().is_none());
 }
 
 /// admin_certs_crud — create, list, delete a cert
@@ -210,12 +210,6 @@ fn admin_certs_crud() {
 #[test]
 fn admin_reload_indexes() {
     let (_dir, conn) = temp_conn();
-    let tokens = vec![Token {
-        token: "tok".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    }];
 
     // Insert site + domain
     let site = Site {
@@ -243,7 +237,7 @@ fn admin_reload_indexes() {
     // Build indexes
     let sites = db::list_sites(&conn).unwrap();
     let domains = db::list_domains(&conn).unwrap();
-    let indexes = pangolin_core::index::Indexes::build(sites, domains, &tokens, Utc::now());
+    let indexes = pangolin_core::index::Indexes::build(sites, domains);
 
     // Look up
     let result = pangolin_core::index::lookup_site(&indexes, "reload.example.com");

@@ -12,6 +12,16 @@
 #   (a) schema drift is impossible (the file mirrors Config 1:1)
 #   (b) new contributors see all knobs without reading the Rust source
 #
+# Environment-variable override: any NGX_<KEY> env var wins over the
+# matching YAML path, with `__` as the nested-key separator. Examples:
+#   NGX_ADDR__HTTP=":8080"      # overrides `addr.http`
+#   NGX_ADDR__HTTPS=":0"        # disable TLS
+#   NGX_ADMIN__PASSWORD=secret  # override admin password
+#   NGX_LOG__LEVEL=warn         # override log level
+#   NGX_ACME__CERT_DIR=/etc/certs
+# The loader is figment-based, so env override is value-level — the
+# YAML text is never re-scanned for `$VAR` placeholders.
+#
 # Dev ports are non-privileged (9080/9443) so `make start-ngx` works
 # without sudo. Production defaults are 0.0.0.0:80 / 0.0.0.0:443
 # (privileged) — see docs/configuration.md for the per-field
@@ -38,8 +48,8 @@
 # 0.0.0.0:443 (single-host public deploy); dev overrides to the
 # unprivileged 9080/9443 pair so `make start-ngx` runs without sudo.
 addr:
-  http: 0.0.0.0:9080    # HTTP listen addr
-  https: 0.0.0.0:9443   # HTTPS listen addr; ":0" = disable TLS entirely
+  http: 0.0.0.0:80    # HTTP listen addr
+  https: 0.0.0.0:443   # HTTPS listen addr; ":0" = disable TLS entirely
 host: null              # virtual host for per-domain cert resolution
                         # (null = "default" → ./certs/default/...)
                         # UNRELATED to [addr] — `host` is the SNI fallback,

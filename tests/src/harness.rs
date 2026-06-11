@@ -232,6 +232,7 @@ pub struct NgxProcess {
     pub admin_port: u16,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
+    pub cert_dir: PathBuf,
     pub log: Arc<Mutex<Vec<u8>>>,
     // tokio tasks draining the child's stdout/stderr into `log`. We
     // hold the JoinHandles so Drop can `abort()` them — otherwise they
@@ -298,9 +299,6 @@ acme:
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
         );
         let config_path = tmpdir.path().join("ngx.yml");
-        // we keep the `cert_dir` in scope (above) so the test's Drop
-        // impl that points at the cert path doesn't race the tmpdir
-        // teardown. _cert_dir is a no-op; just suppress the warning.
         std::fs::write(&config_path, config).expect("write ngx.yml");
 
         // The binary creates pangolin.db at runtime in CWD. We want
@@ -357,6 +355,7 @@ acme:
             admin_port,
             data_dir,
             config_path,
+            cert_dir,
             log,
             _tmpdir: tmpdir,
         }
@@ -373,20 +372,7 @@ acme:
     /// callback loads blobs from here. Use [`gen_self_signed`] to
     /// install a per-host cert before connecting with TLS+SNI.
     pub fn cert_dir(&self) -> PathBuf {
-        // The cert dir lives in the tempdir next to ngx.yml.
-        // We can't plumb a typed field through `start` without
-        // breaking every test, so derive it from the config we
-        // wrote. Cheap and unambiguous.
-        let cfg = std::fs::read_to_string(&self.config_path).expect("read ngx.yml");
-        for line in cfg.lines() {
-            if let Some(rest) = line.trim_start().strip_prefix("cert_dir:") {
-                let p = rest.trim().trim_matches('"').trim_matches('\'');
-                if !p.is_empty() {
-                    return PathBuf::from(p);
-                }
-            }
-        }
-        panic!("cert_dir not found in ngx.yml")
+        self.cert_dir.clone()
     }
 
     /// Drain the captured log into a String for diagnostic asserts.
@@ -437,6 +423,9 @@ pub struct TunProcess {
     pub name: String,
     pub log: Arc<Mutex<Vec<u8>>>,
     log_tasks: Vec<JoinHandle<()>>,
+    // Hold the tempdir so it isn't dropped (and deleted) before the
+    // child finishes reading the config it points at.
+    _config_tmpdir: TempDir,
 }
 
 impl TunProcess {
@@ -473,9 +462,9 @@ log:
         let tmpdir = tempfile::tempdir().expect("tempdir for tun config");
         let config_path = tmpdir.path().join("tun.yml");
         std::fs::write(&config_path, &tun_config).expect("write tun.yml");
-        // keep tmpdir alive for the lifetime of the tun process; the
-        // child reads the config by path, so the file must persist.
-        let _tun_tmpdir = Box::leak(Box::new(tmpdir));
+        // tmpdir is moved into Self below so it lives as long as the
+        // child process (and is dropped after the child is killed in
+        // `Drop`).
 
         let mut cmd = Command::new(&bin);
         cmd.arg("--config").arg(&config_path);
@@ -510,6 +499,7 @@ log:
             name: name.to_string(),
             log,
             log_tasks,
+            _config_tmpdir: tmpdir,
         }
     }
 

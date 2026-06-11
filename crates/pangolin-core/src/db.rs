@@ -4,13 +4,18 @@
 //!   migrations/V{version}__{name}.sql  →  compiled and run at startup
 //!   schema_version table               →  tracks applied migrations
 //!
-//! Six tables, all with TEXT primary keys (natural keys, no surrogate ids):
+//! Five tables, all with TEXT primary keys (natural keys, no surrogate ids):
 //!   sites         (name PK, backend, enabled, ...)
 //!   domains       (domain PK, site_name, enabled, auto_issue, dns_provider, created_at) FK→sites.name
-//!   tun           (name PK, enabled, online, registered_at, last_seen_at)
-//!   tokens        (token PK, enabled, created_at, expires_at)
+//!   tun           (name PK, token, enabled, online, registered_at, last_seen_at, expires_at)
 //!   certs         (domain PK, cert_file, key_file, expires_at, created_at, sans, source, ...)
 //!   dns_providers (name PK, kind, enabled, config, created_at, updated_at)
+//!
+//! v2 (V2 migration): the `tokens` table was merged into `tun`. A tun
+//! row now carries its own auth credential (`token`) and optional
+//! `expires_at`. The two-table model required a 401/403 distinction and
+//! forced operators to pre-register both halves; the merged model is a
+//! single SELECT.
 //!
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
@@ -27,7 +32,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::embedded_migrations::run_migrations;
-use crate::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
+use crate::types::{Cert, DnsProvider, Domain, Site, Tun};
 /// Open a connection with sensible defaults (WAL, foreign keys on).
 pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
@@ -146,7 +151,7 @@ pub fn delete_domain(conn: &Connection, domain: &str) -> rusqlite::Result<bool> 
 
 pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {
     let mut stmt = conn.prepare(
-        "SELECT name, enabled, online, registered_at, last_seen_at
+        "SELECT name, token, enabled, online, registered_at, last_seen_at, expires_at
          FROM tun ORDER BY name",
     )?;
     let rows = stmt.query_map([], row_to_tun)?;
@@ -155,7 +160,7 @@ pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {
 
 pub fn get_tun(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tun>> {
     let mut stmt = conn.prepare(
-        "SELECT name, enabled, online, registered_at, last_seen_at
+        "SELECT name, token, enabled, online, registered_at, last_seen_at, expires_at
          FROM tun WHERE name = ?1",
     )?;
     stmt.query_row(params![name], row_to_tun).optional()
@@ -163,18 +168,22 @@ pub fn get_tun(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tun>> {
 
 pub fn upsert_tun(conn: &Connection, tun: &Tun) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO tun (name, enabled, online, registered_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO tun (name, token, enabled, online, registered_at, last_seen_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET
+            token = excluded.token,
             enabled = excluded.enabled,
             online = excluded.online,
-            last_seen_at = excluded.last_seen_at",
+            last_seen_at = excluded.last_seen_at,
+            expires_at = excluded.expires_at",
         params![
             tun.name,
+            tun.token.as_deref().unwrap_or(""),
             tun.enabled as i32,
             tun.online as i32,
             tun.registered_at.map(|t| t.to_rfc3339()),
             tun.last_seen_at.map(|t| t.to_rfc3339()),
+            tun.expires_at.map(|t| t.to_rfc3339()),
         ],
     )?;
     Ok(())
@@ -193,36 +202,27 @@ pub fn set_tun_online(conn: &Connection, name: &str, online: bool) -> rusqlite::
     Ok(())
 }
 
-// ---- Token CRUD ----
-
-pub fn list_tokens(conn: &Connection) -> rusqlite::Result<Vec<Token>> {
+/// Look up a tun by both its `name` and `token` in a single query.
+/// Returns the row's enabled flag and expires_at if it matched.
+/// This is the only auth check the WS server needs; there's no
+/// two-table validation step anymore.
+pub fn auth_tun(
+    conn: &Connection,
+    name: &str,
+    token: &str,
+) -> rusqlite::Result<Option<(bool, Option<DateTime<Utc>>)>> {
     let mut stmt = conn.prepare(
-        "SELECT token, enabled, created_at, expires_at FROM tokens ORDER BY created_at DESC",
+        "SELECT enabled, expires_at FROM tun
+         WHERE name = ?1 AND token = ?2",
     )?;
-    let rows = stmt.query_map([], row_to_token)?;
-    rows.collect()
-}
-
-pub fn upsert_token(conn: &Connection, token: &Token) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO tokens (token, enabled, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(token) DO UPDATE SET
-            enabled = excluded.enabled,
-            expires_at = excluded.expires_at",
-        params![
-            token.token,
-            token.enabled as i32,
-            token.created_at.to_rfc3339(),
-            token.expires_at.map(|t| t.to_rfc3339()),
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn delete_token(conn: &Connection, token: &str) -> rusqlite::Result<bool> {
-    let n = conn.execute("DELETE FROM tokens WHERE token = ?1", params![token])?;
-    Ok(n > 0)
+    let row = stmt
+        .query_row(params![name, token], |r| {
+            let enabled: i32 = r.get(0)?;
+            let expires_at: Option<String> = r.get(1)?;
+            Ok((enabled != 0, expires_at.as_deref().and_then(parse_dt_opt)))
+        })
+        .optional()?;
+    Ok(row)
 }
 
 // ---- Cert CRUD ----
@@ -413,28 +413,23 @@ fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider>
 
 fn row_to_tun(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tun> {
     let name: String = row.get(0)?;
-    let enabled: i32 = row.get(1)?;
-    let online: i32 = row.get(2)?;
-    let registered_at: Option<String> = row.get(3)?;
-    let last_seen_at: Option<String> = row.get(4)?;
+    let token: Option<String> = row.get(1)?;
+    let enabled: i32 = row.get(2)?;
+    let online: i32 = row.get(3)?;
+    let registered_at: Option<String> = row.get(4)?;
+    let last_seen_at: Option<String> = row.get(5)?;
+    let expires_at: Option<String> = row.get(6)?;
     Ok(Tun {
         name,
+        token: if token.as_deref().unwrap_or("").is_empty() {
+            None
+        } else {
+            token
+        },
         enabled: enabled != 0,
         online: online != 0,
         registered_at: registered_at.as_deref().and_then(parse_dt_opt),
         last_seen_at: last_seen_at.as_deref().and_then(parse_dt_opt),
-    })
-}
-
-fn row_to_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<Token> {
-    let token: String = row.get(0)?;
-    let enabled: i32 = row.get(1)?;
-    let created_at: String = row.get(2)?;
-    let expires_at: Option<String> = row.get(3)?;
-    Ok(Token {
-        token,
-        enabled: enabled != 0,
-        created_at: parse_dt(&created_at)?,
         expires_at: expires_at.as_deref().and_then(parse_dt_opt),
     })
 }
@@ -478,7 +473,7 @@ fn parse_dt_opt(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Token, Tun};
+    use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Tun};
 
     fn make_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -505,23 +500,25 @@ mod tests {
     fn schema_version_table_tracks_applied_migrations() {
         #[allow(unused_mut)]
         let mut conn = make_conn();
-        // refinery creates a `schema_version` table — verify it's there
-        // and lists V1 as applied.
+        // refinery creates a `refinery_schema_history` table — verify
+        // it's there and lists V1 + V2 as applied (V2 merges tokens
+        // into tun).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
-        assert_eq!(count, 1, "expected exactly 1 applied migration (V1)");
+        assert_eq!(count, 2, "expected V1 + V2 to be applied");
 
-        let version: i32 = conn
+        // Verify V2 is recorded.
+        let v2_present: i64 = conn
             .query_row(
-                "SELECT version FROM refinery_schema_history LIMIT 1",
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 2",
                 [],
                 |r| r.get(0),
             )
             .expect("version column present");
-        assert_eq!(version, 1, "applied migration must be V1");
+        assert_eq!(v2_present, 1, "V2 (merge tokens into tun) must be applied");
     }
 
     #[test]
@@ -684,32 +681,71 @@ mod tests {
         let conn = make_conn();
         let t = Tun {
             name: "office".into(),
+            token: Some("dev".into()),
             enabled: true,
             online: false,
             registered_at: None,
             last_seen_at: None,
+            expires_at: None,
         };
         upsert_tun(&conn, &t).unwrap();
         let back = get_tun(&conn, "office").unwrap().unwrap();
         assert!(!back.online);
+        assert_eq!(back.token.as_deref(), Some("dev"));
         set_tun_online(&conn, "office", true).unwrap();
         let back = get_tun(&conn, "office").unwrap().unwrap();
         assert!(back.online);
     }
 
     #[test]
-    fn token_upsert_and_list() {
+    fn auth_tun_match_and_mismatch() {
         let conn = make_conn();
-        let t = Token {
-            token: "abc123".into(),
+        let t = Tun {
+            name: "office".into(),
+            token: Some("dev".into()),
             enabled: true,
-            created_at: dt("2026-01-01T00:00:00+00:00"),
+            online: false,
+            registered_at: None,
+            last_seen_at: None,
             expires_at: None,
         };
-        upsert_token(&conn, &t).unwrap();
-        let list = list_tokens(&conn).unwrap();
-        assert_eq!(list.len(), 1);
-        assert!(delete_token(&conn, "abc123").unwrap());
+        upsert_tun(&conn, &t).unwrap();
+
+        // Match → Some((enabled, _))
+        let r = auth_tun(&conn, "office", "dev").unwrap();
+        assert_eq!(r.map(|(e, _)| e), Some(true));
+
+        // Wrong token → None
+        assert!(auth_tun(&conn, "office", "wrong").unwrap().is_none());
+
+        // Wrong name → None
+        assert!(auth_tun(&conn, "nope", "dev").unwrap().is_none());
+    }
+
+    #[test]
+    fn auth_tun_disabled_returns_none() {
+        // If the admin explicitly disabled a tun, the WS server must
+        // not authenticate against it even when the (name, token)
+        // pair matches.
+        let conn = make_conn();
+        upsert_tun(
+            &conn,
+            &Tun {
+                name: "office".into(),
+                token: Some("dev".into()),
+                enabled: false,
+                online: false,
+                registered_at: None,
+                last_seen_at: None,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        // auth_tun is "row matches (name, token)" — caller's auth
+        // check is then `row.enabled && not expired`. Verify the
+        // matching row surfaces enabled=false so the caller can drop it.
+        let (enabled, _) = auth_tun(&conn, "office", "dev").unwrap().unwrap();
+        assert!(!enabled);
     }
 
     #[test]

@@ -25,40 +25,34 @@ use pangolin_core::{deserialize_msgpack, serialize_msgpack, TunnelFrame};
 
 use crate::{App, TunnelMessage};
 
-// ---- Token validation ----
+// ---- Auth ----
 
-/// Validate token and name against the DB.
-/// Returns Ok if valid, Err with status code otherwise.
+/// Validate a tun's (name, token) against the `tun` table.
+///
+/// v2: tokens and tun names live in the same row, so this is a single
+/// SQL lookup. Three outcomes:
+///
+///   * `Ok(())` — a matching row exists, is `enabled=1`, and not
+///     expired. The tun is admitted.
+///   * `Err(401)` — no row matches `(name, token)`. Hard reject;
+///     the (name, token) pair must be admin-provisioned via
+///     `POST /api/tun` before the tun can come online. There is
+///     no auto-register: presenting a valid token for an unknown
+///     name does NOT create the row, because the admin is the
+///     sole source of truth for "this tun exists".
+///   * `Err(403)` — a row matched but `enabled=0` (admin disabled
+///     it). The tun cannot reconnect until the admin re-enables it.
 async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
     let conn = app.db.lock().await;
-    let tokens = match pangolin_core::db::list_tokens(&conn) {
-        Ok(t) => t,
+    let row = match pangolin_core::db::auth_tun(&conn, tun_name, token) {
+        Ok(r) => r,
         Err(_) => return Err(500),
     };
-    drop(conn);
-
-    let token_rec = tokens.iter().find(|t| {
-        t.token == token && t.enabled && t.expires_at.is_none_or(|e| e > chrono::Utc::now())
-    });
-
-    if token_rec.is_none() {
-        return Err(401);
+    match row {
+        None => Err(401),
+        Some((false, _)) => Err(403),
+        Some((true, _)) => Ok(()),
     }
-
-    // Validate tun name against DB
-    let conn = app.db.lock().await;
-    let tuns = match pangolin_core::db::list_tuns(&conn) {
-        Ok(t) => t,
-        Err(_) => return Err(500),
-    };
-    drop(conn);
-
-    let tun_rec = tuns.iter().find(|t| t.name == tun_name && t.enabled);
-    if tun_rec.is_none() {
-        return Err(403);
-    }
-
-    Ok(())
 }
 
 /// Mark a tun as online in the DB.
@@ -190,11 +184,6 @@ async fn handle_client(
     //   GET /tunnel?token=xxx&name=yyy HTTP/1.1\r\n...
     // so the URL is the second whitespace-separated token. We strip
     // the leading `/tunnel?` to get the raw query string.
-    //
-    // Note: re-derive `peek_str` from the sliced buffer (not the
-    // zero-padded whole buffer); `from_utf8` on `\0` padding would
-    // return Err and the URL parse would degrade to "".
-    let peek_str = std::str::from_utf8(&peek_buf[..peek_n]).unwrap_or("");
     let query = peek_str
         .split_whitespace()
         .nth(1)
@@ -217,9 +206,19 @@ async fn handle_client(
         return Ok(());
     }
 
-    if let Err(status) = validate_token(&app, token, name).await {
-        warn!("tunnel auth failed for {}: status {}", name, status);
-        return Ok(());
+    match validate_token(&app, token, name).await {
+        Ok(()) => {}
+        Err(status) => {
+            // 401: no row matches (name, token) — admin hasn't
+            //      provisioned this (name, token) pair yet.
+            // 403: row exists but `enabled=0` — admin disabled it.
+            // 500: DB error.
+            // All three are hard rejects; the tun stays offline
+            // until an operator creates / re-enables the row via
+            // `POST /api/tun` (or the admin UI Tunnels page).
+            warn!("tunnel auth failed for {}: status {}", name, status);
+            return Ok(());
+        }
     }
 
     let tun_name = name.to_string();
