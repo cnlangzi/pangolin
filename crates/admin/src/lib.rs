@@ -139,9 +139,7 @@ pub async fn handle(
         // ── UI HTML pages at root ──────────────────────────────────
         ("" | "dashboard", "GET") => routes::dashboard::render(&app, &csrf_token).await?,
         ("sites", "GET") => routes::sites::render(&app, &csrf_token).await?,
-        ("sites/new", "GET") => {
-            routes::sites::render_create_page(&app, &csrf_token).await?
-        }
+        ("sites/new", "GET") => routes::sites::render_create_page(&app, &csrf_token).await?,
         ("sites/new", "POST") => {
             routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
         }
@@ -167,9 +165,7 @@ pub async fn handle(
                 .await?
         }
         ("domains", "GET") => routes::domains::render(&app, &csrf_token).await?,
-        ("domains/new", "GET") => {
-            routes::domains::render_create_page(&app, &csrf_token).await?
-        }
+        ("domains/new", "GET") => routes::domains::render_create_page(&app, &csrf_token).await?,
         ("domains/new", "POST") => {
             routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
@@ -182,9 +178,7 @@ pub async fn handle(
             .await?
         }
         ("tun", "GET") => routes::tun::render(&app, &csrf_token).await?,
-        ("tun/new", "GET") => {
-            routes::tun::render_create_page(&csrf_token).await?
-        }
+        ("tun/new", "GET") => routes::tun::render_create_page(&csrf_token).await?,
         ("tun/new", "POST") => {
             routes::tun::handle_create(&app, &merged_params, &csrf_token).await?
         }
@@ -206,12 +200,8 @@ pub async fn handle(
             .await?
         }
         ("tun/delete", "POST") => {
-            routes::tun::handle_delete(
-                &app,
-                query_param_opt(&merged_params, "name"),
-                &csrf_token,
-            )
-            .await?
+            routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
         }
         ("certs", "GET") => routes::certs::render(&app, &csrf_token).await?,
         ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
@@ -235,12 +225,9 @@ pub async fn handle(
 
         // ── Auth ────────────────────────────────────────────────────
         ("login", "GET") => {
-            routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref())
-                .await?
+            routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref()).await?
         }
-        ("login", "POST") => {
-            routes::auth::handle_login(&app, sessions, &merged_params).await?
-        }
+        ("login", "POST") => routes::auth::handle_login(&app, sessions, &merged_params).await?,
         ("logout", "POST") => {
             routes::auth::handle_logout(sessions, &session_token.unwrap(), &merged_params).await?
         }
@@ -252,8 +239,7 @@ pub async fn handle(
                 if let Some((site_name, suffix)) = rest.split_once('/') {
                     match suffix {
                         "domains" => {
-                            routes::domains::render_for_site(&app, site_name, &csrf_token)
-                                .await?
+                            routes::domains::render_for_site(&app, site_name, &csrf_token).await?
                         }
                         _ => not_found(),
                     }
@@ -268,12 +254,8 @@ pub async fn handle(
                     if let Some((site_name, suffix)) = rest2.split_once('/') {
                         match (suffix, method) {
                             ("domains", "GET") => {
-                                routes::domains::render_table_for_site(
-                                    &app,
-                                    site_name,
-                                    &csrf_token,
-                                )
-                                .await?
+                                routes::domains::render_table_for_site(&app, site_name, &csrf_token)
+                                    .await?
                             }
                             ("domains/new", "GET") => {
                                 routes::domains::api_render_form_new(
@@ -314,12 +296,8 @@ pub async fn handle(
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
-                            routes::dns::render_edit_page(
-                                &app,
-                                Some(name.to_string()),
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::dns::render_edit_page(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         ("edit", "POST") => {
                             routes::dns::handle_update(
@@ -331,12 +309,8 @@ pub async fn handle(
                             .await?
                         }
                         ("delete", "POST") => {
-                            routes::dns::handle_delete(
-                                &app,
-                                Some(name.to_string()),
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::dns::handle_delete(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         _ => not_found(),
                     }
@@ -350,12 +324,8 @@ pub async fn handle(
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
-                            routes::tun::render_edit_page(
-                                &app,
-                                Some(name.to_string()),
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::tun::render_edit_page(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         ("edit", "POST") => {
                             routes::tun::handle_update(
@@ -367,12 +337,8 @@ pub async fn handle(
                             .await?
                         }
                         ("delete", "POST") => {
-                            routes::tun::handle_delete(
-                                &app,
-                                Some(name.to_string()),
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::tun::handle_delete(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         _ => not_found(),
                     }
@@ -452,8 +418,14 @@ fn serve_static_asset(path: &str) -> Option<Response<Full<Bytes>>> {
         return None;
     }
     let (bytes, content_type) = match name {
-        "app.css" => (include_bytes!("../../../assets/app.css").to_vec(), "text/css; charset=utf-8"),
-        "app.js" => (include_bytes!("../../../assets/app.js").to_vec(), "application/javascript; charset=utf-8"),
+        "app.css" => (
+            include_bytes!("../../../assets/app.css").to_vec(),
+            "text/css; charset=utf-8",
+        ),
+        "app.js" => (
+            include_bytes!("../../../assets/app.js").to_vec(),
+            "application/javascript; charset=utf-8",
+        ),
         _ => return None,
     };
     let resp = Response::builder()

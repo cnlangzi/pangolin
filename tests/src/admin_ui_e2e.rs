@@ -25,14 +25,7 @@ async fn start_ngx() -> NgxProcess {
 async fn unauth_redirect_dashboard() {
     let ngx = start_ngx().await;
     let client = new_client_no_redirect();
-    for path in &[
-        "/",
-        "/sites",
-        "/sites/new",
-        "/domains",
-        "/tun",
-        "/certs",
-    ] {
+    for path in &["/", "/sites", "/sites/new", "/domains", "/tun", "/certs"] {
         let resp = client.get(&ngx.admin_url(path)).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 302, "path {} should redirect", path);
         let loc = resp
@@ -402,10 +395,7 @@ async fn sites_delete_with_csrf() {
         .unwrap();
 
     let resp = client
-        .post_form(
-            "/sites/delete",
-            &[("name", "delete-me"), ("_csrf", &csrf)],
-        )
+        .post_form("/sites/delete", &[("name", "delete-me"), ("_csrf", &csrf)])
         .await
         .unwrap();
     assert_eq!(
@@ -491,13 +481,7 @@ async fn sites_create_full_ui_flow() {
     client.login("admin", "admin").await.unwrap();
 
     // 1. Sites page renders a "New site" link.
-    let sites_page = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let sites_page = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(
         sites_page.contains("New site"),
         "sites page should expose a 'New site' link"
@@ -551,13 +535,7 @@ async fn sites_create_full_ui_flow() {
     );
 
     // 4. The site now appears in the sites list.
-    let list_after = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list_after = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(
         list_after.contains("ui-flow-site"),
         "newly created site 'ui-flow-site' should appear in the sites list"
@@ -604,13 +582,7 @@ async fn sites_create_full_ui_flow_unique_names() {
         );
     }
 
-    let list = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(list.contains("flow-a"), "flow-a should be in list");
     assert!(list.contains("flow-b"), "flow-b should be in list");
 }
@@ -645,13 +617,7 @@ async fn domains_create_and_list() {
         .unwrap();
 
     // Create domain
-    let page2 = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page2 = client.get("/domains").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
         .post_form(
@@ -672,13 +638,7 @@ async fn domains_create_and_list() {
     );
 
     // Verify in list
-    let list = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
     assert!(list.contains("example.com"), "domain should appear in list");
 }
 
@@ -799,13 +759,7 @@ async fn domains_delete_verified_removed() {
         .await
         .unwrap();
 
-    let list = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
     assert!(
         !list.contains("gone.com"),
         "deleted domain should not appear"
@@ -826,13 +780,7 @@ async fn certs_create_and_list() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/certs")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -920,13 +868,7 @@ async fn certs_delete_with_csrf() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/certs")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1009,13 +951,7 @@ async fn tunnels_create_valid_auto_token() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1043,13 +979,7 @@ async fn tunnels_create_valid_auto_token() {
     assert!(loc.contains("/tun"), "should redirect to /tun");
 
     // Verify tunnel appears in list with a non-empty token
-    let list = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(
         list.contains("auto-token-node"),
         "tunnel name should appear in list"
@@ -1067,13 +997,7 @@ async fn tunnels_create_with_provided_token() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1090,13 +1014,7 @@ async fn tunnels_create_with_provided_token() {
     assert_eq!(resp.status().as_u16(), 302);
 
     // Token should appear in the list
-    let list = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(list.contains("manual-token-node"));
     assert!(
         list.contains("my-super-secret-token-123"),
@@ -1110,13 +1028,7 @@ async fn tunnels_create_with_expires_at() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1134,13 +1046,7 @@ async fn tunnels_create_with_expires_at() {
     assert_eq!(resp.status().as_u16(), 302);
 
     // Expires column should show the date
-    let list = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(list.contains("expiring-node"));
     assert!(
         list.contains("2030-12-31"),
@@ -1178,13 +1084,7 @@ async fn tunnels_create_invalid_name_chars() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1214,13 +1114,7 @@ async fn tunnels_edit_page_prefilled() {
     client.login("admin", "admin").await.unwrap();
 
     // Create a tunnel first
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1235,10 +1129,7 @@ async fn tunnels_edit_page_prefilled() {
         .unwrap();
 
     // Open edit page
-    let resp = client
-        .get("/tun/edit?name=edit-me-node")
-        .await
-        .unwrap();
+    let resp = client.get("/tun/edit?name=edit-me-node").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("Edit tunnel"));
@@ -1256,13 +1147,7 @@ async fn tunnels_update() {
     client.login("admin", "admin").await.unwrap();
 
     // Create
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1300,13 +1185,7 @@ async fn tunnels_update() {
     );
 
     // Verify updated token in list
-    let list = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(
         list.contains("updated-token"),
         "updated token should appear in list"
@@ -1319,13 +1198,7 @@ async fn tunnels_delete_with_csrf() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1373,13 +1246,7 @@ async fn tunnels_delete_verified_in_list() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1401,13 +1268,7 @@ async fn tunnels_delete_verified_in_list() {
         .await
         .unwrap();
 
-    let list = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(
         !list.contains("verify-delete-node"),
         "deleted tunnel should not appear in list"
@@ -1434,10 +1295,7 @@ async fn tunnels_edit_nonexistent_not_found() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let resp = client
-        .get("/tun/edit?name=nonexistent-node")
-        .await
-        .unwrap();
+    let resp = client.get("/tun/edit?name=nonexistent-node").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200); // renders error in body
     let body = resp.text().await.unwrap();
     assert!(
@@ -1490,10 +1348,7 @@ async fn logout_redirects_to_login() {
         .get("location")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(
-        loc.contains("/login"),
-        "logout should redirect to login"
-    );
+    assert!(loc.contains("/login"), "logout should redirect to login");
 }
 
 // ── §30 — After logout, protected pages redirect ────────────────────────────
@@ -1510,11 +1365,7 @@ async fn after_logout_redirects_to_login() {
 
     // Now check that without session, we'd redirect (fresh client)
     let fresh_client = new_client_no_redirect();
-    let resp2 = fresh_client
-        .get(&ngx.admin_url("/"))
-        .send()
-        .await
-        .unwrap();
+    let resp2 = fresh_client.get(&ngx.admin_url("/")).send().await.unwrap();
     assert_eq!(resp2.status().as_u16(), 302);
 }
 
@@ -1580,13 +1431,7 @@ async fn site_domains_subpage_renders() {
         .unwrap();
 
     // Create two domains for this site
-    let domains_page = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let domains_page = client.get("/domains").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
@@ -1612,10 +1457,7 @@ async fn site_domains_subpage_renders() {
         .unwrap();
 
     // Visit the site-specific domains sub-page
-    let resp = client
-        .get("/site/subpage-test-site/domains")
-        .await
-        .unwrap();
+    let resp = client.get("/site/subpage-test-site/domains").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
 
@@ -1663,13 +1505,7 @@ async fn site_domains_count_link_in_sites_table() {
         )
         .await
         .unwrap();
-    let domains_page = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let domains_page = client.get("/domains").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
@@ -1684,13 +1520,7 @@ async fn site_domains_count_link_in_sites_table() {
         .unwrap();
 
     // Sites table should have a link with the domain count
-    let sites_body = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let sites_body = client.get("/sites").await.unwrap().text().await.unwrap();
     // Should contain a link to the site domains sub-page
     assert!(
         sites_body.contains("/site/count-link-test/domains"),
@@ -1750,13 +1580,7 @@ async fn site_domains_api_table_for_site() {
         )
         .await
         .unwrap();
-    let domains_page = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let domains_page = client.get("/domains").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
@@ -1771,10 +1595,7 @@ async fn site_domains_api_table_for_site() {
         .unwrap();
 
     // HTMX endpoint should return only the table rows
-    let resp = client
-        .get("/api/site/hx-table-test/domains")
-        .await
-        .unwrap();
+    let resp = client.get("/api/site/hx-table-test/domains").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -1892,13 +1713,7 @@ async fn sites_create_preserves_form_values_on_error() {
         .expect("hidden backend input should still be present");
     // No site was created — a fresh site-name must not appear in the
     // sites list.
-    let list_body = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list_body = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(
         !list_body.contains("preserved-name"),
         "site should not be persisted on validation error"
@@ -1941,13 +1756,7 @@ async fn sites_create_direct_file_backend() {
     );
 
     // The site should appear in the sites list with the file:// backend.
-    let list_body = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list_body = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(list_body.contains("file-static-site"));
     assert!(list_body.contains("file:///var/www/static"));
 }
@@ -2057,13 +1866,7 @@ async fn sites_create_file_long_path_server_side_fallback() {
         resp.status()
     );
 
-    let list_body = client
-        .get("/sites")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list_body = client.get("/sites").await.unwrap().text().await.unwrap();
     assert!(list_body.contains("long-path-site"));
     // The path was correctly assembled into a file:// URL.
     assert!(
@@ -2216,13 +2019,7 @@ async fn tun_crud_full_ui_flow() {
     client.login("admin", "admin").await.unwrap();
 
     // GET /tun/new page, capture CSRF.
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     // POST /tun/new with name + token + enabled.
@@ -2289,19 +2086,10 @@ async fn tun_crud_full_ui_flow() {
     );
 
     // POST /tun/office/delete.
-    let list_page_after = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let list_page_after = client.get("/tun").await.unwrap().text().await.unwrap();
     let delete_csrf = client.csrf_token(&list_page_after).unwrap_or_default();
     let del_resp = client
-        .post_form(
-            "/tun/office/delete",
-            &[("_csrf", &delete_csrf)],
-        )
+        .post_form("/tun/office/delete", &[("_csrf", &delete_csrf)])
         .await
         .unwrap();
     assert_eq!(
@@ -2314,8 +2102,7 @@ async fn tun_crud_full_ui_flow() {
     // Confirm deletion in the list.
     let final_body = client.get("/tun").await.unwrap().text().await.unwrap();
     assert!(
-        !final_body.contains(r#"id="tun-office""#)
-            && !final_body.contains(">office<"),
+        !final_body.contains(r#"id="tun-office""#) && !final_body.contains(">office<"),
         "tunnels list should no longer contain 'office' after delete, got: {}",
         final_body
     );
@@ -2332,11 +2119,7 @@ async fn tun_create_no_csrf_forbidden() {
     let resp = client
         .post_form(
             "/tun/new",
-            &[
-                ("name", "no-csrf-tun"),
-                ("token", "tok"),
-                ("enabled", "1"),
-            ],
+            &[("name", "no-csrf-tun"), ("token", "tok"), ("enabled", "1")],
         )
         .await
         .unwrap();
@@ -2380,13 +2163,7 @@ async fn domains_hx_delete_with_body_csrf_works() {
         .await
         .unwrap();
 
-    let page2 = client
-        .get("/domains")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page2 = client.get("/domains").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     client
         .post_form(
@@ -2448,13 +2225,7 @@ async fn tun_create_duplicate_fails_without_overwriting() {
     client.login("admin", "admin").await.unwrap();
 
     // 1. Create first tun with a distinct token
-    let page = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -2484,13 +2255,7 @@ async fn tun_create_duplicate_fails_without_overwriting() {
     );
 
     // 3. Attempt to create another tun with the same name but different token
-    let page2 = client
-        .get("/tun/new")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let page2 = client.get("/tun/new").await.unwrap().text().await.unwrap();
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
 
     let resp2 = client
@@ -2520,22 +2285,10 @@ async fn tun_create_duplicate_fails_without_overwriting() {
     );
 
     // 4. Verify the first tun is UNCHANGED — edit page should NOT show second-token
-    let edit_page = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let edit_page = client.get("/tun").await.unwrap().text().await.unwrap();
     // The tun list page shows the tun name; navigate to the edit page for dup-tun
     // We get /tun/edit?name=dup-tun via query param
-    let edit_resp = client
-        .get("/tun")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let edit_resp = client.get("/tun").await.unwrap().text().await.unwrap();
     // The TunFormTemplate never echoes back the token value (security).
     // Instead we verify that "second-token" does NOT appear anywhere as
     // a marker that the old row was NOT overwritten.
