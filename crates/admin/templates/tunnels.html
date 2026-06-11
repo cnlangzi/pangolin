@@ -10,7 +10,7 @@
       <h1 class="text-2xl font-bold text-slate-900">Tunnels</h1>
       <p class="text-slate-500 text-sm mt-1">Each row is one tun node — the <code class="text-xs">token</code> column is the credential the WS server checks. Provision both via this page; the server does not auto-register new tuns.</p>
     </div>
-    <a href="/admin/tun/new"
+    <a href="/tun/new"
       class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4"/></svg>
       New tunnel
@@ -60,13 +60,13 @@
           <td class="px-4 py-3 text-sm text-slate-500">{% if let Some(t) = tun.last_seen_at %}{{ t.format("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</td>
           <td class="px-4 py-3">
             <div class="flex items-center justify-end gap-1">
-              <a href="/admin/tun/edit?name={{ tun.name }}"
+              <a href="/tun/edit?name={{ tun.name }}"
                 class="text-slate-400 hover:text-accent-500 p-1.5 rounded hover:bg-accent-50 transition-colors"
                 title="Edit"
                 aria-label="Edit {{ tun.name }}">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z"/></svg>
               </a>
-              <form method="POST" action="/admin/tun/delete" onsubmit="return confirm('Delete tunnel {{ tun.name }}? This cannot be undone.');" class="inline">
+              <form method="POST" action="/tun/delete" onsubmit="return confirm('Delete tunnel {{ tun.name }}? This cannot be undone.');" class="inline">
                 <input type="hidden" name="name" value="{{ tun.name }}">
                 <input type="hidden" name="_csrf" value="__CSRF__">
                 <button type="submit"
@@ -79,7 +79,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="px-4 py-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/admin/tun/new" class="text-accent-500 hover:underline">Create one</a> to get started.</td></tr>
+        <tr><td colspan="6" class="px-4 py-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/tun/new" class="text-accent-500 hover:underline">Create one</a> to get started.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -110,9 +110,9 @@
           <div>Last seen: {% if let Some(t) = tun.last_seen_at %}{{ t.format("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</div>
         </div>
         <div class="flex gap-1 mt-3">
-          <a href="/admin/tun/edit?name={{ tun.name }}"
+          <a href="/tun/edit?name={{ tun.name }}"
             class="flex-1 text-center text-sm text-accent-600 hover:text-accent-700 border border-accent-200 hover:bg-accent-50 rounded-lg py-1.5 transition-colors">Edit</a>
-          <form method="POST" action="/admin/tun/delete" onsubmit="return confirm('Delete tunnel {{ tun.name }}?');" class="flex-1">
+          <form method="POST" action="/tun/delete" onsubmit="return confirm('Delete tunnel {{ tun.name }}?');" class="flex-1">
             <input type="hidden" name="name" value="{{ tun.name }}">
             <input type="hidden" name="_csrf" value="__CSRF__">
             <button type="submit" class="w-full text-sm text-red-500 hover:text-red-600 border border-red-100 hover:bg-red-50 rounded-lg py-1.5 transition-colors">Delete</button>
@@ -120,7 +120,7 @@
         </div>
       </div>
       {% else %}
-      <div class="p-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/admin/tun/new" class="text-accent-500 hover:underline">Create one</a> to get started.</div>
+      <div class="p-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/tun/new" class="text-accent-500 hover:underline">Create one</a> to get started.</div>
       {% endfor %}
     </div>
   </div>

@@ -18,7 +18,6 @@
 //!    finishes, the pingora thread is joined, and `main` returns.
 
 mod acme;
-mod admin_api;
 mod dns;
 mod proxy;
 mod runtime;

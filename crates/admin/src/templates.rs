@@ -55,64 +55,56 @@ pub struct SiteFormTemplate<'a> {
 }
 
 impl<'a> SiteFormTemplate<'a> {
-    /// Returns the initial `route_mode` for the hierarchical backend form:
-    /// "tunnel" if the existing backend is a `tun:scheme://...` URL,
-    /// "direct" otherwise (including the new-site empty case).
     pub fn initial_route_mode(&self) -> &'static str {
         self.site
             .as_ref()
             .map(|s| s.backend_route_mode())
             .unwrap_or("direct")
     }
-    /// Returns the initial tunnel name selection, or empty string for
-    /// direct / new-site.
+
     pub fn initial_tun_name(&self) -> &str {
         self.site
             .as_ref()
             .map(|s| s.backend_tun_name())
             .unwrap_or("")
     }
-    /// Returns the initial scheme selection (http/https/file), defaulting
-    /// to "http" for the new-site case.
+
     pub fn initial_scheme(&self) -> &str {
         self.site
             .as_ref()
             .map(|s| {
-                let s = s.backend_scheme();
-                if s.is_empty() {
+                let scheme = s.backend_scheme();
+                if scheme.is_empty() {
                     "http"
                 } else {
-                    s
+                    scheme
                 }
             })
             .unwrap_or("http")
     }
-    /// Returns the initial host:port value, or empty string for new-site.
+
     pub fn initial_host_port(&self) -> &str {
         self.site
             .as_ref()
             .map(|s| s.backend_host_port())
             .unwrap_or("")
     }
-    /// True when the `backend` field is the one that triggered the error.
-    /// The template uses this to render an inline error message and a
-    /// red border on the host:port input.
+
     pub fn backend_has_error(&self) -> bool {
         self.field_error == Some("backend")
     }
-    /// True when the `name` field is the one that triggered the error.
+
     pub fn name_has_error(&self) -> bool {
         self.field_error == Some("name")
     }
-    /// Whether the host_custom field should be visible (only when the
-    /// existing/new site is in custom host mode).
+
     pub fn show_host_custom(&self) -> bool {
         self.site
             .as_ref()
             .map(|s| s.is_host_mode_custom())
             .unwrap_or(false)
     }
-    /// Pre-fill value for the host_custom input.
+
     pub fn host_custom_value(&self) -> &str {
         self.site
             .as_ref()
@@ -149,12 +141,7 @@ pub struct DomainFormTemplate<'a> {
     /// Defaults to `false` for the "new" form, mirroring the v2 design rule
     /// that operators must explicitly opt in to auto-issuance.
     pub auto_issue_checked: bool,
-    /// When `Some(domain)`, render in edit mode. The domain name becomes
-    /// a read-only display (primary key), the site field is locked to the
-    /// domain's current site_name, and the form action is the update
-    /// endpoint instead of the create endpoint.
     pub edit_domain: Option<String>,
-    /// Pre-filled `auto_issue` value when editing an existing domain.
     pub current_auto_issue: bool,
 }
 
@@ -165,27 +152,20 @@ impl<'a> DomainFormTemplate<'a> {
         self.preselected_site_name.as_deref() == Some(site_name)
     }
 
-    /// Form action URL: edit endpoint when in edit mode, create endpoint
-    /// otherwise. When invoked from a site-specific sub-page (site is
-    /// preselected), the new-domain form posts to the generic create
-    /// endpoint so the redirect can land back on the site_domains page.
     pub fn form_action(&self) -> String {
         if let Some(domain) = &self.edit_domain {
-            return format!("/admin/api/domains/{}/edit", domain);
+            return format!("/api/domains/{}/edit", domain);
         }
         if self.preselected_site_name.is_some() {
-            return "/admin/api/domains".to_string();
+            return "/api/domains".to_string();
         }
-        "/admin/domains/new".to_string()
+        "/domains/new".to_string()
     }
 
-    /// Submit-button label. Always "Save"; left as a method so future
-    /// variants (e.g. "Create and add another") can vary by mode.
     pub fn submit_label(&self) -> &'static str {
         "Save"
     }
 
-    /// Form title: "Edit domain" or "New domain".
     pub fn form_title(&self) -> &'static str {
         if self.edit_domain.is_some() {
             "Edit domain"
@@ -194,56 +174,31 @@ impl<'a> DomainFormTemplate<'a> {
         }
     }
 
-    /// Whether the site field should be locked to the preselected site
-    /// (hidden input + read-only label instead of an editable dropdown).
-    /// True when editing an existing domain or when invoked from a
-    /// site-specific sub-page that already establishes the site context.
     pub fn lock_site(&self) -> bool {
         self.edit_domain.is_some() || self.preselected_site_name.is_some()
     }
 
-    /// Whether the domain name field should be locked (read-only display +
-    /// hidden field). Only true in edit mode.
     pub fn lock_domain(&self) -> bool {
         self.edit_domain.is_some()
     }
 
-    /// Returns true if the given DNS provider name is the currently-selected
-    /// one for this domain. Used by the <select> dropdown to mark the
-    /// matching <option> as selected.
     pub fn is_dns_provider_selected(&self, name: &str) -> bool {
         self.dns_provider_value == name
     }
 
-    /// Returns the current edit-domain name (or empty string if not in
-    /// edit mode). Used by templates to render the read-only domain badge
-    /// and the hidden field value.
     pub fn edit_domain_value(&self) -> &str {
         self.edit_domain.as_deref().unwrap_or("")
     }
 
-    /// Returns the current preselected site name (or empty string).
     pub fn preselected_site_name_value(&self) -> &str {
         self.preselected_site_name.as_deref().unwrap_or("")
     }
 
-    /// Returns the URL to redirect to after a successful form submit.
-    /// When invoked from a site-specific sub-page (preselected site set),
-    /// this is the site_domains page. When editing, also the site_domains
-    /// page (since edit is always invoked from a row on that page).
-    /// Otherwise (the global new form), returns /admin/domains.
     pub fn next_redirect(&self) -> String {
         if let Some(site) = &self.preselected_site_name {
-            return format!("/admin/site/{}/domains", site);
+            return format!("/site/{}/domains", site);
         }
-        if let Some(domain) = &self.edit_domain {
-            // For edit, we don't have site_name in the template (it's
-            // already locked via preselected_site_name when editing), so
-            // this branch is rarely hit. Fall back to global domains.
-            let _ = domain;
-            return "/admin/domains".to_string();
-        }
-        "/admin/domains".to_string()
+        "/domains".to_string()
     }
 }
 
@@ -266,8 +221,8 @@ pub struct TunnelsTemplate<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "tunnel_form.html")]
-pub struct TunnelFormTemplate<'a> {
+#[template(path = "tun_form.html")]
+pub struct TunFormTemplate<'a> {
     pub tun: Option<Tun>,
     pub action: &'a str,
     pub error: Option<&'a str>,
@@ -385,5 +340,19 @@ impl<'a> DnsProviderFormTemplate<'a> {
     /// Pre-filled Tencent secret id for the edit form.
     pub fn tencent_secret_id_value(&self) -> &str {
         self.tencent_secret_id.as_deref().unwrap_or("")
+    }
+    /// Form POST target. Edit forms POST to `/dns/{name}/edit` (path-param
+    /// style, as specified in the dashboard URL brief). New forms POST to
+    /// `/dns/new`. The name is embedded directly in the URL because the
+    /// route is a path-param style endpoint.
+    pub fn form_action(&self) -> String {
+        if self.is_edit {
+            match &self.provider {
+                Some(p) => format!("/dns/{}/edit", p.name),
+                None => "/dns/edit".to_string(),
+            }
+        } else {
+            "/dns/new".to_string()
+        }
     }
 }

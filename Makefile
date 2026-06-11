@@ -55,11 +55,8 @@ OUT_DIR ?= ./bin
 # binaries that the `mv` steps below can find.
 CARGO_TARGET_DIR ?= ./target
 
-# `build` (and the `Build` CI job) embeds admin assets into the release
-# binary via rust-embed. Building assets first is required — without it
-# the release binary serves empty CSS/JS and the admin UI is broken.
-# `build-debug` is the no-embed path (assets read from disk at runtime
-# via the `debug-embed` feature) and is unaffected.
+# Release builds embed admin assets via rust-embed; building UI assets
+# first is required — without it the binary serves empty CSS/JS.
 build: build-ui
 	mkdir -p $(OUT_DIR)
 	# Single cargo invocation for both binaries so the shared crates
@@ -77,10 +74,8 @@ build: build-ui
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-# `build-ngx` depends on `build-ui` because the release binary embeds
-# admin assets via rust-embed; without assets it would serve empty
-# CSS/JS. `build-tun` does NOT depend on `build-ui` because the tun
-# binary does not embed assets.
+# `build-ngx` embeds admin assets (hence the `build-ui` dep); `build-tun`
+# does not.
 build-ngx: build-ui
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx

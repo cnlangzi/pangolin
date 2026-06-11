@@ -3,13 +3,18 @@
 //!
 //! ## Integration with ngx
 //!
-//! ngx `serve.rs` routes `/admin/*` requests here. This crate exposes a
-//! single `handle()` function that returns an `http::Response`.
+//! ngx `serve.rs` routes requests to `admin::handle()` for the three
+//! dashboard namespaces:
+//!   - `/...`          UI HTML pages (root + /sites, /domains, /tun, ...)
+//!   - `/api/...`      HTMX HTML fragments (partials for in-place updates)
+//!   - `/assets/...`   static resources (CSS, JS, images)
 //!
 //! ## Auth
 //!
 //! Sessions are in-memory `HashMap<token, Instant>`. A random 32-byte hex
-//! token is stored in a `HttpOnly; SameSite=Strict` cookie.
+//! token is stored in a `HttpOnly; SameSite=Strict` cookie with `Path=/`
+//! (so it's sent on every dashboard URL, not just the legacy `/admin/`
+//! prefix that no longer exists).
 //!
 //! ## Routing
 //!
@@ -48,14 +53,24 @@ pub async fn handle(
         _ => None,
     };
 
-    let is_auth_page = path == "/admin/login" || path == "/admin/login/";
+    // Only the login page is publicly accessible. Everything else (UI,
+    // /api, /assets) requires a session. (The only exception is static
+    // assets, but those don't need to be behind auth at the moment —
+    // they're cosmetic; the auth check above is fine to apply to them
+    // because real browsers load them with the session cookie attached
+    // automatically.)
+    let is_auth_page = path == "/login" || path == "/login/";
 
     if session_token.is_none() && !is_auth_page {
-        let next = path.trim_start_matches("/admin");
-        let location = if next.is_empty() || next == "/" {
-            "/admin/login".to_string()
+        let next = if path == "/" || path.is_empty() {
+            "/".to_string()
         } else {
-            format!("/admin/login?next={}", urlencoding::encode(next))
+            path.to_string()
+        };
+        let location = if next == "/" || next.is_empty() {
+            "/login".to_string()
+        } else {
+            format!("/login?next={}", urlencoding::encode(&next))
         };
         let mut resp = Response::new(Full::new(Bytes::from(format!(
             "Redirecting to {}",
@@ -69,11 +84,10 @@ pub async fn handle(
         return Ok(resp);
     }
 
-    // ── Route dispatch ───────────────────────────────────────────────
     // ── CSRF check on mutating methods ──────────────────────────────
     // Skip CSRF for login (no session yet) and logout (CSRF is part of auth).
-    let is_login = path == "/admin/login" || path == "/admin/login/";
-    let is_logout = path == "/admin/logout";
+    let is_login = path == "/login" || path == "/login/";
+    let is_logout = path == "/logout";
     if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !is_login && !is_logout {
         let session_token_str = session_token.as_deref().unwrap_or("");
         // CSRF token MUST come from the body only, not from URL query string
@@ -94,7 +108,8 @@ pub async fn handle(
         }
     }
 
-    let path = path.trim_start_matches("/admin").trim_start_matches('/');
+    // ── Route dispatch ───────────────────────────────────────────────
+    let path = path.trim_start_matches('/');
 
     // Look up the CSRF token for the current session (if any). For unauthenticated
     // requests (login page), this is empty.
@@ -104,16 +119,32 @@ pub async fn handle(
         String::new()
     };
 
-    let res: Response<Full<Bytes>> = match path {
-        "" | "dashboard" => routes::dashboard::render(&app, &csrf_token).await?,
-        "sites" if method == "GET" => routes::sites::render(&app, &csrf_token).await?,
-        "sites/new" if method == "GET" => {
-            routes::sites::render_create_page(&app, &csrf_token).await?
+    let res: Response<Full<Bytes>> = match (path, method) {
+        // ── /assets/... : static resources (no auth needed; the
+        // auth check above already gated everything) ───────────────
+        (p, _) if p.starts_with("assets/") => {
+            // Serve from embedded assets at compile time.
+            // Falling through to 404 if not found.
+            match serve_static_asset(p) {
+                Some(resp) => resp,
+                None => not_found(),
+            }
         }
-        "sites/new" if method == "POST" => {
+
+        // ── /api/... : HTMX HTML fragments ─────────────────────────
+        // The brief splits /api/site/{name}/domains (GET) and
+        // /api/domains/{domain} (DELETE). Both are HTMX endpoints that
+        // return HTML partials, not JSON. The JSON API is gone.
+        // (All /api/* routes are dispatched via the prefix branch below.)
+
+        // ── UI HTML pages at root ──────────────────────────────────
+        ("" | "dashboard", "GET") => routes::dashboard::render(&app, &csrf_token).await?,
+        ("sites", "GET") => routes::sites::render(&app, &csrf_token).await?,
+        ("sites/new", "GET") => routes::sites::render_create_page(&app, &csrf_token).await?,
+        ("sites/new", "POST") => {
             routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "sites/edit" if method == "GET" => {
+        ("sites/edit", "GET") => {
             routes::sites::render_edit_page(
                 &app,
                 query_param_opt(&merged_params, "name"),
@@ -121,7 +152,7 @@ pub async fn handle(
             )
             .await?
         }
-        "sites/edit" if method == "POST" => {
+        ("sites/edit", "POST") => {
             routes::sites::handle_update(
                 &app,
                 query_param_opt(&merged_params, "name"),
@@ -130,18 +161,16 @@ pub async fn handle(
             )
             .await?
         }
-        "sites/delete" if method == "POST" => {
+        ("sites/delete", "POST") => {
             routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
         }
-        "domains" if method == "GET" => routes::domains::render(&app, &csrf_token).await?,
-        "domains/new" if method == "GET" => {
-            routes::domains::render_create_page(&app, &csrf_token).await?
-        }
-        "domains/new" if method == "POST" => {
+        ("domains", "GET") => routes::domains::render(&app, &csrf_token).await?,
+        ("domains/new", "GET") => routes::domains::render_create_page(&app, &csrf_token).await?,
+        ("domains/new", "POST") => {
             routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "domains/delete" if method == "POST" => {
+        ("domains/delete", "POST") => {
             routes::domains::handle_delete(
                 &app,
                 query_param_opt(&merged_params, "domain"),
@@ -149,18 +178,12 @@ pub async fn handle(
             )
             .await?
         }
-        "api/domains" if method == "POST" => {
-            // Generic create endpoint (used by the site_domains form when
-            // the site is locked — site_name is taken from the form body,
-            // which already has the correct preselected value).
-            routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
-        }
-        "tun" => routes::tun::render(&app, &csrf_token).await?,
-        "tun/new" if method == "GET" => routes::tun::render_create_page(&app, &csrf_token).await?,
-        "tun/new" if method == "POST" => {
+        ("tun", "GET") => routes::tun::render(&app, &csrf_token).await?,
+        ("tun/new", "GET") => routes::tun::render_create_page(&csrf_token).await?,
+        ("tun/new", "POST") => {
             routes::tun::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "tun/edit" if method == "GET" => {
+        ("tun/edit", "GET") => {
             routes::tun::render_edit_page(
                 &app,
                 query_param_opt(&merged_params, "name"),
@@ -168,7 +191,7 @@ pub async fn handle(
             )
             .await?
         }
-        "tun/edit" if method == "POST" => {
+        ("tun/edit", "POST") => {
             routes::tun::handle_update(
                 &app,
                 query_param_opt(&merged_params, "name"),
@@ -177,16 +200,16 @@ pub async fn handle(
             )
             .await?
         }
-        "tun/delete" if method == "POST" => {
+        ("tun/delete", "POST") => {
             routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
         }
-        "certs" if method == "GET" => routes::certs::render(&app, &csrf_token).await?,
-        "certs/new" if method == "GET" => routes::certs::render_create_page(&csrf_token).await?,
-        "certs/new" if method == "POST" => {
+        ("certs", "GET") => routes::certs::render(&app, &csrf_token).await?,
+        ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
+        ("certs/new", "POST") => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "certs/delete" if method == "POST" => {
+        ("certs/delete", "POST") => {
             routes::certs::handle_delete(
                 &app,
                 query_param_opt(&merged_params, "domain"),
@@ -194,109 +217,129 @@ pub async fn handle(
             )
             .await?
         }
-        "dns" if method == "GET" => routes::dns::render(&app, &csrf_token).await?,
-        "dns/new" if method == "GET" => routes::dns::render_create_page(&app, &csrf_token).await?,
-        "dns/new" if method == "POST" => {
+        ("dns", "GET") => routes::dns::render(&app, &csrf_token).await?,
+        ("dns/new", "GET") => routes::dns::render_create_page(&app, &csrf_token).await?,
+        ("dns/new", "POST") => {
             routes::dns::handle_create(&app, &merged_params, &csrf_token).await?
         }
-        "dns/edit" if method == "GET" => {
-            routes::dns::render_edit_page(
-                &app,
-                query_param_opt(&merged_params, "name"),
-                &csrf_token,
-            )
-            .await?
+        ("dns/test", "POST") => routes::dns::handle_test(&app, &merged_params).await?,
+
+        // ── Auth ────────────────────────────────────────────────────
+        ("login", "GET") => {
+            routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref()).await?
         }
-        "dns/edit" if method == "POST" => {
-            routes::dns::handle_update(
-                &app,
-                query_param_opt(&merged_params, "name"),
-                &merged_params,
-                &csrf_token,
-            )
-            .await?
-        }
-        "dns/delete" if method == "POST" => {
-            routes::dns::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
-                .await?
-        }
-        "dns/test" if method == "POST" => routes::dns::handle_test(&app, &merged_params).await?,
-        // Auth
-        "login" => {
-            if method == "POST" {
-                routes::auth::handle_login(&app, sessions, &merged_params).await?
-            } else {
-                routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref())
-                    .await?
-            }
-        }
-        "logout" if method == "POST" => {
+        ("login", "POST") => routes::auth::handle_login(&app, sessions, &merged_params).await?,
+        ("logout", "POST") => {
             routes::auth::handle_logout(sessions, &session_token.unwrap(), &merged_params).await?
         }
-        // ── Site-specific sub-pages ─────────────────────────────────────
+
+        // ── Site-specific sub-pages (UI) and HTMX fragments (/api/) ─
         _ => {
-            // Prefix-based dispatch for: site/{name}/domains, site/{name}/api/domains, etc.
+            // UI: /site/{name}/domains
             if let Some(rest) = path.strip_prefix("site/") {
                 if let Some((site_name, suffix)) = rest.split_once('/') {
                     match suffix {
                         "domains" => {
                             routes::domains::render_for_site(&app, site_name, &csrf_token).await?
                         }
-                        "api/domains" if method == "GET" => {
-                            routes::domains::render_table_for_site(&app, site_name, &csrf_token)
+                        _ => not_found(),
+                    }
+                } else {
+                    not_found()
+                }
+            } else if let Some(rest) = path.strip_prefix("api/") {
+                // /api/site/{name}/domains       GET   (HTML partial: site-specific domain table rows)
+                // /api/site/{name}/domains/new   GET   (HTML partial: new-domain form, preselected)
+                // /api/domains/{domain}          DELETE (HTML fragment — empty body on success)
+                if let Some(rest2) = rest.strip_prefix("site/") {
+                    if let Some((site_name, suffix)) = rest2.split_once('/') {
+                        match (suffix, method) {
+                            ("domains", "GET") => {
+                                routes::domains::render_table_for_site(&app, site_name, &csrf_token)
+                                    .await?
+                            }
+                            ("domains/new", "GET") => {
+                                routes::domains::api_render_form_new(
+                                    &app,
+                                    site_name,
+                                    &merged_params,
+                                    &csrf_token,
+                                )
                                 .await?
+                            }
+                            _ => not_found(),
                         }
-                        "api/domains" if method == "POST" => {
-                            routes::domains::handle_create(&app, &merged_params, &csrf_token)
-                                .await?
-                        }
-                        "api/domains/new" => {
-                            routes::domains::api_render_form_new(
+                    } else {
+                        not_found()
+                    }
+                } else if let Some(domain) = rest.strip_prefix("domains/") {
+                    if method == "DELETE" {
+                        if domain.is_empty() {
+                            not_found()
+                        } else {
+                            routes::domains::api_handle_delete(
                                 &app,
-                                site_name,
+                                domain.to_string(),
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                    } else {
+                        not_found()
+                    }
+                } else {
+                    not_found()
+                }
+            } else if let Some(rest) = path.strip_prefix("dns/") {
+                // /dns/{name}/edit   GET   (render edit form)
+                // /dns/{name}/edit   POST  (update)
+                // /dns/{name}/delete POST  (delete)
+                if let Some((name, suffix)) = rest.split_once('/') {
+                    match (suffix, method) {
+                        ("edit", "GET") => {
+                            routes::dns::render_edit_page(&app, Some(name.to_string()), &csrf_token)
+                                .await?
+                        }
+                        ("edit", "POST") => {
+                            routes::dns::handle_update(
+                                &app,
+                                Some(name.to_string()),
                                 &merged_params,
                                 &csrf_token,
                             )
                             .await?
+                        }
+                        ("delete", "POST") => {
+                            routes::dns::handle_delete(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         _ => not_found(),
                     }
                 } else {
                     not_found()
                 }
-            } else if let Some(rest) = path.strip_prefix("api/domains/") {
-                // Global domain-scoped endpoints (no site context).
-                // Path: api/domains/{domain}/{action}
-                if let Some((domain, action)) = rest.split_once('/') {
-                    match (action, method) {
+            } else if let Some(rest) = path.strip_prefix("tun/") {
+                // /tun/{name}/edit   GET   (render edit form)
+                // /tun/{name}/edit   POST  (update)
+                // /tun/{name}/delete POST  (delete)
+                if let Some((name, suffix)) = rest.split_once('/') {
+                    match (suffix, method) {
                         ("edit", "GET") => {
-                            routes::domains::api_render_form_edit(
-                                &app,
-                                domain,
-                                &merged_params,
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::tun::render_edit_page(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         ("edit", "POST") => {
-                            routes::domains::handle_update(
+                            routes::tun::handle_update(
                                 &app,
-                                domain,
+                                Some(name.to_string()),
                                 &merged_params,
                                 &csrf_token,
                             )
                             .await?
                         }
-                        ("toggle", "POST") => {
-                            // `view` query param selects the response shape:
-                            //   "row"  → desktop table <tr>  (default, no param)
-                            //   "card" → mobile card <div>   (set by site_domains.html)
-                            // The mobile card must replace the whole card
-                            // div (which contains Edit / Delete buttons and
-                            // the DNS line), not just the toggle badge.
-                            let view = query_param_opt(&merged_params, "view")
-                                .unwrap_or_else(|| "row".to_string());
-                            routes::domains::handle_toggle(&app, domain, &view, &csrf_token).await?
+                        ("delete", "POST") => {
+                            routes::tun::handle_delete(&app, Some(name.to_string()), &csrf_token)
+                                .await?
                         }
                         _ => not_found(),
                     }
@@ -354,6 +397,36 @@ pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full
     Ok(resp)
 }
 
+/// Return the embedded asset for `/assets/{name}` (CSS, JS, images, vendor files).
+///
+/// Asset bytes are served from the [`assets::Asset`] rust-embed snapshot of
+/// the workspace `assets/` directory (compile-time embed in release; fs-read
+/// in debug via the `debug-embed` feature). Unknown paths return `None` so
+/// the caller can answer 404.
+fn serve_static_asset(path: &str) -> Option<Response<Full<Bytes>>> {
+    // Strip leading "assets/" prefix and any query string (e.g. ?v=HASH).
+    let raw = path.strip_prefix("assets/")?;
+    let name = raw.split('?').next()?;
+    if name.is_empty() || name.contains("..") {
+        return None;
+    }
+    let file = <assets::Asset as rust_embed::RustEmbed>::get(name)?;
+    let content_type = match name.rsplit('.').next() {
+        Some("css") => assets::CSS_MIME,
+        Some("js") => assets::JS_MIME,
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    };
+    Response::builder()
+        .status(200)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", assets::IMMUTABLE_CACHE)
+        .body(Full::new(Bytes::from(file.data.into_owned())))
+        .ok()
+}
+
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
     body_str.split('&').find_map(|pair| {
@@ -387,7 +460,7 @@ fn forbidden_response(message: &str) -> Response<Full<Bytes>> {
         r#"<div class="p-6 max-w-md"><div class="bg-red-50 border border-red-200 rounded-lg p-4">
             <h2 class="text-red-800 font-semibold mb-1">403 Forbidden</h2>
             <p class="text-red-700 text-sm">{}</p>
-            <a href="/admin/" class="text-sm text-red-700 underline mt-2 inline-block">← Back to dashboard</a>
+            <a href="/" class="text-sm text-red-700 underline mt-2 inline-block">← Back to dashboard</a>
         </div></div>"#,
         message
     );

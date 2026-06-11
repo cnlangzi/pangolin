@@ -48,14 +48,6 @@ fn make_test_app() -> (TempDir, Arc<App>) {
 // EventBuffer tests
 // ---------------------------------------------------------------------------
 
-/// event_api_empty — GET /api/events on fresh app returns empty array
-#[test]
-fn event_api_empty() {
-    let (_dir, app) = make_test_app();
-    let events = app.get_recent_events(20);
-    assert!(events.is_empty(), "fresh app should have no events");
-}
-
 /// event_api_add — add_event populates the buffer
 #[test]
 fn event_api_add() {

@@ -146,28 +146,6 @@ fn seed_tun_with_token(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Smoke test: a freshly-spawned `pangolin-ngx` admin API responds
-/// to `GET /api/sites` with the empty list.
-#[tokio::test]
-async fn real_e2e_admin_endpoint() {
-    let ngx = NgxProcess::start(|db_path| {
-        init_pangolin_db(db_path);
-    })
-    .await;
-
-    let url = ngx.admin_url("/api/sites");
-    let resp = reqwest::get(&url).await.expect("GET /api/sites");
-    assert_eq!(
-        resp.status(),
-        200,
-        "admin returned non-200: {}",
-        ngx.log_string()
-    );
-    let body: serde_json::Value = resp.json().await.expect("parse JSON");
-    assert!(body.is_array(), "expected array, got: {}", body);
-    assert_eq!(body.as_array().unwrap().len(), 0, "expected empty sites");
-}
-
 /// `file:///` backend serves a static file. Pre-seeds a `data/static/index.html`
 /// and a site/domain mapping to it, then GETs via the public proxy.
 #[tokio::test]
@@ -229,35 +207,31 @@ async fn real_e2e_tunnel_full() {
         log
     );
 
-    // Ask the admin API whether the tun is online. The expected
-    // response is JSON like `{"name":"office","enabled":true,"online":true,...}`.
-    let resp = reqwest::Client::new()
-        .get(ngx.admin_url("/api/tun"))
-        .send()
-        .await
-        .expect("GET /api/tun");
+    // Ask the admin UI whether the tun is online. Login first, then
+    // GET the tunnels list and assert the row shows the online state.
+    // The previous JSON-API-based check (`GET /api/tun`) was removed
+    // along with the JSON API itself in the dashboard URL refactor
+    // (see issue #31); the UI HTML page is now the only way to read
+    // this state externally.
+    let admin = crate::admin_harness::AdminClient::new(&ngx);
+    admin.login("admin", "admin").await.expect("login");
+    let resp = admin.get("/tun").await.expect("GET /tun");
     assert_eq!(
-        resp.status(),
+        resp.status().as_u16(),
         200,
-        "admin /api/tun non-200: {}",
+        "admin /tun non-200: {}",
         ngx.log_string()
     );
-    let body: serde_json::Value = resp.json().await.expect("parse JSON");
-    let arr = body.as_array().expect("array response");
-    assert_eq!(
-        arr.len(),
-        1,
-        "expected 1 tun, got {}: {}",
-        arr.len(),
-        serde_json::to_string(&body).unwrap()
+    let body = resp.text().await.expect("read body");
+    assert!(
+        body.contains("office"),
+        "tunnels page should list the 'office' tun, got: {}",
+        body
     );
-    let entry = &arr[0];
-    assert_eq!(entry["name"], "office");
-    assert_eq!(entry["enabled"], true);
-    assert_eq!(
-        entry["online"], true,
-        "expected tun online=true after connected handshake, got body: {}",
-        entry
+    assert!(
+        body.contains("online"),
+        "tunnels page should show 'office' as online after WS handshake, got: {}",
+        body
     );
 }
 

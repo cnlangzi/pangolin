@@ -55,18 +55,18 @@ impl AdminClient {
         // GET login page to get initial state (not strictly needed, but realistic)
         let login_page = self
             .client
-            .get(&format!("{}/admin/login", self.base_url))
+            .get(&format!("{}/login", self.base_url))
             .send()
             .await?;
 
         if !login_page.status().is_success() {
-            anyhow::bail!("GET /admin/login returned {}", login_page.status());
+            anyhow::bail!("GET /login returned {}", login_page.status());
         }
 
         // POST credentials
         let resp = self
             .client
-            .post(&format!("{}/admin/login", self.base_url))
+            .post(&format!("{}/login", self.base_url))
             .form(&[("username", username), ("password", password)])
             .send()
             .await?;
@@ -104,6 +104,14 @@ impl AdminClient {
     pub async fn delete(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<Response> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self.client.delete(&url).query(&query).send().await?;
+        Ok(resp)
+    }
+
+    /// DELETE an admin path with form data sent in the request body.
+    /// This is the pattern used by HTMX hx-vals with hx-delete.
+    pub async fn delete_form(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client.delete(&url).form(&form).send().await?;
         Ok(resp)
     }
 
