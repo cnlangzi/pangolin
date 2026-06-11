@@ -16,7 +16,12 @@ fn main() {
     compute_and_emit(
         "app.css",
         "CSS",
-        &["assets/app.css", "../assets/app.css", "../../assets/app.css", "../../../assets/app.css"],
+        &[
+            "assets/app.css",
+            "../assets/app.css",
+            "../../assets/app.css",
+            "../../../assets/app.css",
+        ],
         // Also watch the source tailwind file so rebuilding CSS triggers a rebuild.
         &["assets/tailwindcss.css", "../assets/tailwindcss.css"],
     );
@@ -24,18 +29,21 @@ fn main() {
     compute_and_emit(
         "app.js",
         "JS",
-        &["assets/app.js", "../assets/app.js", "../../assets/app.js", "../../../assets/app.js"],
+        &[
+            "assets/app.js",
+            "../assets/app.js",
+            "../../assets/app.js",
+            "../../../assets/app.js",
+        ],
         // Vendored htmx is bundled by app.js; rebuild when it changes too.
-        &["assets/vendor/htmx-1.9.0.min.js", "../assets/vendor/htmx-1.9.0.min.js"],
+        &[
+            "assets/vendor/htmx-1.9.0.min.js",
+            "../assets/vendor/htmx-1.9.0.min.js",
+        ],
     );
 }
 
-fn compute_and_emit(
-    file_name: &str,
-    label: &str,
-    candidates: &[&str],
-    extra_watch: &[&str],
-) {
+fn compute_and_emit(file_name: &str, label: &str, candidates: &[&str], extra_watch: &[&str]) {
     let path = candidates
         .iter()
         .map(Path::new)

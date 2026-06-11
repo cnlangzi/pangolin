@@ -291,8 +291,8 @@ fn render_create_page_with_error(
 /// in `crates/ngx/src/dns/mod.rs` so a passing test here implies the JSON
 /// will be accepted by the factory at issuance time.
 fn static_validate_config(kind: DnsProviderKind, config: &str) -> Result<(), String> {
-    let v: serde_json::Value = serde_json::from_str(config)
-        .map_err(|e| format!("config is not valid JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(config).map_err(|e| format!("config is not valid JSON: {e}"))?;
     let non_empty = |s: &str| !s.is_empty();
     match kind {
         DnsProviderKind::Cloudflare => {
@@ -302,8 +302,14 @@ fn static_validate_config(kind: DnsProviderKind, config: &str) -> Result<(), Str
             }
         }
         DnsProviderKind::Aliyun => {
-            let ak = v.get("access_key_id").and_then(|x| x.as_str()).unwrap_or("");
-            let sk = v.get("access_key_secret").and_then(|x| x.as_str()).unwrap_or("");
+            let ak = v
+                .get("access_key_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let sk = v
+                .get("access_key_secret")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
             if !non_empty(ak) || !non_empty(sk) {
                 return Err("access_key_id and access_key_secret are required".into());
             }
@@ -338,35 +344,106 @@ fn empty_form<'a>(
     active_nav: &'a str,
 ) -> DnsProviderFormTemplate<'a> {
     let is_edit = provider.is_some();
-    let (cf_token, cf_token_set, aliyun_ak_id, aliyun_ak_secret, aliyun_ak_secret_set, aliyun_region, tencent_secret_id, tencent_secret_key, tencent_secret_key_set) =
-        match provider {
-            Some(p) => {
-                let v: serde_json::Value = serde_json::from_str(&p.config).unwrap_or_default();
-                match p.kind {
-                    DnsProviderKind::Cloudflare => {
-                        let t = v.get("api_token").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        (Some("••••••••••••".into()), !t.is_empty(), None, None, false, None, None, None, false)
-                    }
-                    DnsProviderKind::Aliyun => {
-                        let ak = v.get("access_key_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let sk = v.get("access_key_secret").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let r = v.get("region").and_then(|x| x.as_str()).unwrap_or("cn-hangzhou").to_string();
-                        (None, false, Some(ak), Some("••••••••••••".into()), !sk.is_empty(), Some(r), None, None, false)
-                    }
-                    DnsProviderKind::Tencent => {
-                        let id = v.get("secret_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let key = v.get("secret_key").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        (None, false, None, None, false, None, Some(id), Some("••••••••••••".into()), !key.is_empty())
-                    }
+    let (
+        cf_token,
+        cf_token_set,
+        aliyun_ak_id,
+        aliyun_ak_secret,
+        aliyun_ak_secret_set,
+        aliyun_region,
+        tencent_secret_id,
+        tencent_secret_key,
+        tencent_secret_key_set,
+    ) = match provider {
+        Some(p) => {
+            let v: serde_json::Value = serde_json::from_str(&p.config).unwrap_or_default();
+            match p.kind {
+                DnsProviderKind::Cloudflare => {
+                    let t = v
+                        .get("api_token")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (
+                        Some("••••••••••••".into()),
+                        !t.is_empty(),
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        false,
+                    )
+                }
+                DnsProviderKind::Aliyun => {
+                    let ak = v
+                        .get("access_key_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let sk = v
+                        .get("access_key_secret")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let r = v
+                        .get("region")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("cn-hangzhou")
+                        .to_string();
+                    (
+                        None,
+                        false,
+                        Some(ak),
+                        Some("••••••••••••".into()),
+                        !sk.is_empty(),
+                        Some(r),
+                        None,
+                        None,
+                        false,
+                    )
+                }
+                DnsProviderKind::Tencent => {
+                    let id = v
+                        .get("secret_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let key = v
+                        .get("secret_key")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (
+                        None,
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                        Some(id),
+                        Some("••••••••••••".into()),
+                        !key.is_empty(),
+                    )
                 }
             }
-            None => (None, false, None, None, false, None, None, None, false),
-        };
+        }
+        None => (None, false, None, None, false, None, None, None, false),
+    };
 
     DnsProviderFormTemplate {
         provider: provider.cloned(),
-        action: if is_edit { "/admin/dns/edit" } else { "/admin/dns/new" },
-        form_title: if is_edit { "Edit DNS Provider" } else { "New DNS Provider" },
+        action: if is_edit {
+            "/admin/dns/edit"
+        } else {
+            "/admin/dns/new"
+        },
+        form_title: if is_edit {
+            "Edit DNS Provider"
+        } else {
+            "New DNS Provider"
+        },
         submit_label: if is_edit { "Save" } else { "Create" },
         is_edit,
         error,
@@ -395,18 +472,26 @@ fn assemble_config(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let non_empty = |s: &str| -> bool { !s.is_empty() && s != "••••••••••••" };
+    let non_empty =
+        |s: &str| -> bool { !s.is_empty() && s != "••••••••••••" };
+
+    // Helper to merge a secret field: use submitted value if non-empty, else
+    // fall back to existing config, else error.
+    let merge_secret =
+        |param_name: &str, existing_field: &str, label: &str| -> Result<String, String> {
+            let submitted = params.get(param_name).cloned().unwrap_or_default();
+            if non_empty(&submitted) {
+                Ok(submitted)
+            } else if let Some(prev) = existing.get(existing_field).and_then(|x| x.as_str()) {
+                Ok(prev.to_string())
+            } else {
+                Err(format!("{} is required", label))
+            }
+        };
 
     let v = match kind {
         DnsProviderKind::Cloudflare => {
-            let submitted = params.get("api_token").cloned().unwrap_or_default();
-            let token = if non_empty(&submitted) {
-                submitted
-            } else if let Some(prev) = existing.get("api_token").and_then(|x| x.as_str()) {
-                prev.to_string()
-            } else {
-                return Err("API token is required".to_string());
-            };
+            let token = merge_secret("api_token", "api_token", "API token")?;
             serde_json::json!({ "api_token": token })
         }
         DnsProviderKind::Aliyun => {
@@ -414,14 +499,11 @@ fn assemble_config(
             if ak.is_empty() {
                 return Err("Access Key ID is required".to_string());
             }
-            let sk_submitted = params.get("access_key_secret").cloned().unwrap_or_default();
-            let sk = if non_empty(&sk_submitted) {
-                sk_submitted
-            } else if let Some(prev) = existing.get("access_key_secret").and_then(|x| x.as_str()) {
-                prev.to_string()
-            } else {
-                return Err("Access Key Secret is required".to_string());
-            };
+            let sk = merge_secret(
+                "access_key_secret",
+                "access_key_secret",
+                "Access Key Secret",
+            )?;
             let region = params
                 .get("region")
                 .cloned()
@@ -437,14 +519,7 @@ fn assemble_config(
             if id.is_empty() {
                 return Err("Secret ID is required".to_string());
             }
-            let key_submitted = params.get("secret_key").cloned().unwrap_or_default();
-            let key = if non_empty(&key_submitted) {
-                key_submitted
-            } else if let Some(prev) = existing.get("secret_key").and_then(|x| x.as_str()) {
-                prev.to_string()
-            } else {
-                return Err("Secret Key is required".to_string());
-            };
+            let key = merge_secret("secret_key", "secret_key", "Secret Key")?;
             serde_json::json!({
                 "secret_id": id,
                 "secret_key": key,

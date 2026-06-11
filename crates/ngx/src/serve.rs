@@ -121,9 +121,7 @@ fn serve_js() -> http::Response<Vec<u8>> {
         .or_else(|_| std::fs::read("../../assets/app.js"))
         .unwrap_or_else(|_| {
             // Fallback: embedded at build time.
-            include_str!("../../../assets/app.js")
-                .as_bytes()
-                .to_vec()
+            include_str!("../../../assets/app.js").as_bytes().to_vec()
         });
 
     http::Response::builder()

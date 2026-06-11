@@ -188,9 +188,7 @@ pub async fn handle(
             routes::dns::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
         }
-        "dns/test" if method == "POST" => {
-            routes::dns::handle_test(&app, &merged_params).await?
-        }
+        "dns/test" if method == "POST" => routes::dns::handle_test(&app, &merged_params).await?,
         // Auth
         "login" => {
             if method == "POST" {
