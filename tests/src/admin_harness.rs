@@ -107,6 +107,14 @@ impl AdminClient {
         Ok(resp)
     }
 
+    /// DELETE an admin path with form data sent in the request body.
+    /// This is the pattern used by HTMX hx-vals with hx-delete.
+    pub async fn delete_form(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client.delete(&url).form(&form).send().await?;
+        Ok(resp)
+    }
+
     /// Extract CSRF token from HTML (looks for input[name="_csrf"]).
     pub fn csrf_token(&self, html: &str) -> Option<String> {
         let doc = Html::parse_document(html);

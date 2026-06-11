@@ -92,9 +92,10 @@ async fn serve_admin_ui(
         .to_string();
 
     // Read body. Methods that *typically* carry a body (POST/PUT/PATCH)
-    // need read_body_or_idle; methods that don't (GET/HEAD/DELETE) get
-    // an empty body to avoid hanging on read_body_or_idle.
-    let body = if matches!(method, "GET" | "HEAD" | "DELETE") {
+    // need read_body_or_idle; GET/HEAD get an empty body to avoid
+    // hanging on read_body_or_idle. DELETE needs the body too because
+    // HTMX hx-vals sends the CSRF token in the DELETE request body.
+    let body = if matches!(method, "GET" | "HEAD") {
         vec![]
     } else {
         match http_session.read_body_or_idle(false).await {

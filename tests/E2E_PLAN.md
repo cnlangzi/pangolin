@@ -84,19 +84,19 @@ Using the same initialization as `ngx/src/main.rs` but:
 
 ---
 
-## DELETE API Tests (4)
-
-### admin_delete_site
-**Test**: DELETE `/api/sites/test-site` → site gone from DB
+## DELETE API Tests (1 + 3 removed)
 
 ### admin_delete_domain
-**Test**: DELETE `/api/domains/test.example.com` → domain gone
+**Test**: DELETE `/api/domains/test.example.com` → domain gone (HTMX endpoint)
+
+### admin_delete_site
+`[removed: JSON API deleted in issue #31; site deletion is via POST /sites/delete]`
 
 ### admin_delete_tun
-**Test**: DELETE `/api/tun/test-tun` → tun gone
+`[removed: JSON API deleted in issue #31; tun deletion is via POST /tun/delete]`
 
 ### admin_delete_token
-**Test**: DELETE `/api/tokens/test-token` → token gone
+`[removed: JSON API deleted in issue #31; the tokens table was dropped in v2]`
 
 ---
 

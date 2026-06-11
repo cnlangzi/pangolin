@@ -100,6 +100,21 @@ pub async fn handle_create(
         );
     }
 
+    // Reject duplicate names to avoid silently clobbering an existing
+    // tun's online/last_seen_at/expires_at fields via upsert.
+    {
+        let db = app.db.lock().await;
+        if pangolin_core::db::get_tun(&db, &name).unwrap_or(None).is_some() {
+            return render_create_page_with_error(
+                &format!(
+                    "Tun '{}' already exists; use the edit page to update it",
+                    name
+                ),
+                csrf,
+            );
+        }
+    }
+
     let tun = Tun {
         name: name.clone(),
         token: if token.is_empty() { None } else { Some(token) },

@@ -3,7 +3,7 @@
 //! Covers: tests/E2E_PLAN.md → DELETE API (4 tests)
 //!
 //! Tests that DELETE removes resources from DB.
-//! Direct DB-level tests (the HTTP routing is tested in admin_api).
+//! Direct DB-level tests (the HTTP routing is tested in admin_ui_e2e).
 
 use chrono::Utc;
 use rusqlite::Connection;
