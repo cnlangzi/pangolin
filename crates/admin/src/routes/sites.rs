@@ -92,7 +92,19 @@ pub async fn handle_create(
 ) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
-    let backend = params.get("backend").cloned().unwrap_or_default();
+    // The hidden `backend` field is filled in by the page's JS from the
+    // visible form fields. If JS didn't fire (e.g. browser quirk, the
+    // user pasted a value that didn't trigger an input event, or the
+    // page was re-rendered mid-typing), the hidden can be empty even
+    // though the user did fill in host:port. As a safety net, assemble
+    // the backend server-side from the individual form fields when
+    // `backend` is empty.
+    let backend_from_hidden = params.get("backend").cloned().unwrap_or_default();
+    let backend = if backend_from_hidden.is_empty() {
+        assemble_backend_from_form(&params)
+    } else {
+        backend_from_hidden
+    };
     let host_mode = params
         .get("host_mode")
         .and_then(|v| v.parse::<HostMode>().ok())
@@ -186,7 +198,15 @@ pub async fn handle_update(
         }
     };
     let params = parse_form(body);
-    let backend = params.get("backend").cloned().unwrap_or_default();
+    // Fallback assembly from individual form fields if the hidden `backend`
+    // was empty on submit (e.g. JS didn't update it for some reason).
+    let backend_from_hidden = params.get("backend").cloned().unwrap_or_default();
+    let assembled = assemble_backend_from_form(&params);
+    let backend = if !backend_from_hidden.is_empty() {
+        backend_from_hidden
+    } else {
+        assembled.clone()
+    };
     let host_mode = params
         .get("host_mode")
         .and_then(|v| v.parse::<HostMode>().ok())
@@ -365,4 +385,49 @@ fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {
         }
     }
     params
+}
+
+/// Build `<scheme>://<host>` for http/https, or `file:///<path>` for file.
+fn assemble_url(scheme: &str, host: &str) -> String {
+    if scheme == "file" {
+        let path = host.trim_start_matches('/');
+        format!("file:///{}", path)
+    } else {
+        format!("{}://{}", scheme, host)
+    }
+}
+
+/// Reconstruct the backend string from the individual visible form
+/// fields (route_mode, direct_protocol, direct_host, tun_name,
+/// tunnel_protocol, tunnel_host). Used as a fallback when the hidden
+/// `backend` field is empty on submit (e.g. JS didn't update it).
+///
+/// Returns an empty string if any required piece is missing.
+fn assemble_backend_from_form(params: &std::collections::HashMap<String, String>) -> String {
+    let route_mode = params
+        .get("route_mode")
+        .cloned()
+        .unwrap_or_else(|| "direct".to_string());
+    if route_mode == "tunnel" {
+        let tun = params.get("tun_name").cloned().unwrap_or_default();
+        let proto = params
+            .get("tunnel_protocol")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+        let host = params.get("tunnel_host").cloned().unwrap_or_default();
+        if tun.is_empty() || host.trim().is_empty() {
+            return String::new();
+        }
+        format!("{}:{}", tun, assemble_url(&proto, host.trim()))
+    } else {
+        let proto = params
+            .get("direct_protocol")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+        let host = params.get("direct_host").cloned().unwrap_or_default();
+        if host.trim().is_empty() {
+            return String::new();
+        }
+        assemble_url(&proto, host.trim())
+    }
 }

@@ -112,7 +112,7 @@
           <div class="grid grid-cols-3 gap-2">
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">Protocol</label>
-              <select id="site-backend-direct-protocol"
+              <select id="site-backend-direct-protocol" name="direct_protocol"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
                   border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
@@ -126,7 +126,7 @@
             </div>
             <div class="col-span-2">
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">Host:port</label>
-              <input type="text" id="site-backend-direct"
+              <input type="text" id="site-backend-direct" name="direct_host"
                 value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ self.initial_host_port() }}{% endif %}{% endif %}"
                 class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
@@ -159,7 +159,7 @@
           <div class="grid grid-cols-3 gap-2">
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
-              <select id="site-backend-tunnel"
+              <select id="site-backend-tunnel" name="tun_name"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
                   border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
@@ -173,7 +173,7 @@
             </div>
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-protocol">Protocol</label>
-              <select id="site-backend-protocol"
+              <select id="site-backend-protocol" name="tunnel_protocol"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
                   border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
@@ -187,7 +187,7 @@
             </div>
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-host">Host:port</label>
-              <input type="text" id="site-backend-host"
+              <input type="text" id="site-backend-host" name="tunnel_host"
                 value="{{ self.initial_host_port() }}"
                 class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
@@ -240,7 +240,7 @@
     </div>
 
     <div class="flex gap-2 pt-1">
-      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if let Some(_) = site %}Update{% else %}Create{% endif %}</button>
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if action == "update" %}Update{% else %}Create{% endif %}</button>
       <a href="/admin/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
     </div>
   </form>

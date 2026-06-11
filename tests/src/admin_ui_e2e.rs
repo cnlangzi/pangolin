@@ -1478,6 +1478,67 @@ async fn sites_create_direct_file_backend() {
     assert!(list_body.contains("file:///var/www/static"));
 }
 
+// ── §14b — Sites create with file:// + long path (server-side fallback) ──────
+
+#[tokio::test]
+async fn sites_create_file_long_path_server_side_fallback() {
+    // Mimics the real-world case where the JS update of the hidden
+    // `backend` field didn't fire (or fired late) before the form was
+    // submitted. The server should still be able to assemble the backend
+    // from the individual form fields (`route_mode`, `direct_protocol`,
+    // `direct_host`).
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/admin/sites/new",
+            // No `backend` hidden field — only the individual components.
+            &[
+                ("route_mode", "direct"),
+                ("direct_protocol", "file"),
+                (
+                    "direct_host",
+                    "/Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo",
+                ),
+                ("name", "long-path-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after successful create, got {}",
+        resp.status()
+    );
+
+    let list_body = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_body.contains("long-path-site"));
+    // The path was correctly assembled into a file:// URL.
+    assert!(
+        list_body.contains("file:///Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo"),
+        "expected the file:// URL to be reconstructed from the form fields"
+    );
+}
+
 // ── §15 — Sites form renders tunnel-mode UI and (with no tunnels) warning ──
 
 #[tokio::test]
