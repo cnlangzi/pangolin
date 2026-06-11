@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}Pangolin{% endblock %}</title>
+<link href="/assets/app.css?v=__CSS_HASH__" rel="stylesheet">
+</head>
+<body class="bg-white dark:bg-slate-900 min-h-screen font-sans antialiased text-slate-900 dark:text-slate-100">
+
+<header class="sticky top-0 z-50 bg-slate-900 dark:bg-slate-800 border-b border-slate-700 dark:border-slate-700 shadow-sm">
+  <div class="flex items-center justify-between px-4 py-3 max-w-7xl mx-auto">
+    <a href="/" class="flex items-center gap-2.5 text-white font-bold text-lg">
+      <div class="w-9 h-9 rounded-xl bg-accent-500 flex items-center justify-center shadow-lg">
+        <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+          <path d="M2 17l10 5 10-5"/>
+          <path d="M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <span class="hidden sm:inline">Pangolin</span>
+    </a>
+    <nav class="hidden lg:flex items-center gap-1">
+      <a href="/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "dashboard" %}text-white bg-slate-800{% endif %}">Dashboard</a>
+      <a href="/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "sites" %}text-white bg-slate-800{% endif %}">Sites</a>
+      <a href="/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "domains" %}text-white bg-slate-800{% endif %}">Domains</a>
+      <a href="/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "tun" %}text-white bg-slate-800{% endif %}">Tunnels</a>
+      <a href="/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "certs" %}text-white bg-slate-800{% endif %}">Certs</a>
+      <a href="/dns" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "dns" %}text-white bg-slate-800{% endif %}">DNS</a>
+    </nav>
+    <div class="flex items-center gap-2">
+      <form method="POST" action="/logout" class="hidden lg:block">
+        {% include "components/_csrf.html" %}
+        <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-2 rounded-lg hover:bg-slate-700">Sign out</button>
+      </form>
+      <button id="menu-toggle" class="lg:hidden text-slate-300 hover:text-white p-2 rounded-lg hover:bg-slate-700 transition-colors">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+  <nav id="mobile-nav" class="hidden lg:hidden border-t border-slate-700 px-4 py-3 space-y-1">
+    <a href="/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "dashboard" %}text-white bg-slate-800{% endif %}">Dashboard</a>
+    <a href="/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "sites" %}text-white bg-slate-800{% endif %}">Sites</a>
+    <a href="/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "domains" %}text-white bg-slate-800{% endif %}">Domains</a>
+    <a href="/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "tun" %}text-white bg-slate-800{% endif %}">Tunnels</a>
+    <a href="/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "certs" %}text-white bg-slate-800{% endif %}">Certs</a>
+    <a href="/dns" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "dns" %}text-white bg-slate-800{% endif %}">DNS</a>
+    <form method="POST" action="/logout" class="pt-2 border-t border-slate-700 mt-2">
+      {% include "components/_csrf.html" %}
+      <button type="submit" class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-slate-800">Sign out</button>
+    </form>
+  </nav>
+</header>
+
+{% block content %}{% endblock %}
+
+<script src="/assets/vendor/htmx-1.9.0.min.js"></script>
+<script src="/assets/__JS_FILE__?v=__JS_HASH__" defer></script>
+
+</body>
+</html>

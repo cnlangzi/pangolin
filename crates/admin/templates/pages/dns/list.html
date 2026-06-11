@@ -1,0 +1,53 @@
+{% extends "layouts/base.html" %}
+{% block title %}DNS Providers · Pangolin{% endblock %}
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">DNS Providers</h1>
+      <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">Registry of DNS provider credentials used by ACME DNS-01.</p>
+    </div>
+    <a href="/dns/new" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+      New DNS Provider
+    </a>
+  </div>
+
+  <div class="overflow-x-auto border border-slate-200 dark:border-slate-700 rounded-xl">
+    <table class="w-full border-collapse">
+      <thead class="bg-slate-50 dark:bg-slate-800 border-b-2 border-slate-200 dark:border-slate-700">
+        <tr>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Name</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Kind</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Enabled</th>
+          <th class="px-4 py-3 text-left text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Domains</th>
+          <th class="px-4 py-3 text-right text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">Actions</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
+        {% if providers.is_empty() %}
+        <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No DNS providers configured. <a href="/dns/new" class="text-accent-600 dark:text-accent-400 hover:underline">Add one</a> to enable wildcard cert issuance.</td></tr>
+        {% else %}
+          {% for p in providers %}
+          <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/30">
+            <td class="px-4 py-3 text-sm font-mono text-slate-900 dark:text-slate-100">{{ p.name }}</td>
+            <td class="px-4 py-3 text-sm">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300">{{ p.kind }}</span>
+            </td>
+            <td class="px-4 py-3 text-sm">{% if p.enabled %}<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300">Enabled</span>{% else %}<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">Disabled</span>{% endif %}</td>
+            <td class="px-4 py-3 text-sm text-slate-600 dark:text-slate-400">{{ self.count_for(p.name) }}</td>
+            <td class="px-4 py-3 text-right text-sm space-x-2">
+              <a href="/dns/{{ p.name }}/edit" class="text-accent-600 dark:text-accent-400 hover:underline">Edit</a>
+              <form method="POST" action="/dns/{{ p.name }}/delete" class="inline" onsubmit="return confirm('Delete DNS provider {{ p.name }}? Domains referencing it will fall back to no-association (HTTP-01).');">
+                {% include "components/_csrf.html" %}
+                <button type="submit" class="text-red-600 dark:text-red-400 hover:underline">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</main>
+{% endblock %}

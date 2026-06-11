@@ -1,0 +1,27 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}New site — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
+  <div class="mb-6">
+    <a href="/sites" class="text-sm text-slate-600 dark:text-slate-300 hover:text-accent-500 inline-flex items-center gap-1">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+      Back to sites
+    </a>
+    <h1 class="mt-2 text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">New site</h1>
+    <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
+      Configure the upstream backend for this site
+    </p>
+  </div>
+
+  <form method="POST" action="/sites/new" class="card p-6 space-y-5" data-backend-form>
+    {% include "components/_csrf.html" %}
+    {% include "views/sites/_form_fields.html" %}
+    <div class="flex gap-2 pt-1">
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">Create</button>
+      <a href="/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
+    </div>
+  </form>
+</main>
+{% endblock %}
