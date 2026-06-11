@@ -28,10 +28,16 @@ use crate::error::{PangolinError, Result};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     // ── Proxy listen (top level: this file IS the proxy config) ────────
-    #[serde(default = "default_proxy_port")]
-    pub port: u16,
-    #[serde(default = "default_tls_port")]
-    pub tls_port: u16,
+    /// HTTP / HTTPS listen addresses (full `host:port` strings).
+    /// Defaults to `0.0.0.0:80` + `0.0.0.0:443` so the shipped
+    /// example is immediately usable for a public, single-host
+    /// production deploy. Set a port to `:0` to disable that listener
+    /// entirely (e.g. `https: ":0"` to run HTTP-only).
+    #[serde(default)]
+    pub addr: AddrConfig,
+    /// Virtual host used to resolve per-domain certs. `null` (default)
+    /// → `"default"`. Unrelated to `[addr]` — `host` selects the
+    /// SNI fallback, not the bind address.
     #[serde(default = "default_proxy_host")]
     pub host: Option<String>,
     pub workers: Option<usize>,
@@ -50,36 +56,60 @@ pub struct Config {
     pub log: LogConfig,
 }
 
+/// HTTP / HTTPS listen addresses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddrConfig {
+    #[serde(default = "default_http_addr")]
+    pub http: String,
+    #[serde(default = "default_https_addr")]
+    pub https: String,
+}
+
+fn default_http_addr() -> String {
+    "0.0.0.0:80".into()
+}
+fn default_https_addr() -> String {
+    "0.0.0.0:443".into()
+}
+
+impl Default for AddrConfig {
+    fn default() -> Self {
+        Self {
+            http: default_http_addr(),
+            https: default_https_addr(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelConfig {
-    /// WebSocket listen port for tun clients (loopback-only in production).
-    #[serde(default = "default_tunnel_port")]
-    pub port: u16,
+    /// Full listen address (`host:port`) for the tun WebSocket
+    /// endpoint. Default `127.0.0.1:9001` — accept only local tun
+    /// clients; safe for dev or SSH-tunneled production use. Set to
+    /// `0.0.0.0:9001` (or a specific interface IP) when tun runs on
+    /// a separate host. This is also the address `tun.yml: server:`
+    /// must point at from the tun client side.
+    #[serde(default = "default_tunnel_addr")]
+    pub addr: String,
     /// WebSocket endpoint path (e.g. `/tunnel`).
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
 }
 
-fn default_proxy_port() -> u16 {
-    80
-}
-fn default_tls_port() -> u16 {
-    443
-}
 fn default_proxy_host() -> Option<String> {
     None
 }
 fn default_ws_path() -> String {
     "/tunnel".into()
 }
-fn default_tunnel_port() -> u16 {
-    9001
+fn default_tunnel_addr() -> String {
+    "127.0.0.1:9001".into()
 }
 
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
-            port: default_tunnel_port(),
+            addr: default_tunnel_addr(),
             ws_path: default_ws_path(),
         }
     }
@@ -87,13 +117,12 @@ impl Default for TunnelConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        // Manual impl: `#[derive(Default)]` would zero out `port` /
-        // `tls_port` / `host` / `workers`, ignoring the documented
-        // defaults. The `#[serde(default = "...")]` attributes only
-        // fire on deserialize — they have no effect on `Default::default()`.
+        // Manual impl: `#[derive(Default)]` would zero out the addr /
+        // host / workers fields, ignoring the documented defaults.
+        // The `#[serde(default = "...")]` attributes only fire on
+        // deserialize — they have no effect on `Default::default()`.
         Self {
-            port: default_proxy_port(),
-            tls_port: default_tls_port(),
+            addr: AddrConfig::default(),
             host: default_proxy_host(),
             workers: None,
             tunnel: TunnelConfig::default(),
@@ -107,9 +136,11 @@ impl Default for Config {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminConfig {
-    /// TCP address the admin HTTP server binds to. Default
-    /// `127.0.0.1:9081` (loopback only — admin UI/API is not meant to
-    /// be exposed on the public proxy port).
+    /// Full listen address (`host:port`) for the admin UI / API HTTP
+    /// server. Default `127.0.0.1:9081` (loopback only — admin UI/API
+    /// is not meant to be exposed on the public proxy port).
+    /// Override to `0.0.0.0:9081` for remote management (and restrict
+    /// via firewall / SSH tunnel).
     #[serde(default = "default_admin_addr")]
     pub addr: String,
     #[serde(default = "default_admin_username")]
@@ -326,10 +357,16 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        assert_eq!(c.port, 80);
-        assert_eq!(c.tls_port, 443);
+        // addr defaults — must be 0.0.0.0:80 + 0.0.0.0:443 so the
+        // shipped example is immediately usable for a public deploy.
+        // A regression to 127.0.0.1 would silently bind loopback.
+        assert_eq!(c.addr.http, "0.0.0.0:80");
+        assert_eq!(c.addr.https, "0.0.0.0:443");
+        // tunnel default — must be 127.0.0.1:9001 (loopback) so dev /
+        // SSH-tunnel production is safe. A regression to 0.0.0.0
+        // would silently expose the WS endpoint to any interface.
+        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
         assert_eq!(c.tunnel.ws_path, "/tunnel");
-        assert_eq!(c.tunnel.port, 9001);
         // v2: cert.autorenew removed; per-domain auto_issue in DB
         assert_eq!(c.acme.renew_threshold_days, 30);
         assert_eq!(c.acme.key_type, "ecdsa");
@@ -337,26 +374,36 @@ mod tests {
 
     #[test]
     fn parse_minimal_yaml() {
-        let s = r#"
-            port: 9000
-        "#;
-        let c = Config::from_str(s).unwrap();
-        assert_eq!(c.port, 9000);
-        // others default
-        assert_eq!(c.tls_port, 443);
+        // Empty config: all fields take their defaults.
+        let c = Config::from_str("").unwrap();
+        assert_eq!(c.addr.http, "0.0.0.0:80");
+        assert_eq!(c.addr.https, "0.0.0.0:443");
         // v2: cert.autorenew removed; no global ACME toggle to assert
         assert_eq!(c.acme.key_type, "ecdsa");
     }
 
     #[test]
+    fn parse_addr_overrides() {
+        // Operators can override just one of the two addresses.
+        let s = r#"
+            addr:
+              https: ":0"
+        "#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(c.addr.http, "0.0.0.0:80"); // default
+        assert_eq!(c.addr.https, ":0"); // disabled
+    }
+
+    #[test]
     fn parse_full_yaml() {
         let s = r#"
-            port: 80
-            tls_port: 443
+            addr:
+              http: "0.0.0.0:80"
+              https: "0.0.0.0:443"
             workers: 4
 
             tunnel:
-              port: 9001
+              addr: "0.0.0.0:9001"
               ws_path: "/tunnel"
 
             admin:
@@ -382,7 +429,7 @@ mod tests {
         "#;
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.workers, Some(4));
-        assert_eq!(c.tunnel.port, 9001);
+        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
         assert_eq!(c.tunnel.ws_path, "/tunnel");
         assert_eq!(c.admin.username, "root");
         assert!(c.cache.enabled);
@@ -412,12 +459,45 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_default_addr_is_loopback() {
+        let c = Config::default();
+        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
+    }
+
+    #[test]
+    fn tunnel_addr_overridable() {
+        // The addr is a full host:port string so production
+        // deployments with tun on a separate host can bind to
+        // 0.0.0.0 (or a specific public IP) without going through
+        // a host+port → string assembly in the binary.
+        let s = r#"
+            tunnel:
+              addr: "0.0.0.0:9001"
+              ws_path: /tunnel
+        "#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
+        assert_eq!(c.tunnel.ws_path, "/tunnel");
+    }
+
+    #[test]
+    fn addr_default_is_public_production_ports() {
+        let c = Config::default();
+        // The shipped defaults must be 0.0.0.0:80 + 0.0.0.0:443 so a
+        // production deploy that forgets to set [addr] is still
+        // reachable. A regression that swapped to 127.0.0.1 would
+        // silently bind loopback.
+        assert_eq!(c.addr.http, "0.0.0.0:80");
+        assert_eq!(c.addr.https, "0.0.0.0:443");
+    }
+
+    #[test]
     fn pangolin_yml_section_headings_match_config_struct() {
         // Regression: PR #23 renamed Config::cert → Config::acme; PR #24
         // renamed the file pangolin.yml → ngx.yml. This test pins the
         // shipping example config so a future rename can't drift again.
         let yml = include_str!("../../../ngx.yml");
-        let c: Config = serde_yaml::from_str(yml).expect("pangolin.yml must parse");
+        let c: Config = serde_yaml::from_str(yml).expect("ngx.yml must parse");
         // acme.email is "" in the dev example; default email is "" too,
         // so the only signal that the section was actually read is the
         // acme_directory override.

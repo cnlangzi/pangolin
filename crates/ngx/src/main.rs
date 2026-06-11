@@ -93,9 +93,10 @@ fn main() -> anyhow::Result<()> {
     )?);
 
     log::info!(
-        "Pangolin ngx {} starting on port {}",
+        "Pangolin ngx {} starting on http={} https={}",
         pangolin_core::VERSION,
-        config.port
+        config.addr.http,
+        config.addr.https,
     );
 
     // Ensure the cert dir exists before any service starts.
@@ -113,7 +114,10 @@ fn main() -> anyhow::Result<()> {
     let acme_state = Arc::new(crate::acme::AcmeState::empty());
 
     // ---- 4. Build services -------------------------------------------------
-    let tunnel_addr = format!("127.0.0.1:{}", config.tunnel.port);
+    // tunnel.addr is a full host:port string (default 127.0.0.1:9001);
+    // operators set it to e.g. 0.0.0.0:9001 to accept tun clients on
+    // a different host.
+    let tunnel_addr = config.tunnel.addr.clone();
 
     // ---- 5. Spawn pingora on its own std::thread ---------------------------
     // pingora runs `server.run(args)`, which observes our
@@ -189,9 +193,9 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
 
     // HTTP proxy service (domain-routed).
     let mut proxy_service = http_proxy_service(&conf, app_proxy);
-    proxy_service.add_tcp(&format!("0.0.0.0:{}", config.port));
-    if config.tls_port > 0 {
-        let tls_addr = format!("0.0.0.0:{}", config.tls_port);
+    proxy_service.add_tcp(&config.addr.http);
+    if config.addr.https != ":0" && !config.addr.https.is_empty() {
+        let tls_addr = config.addr.https.clone();
         // v2: SNI callback that loads per-host cert blobs on demand from
         // config.acme.cert_dir. The previous static-blob path with
         // "default" fallback was removed.

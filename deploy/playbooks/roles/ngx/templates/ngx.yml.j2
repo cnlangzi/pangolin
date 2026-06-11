@@ -19,40 +19,40 @@
 # admin UI under "DNS Providers"). See docs/configuration.md and the
 # v2 design doc for the full model.
 #
-#   port                  HTTP listen port (default 80)
-#   tls_port              HTTPS listen port; set 0 to disable TLS entirely
-#   host                  virtual host used to resolve per-domain cert
-#                         (default `None` → "default")
-#   workers               pingora worker count (default = CPU count)
-#   tunnel.port           WS listener for tun clients (default 9001)
-#   tunnel.ws_path        WS endpoint path (default "/tunnel")
-#   admin.*               admin UI bind addr + basic-auth creds
-#   acme.cert_dir         where CertManager looks for cert blobs
-#                         (autocert DirCache native layout: {host} or
-#                         {host}+rsa; no `default` fallback in v2)
-#   acme.acme_directory   ACME directory URL (LE staging for testing)
-#   acme.key_type         "ecdsa" (default) or "rsa"
-#   log.level             env_logger filter (trace|debug|info|warn|error)
+#   addr.http            HTTP listen addr (default `0.0.0.0:80`)
+#   addr.https           HTTPS listen addr (default `0.0.0.0:443`); ":0" disables
+#   host                 virtual host used to resolve per-domain cert
+#                        (default `None` → "default"). UNRELATED to [addr].
+#   workers              pingora worker count (default = CPU count)
+#   tunnel.addr          WS listener for tun clients (default `127.0.0.1:9001`)
+#   tunnel.ws_path       WS endpoint path (default "/tunnel")
+#   admin.addr           admin UI bind addr (default `127.0.0.1:9081`)
+#   admin.username       admin UI basic-auth user
+#   admin.password       admin UI basic-auth password
+#   acme.cert_dir        where CertManager looks for cert blobs
+#                        (autocert DirCache native layout: {host} or
+#                        {host}+rsa; no `default` fallback in v2)
+#   acme.acme_directory  ACME directory URL (LE staging for testing)
+#   acme.key_type        "ecdsa" (default) or "rsa"
+#   log.level            env_logger filter (trace|debug|info|warn|error)
 
 # ── Proxy listen (top level) ────────────────────────────────────────────
-port: {{ ngx_port_http | default(80) }}
-tls_port: {{ ngx_port_https | default(443) }}
+addr:
+  http: {{ ngx_addr_http | default('0.0.0.0:80') }}
+  https: {{ ngx_addr_https | default('0.0.0.0:443') }}
 {% if ngx_host is defined and ngx_host %}
 host: {{ ngx_host }}
 {% endif %}
 
 # ── WebSocket endpoint for tun clients ──────────────────────────────────
 tunnel:
-  port: {{ ngx_tunnel_port | default(9001) }}
+  addr: {{ ngx_tunnel_addr | default('127.0.0.1:9001') }}
   ws_path: {{ ngx_tunnel_ws_path | default('/tunnel') }}
 
 admin:
   # Bind on all IPv4 interfaces — deploys need remote management.
   # The Rust default (127.0.0.1:9081) is intentionally loopback for
-  # local dev; we override it here.  Must be a standard socket addr
-  # (`0.0.0.0:9081` or `127.0.0.1:9081`) — pingora rejects bare `:port`.
-  # If the host has no firewall, restrict 9081 via ufw/iptables or
-  # set ngx_admin_addr in hosts.
+  # local dev; we override it here.
   addr: {{ ngx_admin_addr | default('0.0.0.0:9081') }}
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}

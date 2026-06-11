@@ -271,12 +271,13 @@ impl NgxProcess {
 
         let config = format!(
             r#"
-port: {http}
-tls_port: {tls}
+addr:
+  http: "127.0.0.1:{http}"
+  https: "127.0.0.1:{tls}"
 host: default
 
 tunnel:
-  port: {tunnel_port}
+  addr: "127.0.0.1:{tunnel_port}"
   ws_path: /tunnel
 
 log:

@@ -175,12 +175,13 @@ Encrypt on every restart.
 
 ```yaml
 # ngx.yml — local dev
-port: 9080              # unprivileged HTTP port
-tls_port: 0             # disable HTTPS entirely
+addr:
+  http: 0.0.0.0:9080    # unprivileged HTTP port
+  https: ":0"            # disable HTTPS entirely
 workers: 2              # fix workers for predictable debug output
 
 tunnel:
-  port: 9001
+  addr: 127.0.0.1:9001
   ws_path: /tunnel
 
 admin:
@@ -225,13 +226,14 @@ challenges served from port 80.
 
 ```yaml
 # ngx.yml — production
-port: 80
-tls_port: 443
+addr:
+  http: 0.0.0.0:80
+  https: 0.0.0.0:443
 host: default           # use ./certs/default/ for the cert
 workers: null           # auto = number of CPUs
 
 tunnel:
-  port: 9001            # loopback only — never expose this
+  addr: 127.0.0.1:9001  # loopback + SSH-tunnel for single-host
   ws_path: /tunnel
 
 admin:

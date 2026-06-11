@@ -672,15 +672,18 @@ ngx 和 tun 是两个独立的 binary,各读自己的 YAML 配置文件。文件
 
 ```yaml
 # ── Proxy listen (顶层就是 proxy,不加 proxy: 包装) ─────
-port: 80              # HTTP 监听端口
-tls_port: 443         # HTTPS 监听;0 = 完全关闭 TLS
-host: null            # per-domain cert 解析用的虚拟主机
+addr:
+  http: 0.0.0.0:80     # HTTP 监听地址(完整 host:port)
+  https: 0.0.0.0:443   # HTTPS 监听地址;":0" = 完全关闭 TLS
+host: null            # per-domain cert 解析用的虚拟主机(SNI fallback)
                       # (null = "default" → ./certs/default/...)
+                      # 注意 `host` 跟 `[addr]` 无关 —— 它是 SNI 解析键,不是 bind 地址
 workers: null         # pingora worker 数;null = CPU 核数
 
 # ── WebSocket 接入端点(tun 客户端连这个) ─────────────
 tunnel:
-  port: 9001          # WS 监听端口(loopback only in production)
+  addr: 0.0.0.0:9001   # 监听地址(完整 host:port);`0.0.0.0:9001` 接受任意接口的
+                      # tun 连入(多机部署),`127.0.0.1:9001` (默认) 只接受本地
   ws_path: /tunnel    # WS endpoint path
 
 admin:
