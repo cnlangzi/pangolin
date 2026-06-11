@@ -1,3 +1,16 @@
+/* ============================================================================
+ * assets/tailwindcss.css — Pangolin admin UI source stylesheet.
+ *
+ * @deprecated The @apply component classes (btn-accent, card, alert-error,
+ * form-input, nav-link, …) below are deprecated as of the
+ * "Admin UI Tailwind utility refactor" (#26).
+ *
+ * New templates MUST use Tailwind utility classes inline.
+ * The classes below are kept temporarily for the 9 not-yet-refactored
+ * templates (sites, certs, domains, tokens, …). Do not add new uses.
+ * See docs/vi/tailwind-idioms.md for the migration convention.
+ * ========================================================================== */
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

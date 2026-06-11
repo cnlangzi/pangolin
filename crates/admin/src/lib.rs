@@ -188,6 +188,7 @@ pub async fn handle(
             routes::dns::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
         }
+        "dns/test" if method == "POST" => routes::dns::handle_test(&app, &merged_params).await?,
         // Auth
         "login" => {
             if method == "POST" {
@@ -250,10 +251,17 @@ fn query_param(body: &[u8], key: &str) -> String {
 /// from `assets/app.css` and embedded as a `?v=<hash>` query parameter.
 pub const CSS_HASH: &str = env!("APP_CSS_HASH");
 
-/// Substitute the `__CSS_HASH__` placeholder in rendered HTML with the build-time
-/// CSS hash. Used to prevent browser caching of stale CSS after rebuilds.
+/// JS bundle content hash for cache-busting. Computed at build time by `build.rs`
+/// from `assets/app.js` and embedded as a `?v=<hash>` query parameter. The
+/// admin UI loads the bundle once from `base.html` via `/admin/app.js?v=__JS_HASH__`.
+pub const JS_HASH: &str = env!("APP_JS_HASH");
+
+/// Substitute the `__CSS_HASH__` and `__JS_HASH__` placeholders in rendered
+/// HTML with the build-time bundle hashes. Used to prevent browser caching of
+/// stale CSS/JS after rebuilds.
 pub fn render_with_assets(html: String) -> String {
     html.replace("__CSS_HASH__", CSS_HASH)
+        .replace("__JS_HASH__", JS_HASH)
 }
 
 /// Substitute the `__CSRF__` placeholder in rendered HTML with the user's
