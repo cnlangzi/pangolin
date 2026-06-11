@@ -165,9 +165,11 @@ fn detect_scheme(url: &str) -> &'static str {
 }
 
 /// Strips the URL scheme prefix and splits host from path. For
-/// `file:///var/www` this returns `var/www` (no host). Used by
-/// `Site::backend_host_port` to operate on `host[:port][/path]` rather
-/// than the full `scheme://host:port[/path]` URL.
+/// `file:///var/www` this returns `/var/www` (with the leading slash
+/// preserved, so the round-trip through the form's host:port field
+/// keeps the full path). Used by `Site::backend_host_port` to operate
+/// on `host[:port][/path]` rather than the full `scheme://host:port[/path]`
+/// URL.
 fn strip_scheme_and_split(url: &str) -> &str {
     if let Some(rest) = url.strip_prefix("https://") {
         return split_host_path(rest);
@@ -176,7 +178,7 @@ fn strip_scheme_and_split(url: &str) -> &str {
         return split_host_path(rest);
     }
     if let Some(rest) = url.strip_prefix("file://") {
-        return rest.trim_start_matches('/');
+        return rest;
     }
     ""
 }
@@ -489,9 +491,11 @@ mod tests {
 
     #[test]
     fn host_port_direct_file() {
+        // The leading slash is preserved so the value round-trips through
+        // the form's host:port field without losing the path's root.
         assert_eq!(
             site_with("file:///var/www/static").backend_host_port(),
-            "var/www/static"
+            "/var/www/static"
         );
     }
 
@@ -516,9 +520,10 @@ mod tests {
     #[test]
     fn host_port_tunnel_file() {
         // The other half of the fix: tunnel + file:// used to return "file:".
+        // Leading slash preserved for round-trip through the form field.
         assert_eq!(
             site_with("office:file:///home/user/docs").backend_host_port(),
-            "home/user/docs"
+            "/home/user/docs"
         );
     }
 
@@ -526,7 +531,7 @@ mod tests {
     fn host_port_tunnel_file_with_subpath() {
         assert_eq!(
             site_with("office:file:///var/www/static/index.html").backend_host_port(),
-            "var/www/static/index.html"
+            "/var/www/static/index.html"
         );
     }
 

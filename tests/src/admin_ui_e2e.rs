@@ -7,6 +7,7 @@
 
 use crate::admin_harness::AdminClient;
 use crate::harness::{init_pangolin_db, NgxProcess};
+use scraper::{Html, Selector};
 
 // ── helper ──────────────────────────────────────────────────────────────────
 
@@ -1476,6 +1477,65 @@ async fn sites_create_direct_file_backend() {
         .unwrap();
     assert!(list_body.contains("file-static-site"));
     assert!(list_body.contains("file:///var/www/static"));
+}
+
+// ── §14c — Edit page preserves file:// path with leading slash ──────────────
+
+#[tokio::test]
+async fn sites_edit_preserves_file_path_leading_slash() {
+    // Regression: edit page for a file:// site used to show the path
+    // without its leading slash, so a re-submit would drop the root.
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site with file:// URL (the leading slash in the path is
+    // essential for the path to be a valid absolute filesystem path).
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "file:///Users/geax/foo"),
+                ("name", "file-slash-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Open the edit page and verify the host:port field shows the path
+    // WITH the leading slash — so the user can resubmit without losing it.
+    let edit_body = client
+        .get("/admin/sites/edit?name=file-slash-test")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    client
+        .assert_selector_exists(&edit_body, r#"select[name="direct_protocol"]"#)
+        .unwrap();
+    // The host:port field for direct mode should carry value="/Users/geax/foo"
+    // (with the leading slash preserved).
+    let doc = Html::parse_document(&edit_body);
+    let sel = Selector::parse(r#"input[name="direct_host"]"#).unwrap();
+    let direct_host = doc
+        .select(&sel)
+        .next()
+        .and_then(|el| el.value().attr("value"))
+        .unwrap_or("");
+    assert_eq!(
+        direct_host, "/Users/geax/foo",
+        "edit page should preserve the leading slash in the file:// path"
+    );
 }
 
 // ── §14b — Sites create with file:// + long path (server-side fallback) ──────
