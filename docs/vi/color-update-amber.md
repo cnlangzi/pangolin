@@ -223,7 +223,7 @@ sed -i 's/indigo/amber/g' <文件>
 
 只需重新构建 CSS：
 ```bash
-npm run build
+make build-ui
 ```
 
 ---
