@@ -120,8 +120,10 @@ async fn serve_admin_ui(
 
     // Static JS bundle — serves whichever file `JS_FILE` points at
     // (`app.min.js` in production, `app.js` in raw/dev mode). Both
-    // `/admin/app.js` and `/admin/app.min.js` routes are accepted so
-    // existing bookmarks and CDN-issued URLs keep working.
+    // `/admin/app.js` and `/admin/app.min.js` routes are accepted
+    // unconditionally so a `PANGOLIN_ADMIN_JS` env-var flip between
+    // raw and production mode doesn't strand old browser caches on a
+    // 404.
     if path == "/admin/app.js"
         || path == "/admin/app.min.js"
         || path == "/admin/assets/app.js"

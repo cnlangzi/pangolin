@@ -7,7 +7,7 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
@@ -55,7 +55,12 @@ OUT_DIR ?= ./bin
 # binaries that the `mv` steps below can find.
 CARGO_TARGET_DIR ?= ./target
 
-build:
+# `build` (and the `Build` CI job) embeds admin assets into the release
+# binary via rust-embed. Building assets first is required — without it
+# the release binary serves empty CSS/JS and the admin UI is broken.
+# `build-debug` is the no-embed path (assets read from disk at runtime
+# via the `debug-embed` feature) and is unaffected.
+build: build-ui
 	mkdir -p $(OUT_DIR)
 	# Single cargo invocation for both binaries so the shared crates
 	# (pangolin-core, admin, pingora, …) are compiled and linked
@@ -72,7 +77,11 @@ build:
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-build-ngx:
+# `build-ngx` depends on `build-ui` because the release binary embeds
+# admin assets via rust-embed; without assets it would serve empty
+# CSS/JS. `build-tun` does NOT depend on `build-ui` because the tun
+# binary does not embed assets.
+build-ngx: build-ui
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
@@ -85,23 +94,49 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
+# `build-css` is a backward-compat alias for `build-ui` (the old target
+# only built CSS; the new one builds CSS + JS).
 build-css: build-ui
 	@echo "  build-css is now an alias for build-ui"
 
+# Download the standalone Tailwind and esbuild CLIs to ./bin/ (gitignored)
+# and rebuild the admin CSS and JS bundles. Idempotent: skips downloads
+# if the binaries are already present. Wget/curl failures are surfaced
+# loudly (clean up partial file + exit non-zero) so a stale HTML error
+# page never sneaks into the build pipeline.
+#
+# esbuild quirk: starting with v0.25.0 the author no longer uploads
+# pre-built linux-64 binaries to the GitHub release page. The official
+# distribution channel is the `@esbuild/linux-x64` npm package, so we
+# curl the tarball and extract the binary. No `npm` CLI required.
 build-ui:
-	@echo "Downloading tailwindcss..."
 	@mkdir -p bin
-	@command -v bin/tailwindcss >/dev/null 2>&1 || {\
-		wget -q https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 -O bin/tailwindcss; \
+	@if [ ! -x bin/tailwindcss ]; then \
+		echo "Downloading tailwindcss v3.4.17 (from GitHub releases)..."; \
+		if ! curl -fsSL -o bin/tailwindcss.tmp \
+			https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64; then \
+			echo "  ERROR: failed to download tailwindcss" >&2; \
+			rm -f bin/tailwindcss.tmp; \
+			exit 1; \
+		fi; \
+		mv bin/tailwindcss.tmp bin/tailwindcss; \
 		chmod +x bin/tailwindcss; \
 		echo "  tailwindcss downloaded"; \
-	}
-	@echo "Downloading esbuild..."
-	@command -v bin/esbuild >/dev/null 2>&1 || {\
-		wget -q https://github.com/evanw/esbuild/releases/download/v0.24.0/esbuild-linux-64 -O bin/esbuild; \
-		chmod +x bin/esbuild; \
+	fi
+	@if [ ! -x bin/esbuild ]; then \
+		echo "Downloading esbuild v0.28.0 (from npm registry)..."; \
+		if ! curl -fsSL -o bin/esbuild.tgz \
+			https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz; then \
+			echo "  ERROR: failed to download esbuild" >&2; \
+			rm -f bin/esbuild.tgz; \
+			exit 1; \
+		fi; \
+		tar -xzOf bin/esbuild.tgz package/bin/esbuild > bin/esbuild.tmp; \
+		rm -f bin/esbuild.tgz; \
+		chmod +x bin/esbuild.tmp; \
+		mv bin/esbuild.tmp bin/esbuild; \
 		echo "  esbuild downloaded"; \
-	}
+	fi
 	@echo "Building admin UI CSS..."
 	bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify
 	@echo "Building admin UI JS bundle..."
