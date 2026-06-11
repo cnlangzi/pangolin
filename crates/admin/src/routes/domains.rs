@@ -507,15 +507,21 @@ async fn render_edit_page_with_error(
 }
 
 /// POST /admin/api/domains/{domain}/toggle — flip the `enabled` flag on a
-/// single domain row, then return the freshly-rendered row HTML so htmx
-/// can swap it in place. The CSRF token is in the form body for browser
-/// hx-post requests; we verify it via the standard CSRF check in `handle`.
+/// single domain row, then return the freshly-rendered fragment HTML so
+/// htmx can swap it in place.
+///
+/// `view` is `"row"` (default, desktop table) or `"card"` (mobile card
+/// layout). The mobile card is the whole `<div class="p-4">` block — its
+/// hx-target is the outer card div, so the response must replace the
+/// entire card (including the Edit / Delete buttons and DNS line), not
+/// just the toggle badge. The desktop row is the `<tr>`.
 pub async fn handle_toggle(
     app: &Arc<App>,
     domain: &str,
+    view: &str,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    let (new_state, site_name) = {
+    let (new_state, site_name, dns_provider) = {
         let db = app.db.lock().await;
         let current = pangolin_core::db::list_domains(&db)
             .unwrap_or_default()
@@ -537,14 +543,19 @@ pub async fn handle_toggle(
             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             return Ok(resp);
         }
-        (new_state, current.site_name.clone())
+        (new_state, current.site_name.clone(), current.dns_provider.clone())
     };
     // Reload indexes so the routing layer picks up the new enabled state.
     app.reload_indexes().await;
 
-    // Re-render the row so htmx can swap it in place.
-    let row = render_domain_row(domain, new_state, &site_name);
-    ok_html(crate::render_with_assets_and_csrf(row, csrf))
+    // Re-render the row / card so htmx can swap it in place. Mobile uses
+    // the card fragment (whole <div class="p-4">); desktop uses the row
+    // fragment (<tr>).
+    let fragment = match view {
+        "card" => render_domain_card(domain, new_state, dns_provider.as_deref()),
+        _ => render_domain_row(domain, new_state, &site_name),
+    };
+    ok_html(crate::render_with_assets_and_csrf(fragment, csrf))
 }
 
 /// Render a single domain row for htmx swap. Used by handle_toggle to
@@ -590,6 +601,53 @@ fn render_domain_row(domain: &str, enabled: bool, site_name: &str) -> String {
 </tr>"##,
         domain = domain,
         site_name = site_name,
+        badge_bg = if enabled { "bg-green-100 text-green-700" } else { "bg-slate-100 text-slate-400" },
+        badge_dark = if enabled { "dark:bg-green-900/30 dark:text-green-300" } else { "dark:bg-slate-700 dark:text-slate-500" },
+        strike = if enabled { "" } else { "line-through" },
+        badge_label = if enabled { "enabled" } else { "disabled" },
+    )
+}
+
+/// Render the mobile card for a single domain (the whole `<div class="p-4">`
+/// block, including the toggle badge, DNS line, and Edit / Delete buttons).
+/// Used by handle_toggle when `view == "card"` to swap the entire card in
+/// place. Mirrors the structure of the mobile card in site_domains.html.
+fn render_domain_card(domain: &str, enabled: bool, dns_provider: Option<&str>) -> String {
+    let dns_line = match dns_provider {
+        Some(p) => format!(
+            r##"<div class="text-xs text-slate-500 dark:text-slate-400">DNS: {p}</div>"##
+        ),
+        None => String::new(),
+    };
+    format!(
+        r##"<div id="domain-card-{domain}" class="p-4">
+      <div class="flex items-center justify-between mb-1">
+        <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{domain}</span>
+        <button hx-post="/admin/api/domains/{domain}/toggle?view=card"
+          hx-vals='{{"_csrf": "__CSRF__"}}'
+          hx-swap="outerHTML"
+          hx-target="#domain-card-{domain}"
+          class="text-xs font-medium px-2 py-0.5 rounded-full transition-colors {badge_bg} {badge_dark} {strike}"
+          title="Click to toggle">
+          {badge_label}
+        </button>
+      </div>
+      <div class="flex flex-col gap-1">
+        {dns_line}
+        <div class="flex gap-1 mt-2">
+          <button hx-get="/admin/api/domains/{domain}/edit"
+            hx-target="#modal-body"
+            class="flex-1 text-center text-sm text-accent-600 dark:text-accent-400 border border-accent-200 dark:border-accent-500/30 rounded-lg py-1.5">Edit</button>
+          <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {domain}?');" class="flex-1">
+            <input type="hidden" name="domain" value="{domain}">
+            <input type="hidden" name="_csrf" value="__CSRF__">
+            <button type="submit" class="w-full text-sm text-red-500 dark:text-red-400 border border-red-100 dark:border-red-500/30 rounded-lg py-1.5">Delete</button>
+          </form>
+        </div>
+      </div>
+    </div>"##,
+        domain = domain,
+        dns_line = dns_line,
         badge_bg = if enabled { "bg-green-100 text-green-700" } else { "bg-slate-100 text-slate-400" },
         badge_dark = if enabled { "dark:bg-green-900/30 dark:text-green-300" } else { "dark:bg-slate-700 dark:text-slate-500" },
         strike = if enabled { "" } else { "line-through" },

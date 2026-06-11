@@ -151,7 +151,15 @@ impl Site {
     /// `scheme://` and before any path. For `file:///var/www` this returns
     /// `var/www` (no host), which is what the user types into the
     /// hierarchical form's host:port field.
+    ///
+    /// For tunnel-mode URLs (`tun:scheme://...`) we first strip the
+    /// `tun_name:` prefix and then re-apply scheme stripping. This is
+    /// important: applying `split_host_path` directly to `http://host:port`
+    /// would split at the first `/` (right after `http:`) and return the
+    /// bogus string `http:`. The form's JS round-trip relies on getting
+    /// just the host:port back.
     pub fn backend_host_port(&self) -> &str {
+        // ── Direct modes: scheme:// is at the start of the string. ──
         if let Some(rest) = self.backend.strip_prefix("https://") {
             return split_host_path(rest);
         }
@@ -165,10 +173,21 @@ impl Site {
             // re-adds it on submit by concatenating `file:///` + value).
             return rest.trim_start_matches('/');
         }
+        // ── Tunnel modes: strip the `tun_name:` prefix, then re-apply
+        //    scheme stripping so we operate on `host[:port][/path]`
+        //    rather than the full `scheme://host:port[/path]` URL. ──
         if self.backend_route_mode() == "tunnel" {
-            // Format: `tun_name:scheme://host:port[/path]`
             if let Some(colon_idx) = self.backend.find(':') {
-                return split_host_path(&self.backend[colon_idx + 1..]);
+                let url = &self.backend[colon_idx + 1..];
+                if let Some(rest) = url.strip_prefix("https://") {
+                    return split_host_path(rest);
+                }
+                if let Some(rest) = url.strip_prefix("http://") {
+                    return split_host_path(rest);
+                }
+                if let Some(rest) = url.strip_prefix("file://") {
+                    return rest.trim_start_matches('/');
+                }
             }
         }
         ""
@@ -444,5 +463,83 @@ mod tests {
         let k: DnsProviderKind = "tencent".parse().unwrap();
         assert_eq!(k, DnsProviderKind::Tencent);
         assert!("nope".parse::<DnsProviderKind>().is_err());
+    }
+
+    // ── backend_host_port helper: round-trip cases ─────────────────
+    // These cover the bug we hit in issue #25 where the tunnel-mode
+    // branch was applying `split_host_path` to the full `scheme://...`
+    // URL, which split at the first `/` (right after the scheme) and
+    // returned `"http:"` / `"file:"` instead of the actual host / path.
+
+    fn site_with(backend: &str) -> Site {
+        Site {
+            name: "s".into(),
+            backend: backend.into(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        }
+    }
+
+    #[test]
+    fn host_port_direct_http() {
+        assert_eq!(site_with("http://127.0.0.1:8080").backend_host_port(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn host_port_direct_https_with_path() {
+        // Direct mode already worked; path is stripped for the form.
+        assert_eq!(
+            site_with("https://example.com/api/v1").backend_host_port(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn host_port_direct_file() {
+        assert_eq!(site_with("file:///var/www/static").backend_host_port(), "var/www/static");
+    }
+
+    #[test]
+    fn host_port_tunnel_http() {
+        // The main fix: tunnel + http used to return "http:" — now correct.
+        assert_eq!(
+            site_with("office:http://192.168.1.100:8080").backend_host_port(),
+            "192.168.1.100:8080"
+        );
+    }
+
+    #[test]
+    fn host_port_tunnel_https_with_path() {
+        // Path is stripped in tunnel mode too (matches JS round-trip).
+        assert_eq!(
+            site_with("home:https://10.0.0.5:443/api").backend_host_port(),
+            "10.0.0.5:443"
+        );
+    }
+
+    #[test]
+    fn host_port_tunnel_file() {
+        // The other half of the fix: tunnel + file:// used to return "file:".
+        assert_eq!(
+            site_with("office:file:///home/user/docs").backend_host_port(),
+            "home/user/docs"
+        );
+    }
+
+    #[test]
+    fn host_port_tunnel_file_with_subpath() {
+        assert_eq!(
+            site_with("office:file:///var/www/static/index.html").backend_host_port(),
+            "var/www/static/index.html"
+        );
+    }
+
+    #[test]
+    fn host_port_empty() {
+        assert_eq!(site_with("").backend_host_port(), "");
     }
 }

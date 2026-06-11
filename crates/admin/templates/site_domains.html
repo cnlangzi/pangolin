@@ -117,20 +117,20 @@
 
       <div class="block md:hidden divide-y divide-slate-100 dark:divide-slate-700">
         {% for domain in domains %}
-        <div class="p-4">
+        <div id="domain-card-{{ domain.domain }}" class="p-4">
           <div class="flex items-center justify-between mb-1">
             <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
-            <button hx-post="/admin/api/domains/{{ domain.domain }}/toggle"
+            <button hx-post="/admin/api/domains/{{ domain.domain }}/toggle?view=card"
               hx-vals='{"_csrf": "__CSRF__"}'
               hx-swap="outerHTML"
-              hx-target="#domain-mobile-{{ domain.domain }}"
+              hx-target="#domain-card-{{ domain.domain }}"
               class="text-xs font-medium px-2 py-0.5 rounded-full transition-colors
                 {% if domain.enabled %}bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300{% else %}bg-slate-100 text-slate-400 dark:bg-slate-700 dark:text-slate-500 line-through{% endif %}"
               title="Click to toggle">
               {% if domain.enabled %}enabled{% else %}disabled{% endif %}
             </button>
           </div>
-          <div id="domain-mobile-{{ domain.domain }}" class="flex flex-col gap-1">
+          <div class="flex flex-col gap-1">
             {% if let Some(p) = domain.dns_provider %}
             <div class="text-xs text-slate-500 dark:text-slate-400">DNS: {{ p }}</div>
             {% endif %}

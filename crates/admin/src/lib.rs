@@ -276,7 +276,16 @@ pub async fn handle(
                             .await?
                         }
                         ("toggle", "POST") => {
-                            routes::domains::handle_toggle(&app, domain, &csrf_token).await?
+                            // `view` query param selects the response shape:
+                            //   "row"  → desktop table <tr>  (default, no param)
+                            //   "card" → mobile card <div>   (set by site_domains.html)
+                            // The mobile card must replace the whole card
+                            // div (which contains Edit / Delete buttons and
+                            // the DNS line), not just the toggle badge.
+                            let view = query_param_opt(&merged_params, "view")
+                                .unwrap_or_else(|| "row".to_string());
+                            routes::domains::handle_toggle(&app, domain, &view, &csrf_token)
+                                .await?
                         }
                         _ => not_found(),
                     }
