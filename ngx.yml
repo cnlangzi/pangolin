@@ -58,10 +58,9 @@ tunnel:
 admin:
   addr: 0.0.0.0:9081    # admin UI/API bind addr. Default `0.0.0.0:9081`
                         # accepts remote admin (e.g. via SSH port
-                        # forward). The shipped default password is
-                        # `admin` — override via env var injection
-                        # (e.g. ${ADMIN_PASSWORD}) before exposing
-                        # this to any non-trusted network.
+                        # forward). Set the password directly in
+                        # this file; restrict access via ufw/iptables
+                        # if exposing to a non-trusted network.
   username: admin
   password: admin
 

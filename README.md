@@ -719,8 +719,8 @@ log:
 
 ```yaml
 # ── 连接信息(顶层就是 tun 客户端,不加 connection: 包装) ─
-server: ngx.example.com:8080   # ngx 地址
-token: "${TUN_TOKEN}"         # 认证 token(用 env var 注入)
+server: ngx.example.com:9001   # ngx 地址(匹配 ngx 的 [tunnel].addr)
+token: "your-tun-token-here"   # 认证 token,直接写在文件里
 name: office                  # tun 节点名;^[a-z0-9_-]+$, 1~32 字符,
                               # 非纯数字
 
@@ -729,7 +729,7 @@ log:
   file: ""                    # 空 = stderr
 ```
 
-`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 推荐用 `${TUN_TOKEN}` 形式从环境变量注入,缺少变量且没有默认值时启动会 fail-fast。
+`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 字段直接写即可,不需要用 env 注入;如果想保密,把配置文件设 0600 权限(或用系统 secret 管理工具管理整个文件)。
 
 ### 关键配置项说明
 

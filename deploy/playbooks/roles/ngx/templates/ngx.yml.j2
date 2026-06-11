@@ -51,10 +51,9 @@ tunnel:
 
 admin:
   # Default binds 0.0.0.0:9081 so a remote admin (e.g. via SSH
-  # port forward) works without an explicit override. The default
-  # password is `admin`; override via env var injection
-  # (e.g. ${ADMIN_PASSWORD}) before exposing 9081 to a non-trusted
-  # network, or restrict via ufw/iptables to known admin IPs.
+  # port forward) works without an explicit override. Set the
+  # password directly in this file; restrict access via
+  # ufw/iptables if exposing to a non-trusted network.
   addr: {{ ngx_admin_addr | default('0.0.0.0:9081') }}
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}

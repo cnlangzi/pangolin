@@ -11,10 +11,11 @@
 #   --token  <TOKEN> →  token:  <TOKEN>
 #   --name   <NAME>  →  name:   <NAME>
 #
-# Use a secret manager / env var for the token. The `${VAR}` syntax is
-# expanded at load time and fail-fast on missing required vars:
-#
-#   token: "${TUN_TOKEN}"
+# The token is written directly in this file. Operators who prefer
+# to keep the token out of plain text can use the env-var expansion
+# form (`token: "${TUN_TOKEN}"`) and rely on the loader's fail-fast
+# behaviour when the var is unset, but it's not required — file
+# permissions (0600) on the config are the canonical protection.
 #
 # Rules for `name` (validated at load):
 #   - matches ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore)

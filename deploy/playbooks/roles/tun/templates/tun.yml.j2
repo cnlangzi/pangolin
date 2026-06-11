@@ -12,9 +12,10 @@
 #   name       tun name; matches ^[a-z0-9_-]+$, 1..=32 chars,
 #              non-purely-numeric
 #
-# `token` is sourced from the `tun_token` host var. For real deploys
-# use Ansible Vault or an equivalent secret manager — never commit
-# a real token to inventory.
+# `token` is sourced from the `tun_token` host var. Write the
+# token directly in inventory (or use Ansible Vault if you prefer
+# to keep it out of plain text) — neither is required, the config
+# loader does not enforce any particular secret-storage strategy.
 
 server: {{ tun_server | default('ngx.example.com:8080') }}
 token: "{{ tun_token | default('') }}"

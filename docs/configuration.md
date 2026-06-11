@@ -35,9 +35,9 @@ The expansion applies to **values**, not keys. Use it for secrets
 ports) — keep the YAML structure stable, vary the runtime data.
 
 ```yaml
-# tun.yml — typical pattern for secrets
-server: gateway.example.com:8080
-token: "${TUN_TOKEN}"        # must be exported before starting tun
+# tun.yml — typical pattern (token written directly in the file)
+server: gateway.example.com:9001
+token: "your-tun-token-here"
 name: office
 ```
 
@@ -69,24 +69,11 @@ The admin server is a separate bind from the proxy. The default
 admin (via SSH port forward, or a dedicated mgmt network) works
 without an explicit override.
 
-> **⚠ Default credentials.** The shipped default password is
-> `admin`. **Override via env var injection before exposing
-> 9081 to any non-trusted network.** Typical pattern:
->
-> ```yaml
-> admin:
->   password: "${ADMIN_PASSWORD}"
-> ```
->
-> …and export `ADMIN_PASSWORD` from your secret store / vault /
-> systemd `EnvironmentFile`. Alternatively, restrict 9081 via
-> `ufw` / `iptables` to known admin IPs.
-
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
 | `addr`      | `string` | `0.0.0.0:9081`   | no       | Full `host:port` string for the admin HTTP server. Override to `127.0.0.1:9081` for local-only access. |
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
-| `password`  | `string` | `admin`          | no       | HTTP basic auth password. Override via `${ADMIN_PASSWORD}` in any non-trusted environment. |
+| `password`  | `string` | `admin`          | no       | HTTP basic auth password. Write the real password directly in this file. Restrict access via `ufw` / `iptables` if exposing 9081 to a non-trusted network. |
 
 ### `[cache]` — response cache
 
@@ -171,7 +158,7 @@ time and refuses to start on any violation.
 | Field      | Type     | Default | Required | Validation |
 | ---------- | -------- | ------- | -------- | ---------- |
 | `server`   | `string` | —       | **yes**  | Non-empty. Format `host:port` (or `ip:port`); the `port` must match `tunnel.port` in `ngx.yml`. |
-| `token`    | `string` | —       | **yes**  | Non-empty. Whitelisted in ngx's `tokens` table. Inject via `${TUN_TOKEN}`. |
+| `token`    | `string` | —       | **yes**  | Non-empty. Whitelisted in ngx's `tokens` table. Write the real token directly in this file. |
 | `name`     | `string` | —       | **yes**  | `^[a-z0-9_-]+$`, 1–32 chars, **not purely numeric**. The name is the tun's primary key on the ngx side; the validator refuses to start if the name collides with another online tun or violates the rule. |
 
 ### `[log]`
@@ -254,7 +241,7 @@ admin:
   addr: 0.0.0.0:9081    # default — restrict via ufw/iptables if
                         # exposing to a non-trusted network
   username: admin
-  password: "${ADMIN_PASSWORD}"   # injected from secret store
+  password: "your-admin-password"   # written directly in the file
 
 cache:
   enabled: true
@@ -282,8 +269,8 @@ with network reachability to this gateway):
 
 ```yaml
 # tun.yml — co-located or remote tun
-server: gateway.example.com:9001   # match tunnel.port
-token: "${TUN_TOKEN}"
+server: gateway.example.com:9001   # match tunnel.addr
+token: "your-tun-token-here"        # written directly in the file
 name: office
 
 log:
@@ -304,7 +291,7 @@ a different machine):
 ```yaml
 # tun.yml @ home
 server: gateway.example.com:9001
-token: "${TUN_TOKEN_HOME}"
+token: "home-tun-token"
 name: home
 
 log:
@@ -315,7 +302,7 @@ log:
 ```yaml
 # tun.yml @ office
 server: gateway.example.com:9001
-token: "${TUN_TOKEN_OFFICE}"
+token: "office-tun-token"
 name: office
 
 log:
@@ -326,7 +313,7 @@ log:
 ```yaml
 # tun.yml @ vps-eu
 server: gateway.example.com:9001
-token: "${TUN_TOKEN_VPS_EU}"
+token: "vps-eu-tun-token"
 name: vps-eu
 
 log:
