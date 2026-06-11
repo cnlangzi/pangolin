@@ -82,55 +82,30 @@ impl ServeHttp for AppHttp {
     }
 }
 
-/// Serve admin UI by delegating to the external admin crate.
-fn serve_css() -> http::Response<Vec<u8>> {
-    // Read the CSS file at runtime from `assets/app.css` relative to the
-    // current working directory. This lets ops rebuild CSS without recompiling
-    // the binary (`npm run build` regenerates `assets/app.css`).
-    //
-    // If the file is not found (e.g. running from a different working
-    // directory), fall back to the compile-time embed so the UI still works.
-    let css = std::fs::read("assets/app.css")
-        .or_else(|_| std::fs::read("../assets/app.css"))
-        .or_else(|_| std::fs::read("../../assets/app.css"))
-        .unwrap_or_else(|_| {
-            // Fallback: embedded at build time.
-            include_str!("../../../assets/app.css").as_bytes().to_vec()
-        });
-
+/// Serve admin CSS using the rust-embed asset pipeline.
+/// Returns `assets::css_bytes()` with immutable cache headers.
+fn serve_admin_css() -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(200)
-        .header("Content-Type", "text/css; charset=utf-8")
-        .header("Cache-Control", "no-cache, must-revalidate")
-        .body(css)
+        .header("Content-Type", ::admin::assets::CSS_MIME)
+        .header("Cache-Control", ::admin::assets::IMMUTABLE_CACHE)
+        .body(::admin::assets::css_bytes())
         .unwrap()
 }
 
-/// Serve the single admin UI client bundle (`assets/app.js`).
-///
-/// The bundle contains all client logic (mobile nav, DNS kind sync,
-/// password reveal, mask/replace, test-connection, htmx modal + toast)
-/// and imports the vendored htmx from `assets/vendor/htmx-1.9.0.min.js`.
-///
-/// Lookup mirrors `serve_css()`: try a few relative paths from the
-/// current working directory so the binary works whether it's invoked
-/// from the workspace root, the crate directory, or the target dir.
-fn serve_js() -> http::Response<Vec<u8>> {
-    let js = std::fs::read("assets/app.js")
-        .or_else(|_| std::fs::read("../assets/app.js"))
-        .or_else(|_| std::fs::read("../../assets/app.js"))
-        .unwrap_or_else(|_| {
-            // Fallback: embedded at build time.
-            include_str!("../../../assets/app.js").as_bytes().to_vec()
-        });
-
+/// Serve the active admin JS bundle using the rust-embed asset pipeline.
+/// The active file is determined by `PANGOLIN_ADMIN_JS` at startup
+/// (`app.js` for `raw`, `app.min.js` otherwise). Both `/admin/app.js`
+/// and `/admin/app.min.js` routes are accepted regardless of which is active.
+fn serve_admin_js() -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(200)
-        .header("Content-Type", "application/javascript; charset=utf-8")
-        .header("Cache-Control", "no-cache, must-revalidate")
-        .body(js)
+        .header("Content-Type", ::admin::assets::JS_MIME)
+        .header("Cache-Control", ::admin::assets::IMMUTABLE_CACHE)
+        .body(::admin::assets::js_bytes())
         .unwrap()
 }
+
 async fn serve_admin_ui(
     http_session: &mut ServerSession,
     app: &Arc<App>,
@@ -140,13 +115,19 @@ async fn serve_admin_ui(
 ) -> http::Response<Vec<u8>> {
     // Static CSS file
     if path == "/admin/app.css" || path == "/admin/assets/app.css" {
-        return serve_css();
+        return serve_admin_css();
     }
 
-    // Static JS bundle (`assets/app.js`). The browser fetches it with
-    // `?v=<hash>` for cache busting; the query string is ignored here.
-    if path == "/admin/app.js" || path == "/admin/assets/app.js" {
-        return serve_js();
+    // Static JS bundle — serves whichever file `JS_FILE` points at
+    // (`app.min.js` in production, `app.js` in raw/dev mode). Both
+    // `/admin/app.js` and `/admin/app.min.js` routes are accepted so
+    // existing bookmarks and CDN-issued URLs keep working.
+    if path == "/admin/app.js"
+        || path == "/admin/app.min.js"
+        || path == "/admin/assets/app.js"
+        || path == "/admin/assets/app.min.js"
+    {
+        return serve_admin_js();
     }
 
     // Get cookie header

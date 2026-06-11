@@ -14,7 +14,8 @@ help:
 	@echo "  make build         # Local build ngx + tun (release)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-css     # Build admin UI CSS (Tailwind)"
+	@echo "  make build-css     # Build admin UI CSS + JS bundles (Tailwind + esbuild, backward compat)"
+	@echo "  make build-ui       # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
 	@echo "  make build-dist    # Docker build, export to build/output/"
 	@echo "  make debian        # Build base Docker image"
 	@echo ""
@@ -84,19 +85,28 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
-build-css:
+build-css: build-ui
+	@echo "  build-css is now an alias for build-ui"
+
+build-ui:
+	@echo "Downloading tailwindcss..."
+	@mkdir -p bin
+	@command -v bin/tailwindcss >/dev/null 2>&1 || {\
+		wget -q https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 -O bin/tailwindcss; \
+		chmod +x bin/tailwindcss; \
+		echo "  tailwindcss downloaded"; \
+	}
+	@echo "Downloading esbuild..."
+	@command -v bin/esbuild >/dev/null 2>&1 || {\
+		wget -q https://github.com/evanw/esbuild/releases/download/v0.24.0/esbuild-linux-64 -O bin/esbuild; \
+		chmod +x bin/esbuild; \
+		echo "  esbuild downloaded"; \
+	}
 	@echo "Building admin UI CSS..."
-	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found. Please install Node.js"; exit 1; }
-	@# Skip rebuild when the bundled CSS is newer than every source it was built from.
-	@if [ -f assets/app.css ] && \
-	   [ assets/app.css -nt assets/tailwindcss.css ] && \
-	   [ assets/app.css -nt tailwind.config.js ] && \
-	   [ assets/app.css -nt package.json ] && \
-	   [ -z "$$(find crates/admin/templates -name '*.html' -newer assets/app.css 2>/dev/null)" ]; then \
-	    echo "  up to date, skipping"; \
-	else \
-	    npm run build; \
-	fi
+	bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify
+	@echo "Building admin UI JS bundle..."
+	bin/esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js
+	@echo "  build-ui done"
 
 build-dist: debian dist
 
