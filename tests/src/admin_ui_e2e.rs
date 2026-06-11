@@ -1351,9 +1351,15 @@ async fn site_domains_new_modal_preselected() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
 
-    // The site dropdown should have "preselect-test-site" selected
+    // The site field is locked in site-specific context: rendered as a
+    // read-only display with a hidden input carrying the value, so the
+    // form still POSTs `site_name=preselect-test-site` back.
     assert!(
-        body.contains(r#"<option value="preselect-test-site" selected"#),
-        "Expected preselected site option to be selected in the domains modal"
+        body.contains(r#"value="preselect-test-site""#),
+        "Expected preselected site name to be carried in a hidden field"
+    );
+    assert!(
+        !body.contains("Select a site..."),
+        "Site field should be locked (no dropdown) when invoked from a site sub-page"
     );
 }
