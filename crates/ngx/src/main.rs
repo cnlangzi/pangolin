@@ -136,9 +136,7 @@ fn main() -> anyhow::Result<()> {
         // Build & start services (fail-fast on startup error).
         let services: Vec<Box<dyn runtime::Service>> = vec![
             Box::new(acme::AcmeService::new(acme_state)),
-            Box::new(tunnel::TunnelService::new(format!(
-                "127.0.0.1:{tunnel_addr}"
-            ))),
+            Box::new(tunnel::TunnelService::new(tunnel_addr.clone())),
         ];
 
         let ctx = runtime::ServiceContext::new(app, shutdown.clone());
@@ -213,25 +211,12 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     http_server.add_tcp(&config.admin.addr);
     server.add_service(http_server);
 
-    // Tunnel WebSocket server (independent TCP listener, runs as background task).
-    // See the note above on why this is `std::thread::spawn` + a dedicated
-    // current-thread runtime, not `tokio::spawn`.
-    let app_tunnel = app.clone();
-    let tunnel_addr = format!("127.0.0.1:{}", config.tunnel.port);
-    let tunnel_shutdown = shutdown.clone();
-    std::thread::Builder::new()
-        .name("pangolin-tunnel".to_string())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tunnel runtime");
-            let _ = rt.block_on(tunnel::start_tunnel_server(
-                app_tunnel,
-                &tunnel_addr,
-                tunnel_shutdown,
-            ));
-        })?;
+    // The tunnel WebSocket listener is now a host-runtime Service
+    // (TunnelService), registered in `run_pingora`'s sibling block
+    // above. The previous PR #24-era std::thread::Builder + dedicated
+    // current-thread runtime was removed when PR #23 unified
+    // non-pingora services under the host runtime; keeping it here
+    // would race TunnelService for `config.tunnel.port` (EADDRINUSE).
 
     // Drive pingora with our shared shutdown token.
     let run_args = RunArgs {
@@ -240,5 +225,4 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     server.run(run_args);
     log::info!("pingora exited cleanly");
     Ok(())
-
 }

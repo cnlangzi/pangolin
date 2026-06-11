@@ -61,20 +61,25 @@ build:
 	# exactly once, not twice.  Two separate `cargo build` calls
 	# re-link every shared crate.
 	$(CARGO) build --release -p ngx -p tun
-	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
-	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
+	# `install` instead of `mv` so the copy is a fresh inode even when
+	# `target/release/<bin>` and `bin/<bin>` are hardlinks of each
+	# other (e.g. after a previous run that did `cp` rather than
+	# `mv`). Plain `mv same-file` errors out and aborts the Make
+	# target.
+	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
+	install -m 0755 $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
 build-ngx:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
-	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
+	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
 
 build-tun:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p tun
-	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
+	install -m 0755 $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun
