@@ -37,7 +37,7 @@ use crate::{App, TunnelMessage};
 ///   * `Err(401)` — either no row matches `(name, token)`, **or**
 ///     the row matches but its `expires_at` is in the past. Both
 ///     are hard rejects: a missing row means the (name, token) pair
-///     must be admin-provisioned via `POST /api/tun` before the tun
+///     must be admin-provisioned via the admin UI /tun/new form (POST /tun/new) before the tun
 ///     can come online (no auto-register), and an expired token
 ///     must be rotated by the admin. We collapse both into 401 so
 ///     the client doesn't learn "this (name, token) was once
@@ -221,7 +221,7 @@ async fn handle_client(
             // 500: DB error.
             // All three are hard rejects; the tun stays offline
             // until an operator creates / re-enables the row via
-            // `POST /api/tun` (or the admin UI Tunnels page).
+            // `POST /tun/new` (the admin UI Tunnels page).
             warn!("tunnel auth failed for {}: status {}", name, status);
             return Ok(());
         }

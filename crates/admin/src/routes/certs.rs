@@ -93,7 +93,7 @@ pub async fn handle_create(
     drop(db);
 
     match result {
-        Ok(()) => Ok(redirect_response("/admin/certs")),
+        Ok(()) => Ok(redirect_response("/certs")),
         Err(e) => render_create_page_with_error(&format!("Database error: {}", e), csrf),
     }
 }
@@ -121,7 +121,7 @@ pub async fn handle_delete(
             app.reload_indexes().await;
         }
     }
-    Ok(redirect_response("/admin/certs"))
+    Ok(redirect_response("/certs"))
 }
 
 fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {

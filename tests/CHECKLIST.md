@@ -138,9 +138,9 @@
 - `tests/src/harness.rs` — RAII wrappers (`NgxProcess`, `TunProcess`)
   that spawn real `pangolin-ngx` and `pangolin-tun` subprocesses with
   per-test ports, per-test certs, and per-test config.
-- `tests/src/real_e2e.rs` — 4 tests:
-  - [x] `real_e2e_admin_endpoint` — GET `/api/sites` on a live
-    `pangolin-ngx` returns 200 + `[]`
+- `tests/src/real_e2e.rs` — 3 tests (the JSON API `real_e2e_admin_endpoint`
+  test was removed along with `crates/ngx/src/admin_api.rs` in the
+  dashboard URL refactor, see issue #31):
   - [x] `real_e2e_static_file` — `file:///` backend serves a static
     file through the real proxy
   - [x] `real_e2e_tunnel_full` — real `ngx` + real `tun` + mock HTTP

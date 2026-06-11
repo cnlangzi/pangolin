@@ -134,7 +134,7 @@ Two certificate modes coexist at runtime:
   apply to all such domains.
 - **Manual mode** (per-domain `auto_issue = false`, the default for
   new rows): skip ACME entirely. Operators upload cert + key via
-  `POST /api/certs`.
+  `POST /certs/new` (the admin UI form).
 
 | Field                        | Type     | Default                                              | Required | Notes |
 | ---------------------------- | -------- | ---------------------------------------------------- | -------- | ----- |
@@ -156,7 +156,7 @@ Two certificate modes coexist at runtime:
 
 These columns control per-domain cert behaviour and live in SQLite,
 not `ngx.yml`. They are managed via the admin UI or the
-`/api/domains` endpoints.
+`/domains` UI pages and `/api/domains/{domain}` HTMX endpoints.
 
 | Column         | Type      | Default  | Notes |
 | -------------- | --------- | -------- | ----- |

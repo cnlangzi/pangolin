@@ -8,7 +8,7 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 
-use crate::templates::TunnelFormTemplate;
+use crate::templates::TunFormTemplate;
 use crate::{redirect_response, App};
 use pangolin_core::types::Tun;
 
@@ -20,7 +20,7 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
-/// GET /admin/tun — list all tunnels.
+/// GET /tun — list all tunnels.
 pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
@@ -34,10 +34,9 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-/// GET /admin/tun/new — render the new tunnel form.
-pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
-    let _ = app;
-    let html = TunnelFormTemplate {
+/// GET /tun/new — render the new tunnel form.
+pub async fn render_create_page(csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+    let html = TunFormTemplate {
         tun: None,
         action: "create",
         error: None,
@@ -48,7 +47,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-/// POST /admin/tun/new — create a new tunnel.
+/// POST /tun/new — create a new tunnel.
 pub async fn handle_create(
     app: &Arc<App>,
     body: &[u8],
@@ -93,6 +92,24 @@ pub async fn handle_create(
         }
     };
 
+    {
+        let db = app.db.lock().await;
+        if pangolin_core::db::get_tun(&db, &name)
+            .unwrap_or_default()
+            .is_some()
+        {
+            drop(db);
+            return render_create_page_with_error(
+                None,
+                &format!(
+                    "Tunnel '{}' already exists; use the edit page to update it",
+                    name
+                ),
+                csrf,
+            );
+        }
+    }
+
     let enabled = params.get("enabled").map(|v| v == "1").unwrap_or(true);
     let expires_at = parse_datetime(params.get("expires_at").cloned().as_deref());
 
@@ -111,12 +128,12 @@ pub async fn handle_create(
     drop(db);
 
     match result {
-        Ok(()) => Ok(redirect_response("/admin/tun")),
+        Ok(()) => Ok(redirect_response("/tun")),
         Err(e) => render_create_page_with_error(None, &format!("Database error: {}", e), csrf),
     }
 }
 
-/// GET /admin/tun/edit?name=xxx — render the edit form prefilled with the named tunnel.
+/// GET /tun/edit?name=xxx — render the edit form prefilled with the named tunnel.
 pub async fn render_edit_page(
     app: &Arc<App>,
     name: Option<String>,
@@ -126,7 +143,7 @@ pub async fn render_edit_page(
         Some(n) if !n.is_empty() => n,
         _ => {
             let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/admin/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
             )));
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(resp);
@@ -141,7 +158,7 @@ pub async fn render_edit_page(
         return render_edit_page_with_error(&name, "Tunnel not found", csrf);
     }
 
-    let html = TunnelFormTemplate {
+    let html = TunFormTemplate {
         tun,
         action: "update",
         error: None,
@@ -152,7 +169,7 @@ pub async fn render_edit_page(
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-/// POST /admin/tun/edit — update an existing tunnel.
+/// POST /tun/edit — update an existing tunnel.
 pub async fn handle_update(
     app: &Arc<App>,
     name: Option<String>,
@@ -163,7 +180,7 @@ pub async fn handle_update(
         Some(n) if !n.is_empty() => n,
         _ => {
             let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/admin/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
             )));
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(resp);
@@ -205,12 +222,12 @@ pub async fn handle_update(
     drop(db);
 
     match result {
-        Ok(()) => Ok(redirect_response("/admin/tun")),
+        Ok(()) => Ok(redirect_response("/tun")),
         Err(e) => render_edit_page_with_error(&name, &format!("Database error: {}", e), csrf),
     }
 }
 
-/// POST /admin/tun/delete — delete a tunnel.
+/// POST /tun/delete — delete a tunnel.
 pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
@@ -223,7 +240,7 @@ pub async fn handle_delete(
             drop(db);
         }
     }
-    Ok(redirect_response("/admin/tun"))
+    Ok(redirect_response("/tun"))
 }
 
 fn render_create_page_with_error(
@@ -231,7 +248,7 @@ fn render_create_page_with_error(
     error: &str,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    let html = TunnelFormTemplate {
+    let html = TunFormTemplate {
         tun,
         action: "create",
         error: Some(error),
@@ -256,7 +273,7 @@ fn render_edit_page_with_error(
         last_seen_at: None,
         expires_at: None,
     };
-    let html = TunnelFormTemplate {
+    let html = TunFormTemplate {
         tun: Some(stub),
         action: "update",
         error: Some(error),

@@ -22,7 +22,7 @@
         </td>
         <td class="px-4 py-3">
           <div class="flex items-center justify-end">
-            <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');" class="inline">
+            <form method="POST" action="/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');" class="inline">
               <input type="hidden" name="domain" value="{{ domain.domain }}">
               <input type="hidden" name="_csrf" value="__CSRF__">
               <button type="submit"
@@ -35,7 +35,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="4" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No domains yet. <a href="/admin/domains/new" class="text-accent-500 hover:underline">Add one</a>.</td></tr>
+      <tr><td colspan="4" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No domains yet. <a href="/domains/new" class="text-accent-500 hover:underline">Add one</a>.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -52,7 +52,7 @@
         {% endif %}
       </div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">Site: {{ domain.site_name }}</div>
-      <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');">
+      <form method="POST" action="/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');">
         <input type="hidden" name="domain" value="{{ domain.domain }}">
         <input type="hidden" name="_csrf" value="__CSRF__">
         <button type="submit" class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">

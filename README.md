@@ -70,8 +70,8 @@ pangolin/
 ./tun
 
 # token 在 ngx 的 tun 表里统一管理(v2 起;tokens 表已合并进 tun)。
-# 流程:admin 先 POST /api/tun {name, token, ...} 显式建行(也可以在 admin UI "Tunnels" 页),
-# 然后把同一对 (name, token) 写到 tun.yml 里。
+# 流程:admin 先在 admin UI "Tunnels" 页面(GET/POST /tun/new)
+# 显式创建一行,然后把同一对 (name, token) 写到 tun.yml 里。
 # WS 握手时,服务器单条 SQL 校验,匹配 + enabled=1 才放行。
 # 不再有自动注册 —— tun 自己不能"随便带个 token 来就建身份"。
 ```
@@ -418,7 +418,7 @@ domains:
 
 - **per-domain `auto_issue`**：是否为某个域名走 ACME 自动申请 + 续期，存于 `domains` 表的 `auto_issue` 列，admin UI 可改
 - **`auto_issue = true`（针对某个域名）**：启动时扫该域名对应的 cert，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
-- **`auto_issue = false`（默认）**：完全跳过该域名的 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
+- **`auto_issue = false`（默认）**：完全跳过该域名的 ACME（首次申请 + 续期都不跑），admin 通过 Certs 页(GET/POST /certs/new) 手动上传 cert（pem + key）
 
 **适用场景**：
 
@@ -513,21 +513,25 @@ tun 开始代理这些域名的请求
 
 ---
 
-## Admin API
+## Admin UI (Dashboard)
 
-所有 API 资源的主键是自然键（`name` / `domain` / `token`），URL 段用主键值。
+整个管理面板就是网关的根路径（`/`），不再是 `/admin` 前缀下的隐藏子站。
 
-| 方法 | 路径 | 说明 |
+| 命名空间 | 用途 | 例子 |
 |------|------|------|
-| GET/POST | `/api/sites` | 站点列表/新增 |
-| PUT/DELETE | `/api/sites/:name` | 更新/删除站点（name 主键） |
-| GET/POST | `/api/domains` | 域名列表/新增 |
-| PUT/DELETE | `/api/domains/:domain` | 更新/删除域名（domain 主键） |
-| GET/POST | `/api/tun` | tun 节点列表/新增 |
-| PUT/DELETE | `/api/tun/:name` | 更新/删除 tun（name 主键） |
-| GET/POST | `/api/tun` | tun 列表/新增(v2:`token` 字段作为 body 字段一起 POST) |
-| GET/POST | `/api/certs` | 证书列表/上传 |
-| DELETE | `/api/certs/:domain` | 删除证书（domain 主键） |
+| `/` | UI 页面（HTML + 模板渲染） | `/login`、`/sites`、`/tun`、`/dns`、`/certs` |
+| `/api/*` | HTMX 片段（HTML 片段，不返回 JSON） | `/api/site/{name}/domains`、`/api/domains/{domain}` |
+| `/assets/*` | 静态资源（CSS、JS） | `/assets/app.css?v=HASH`、`/assets/app.js?v=HASH` |
+
+`/health`、`/ping`、`/healthz` 健康检查路径保留（不在上述三个命名空间内）。
+
+## 历史说明
+
+v2 之前有一条独立的 JSON API（`GET/POST /api/sites`、`POST /api/tun` 等）。它仅用于：
+1. 文档中举列的 cURL 调用示例；
+2. 一个 `real_e2e_admin_endpoint` 烟雾测试。
+
+该 JSON API 在 dashboard URL refactor 中被删除。**操作者现在通过 admin UI 完成所有 CRUD**。HTTP 表单与 `Content-Type: application/x-www-form-urlencoded` 是唯一可编程的入口（通过 `curl`/脚本模拟表单提交即可），HTMX `/api/*` 端点也返回 HTML。
 
 ---
 
@@ -758,7 +762,7 @@ NGX_TUNNEL__ADDR=0.0.0.0:9001 ./ngx
 
 - `domains.auto_issue` (DB,per-domain):**单域名 ACME 开关**。v2 不再有全局 `cert.autorenew`。
   - `true`:该域名启动时申请 cert(如缺失)+ 定期续期
-  - `false`(默认,新行):完全跳过该域名的 ACME,admin 通过 `POST /api/certs` 手动上传 cert
+  - `false`(默认,新行):完全跳过该域名的 ACME,admin 通过 `POST /certs/new` 手动上传 cert
 - `domains.dns_provider` (DB,per-domain):指向 `dns_providers` 表中某行,设置后该域名走 DNS-01 挑战(**`*.example.com` 通配必须**)。空字符串走 HTTP-01。
 - `ngx.yml: acme.acme_directory`:可指向 LE staging 测试
 - `ngx.yml: workers`:pingora 推荐设为 CPU 核数

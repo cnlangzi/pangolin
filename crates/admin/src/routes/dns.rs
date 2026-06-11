@@ -123,7 +123,7 @@ pub async fn handle_create(
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/dns"))
+            Ok(redirect_response("/dns"))
         }
         Err(e) => render_create_page_with_error(app, &format!("Database error: {e}"), csrf),
     }
@@ -174,13 +174,13 @@ pub async fn handle_update(
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/dns"))
+            Ok(redirect_response("/dns"))
         }
         Err(e) => Ok(error_response(&format!("Database error: {e}"))),
     }
 }
 
-/// POST /admin/dns/test — verify credentials by constructing a provider and
+/// POST /dns/test — verify credentials by constructing a provider and
 /// doing one read-only call. Returns JSON {"ok": bool, "error": "..."}.
 pub async fn handle_test(app: &Arc<App>, body: &[u8]) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
@@ -250,7 +250,7 @@ pub async fn handle_delete(
                 upd
             );
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/dns"))
+            Ok(redirect_response("/dns"))
         }
         Err(e) => Ok(error_response(&format!("delete failed: {e}"))),
     }
@@ -435,9 +435,13 @@ fn empty_form<'a>(
     DnsProviderFormTemplate {
         provider: provider.cloned(),
         action: if is_edit {
-            "/admin/dns/edit"
+            // Path-param style: /dns/{name}/edit (POST).
+            // `name` is guaranteed to be present when is_edit is true
+            // because render_edit_page returns 404 when the name is
+            // missing or the row doesn't exist.
+            "/dns/edit"
         } else {
-            "/admin/dns/new"
+            "/dns/new"
         },
         form_title: if is_edit {
             "Edit DNS Provider"

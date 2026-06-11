@@ -1,6 +1,11 @@
 //! HTTP server via pingora `ServeHttp` trait for admin UI + static files.
 //!
 //! This runs as a separate pingora Service sharing the same App state.
+//!
+//! URL dispatch (per dashboard URL refactor #31):
+//!   - `/health`, `/ping`, `/healthz` — health endpoints
+//!   - everything else — delegated to the external admin crate, which
+//!     handles the three-namespace layout (`/...`, `/api/...`, `/assets/...`)
 
 use std::sync::Arc;
 
@@ -11,8 +16,6 @@ use pingora::apps::http_app::ServeHttp;
 use pingora::protocols::http::ServerSession;
 
 use crate::App;
-// NOTE: `crate::admin_api` = local ngx JSON API module (crates/ngx/src/admin_api.rs).
-//       `crate::admin`     = external admin UI crate (crates/admin/) via lib.rs alias.
 
 /// `ServeHttp` implementation for the admin UI + static file serving.
 pub struct AppHttp {
@@ -28,7 +31,8 @@ impl ServeHttp for AppHttp {
         let path = req.uri.path().to_string();
         let method = req.method.as_str().to_string();
 
-        // Health check
+        // Health check (text/plain for backwards compat with existing
+        // healthcheck scripts).
         if path == "/health" || path == "/ping" {
             return http::Response::builder()
                 .status(200)
@@ -37,7 +41,7 @@ impl ServeHttp for AppHttp {
                 .unwrap();
         }
 
-        // Kubernetes-compatible health check endpoint with JSON response
+        // Kubernetes-compatible health check endpoint with JSON response.
         if path == "/healthz" {
             let body = serde_json::to_vec(&serde_json::json!({
                 "status": "ok",
@@ -51,86 +55,19 @@ impl ServeHttp for AppHttp {
                 .unwrap();
         }
 
-        // Admin UI routes (use the external admin crate)
-        if path.starts_with("/admin") {
-            debug!("HTTP admin UI: {} {}", method, path);
-            return serve_admin_ui(http_session, &self.app, &self.sessions, &path, &method).await;
-        }
-
-        // JSON API routes (handled by the local mod admin_api)
-        if path.starts_with("/api/") {
-            debug!("HTTP admin API: {} {}", method, path);
-            return crate::admin_api::handle_api_http(http_session, &self.app, &path, &method)
-                .await;
-        }
-
-        // Root — redirect to admin login
-        if path == "/" {
-            return http::Response::builder()
-                .status(302)
-                .header("Location", "/admin/login")
-                .body(vec![])
-                .unwrap();
-        }
-
-        // 404
-        http::Response::builder()
-            .status(404)
-            .header("Content-Type", "text/plain")
-            .body(b"Not found".to_vec())
-            .unwrap()
+        // Everything else (including `/`, `/login`, `/sites`, `/api/...`,
+        // `/assets/...`, `/tun`, etc.) is delegated to the external
+        // admin crate. The admin crate's `handle()` does its own auth,
+        // CSRF, and route dispatch for the three-namespace layout.
+        //
+        // The JSON API (`/api/sites`, `/api/tun`, ...) used to live here
+        // as `crate::admin_api`; it has been removed. `/api/*` now means
+        // HTMX HTML fragments, not JSON.
+        debug!("HTTP admin: {} {}", method, path);
+        return serve_admin_ui(http_session, &self.app, &self.sessions, &path, &method).await;
     }
 }
 
-/// Serve admin UI by delegating to the external admin crate.
-fn serve_css() -> http::Response<Vec<u8>> {
-    // Read the CSS file at runtime from `assets/app.css` relative to the
-    // current working directory. This lets ops rebuild CSS without recompiling
-    // the binary (`npm run build` regenerates `assets/app.css`).
-    //
-    // If the file is not found (e.g. running from a different working
-    // directory), fall back to the compile-time embed so the UI still works.
-    let css = std::fs::read("assets/app.css")
-        .or_else(|_| std::fs::read("../assets/app.css"))
-        .or_else(|_| std::fs::read("../../assets/app.css"))
-        .unwrap_or_else(|_| {
-            // Fallback: embedded at build time.
-            include_str!("../../../assets/app.css").as_bytes().to_vec()
-        });
-
-    http::Response::builder()
-        .status(200)
-        .header("Content-Type", "text/css; charset=utf-8")
-        .header("Cache-Control", "no-cache, must-revalidate")
-        .body(css)
-        .unwrap()
-}
-
-/// Serve the single admin UI client bundle (`assets/app.js`).
-///
-/// The bundle contains all client logic (mobile nav, DNS kind sync,
-/// password reveal, mask/replace, test-connection, htmx modal + toast)
-/// and imports the vendored htmx from `assets/vendor/htmx-1.9.0.min.js`.
-///
-/// Lookup mirrors `serve_css()`: try a few relative paths from the
-/// current working directory so the binary works whether it's invoked
-/// from the workspace root, the crate directory, or the target dir.
-fn serve_js() -> http::Response<Vec<u8>> {
-    let js = std::fs::read("assets/app.js")
-        .or_else(|_| std::fs::read("../assets/app.js"))
-        .or_else(|_| std::fs::read("../../assets/app.js"))
-        .unwrap_or_else(|_| {
-            // Fallback: embedded at build time.
-            include_str!("../../../assets/app.js").as_bytes().to_vec()
-        });
-
-    http::Response::builder()
-        .status(200)
-        .header("Content-Type", "application/javascript; charset=utf-8")
-        .header("Cache-Control", "no-cache, must-revalidate")
-        .body(js)
-        .unwrap()
-}
 async fn serve_admin_ui(
     http_session: &mut ServerSession,
     app: &Arc<App>,
@@ -138,17 +75,6 @@ async fn serve_admin_ui(
     path: &str,
     method: &str,
 ) -> http::Response<Vec<u8>> {
-    // Static CSS file
-    if path == "/admin/app.css" || path == "/admin/assets/app.css" {
-        return serve_css();
-    }
-
-    // Static JS bundle (`assets/app.js`). The browser fetches it with
-    // `?v=<hash>` for cache busting; the query string is ignored here.
-    if path == "/admin/app.js" || path == "/admin/assets/app.js" {
-        return serve_js();
-    }
-
     // Get cookie header
     let cookie = http_session
         .req_header()
@@ -166,9 +92,10 @@ async fn serve_admin_ui(
         .to_string();
 
     // Read body. Methods that *typically* carry a body (POST/PUT/PATCH)
-    // need read_body_or_idle; methods that don't (GET/HEAD/DELETE) get
-    // an empty body to avoid hanging on read_body_or_idle.
-    let body = if matches!(method, "GET" | "HEAD" | "DELETE") {
+    // need read_body_or_idle; GET/HEAD get an empty body to avoid
+    // hanging on read_body_or_idle. DELETE needs the body too because
+    // HTMX hx-vals sends the CSRF token in the DELETE request body.
+    let body = if matches!(method, "GET" | "HEAD") {
         vec![]
     } else {
         match http_session.read_body_or_idle(false).await {
