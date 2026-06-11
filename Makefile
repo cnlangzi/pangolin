@@ -7,15 +7,14 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-css     # Build admin UI CSS + JS bundles (Tailwind + esbuild, backward compat)"
-	@echo "  make build-ui       # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
+	@echo "  make build-ui      # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
 	@echo "  make build-dist    # Docker build, export to build/output/"
 	@echo "  make debian        # Build base Docker image"
 	@echo ""
@@ -74,8 +73,6 @@ build: build-ui
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-# `build-ngx` embeds admin assets (hence the `build-ui` dep); `build-tun`
-# does not.
 build-ngx: build-ui
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
@@ -89,27 +86,37 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
-# `build-css` is a backward-compat alias for `build-ui` (the old target
-# only built CSS; the new one builds CSS + JS).
-build-css: build-ui
-	@echo "  build-css is now an alias for build-ui"
-
-# Download the standalone Tailwind and esbuild CLIs to ./bin/ (gitignored)
-# and rebuild the admin CSS and JS bundles. Idempotent: skips downloads
-# if the binaries are already present. Wget/curl failures are surfaced
-# loudly (clean up partial file + exit non-zero) so a stale HTML error
-# page never sneaks into the build pipeline.
-#
-# esbuild quirk: starting with v0.25.0 the author no longer uploads
-# pre-built linux-64 binaries to the GitHub release page. The official
-# distribution channel is the `@esbuild/linux-x64` npm package, so we
-# curl the tarball and extract the binary. No `npm` CLI required.
-build-ui:
+# Download tailwindcss and esbuild CLIs to ./bin/.
+# Separated from build-ui so Docker can cache this layer independently.
+# Supports Linux/macOS × x64/ARM64.
+download-ui-tools:
 	@mkdir -p bin
-	@if [ ! -x bin/tailwindcss ]; then \
-		echo "Downloading tailwindcss v3.4.17 (from GitHub releases)..."; \
+	@OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH=$$(uname -m); \
+	if [ "$$OS" = "darwin" ]; then \
+		if [ "$$ARCH" = "arm64" ]; then \
+			TAILWIND_PLATFORM="macos-arm64"; \
+			ESBUILD_PACKAGE="@esbuild/darwin-arm64"; \
+		else \
+			TAILWIND_PLATFORM="macos-x64"; \
+			ESBUILD_PACKAGE="@esbuild/darwin-x64"; \
+		fi; \
+	elif [ "$$OS" = "linux" ]; then \
+		if [ "$$ARCH" = "aarch64" ] || [ "$$ARCH" = "arm64" ]; then \
+			TAILWIND_PLATFORM="linux-arm64"; \
+			ESBUILD_PACKAGE="@esbuild/linux-arm64"; \
+		else \
+			TAILWIND_PLATFORM="linux-x64"; \
+			ESBUILD_PACKAGE="@esbuild/linux-x64"; \
+		fi; \
+	else \
+		echo "  ERROR: Unsupported OS: $$OS" >&2; \
+		exit 1; \
+	fi; \
+	if [ ! -x bin/tailwindcss ]; then \
+		echo "Downloading tailwindcss v3.4.17 for $$TAILWIND_PLATFORM (from GitHub releases)..."; \
 		if ! curl -fsSL -o bin/tailwindcss.tmp \
-			https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64; then \
+			"https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-$$TAILWIND_PLATFORM"; then \
 			echo "  ERROR: failed to download tailwindcss" >&2; \
 			rm -f bin/tailwindcss.tmp; \
 			exit 1; \
@@ -117,11 +124,12 @@ build-ui:
 		mv bin/tailwindcss.tmp bin/tailwindcss; \
 		chmod +x bin/tailwindcss; \
 		echo "  tailwindcss downloaded"; \
-	fi
-	@if [ ! -x bin/esbuild ]; then \
-		echo "Downloading esbuild v0.28.0 (from npm registry)..."; \
+	fi; \
+	if [ ! -x bin/esbuild ]; then \
+		echo "Downloading esbuild v0.28.0 for $$ESBUILD_PACKAGE (from npm registry)..."; \
+		NPM_PACKAGE=$$(echo "$$ESBUILD_PACKAGE" | sed 's/@/%40/g' | sed 's/\//%2F/g'); \
 		if ! curl -fsSL -o bin/esbuild.tgz \
-			https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz; then \
+			"https://registry.npmjs.org/$$ESBUILD_PACKAGE/-/$${ESBUILD_PACKAGE##*/}-0.28.0.tgz"; then \
 			echo "  ERROR: failed to download esbuild" >&2; \
 			rm -f bin/esbuild.tgz; \
 			exit 1; \
@@ -132,6 +140,9 @@ build-ui:
 		mv bin/esbuild.tmp bin/esbuild; \
 		echo "  esbuild downloaded"; \
 	fi
+
+# Build admin UI CSS and JS bundles.
+build-ui: download-ui-tools
 	@echo "Building admin UI CSS..."
 	bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify
 	@echo "Building admin UI JS bundle..."
@@ -199,7 +210,7 @@ play-tun:
 # Run the locally-built binary directly. Foreground — Ctrl-C to stop.
 # No sudo, no systemd. For a daemon-mode install see install-* below.
 
-start-ngx: build-css build-ngx
+start-ngx: build-ui build-ngx
 	./bin/pangolin-ngx
 
 start-tun: build-tun
@@ -207,7 +218,7 @@ start-tun: build-tun
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
-install-ngx: build-css build-ngx
+install-ngx: build-ui build-ngx
 	$(MAKE) install-service SVC=ngx
 
 install-tun: build-tun
