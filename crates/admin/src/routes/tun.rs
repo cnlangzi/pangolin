@@ -1,16 +1,11 @@
-//! Tunnels route — list / new / edit / delete (full-page).
-//!
-//! Provides the tun CRUD UI that used to be served by the JSON API
-//! (`POST /api/tun`). With the JSON API removed, operators need a
-//! web form to register new tun nodes; the README explicitly required
-//! admin to do this *before* starting a tun client, otherwise the
-//! handshake will be rejected.
+//! Tunnels route — list / new / edit / delete.
 
 use askama::Template;
+use rand::Rng;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::Response;
+use http::{Response, StatusCode};
 use http_body_util::Full;
 
 use crate::templates::TunFormTemplate;
@@ -25,25 +20,25 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .unwrap())
 }
 
+/// GET /tun — list all tunnels.
 pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     drop(db);
-    ok_html(crate::render_with_assets_and_csrf(
-        crate::templates::TunnelsTemplate {
-            tuns,
-            active_nav: "tun",
-        }
-        .render()
-        .unwrap(),
-        csrf,
-    ))
+    let html = crate::templates::TunnelsTemplate {
+        tuns,
+        active_nav: "tun",
+    }
+    .render()
+    .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-/// Render the New tun page.
+/// GET /tun/new — render the new tunnel form.
 pub async fn render_create_page(csrf: &str) -> http::Result<Response<Full<Bytes>>> {
     let html = TunFormTemplate {
         tun: None,
+        action: "create",
         error: None,
         active_nav: "tun",
     }
@@ -52,34 +47,7 @@ pub async fn render_create_page(csrf: &str) -> http::Result<Response<Full<Bytes>
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-/// Render the Edit tun page, prefilled with the named tun row.
-pub async fn render_edit_page(
-    app: &Arc<App>,
-    name: Option<String>,
-    csrf: &str,
-) -> http::Result<Response<Full<Bytes>>> {
-    let name = match name {
-        Some(n) if !n.is_empty() => n,
-        _ => return Ok(crate::not_found()),
-    };
-    let db = app.db.lock().await;
-    let tun = pangolin_core::db::get_tun(&db, &name).unwrap_or(None);
-    drop(db);
-    let tun = match tun {
-        Some(t) => t,
-        None => return Ok(crate::not_found()),
-    };
-    let html = TunFormTemplate {
-        tun: Some(tun),
-        error: None,
-        active_nav: "tun",
-    }
-    .render()
-    .unwrap();
-    ok_html(crate::render_with_assets_and_csrf(html, csrf))
-}
-
-/// POST /tun/new — create a new tun row.
+/// POST /tun/new — create a new tunnel.
 pub async fn handle_create(
     app: &Arc<App>,
     body: &[u8],
@@ -87,42 +55,54 @@ pub async fn handle_create(
 ) -> http::Result<Response<Full<Bytes>>> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
-    let token = params.get("token").cloned().unwrap_or_default();
-    let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
 
     if name.is_empty() {
-        return render_create_page_with_error("Tun name is required", csrf);
+        return render_create_page_with_error(None, "Name is required", csrf);
     }
-    if !pangolin_core::is_valid_tun_name(&name) {
+    if name.len() > 64 {
+        return render_create_page_with_error(None, "Name must be 64 characters or less", csrf);
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
         return render_create_page_with_error(
-            "Tun name must be lowercase letters, digits, or hyphens (1-32 chars)",
+            None,
+            "Name may only contain letters, digits, underscores, and hyphens",
             csrf,
         );
     }
 
-    // Reject duplicate names to avoid silently clobbering an existing
-    // tun's online/last_seen_at/expires_at fields via upsert.
-    {
-        let db = app.db.lock().await;
-        if pangolin_core::db::get_tun(&db, &name).unwrap_or(None).is_some() {
+    // Token: use provided value or auto-generate a random 32-byte hex string.
+    let token = params
+        .get("token")
+        .cloned()
+        .filter(|t| !t.is_empty())
+        .map(Ok)
+        .unwrap_or_else(generate_token);
+
+    let token = match token {
+        Ok(t) => t,
+        Err(e) => {
             return render_create_page_with_error(
-                &format!(
-                    "Tun '{}' already exists; use the edit page to update it",
-                    name
-                ),
+                None,
+                &format!("Token generation error: {}", e),
                 csrf,
-            );
+            )
         }
-    }
+    };
+
+    let enabled = params.get("enabled").map(|v| v == "1").unwrap_or(true);
+    let expires_at = parse_datetime(params.get("expires_at").cloned().as_deref());
 
     let tun = Tun {
         name: name.clone(),
-        token: if token.is_empty() { None } else { Some(token) },
+        token: Some(token),
         enabled,
         online: false,
         registered_at: None,
         last_seen_at: None,
-        expires_at: None,
+        expires_at,
     };
 
     let db = app.db.lock().await;
@@ -131,11 +111,47 @@ pub async fn handle_create(
 
     match result {
         Ok(()) => Ok(redirect_response("/tun")),
-        Err(e) => render_create_page_with_error(&format!("Database error: {}", e), csrf),
+        Err(e) => render_create_page_with_error(None, &format!("Database error: {}", e), csrf),
     }
 }
 
-/// POST /tun/{name}/edit — update an existing tun row.
+/// GET /tun/edit?name=xxx — render the edit form prefilled with the named tunnel.
+pub async fn render_edit_page(
+    app: &Arc<App>,
+    name: Option<String>,
+    csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    let name = match name {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            let mut resp = Response::new(Full::new(Bytes::from(
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
+            )));
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return Ok(resp);
+        }
+    };
+
+    let db = app.db.lock().await;
+    let tun = pangolin_core::db::get_tun(&db, &name).unwrap_or_default();
+    drop(db);
+
+    if tun.is_none() {
+        return render_edit_page_with_error(&name, "Tunnel not found", csrf);
+    }
+
+    let html = TunFormTemplate {
+        tun,
+        action: "update",
+        error: None,
+        active_nav: "tun",
+    }
+    .render()
+    .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+/// POST /tun/edit — update an existing tunnel.
 pub async fn handle_update(
     app: &Arc<App>,
     name: Option<String>,
@@ -144,26 +160,47 @@ pub async fn handle_update(
 ) -> http::Result<Response<Full<Bytes>>> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
-        _ => return Ok(crate::not_found()),
+        _ => {
+            let mut resp = Response::new(Full::new(Bytes::from(
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
+            )));
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return Ok(resp);
+        }
     };
-    let params = parse_form(body);
-    let token = params.get("token").cloned().unwrap_or_default();
-    let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
 
-    // Fetch the existing row to preserve online/last_seen_at.
-    let existing = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_tun(&db, &name).unwrap_or(None)
+    let params = parse_form(body);
+
+    // Fetch existing tun to preserve system-managed fields.
+    let db = app.db.lock().await;
+    let existing = pangolin_core::db::get_tun(&db, &name).unwrap_or_default();
+    drop(db);
+
+    let Some(mut tun) = existing else {
+        return render_edit_page_with_error(&name, "Tunnel not found", csrf);
     };
-    let Some(mut existing) = existing else {
-        return Ok(crate::not_found());
-    };
-    existing.token = if token.is_empty() { None } else { Some(token) };
-    existing.enabled = enabled;
-    let updated = existing;
+
+    // Token: use provided value or keep existing.
+    if let Some(new_token) = params.get("token").cloned().filter(|t| !t.is_empty()) {
+        tun.token = Some(new_token);
+    }
+
+    // expires_at: use provided value or keep existing (empty string clears it).
+    if let Some(raw) = params.get("expires_at").cloned() {
+        if raw.is_empty() {
+            tun.expires_at = None;
+        } else {
+            tun.expires_at = parse_datetime(Some(raw.as_str()));
+        }
+    }
+
+    tun.enabled = params
+        .get("enabled")
+        .map(|v| v == "1")
+        .unwrap_or(tun.enabled);
 
     let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_tun(&db, &updated);
+    let result = pangolin_core::db::upsert_tun(&db, &tun);
     drop(db);
 
     match result {
@@ -172,30 +209,30 @@ pub async fn handle_update(
     }
 }
 
-/// POST /tun/{name}/delete — delete the named tun row.
+/// POST /tun/delete — delete a tunnel.
 pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
     _csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    let Some(n) = name else {
-        return Ok(crate::not_found());
-    };
-    if !n.is_empty() {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_tun(&db, &n);
-        drop(db);
-        app.reload_indexes().await;
+    if let Some(n) = name {
+        if !n.is_empty() {
+            let db = app.db.lock().await;
+            let _ = pangolin_core::db::delete_tun(&db, &n);
+            drop(db);
+        }
     }
     Ok(redirect_response("/tun"))
 }
 
 fn render_create_page_with_error(
+    tun: Option<pangolin_core::types::Tun>,
     error: &str,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
     let html = TunFormTemplate {
-        tun: None,
+        tun,
+        action: "create",
         error: Some(error),
         active_nav: "tun",
     }
@@ -209,11 +246,7 @@ fn render_edit_page_with_error(
     error: &str,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    // Re-render the edit page with a stub. The token field is never
-    // echoed back to the browser; if the user wants to change it they
-    // re-submit. Online / last_seen are shown read-only on the next
-    // successful GET.
-    let stub = Tun {
+    let stub = pangolin_core::types::Tun {
         name: name.to_string(),
         token: None,
         enabled: true,
@@ -224,6 +257,7 @@ fn render_edit_page_with_error(
     };
     let html = TunFormTemplate {
         tun: Some(stub),
+        action: "update",
         error: Some(error),
         active_nav: "tun",
     }
@@ -243,4 +277,29 @@ fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {
         }
     }
     params
+}
+
+/// Generate a random 32-byte hex token (64 hex characters).
+fn generate_token() -> Result<String, String> {
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill(&mut buf);
+    Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Parse a `datetime-local` input value (YYYY-MM-DDTHH:MM) into an Option<DateTime<Utc>>.
+fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s?;
+    // datetime-local format: "2025-12-31T23:59"
+    let (date_part, time_part) = s.split_once('T')?;
+    let naive = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(
+            time_part.split(':').next()?.parse().ok()?,
+            time_part.split(':').nth(1)?.parse().ok()?,
+            0,
+        )?;
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        naive,
+        chrono::Utc,
+    ))
 }

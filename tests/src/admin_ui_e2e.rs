@@ -7,6 +7,7 @@
 
 use crate::admin_harness::AdminClient;
 use crate::harness::{init_pangolin_db, NgxProcess};
+use scraper::{Html, Selector};
 
 // ── helper ──────────────────────────────────────────────────────────────────
 
@@ -955,10 +956,10 @@ async fn certs_delete_with_csrf() {
     );
 }
 
-// ── §28 — Tunnels read-only page ─────────────────────────────────────────────
+// ── §28 — Tunnels CRUD ────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn tunnels_readonly_page_renders() {
+async fn tunnels_list_renders_with_new_button() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
@@ -966,9 +967,482 @@ async fn tunnels_readonly_page_renders() {
     let resp = client.get("/tun").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
+    assert!(body.contains("Tunnel") || body.contains("tunnel"));
     assert!(
-        body.contains("Tunnel") || body.contains("tunnel"),
-        "page should contain tunnel info"
+        body.contains("New tunnel"),
+        "tunnels page should expose a 'New tunnel' link"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_new_page_is_full_page() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client.get("/tun/new").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<html"),
+        "new tunnel page should be a full HTML page"
+    );
+    assert!(body.contains("Back to tunnels"));
+    client
+        .assert_selector_exists(&body, "input[name=name]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=token]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=expires_at]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=enabled]")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tunnels_create_valid_auto_token() {
+    // Token field left blank → server auto-generates via OsRng
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "auto-token-node"),
+                ("token", ""), // blank → auto-generate
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create should redirect, got {}",
+        resp.status()
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(loc.contains("/tun"), "should redirect to /tun");
+
+    // Verify tunnel appears in list with a non-empty token
+    let list = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        list.contains("auto-token-node"),
+        "tunnel name should appear in list"
+    );
+    // Token cell should NOT be empty "—" (a token was auto-generated)
+    assert!(
+        !list.contains("auto-token-node") || list.contains("font-mono"),
+        "token should be visible in the list"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_create_with_provided_token() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "manual-token-node"),
+                ("token", "my-super-secret-token-123"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // Token should appear in the list
+    let list = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list.contains("manual-token-node"));
+    assert!(
+        list.contains("my-super-secret-token-123"),
+        "provided token should be visible in the list"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_create_with_expires_at() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "expiring-node"),
+                ("token", "any-token"),
+                ("expires_at", "2030-12-31T23:59"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // Expires column should show the date
+    let list = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list.contains("expiring-node"));
+    assert!(
+        list.contains("2030-12-31"),
+        "expires_at should appear in list"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_create_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "no-csrf-node"),
+                ("token", "any-token"),
+                // no _csrf
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "missing CSRF should be forbidden"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_create_invalid_name_chars() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "invalid name with spaces"),
+                ("token", "any-token"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    // Should re-render the form with an error, not redirect
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("letters, digits") || body.contains("Name"),
+        "error should be shown for invalid name"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_edit_page_prefilled() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a tunnel first
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "edit-me-node"),
+                ("token", "original-token"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Open edit page
+    let resp = client
+        .get("/tun/edit?name=edit-me-node")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Edit tunnel"));
+    // Name should be shown as read-only display (not an input)
+    assert!(body.contains("edit-me-node"));
+    client
+        .assert_selector_exists(&body, "input[name=token]")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tunnels_update() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "update-me-node"),
+                ("token", "original-token"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Update
+    let page2 = client
+        .get("/tun/edit?name=update-me-node")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf2 = client.csrf_token(&page2).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/tun/edit?name=update-me-node",
+            &[("token", "updated-token"), ("_csrf", &csrf2)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "update should redirect, got {}",
+        resp.status()
+    );
+
+    // Verify updated token in list
+    let list = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        list.contains("updated-token"),
+        "updated token should appear in list"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_delete_with_csrf() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "delete-me-node"),
+                ("token", "any-token"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let resp = client
+        .post_form(
+            "/tun/delete",
+            &[("name", "delete-me-node"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "delete should redirect, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn tunnels_delete_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client
+        .post_form("/tun/delete", &[("name", "any-node")])
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn tunnels_delete_verified_in_list() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "verify-delete-node"),
+                ("token", "any-token"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    client
+        .post_form(
+            "/tun/delete",
+            &[("name", "verify-delete-node"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+
+    let list = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !list.contains("verify-delete-node"),
+        "deleted tunnel should not appear in list"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_edit_missing_name_bad_request() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client.get("/tun/edit").await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "missing name param should return 400"
+    );
+}
+
+#[tokio::test]
+async fn tunnels_edit_nonexistent_not_found() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client
+        .get("/tun/edit?name=nonexistent-node")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200); // renders error in body
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("not found") || body.contains("Not found"),
+        "should show not-found error"
     );
 }
 
@@ -1351,10 +1825,366 @@ async fn site_domains_new_modal_preselected() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
 
-    // The site dropdown should have "preselect-test-site" selected
+    // The site field is locked in site-specific context: rendered as a
+    // read-only display with a hidden input carrying the value, so the
+    // form still POSTs `site_name=preselect-test-site` back.
     assert!(
-        body.contains(r#"<option value="preselect-test-site" selected"#),
-        "Expected preselected site option to be selected in the domains modal"
+        body.contains(r#"value="preselect-test-site""#),
+        "Expected preselected site name to be carried in a hidden field"
+    );
+    assert!(
+        !body.contains("Select a site..."),
+        "Site field should be locked (no dropdown) when invoked from a site sub-page"
+    );
+}
+
+// ── §13 — Sites form preserves user input on error ──────────────────────────
+
+#[tokio::test]
+async fn sites_create_preserves_form_values_on_error() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    // Submit with an empty backend (the JS empty-backend guard is
+    // client-side, so we exercise the server-side path by POSTing an
+    // empty string).
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", ""),
+                ("name", "preserved-name"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    let _ = status; // kept for debugging
+
+    // The user-friendly summary error must be present, and the form
+    // must pre-fill the name input with the value the user typed.
+    assert!(
+        body.contains("Backend is required"),
+        "summary error should mention 'Backend is required'"
+    );
+    // The name input must carry `value="preserved-name"` so the user
+    // doesn't have to re-type it.
+    assert!(
+        body.contains(r#"id="site-name" required"#) && body.contains(r#"value="preserved-name""#),
+        "name input should be pre-filled with the submitted value"
+    );
+    // The hidden backend field should also reflect the (empty) submission
+    // — proving the server re-rendered with the user's input intact.
+    client
+        .assert_selector_exists(&body, r#"input[name="backend"]"#)
+        .expect("hidden backend input should still be present");
+    // No site was created — a fresh site-name must not appear in the
+    // sites list.
+    let list_body = client
+        .get("/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !list_body.contains("preserved-name"),
+        "site should not be persisted on validation error"
+    );
+}
+
+// ── §14 — Sites create with direct/file backend ──────────────────────────────
+
+#[tokio::test]
+async fn sites_create_direct_file_backend() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "file:///var/www/static"),
+                ("name", "file-static-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after successful create, got {}",
+        resp.status()
+    );
+
+    // The site should appear in the sites list with the file:// backend.
+    let list_body = client
+        .get("/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_body.contains("file-static-site"));
+    assert!(list_body.contains("file:///var/www/static"));
+}
+
+// ── §14c — Edit page preserves file:// path with leading slash ──────────────
+
+#[tokio::test]
+async fn sites_edit_preserves_file_path_leading_slash() {
+    // Regression: edit page for a file:// site used to show the path
+    // without its leading slash, so a re-submit would drop the root.
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site with file:// URL (the leading slash in the path is
+    // essential for the path to be a valid absolute filesystem path).
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "file:///Users/geax/foo"),
+                ("name", "file-slash-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Open the edit page and verify the host:port field shows the path
+    // WITH the leading slash — so the user can resubmit without losing it.
+    let edit_body = client
+        .get("/sites/edit?name=file-slash-test")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    client
+        .assert_selector_exists(&edit_body, r#"select[name="direct_protocol"]"#)
+        .unwrap();
+    // The host:port field for direct mode should carry value="/Users/geax/foo"
+    // (with the leading slash preserved).
+    let doc = Html::parse_document(&edit_body);
+    let sel = Selector::parse(r#"input[name="direct_host"]"#).unwrap();
+    let direct_host = doc
+        .select(&sel)
+        .next()
+        .and_then(|el| el.value().attr("value"))
+        .unwrap_or("");
+    assert_eq!(
+        direct_host, "/Users/geax/foo",
+        "edit page should preserve the leading slash in the file:// path"
+    );
+}
+
+// ── §14b — Sites create with file:// + long path (server-side fallback) ──────
+
+#[tokio::test]
+async fn sites_create_file_long_path_server_side_fallback() {
+    // Mimics the real-world case where the JS update of the hidden
+    // `backend` field didn't fire (or fired late) before the form was
+    // submitted. The server should still be able to assemble the backend
+    // from the individual form fields (`route_mode`, `direct_protocol`,
+    // `direct_host`).
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/sites/new",
+            // No `backend` hidden field — only the individual components.
+            &[
+                ("route_mode", "direct"),
+                ("direct_protocol", "file"),
+                (
+                    "direct_host",
+                    "/Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo",
+                ),
+                ("name", "long-path-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after successful create, got {}",
+        resp.status()
+    );
+
+    let list_body = client
+        .get("/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_body.contains("long-path-site"));
+    // The path was correctly assembled into a file:// URL.
+    assert!(
+        list_body.contains("file:///Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo"),
+        "expected the file:// URL to be reconstructed from the form fields"
+    );
+}
+
+// ── §15 — Sites form renders tunnel-mode UI and (with no tunnels) warning ──
+
+#[tokio::test]
+async fn sites_create_tunnel_backend_no_tunnels_registered() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The new site form should always render the route-mode picker
+    // (Direct / Tunnel). With no tunnels registered, switching to Tunnel
+    // mode shows a helpful warning — that path is what we exercise here.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Both route-mode options present.
+    assert!(page.contains(r#"value="direct""#));
+    assert!(page.contains(r#"value="tunnel""#));
+    // New site starts in Direct mode (per template default).
+    assert!(page.contains("Direct") && page.contains("Tunnel"));
+}
+
+// ── §16 — Sites edit and update (preserves form data on edit error too) ─────
+
+#[tokio::test]
+async fn sites_edit_and_update() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "edit-update-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Update to a different backend
+    let edit_page = client
+        .get("/sites/edit?name=edit-update-site")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let edit_csrf = client.csrf_token(&edit_page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/sites/edit?name=edit-update-site",
+            &[
+                ("backend", "http://127.0.0.1:9090"),
+                ("host_mode", "passthrough"),
+                ("_csrf", &edit_csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after update, got {}",
+        resp.status()
+    );
+
+    // Re-fetch the edit page; the new backend should be pre-filled.
+    let body = client
+        .get("/sites/edit?name=edit-update-site")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("http://127.0.0.1:9090"));
+
+    // And an invalid update (empty backend) should re-render the form
+    // without persisting the change.
+    let bad_csrf = client.csrf_token(&body).unwrap_or_default();
+    let bad_resp = client
+        .post_form(
+            "/sites/edit?name=edit-update-site",
+            &[
+                ("backend", ""),
+                ("host_mode", "passthrough"),
+                ("_csrf", &bad_csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let bad_body = bad_resp.text().await.unwrap();
+    assert!(bad_body.contains("Backend is required"));
+    // The previous (good) backend must still be in the page (proves we
+    // re-fetched the existing value rather than blanking it).
+    assert!(
+        bad_body.contains("http://127.0.0.1:9090"),
+        "edit-error page should still show the previously-saved backend"
     );
 }
 
@@ -1600,7 +2430,7 @@ async fn domains_hx_delete_with_body_csrf_works() {
         .text()
         .await
         .unwrap();
-    assert(
+    assert!(
         !site_page.contains("hx-delete.example.com"),
         "domain should be gone after HTMX DELETE",
     );

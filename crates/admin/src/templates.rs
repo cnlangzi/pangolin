@@ -41,7 +41,17 @@ pub struct SiteFormTemplate<'a> {
     pub site: Option<Site>,
     pub action: &'a str,
     pub error: Option<&'a str>,
+    /// When set to a field name ("backend", "name"), an inline error is
+    /// rendered next to that specific field, in addition to the summary
+    /// alert at the top of the form. The summary alert is driven by
+    /// `error`; this is just the field-level highlight.
+    pub field_error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// Available tunnel names, for the hierarchical backend URL form's
+    /// "Tunnel" dropdown. Templates should never render an empty list
+    /// without a clear "no tunnels registered" hint, since the form
+    /// becomes useless otherwise.
+    pub tunnels: Vec<Tun>,
 }
 
 // ─── Domains ───────────────────────────────────────────────────────────────────
@@ -103,6 +113,7 @@ pub struct TunnelsTemplate<'a> {
 #[template(path = "tun_form.html")]
 pub struct TunFormTemplate<'a> {
     pub tun: Option<Tun>,
+    pub action: &'a str,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
 }

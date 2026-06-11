@@ -15,7 +15,9 @@
       {% for site in sites %}
       <tr id="site-{{ site.name }}" class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
         <td class="px-4 py-3"><div class="font-medium text-slate-900 dark:text-slate-100 text-sm">{{ site.name }}</div></td>
-        <td class="px-4 py-3"><code class="text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded font-mono">{{ site.backend }}</code></td>
+        <td class="px-4 py-3 max-w-[180px]">
+          <code class="block truncate text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded font-mono" title="{{ site.backend }}">{{ site.backend }}</code>
+        </td>
         <td class="px-4 py-3">
           {% if site.domain_count > 0 %}
           <a href="/site/{{ site.name }}/domains"
@@ -25,7 +27,12 @@
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/></svg>
           </a>
           {% else %}
-          <span class="text-sm text-slate-400 dark:text-slate-500">0</span>
+          <a href="/admin/site/{{ site.name }}/domains"
+             class="inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400 hover:text-accent-600 dark:hover:text-accent-400 hover:underline"
+             title="Add a domain for this site">
+            0
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+          </a>
           {% endif %}
         </td>
         <td class="px-4 py-3">
@@ -70,6 +77,12 @@
            class="text-xs text-accent-600 dark:text-accent-400 hover:text-accent-700 dark:hover:text-accent-300 font-medium">
           {{ site.domain_count }} domain{% if site.domain_count != 1 %}s{% endif %} →
         </a>
+        {% else %}
+        <a href="/admin/site/{{ site.name }}/domains"
+           class="text-xs text-slate-500 dark:text-slate-400 hover:text-accent-600 dark:hover:text-accent-400 font-medium"
+           title="Add a domain for this site">
+          + add domain
+        </a>
         {% endif %}
       </div>
         {% if site.enabled %}
@@ -78,7 +91,7 @@
         <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500">off</span>
         {% endif %}
       </div>
-      <code class="text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded font-mono">{{ site.backend }}</code>
+      <code class="block truncate max-w-full text-xs text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded font-mono" title="{{ site.backend }}">{{ site.backend }}</code>
       <div class="flex gap-1 mt-3">
         <a href="/sites/edit?name={{ site.name }}"
           class="flex-1 text-center text-sm text-accent-600 dark:text-accent-400 hover:text-accent-700 dark:hover:text-accent-300 border border-accent-200 dark:border-accent-500/30 hover:bg-accent-50 dark:hover:bg-accent-500/10 rounded-lg py-1.5 transition-colors">Edit</a>
