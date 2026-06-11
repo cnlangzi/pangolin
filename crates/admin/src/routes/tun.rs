@@ -137,6 +137,10 @@ pub async fn render_edit_page(
     let tun = pangolin_core::db::get_tun(&db, &name).unwrap_or_default();
     drop(db);
 
+    if tun.is_none() {
+        return render_edit_page_with_error(&name, "Tunnel not found", csrf);
+    }
+
     let html = TunnelFormTemplate {
         tun,
         action: "update",
