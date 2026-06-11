@@ -99,6 +99,15 @@ pub struct TunnelsTemplate<'a> {
     pub active_nav: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "tunnel_form.html")]
+pub struct TunnelFormTemplate<'a> {
+    pub tun: Option<Tun>,
+    pub action: &'a str,
+    pub error: Option<&'a str>,
+    pub active_nav: &'a str,
+}
+
 // ─── Certs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Template)]
