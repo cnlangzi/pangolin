@@ -29,3 +29,5 @@ rusqlite = { workspace = true }
 serde_json.workspace = true
 log.workspace = true
 anyhow.workspace = true
+rust-embed = { version = "8.5", features = ["debug-embed"] }
+sha2 = "0.10"

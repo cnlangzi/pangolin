@@ -7,14 +7,15 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-css     # Build admin UI CSS (Tailwind)"
+	@echo "  make build-css     # Build admin UI CSS + JS bundles (Tailwind + esbuild, backward compat)"
+	@echo "  make build-ui       # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
 	@echo "  make build-dist    # Docker build, export to build/output/"
 	@echo "  make debian        # Build base Docker image"
 	@echo ""
@@ -54,7 +55,9 @@ OUT_DIR ?= ./bin
 # binaries that the `mv` steps below can find.
 CARGO_TARGET_DIR ?= ./target
 
-build:
+# Release builds embed admin assets via rust-embed; building UI assets
+# first is required — without it the binary serves empty CSS/JS.
+build: build-ui
 	mkdir -p $(OUT_DIR)
 	# Single cargo invocation for both binaries so the shared crates
 	# (pangolin-core, admin, pingora, …) are compiled and linked
@@ -71,7 +74,9 @@ build:
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-build-ngx:
+# `build-ngx` embeds admin assets (hence the `build-ui` dep); `build-tun`
+# does not.
+build-ngx: build-ui
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
@@ -84,19 +89,54 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
-build-css:
-	@echo "Building admin UI CSS..."
-	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found. Please install Node.js"; exit 1; }
-	@# Skip rebuild when the bundled CSS is newer than every source it was built from.
-	@if [ -f assets/app.css ] && \
-	   [ assets/app.css -nt assets/tailwindcss.css ] && \
-	   [ assets/app.css -nt tailwind.config.js ] && \
-	   [ assets/app.css -nt package.json ] && \
-	   [ -z "$$(find crates/admin/templates -name '*.html' -newer assets/app.css 2>/dev/null)" ]; then \
-	    echo "  up to date, skipping"; \
-	else \
-	    npm run build; \
+# `build-css` is a backward-compat alias for `build-ui` (the old target
+# only built CSS; the new one builds CSS + JS).
+build-css: build-ui
+	@echo "  build-css is now an alias for build-ui"
+
+# Download the standalone Tailwind and esbuild CLIs to ./bin/ (gitignored)
+# and rebuild the admin CSS and JS bundles. Idempotent: skips downloads
+# if the binaries are already present. Wget/curl failures are surfaced
+# loudly (clean up partial file + exit non-zero) so a stale HTML error
+# page never sneaks into the build pipeline.
+#
+# esbuild quirk: starting with v0.25.0 the author no longer uploads
+# pre-built linux-64 binaries to the GitHub release page. The official
+# distribution channel is the `@esbuild/linux-x64` npm package, so we
+# curl the tarball and extract the binary. No `npm` CLI required.
+build-ui:
+	@mkdir -p bin
+	@if [ ! -x bin/tailwindcss ]; then \
+		echo "Downloading tailwindcss v3.4.17 (from GitHub releases)..."; \
+		if ! curl -fsSL -o bin/tailwindcss.tmp \
+			https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64; then \
+			echo "  ERROR: failed to download tailwindcss" >&2; \
+			rm -f bin/tailwindcss.tmp; \
+			exit 1; \
+		fi; \
+		mv bin/tailwindcss.tmp bin/tailwindcss; \
+		chmod +x bin/tailwindcss; \
+		echo "  tailwindcss downloaded"; \
 	fi
+	@if [ ! -x bin/esbuild ]; then \
+		echo "Downloading esbuild v0.28.0 (from npm registry)..."; \
+		if ! curl -fsSL -o bin/esbuild.tgz \
+			https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz; then \
+			echo "  ERROR: failed to download esbuild" >&2; \
+			rm -f bin/esbuild.tgz; \
+			exit 1; \
+		fi; \
+		tar -xzOf bin/esbuild.tgz package/bin/esbuild > bin/esbuild.tmp; \
+		rm -f bin/esbuild.tgz; \
+		chmod +x bin/esbuild.tmp; \
+		mv bin/esbuild.tmp bin/esbuild; \
+		echo "  esbuild downloaded"; \
+	fi
+	@echo "Building admin UI CSS..."
+	bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify
+	@echo "Building admin UI JS bundle..."
+	bin/esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js
+	@echo "  build-ui done"
 
 build-dist: debian dist
 

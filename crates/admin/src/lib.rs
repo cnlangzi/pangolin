@@ -22,6 +22,7 @@
 //! `App` type from `pangolin-core` for convenience.
 
 pub mod app;
+pub mod assets;
 pub mod routes;
 pub mod state;
 pub mod templates;
@@ -360,21 +361,13 @@ fn query_param(body: &[u8], key: &str) -> String {
     query_param_opt(body, key).unwrap_or_default()
 }
 
-/// CSS content hash for cache-busting. Computed at build time by `build.rs`
-/// from `assets/app.css` and embedded as a `?v=<hash>` query parameter.
-pub const CSS_HASH: &str = env!("APP_CSS_HASH");
-
-/// JS bundle content hash for cache-busting. Computed at build time by `build.rs`
-/// from `assets/app.js` and embedded as a `?v=<hash>` query parameter. The
-/// admin UI loads the bundle once from `base.html` via `/assets/app.js?v=__JS_HASH__`.
-pub const JS_HASH: &str = env!("APP_JS_HASH");
-
-/// Substitute the `__CSS_HASH__` and `__JS_HASH__` placeholders in rendered
-/// HTML with the build-time bundle hashes. Used to prevent browser caching of
-/// stale CSS/JS after rebuilds.
+/// Substitute the `__CSS_HASH__`, `__JS_FILE__`, and `__JS_HASH__` placeholders
+/// in rendered HTML with the runtime asset hashes and active JS filename.
+/// Used to prevent browser caching of stale CSS/JS after rebuilds.
 pub fn render_with_assets(html: String) -> String {
-    html.replace("__CSS_HASH__", CSS_HASH)
-        .replace("__JS_HASH__", JS_HASH)
+    html.replace("__CSS_HASH__", &assets::CSS_HASH)
+        .replace("__JS_FILE__", *assets::JS_FILE)
+        .replace("__JS_HASH__", &assets::JS_HASH)
 }
 
 /// Substitute the `__CSRF__` placeholder in rendered HTML with the user's
@@ -404,12 +397,12 @@ pub fn ok_html_with_csrf(body: String, csrf: &str) -> http::Result<Response<Full
     Ok(resp)
 }
 
-/// Return the embedded asset for `/assets/{name}` (CSS, JS, images).
+/// Return the embedded asset for `/assets/{name}` (CSS, JS, images, vendor files).
 ///
-/// Asset bytes are embedded at compile time by `build.rs` from
-/// `crates/admin/assets/`. The asset list is small (a single CSS bundle
-/// and a single JS bundle plus a few SVG/PNG icons). For unknown asset
-/// paths we return `None` so the caller can answer 404.
+/// Asset bytes are served from the [`assets::Asset`] rust-embed snapshot of
+/// the workspace `assets/` directory (compile-time embed in release; fs-read
+/// in debug via the `debug-embed` feature). Unknown paths return `None` so
+/// the caller can answer 404.
 fn serve_static_asset(path: &str) -> Option<Response<Full<Bytes>>> {
     // Strip leading "assets/" prefix and any query string (e.g. ?v=HASH).
     let raw = path.strip_prefix("assets/")?;
@@ -417,27 +410,21 @@ fn serve_static_asset(path: &str) -> Option<Response<Full<Bytes>>> {
     if name.is_empty() || name.contains("..") {
         return None;
     }
-    let (bytes, content_type) = match name {
-        "app.css" => (
-            include_bytes!("../../../assets/app.css").to_vec(),
-            "text/css; charset=utf-8",
-        ),
-        "app.js" => (
-            include_bytes!("../../../assets/app.js").to_vec(),
-            "application/javascript; charset=utf-8",
-        ),
-        _ => return None,
+    let file = <assets::Asset as rust_embed::RustEmbed>::get(name)?;
+    let content_type = match name.rsplit('.').next() {
+        Some("css") => assets::CSS_MIME,
+        Some("js") => assets::JS_MIME,
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
     };
-    let resp = Response::builder()
+    Response::builder()
         .status(200)
         .header("Content-Type", content_type)
-        // Long cache + immutable. The cache-busting query string
-        // (`?v=HASH`) handles content invalidation, so the browser will
-        // re-request on each release.
-        .header("Cache-Control", "public, max-age=31536000, immutable")
-        .body(Full::new(Bytes::from(bytes)))
-        .ok()?;
-    Some(resp)
+        .header("Cache-Control", assets::IMMUTABLE_CACHE)
+        .body(Full::new(Bytes::from(file.data.into_owned())))
+        .ok()
 }
 
 fn query_param_opt(body: &[u8], key: &str) -> Option<String> {

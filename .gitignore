@@ -14,6 +14,11 @@ Cargo.lock.bak
 /assets/static/*.css
 /assets/static/*.js
 
+# Standalone Tailwind + esbuild binaries and generated bundles
+/bin/
+/assets/app.css
+/assets/app.min.js
+
 # Generated certs (test or runtime)
 /certs
 *.pem
