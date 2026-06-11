@@ -91,10 +91,7 @@ impl TunnelClient {
             let session_outcome = self.connect_and_handle().await;
             match session_outcome {
                 SessionOutcome::EstablishedAndEnded(Ok(())) => {
-                    log::info!(
-                        "tun {} disconnected, will reconnect",
-                        self.config.name
-                    );
+                    log::info!("tun {} disconnected, will reconnect", self.config.name);
                     // We got past the handshake, so a session ran.
                     // Reset backoff — the next drop is a fresh event,
                     // not a continuation of an outage.
@@ -119,13 +116,12 @@ impl TunnelClient {
                 }
             }
 
-            let jitter_ms =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_millis() as u64).unwrap_or(0)
-                    % (MAX_JITTER_MS + 1);
-            sleep(Duration::from_millis(
-                backoff_secs * 1000 + jitter_ms,
-            ))
-            .await;
+            let jitter_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_millis() as u64)
+                .unwrap_or(0)
+                % (MAX_JITTER_MS + 1);
+            sleep(Duration::from_millis(backoff_secs * 1000 + jitter_ms)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
         }
     }
