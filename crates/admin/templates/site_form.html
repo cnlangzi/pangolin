@@ -74,13 +74,28 @@
           </div>
         </div>
 
-        {# Direct mode: full URL text input (current behaviour, kept for power users) #}
+        {# Direct mode: protocol selector + host:port. Mirrors tunnel mode
+           but without the tunnel prefix. Only the 3 supported schemes
+           (http / https / file) are offered. #}
         <div id="backend-direct-fields" {% if self.initial_route_mode() != "direct" %}class="hidden"{% endif %}>
-          <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">URL</label>
-          <input type="text" id="site-backend-direct"
-            value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ s.backend }}{% endif %}{% endif %}"
-            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-            placeholder="http://127.0.0.1:8080">
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">Protocol</label>
+              <select id="site-backend-direct-protocol"
+                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+                <option value="http"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "http" %} selected{% endif %}>http</option>
+                <option value="https"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "https" %} selected{% endif %}>https</option>
+                <option value="file"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "file" %} selected{% endif %}>file</option>
+              </select>
+            </div>
+            <div class="col-span-2">
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">Host:port</label>
+              <input type="text" id="site-backend-direct"
+                value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ self.initial_host_port() }}{% endif %}{% endif %}"
+                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+                placeholder="127.0.0.1:8080">
+            </div>
+          </div>
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">e.g. <code class="font-mono">http://127.0.0.1:8080</code> or <code class="font-mono">file:///var/www/static</code></p>
         </div>
 
@@ -172,6 +187,7 @@
   const directFields = document.getElementById('backend-direct-fields');
   const tunnelFields = document.getElementById('backend-tunnel-fields');
   const hidden = document.getElementById('site-backend-hidden');
+  const directProto = document.getElementById('site-backend-direct-protocol');
   const directInput = document.getElementById('site-backend-direct');
   const tunnelSelect = document.getElementById('site-backend-tunnel');
   const protocolSelect = document.getElementById('site-backend-protocol');
@@ -192,31 +208,34 @@
     updateHidden();
   };
 
+  /// Build `<scheme>://<host>` for http/https, or `file:///<path>` for file.
+  function assembleUrl(scheme, host) {
+    if (scheme === 'file') {
+      const path = host.replace(/^\/+/, '');
+      return 'file:///' + path;
+    }
+    return scheme + '://' + host;
+  }
+
   function updateHidden() {
     const mode = document.querySelector('input[name="route_mode"]:checked');
     const modeValue = mode ? mode.value : 'direct';
     let value = '';
     if (modeValue === 'direct') {
-      value = directInput.value.trim();
+      const proto = directProto ? directProto.value : 'http';
+      const host = directInput ? directInput.value.trim() : '';
+      value = assembleUrl(proto, host);
     } else {
       const tun = tunnelSelect ? tunnelSelect.value : '';
       const proto = protocolSelect ? protocolSelect.value : 'http';
       const host = hostInput ? hostInput.value.trim() : '';
-      // file:// scheme is "file:///" + path with no host — handle the
-      // "file" protocol case so the preview matches what the server
-      // will receive.
-      if (proto === 'file') {
-        // Strip leading slashes from host to keep the format `file:///path`.
-        const path = host.replace(/^\/+/, '');
-        value = tun + ':file:///' + path;
-      } else {
-        value = tun + ':' + proto + '://' + host;
-      }
+      value = tun + ':' + assembleUrl(proto, host);
       if (preview) preview.textContent = value || '(empty)';
     }
     hidden.value = value;
   }
 
+  if (directProto) directProto.addEventListener('change', updateHidden);
   if (directInput) directInput.addEventListener('input', updateHidden);
   if (tunnelSelect) tunnelSelect.addEventListener('change', updateHidden);
   if (protocolSelect) protocolSelect.addEventListener('change', updateHidden);
