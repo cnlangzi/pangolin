@@ -140,10 +140,11 @@ async fn tunnel_ws_relay_start() {
     let mock_ngx = TestWsServer::start().await;
 
     // Start tun client — it connects to mock ngx and registers
-    let tun_config = tun::Config {
+    let tun_config = tun::TunConfig {
         server: mock_ngx.addr().to_string(),
         token: "test".to_string(),
         name: "testnode".to_string(),
+        ..Default::default()
     };
     let tun_client = tun::TunnelClient::new(tun_config);
 

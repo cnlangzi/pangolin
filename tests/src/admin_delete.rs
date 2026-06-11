@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Domain, HostMode, Site, Token, Tun};
+use pangolin_core::types::{Domain, HostMode, Site, Tun};
 
 fn temp_conn() -> (TempDir, Connection) {
     let dir = TempDir::new().unwrap();
@@ -89,10 +89,12 @@ fn admin_delete_tun() {
 
     let tun = Tun {
         name: "del-tun".into(),
+        token: None,
         enabled: true,
         online: false,
         registered_at: None,
         last_seen_at: None,
+        expires_at: None,
     };
     db::upsert_tun(&conn, &tun).unwrap();
 
@@ -105,24 +107,6 @@ fn admin_delete_tun() {
     assert!(tuns.is_empty(), "tun should be deleted");
 }
 
-/// admin_delete_token — delete_token removes token from DB
-#[test]
-fn admin_delete_token() {
-    let (_dir, conn) = temp_conn();
-
-    let token = Token {
-        token: "del-token-xyz".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    };
-    db::upsert_token(&conn, &token).unwrap();
-
-    let tokens = db::list_tokens(&conn).unwrap();
-    assert_eq!(tokens.len(), 1);
-
-    db::delete_token(&conn, "del-token-xyz").unwrap();
-
-    let tokens = db::list_tokens(&conn).unwrap();
-    assert!(tokens.is_empty(), "token should be deleted");
-}
+// `admin_delete_token` removed in v2: the `tokens` table was
+// dropped when the credential was merged onto the `tun` row.
+// Tun deletion is covered by `admin_delete_tun` above.

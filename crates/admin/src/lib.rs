@@ -149,21 +149,6 @@ pub async fn handle(
             .await?
         }
         "tun" => routes::tun::render(&app, &csrf_token).await?,
-        "tokens" if method == "GET" => routes::tokens::render(&app, &csrf_token).await?,
-        "tokens/new" if method == "GET" => {
-            routes::tokens::render_create_page(&app, &csrf_token).await?
-        }
-        "tokens/new" if method == "POST" => {
-            routes::tokens::handle_create(&app, &merged_params, &csrf_token).await?
-        }
-        "tokens/delete" if method == "POST" => {
-            routes::tokens::handle_delete(
-                &app,
-                query_param_opt(&merged_params, "token"),
-                &csrf_token,
-            )
-            .await?
-        }
         "certs" if method == "GET" => routes::certs::render(&app, &csrf_token).await?,
         "certs/new" if method == "GET" => routes::certs::render_create_page(&csrf_token).await?,
         "certs/new" if method == "POST" => {

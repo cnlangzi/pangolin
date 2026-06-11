@@ -1,0 +1,100 @@
+# pangolin-ngx config (auto-loaded because the binary's --config
+# default is `ngx.yml`).
+#
+# The top level of this file IS the proxy config — there is no
+# `proxy:` wrapper. The `[tunnel]` sub-section is the WebSocket
+# endpoint that tun clients connect into. Other features (admin UI,
+# response cache, ACME certs, logging) each have their own sub-section.
+#
+# Every field is optional — all sections have `#[serde(default)]` in
+# crates/pangolin-core/src/config.rs. This file lists every field
+# explicitly so that:
+#   (a) schema drift is impossible (the file mirrors Config 1:1)
+#   (b) new contributors see all knobs without reading the Rust source
+#
+# Environment-variable override: any NGX_<KEY> env var wins over the
+# matching YAML path, with `__` as the nested-key separator. Examples:
+#   NGX_ADDR__HTTP=":8080"      # overrides `addr.http`
+#   NGX_ADDR__HTTPS=":0"        # disable TLS
+#   NGX_ADMIN__PASSWORD=secret  # override admin password
+#   NGX_LOG__LEVEL=warn         # override log level
+#   NGX_ACME__CERT_DIR=/etc/certs
+# The loader is figment-based, so env override is value-level — the
+# YAML text is never re-scanned for `$VAR` placeholders.
+#
+# Dev ports are non-privileged (9080/9443) so `make start-ngx` works
+# without sudo. Production defaults are 0.0.0.0:80 / 0.0.0.0:443
+# (privileged) — see docs/configuration.md for the per-field
+# documentation.
+#
+# ── TLS setup for local dev ──────────────────────────────────────────────
+# In v2 there is no `default` blob fallback — each host you serve TLS
+# for needs its own blob at `./certs/{host}` (or `./certs/{host}+rsa`).
+# Easiest dev setup: use SNI to a single cert for everything. Generate
+# one for `localhost` with:
+#
+#   mkdir -p ./certs
+#   openssl req -x509 -newkey rsa:2048 -nodes \
+#     -keyout ./certs/localhost \
+#     -out ./certs/localhost \
+#     -days 365 -subj "/CN=localhost"
+#   (Note: the cert is a *combined* key+cert blob, not a dir.)
+#
+# For HTTP-only dev, set `addr.https` to ":0" below.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Proxy listen (top level: this file IS the proxy config) ──────────────
+# Full host:port strings. The Rust defaults are 0.0.0.0:80 +
+# 0.0.0.0:443 (single-host public deploy); dev overrides to the
+# unprivileged 9080/9443 pair so `make start-ngx` runs without sudo.
+addr:
+  http: 0.0.0.0:80    # HTTP listen addr
+  https: 0.0.0.0:443   # HTTPS listen addr; ":0" = disable TLS entirely
+host: null              # virtual host for per-domain cert resolution
+                        # (null = "default" → ./certs/default/...)
+                        # UNRELATED to [addr] — `host` is the SNI fallback,
+                        # not a bind address.
+workers: null           # pingora worker count; null = auto (CPU count)
+
+# ── WebSocket endpoint for tun clients ───────────────────────────────────
+tunnel:
+  addr: 0.0.0.0:9001    # listen addr (full host:port). Default
+                        # `0.0.0.0:9001` accepts tun clients on any
+                        # interface (the normal multi-host deploy).
+                        # Override to `127.0.0.1:9001` if you want
+                        # to force tun-on-this-host-only semantics.
+  ws_path: /tunnel      # WebSocket path
+
+admin:
+  addr: 0.0.0.0:9081    # admin UI/API bind addr. Default `0.0.0.0:9081`
+                        # accepts remote admin (e.g. via SSH port
+                        # forward). Set the password directly in
+                        # this file; restrict access via ufw/iptables
+                        # if exposing to a non-trusted network.
+  username: admin
+  password: admin
+
+cache:
+  enabled: false        # response cache (pingora proxy_cache)
+  dir: ./cache          # cache storage dir
+
+acme:
+  email: ""               # ACME registration email
+  cert_dir: ./certs       # where CertManager looks for host blobs
+                          # (autocert DirCache native layout: {host} or {host}+rsa)
+                          # v2 has NO `default` blob fallback — each host
+                          # must have its own cert on disk.
+  acme_directory: https://acme-v02.api.letsencrypt.org/directory
+  renew_threshold_days: 30
+  renew_check_interval_hours: 6
+  renew_max_retries: 3
+  key_type: ecdsa         # ecdsa | rsa (default: ecdsa)
+  # NOTE: in v2 there is no global `autorenew` toggle. Auto-issuance is
+  # controlled per-domain via `domains.auto_issue` in the database, and
+  # the DNS provider used for DNS-01 challenges is set per-domain via
+  # `domains.dns_provider` (referencing a row in the `dns_providers`
+  # table). See the v2 design doc for details.
+
+log:
+  level: debug          # env_logger filter: trace|debug|info|warn|error
+  file: ""              # log file path; "" = stderr only
