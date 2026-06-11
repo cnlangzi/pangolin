@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if let Some(_) = site %}Edit site{% else %}New site{% endif %} — Pangolin{% endblock %}
+{% block title %}{% if action == "update" %}Edit site{% else %}New site{% endif %} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
@@ -10,73 +10,235 @@
       Back to sites
     </a>
     <h1 class="mt-2 text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">
-      {% if let Some(_) = site %}Edit site{% else %}New site{% endif %}
+      {% if action == "update" %}Edit site{% else %}New site{% endif %}
     </h1>
     <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
       Configure the upstream backend for this site
     </p>
   </div>
 
-  <form method="POST" action="{% if let Some(s) = site %}/sites/edit?name={{ s.name }}{% else %}/sites/new{% endif %}" class="card p-6 space-y-4">
+  <form method="POST" action="{% if action == "update" %}/sites/edit?name={% if let Some(s) = site %}{{ s.name }}{% endif %}{% else %}/sites/new{% endif %}" class="card p-6 space-y-5" data-backend-form>
     <input type="hidden" name="_csrf" value="__CSRF__">
+    {# The actual backend string sent to the server. JS keeps this in sync
+       with the hierarchical form below — the server-side parser is the
+       same one the simple text input used, so output format is unchanged. #}
+    <input type="hidden" name="backend" id="site-backend-hidden"
+      value="{% if let Some(s) = site %}{{ s.backend }}{% endif %}">
 
-    {% if let Some(s) = site %}
+    {# Summary error alert at the top of the form. Field-level errors are
+       also rendered inline next to the offending field. The summary stays
+       for context, with clear spacing from the rest of the form. #}
+    {% if let Some(e) = error %}
+    <div id="form-error-summary" role="alert" class="flex items-start gap-3 p-3.5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-500/30 rounded-lg">
+      <svg class="w-5 h-5 flex-shrink-0 text-red-500 dark:text-red-400 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+      </svg>
+      <div class="flex-1 min-w-0">
+        <p class="text-sm font-medium text-red-800 dark:text-red-200">{{ e }}</p>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if action == "update" %}
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">Name</label>
-      <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-600 dark:text-slate-300 font-mono">{{ s.name }}</div>
+      <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-600 dark:text-slate-300 font-mono">{% if let Some(s) = site %}{{ s.name }}{% endif %}</div>
     </div>
     {% else %}
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-name">Name</label>
       <input type="text" name="name" id="site-name" required
-        class="input"
+        value="{% if let Some(s) = site %}{{ s.name }}{% endif %}"
+        class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+          {% if self.name_has_error() %}
+          border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+          {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+          {% endif %}"
         placeholder="my-site">
+      {% if let Some(e) = error %}
+        {% if self.name_has_error() %}
+        <p class="text-xs text-red-600 dark:text-red-400 mt-1 flex items-center gap-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+          {{ e }}
+        </p>
+        {% else %}
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+        {% endif %}
+      {% else %}
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+      {% endif %}
     </div>
     {% endif %}
 
+    {# ─── Hierarchical Backend URL ────────────────────────────────────────────
+       Step 1: pick routing mode (Direct or Tunnel)
+       Step 2: if Tunnel, pick protocol
+       Step 3: backend host:port
+       JS assembles the final URL into #site-backend-hidden before submit. #}
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-backend">Backend URL</label>
-      <input type="text" name="backend" id="site-backend" required
-        value="{% if let Some(s) = site %}{{ s.backend }}{% endif %}"
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        placeholder="http://127.0.0.1:8080">
-      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">http://... or tun_name:http://...</p>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">Backend URL</label>
+
+      <div class="space-y-3">
+        {# Step 1: Route via #}
+        <div>
+          <span class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5">Route via</span>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
+              <input type="radio" name="route_mode" value="direct" class="mt-0.5 text-accent-600 focus:ring-accent-500"
+                {% if self.initial_route_mode() == "direct" %}checked{% endif %}>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Direct</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Connect straight to the URL — no tunnel</div>
+              </div>
+            </label>
+            <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
+              <input type="radio" name="route_mode" value="tunnel" class="mt-0.5 text-accent-600 focus:ring-accent-500"
+                {% if self.initial_route_mode() == "tunnel" %}checked{% endif %}>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Tunnel</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Forward through a registered tunnel node</div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        {# Direct mode: protocol selector + host:port. Mirrors tunnel mode
+           but without the tunnel prefix. Only the 3 supported schemes
+           (http / https / file) are offered. #}
+        <div id="backend-direct-fields" {% if self.initial_route_mode() != "direct" %}class="hidden"{% endif %}>
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">Protocol</label>
+              <select id="site-backend-direct-protocol" name="direct_protocol"
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
+                <option value="http"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "http" %} selected{% endif %}>http</option>
+                <option value="https"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "https" %} selected{% endif %}>https</option>
+                <option value="file"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "file" %} selected{% endif %}>file</option>
+              </select>
+            </div>
+            <div class="col-span-2">
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">Host:port</label>
+              <input type="text" id="site-backend-direct" name="direct_host"
+                value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ self.initial_host_port() }}{% endif %}{% endif %}"
+                class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}"
+                placeholder="127.0.0.1:8080">
+            </div>
+          </div>
+          {% if self.backend_has_error() %}
+            {% if let Some(e) = error %}
+            <p id="backend-inline-error" class="text-xs text-red-600 dark:text-red-400 mt-1.5 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+              {{ e }}
+            </p>
+            {% endif %}
+          {% else %}
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">e.g. <code class="font-mono">http://127.0.0.1:8080</code> or <code class="font-mono">file:///var/www/static</code></p>
+          {% endif %}
+        </div>
+
+        {# Tunnel mode: tunnel dropdown + protocol + host:port #}
+        <div id="backend-tunnel-fields" {% if self.initial_route_mode() != "tunnel" %}class="hidden"{% endif %}>
+          {% if tunnels.is_empty() %}
+          <div class="mb-2 px-3 py-2 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
+            No tunnel nodes registered yet. <a href="/tun" class="underline">Register a tunnel</a> first.
+          </div>
+          {% endif %}
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
+              <select id="site-backend-tunnel" name="tun_name"
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
+                {% if tunnels.is_empty() %}
+                <option value="" disabled selected>— no tunnels registered —</option>
+                {% else %}
+                {% for t in tunnels %}
+                <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} (online){% else %} (offline){% endif %}</option>
+                {% endfor %}
+                {% endif %}
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-protocol">Protocol</label>
+              <select id="site-backend-protocol" name="tunnel_protocol"
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
+                <option value="http"{% if self.initial_scheme() == "http" %} selected{% endif %}>http</option>
+                <option value="https"{% if self.initial_scheme() == "https" %} selected{% endif %}>https</option>
+                <option value="file"{% if self.initial_scheme() == "file" %} selected{% endif %}>file</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-host">Host:port</label>
+              <input type="text" id="site-backend-host" name="tunnel_host"
+                value="{{ self.initial_host_port() }}"
+                class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}"
+                placeholder="127.0.0.1:8080">
+            </div>
+          </div>
+          {% if self.backend_has_error() %}
+            {% if let Some(e) = error %}
+            <p class="text-xs text-red-600 dark:text-red-400 mt-1.5 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+              {{ e }}
+            </p>
+            {% else %}
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+            {% endif %}
+          {% else %}
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+          {% endif %}
+        </div>
+      </div>
     </div>
 
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
       <select name="host_mode" id="host-mode"
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        onchange="document.getElementById('host-custom-wrapper').classList.toggle('hidden', this.value !== 'custom')">
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
         <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
         <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
       </select>
     </div>
 
-    <div id="host-custom-wrapper" class="{% if let Some(s) = site %}{% if !s.is_host_mode_custom() %}hidden{% endif %}{% else %}hidden{% endif %}">
+    <div id="host-custom-wrapper" {% if !self.show_host_custom() %}class="hidden"{% endif %}>
       <div>
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
         <input type="text" name="host_custom" id="host-custom"
-          value="{% if let Some(s) = site %}{% if let Some(hc) = s.host_custom %}{{ hc }}{% endif %}{% endif %}"
+          value="{{ self.host_custom_value() }}"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
           placeholder="e.g. internal.example.com">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
     </div>
 
-    {% if let Some(e) = error %}
-    <div class="alert-error text-sm">
-      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
-      </svg>
-      <span>{{ e }}</span>
-    </div>
-    {% endif %}
-
-    <div class="flex gap-2 pt-2">
-      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if let Some(_) = site %}Update{% else %}Create{% endif %}</button>
+    <div class="flex gap-2 pt-1">
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if action == "update" %}Update{% else %}Create{% endif %}</button>
       <a href="/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
     </div>
   </form>

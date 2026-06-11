@@ -54,6 +54,65 @@ pub struct SiteFormTemplate<'a> {
     pub tunnels: Vec<Tun>,
 }
 
+impl<'a> SiteFormTemplate<'a> {
+    pub fn initial_route_mode(&self) -> &'static str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_route_mode())
+            .unwrap_or("direct")
+    }
+
+    pub fn initial_tun_name(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_tun_name())
+            .unwrap_or("")
+    }
+
+    pub fn initial_scheme(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| {
+                let scheme = s.backend_scheme();
+                if scheme.is_empty() {
+                    "http"
+                } else {
+                    scheme
+                }
+            })
+            .unwrap_or("http")
+    }
+
+    pub fn initial_host_port(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_host_port())
+            .unwrap_or("")
+    }
+
+    pub fn backend_has_error(&self) -> bool {
+        self.field_error == Some("backend")
+    }
+
+    pub fn name_has_error(&self) -> bool {
+        self.field_error == Some("name")
+    }
+
+    pub fn show_host_custom(&self) -> bool {
+        self.site
+            .as_ref()
+            .map(|s| s.is_host_mode_custom())
+            .unwrap_or(false)
+    }
+
+    pub fn host_custom_value(&self) -> &str {
+        self.site
+            .as_ref()
+            .and_then(|s| s.host_custom.as_deref())
+            .unwrap_or("")
+    }
+}
+
 // ─── Domains ───────────────────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -82,6 +141,8 @@ pub struct DomainFormTemplate<'a> {
     /// Defaults to `false` for the "new" form, mirroring the v2 design rule
     /// that operators must explicitly opt in to auto-issuance.
     pub auto_issue_checked: bool,
+    pub edit_domain: Option<String>,
+    pub current_auto_issue: bool,
 }
 
 impl<'a> DomainFormTemplate<'a> {
@@ -89,6 +150,55 @@ impl<'a> DomainFormTemplate<'a> {
     /// This is a helper to avoid Option<String> == String comparisons in templates.
     pub fn is_site_preselected(&self, site_name: &str) -> bool {
         self.preselected_site_name.as_deref() == Some(site_name)
+    }
+
+    pub fn form_action(&self) -> String {
+        if let Some(domain) = &self.edit_domain {
+            return format!("/api/domains/{}/edit", domain);
+        }
+        if self.preselected_site_name.is_some() {
+            return "/api/domains".to_string();
+        }
+        "/domains/new".to_string()
+    }
+
+    pub fn submit_label(&self) -> &'static str {
+        "Save"
+    }
+
+    pub fn form_title(&self) -> &'static str {
+        if self.edit_domain.is_some() {
+            "Edit domain"
+        } else {
+            "New domain"
+        }
+    }
+
+    pub fn lock_site(&self) -> bool {
+        self.edit_domain.is_some() || self.preselected_site_name.is_some()
+    }
+
+    pub fn lock_domain(&self) -> bool {
+        self.edit_domain.is_some()
+    }
+
+    pub fn is_dns_provider_selected(&self, name: &str) -> bool {
+        self.dns_provider_value == name
+    }
+
+    pub fn edit_domain_value(&self) -> &str {
+        self.edit_domain.as_deref().unwrap_or("")
+    }
+
+    pub fn preselected_site_name_value(&self) -> &str {
+        self.preselected_site_name.as_deref().unwrap_or("")
+    }
+
+    pub fn next_redirect(&self) -> String {
+        if let Some(site) = &self.preselected_site_name {
+            return format!("/site/{}/domains", site);
+        }
+        "/domains".to_string()
     }
 }
 
@@ -98,6 +208,7 @@ pub struct SiteDomainsTemplate {
     pub site: Site,
     pub domains: Vec<Domain>,
     pub sites: Vec<Site>,
+    pub active_nav: &'static str,
 }
 
 // ─── Tunnels ────────────────────────────────────────────────────────────────────

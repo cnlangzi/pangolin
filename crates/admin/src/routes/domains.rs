@@ -50,6 +50,8 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         preselected_site_name: None,
         dns_provider_value: String::new(),
         auto_issue_checked: false,
+        edit_domain: None,
+        current_auto_issue: false,
     }
     .render()
     .unwrap();
@@ -90,6 +92,7 @@ pub async fn render_for_site(
             site,
             domains,
             sites,
+            active_nav: "domains",
         }
         .render()
         .unwrap(),
@@ -178,6 +181,8 @@ pub async fn api_render_form_new(
         preselected_site_name: Some(site_name.to_string()),
         dns_provider_value: String::new(),
         auto_issue_checked: false,
+        edit_domain: None,
+        current_auto_issue: false,
     }
     .render()
     .unwrap();
@@ -293,6 +298,8 @@ async fn render_create_page_with_error(
         preselected_site_name: preselected_site.map(String::from),
         dns_provider_value: String::new(),
         auto_issue_checked: false,
+        edit_domain: None,
+        current_auto_issue: false,
     }
     .render()
     .unwrap();

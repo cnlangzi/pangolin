@@ -92,6 +92,24 @@ pub async fn handle_create(
         }
     };
 
+    {
+        let db = app.db.lock().await;
+        if pangolin_core::db::get_tun(&db, &name)
+            .unwrap_or_default()
+            .is_some()
+        {
+            drop(db);
+            return render_create_page_with_error(
+                None,
+                &format!(
+                    "Tunnel '{}' already exists; use the edit page to update it",
+                    name
+                ),
+                csrf,
+            );
+        }
+    }
+
     let enabled = params.get("enabled").map(|v| v == "1").unwrap_or(true);
     let expires_at = parse_datetime(params.get("expires_at").cloned().as_deref());
 

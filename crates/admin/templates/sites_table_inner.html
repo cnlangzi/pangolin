@@ -27,7 +27,7 @@
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/></svg>
           </a>
           {% else %}
-          <a href="/admin/site/{{ site.name }}/domains"
+          <a href="/site/{{ site.name }}/domains"
              class="inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400 hover:text-accent-600 dark:hover:text-accent-400 hover:underline"
              title="Add a domain for this site">
             0
@@ -78,7 +78,7 @@
           {{ site.domain_count }} domain{% if site.domain_count != 1 %}s{% endif %} →
         </a>
         {% else %}
-        <a href="/admin/site/{{ site.name }}/domains"
+        <a href="/site/{{ site.name }}/domains"
            class="text-xs text-slate-500 dark:text-slate-400 hover:text-accent-600 dark:hover:text-accent-400 font-medium"
            title="Add a domain for this site">
           + add domain
