@@ -152,10 +152,10 @@
         {# Tunnel mode: tunnel dropdown + protocol + host:port #}
         <div id="backend-tunnel-fields" {% if self.initial_route_mode() != "tunnel" %}class="hidden"{% endif %}>
           {% if tunnels.is_empty() %}
-          <div class="px-3 py-2.5 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
-            No tunnel nodes are registered yet. Switch to <strong>Direct</strong>, or register a tunnel under <a href="/admin/tun" class="underline">Tunnels</a> first.
+          <div class="mb-2 px-3 py-2 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
+            No tunnel nodes registered yet. <a href="/admin/tun" class="underline">Register a tunnel</a> first.
           </div>
-          {% else %}
+          {% endif %}
           <div class="grid grid-cols-3 gap-2">
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
@@ -166,9 +166,13 @@
                   {% else %}
   border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
                   {% endif %}">
+                {% if tunnels.is_empty() %}
+                <option value="" disabled selected>— no tunnels registered —</option>
+                {% else %}
                 {% for t in tunnels %}
                 <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} (online){% else %} (offline){% endif %}</option>
                 {% endfor %}
+                {% endif %}
               </select>
             </div>
             <div>
@@ -210,7 +214,6 @@
           {% else %}
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
           {% endif %}
-          {% endif %}
         </div>
       </div>
     </div>
@@ -219,15 +222,14 @@
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
       <select name="host_mode" id="host-mode"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        hx-get="/admin/sites/host-custom-field" hx-target="#host-custom-wrapper" hx-swap="innerHTML">
+        onchange="toggleHostCustom()">
         <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
         <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
         <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
       </select>
     </div>
 
-    <div id="host-custom-wrapper">
-      {% if self.show_host_custom() %}
+    <div id="host-custom-wrapper" {% if !self.show_host_custom() %}class="hidden"{% endif %}>
       <div>
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
         <input type="text" name="host_custom" id="host-custom"
@@ -236,7 +238,6 @@
           placeholder="e.g. internal.example.com">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
-      {% endif %}
     </div>
 
     <div class="flex gap-2 pt-1">
@@ -264,8 +265,18 @@
   const hostInput = document.getElementById('site-backend-host');
   const preview = document.getElementById('backend-preview');
 
-  // htmx may not load on the simple-edit page; expose a global so the
-  // `hx-on:change="toggleBackendMode()"` calls work either way.
+  // Toggle host_custom input visibility based on host_mode selection.
+  window.toggleHostCustom = function() {
+    const mode = document.getElementById('host-mode');
+    const wrapper = document.getElementById('host-custom-wrapper');
+    if (!mode || !wrapper) return;
+    if (mode.value === 'custom') {
+      wrapper.classList.remove('hidden');
+    } else {
+      wrapper.classList.add('hidden');
+    }
+  };
+
   window.toggleBackendMode = function() {
     const mode = document.querySelector('input[name="route_mode"]:checked').value;
     if (mode === 'direct') {
