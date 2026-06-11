@@ -270,8 +270,7 @@ pub async fn handle(
                             // the DNS line), not just the toggle badge.
                             let view = query_param_opt(&merged_params, "view")
                                 .unwrap_or_else(|| "row".to_string());
-                            routes::domains::handle_toggle(&app, domain, &view, &csrf_token)
-                                .await?
+                            routes::domains::handle_toggle(&app, domain, &view, &csrf_token).await?
                         }
                         _ => not_found(),
                     }

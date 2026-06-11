@@ -149,14 +149,10 @@ impl<'a> DomainFormTemplate<'a> {
         "/admin/domains/new".to_string()
     }
 
-    /// Submit-button label: "Save" in edit mode, "Save" otherwise. Kept as
-    /// a method for symmetry with future variants (e.g. "Create and add another").
+    /// Submit-button label. Always "Save"; left as a method so future
+    /// variants (e.g. "Create and add another") can vary by mode.
     pub fn submit_label(&self) -> &'static str {
-        if self.edit_domain.is_some() {
-            "Save"
-        } else {
-            "Save"
-        }
+        "Save"
     }
 
     /// Form title: "Edit domain" or "New domain".

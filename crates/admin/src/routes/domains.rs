@@ -335,10 +335,7 @@ pub async fn api_render_form_edit(
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    let existing = pangolin_core::db::list_domains(&db)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|d| d.domain == domain);
+    let existing = pangolin_core::db::get_domain(&db, domain).unwrap_or(None);
     drop(db);
 
     let Some(existing) = existing else {
@@ -395,10 +392,7 @@ pub async fn handle_update(
     // created_at) and to read the current `enabled` flag.
     let existing = {
         let db = app.db.lock().await;
-        pangolin_core::db::list_domains(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|d| d.domain == domain)
+        pangolin_core::db::get_domain(&db, domain).unwrap_or(None)
     };
     let Some(existing) = existing else {
         let mut resp = Response::new(Full::new(Bytes::from(
@@ -472,10 +466,7 @@ async fn render_edit_page_with_error(
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    let existing = pangolin_core::db::list_domains(&db)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|d| d.domain == domain);
+    let existing = pangolin_core::db::get_domain(&db, domain).unwrap_or(None);
     drop(db);
 
     let (preselected_site, preselected_site_name, dns_provider_value, auto_issue_checked) =
@@ -523,10 +514,7 @@ pub async fn handle_toggle(
 ) -> http::Result<Response<Full<Bytes>>> {
     let (new_state, site_name, dns_provider) = {
         let db = app.db.lock().await;
-        let current = pangolin_core::db::list_domains(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|d| d.domain == domain);
+        let current = pangolin_core::db::get_domain(&db, domain).unwrap_or(None);
         let Some(current) = current else {
             let mut resp = Response::new(Full::new(Bytes::from(
                 "<tr><td colspan='3' class='text-red-500 text-sm p-3'>Domain not found.</td></tr>",
@@ -535,7 +523,8 @@ pub async fn handle_toggle(
             return Ok(resp);
         };
         let new_state = !current.enabled;
-        let updated = pangolin_core::db::set_domain_enabled(&db, domain, new_state).unwrap_or(false);
+        let updated =
+            pangolin_core::db::set_domain_enabled(&db, domain, new_state).unwrap_or(false);
         if !updated {
             let mut resp = Response::new(Full::new(Bytes::from(
                 "<tr><td colspan='3' class='text-red-500 text-sm p-3'>Toggle failed.</td></tr>",
@@ -543,7 +532,11 @@ pub async fn handle_toggle(
             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             return Ok(resp);
         }
-        (new_state, current.site_name.clone(), current.dns_provider.clone())
+        (
+            new_state,
+            current.site_name.clone(),
+            current.dns_provider.clone(),
+        )
     };
     // Reload indexes so the routing layer picks up the new enabled state.
     app.reload_indexes().await;
@@ -561,6 +554,7 @@ pub async fn handle_toggle(
 /// Render a single domain row for htmx swap. Used by handle_toggle to
 /// return the new HTML fragment for the row.
 fn render_domain_row(domain: &str, enabled: bool, site_name: &str) -> String {
+    let (badge_bg, badge_dark, strike, badge_label) = badge_classes(enabled);
     format!(
         r##"<tr id="domain-{domain}" class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
   <td class="px-4 py-3">
@@ -601,11 +595,31 @@ fn render_domain_row(domain: &str, enabled: bool, site_name: &str) -> String {
 </tr>"##,
         domain = domain,
         site_name = site_name,
-        badge_bg = if enabled { "bg-green-100 text-green-700" } else { "bg-slate-100 text-slate-400" },
-        badge_dark = if enabled { "dark:bg-green-900/30 dark:text-green-300" } else { "dark:bg-slate-700 dark:text-slate-500" },
-        strike = if enabled { "" } else { "line-through" },
-        badge_label = if enabled { "enabled" } else { "disabled" },
+        badge_bg = badge_bg,
+        badge_dark = badge_dark,
+        strike = strike,
+        badge_label = badge_label,
     )
+}
+
+/// Returns (light-mode classes, dark-mode classes, line-through modifier,
+/// label) for the domain enabled/disabled badge.
+fn badge_classes(enabled: bool) -> (&'static str, &'static str, &'static str, &'static str) {
+    if enabled {
+        (
+            "bg-green-100 text-green-700",
+            "dark:bg-green-900/30 dark:text-green-300",
+            "",
+            "enabled",
+        )
+    } else {
+        (
+            "bg-slate-100 text-slate-400",
+            "dark:bg-slate-700 dark:text-slate-500",
+            "line-through",
+            "disabled",
+        )
+    }
 }
 
 /// Render the mobile card for a single domain (the whole `<div class="p-4">`
@@ -613,10 +627,11 @@ fn render_domain_row(domain: &str, enabled: bool, site_name: &str) -> String {
 /// Used by handle_toggle when `view == "card"` to swap the entire card in
 /// place. Mirrors the structure of the mobile card in site_domains.html.
 fn render_domain_card(domain: &str, enabled: bool, dns_provider: Option<&str>) -> String {
+    let (badge_bg, badge_dark, strike, badge_label) = badge_classes(enabled);
     let dns_line = match dns_provider {
-        Some(p) => format!(
-            r##"<div class="text-xs text-slate-500 dark:text-slate-400">DNS: {p}</div>"##
-        ),
+        Some(p) => {
+            format!(r##"<div class="text-xs text-slate-500 dark:text-slate-400">DNS: {p}</div>"##)
+        }
         None => String::new(),
     };
     format!(
@@ -648,10 +663,10 @@ fn render_domain_card(domain: &str, enabled: bool, dns_provider: Option<&str>) -
     </div>"##,
         domain = domain,
         dns_line = dns_line,
-        badge_bg = if enabled { "bg-green-100 text-green-700" } else { "bg-slate-100 text-slate-400" },
-        badge_dark = if enabled { "dark:bg-green-900/30 dark:text-green-300" } else { "dark:bg-slate-700 dark:text-slate-500" },
-        strike = if enabled { "" } else { "line-through" },
-        badge_label = if enabled { "enabled" } else { "disabled" },
+        badge_bg = badge_bg,
+        badge_dark = badge_dark,
+        strike = strike,
+        badge_label = badge_label,
     )
 }
 

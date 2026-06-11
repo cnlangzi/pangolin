@@ -120,31 +120,12 @@ impl Site {
     /// For tunnel backends (`tun:scheme://...`), returns the scheme of the
     /// URL portion, not the tunnel name.
     pub fn backend_scheme(&self) -> &str {
-        if self.backend.starts_with("https://") {
-            return "https";
-        }
-        if self.backend.starts_with("http://") {
-            return "http";
-        }
-        if self.backend.starts_with("file:///") {
-            return "file";
-        }
-        // Tunnel case: strip the `tun:` prefix and re-check.
         if self.backend_route_mode() == "tunnel" {
             if let Some(colon_idx) = self.backend.find(':') {
-                let url = &self.backend[colon_idx + 1..];
-                if url.starts_with("https://") {
-                    return "https";
-                }
-                if url.starts_with("http://") {
-                    return "http";
-                }
-                if url.starts_with("file:///") {
-                    return "file";
-                }
+                return detect_scheme(&self.backend[colon_idx + 1..]);
             }
         }
-        ""
+        detect_scheme(&self.backend)
     }
 
     /// Host (and optional port) portion of the URL, i.e. the part after
@@ -159,39 +140,45 @@ impl Site {
     /// bogus string `http:`. The form's JS round-trip relies on getting
     /// just the host:port back.
     pub fn backend_host_port(&self) -> &str {
-        // ── Direct modes: scheme:// is at the start of the string. ──
-        if let Some(rest) = self.backend.strip_prefix("https://") {
-            return split_host_path(rest);
-        }
-        if let Some(rest) = self.backend.strip_prefix("http://") {
-            return split_host_path(rest);
-        }
-        if let Some(rest) = self.backend.strip_prefix("file://") {
-            // file:///var/www → host is empty, path is /var/www.
-            // We want to show the path part in the form so users can edit
-            // it directly. Drop the leading slash for display (the form
-            // re-adds it on submit by concatenating `file:///` + value).
-            return rest.trim_start_matches('/');
-        }
-        // ── Tunnel modes: strip the `tun_name:` prefix, then re-apply
-        //    scheme stripping so we operate on `host[:port][/path]`
-        //    rather than the full `scheme://host:port[/path]` URL. ──
         if self.backend_route_mode() == "tunnel" {
             if let Some(colon_idx) = self.backend.find(':') {
-                let url = &self.backend[colon_idx + 1..];
-                if let Some(rest) = url.strip_prefix("https://") {
-                    return split_host_path(rest);
-                }
-                if let Some(rest) = url.strip_prefix("http://") {
-                    return split_host_path(rest);
-                }
-                if let Some(rest) = url.strip_prefix("file://") {
-                    return rest.trim_start_matches('/');
-                }
+                return strip_scheme_and_split(&self.backend[colon_idx + 1..]);
             }
         }
+        strip_scheme_and_split(&self.backend)
+    }
+}
+
+/// Returns the URL scheme of a backend string, or "" if none of the
+/// known schemes match. Used by `Site::backend_scheme` to detect the
+/// `http`/`https`/`file` prefix on either direct or tunnel-mode URLs.
+fn detect_scheme(url: &str) -> &'static str {
+    if url.starts_with("https://") {
+        "https"
+    } else if url.starts_with("http://") {
+        "http"
+    } else if url.starts_with("file:///") {
+        "file"
+    } else {
         ""
     }
+}
+
+/// Strips the URL scheme prefix and splits host from path. For
+/// `file:///var/www` this returns `var/www` (no host). Used by
+/// `Site::backend_host_port` to operate on `host[:port][/path]` rather
+/// than the full `scheme://host:port[/path]` URL.
+fn strip_scheme_and_split(url: &str) -> &str {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return split_host_path(rest);
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        return split_host_path(rest);
+    }
+    if let Some(rest) = url.strip_prefix("file://") {
+        return rest.trim_start_matches('/');
+    }
+    ""
 }
 
 /// Splits an `host[:port][/path]` string at the first `/`, returning the
@@ -485,7 +472,10 @@ mod tests {
 
     #[test]
     fn host_port_direct_http() {
-        assert_eq!(site_with("http://127.0.0.1:8080").backend_host_port(), "127.0.0.1:8080");
+        assert_eq!(
+            site_with("http://127.0.0.1:8080").backend_host_port(),
+            "127.0.0.1:8080"
+        );
     }
 
     #[test]
@@ -499,7 +489,10 @@ mod tests {
 
     #[test]
     fn host_port_direct_file() {
-        assert_eq!(site_with("file:///var/www/static").backend_host_port(), "var/www/static");
+        assert_eq!(
+            site_with("file:///var/www/static").backend_host_port(),
+            "var/www/static"
+        );
     }
 
     #[test]
