@@ -7,12 +7,11 @@
 use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::parse::{parse_backend, ParseError};
-use pangolin_core::types::{Domain, HostMode, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site};
 use std::collections::HashMap;
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    let tokens = vec![];
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// error_not_found — unknown domain → lookup returns None, ngx proxy returns 404

@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Site, Token, Tun};
+use pangolin_core::types::{Site, Tun};
 use pangolin_core::{App, CertManager, EventType};
 
 /// Create a test CertManager. (v2: per-domain `auto_issue` replaced the
@@ -138,10 +138,12 @@ fn tun_online_offline_db() {
     // Insert a tun
     let tun = Tun {
         name: "office".into(),
+        token: None,
         enabled: true,
         online: false,
         registered_at: None,
         last_seen_at: None,
+        expires_at: None,
     };
     db::upsert_tun(&conn, &tun).unwrap();
 

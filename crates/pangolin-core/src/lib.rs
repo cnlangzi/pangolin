@@ -9,8 +9,7 @@
 //! ```text
 //! Site (1) ──* Domain      (in-memory: domainIndex)
 //! Site (1) ──* (via backend prefix) → tun_name → *Domain (tunIndex)
-//! Tun (independent)
-//! Token (independent, decoupled from tun)
+//! Tun (carries its own auth token)
 //! Cert (independent, 1:1 with domain)
 //! ```
 //!
@@ -29,7 +28,7 @@ pub mod parse;
 pub mod types;
 
 pub use app::{plan_issuance, App, CertManager, DnsIndex, IssuancePlan, TunnelMessage};
-pub use config::Config;
+pub use config::{init_logger, Config, LogConfig};
 pub use error::{PangolinError, Result};
 pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{lookup_site, Indexes};
@@ -39,7 +38,7 @@ pub use parse::{
 };
 pub use types::{
     deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, ChallengeType,
-    DnsProvider, DnsProviderKind, Domain, Site, Token, Tun, TunnelFrame, TunnelRequestFrame,
+    DnsProvider, DnsProviderKind, Domain, Site, Tun, TunnelFrame, TunnelRequestFrame,
     TunnelResponseFrame,
 };
 

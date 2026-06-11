@@ -813,136 +813,10 @@ async fn domains_delete_verified_removed() {
 }
 
 // ── §20-23 — Tokens full cycle ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn tokens_create_and_list() {
-    let ngx = start_ngx().await;
-    let client = AdminClient::new(&ngx);
-    client.login("admin", "admin").await.unwrap();
-
-    let page = client
-        .get("/admin/tokens")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let csrf = client.csrf_token(&page).unwrap_or_default();
-    let resp = client
-        .post_form(
-            "/admin/tokens/new",
-            &[("token", "mytoken123"), ("_csrf", &csrf)],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        302,
-        "token create should redirect, got {}",
-        resp.status()
-    );
-
-    let list = client
-        .get("/admin/tokens")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(list.contains("mytoken123"), "token should appear in list");
-}
-
-#[tokio::test]
-async fn tokens_create_no_csrf_forbidden() {
-    let ngx = start_ngx().await;
-    let client = AdminClient::new(&ngx);
-    client.login("admin", "admin").await.unwrap();
-
-    let resp = client
-        .post_form("/admin/tokens/new", &[("token", "mytoken123")])
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 403);
-}
-
-#[tokio::test]
-async fn tokens_delete_with_csrf() {
-    let ngx = start_ngx().await;
-    let client = AdminClient::new(&ngx);
-    client.login("admin", "admin").await.unwrap();
-
-    let page = client
-        .get("/admin/tokens")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let csrf = client.csrf_token(&page).unwrap_or_default();
-    client
-        .post_form(
-            "/admin/tokens/new",
-            &[("token", "del-token"), ("_csrf", &csrf)],
-        )
-        .await
-        .unwrap();
-
-    let resp = client
-        .post_form(
-            "/admin/tokens/delete",
-            &[("token", "del-token"), ("_csrf", &csrf)],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        302,
-        "token delete should redirect, got {}",
-        resp.status()
-    );
-}
-
-#[tokio::test]
-async fn tokens_delete_verified_removed() {
-    let ngx = start_ngx().await;
-    let client = AdminClient::new(&ngx);
-    client.login("admin", "admin").await.unwrap();
-
-    let page = client
-        .get("/admin/tokens")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let csrf = client.csrf_token(&page).unwrap_or_default();
-    client
-        .post_form(
-            "/admin/tokens/new",
-            &[("token", "gone-token"), ("_csrf", &csrf)],
-        )
-        .await
-        .unwrap();
-    client
-        .post_form(
-            "/admin/tokens/delete",
-            &[("token", "gone-token"), ("_csrf", &csrf)],
-        )
-        .await
-        .unwrap();
-
-    let list = client
-        .get("/admin/tokens")
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(
-        !list.contains("gone-token"),
-        "deleted token should not appear"
-    );
-}
+// Removed in v2: the `/admin/tokens` route and `tokens` table were
+// dropped when the credential was merged onto the `tun` row.
+// Auth lifecycle for tuns is covered by `tests/src/auth.rs` (DB layer)
+// and `real_e2e::real_e2e_tunnel_*` (binary end-to-end).
 
 // ── §24-27 — Certs full cycle ────────────────────────────────────────────────
 
@@ -1183,7 +1057,6 @@ async fn nav_active_state_per_page() {
         ("/admin/sites", "Sites"),
         ("/admin/domains", "Domains"),
         ("/admin/tun", "Tunnels"),
-        ("/admin/tokens", "Tokens"),
         ("/admin/certs", "Certs"),
     ];
 

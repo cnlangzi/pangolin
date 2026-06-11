@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::types::{Domain, HostMode, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site};
 use pangolin_core::{App, CertManager};
 
 fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
@@ -142,39 +142,10 @@ async fn reload_indexes_domain_triggers_routing() {
     }
 }
 
-/// reload_indexes_token_affects_active_state — after disabling token,
-/// reload_indexes reflects the change in tokenIndex.
-#[tokio::test]
-async fn reload_indexes_token_affects_active_state() {
-    let dir = TempDir::new().unwrap();
-    let app = make_test_app(&dir);
-
-    // Insert enabled token
-    let token = Token {
-        token: "test-reload-token".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    };
-    db::upsert_token(&*app.db.lock().await, &token).unwrap();
-    app.reload_indexes().await;
-
-    {
-        let idx = app.indexes.read().await;
-        assert_eq!(idx.token.get("test-reload-token"), Some(&true));
-    }
-
-    // Disable token
-    let mut disabled = token.clone();
-    disabled.enabled = false;
-    db::upsert_token(&*app.db.lock().await, &disabled).unwrap();
-    app.reload_indexes().await;
-
-    {
-        let idx = app.indexes.read().await;
-        assert_eq!(idx.token.get("test-reload-token"), Some(&false));
-    }
-}
+// `reload_indexes_token_affects_active_state` removed in v2: the
+// in-memory `indexes.token` was dropped when tokens were merged into
+// `tun`. Tun enable/disable reload behavior is covered by
+// `admin_reload_tun` in `tests/src/admin_reload.rs`.
 
 /// reload_indexes_no_change_is_idempotent — calling reload_indexes
 /// when nothing changed is safe (no panic, index unchanged).
@@ -200,7 +171,6 @@ async fn reload_indexes_no_change_is_idempotent() {
     let idx1 = app.indexes.read().await;
     let site1_name =
         pangolin_core::index::lookup_site(&idx1, "stable-site.com").map(|s| s.name.clone());
-    let token_count = idx1.token.len();
     drop(idx1);
 
     // Reload again — nothing changed
@@ -209,6 +179,5 @@ async fn reload_indexes_no_change_is_idempotent() {
     let idx2 = app.indexes.read().await;
     let site2_name =
         pangolin_core::index::lookup_site(&idx2, "stable-site.com").map(|s| s.name.clone());
-    assert_eq!(idx2.token.len(), token_count);
     assert_eq!(site1_name, site2_name, "index should be unchanged");
 }

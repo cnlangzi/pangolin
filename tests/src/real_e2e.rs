@@ -120,21 +120,26 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
 }
 
 fn seed_tun(conn: &Connection, name: &str, enabled: bool) {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO tun (name, enabled, online, registered_at, last_seen_at) VALUES (?1, ?2, 0, ?3, ?3)",
-        rusqlite::params![name, enabled as i32, now],
-    )
-    .expect("insert tun");
+    // Convenience wrapper: insert a tun with token "test-token"
+    // (matches the harness's `TunProcess::start(..., "test-token")`
+    // call). v2: `tun` carries its own auth credential.
+    seed_tun_with_token(conn, name, "test-token", enabled, None);
 }
 
-fn seed_token(conn: &Connection, token: &str, enabled: bool, expires_at: Option<&str>) {
+fn seed_tun_with_token(
+    conn: &Connection,
+    name: &str,
+    token: &str,
+    enabled: bool,
+    expires_at: Option<&str>,
+) {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO tokens (token, enabled, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![token, enabled as i32, now, expires_at],
+        "INSERT INTO tun (name, token, enabled, online, registered_at, last_seen_at, expires_at)
+         VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5)",
+        rusqlite::params![name, token, enabled as i32, now, expires_at],
     )
-    .expect("insert token");
+    .expect("insert tun");
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +218,6 @@ async fn real_e2e_tunnel_full() {
         init_pangolin_db(db_path);
         let conn = Connection::open(db_path).expect("open db");
         seed_tun(&conn, "office", true);
-        seed_token(&conn, "test-token", true, None);
     })
     .await;
 
@@ -268,10 +272,11 @@ async fn real_e2e_tunnel_token_rejected() {
     let ngx = NgxProcess::start(|db_path| {
         init_pangolin_db(db_path);
         let conn = Connection::open(db_path).expect("open db");
-        // tun is enabled, but the token is expired.
-        seed_tun(&conn, "office", true);
+        // v2: the tun row carries the token AND its expiry. An
+        // expired token is now `expires_at` in the past on the
+        // tun row.
         let past = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
-        seed_token(&conn, "expired-token", true, Some(&past.as_str()));
+        seed_tun_with_token(&conn, "office", "expired-token", true, Some(&past.as_str()));
     })
     .await;
 

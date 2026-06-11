@@ -209,7 +209,7 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 // ---------------------------------------------------------------------------
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    Indexes::build(sites, domains, &[], chrono::Utc::now())
+    Indexes::build(sites, domains)
 }
 
 // ---------------------------------------------------------------------------

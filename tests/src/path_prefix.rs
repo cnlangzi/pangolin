@@ -17,7 +17,7 @@
 use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
 use pangolin_core::parse::parse_backend;
-use pangolin_core::types::{Domain, HostMode, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site};
 
 fn make_site(name: &str, backend: &str) -> Site {
     Site {
@@ -44,8 +44,7 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
 }
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    let tokens = vec![];
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// path_prefix_no_trailing_slash — `http://host/prefix` strips own path, appends request path
