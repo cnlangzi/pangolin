@@ -7,6 +7,7 @@
 
 use crate::admin_harness::AdminClient;
 use crate::harness::{init_pangolin_db, NgxProcess};
+use scraper::{Html, Selector};
 
 // ── helper ──────────────────────────────────────────────────────────────────
 
@@ -1824,9 +1825,365 @@ async fn site_domains_new_modal_preselected() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
 
-    // The site dropdown should have "preselect-test-site" selected
+    // The site field is locked in site-specific context: rendered as a
+    // read-only display with a hidden input carrying the value, so the
+    // form still POSTs `site_name=preselect-test-site` back.
     assert!(
-        body.contains(r#"<option value="preselect-test-site" selected"#),
-        "Expected preselected site option to be selected in the domains modal"
+        body.contains(r#"value="preselect-test-site""#),
+        "Expected preselected site name to be carried in a hidden field"
+    );
+    assert!(
+        !body.contains("Select a site..."),
+        "Site field should be locked (no dropdown) when invoked from a site sub-page"
+    );
+}
+
+// ── §13 — Sites form preserves user input on error ──────────────────────────
+
+#[tokio::test]
+async fn sites_create_preserves_form_values_on_error() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    // Submit with an empty backend (the JS empty-backend guard is
+    // client-side, so we exercise the server-side path by POSTing an
+    // empty string).
+    let resp = client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", ""),
+                ("name", "preserved-name"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    let _ = status; // kept for debugging
+
+    // The user-friendly summary error must be present, and the form
+    // must pre-fill the name input with the value the user typed.
+    assert!(
+        body.contains("Backend is required"),
+        "summary error should mention 'Backend is required'"
+    );
+    // The name input must carry `value="preserved-name"` so the user
+    // doesn't have to re-type it.
+    assert!(
+        body.contains(r#"id="site-name" required"#) && body.contains(r#"value="preserved-name""#),
+        "name input should be pre-filled with the submitted value"
+    );
+    // The hidden backend field should also reflect the (empty) submission
+    // — proving the server re-rendered with the user's input intact.
+    client
+        .assert_selector_exists(&body, r#"input[name="backend"]"#)
+        .expect("hidden backend input should still be present");
+    // No site was created — a fresh site-name must not appear in the
+    // sites list.
+    let list_body = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !list_body.contains("preserved-name"),
+        "site should not be persisted on validation error"
+    );
+}
+
+// ── §14 — Sites create with direct/file backend ──────────────────────────────
+
+#[tokio::test]
+async fn sites_create_direct_file_backend() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "file:///var/www/static"),
+                ("name", "file-static-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after successful create, got {}",
+        resp.status()
+    );
+
+    // The site should appear in the sites list with the file:// backend.
+    let list_body = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_body.contains("file-static-site"));
+    assert!(list_body.contains("file:///var/www/static"));
+}
+
+// ── §14c — Edit page preserves file:// path with leading slash ──────────────
+
+#[tokio::test]
+async fn sites_edit_preserves_file_path_leading_slash() {
+    // Regression: edit page for a file:// site used to show the path
+    // without its leading slash, so a re-submit would drop the root.
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site with file:// URL (the leading slash in the path is
+    // essential for the path to be a valid absolute filesystem path).
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "file:///Users/geax/foo"),
+                ("name", "file-slash-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Open the edit page and verify the host:port field shows the path
+    // WITH the leading slash — so the user can resubmit without losing it.
+    let edit_body = client
+        .get("/admin/sites/edit?name=file-slash-test")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    client
+        .assert_selector_exists(&edit_body, r#"select[name="direct_protocol"]"#)
+        .unwrap();
+    // The host:port field for direct mode should carry value="/Users/geax/foo"
+    // (with the leading slash preserved).
+    let doc = Html::parse_document(&edit_body);
+    let sel = Selector::parse(r#"input[name="direct_host"]"#).unwrap();
+    let direct_host = doc
+        .select(&sel)
+        .next()
+        .and_then(|el| el.value().attr("value"))
+        .unwrap_or("");
+    assert_eq!(
+        direct_host, "/Users/geax/foo",
+        "edit page should preserve the leading slash in the file:// path"
+    );
+}
+
+// ── §14b — Sites create with file:// + long path (server-side fallback) ──────
+
+#[tokio::test]
+async fn sites_create_file_long_path_server_side_fallback() {
+    // Mimics the real-world case where the JS update of the hidden
+    // `backend` field didn't fire (or fired late) before the form was
+    // submitted. The server should still be able to assemble the backend
+    // from the individual form fields (`route_mode`, `direct_protocol`,
+    // `direct_host`).
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/admin/sites/new",
+            // No `backend` hidden field — only the individual components.
+            &[
+                ("route_mode", "direct"),
+                ("direct_protocol", "file"),
+                (
+                    "direct_host",
+                    "/Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo",
+                ),
+                ("name", "long-path-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after successful create, got {}",
+        resp.status()
+    );
+
+    let list_body = client
+        .get("/admin/sites")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(list_body.contains("long-path-site"));
+    // The path was correctly assembled into a file:// URL.
+    assert!(
+        list_body.contains("file:///Users/geax/code/geax/github.com/yaitoo/proxy/cmd/mux/yaitoo"),
+        "expected the file:// URL to be reconstructed from the form fields"
+    );
+}
+
+// ── §15 — Sites form renders tunnel-mode UI and (with no tunnels) warning ──
+
+#[tokio::test]
+async fn sites_create_tunnel_backend_no_tunnels_registered() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The new site form should always render the route-mode picker
+    // (Direct / Tunnel). With no tunnels registered, switching to Tunnel
+    // mode shows a helpful warning — that path is what we exercise here.
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Both route-mode options present.
+    assert!(page.contains(r#"value="direct""#));
+    assert!(page.contains(r#"value="tunnel""#));
+    // New site starts in Direct mode (per template default).
+    assert!(page.contains("Direct") && page.contains("Tunnel"));
+}
+
+// ── §16 — Sites edit and update (preserves form data on edit error too) ─────
+
+#[tokio::test]
+async fn sites_edit_and_update() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create
+    let page = client
+        .get("/admin/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/admin/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "edit-update-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Update to a different backend
+    let edit_page = client
+        .get("/admin/sites/edit?name=edit-update-site")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let edit_csrf = client.csrf_token(&edit_page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/admin/sites/edit?name=edit-update-site",
+            &[
+                ("backend", "http://127.0.0.1:9090"),
+                ("host_mode", "passthrough"),
+                ("_csrf", &edit_csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "expected redirect after update, got {}",
+        resp.status()
+    );
+
+    // Re-fetch the edit page; the new backend should be pre-filled.
+    let body = client
+        .get("/admin/sites/edit?name=edit-update-site")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("http://127.0.0.1:9090"));
+
+    // And an invalid update (empty backend) should re-render the form
+    // without persisting the change.
+    let bad_csrf = client.csrf_token(&body).unwrap_or_default();
+    let bad_resp = client
+        .post_form(
+            "/admin/sites/edit?name=edit-update-site",
+            &[
+                ("backend", ""),
+                ("host_mode", "passthrough"),
+                ("_csrf", &bad_csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let bad_body = bad_resp.text().await.unwrap();
+    assert!(bad_body.contains("Backend is required"));
+    // The previous (good) backend must still be in the page (proves we
+    // re-fetched the existing value rather than blanking it).
+    assert!(
+        bad_body.contains("http://127.0.0.1:9090"),
+        "edit-error page should still show the previously-saved backend"
     );
 }

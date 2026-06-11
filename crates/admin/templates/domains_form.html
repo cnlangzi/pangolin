@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}New domain — Pangolin{% endblock %}
+{% block title %}{{ self.form_title() }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
@@ -9,31 +9,55 @@
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
       Back to domains
     </a>
-    <h1 class="mt-2 text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">New domain</h1>
+    <h1 class="mt-2 text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ self.form_title() }}</h1>
     <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
       Map a hostname to one of your configured sites
     </p>
   </div>
 
-  <form method="POST" action="/admin/domains/new" class="card p-6 space-y-4">
+  <form method="POST" action="{{ self.form_action() }}" class="card p-6 space-y-4">
     <input type="hidden" name="_csrf" value="__CSRF__">
+    {# Optional redirect target after a successful submit. Used to land the
+       user back on the site_domains page when the form was opened from
+       there. `handle_create` validates this against /admin/* before use. #}
+    <input type="hidden" name="next" value="{{ self.next_redirect() }}">
 
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-name">Domain name</label>
-      <input type="text" name="domain" id="domain-name" required
-        placeholder="example.com"
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      {% if self.lock_domain() %}
+        {# Edit mode: domain is the primary key, render as read-only text + hidden field. #}
+        <div class="flex items-center gap-2">
+          <code class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm font-mono text-slate-700 dark:text-slate-200 flex-1 truncate">{{ self.edit_domain_value() }}</code>
+        </div>
+        <input type="hidden" name="domain" value="{{ self.edit_domain_value() }}">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">The domain name is the primary key and cannot be changed.</p>
+      {% else %}
+        <input type="text" name="domain" id="domain-name" required
+          placeholder="example.com"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      {% endif %}
     </div>
 
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-site">Site</label>
-      <select name="site_name" id="domain-site" required
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-        <option value="">Select a site...</option>
-        {% for site in sites %}
-        <option value="{{ site.name }}"{% if self.is_site_preselected(site.name) %} selected{% endif %}>{{ site.name }} — {{ site.backend }}</option>
-        {% endfor %}
-      </select>
+      {% if self.lock_site() %}
+        {# Site is locked when editing, or when invoked from a site-specific
+           sub-page. Render as read-only text + hidden field so the value
+           still gets POSTed. #}
+        <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-700 dark:text-slate-200 font-mono">
+          {{ self.preselected_site_name_value() }}
+        </div>
+        <input type="hidden" name="site_name" value="{{ self.preselected_site_name_value() }}">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Site is fixed for this form.</p>
+      {% else %}
+        <select name="site_name" id="domain-site" required
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <option value="">Select a site...</option>
+          {% for site in sites %}
+          <option value="{{ site.name }}"{% if self.is_site_preselected(site.name) %} selected{% endif %}>{{ site.name }} — {{ site.backend }}</option>
+          {% endfor %}
+        </select>
+      {% endif %}
     </div>
 
     <div>
@@ -55,7 +79,7 @@
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         <option value="">(none — use HTTP-01)</option>
         {% for p in dns_providers %}
-        <option value="{{ p.name }}"{% if dns_provider_value == p.name %} selected{% endif %}>{{ p.name }} ({{ p.kind }})</option>
+        <option value="{{ p.name }}"{% if self.is_dns_provider_selected(p.name) %} selected{% endif %}>{{ p.name }} ({{ p.kind }})</option>
         {% endfor %}
       </select>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
@@ -73,7 +97,7 @@
     {% endif %}
 
     <div class="flex gap-2 pt-2">
-      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">Save</button>
+      <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{{ self.submit_label() }}</button>
       <a href="/admin/domains" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
     </div>
   </form>

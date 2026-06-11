@@ -147,6 +147,48 @@ pub fn delete_domain(conn: &Connection, domain: &str) -> rusqlite::Result<bool> 
     Ok(n > 0)
 }
 
+/// Get a single domain by its primary key. Returns None if not found.
+/// Cheaper than list_domains().find() when only one row is needed.
+pub fn get_domain(conn: &Connection, domain: &str) -> rusqlite::Result<Option<Domain>> {
+    let mut stmt = conn.prepare(
+        "SELECT domain, site_name, enabled, auto_issue, dns_provider, created_at
+         FROM domains WHERE domain = ?1",
+    )?;
+    let result = stmt.query_row(params![domain], |row| {
+        let enabled: i32 = row.get(2)?;
+        let auto_issue: i32 = row.get(3)?;
+        let created_at: String = row.get(5)?;
+        Ok(Domain {
+            domain: row.get(0)?,
+            site_name: row.get(1)?,
+            enabled: enabled != 0,
+            auto_issue: auto_issue != 0,
+            dns_provider: row.get(4)?,
+            created_at: parse_dt(&created_at)?,
+        })
+    });
+    match result {
+        Ok(d) => Ok(Some(d)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Toggle / set the `enabled` flag on a single domain row. Returns true
+/// if the row existed and was updated. Used by the admin UI's per-row
+/// toggle switch (POST /admin/api/domains/{domain}/toggle).
+pub fn set_domain_enabled(
+    conn: &Connection,
+    domain: &str,
+    enabled: bool,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE domains SET enabled = ?1 WHERE domain = ?2",
+        params![enabled as i32, domain],
+    )?;
+    Ok(n > 0)
+}
+
 // ---- Tun CRUD ----
 
 pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {
