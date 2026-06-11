@@ -148,6 +148,12 @@ pub async fn handle(
             )
             .await?
         }
+        "api/domains" if method == "POST" => {
+            // Generic create endpoint (used by the site_domains form when
+            // the site is locked — site_name is taken from the form body,
+            // which already has the correct preselected value).
+            routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
+        }
         "tun" => routes::tun::render(&app, &csrf_token).await?,
         "certs" if method == "GET" => routes::certs::render(&app, &csrf_token).await?,
         "certs/new" if method == "GET" => routes::certs::render_create_page(&csrf_token).await?,
@@ -226,6 +232,45 @@ pub async fn handle(
                                 &csrf_token,
                             )
                             .await?
+                        }
+                        _ => not_found(),
+                    }
+                } else {
+                    not_found()
+                }
+            } else if let Some(rest) = path.strip_prefix("api/domains/") {
+                // Global domain-scoped endpoints (no site context).
+                // Path: api/domains/{domain}/{action}
+                if let Some((domain, action)) = rest.split_once('/') {
+                    match (action, method) {
+                        ("edit", "GET") => {
+                            routes::domains::api_render_form_edit(
+                                &app,
+                                domain,
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        ("edit", "POST") => {
+                            routes::domains::handle_update(
+                                &app,
+                                domain,
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        ("toggle", "POST") => {
+                            // `view` query param selects the response shape:
+                            //   "row"  → desktop table <tr>  (default, no param)
+                            //   "card" → mobile card <div>   (set by site_domains.html)
+                            // The mobile card must replace the whole card
+                            // div (which contains Edit / Delete buttons and
+                            // the DNS line), not just the toggle badge.
+                            let view = query_param_opt(&merged_params, "view")
+                                .unwrap_or_else(|| "row".to_string());
+                            routes::domains::handle_toggle(&app, domain, &view, &csrf_token).await?
                         }
                         _ => not_found(),
                     }
