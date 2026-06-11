@@ -112,7 +112,10 @@ fn short_hash(name: &str) -> String {
             hex_prefix(digest.as_slice(), SHORT_HASH_LEN)
         }
         None => {
-            log::warn!("admin assets: no embedded file for {}, hash will be empty", name);
+            log::warn!(
+                "admin assets: no embedded file for {}, hash will be empty",
+                name
+            );
             String::new()
         }
     }
