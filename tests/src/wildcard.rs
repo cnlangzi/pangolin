@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use pangolin_core::index::{lookup_site, Indexes};
-use pangolin_core::types::{Domain, HostMode, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site};
 
 fn make_site(name: &str, backend: &str) -> Site {
     Site {
@@ -31,12 +31,6 @@ fn make_domain(domain: &str, site_name: &str) -> Domain {
 }
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    let tokens = vec![Token {
-        token: "test-token".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    }];
     Indexes::build(sites, domains)
 }
 

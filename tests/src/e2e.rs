@@ -475,7 +475,6 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 // ---------------------------------------------------------------------------
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    let tokens = vec![];
     Indexes::build(sites, domains)
 }
 

@@ -32,26 +32,32 @@ use crate::{App, TunnelMessage};
 /// v2: tokens and tun names live in the same row, so this is a single
 /// SQL lookup. Three outcomes:
 ///
-///   * `Ok(())` — a matching row exists, is `enabled=1`, and not
-///     expired. The tun is admitted.
-///   * `Err(401)` — no row matches `(name, token)`. Hard reject;
-///     the (name, token) pair must be admin-provisioned via
-///     `POST /api/tun` before the tun can come online. There is
-///     no auto-register: presenting a valid token for an unknown
-///     name does NOT create the row, because the admin is the
-///     sole source of truth for "this tun exists".
-///   * `Err(403)` — a row matched but `enabled=0` (admin disabled
-///     it). The tun cannot reconnect until the admin re-enables it.
+///   * `Ok(())` — a matching row exists, is `enabled=1`, and the
+///     token has not expired (or has no expiry). The tun is admitted.
+///   * `Err(401)` — either no row matches `(name, token)`, **or**
+///     the row matches but its `expires_at` is in the past. Both
+///     are hard rejects: a missing row means the (name, token) pair
+///     must be admin-provisioned via `POST /api/tun` before the tun
+///     can come online (no auto-register), and an expired token
+///     must be rotated by the admin. We collapse both into 401 so
+///     the client doesn't learn "this (name, token) was once
+///     valid, just expired" vs "never existed."
+///   * `Err(403)` — a row matched and the token is not expired, but
+///     `enabled=0` (admin disabled it). The tun cannot reconnect
+///     until the admin re-enables it.
 async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
     let conn = app.db.lock().await;
     let row = match pangolin_core::db::auth_tun(&conn, tun_name, token) {
         Ok(r) => r,
         Err(_) => return Err(500),
     };
+    let now = chrono::Utc::now();
     match row {
         None => Err(401),
         Some((false, _)) => Err(403),
-        Some((true, _)) => Ok(()),
+        Some((true, None)) => Ok(()),
+        Some((true, Some(expires_at))) if expires_at > now => Ok(()),
+        Some((true, Some(_))) => Err(401), // expired
     }
 }
 
