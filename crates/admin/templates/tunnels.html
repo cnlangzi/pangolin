@@ -98,7 +98,7 @@
           </div>
           {% if tun.online %}
           <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700">online</span>
-          {% elif tun.enabled %}
+          {% else if tun.enabled %}
           <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">offline</span>
           {% else %}
           <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">disabled</span>

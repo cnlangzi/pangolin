@@ -982,12 +982,23 @@ async fn tunnels_new_page_is_full_page() {
     let resp = client.get("/admin/tun/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("<html"), "new tunnel page should be a full HTML page");
+    assert!(
+        body.contains("<html"),
+        "new tunnel page should be a full HTML page"
+    );
     assert!(body.contains("Back to tunnels"));
-    client.assert_selector_exists(&body, "input[name=name]").unwrap();
-    client.assert_selector_exists(&body, "input[name=token]").unwrap();
-    client.assert_selector_exists(&body, "input[name=expires_at]").unwrap();
-    client.assert_selector_exists(&body, "input[name=enabled]").unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=name]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=token]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=expires_at]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=enabled]")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -997,7 +1008,13 @@ async fn tunnels_create_valid_auto_token() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1011,7 +1028,12 @@ async fn tunnels_create_valid_auto_token() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 302, "create should redirect, got {}", resp.status());
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create should redirect, got {}",
+        resp.status()
+    );
     let loc = resp
         .headers()
         .get("location")
@@ -1020,11 +1042,22 @@ async fn tunnels_create_valid_auto_token() {
     assert!(loc.contains("/admin/tun"), "should redirect to /admin/tun");
 
     // Verify tunnel appears in list with a non-empty token
-    let list = client.get("/admin/tun").await.unwrap().text().await.unwrap();
-    assert!(list.contains("auto-token-node"), "tunnel name should appear in list");
+    let list = client
+        .get("/admin/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        list.contains("auto-token-node"),
+        "tunnel name should appear in list"
+    );
     // Token cell should NOT be empty "—" (a token was auto-generated)
-    assert!(!list.contains("auto-token-node") || list.contains("font-mono"),
-        "token should be visible in the list");
+    assert!(
+        !list.contains("auto-token-node") || list.contains("font-mono"),
+        "token should be visible in the list"
+    );
 }
 
 #[tokio::test]
@@ -1033,7 +1066,13 @@ async fn tunnels_create_with_provided_token() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1050,10 +1089,18 @@ async fn tunnels_create_with_provided_token() {
     assert_eq!(resp.status().as_u16(), 302);
 
     // Token should appear in the list
-    let list = client.get("/admin/tun").await.unwrap().text().await.unwrap();
+    let list = client
+        .get("/admin/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(list.contains("manual-token-node"));
-    assert!(list.contains("my-super-secret-token-123"),
-        "provided token should be visible in the list");
+    assert!(
+        list.contains("my-super-secret-token-123"),
+        "provided token should be visible in the list"
+    );
 }
 
 #[tokio::test]
@@ -1062,7 +1109,13 @@ async fn tunnels_create_with_expires_at() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1080,9 +1133,18 @@ async fn tunnels_create_with_expires_at() {
     assert_eq!(resp.status().as_u16(), 302);
 
     // Expires column should show the date
-    let list = client.get("/admin/tun").await.unwrap().text().await.unwrap();
+    let list = client
+        .get("/admin/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(list.contains("expiring-node"));
-    assert!(list.contains("2030-12-31"), "expires_at should appear in list");
+    assert!(
+        list.contains("2030-12-31"),
+        "expires_at should appear in list"
+    );
 }
 
 #[tokio::test]
@@ -1102,7 +1164,11 @@ async fn tunnels_create_no_csrf_forbidden() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 403, "missing CSRF should be forbidden");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "missing CSRF should be forbidden"
+    );
 }
 
 #[tokio::test]
@@ -1111,7 +1177,13 @@ async fn tunnels_create_invalid_name_chars() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
     let resp = client
@@ -1128,8 +1200,10 @@ async fn tunnels_create_invalid_name_chars() {
     // Should re-render the form with an error, not redirect
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("letters, digits") || body.contains("Name"),
-        "error should be shown for invalid name");
+    assert!(
+        body.contains("letters, digits") || body.contains("Name"),
+        "error should be shown for invalid name"
+    );
 }
 
 #[tokio::test]
@@ -1139,7 +1213,13 @@ async fn tunnels_edit_page_prefilled() {
     client.login("admin", "admin").await.unwrap();
 
     // Create a tunnel first
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1163,7 +1243,9 @@ async fn tunnels_edit_page_prefilled() {
     assert!(body.contains("Edit tunnel"));
     // Name should be shown as read-only display (not an input)
     assert!(body.contains("edit-me-node"));
-    client.assert_selector_exists(&body, "input[name=token]").unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=token]")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1173,7 +1255,13 @@ async fn tunnels_update() {
     client.login("admin", "admin").await.unwrap();
 
     // Create
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1199,18 +1287,29 @@ async fn tunnels_update() {
     let resp = client
         .post_form(
             "/admin/tun/edit?name=update-me-node",
-            &[
-                ("token", "updated-token"),
-                ("_csrf", &csrf2),
-            ],
+            &[("token", "updated-token"), ("_csrf", &csrf2)],
         )
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 302, "update should redirect, got {}", resp.status());
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "update should redirect, got {}",
+        resp.status()
+    );
 
     // Verify updated token in list
-    let list = client.get("/admin/tun").await.unwrap().text().await.unwrap();
-    assert!(list.contains("updated-token"), "updated token should appear in list");
+    let list = client
+        .get("/admin/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        list.contains("updated-token"),
+        "updated token should appear in list"
+    );
 }
 
 #[tokio::test]
@@ -1219,7 +1318,13 @@ async fn tunnels_delete_with_csrf() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1240,7 +1345,12 @@ async fn tunnels_delete_with_csrf() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 302, "delete should redirect, got {}", resp.status());
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "delete should redirect, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -1262,7 +1372,13 @@ async fn tunnels_delete_verified_in_list() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let page = client.get("/admin/tun/new").await.unwrap().text().await.unwrap();
+    let page = client
+        .get("/admin/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
@@ -1284,9 +1400,17 @@ async fn tunnels_delete_verified_in_list() {
         .await
         .unwrap();
 
-    let list = client.get("/admin/tun").await.unwrap().text().await.unwrap();
-    assert!(!list.contains("verify-delete-node"),
-        "deleted tunnel should not appear in list");
+    let list = client
+        .get("/admin/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !list.contains("verify-delete-node"),
+        "deleted tunnel should not appear in list"
+    );
 }
 
 #[tokio::test]
@@ -1296,7 +1420,11 @@ async fn tunnels_edit_missing_name_bad_request() {
     client.login("admin", "admin").await.unwrap();
 
     let resp = client.get("/admin/tun/edit").await.unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "missing name param should return 400");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "missing name param should return 400"
+    );
 }
 
 #[tokio::test]
@@ -1311,8 +1439,10 @@ async fn tunnels_edit_nonexistent_not_found() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200); // renders error in body
     let body = resp.text().await.unwrap();
-    assert!(body.contains("not found") || body.contains("Not found"),
-        "should show not-found error");
+    assert!(
+        body.contains("not found") || body.contains("Not found"),
+        "should show not-found error"
+    );
 }
 
 // ── §29 — Logout ─────────────────────────────────────────────────────────────

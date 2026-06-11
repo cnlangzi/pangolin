@@ -41,7 +41,7 @@
         <span class="text-xs font-normal text-slate-400 ml-1">(leave blank to auto-generate)</span>
       </label>
       <input type="text" name="token" id="tun-token"
-        value="{% if let Some(t) = tun %}{{ t.token }}{% endif %}"
+        value="{% if let Some(t) = tun %}{% if let Some(v) = t.token %}{{ v }}{% endif %}{% endif %}"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
         placeholder="auto-generate if blank">
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">The credential this tun node presents when connecting via WebSocket.</p>

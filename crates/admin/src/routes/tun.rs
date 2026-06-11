@@ -1,6 +1,7 @@
 //! Tunnels route — list / new / edit / delete.
 
 use askama::Template;
+use rand::Rng;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -62,8 +63,15 @@ pub async fn handle_create(
     if name.len() > 64 {
         return render_create_page_with_error(None, "Name must be 64 characters or less", csrf);
     }
-    if !name.chars().all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-') {
-        return render_create_page_with_error(None, "Name may only contain letters, digits, underscores, and hyphens", csrf);
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return render_create_page_with_error(
+            None,
+            "Name may only contain letters, digits, underscores, and hyphens",
+            csrf,
+        );
     }
 
     // Token: use provided value or auto-generate a random 32-byte hex string.
@@ -72,11 +80,17 @@ pub async fn handle_create(
         .cloned()
         .filter(|t| !t.is_empty())
         .map(Ok)
-        .unwrap_or_else(|| generate_token());
+        .unwrap_or_else(generate_token);
 
     let token = match token {
         Ok(t) => t,
-        Err(e) => return render_create_page_with_error(None, &format!("Token generation error: {}", e), csrf),
+        Err(e) => {
+            return render_create_page_with_error(
+                None,
+                &format!("Token generation error: {}", e),
+                csrf,
+            )
+        }
     };
 
     let enabled = params.get("enabled").map(|v| v == "1").unwrap_or(true);
@@ -173,11 +187,14 @@ pub async fn handle_update(
         if raw.is_empty() {
             tun.expires_at = None;
         } else {
-            tun.expires_at = parse_datetime(Some(&raw).as_deref());
+            tun.expires_at = parse_datetime(Some(raw.as_str()));
         }
     }
 
-    tun.enabled = params.get("enabled").map(|v| v == "1").unwrap_or(tun.enabled);
+    tun.enabled = params
+        .get("enabled")
+        .map(|v| v == "1")
+        .unwrap_or(tun.enabled);
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_tun(&db, &tun);
@@ -266,7 +283,6 @@ fn generate_token() -> Result<String, String> {
     Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
-
 /// Parse a `datetime-local` input value (YYYY-MM-DDTHH:MM) into an Option<DateTime<Utc>>.
 fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = s?;
@@ -279,5 +295,8 @@ fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
             time_part.split(':').nth(1)?.parse().ok()?,
             0,
         )?;
-    Some(chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        naive,
+        chrono::Utc,
+    ))
 }
