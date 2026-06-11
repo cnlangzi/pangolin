@@ -42,6 +42,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         site: None,
         action: "create",
         error: None,
+        field_error: None,
         active_nav: "sites",
         tunnels,
     }
@@ -75,6 +76,7 @@ pub async fn render_edit_page(
         site,
         action: "update",
         error: None,
+        field_error: None,
         active_nav: "sites",
         tunnels,
     }
@@ -91,37 +93,59 @@ pub async fn handle_create(
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
     let backend = params.get("backend").cloned().unwrap_or_default();
+    let host_mode = params
+        .get("host_mode")
+        .and_then(|v| v.parse::<HostMode>().ok())
+        .unwrap_or(HostMode::Passthrough);
+    let host_custom = params.get("host_custom").cloned().filter(|v| !v.is_empty());
 
-    if name.is_empty() {
-        return render_create_page_with_error(None, "Site name is required", csrf);
-    }
-    if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
-        return render_create_page_with_error(
-            Some(Site {
-                name,
-                backend,
-                enabled: true,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                host_mode: HostMode::Passthrough,
-                host_custom: None,
-                domain_count: 0,
-            }),
-            &format!("Invalid backend: {}", e),
-            csrf,
-        );
-    }
-
-    let site = Site {
+    // Build a prefill Site from the submitted form values. This is what
+    // gets passed back to the template on error so the user doesn't lose
+    // their input (name, protocol/host/tunnel selections, host_mode,
+    // host_custom) when the server rejects the submission.
+    let prefill = || Site {
         name: name.clone(),
-        backend,
+        backend: backend.clone(),
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        host_mode: HostMode::Passthrough,
-        host_custom: None,
+        host_mode,
+        host_custom: host_custom.clone(),
         domain_count: 0,
     };
+
+    if name.is_empty() {
+        return render_create_page_with_error(
+            app,
+            Some(prefill()),
+            "Site name is required",
+            Some("name"),
+            csrf,
+        )
+        .await;
+    }
+    if backend.is_empty() {
+        return render_create_page_with_error(
+            app,
+            Some(prefill()),
+            "Backend is required — fill in the host:port (or file path) field",
+            Some("backend"),
+            csrf,
+        )
+        .await;
+    }
+    if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
+        return render_create_page_with_error(
+            app,
+            Some(prefill()),
+            &format!("Invalid backend: {}", e),
+            Some("backend"),
+            csrf,
+        )
+        .await;
+    }
+
+    let site = prefill();
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_site(&db, &site);
@@ -132,7 +156,16 @@ pub async fn handle_create(
             app.reload_indexes().await;
             Ok(redirect_response("/admin/sites"))
         }
-        Err(e) => render_create_page_with_error(None, &format!("Database error: {}", e), csrf),
+        Err(e) => {
+            render_create_page_with_error(
+                app,
+                Some(prefill()),
+                &format!("Database error: {}", e),
+                None,
+                csrf,
+            )
+            .await
+        }
     }
 }
 
@@ -160,23 +193,77 @@ pub async fn handle_update(
         .unwrap_or(HostMode::Passthrough);
     let host_custom = params.get("host_custom").cloned().filter(|v| !v.is_empty());
 
-    if backend.is_empty() {
-        return render_edit_page_with_error(app, &name, "Backend is required", csrf);
-    }
-    if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
-        return render_edit_page_with_error(app, &name, &format!("Invalid backend: {}", e), csrf);
-    }
+    // Preserve form data on error — re-render the form with the user's
+    // submitted backend/host_mode/host_custom rather than blanking them.
+    // For edit mode, if the user submitted an empty backend (e.g. left
+    // host:port blank), fall back to the previously-saved value so the
+    // form doesn't appear to have lost the existing configuration.
+    let prefill = || -> Site {
+        // Note: this closure runs synchronously in the caller. We can't
+        // .await a DB lookup here, so for the "empty submitted backend"
+        // case we just preserve the submitted value — the template's
+        // initial_host_port will be empty in that case. The caller
+        // can override the backend field separately if it needs to
+        // fall back to the saved value.
+        Site {
+            name: name.clone(),
+            backend: backend.clone(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            host_mode,
+            host_custom: host_custom.clone(),
+            domain_count: 0,
+        }
+    };
 
-    let site = Site {
+    // For edit mode, fetch the existing site once so we can fall back to
+    // its backend when the submission was empty (better UX than a
+    // blanked-out form on the error path).
+    let existing_backend: Option<String> = if backend.is_empty() {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_site(&db, &name)
+            .ok()
+            .flatten()
+            .map(|s| s.backend)
+    } else {
+        None
+    };
+    let effective_backend_submitted = backend.clone();
+    let backend_for_prefill = existing_backend.unwrap_or(effective_backend_submitted);
+    let prefill_with_fallback = || Site {
         name: name.clone(),
-        backend,
+        backend: backend_for_prefill.clone(),
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         host_mode,
-        host_custom,
+        host_custom: host_custom.clone(),
         domain_count: 0,
     };
+
+    if backend.is_empty() {
+        return render_edit_page_with_error(
+            app,
+            prefill_with_fallback(),
+            "Backend is required — fill in the host:port (or file path) field",
+            Some("backend"),
+            csrf,
+        )
+        .await;
+    }
+    if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
+        return render_edit_page_with_error(
+            app,
+            prefill(),
+            &format!("Invalid backend: {}", e),
+            Some("backend"),
+            csrf,
+        )
+        .await;
+    }
+
+    let site = prefill();
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_site(&db, &site);
@@ -187,7 +274,16 @@ pub async fn handle_update(
             app.reload_indexes().await;
             Ok(redirect_response("/admin/sites"))
         }
-        Err(e) => render_edit_page_with_error(app, &name, &format!("Database error: {}", e), csrf),
+        Err(e) => {
+            render_edit_page_with_error(
+                app,
+                prefill(),
+                &format!("Database error: {}", e),
+                None,
+                csrf,
+            )
+            .await
+        }
     }
 }
 
@@ -207,52 +303,51 @@ pub async fn handle_delete(
     Ok(redirect_response("/admin/sites"))
 }
 
-fn render_create_page_with_error(
-    site: Option<pangolin_core::types::Site>,
+async fn render_create_page_with_error(
+    app: &Arc<App>,
+    prefill: Option<pangolin_core::types::Site>,
     error: &str,
+    field_error: Option<&'static str>,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    // The tunnels list isn't strictly required to re-render with an error
-    // (the form will be re-submitted), but fetching it keeps the form
-    // consistent if the user retries without reloading the page.
-    let _ = site;
+    // Re-fetch tunnels so the tunnel-mode select has options. Cheap (tiny
+    // table) and only on the error path.
+    let tunnels = {
+        let db = app.db.lock().await;
+        pangolin_core::db::list_tuns(&db).unwrap_or_default()
+    };
     let html = SiteFormTemplate {
-        site: None,
+        site: prefill,
         action: "create",
         error: Some(error),
+        field_error,
         active_nav: "sites",
-        tunnels: Vec::new(),
+        tunnels,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-fn render_edit_page_with_error(
-    _app: &Arc<App>,
-    name: &str,
+async fn render_edit_page_with_error(
+    app: &Arc<App>,
+    prefill: pangolin_core::types::Site,
     error: &str,
+    field_error: Option<&'static str>,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    // Re-render the edit page with the existing backend value (we don't
-    // have the original row here without a DB lookup, so just show the
-    // error message). In practice users will fix and resubmit.
-    let stub = Site {
-        name: name.to_string(),
-        backend: String::new(),
-        enabled: true,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        host_mode: HostMode::Passthrough,
-        host_custom: None,
-        domain_count: 0,
+    // Re-fetch tunnels so the tunnel-mode select has options.
+    let tunnels = {
+        let db = app.db.lock().await;
+        pangolin_core::db::list_tuns(&db).unwrap_or_default()
     };
     let html = SiteFormTemplate {
-        site: Some(stub),
+        site: Some(prefill),
         action: "update",
         error: Some(error),
+        field_error,
         active_nav: "sites",
-        tunnels: Vec::new(),
+        tunnels,
     }
     .render()
     .unwrap();

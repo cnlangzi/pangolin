@@ -41,6 +41,11 @@ pub struct SiteFormTemplate<'a> {
     pub site: Option<Site>,
     pub action: &'a str,
     pub error: Option<&'a str>,
+    /// When set to a field name ("backend", "name"), an inline error is
+    /// rendered next to that specific field, in addition to the summary
+    /// alert at the top of the form. The summary alert is driven by
+    /// `error`; this is just the field-level highlight.
+    pub field_error: Option<&'a str>,
     pub active_nav: &'a str,
     /// Available tunnel names, for the hierarchical backend URL form's
     /// "Tunnel" dropdown. Templates should never render an empty list
@@ -87,6 +92,31 @@ impl<'a> SiteFormTemplate<'a> {
         self.site
             .as_ref()
             .map(|s| s.backend_host_port())
+            .unwrap_or("")
+    }
+    /// True when the `backend` field is the one that triggered the error.
+    /// The template uses this to render an inline error message and a
+    /// red border on the host:port input.
+    pub fn backend_has_error(&self) -> bool {
+        self.field_error == Some("backend")
+    }
+    /// True when the `name` field is the one that triggered the error.
+    pub fn name_has_error(&self) -> bool {
+        self.field_error == Some("name")
+    }
+    /// Whether the host_custom field should be visible (only when the
+    /// existing/new site is in custom host mode).
+    pub fn show_host_custom(&self) -> bool {
+        self.site
+            .as_ref()
+            .map(|s| s.is_host_mode_custom())
+            .unwrap_or(false)
+    }
+    /// Pre-fill value for the host_custom input.
+    pub fn host_custom_value(&self) -> &str {
+        self.site
+            .as_ref()
+            .and_then(|s| s.host_custom.as_deref())
             .unwrap_or("")
     }
 }

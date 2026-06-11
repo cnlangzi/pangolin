@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if let Some(_) = site %}Edit site{% else %}New site{% endif %} — Pangolin{% endblock %}
+{% block title %}{% if action == "update" %}Edit site{% else %}New site{% endif %} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
@@ -10,14 +10,14 @@
       Back to sites
     </a>
     <h1 class="mt-2 text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">
-      {% if let Some(_) = site %}Edit site{% else %}New site{% endif %}
+      {% if action == "update" %}Edit site{% else %}New site{% endif %}
     </h1>
     <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
       Configure the upstream backend for this site
     </p>
   </div>
 
-  <form method="POST" action="{% if let Some(s) = site %}/admin/sites/edit?name={{ s.name }}{% else %}/admin/sites/new{% endif %}" class="card p-6 space-y-4">
+  <form method="POST" action="{% if action == "update" %}/admin/sites/edit?name={% if let Some(s) = site %}{{ s.name }}{% endif %}{% else %}/admin/sites/new{% endif %}" class="card p-6 space-y-5">
     <input type="hidden" name="_csrf" value="__CSRF__">
     {# The actual backend string sent to the server. JS keeps this in sync
        with the hierarchical form below — the server-side parser is the
@@ -25,18 +25,49 @@
     <input type="hidden" name="backend" id="site-backend-hidden"
       value="{% if let Some(s) = site %}{{ s.backend }}{% endif %}">
 
-    {% if let Some(s) = site %}
+    {# Summary error alert at the top of the form. Field-level errors are
+       also rendered inline next to the offending field. The summary stays
+       for context, with clear spacing from the rest of the form. #}
+    {% if let Some(e) = error %}
+    <div id="form-error-summary" role="alert" class="flex items-start gap-3 p-3.5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-500/30 rounded-lg">
+      <svg class="w-5 h-5 flex-shrink-0 text-red-500 dark:text-red-400 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+      </svg>
+      <div class="flex-1 min-w-0">
+        <p class="text-sm font-medium text-red-800 dark:text-red-200">{{ e }}</p>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if action == "update" %}
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">Name</label>
-      <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-600 dark:text-slate-300 font-mono">{{ s.name }}</div>
+      <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-600 dark:text-slate-300 font-mono">{% if let Some(s) = site %}{{ s.name }}{% endif %}</div>
     </div>
     {% else %}
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-name">Name</label>
       <input type="text" name="name" id="site-name" required
-        class="input"
+        value="{% if let Some(s) = site %}{{ s.name }}{% endif %}"
+        class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+          {% if self.name_has_error() %}
+          border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+          {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+          {% endif %}"
         placeholder="my-site">
+      {% if let Some(e) = error %}
+        {% if self.name_has_error() %}
+        <p class="text-xs text-red-600 dark:text-red-400 mt-1 flex items-center gap-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+          {{ e }}
+        </p>
+        {% else %}
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+        {% endif %}
+      {% else %}
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+      {% endif %}
     </div>
     {% endif %}
 
@@ -82,7 +113,12 @@
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">Protocol</label>
               <select id="site-backend-direct-protocol"
-                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
                 <option value="http"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "http" %} selected{% endif %}>http</option>
                 <option value="https"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "https" %} selected{% endif %}>https</option>
                 <option value="file"{% if self.initial_route_mode() == "direct" && self.initial_scheme() == "file" %} selected{% endif %}>file</option>
@@ -92,11 +128,25 @@
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">Host:port</label>
               <input type="text" id="site-backend-direct"
                 value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ self.initial_host_port() }}{% endif %}{% endif %}"
-                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+                class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}"
                 placeholder="127.0.0.1:8080">
             </div>
           </div>
+          {% if self.backend_has_error() %}
+            {% if let Some(e) = error %}
+            <p id="backend-inline-error" class="text-xs text-red-600 dark:text-red-400 mt-1.5 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+              {{ e }}
+            </p>
+            {% endif %}
+          {% else %}
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">e.g. <code class="font-mono">http://127.0.0.1:8080</code> or <code class="font-mono">file:///var/www/static</code></p>
+          {% endif %}
         </div>
 
         {# Tunnel mode: tunnel dropdown + protocol + host:port #}
@@ -110,7 +160,12 @@
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
               <select id="site-backend-tunnel"
-                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
                 {% for t in tunnels %}
                 <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} (online){% else %} (offline){% endif %}</option>
                 {% endfor %}
@@ -119,7 +174,12 @@
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-protocol">Protocol</label>
               <select id="site-backend-protocol"
-                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+                class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}">
                 <option value="http"{% if self.initial_scheme() == "http" %} selected{% endif %}>http</option>
                 <option value="https"{% if self.initial_scheme() == "https" %} selected{% endif %}>https</option>
                 <option value="file"{% if self.initial_scheme() == "file" %} selected{% endif %}>file</option>
@@ -129,11 +189,27 @@
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-host">Host:port</label>
               <input type="text" id="site-backend-host"
                 value="{{ self.initial_host_port() }}"
-                class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+                class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
+                  {% if self.backend_has_error() %}
+                  border-2 border-red-500 dark:border-red-400 bg-red-50 dark:bg-red-900/20 text-slate-900 dark:text-slate-100 focus:border-red-500 focus:ring-red-500
+                  {% else %}
+  border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
+                  {% endif %}"
                 placeholder="127.0.0.1:8080">
             </div>
           </div>
+          {% if self.backend_has_error() %}
+            {% if let Some(e) = error %}
+            <p class="text-xs text-red-600 dark:text-red-400 mt-1.5 flex items-center gap-1">
+              <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+              {{ e }}
+            </p>
+            {% else %}
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+            {% endif %}
+          {% else %}
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+          {% endif %}
           {% endif %}
         </div>
       </div>
@@ -151,28 +227,19 @@
     </div>
 
     <div id="host-custom-wrapper">
-      {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}
+      {% if self.show_host_custom() %}
       <div>
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
         <input type="text" name="host_custom" id="host-custom"
-          value="{% if let Some(hc) = s.host_custom %}{{ hc }}{% endif %}"
+          value="{{ self.host_custom_value() }}"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
           placeholder="e.g. internal.example.com">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
-      {% endif %}{% endif %}
+      {% endif %}
     </div>
 
-    {% if let Some(e) = error %}
-    <div class="alert-error text-sm">
-      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
-      </svg>
-      <span>{{ e }}</span>
-    </div>
-    {% endif %}
-
-    <div class="flex gap-2 pt-2">
+    <div class="flex gap-2 pt-1">
       <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if let Some(_) = site %}Update{% else %}Create{% endif %}</button>
       <a href="/admin/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
     </div>
@@ -180,10 +247,13 @@
 </main>
 {% endblock %}
 
-{# Keep the hidden backend field in sync with whichever UI group is shown. #}
+{# Keep the hidden backend field in sync with whichever UI group is shown.
+   Also: client-side guard against submitting an empty backend (e.g. user
+   picked Direct/File but didn't fill in the host:port). #}
 {% block scripts %}
 <script>
 (function() {
+  const form = document.querySelector('form[method="POST"]');
   const directFields = document.getElementById('backend-direct-fields');
   const tunnelFields = document.getElementById('backend-tunnel-fields');
   const hidden = document.getElementById('site-backend-hidden');
@@ -240,6 +310,45 @@
   if (tunnelSelect) tunnelSelect.addEventListener('change', updateHidden);
   if (protocolSelect) protocolSelect.addEventListener('change', updateHidden);
   if (hostInput) hostInput.addEventListener('input', updateHidden);
+
+  // Client-side guard: never let an empty backend reach the server. If the
+  // user picked Direct/File but left host:port blank (or picked Tunnel
+  // without selecting one), show an inline error and stop the submit.
+  // This handles the case where the JS update race causes the hidden
+  // field to be empty even though the user thinks they filled it in.
+  if (form) {
+    form.addEventListener('submit', function(e) {
+      updateHidden();
+      if (!hidden.value || hidden.value === '://' || hidden.value.endsWith('://')) {
+        e.preventDefault();
+        showBackendError('Backend is required — fill in the host:port (or file path) field');
+        // Focus the empty input so the user can fix it immediately.
+        if (directInput && !directFields.classList.contains('hidden') && !directInput.value.trim()) {
+          directInput.focus();
+        } else if (hostInput && !hostInput.value.trim()) {
+          hostInput.focus();
+        }
+      }
+    });
+  }
+
+  function showBackendError(msg) {
+    // Reuse the server-rendered error display: inject a top summary + a
+    // red border on the host:port inputs.
+    let summary = document.getElementById('form-error-summary');
+    if (!summary) {
+      summary = document.createElement('div');
+      summary.id = 'form-error-summary';
+      summary.setAttribute('role', 'alert');
+      summary.className = 'flex items-start gap-3 p-3.5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-500/30 rounded-lg';
+      summary.innerHTML = '<svg class="w-5 h-5 flex-shrink-0 text-red-500 dark:text-red-400 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg><div class="flex-1 min-w-0"><p class="text-sm font-medium text-red-800 dark:text-red-200"></p></div>';
+      form.insertBefore(summary, form.firstChild);
+    }
+    summary.querySelector('p').textContent = msg;
+    // Highlight the empty input(s).
+    if (directInput) directInput.classList.add('border-red-500', 'border-2', 'bg-red-50', 'dark:bg-red-900/20');
+    if (hostInput) hostInput.classList.add('border-red-500', 'border-2', 'bg-red-50', 'dark:bg-red-900/20');
+  }
 
   // Initialise on page load so the hidden field always matches the visible
   // form (handles the edit case where the server pre-filled the hidden
