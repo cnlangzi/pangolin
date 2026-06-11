@@ -7,10 +7,10 @@ Type=simple
 User=pangolin
 Group=pangolin
 WorkingDirectory=/opt/pangolin
-# tun takes CLI args (--server/--token/--name), not a config file.
-# Values come from the env file written by Ansible from hosts vars.
-EnvironmentFile=/opt/pangolin/tun.env
-ExecStart=/opt/pangolin/tun --server ${TUN_SERVER} --token ${TUN_TOKEN} --name ${TUN_NAME}
+# tun reads its config from /opt/pangolin/tun.yml (a single YAML file
+# managed by Ansible — see roles/tun/templates/tun.yml.j2). Override
+# the path with `--config` if needed.
+ExecStart=/opt/pangolin/tun --config /opt/pangolin/tun.yml
 ExecReload=/bin/kill -SIGUSR2 $MAINPID
 Restart=on-failure
 RestartSec=5s

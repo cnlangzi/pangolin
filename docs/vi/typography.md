@@ -1,5 +1,20 @@
 # 字体排版规范
 
+> Tailwind utility 直接用,不用 `@apply` 组件类。详见 `../vi/components.md` 与 `../vi/tailwind-idioms.md`。
+
+## 开发怎么用
+
+```html
+<h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">标题</h1>
+<p class="text-sm text-slate-600 dark:text-slate-300">副文本</p>
+<code class="font-mono text-xs">code</code>
+```
+
+- 标题统一用 `text-slate-900 dark:text-white`
+- 副文本用 `text-slate-600 dark:text-slate-300`
+- 不直接用 `text-gray-*`(统一走 `slate`)
+- 等宽字用 `font-mono` + `text-xs` 或 `text-sm`
+
 ## 字体栈
 
 ### 通用字体（Sans-serif）

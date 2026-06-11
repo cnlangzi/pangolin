@@ -475,8 +475,7 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
 // ---------------------------------------------------------------------------
 
 fn make_indexes(sites: Vec<Site>, domains: Vec<Domain>) -> Indexes {
-    let tokens = vec![];
-    Indexes::build(sites, domains, &tokens, chrono::Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// e2e_direct_http_get — HTTP GET through proxy → 200 + JSON body

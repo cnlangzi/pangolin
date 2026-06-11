@@ -232,6 +232,7 @@ pub struct NgxProcess {
     pub admin_port: u16,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
+    pub cert_dir: PathBuf,
     pub log: Arc<Mutex<Vec<u8>>>,
     // tokio tasks draining the child's stdout/stderr into `log`. We
     // hold the JoinHandles so Drop can `abort()` them — otherwise they
@@ -271,11 +272,14 @@ impl NgxProcess {
 
         let config = format!(
             r#"
-server:
-  port: {http}
-  tls_port: {tls}
-  tunnel_port: {tunnel_port}
-  host: default
+addr:
+  http: "127.0.0.1:{http}"
+  https: "127.0.0.1:{tls}"
+host: default
+
+tunnel:
+  addr: "127.0.0.1:{tunnel_port}"
+  ws_path: /tunnel
 
 log:
   level: info
@@ -283,10 +287,10 @@ log:
 admin:
   addr: 127.0.0.1:{admin}
 
-cert:
+acme:
   cert_dir: "{cert_dir}"
   email: ""
-  autorenew: false
+  # v2: no global autorenew — per-domain auto_issue lives in the DB
 "#,
             http = http_port,
             tls = tls_port,
@@ -294,11 +298,8 @@ cert:
             admin = admin_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
         );
-        let config_path = tmpdir.path().join("pangolin.yml");
-        // we keep the `cert_dir` in scope (above) so the test's Drop
-        // impl that points at the cert path doesn't race the tmpdir
-        // teardown. _cert_dir is a no-op; just suppress the warning.
-        std::fs::write(&config_path, config).expect("write pangolin.yml");
+        let config_path = tmpdir.path().join("ngx.yml");
+        std::fs::write(&config_path, config).expect("write ngx.yml");
 
         // The binary creates pangolin.db at runtime in CWD. We want
         // it in our tempdir so the test owns the DB lifecycle.
@@ -354,6 +355,7 @@ cert:
             admin_port,
             data_dir,
             config_path,
+            cert_dir,
             log,
             _tmpdir: tmpdir,
         }
@@ -370,20 +372,7 @@ cert:
     /// callback loads blobs from here. Use [`gen_self_signed`] to
     /// install a per-host cert before connecting with TLS+SNI.
     pub fn cert_dir(&self) -> PathBuf {
-        // The cert dir lives in the tempdir next to pangolin.yml.
-        // We can't plumb a typed field through `start` without
-        // breaking every test, so derive it from the config we
-        // wrote. Cheap and unambiguous.
-        let cfg = std::fs::read_to_string(&self.config_path).expect("read pangolin.yml");
-        for line in cfg.lines() {
-            if let Some(rest) = line.trim_start().strip_prefix("cert_dir:") {
-                let p = rest.trim().trim_matches('"').trim_matches('\'');
-                if !p.is_empty() {
-                    return PathBuf::from(p);
-                }
-            }
-        }
-        panic!("cert_dir not found in pangolin.yml")
+        self.cert_dir.clone()
     }
 
     /// Drain the captured log into a String for diagnostic asserts.
@@ -434,6 +423,9 @@ pub struct TunProcess {
     pub name: String,
     pub log: Arc<Mutex<Vec<u8>>>,
     log_tasks: Vec<JoinHandle<()>>,
+    // Hold the tempdir so it isn't dropped (and deleted) before the
+    // child finishes reading the config it points at.
+    _config_tmpdir: TempDir,
 }
 
 impl TunProcess {
@@ -449,22 +441,33 @@ impl TunProcess {
                 bin.display()
             );
         }
-        // tun's `--server` is documented as `host:port` (e.g.
-        // `ngx.example.com:8080`); the binary naively formats
-        // `ws://{server}/tunnel?...`, so passing `http://...` would
-        // produce the malformed URL `ws://http://...`. Strip any
-        // scheme to keep tun happy.
-        //
-        // The address here is the **tunnel** port (where ngx's WS
-        // tunnel server listens), not the admin port.
+        // tun now reads its config from `tun.yml` (the old
+        // `--server` / `--name` / `--token` CLI args were removed
+        // when the configs were split). The address here is the
+        // **tunnel** port (where ngx's WS tunnel server listens),
+        // not the admin port.
         let server = format!("127.0.0.1:{}", ngx.tunnel_port);
+        let tun_config = format!(
+            r#"
+server: {server}
+name: {name}
+token: {token}
+log:
+  level: debug
+"#,
+            server = server,
+            name = name,
+            token = token,
+        );
+        let tmpdir = tempfile::tempdir().expect("tempdir for tun config");
+        let config_path = tmpdir.path().join("tun.yml");
+        std::fs::write(&config_path, &tun_config).expect("write tun.yml");
+        // tmpdir is moved into Self below so it lives as long as the
+        // child process (and is dropped after the child is killed in
+        // `Drop`).
+
         let mut cmd = Command::new(&bin);
-        cmd.arg("--server")
-            .arg(&server)
-            .arg("--name")
-            .arg(name)
-            .arg("--token")
-            .arg(token);
+        cmd.arg("--config").arg(&config_path);
         cmd.kill_on_drop(true);
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
@@ -496,6 +499,7 @@ impl TunProcess {
             name: name.to_string(),
             log,
             log_tasks,
+            _config_tmpdir: tmpdir,
         }
     }
 

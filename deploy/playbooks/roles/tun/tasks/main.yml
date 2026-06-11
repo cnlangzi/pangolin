@@ -29,11 +29,11 @@
     backup: yes
   notify: restart tun
 
-- name: Upload tun env file
+- name: Upload tun config
   become: true
   template:
-    src: tun.env.j2
-    dest: /opt/pangolin/tun.env
+    src: tun.yml.j2
+    dest: /opt/pangolin/tun.yml
     owner: pangolin
     group: pangolin
     mode: 0600

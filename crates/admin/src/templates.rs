@@ -2,7 +2,7 @@
 
 use askama::Template;
 use chrono::{DateTime, Utc};
-use pangolin_core::types::{Cert, DnsProvider, Domain, Site, Token, Tun};
+use pangolin_core::types::{Cert, DnsProvider, Domain, Site, Tun};
 
 // ─── Login ──────────────────────────────────────────────────────────────────────
 
@@ -22,7 +22,6 @@ pub struct DashboardTemplate<'a> {
     pub domain_count: usize,
     pub online_tun_count: usize,
     pub total_tun_count: usize,
-    pub token_count: usize,
     pub cert_count: usize,
     pub active_nav: &'a str,
 }
@@ -240,23 +239,6 @@ pub struct TunnelsTemplate<'a> {
     pub active_nav: &'a str,
 }
 
-// ─── Tokens ────────────────────────────────────────────────────────────────────
-
-#[derive(Template)]
-#[template(path = "tokens.html")]
-pub struct TokensTemplate<'a> {
-    pub tokens: Vec<Token>,
-    pub active_nav: &'a str,
-}
-
-#[derive(Template)]
-#[template(path = "tokens_form.html")]
-pub struct TokenFormTemplate<'a> {
-    pub token: Option<Token>,
-    pub error: Option<&'a str>,
-    pub active_nav: &'a str,
-}
-
 // ─── Certs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -308,6 +290,23 @@ pub struct DnsProviderFormTemplate<'a> {
     pub is_edit: bool,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+
+    /// Cloudflare credential. On edit, only `cf_token_set` is meaningful;
+    /// the raw token is never echoed to the browser.
+    pub cf_token: Option<String>,
+    pub cf_token_set: bool,
+
+    /// Aliyun credentials. `access_key_id` is plaintext (not a secret in
+    /// the same sense); `access_key_secret` is a secret.
+    pub aliyun_ak_id: Option<String>,
+    pub aliyun_ak_secret: Option<String>,
+    pub aliyun_ak_secret_set: bool,
+    pub aliyun_region: Option<String>,
+
+    /// Tencent credentials. `secret_id` is plaintext; `secret_key` is a secret.
+    pub tencent_secret_id: Option<String>,
+    pub tencent_secret_key: Option<String>,
+    pub tencent_secret_key_set: bool,
 }
 
 impl<'a> DnsProviderFormTemplate<'a> {
@@ -319,26 +318,37 @@ impl<'a> DnsProviderFormTemplate<'a> {
             .map(|p| p.name.as_str())
             .unwrap_or("")
     }
-    pub fn config_value(&self) -> &str {
-        self.provider
-            .as_ref()
-            .map(|p| p.config.as_str())
-            .unwrap_or("")
-    }
-    /// Returns true if the given kind string matches the provider's current
-    /// kind. Used by the <select> to mark the right <option> as selected.
-    pub fn is_kind(&self, kind: &str) -> bool {
-        let current = match self.provider.as_ref().map(|p| p.kind) {
+    /// String form of the current kind, used by the radiogroup's `checked`
+    /// attribute and the `is_kind(...)` helper.
+    pub fn kind_value(&self) -> &'static str {
+        match self.provider.as_ref().map(|p| p.kind) {
             Some(pangolin_core::DnsProviderKind::Cloudflare) => "cloudflare",
             Some(pangolin_core::DnsProviderKind::Aliyun) => "aliyun",
             Some(pangolin_core::DnsProviderKind::Tencent) => "tencent",
-            None => "",
-        };
-        current == kind
+            None => "cloudflare",
+        }
+    }
+    /// Returns true if the given kind string matches the provider's current
+    /// kind. Used by the radiogroup to mark the right card as selected.
+    pub fn is_kind(&self, kind: &str) -> bool {
+        self.kind_value() == kind
     }
     /// Whether the enabled checkbox should render as checked. Defaults to
     /// `true` for the "new" form.
     pub fn enabled_checked(&self) -> bool {
         self.provider.as_ref().map(|p| p.enabled).unwrap_or(true)
+    }
+    /// Pre-filled Aliyun access key id for the edit form. Empty string for
+    /// the "new" form unless the caller seeded it from query state.
+    pub fn aliyun_ak_id_value(&self) -> &str {
+        self.aliyun_ak_id.as_deref().unwrap_or("")
+    }
+    /// Pre-selected Aliyun region. Defaults to `cn-hangzhou`.
+    pub fn aliyun_region_value(&self) -> &str {
+        self.aliyun_region.as_deref().unwrap_or("cn-hangzhou")
+    }
+    /// Pre-filled Tencent secret id for the edit form.
+    pub fn tencent_secret_id_value(&self) -> &str {
+        self.tencent_secret_id.as_deref().unwrap_or("")
     }
 }

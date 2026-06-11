@@ -11,10 +11,11 @@ rusqlite.workspace = true
 refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+figment.workspace = true
 log.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+env_logger.workspace = true
 rmp-serde.workspace = true
 flate2.workspace = true
 tokio = { workspace = true, optional = true }

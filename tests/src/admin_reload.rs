@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use pangolin_core::db;
 use pangolin_core::index::Indexes;
-use pangolin_core::types::{Domain, HostMode, Site, Token};
+use pangolin_core::types::{Domain, HostMode, Site};
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -29,8 +29,7 @@ fn temp_conn() -> (TempDir, Connection) {
 fn build_indexes(conn: &Connection) -> Indexes {
     let sites = db::list_sites(conn).unwrap();
     let domains = db::list_domains(conn).unwrap();
-    let tokens = db::list_tokens(conn).unwrap();
-    Indexes::build(sites, domains, &tokens, Utc::now())
+    Indexes::build(sites, domains)
 }
 
 /// admin_reload_site — insert site → rebuild indexes → domain lookup finds it
@@ -104,8 +103,7 @@ fn admin_reload_domain() {
     // Verify indexes lookup works
     let domains = db::list_domains(&conn).unwrap();
     let sites = db::list_sites(&conn).unwrap();
-    let tokens = db::list_tokens(&conn).unwrap();
-    let indexes = Indexes::build(sites, domains, &tokens, Utc::now());
+    let indexes = Indexes::build(sites, domains);
 
     let result = pangolin_core::index::lookup_site(&indexes, "new.example.com");
     assert!(result.is_some());
@@ -144,18 +142,19 @@ fn admin_reload_tun() {
     // Insert tun
     let tun = pangolin_core::types::Tun {
         name: "office".into(),
+        token: None,
         enabled: true,
         online: false,
         registered_at: None,
         last_seen_at: None,
+        expires_at: None,
     };
     db::upsert_tun(&conn, &tun).unwrap();
 
     // Rebuild indexes
     let domains = db::list_domains(&conn).unwrap();
     let sites = db::list_sites(&conn).unwrap();
-    let tokens = db::list_tokens(&conn).unwrap();
-    let indexes = Indexes::build(sites, domains, &tokens, Utc::now());
+    let indexes = Indexes::build(sites, domains);
 
     // Tun index should contain 'office' → site 'tun-site'
     let tun_entry = indexes.tun.get("office");
@@ -167,45 +166,7 @@ fn admin_reload_tun() {
     );
 }
 
-/// admin_reload_token — add/enable/disable token → token index reflects state
-#[test]
-fn admin_reload_token() {
-    let (_dir, conn) = temp_conn();
-
-    // Insert token (enabled)
-    let token = Token {
-        token: "reload-token".into(),
-        enabled: true,
-        created_at: Utc::now(),
-        expires_at: None,
-    };
-    db::upsert_token(&conn, &token).unwrap();
-
-    let indexes = build_indexes(&conn);
-    assert_eq!(
-        indexes.token.get("reload-token"),
-        Some(&true),
-        "enabled token should be active"
-    );
-
-    // Disable token
-    let mut updated = token.clone();
-    updated.enabled = false;
-    db::upsert_token(&conn, &updated).unwrap();
-
-    let indexes = build_indexes(&conn);
-    assert_eq!(
-        indexes.token.get("reload-token"),
-        Some(&false),
-        "disabled token should be inactive"
-    );
-
-    // Delete token
-    db::delete_token(&conn, "reload-token").unwrap();
-    let indexes = build_indexes(&conn);
-    assert_eq!(
-        indexes.token.get("reload-token"),
-        None,
-        "deleted token should be absent"
-    );
-}
+// `admin_reload_token` removed in v2: the in-memory `indexes.token`
+// was dropped when tokens were merged into `tun`. WS auth is now a
+// single SQL (`auth_tun`) and is exercised by
+// `tests/src/auth.rs::auth_*` plus the e2e `real_e2e_tunnel_*`.

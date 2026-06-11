@@ -8,12 +8,16 @@
 //!
 //! This is intentionally simpler than the originally-proposed
 //! `domainIndex + wildcardList` design (over-engineered, removed).
+//!
+//! v2: the in-memory `token` index is gone. WS auth is now a single
+//! `auth_tun(name, token)` SQL query against the `tun` table, so there
+//! is no need to mirror tokens into memory on startup.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
-use crate::types::{Domain, Site, Token};
+use crate::types::{Domain, Site};
 
 /// Site + its domains, as assembled in `Indexes::build`.
 /// Used for `rebuild_tun_index` which needs the relationship.
@@ -31,8 +35,6 @@ pub struct Indexes {
     pub domain: HashMap<String, Arc<Site>>,
     /// tun_name → domains that route through that tun
     pub tun: HashMap<String, Vec<Arc<Domain>>>,
-    /// token string → enabled (and not expired)
-    pub token: HashMap<String, bool>,
 }
 
 impl Indexes {
@@ -45,12 +47,7 @@ impl Indexes {
     /// `sites` and `domains` are joined in-memory (one site has many
     /// domains). The relationship is logical: `domains[i].site_name`
     /// must match a `sites[j].name`, otherwise the domain is dropped.
-    pub fn build(
-        sites: Vec<Site>,
-        domains: Vec<Domain>,
-        tokens: &[Token],
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
+    pub fn build(sites: Vec<Site>, domains: Vec<Domain>) -> Self {
         // 1. Wrap sites in Arc and group domains by site_name.
         let mut sites_arc: Vec<Arc<Site>> = sites.into_iter().map(Arc::new).collect();
         // Sort sites by name for deterministic iteration order.
@@ -91,27 +88,11 @@ impl Indexes {
         // 4. tunIndex: sites whose backend has `tun_name:` prefix.
         let tun_idx = rebuild_tun_index(&sites_with_domains);
 
-        // 5. tokenIndex: enabled and not expired.
-        let token_idx = build_token_index(tokens, now);
-
         Self {
             domain: domain_idx,
             tun: tun_idx,
-            token: token_idx,
         }
     }
-}
-
-fn build_token_index(
-    tokens: &[Token],
-    now: chrono::DateTime<chrono::Utc>,
-) -> HashMap<String, bool> {
-    let mut idx = HashMap::new();
-    for t in tokens {
-        let active = t.enabled && t.expires_at.map(|e| e > now).unwrap_or(true);
-        idx.insert(t.token.clone(), active);
-    }
-    idx
 }
 
 /// Build the `tunIndex` map: tun_name → list of domains that route
@@ -210,21 +191,11 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    fn make_token(token: &str, enabled: bool) -> Token {
-        Token {
-            token: token.into(),
-            enabled,
-            created_at: Utc::now(),
-            expires_at: None,
-        }
-    }
-
     #[test]
     fn exact_match() {
         let sites = vec![make_site("app", "http://127.0.0.1:8080")];
         let domains = vec![make_domain("app.example.com", "app")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "app.example.com").unwrap();
         assert_eq!(s.name, "app");
     }
@@ -233,7 +204,7 @@ mod tests {
     fn exact_match_normalizes_case_and_port() {
         let sites = vec![make_site("app", "http://127.0.0.1:8080")];
         let domains = vec![make_domain("app.example.com", "app")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
 
         assert!(lookup_site(&idx, "App.Example.COM:8443").is_some());
     }
@@ -242,7 +213,7 @@ mod tests {
     fn wildcard_match() {
         let sites = vec![make_site("wild", "office:http://192.168.1.1:8080")];
         let domains = vec![make_domain("*.example.com", "wild")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "foo.example.com").unwrap();
         assert_eq!(s.name, "wild");
     }
@@ -259,7 +230,7 @@ mod tests {
             make_domain("*.example.com", "short"),
             make_domain("*.foo.example.com", "long"),
         ];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "x.foo.example.com").unwrap();
         assert_eq!(s.name, "long");
     }
@@ -269,7 +240,7 @@ mod tests {
         // Devin's correction: wildcard + tunnel is legitimate.
         let sites = vec![make_site("wild", "office:http://192.168.1.1:8080")];
         let domains = vec![make_domain("*.example.com", "wild")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "foo.example.com").unwrap();
         assert_eq!(s.name, "wild");
         // tunIndex has 'office' (not empty)
@@ -280,7 +251,7 @@ mod tests {
     fn no_match_returns_none() {
         let sites = vec![make_site("app", "http://x:8080")];
         let domains = vec![make_domain("app.example.com", "app")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert!(lookup_site(&idx, "other.com").is_none());
         assert!(lookup_site(&idx, "unknown.example.com").is_none());
     }
@@ -299,7 +270,7 @@ mod tests {
             make_domain("c1.example.com", "c"),
             make_domain("d1.example.com", "d"),
         ];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert_eq!(idx.tun.get("office").unwrap().len(), 2);
         assert_eq!(idx.tun.get("home").unwrap().len(), 1);
         assert!(!idx.tun.contains_key("direct"));
@@ -310,7 +281,7 @@ mod tests {
         // Critical: tun='home' must NOT match site backend='homestay:...'
         let sites = vec![make_site("a", "homestay:http://x:8080")];
         let domains = vec![make_domain("a.example.com", "a")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert!(!idx.tun.contains_key("home"));
         assert!(idx.tun.contains_key("homestay"));
     }
@@ -326,7 +297,7 @@ mod tests {
             dns_provider: None,
             created_at: Utc::now(),
         }];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert!(lookup_site(&idx, "app.example.com").is_none());
     }
 
@@ -343,7 +314,7 @@ mod tests {
             domain_count: 0,
         }];
         let domains = vec![make_domain("app.example.com", "app")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert!(lookup_site(&idx, "app.example.com").is_none());
     }
 
@@ -355,48 +326,9 @@ mod tests {
             make_domain("app.example.com", "app"),
             make_domain("orphan.example.com", "nonexistent"),
         ];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         assert!(lookup_site(&idx, "app.example.com").is_some());
         assert!(lookup_site(&idx, "orphan.example.com").is_none());
-    }
-
-    #[test]
-    fn token_index_active_and_expired() {
-        let now = Utc::now();
-        let past = now - chrono::Duration::hours(1);
-        let future = now + chrono::Duration::hours(1);
-
-        let tokens = vec![
-            Token {
-                token: "active".into(),
-                enabled: true,
-                created_at: now,
-                expires_at: None,
-            },
-            Token {
-                token: "future".into(),
-                enabled: true,
-                created_at: now,
-                expires_at: Some(future),
-            },
-            Token {
-                token: "past".into(),
-                enabled: true,
-                created_at: now,
-                expires_at: Some(past),
-            },
-            Token {
-                token: "disabled".into(),
-                enabled: false,
-                created_at: now,
-                expires_at: None,
-            },
-        ];
-        let idx = Indexes::build(vec![], vec![], &tokens, now);
-        assert_eq!(idx.token.get("active"), Some(&true));
-        assert_eq!(idx.token.get("future"), Some(&true));
-        assert_eq!(idx.token.get("past"), Some(&false));
-        assert_eq!(idx.token.get("disabled"), Some(&false));
     }
 
     #[test]
@@ -406,7 +338,7 @@ mod tests {
         // to the site; request-time parse will fail with 502).
         let sites = vec![make_site("a", "ftp://x:21")];
         let domains = vec![make_domain("a.example.com", "a")];
-        let idx = Indexes::build(sites, domains, &[], Utc::now());
+        let idx = Indexes::build(sites, domains);
         // domainIndex has the site (we don't validate backend at build)
         assert!(lookup_site(&idx, "a.example.com").is_some());
         // but tunIndex is empty

@@ -1,14 +1,56 @@
-{% extends "base.html" %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ site.name }}: Domains — Pangolin</title>
+<link href="/admin/app.css?v=__CSS_HASH__" rel="stylesheet">
+</head>
+<body class="bg-slate-100 dark:bg-slate-900 min-h-screen font-sans antialiased text-slate-900 dark:text-slate-100">
 
-{% block title %}{{ site.name }}: Domains — Pangolin{% endblock %}
+<header class="sticky top-0 z-50 bg-slate-900 dark:bg-slate-800 border-b border-slate-700 shadow-sm">
+  <div class="flex items-center justify-between px-4 py-3 max-w-7xl mx-auto">
+    <a href="/admin/" class="flex items-center gap-2.5 text-white font-bold text-lg">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent-500 to-accent-600 flex items-center justify-center shadow">
+        <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <span class="hidden sm:inline">Pangolin</span>
+    </a>
+    <nav class="hidden md:flex items-center gap-1">
+      <a href="/admin/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Dashboard</a>
+      <a href="/admin/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
+      <a href="/admin/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Domains</a>
+      <a href="/admin/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Tunnels</a>
+      <a href="/admin/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Certs</a>
+    </nav>
+    <div class="flex items-center gap-2">
+      <form method="POST" action="/admin/logout" class="hidden md:block">
+        <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-1.5 rounded hover:bg-slate-700">Sign out</button>
+      </form>
+      <button id="menu-toggle" class="md:hidden text-slate-300 hover:text-white p-1">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+    </div>
+  </div>
+  <nav id="mobile-nav" class="hidden md:hidden border-t border-slate-700 px-4 py-3 space-y-1">
+    <a href="/admin/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Dashboard</a>
+    <a href="/admin/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
+    <a href="/admin/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Domains</a>
+    <a href="/admin/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Tunnels</a>
+    <a href="/admin/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Certs</a>
+    <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
+      <button type="submit" class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-slate-800">Sign out</button>
+    </form>
+  </nav>
+</header>
 
-{% block content %}
-<main class="px-4 py-6 md:px-6 md:py-6 max-w-7xl mx-auto">
-  {# Breadcrumb #}
-  <div class="flex items-center gap-1.5 text-sm text-slate-500 mb-4">
-    <a href="/admin/sites" class="hover:text-accent-500 transition-colors">Sites</a>
+<main class="px-4 py-6 md:px-6 max-w-7xl mx-auto">
+  <div class="flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400 mb-4">
+    <a href="/admin/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-    <span class="text-slate-800 dark:text-slate-100 font-medium">{{ site.name }}</span>
+    <span class="text-slate-800 dark:text-slate-200 font-medium">{{ site.name }}</span>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
     <span>Domains</span>
   </div>
@@ -17,156 +59,98 @@
     <div>
       <h1 class="text-2xl font-bold text-slate-900 dark:text-white">{{ site.name }}</h1>
       <p class="text-slate-500 dark:text-slate-400 text-sm mt-1">
-        <code class="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded">{{ site.backend }}</code>
+        <code class="font-mono text-xs bg-slate-100 dark:bg-slate-700 px-1.5 py-0.5 rounded">{{ site.backend }}</code>
         — {{ domains.len() }} domain{% if domains.len() != 1 %}s{% endif %}
       </p>
     </div>
-    <div class="hidden md:flex items-center gap-2">
-      <a href="/admin/domains?site={{ site.name }}" class="px-3 py-2 text-sm text-slate-600 dark:text-slate-300 hover:text-accent-500 border border-slate-200 dark:border-slate-700 rounded-lg transition-colors">View all</a>
-      <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
-        hx-target="#modal-body"
-        class="inline-flex items-center gap-2 px-4 py-2 bg-accent-500 hover:bg-accent-600 text-white text-sm font-medium rounded-lg transition-colors">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-        New domain
-      </button>
-    </div>
-  </div>
-
-  <div class="md:hidden mb-4 flex gap-2">
-    <a href="/admin/domains?site={{ site.name }}" class="flex-1 text-center px-3 py-2 text-sm text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 rounded-lg">View all</a>
     <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
       hx-target="#modal-body"
-      class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2 bg-accent-500 hover:bg-accent-600 text-white text-sm font-medium rounded-lg">
+      class="hidden md:inline-flex items-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
       New domain
     </button>
   </div>
 
+  <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
+    hx-target="#modal-body"
+    class="md:hidden mb-4 w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm">
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+    New domain
+  </button>
+
   <div id="site-domains-table">
-    {% if domains.is_empty() %}
-    {# Empty state with Add CTA — the domains count of 0 in the sites table
-       navigates here, so always show a clear way forward. #}
-    <div class="bg-white dark:bg-slate-800 border border-dashed border-slate-300 dark:border-slate-600 rounded-xl p-10 text-center">
-      <div class="mx-auto w-12 h-12 rounded-full bg-accent-50 dark:bg-accent-500/10 flex items-center justify-center mb-3">
-        <svg class="w-6 h-6 text-accent-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m-9 9h18"/></svg>
-      </div>
-      <h3 class="text-base font-semibold text-slate-900 dark:text-white">No domains yet</h3>
-      <p class="text-sm text-slate-500 dark:text-slate-400 mt-1 max-w-md mx-auto">Add a domain to route traffic for <code class="font-mono text-xs">{{ site.name }}</code>. You'll pick a hostname and (optionally) a DNS provider for wildcard certs.</p>
-      <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
-        hx-target="#modal-body"
-        class="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-accent-500 hover:bg-accent-600 text-white text-sm font-medium rounded-lg transition-colors">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-        Add the first domain
-      </button>
-    </div>
-    {% else %}
     <div class="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-sm">
-      <table class="hidden md:table table-auto w-full">
-        <thead class="bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
+      <table class="hidden md:table table-auto w-full border-collapse">
+        <thead class="bg-slate-50 dark:bg-slate-800/40 border-b-2 border-slate-200 dark:border-slate-700">
           <tr>
-            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Domain</th>
-            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Status</th>
+            <th class="text-left text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide px-4 py-3">Domain</th>
+            <th class="text-left text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide px-4 py-3">Status</th>
             <th class="text-right px-4 py-3"></th>
           </tr>
         </thead>
-        <tbody id="site-domains-tbody" class="divide-y divide-slate-100 dark:divide-slate-700">
+        <tbody id="site-domains-tbody" class="divide-y divide-slate-200 dark:divide-slate-700">
           {% for domain in domains %}
-          <tr id="domain-{{ domain.domain }}" class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
+          <tr id="domain-{{ domain.domain }}" class="hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors">
+            <td class="px-4 py-3"><span class="font-mono text-sm text-slate-800 dark:text-slate-200">{{ domain.domain }}</span></td>
             <td class="px-4 py-3">
-              <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
-              {% if let Some(p) = domain.dns_provider %}
-              <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">DNS: {{ p }}</div>
+              {% if domain.enabled %}
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300">enabled</span>
+              {% else %}
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 line-through">disabled</span>
               {% endif %}
             </td>
             <td class="px-4 py-3">
-              <button hx-post="/admin/api/domains/{{ domain.domain }}/toggle"
-                hx-vals='{"_csrf": "__CSRF__"}'
-                hx-swap="outerHTML"
-                hx-target="#domain-{{ domain.domain }}"
-                class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full transition-colors
-                  {% if domain.enabled %}bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300{% else %}bg-slate-100 text-slate-400 dark:bg-slate-700 dark:text-slate-500 line-through{% endif %}"
-                title="Click to toggle">
-                {% if domain.enabled %}enabled{% else %}disabled{% endif %}
-              </button>
-            </td>
-            <td class="px-4 py-3">
               <div class="flex items-center justify-end gap-1">
-                <button hx-get="/admin/api/domains/{{ domain.domain }}/edit"
-                  hx-target="#modal-body"
-                  class="text-slate-400 dark:text-slate-400 hover:text-accent-500 dark:hover:text-accent-400 p-1.5 rounded hover:bg-accent-50 dark:hover:bg-accent-500/10 transition-colors"
-                  title="Edit"
-                  aria-label="Edit {{ domain.domain }}">
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z"/></svg>
+                <button hx-delete="/admin/api/domains"
+                  hx-vals='{"domain": "{{ domain.domain }}", "_csrf": "__CSRF__"}'
+                  hx-confirm="Delete domain {{ domain.domain }}?"
+                  hx-swap="delete"
+                  class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                  title="Delete">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
                 </button>
-                <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');" class="inline">
-                  <input type="hidden" name="domain" value="{{ domain.domain }}">
-                  <input type="hidden" name="_csrf" value="__CSRF__">
-                  <button type="submit"
-                    class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-                    title="Delete"
-                    aria-label="Delete {{ domain.domain }}">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
-                  </button>
-                </form>
               </div>
             </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="3" class="px-4 py-8 text-center text-slate-400 text-sm">No domains for this site yet. Add one to get started.</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
 
-      <div class="block md:hidden divide-y divide-slate-100 dark:divide-slate-700">
+      <div class="block md:hidden divide-y divide-slate-200 dark:divide-slate-700">
         {% for domain in domains %}
-        <div id="domain-card-{{ domain.domain }}" class="p-4">
-          <div class="flex items-center justify-between mb-1">
-            <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
-            <button hx-post="/admin/api/domains/{{ domain.domain }}/toggle?view=card"
-              hx-vals='{"_csrf": "__CSRF__"}'
-              hx-swap="outerHTML"
-              hx-target="#domain-card-{{ domain.domain }}"
-              class="text-xs font-medium px-2 py-0.5 rounded-full transition-colors
-                {% if domain.enabled %}bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300{% else %}bg-slate-100 text-slate-400 dark:bg-slate-700 dark:text-slate-500 line-through{% endif %}"
-              title="Click to toggle">
-              {% if domain.enabled %}enabled{% else %}disabled{% endif %}
-            </button>
-          </div>
-          <div class="flex flex-col gap-1">
-            {% if let Some(p) = domain.dns_provider %}
-            <div class="text-xs text-slate-500 dark:text-slate-400">DNS: {{ p }}</div>
+        <div class="p-4">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-mono text-sm text-slate-800 dark:text-slate-200">{{ domain.domain }}</span>
+            {% if domain.enabled %}
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300">on</span>
+            {% else %}
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">off</span>
             {% endif %}
-            <div class="flex gap-1 mt-2">
-              <button hx-get="/admin/api/domains/{{ domain.domain }}/edit"
-                hx-target="#modal-body"
-                class="flex-1 text-center text-sm text-accent-600 dark:text-accent-400 border border-accent-200 dark:border-accent-500/30 rounded-lg py-1.5">Edit</button>
-              <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {{ domain.domain }}?');" class="flex-1">
-                <input type="hidden" name="domain" value="{{ domain.domain }}">
-                <input type="hidden" name="_csrf" value="__CSRF__">
-                <button type="submit" class="w-full text-sm text-red-500 dark:text-red-400 border border-red-100 dark:border-red-500/30 rounded-lg py-1.5">Delete</button>
-              </form>
-            </div>
           </div>
+          <button hx-delete="/admin/api/domains"
+            hx-vals='{"domain": "{{ domain.domain }}", "_csrf": "__CSRF__"}'
+            hx-confirm="Delete domain {{ domain.domain }}?"
+            class="w-full text-center text-sm text-red-500 hover:text-red-600 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
+            Delete
+          </button>
         </div>
+        {% else %}
+        <div class="p-8 text-center text-slate-400 text-sm">No domains for this site yet.</div>
         {% endfor %}
       </div>
     </div>
-    {% endif %}
   </div>
 
   <dialog id="modal" class="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end md:items-center justify-center p-4 w-full">
-    <div id="modal-body" class="bg-white dark:bg-slate-800 rounded-t-2xl md:rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto"></div>
+    <div id="modal-body" class="bg-white rounded-t-2xl md:rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto"></div>
   </dialog>
 </main>
-{% endblock %}
 
-{% block scripts %}
-<script>
-  (function() {
-    const modal = document.getElementById('modal');
-    if (!modal) return;
-    modal.addEventListener('htmx:afterSwap', function() { modal.showModal(); });
-    modal.addEventListener('click', function(e) { if (e.target === modal) modal.close(); });
-    // Close on Escape (htmx doesn't auto-close on cancel).
-    modal.addEventListener('cancel', function() { modal.close(); });
-  })();
-</script>
-{% endblock %}
+<div id="toast" class="fixed bottom-4 right-4 z-50"></div>
+<script src="/admin/app.js?v=__JS_HASH__" defer></script>
+</body>
+</html>

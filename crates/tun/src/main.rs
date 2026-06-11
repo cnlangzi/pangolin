@@ -1,52 +1,41 @@
 //! Pangolin tunnel node (tun) — entry point.
+//!
+//! Loads its config from `tun.yml` (path overridable via `--config`).
+//! The previous CLI-only mode (`--server` / `--token` / `--name`) has
+//! been removed: the config file is the single source of truth, and
+//! keeping the surface tiny makes it obvious which knobs are tun's.
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
 
 mod client;
+mod config;
 mod frame;
 #[cfg(test)]
 mod test_ws_server;
 
-use client::{validate_config, Config, TunnelClient};
+use client::TunnelClient;
+use config::TunConfig;
+use pangolin_core::init_logger;
 
-/// CLI arguments for the tunnel node.
 #[derive(Debug, clap::Parser)]
+#[command(name = "tun")]
+#[command(about = "Pangolin tunnel node — connects to ngx, proxies customer traffic")]
 struct Args {
-    /// ngx server address (e.g. ngx.example.com:8080)
-    #[arg(long)]
-    server: String,
-
-    /// Authentication token
-    #[arg(long)]
-    token: String,
-
-    /// Tunnel node name (must match ^[a-z0-9_-]+$, max 32 chars)
-    #[arg(long)]
-    name: String,
+    /// Path to config file (default: ./tun.yml)
+    #[arg(short, long, default_value = "tun.yml")]
+    config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let args = Args::parse();
+    let tun_cfg = TunConfig::from_file(&args.config)?;
+    init_logger(&tun_cfg.log);
 
-    let config = Config {
-        server: args.server,
-        token: args.token,
-        name: args.name,
-    };
-
-    validate_config(&config)?;
-
-    log::info!(
-        "starting tun node: name={}, server={}",
-        config.name,
-        config.server
-    );
-
-    let client = TunnelClient::new(config);
+    let client = TunnelClient::new(tun_cfg);
     client.run().await;
 
     Ok(())

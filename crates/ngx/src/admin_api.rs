@@ -9,8 +9,9 @@
 //!   PUT/DELETE /api/domains/:domain
 //!   GET/POST   /api/tun
 //!   PUT/DELETE /api/tun/:name
-//!   GET/POST   /api/tokens
-//!   PUT/DELETE /api/tokens/:token
+//!
+//! v2: `/api/tokens` is gone. The auth credential is now a column on
+//! the `tun` row; manage it via `/api/tun`'s `token` body field.
 //!   GET/POST   /api/certs
 //!   DELETE     /api/certs/:domain
 //!   GET        /api/events
@@ -23,7 +24,7 @@ use pingora::protocols::http::ServerSession;
 use crate::App;
 use pangolin_core::{
     db, is_valid_domain, is_valid_tun_name, parse_backend,
-    types::{Cert, Domain, Site, Token, Tun},
+    types::{Cert, Domain, Site, Tun},
 };
 
 // ---- JSON response helpers ----
@@ -68,11 +69,19 @@ async fn read_body_http(http_session: &mut ServerSession) -> Result<Vec<u8>, Res
 // ---- Sites ----
 
 async fn list_sites(app: &App) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::list_sites(&conn) {
-        Ok(sites) => json_ok(serde_json::to_vec(&sites).unwrap().as_slice()),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
+    // Read rows under the lock, drop it, then serialise. The lock is
+    // a `tokio::Mutex` on the single shared SQLite connection, so
+    // holding it through `serde_json::to_vec` (pure CPU) would block
+    // every other admin op + WS connect for the duration of the
+    // serialise, on a list whose size scales with the table.
+    let sites = {
+        let conn = app.db.lock().await;
+        match db::list_sites(&conn) {
+            Ok(s) => s,
+            Err(e) => return json_error(500, &format!("db error: {}", e)),
+        }
+    };
+    json_ok(serde_json::to_vec(&sites).unwrap().as_slice())
 }
 
 async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
@@ -129,11 +138,14 @@ async fn upsert_site(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
 // ---- Domains ----
 
 async fn list_domains(app: &App) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::list_domains(&conn) {
-        Ok(domains) => json_ok(serde_json::to_vec(&domains).unwrap().as_slice()),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
+    let domains = {
+        let conn = app.db.lock().await;
+        match db::list_domains(&conn) {
+            Ok(d) => d,
+            Err(e) => return json_error(500, &format!("db error: {}", e)),
+        }
+    };
+    json_ok(serde_json::to_vec(&domains).unwrap().as_slice())
 }
 
 async fn upsert_domain(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>> {
@@ -175,18 +187,26 @@ async fn upsert_domain(app: &App, domain: &str, body: &[u8]) -> Response<Vec<u8>
 // ---- Tun ----
 
 async fn list_tuns(app: &App) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::list_tuns(&conn) {
-        Ok(tuns) => json_ok(serde_json::to_vec(&tuns).unwrap().as_slice()),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
+    let tuns = {
+        let conn = app.db.lock().await;
+        match db::list_tuns(&conn) {
+            Ok(t) => t,
+            Err(e) => return json_error(500, &format!("db error: {}", e)),
+        }
+    };
+    json_ok(serde_json::to_vec(&tuns).unwrap().as_slice())
 }
 
 async fn upsert_tun(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     #[derive(serde::Deserialize)]
     struct Req {
+        /// Auth credential the tun will present in the WS query.
+        /// If omitted, the existing value (if any) is preserved.
+        token: Option<String>,
         enabled: Option<bool>,
         online: Option<bool>,
+        /// Optional RFC3339 expiry. None = never expires.
+        expires_at: Option<String>,
     }
     let req: Req = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -197,12 +217,36 @@ async fn upsert_tun(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
         return json_error(400, "invalid tun name");
     }
 
+    let expires_at = match &req.expires_at {
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+        {
+            Some(dt) => Some(dt),
+            None => return json_error(400, "invalid expires_at (must be RFC3339)"),
+        },
+        None => None,
+    };
+
+    // Preserve existing token / registered_at if the request didn't
+    // specify them — PUT-as-partial-update semantics for those fields.
+    let (existing_token, existing_registered_at) = {
+        let conn = app.db.lock().await;
+        match db::get_tun(&conn, name) {
+            Ok(Some(t)) => (t.token, t.registered_at),
+            Ok(None) => (None, None),
+            Err(e) => return json_error(500, &format!("db error: {}", e)),
+        }
+    };
+
     let t = Tun {
         name: name.to_string(),
+        token: req.token.or(existing_token),
         enabled: req.enabled.unwrap_or(true),
         online: req.online.unwrap_or(false),
-        registered_at: None,
+        registered_at: existing_registered_at,
         last_seen_at: None,
+        expires_at,
     };
 
     let conn = app.db.lock().await;
@@ -217,61 +261,17 @@ async fn upsert_tun(app: &App, name: &str, body: &[u8]) -> Response<Vec<u8>> {
     }
 }
 
-// ---- Tokens ----
-
-async fn list_tokens(app: &App) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::list_tokens(&conn) {
-        Ok(tokens) => json_ok(serde_json::to_vec(&tokens).unwrap().as_slice()),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
-async fn upsert_token(app: &App, token: &str, body: &[u8]) -> Response<Vec<u8>> {
-    #[derive(serde::Deserialize)]
-    struct Req {
-        enabled: Option<bool>,
-        expires_at: Option<String>,
-    }
-    let req: Req = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => return json_error(400, &format!("invalid JSON: {}", e)),
-    };
-
-    let expires_at = match &req.expires_at {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc)),
-        None => None,
-    };
-
-    let t = Token {
-        token: token.to_string(),
-        enabled: req.enabled.unwrap_or(true),
-        created_at: Utc::now(),
-        expires_at,
-    };
-
-    let conn = app.db.lock().await;
-    match db::upsert_token(&conn, &t) {
-        Ok(()) => {
-            drop(conn);
-            app.reload_indexes().await;
-            debug!("upserted token: {}", token);
-            json_created(serde_json::to_vec(&t).unwrap().as_slice())
-        }
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
-}
-
 // ---- Certs ----
 
 async fn list_certs(app: &App) -> Response<Vec<u8>> {
-    let conn = app.db.lock().await;
-    match db::list_certs(&conn) {
-        Ok(certs) => json_ok(serde_json::to_vec(&certs).unwrap().as_slice()),
-        Err(e) => json_error(500, &format!("db error: {}", e)),
-    }
+    let certs = {
+        let conn = app.db.lock().await;
+        match db::list_certs(&conn) {
+            Ok(c) => c,
+            Err(e) => return json_error(500, &format!("db error: {}", e)),
+        }
+    };
+    json_ok(serde_json::to_vec(&certs).unwrap().as_slice())
 }
 
 // ---- Events ----
@@ -369,15 +369,6 @@ pub async fn handle_api_http(
                 upsert_tun(app, parts[1], &[]).await
             } else {
                 json_error(400, "POST requires tun name in path")
-            }
-        }
-        // Tokens
-        ("tokens", "GET") => list_tokens(app).await,
-        ("tokens", "POST") => {
-            if parts.len() >= 2 {
-                upsert_token(app, parts[1], &[]).await
-            } else {
-                json_error(400, "POST requires token in path")
             }
         }
         // Certs

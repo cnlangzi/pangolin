@@ -1,4 +1,3 @@
-{# base.html — base layout for all admin pages #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -22,20 +21,17 @@
       <span class="hidden sm:inline">Pangolin</span>
     </a>
     <nav class="hidden lg:flex items-center gap-1">
-      <a href="/admin/" class="nav-link {% if active_nav == "dashboard" %}nav-link-active{% endif %}">Dashboard</a>
-      <a href="/admin/sites" class="nav-link {% if active_nav == "sites" %}nav-link-active{% endif %}">Sites</a>
-      <a href="/admin/domains" class="nav-link {% if active_nav == "domains" %}nav-link-active{% endif %}">Domains</a>
-      <a href="/admin/tun" class="nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
-      <a href="/admin/tokens" class="nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
-      <a href="/admin/certs" class="nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
-      <a href="/admin/dns" class="nav-link {% if active_nav == "dns" %}nav-link-active{% endif %}">DNS</a>
+      <a href="/admin/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "dashboard" %}text-white bg-slate-800{% endif %}">Dashboard</a>
+      <a href="/admin/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "sites" %}text-white bg-slate-800{% endif %}">Sites</a>
+      <a href="/admin/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "domains" %}text-white bg-slate-800{% endif %}">Domains</a>
+      <a href="/admin/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "tun" %}text-white bg-slate-800{% endif %}">Tunnels</a>
+      <a href="/admin/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "certs" %}text-white bg-slate-800{% endif %}">Certs</a>
+      <a href="/admin/dns" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800 {% if active_nav == "dns" %}text-white bg-slate-800{% endif %}">DNS</a>
     </nav>
     <div class="flex items-center gap-2">
       <form method="POST" action="/admin/logout" class="hidden lg:block">
         <input type="hidden" name="_csrf" value="__CSRF__">
-        <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-2 rounded-lg hover:bg-slate-700">
-          Sign out
-        </button>
+        <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-2 rounded-lg hover:bg-slate-700">Sign out</button>
       </form>
       <button id="menu-toggle" class="lg:hidden text-slate-300 hover:text-white p-2 rounded-lg hover:bg-slate-700 transition-colors">
         <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -45,48 +41,22 @@
     </div>
   </div>
   <nav id="mobile-nav" class="hidden lg:hidden border-t border-slate-700 px-4 py-3 space-y-1">
-    <a href="/admin/" class="mobile-nav-link nav-link {% if active_nav == "dashboard" %}nav-link-active{% endif %}">Dashboard</a>
-    <a href="/admin/sites" class="mobile-nav-link nav-link {% if active_nav == "sites" %}nav-link-active{% endif %}">Sites</a>
-    <a href="/admin/domains" class="mobile-nav-link nav-link {% if active_nav == "domains" %}nav-link-active{% endif %}">Domains</a>
-    <a href="/admin/tun" class="mobile-nav-link nav-link {% if active_nav == "tun" %}nav-link-active{% endif %}">Tunnels</a>
-    <a href="/admin/tokens" class="mobile-nav-link nav-link {% if active_nav == "tokens" %}nav-link-active{% endif %}">Tokens</a>
-    <a href="/admin/certs" class="mobile-nav-link nav-link {% if active_nav == "certs" %}nav-link-active{% endif %}">Certs</a>
-    <a href="/admin/dns" class="mobile-nav-link nav-link {% if active_nav == "dns" %}nav-link-active{% endif %}">DNS</a>
+    <a href="/admin/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "dashboard" %}text-white bg-slate-800{% endif %}">Dashboard</a>
+    <a href="/admin/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "sites" %}text-white bg-slate-800{% endif %}">Sites</a>
+    <a href="/admin/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "domains" %}text-white bg-slate-800{% endif %}">Domains</a>
+    <a href="/admin/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "tun" %}text-white bg-slate-800{% endif %}">Tunnels</a>
+    <a href="/admin/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "certs" %}text-white bg-slate-800{% endif %}">Certs</a>
+    <a href="/admin/dns" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 {% if active_nav == "dns" %}text-white bg-slate-800{% endif %}">DNS</a>
     <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
       <input type="hidden" name="_csrf" value="__CSRF__">
-      <button type="submit" class="mobile-nav-link nav-link text-danger hover:text-red-400 w-full text-left">
-        Sign out
-      </button>
+      <button type="submit" class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-slate-800">Sign out</button>
     </form>
   </nav>
 </header>
 
 {% block content %}{% endblock %}
 
-<script src="https://unpkg.com/htmx.org@1.9.0"></script>
-{% block scripts %}{% endblock %}
-
-<script>
-document.getElementById('menu-toggle').addEventListener('click', function() {
-  document.getElementById('mobile-nav').classList.toggle('hidden');
-});
-</script>
+<script src="/admin/app.js?v=__JS_HASH__" defer></script>
 
 </body>
 </html>
-
-{# Reusable macros #}
-
-{# Status badge (enabled/disabled) #}
-{% macro status_badge(enabled) %}
-{% if enabled %}
-<span class="badge-success">Enabled</span>
-{% else %}
-<span class="badge-gray">Disabled</span>
-{% endif %}
-{% endmacro %}
-
-{# CSRF hidden input #}
-{% macro csrf_input() %}
-<input type="hidden" name="_csrf" value="__CSRF__">
-{% endmacro %}

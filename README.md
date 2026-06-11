@@ -13,7 +13,7 @@
 | **site** | 站点（后端服务） | 配置 `backend`，指向具体服务 |
 | **domain** | 域名 | 关联到 site，外部访问入口 |
 | **tun_name** | 隧道节点名 | 文本名（如 `office`），用于 backend 字段路由到指定 tun |
-| **token** | 客户端 token | tokens 表里管理，tun 启动时携带，身份验证用 |
+| **token** | 客户端 token | tun 表里的 `token` 列(每个 tun 自带一份凭证) |
 | **backend** | 后端 URL | `[tun_name:]url` 格式 |
 
 ---
@@ -63,14 +63,17 @@ pangolin/
 **使用方式：**
 
 ```bash
-# ngx 主节点
-./ngx --port 8080
+# ngx 主节点(读 ./ngx.yml)
+./ngx
 
-# tun 隧道节点（客户内网）
-./tun --server gateway.example.com:8080 --token abc123
+# tun 隧道节点(客户内网,读 ./tun.yml)
+./tun
 
-# token 在 ngx 的 tokens 表里统一管理（admin 增删，热加载生效），
-# 多个 token 可共存。tun 启动时任意携带一个有效 token + name 即可连上。
+# token 在 ngx 的 tun 表里统一管理(v2 起;tokens 表已合并进 tun)。
+# 流程:admin 先 POST /api/tun {name, token, ...} 显式建行(也可以在 admin UI "Tunnels" 页),
+# 然后把同一对 (name, token) 写到 tun.yml 里。
+# WS 握手时,服务器单条 SQL 校验,匹配 + enabled=1 才放行。
+# 不再有自动注册 —— tun 自己不能"随便带个 token 来就建身份"。
 ```
 
 无需 `--mode` 标志，二进制名 = 角色名。
@@ -150,30 +153,20 @@ CREATE TABLE domains (
 
 -- 隧道节点
 --   name: tun_name，文本名（backend 字段引用此值，例 'office'），主键
---   注意：
---     1. tun 与 domain 不需要中间表。domain 走哪个 tun 完全由 site.backend
---        决定（有无 tun_name: 前缀），ngx 通过 site 表 JOIN domains 表反查
---        得到 tun 应代理的 domain 列表。
---     2. token 不在 tun 表里。tun 启动时携带任意一个 tokens 表里的有效 token，
---        用 name 区分身份。token 与 tun 完全解耦。
+--   v2: `token` 列在本表里 —— 每个 tun 节点自带凭证。tun 首次
+--       连上时 WS 服务器会 (name, token) 一次性校验，自动注册。
+--       不再有独立的 tokens 表 / /api/tokens 端点。
 CREATE TABLE tun (
-    name      TEXT PRIMARY KEY,             -- tun_name（小写字母数字下划线短横线，1~32 字符）
-    enabled   INTEGER DEFAULT 1,
-    online    INTEGER DEFAULT 0,
+    name         TEXT PRIMARY KEY,          -- tun_name（小写字母数字下划线短横线，1~32 字符）
+    token        TEXT NOT NULL DEFAULT '',  -- 客户端 token（首次连入时由 WS 握手写入）
+    enabled      INTEGER DEFAULT 1,
+    online       INTEGER DEFAULT 0,
     registered_at DATETIME,
-    last_seen_at  DATETIME
+    last_seen_at  DATETIME,
+    expires_at    DATETIME                  -- token 过期(NULL = 永不过期)
 );
-
--- token 白名单
---   任何客户端（tun 节点、admin CLI、未来其他客户端）连接 ngx 时，
---   必须在 tokens 表里有对应 token（且 enabled=1、未过期）。
---   token 与 tun 解耦：tun 启动时用哪个有效 token 都行，用 name 区分身份。
-CREATE TABLE tokens (
-    token      TEXT PRIMARY KEY,            -- token 字符串本身
-    enabled    INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME                     -- NULL = 永不过期
-);
+-- 后续 token 轮换:UPDATE tun SET token='new' WHERE name='office'
+-- 后续停用某个节点:UPDATE tun SET enabled=0 WHERE name='office'
 
 -- 证书（Let's Encrypt 自动管理）
 --   domain: 域名，主键（一对一）
@@ -262,8 +255,9 @@ ALTER TABLE sites ADD COLUMN last_audit_at TEXT;
 
 **创建索引：**
 ```sql
--- migrations/V5__index_tokens_expires.sql
-CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires_at);
+-- migrations/V2__merge_tokens_into_tun.sql 已把 tokens 表合进 tun。
+-- 常用索引：
+CREATE INDEX IF NOT EXISTS idx_tun_token ON tun(token);    -- WS 握手 (name, token) 走 tun_token 索引
 ```
 
 ### 启动时 migration 自动运行
@@ -420,15 +414,16 @@ domains:
 - 单域名 `app.example.com` → 申请 `app.example.com`
 - 用 `instant-acme` 客户端走 ACME 协议
 
-**续期规则**（受 `cert.autorenew` 控制，详见「全局配置」一节）：
+**续期规则**（v2 ACME，PR #23 取消全局 `cert.autorenew` 开关）：
 
-- `autorenew = true`（默认）：启动时扫 `certs` 表，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
-- `autorenew = false`：完全跳过 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
+- **per-domain `auto_issue`**：是否为某个域名走 ACME 自动申请 + 续期，存于 `domains` 表的 `auto_issue` 列，admin UI 可改
+- **`auto_issue = true`（针对某个域名）**：启动时扫该域名对应的 cert，过期 < 30 天立即续期；后台每 6 小时扫一次，重试 3 次
+- **`auto_issue = false`（默认）**：完全跳过该域名的 ACME（首次申请 + 续期都不跑），admin 通过 `POST /api/certs` 手动上传 cert（pem + key）
 
 **适用场景**：
 
-- `autorenew = true`：公网部署，Let's Encrypt 可访问
-- `autorenew = false`：ngx 部署在内网无法被 Let's Encrypt 访问，需要 admin 手动管 cert；或企业用自有 CA 签发 cert
+- 某个域 `auto_issue = true`：公网域名，Let's Encrypt 可访问
+- 某个域 `auto_issue = false`：内网域名，ngx 无法被 Let's Encrypt 访问，需 admin 手动管 cert；或企业用自有 CA 签发 cert
 
 
 ---
@@ -472,7 +467,7 @@ domainIndex[app.example.com]  →  *Site
 ### 2. tun 启动流程
 
 ```
-tun 配置: --server gateway.com:8080 --token abc123 --name office
+tun 配置: ./tun.yml { server: gateway.com:8080, token: abc123, name: office }
     │
     ▼
 WS 连接 ngx，发 token + name
@@ -498,7 +493,7 @@ tun 开始代理这些域名的请求
 ./ngx --port 8080
     │
     ▼
-初始化 SQLite（sites/domains/tun/tokens/certs）
+初始化 SQLite（sites/domains/tun/certs）
     │
     ▼
 构建内存索引（启动时一次性）：
@@ -530,8 +525,7 @@ tun 开始代理这些域名的请求
 | PUT/DELETE | `/api/domains/:domain` | 更新/删除域名（domain 主键） |
 | GET/POST | `/api/tun` | tun 节点列表/新增 |
 | PUT/DELETE | `/api/tun/:name` | 更新/删除 tun（name 主键） |
-| GET/POST | `/api/tokens` | token 列表/新增 |
-| PUT/DELETE | `/api/tokens/:token` | 更新/删除 token（token 主键） |
+| GET/POST | `/api/tun` | tun 列表/新增(v2:`token` 字段作为 body 字段一起 POST) |
 | GET/POST | `/api/certs` | 证书列表/上传 |
 | DELETE | `/api/certs/:domain` | 删除证书（domain 主键） |
 
@@ -578,7 +572,7 @@ tun 开始代理这些域名的请求
    - site_name: customer-web
 
 5. 客户在内网部署 tun
-   ./tun --name office --server gateway.example.com:8080 --token <admin 给的 token>
+   ./tun   # 读 ./tun.yml(server/token/name)
 
 6. tun 启动 → WS 连 ngx → 发 token + name
    ngx 查 tokenIndex[token] → 验证 token 有效（内存，一次 map lookup）
@@ -658,52 +652,120 @@ office:file:///home/user/docs    → 通过 office tun 把客户内网目录暴�
 
 ## 全局配置
 
-ngx 启动时读一个 TOML 配置文件。文件位置按优先级：
+ngx 和 tun 是两个独立的 binary,各读自己的 YAML 配置文件。文件位置按优先级(都可用 `--config` 覆盖):
 
-1. `--config /path/to/config.toml` 命令行参数
-2. `./config.toml`（当前目录）
-3. `/etc/pangolin/config.toml`（系统级）
+1. `./ngx.yml` / `./tun.yml`(当前目录)
+2. `/etc/pangolin/ngx.yml` / `/etc/pangolin/tun.yml`(系统级)
 
-**完整配置示例**：
+**职责分离**:`ngx.yml` 只关心网关本身(`[proxy]` 顶层字段 + `[tunnel]` 接入端点 + `[admin]`/`[cache]`/`[cert]`/`[log]` 子节);`tun.yml` 只关心 tun 客户端的连接信息(顶层 `server`/`token`/`name` + `[log]`)。两个文件之间**不共享任何字段**。
 
-```toml
-[server]
-port = 8080           # HTTP 监听端口
-tls_port = 8443       # HTTPS 监听端口
-ws_path = "/tunnel"   # tun WS 接入路径
-workers = 4           # tokio runtime worker 数（默认 = CPU 核数）
+**为什么拆分**:之前只有一个 `pangolin.yml`,`ws_path` / `tunnel_port` 这种 tunnel 相关字段和 `port` / `tls_port` 这种 proxy 字段混在同一个 `[server]` 段下,语义上不清晰。拆成两个文件后,文件本身就是角色声明,改哪个不传哪个一目了然。
 
-[admin]
-username = "admin"
-password = "***"      # 生产用 secret 管理器注入，不要明文进文件
+### `ngx.yml` — 网关配置
 
-[cache]
-enabled = true
-dir = "./cache"
+```yaml
+# ── Proxy listen (顶层就是 proxy,不加 proxy: 包装) ─────
+addr:
+  http: 0.0.0.0:80     # HTTP 监听地址(完整 host:port)
+  https: 0.0.0.0:443   # HTTPS 监听地址;":0" = 完全关闭 TLS
+host: null            # per-domain cert 解析用的虚拟主机(SNI fallback)
+                      # (null = "default" → ./certs/default/...)
+                      # 注意 `host` 跟 `[addr]` 无关 —— 它是 SNI 解析键,不是 bind 地址
+workers: null         # pingora worker 数;null = CPU 核数
 
-[cert]
-email = "admin@yourdomain.com"   # ACME 注册邮箱
-cert_dir = "./certs"             # 证书落盘目录
-autorenew = true                  # 是否自动续期（+ 首次申请），默认 true
-acme_directory = "https://acme-v02.api.letsencrypt.org/directory"  # ACME 目录
-renew_threshold_days = 30         # 过期 < N 天触发续期
-renew_check_interval_hours = 6    # 后台续期检查周期
-renew_max_retries = 3             # 单次续期失败重试次数
+# ── WebSocket 接入端点(tun 客户端连这个) ─────────────
+tunnel:
+  addr: 0.0.0.0:9001   # 监听地址(完整 host:port);默认 0.0.0.0:9001 接受任意接口
+                      # 的 tun 连入(多机部署)。覆盖到 127.0.0.1:9001 强制
+                      # tun 只能从本机连入
+  ws_path: /tunnel    # WS endpoint path
 
-[log]
-level = "info"          # trace | debug | info | warn | error
-file = "./pangolin.log" # 空字符串 = stdout
+admin:
+  addr: 0.0.0.0:9081   # admin UI/API 绑定;默认 0.0.0.0:9081 接受远程管理
+                      # (如 SSH 端口转发)。覆盖到 127.0.0.1:9081 强制本地
+                      # 访问。**非受信网络下必须改 password**
+  username: admin
+  password: ***          # 生产用 secret 管理器注入,不要明文进文件
+
+cache:
+  enabled: true
+  dir: ./cache
+
+# v2 (PR #23): 全局 `cert.autorenew` 取消。
+# 是否走 ACME 由 `domains.auto_issue` (DB) 逐域名控制。
+# [acme] 段只放运行期调参。
+acme:
+  email: "admin@yourdomain.com"   # ACME 注册邮箱
+  cert_dir: "./certs"             # cert blob 落盘目录(autocert native 布局)
+  acme_directory: "https://acme-v02.api.letsencrypt.org/directory"
+  renew_threshold_days: 30
+  renew_check_interval_hours: 6
+  renew_max_retries: 3
+  key_type: "ecdsa"               # ecdsa | rsa
+
+log:
+  level: "info"          # trace | debug | info | warn | error
+  file: "./pangolin.log" # 空字符串 = stdout
 ```
 
-**关键配置项说明**：
+### `tun.yml` — 隧道客户端配置
 
-- `cert.autorenew`：**总开关**，决定是否走 ACME 流程
-  - `true`（默认，公网部署）：启动时申请缺失 cert + 定期续期
-  - `false`（内网部署，ngx 无法被 Let's Encrypt 访问）：完全跳过 ACME，admin 通过 `POST /api/certs` 手动上传 cert
-- `cert.acme_directory`：可指向 staging (`https://acme-staging-v02.api.letsencrypt.org/directory`) 测玴
-- `server.workers`：pingora 推荐设为 CPU 核数
+```yaml
+# ── 连接信息(顶层就是 tun 客户端,不加 connection: 包装) ─
+server: ngx.example.com:9001   # ngx 地址(匹配 ngx 的 [tunnel].addr)
+token: "your-tun-token-here"   # 认证 token,直接写在文件里
+name: office                  # tun 节点名;^[a-z0-9_-]+$, 1~32 字符,
+                              # 非纯数字
 
-**后续**：未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
+log:
+  level: "info"
+  file: ""                    # 空 = stderr
+```
+
+`tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 字段直接写即可;如果想保密,可以:
+- 把配置文件设 0600 权限(或用系统 secret 管理工具管理整个文件);
+- **用环境变量覆盖**(见下):`TUN_TOKEN=…` 比 `tun.yml: token:` 优先。
+
+### 环境变量覆盖(YAML 上叠一层)
+
+两个配置文件都用 `figment` 加载,所以 env 变量可以在 YAML 之上**逐字段覆盖**。命名规则:
+
+- 前缀:`NGX_` 对应 `ngx.yml`,`TUN_` 对应 `tun.yml`。
+- 嵌套键分隔符:`__` (双下划线)。
+- 大小写:env 名按小写匹配到配置 key(`NGX_ADDR__HTTP` → `addr.http`)。
+
+例子:
+
+```bash
+# 共享 token 跑多个 tun(避免把 secret 写进 tun.yml)
+TUN_TOKEN=abc123 TUN_NAME=office ./tun
+
+# 改 ngx 监听端口 + 调日志等级
+NGX_ADDR__HTTP=":8080" NGX_LOG__LEVEL=info ./ngx
+
+# 关闭 ngx 的 TLS listener
+NGX_ADDR__HTTPS=":0" ./ngx
+
+# 嵌套字段
+NGX_ADMIN__PASSWORD=secret \
+NGX_ACME__CERT_DIR=/etc/certs \
+NGX_TUNNEL__ADDR=0.0.0.0:9001 ./ngx
+```
+
+未设置的 env 变量**不影响** YAML 值;loader 不会扫描 YAML 文本里的 `$VAR` 占位符,所以注释里写 `${EXAMPLE}` 也不会被误解析(替代了旧的 `expand_env_vars` 文本替换方案)。详细字段表见 `docs/configuration.md`。
+
+### 关键配置项说明
+
+- `domains.auto_issue` (DB,per-domain):**单域名 ACME 开关**。v2 不再有全局 `cert.autorenew`。
+  - `true`:该域名启动时申请 cert(如缺失)+ 定期续期
+  - `false`(默认,新行):完全跳过该域名的 ACME,admin 通过 `POST /api/certs` 手动上传 cert
+- `domains.dns_provider` (DB,per-domain):指向 `dns_providers` 表中某行,设置后该域名走 DNS-01 挑战(**`*.example.com` 通配必须**)。空字符串走 HTTP-01。
+- `ngx.yml: acme.acme_directory`:可指向 LE staging 测试
+- `ngx.yml: workers`:pingora 推荐设为 CPU 核数
+- `tun.yml: name` 约束与 ngx 端 `tun.name` 主键一致,过不了校验则启动 fail
+- 详细字段表、dev / production / multi-tun 实战示例、gotchas:见 `docs/configuration.md`
+
+**后续**:未来可能增加 `[reload]`、`[metrics]`、`[rate_limit]` 等节。
 
 ---
 
@@ -844,13 +906,13 @@ type TunIndex = HashMap<String, Vec<Arc<Domain>>>;      // key: tun_name
 // tun 注册时用：所有 site（reload 时扫，建 tunIndex 用）
 type Sites = Vec<Arc<Site>>;
 
-// tun 注册时用：token 白名单（O(1) 验证）
-type TokenIndex = HashMap<String, bool>;                // key: token, value: enabled && !expired
+// v2: TokenIndex 已删除。WS 握手校验是单条 SQL
+//   `SELECT enabled, expires_at FROM tun WHERE name=? AND token=?`
+//   不再在内存里镜像 token 白名单。
 
 pub struct Indexes {
     pub domain: DomainIndex,
     pub tun: TunIndex,
-    pub token: TokenIndex,
     pub sites: Sites,
 }
 pub type SharedIndexes = Arc<RwLock<Indexes>>;

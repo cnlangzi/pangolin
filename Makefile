@@ -7,7 +7,7 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun stop-ngx stop-tun status-ngx status-tun
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
 
 help:
 	@echo "=== Build ==="
@@ -61,20 +61,25 @@ build:
 	# exactly once, not twice.  Two separate `cargo build` calls
 	# re-link every shared crate.
 	$(CARGO) build --release -p ngx -p tun
-	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
-	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
+	# `install` instead of `mv` so the copy is a fresh inode even when
+	# `target/release/<bin>` and `bin/<bin>` are hardlinks of each
+	# other (e.g. after a previous run that did `cp` rather than
+	# `mv`). Plain `mv same-file` errors out and aborts the Make
+	# target.
+	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
+	install -m 0755 $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
 build-ngx:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
-	mv $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
+	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
 
 build-tun:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p tun
-	mv $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
+	install -m 0755 $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 
 build-debug:
 	$(CARGO) build -p ngx -p tun
@@ -163,18 +168,22 @@ start-tun: build-tun
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
 install-ngx: build-css build-ngx
-	sudo cp ./systemd/pangolin-ngx-local.service /etc/systemd/system/pangolin-ngx.service
-	sudo systemctl daemon-reload
-	sudo systemctl enable pangolin-ngx
-	sudo systemctl restart pangolin-ngx
-	@echo "ngx installed and started"
+	$(MAKE) install-service SVC=ngx
 
 install-tun: build-tun
-	sudo cp ./systemd/pangolin-tun-local.service /etc/systemd/system/pangolin-tun.service
+	$(MAKE) install-service SVC=tun
+
+# Parameterized installer: `make install-service SVC=ngx` copies the
+# service file and restarts the matching systemd unit. Keeps
+# install-ngx / install-tun as one-liners and centralizes the steps
+# that always run together (daemon-reload, enable, restart).
+install-service:
+	@if [ -z "$(SVC)" ]; then echo "usage: make install-service SVC=ngx|tun" >&2; exit 2; fi
+	sudo cp ./deploy/playbooks/roles/$(SVC)/files/$(SVC).service /etc/systemd/system/pangolin-$(SVC).service
 	sudo systemctl daemon-reload
-	sudo systemctl enable pangolin-tun
-	sudo systemctl restart pangolin-tun
-	@echo "tun installed and started"
+	sudo systemctl enable pangolin-$(SVC)
+	sudo systemctl restart pangolin-$(SVC)
+	@echo "$(SVC) installed and started"
 
 # ── Stop / status (operates on the systemd service installed by install-*) ───
 

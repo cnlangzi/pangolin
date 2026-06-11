@@ -225,24 +225,23 @@ pub struct Domain {
 }
 
 /// Tun node (tun table). name is the primary key.
-/// No token here — tokens are managed in the tokens table and decoupled.
+///
+/// v2: `token` is now a column on `tun` itself. Auth model is
+/// "the WS query presents (name, token); a single SELECT confirms
+/// both match an enabled, non-expired row." Auto-register on first
+/// sight is the default for any new (name, token) pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tun {
     pub name: String,
+    /// The auth credential this tun presents in the WS query string.
+    /// `None` until the tun has been seen at least once or an admin
+    /// has provisioned the row via the admin API.
+    pub token: Option<String>,
     pub enabled: bool,
     pub online: bool,
     pub registered_at: Option<DateTime<Utc>>,
     pub last_seen_at: Option<DateTime<Utc>>,
-}
-
-/// Token (tokens table). token is the primary key.
-/// Used by any client (tun node, admin CLI, future tooling) to
-/// authenticate to ngx.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Token {
-    pub token: String,
-    pub enabled: bool,
-    pub created_at: DateTime<Utc>,
+    /// Per-tun token expiry. `None` = never expires.
     pub expires_at: Option<DateTime<Utc>>,
 }
 
