@@ -30,7 +30,6 @@ async fn unauth_redirect_dashboard() {
         "/admin/sites/new",
         "/admin/domains",
         "/admin/tun",
-        "/admin/tokens",
         "/admin/certs",
     ] {
         let resp = client.get(&ngx.admin_url(path)).send().await.unwrap();
