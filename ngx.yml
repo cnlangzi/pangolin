@@ -48,14 +48,20 @@ workers: null           # pingora worker count; null = auto (CPU count)
 
 # ── WebSocket endpoint for tun clients ───────────────────────────────────
 tunnel:
-  addr: 127.0.0.1:9001  # listen addr (full host:port). `127.0.0.1:9001`
-                        # (default) accepts only local tun clients;
-                        # set to `0.0.0.0:9001` when tun runs on a
-                        # different host and connects in over the network.
+  addr: 0.0.0.0:9001    # listen addr (full host:port). Default
+                        # `0.0.0.0:9001` accepts tun clients on any
+                        # interface (the normal multi-host deploy).
+                        # Override to `127.0.0.1:9001` if you want
+                        # to force tun-on-this-host-only semantics.
   ws_path: /tunnel      # WebSocket path
 
 admin:
-  addr: 127.0.0.1:9081  # admin UI/API bind addr (loopback recommended)
+  addr: 0.0.0.0:9081    # admin UI/API bind addr. Default `0.0.0.0:9081`
+                        # accepts remote admin (e.g. via SSH port
+                        # forward). The shipped default password is
+                        # `admin` — override via env var injection
+                        # (e.g. ${ADMIN_PASSWORD}) before exposing
+                        # this to any non-trusted network.
   username: admin
   password: admin
 

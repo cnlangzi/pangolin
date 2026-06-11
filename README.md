@@ -682,12 +682,15 @@ workers: null         # pingora worker 数;null = CPU 核数
 
 # ── WebSocket 接入端点(tun 客户端连这个) ─────────────
 tunnel:
-  addr: 0.0.0.0:9001   # 监听地址(完整 host:port);`0.0.0.0:9001` 接受任意接口的
-                      # tun 连入(多机部署),`127.0.0.1:9001` (默认) 只接受本地
+  addr: 0.0.0.0:9001   # 监听地址(完整 host:port);默认 0.0.0.0:9001 接受任意接口
+                      # 的 tun 连入(多机部署)。覆盖到 127.0.0.1:9001 强制
+                      # tun 只能从本机连入
   ws_path: /tunnel    # WS endpoint path
 
 admin:
-  addr: 127.0.0.1:9081  # admin UI/API 绑定(loopback 推荐)
+  addr: 0.0.0.0:9081   # admin UI/API 绑定;默认 0.0.0.0:9081 接受远程管理
+                      # (如 SSH 端口转发)。覆盖到 127.0.0.1:9081 强制本地
+                      # 访问。**非受信网络下必须改 password**
   username: admin
   password: ***          # 生产用 secret 管理器注入,不要明文进文件
 

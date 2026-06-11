@@ -46,13 +46,15 @@ host: {{ ngx_host }}
 
 # ── WebSocket endpoint for tun clients ──────────────────────────────────
 tunnel:
-  addr: {{ ngx_tunnel_addr | default('127.0.0.1:9001') }}
+  addr: {{ ngx_tunnel_addr | default('0.0.0.0:9001') }}
   ws_path: {{ ngx_tunnel_ws_path | default('/tunnel') }}
 
 admin:
-  # Bind on all IPv4 interfaces — deploys need remote management.
-  # The Rust default (127.0.0.1:9081) is intentionally loopback for
-  # local dev; we override it here.
+  # Default binds 0.0.0.0:9081 so a remote admin (e.g. via SSH
+  # port forward) works without an explicit override. The default
+  # password is `admin`; override via env var injection
+  # (e.g. ${ADMIN_PASSWORD}) before exposing 9081 to a non-trusted
+  # network, or restrict via ufw/iptables to known admin IPs.
   addr: {{ ngx_admin_addr | default('0.0.0.0:9081') }}
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}

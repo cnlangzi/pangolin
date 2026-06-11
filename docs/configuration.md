@@ -57,22 +57,36 @@ config. There is no `proxy:` wrapper.
 
 ### `[tunnel]` — WebSocket endpoint for tun clients
 
-| Field       | Type     | Default   | Required | Notes |
-| ----------- | -------- | --------- | -------- | ----- |
-| `port`      | `u16`    | `9001`    | no       | WS listen port. **Bind to loopback in production**; tun clients connect locally. |
-| `ws_path`   | `string` | `/tunnel` | no       | WebSocket path on the listen port. Change it if you proxy the WS port through another path-aware reverse proxy. |
+| Field       | Type     | Default          | Required | Notes |
+| ----------- | -------- | ---------------- | -------- | ----- |
+| `addr`      | `string` | `0.0.0.0:9001`   | no       | Full `host:port` string for the tun WebSocket listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **This is also the address `tun.yml: server:` must point at from the tun client side.** |
+| `ws_path`   | `string` | `/tunnel`        | no       | WebSocket path on the listen port. Change it if you proxy the WS port through another path-aware reverse proxy. |
 
 ### `[admin]` — admin UI / API
 
 The admin server is a separate bind from the proxy. The default
-loopback bind means it is not exposed on the public proxy port by
-default.
+`0.0.0.0:9081` accepts connections on any interface, so a remote
+admin (via SSH port forward, or a dedicated mgmt network) works
+without an explicit override.
 
-| Field       | Type     | Default              | Required | Notes |
-| ----------- | -------- | -------------------- | -------- | ----- |
-| `addr`      | `string` | `127.0.0.1:9081`     | no       | TCP bind. Loopback recommended; expose via SSH tunnel / VPN if you need remote access. |
-| `username`  | `string` | `admin`              | no       | HTTP basic auth user. |
-| `password`  | `string` | `admin`              | no       | HTTP basic auth password. **Change in production** — use `${ADMIN_PASSWORD}` to inject from a secret store. |
+> **⚠ Default credentials.** The shipped default password is
+> `admin`. **Override via env var injection before exposing
+> 9081 to any non-trusted network.** Typical pattern:
+>
+> ```yaml
+> admin:
+>   password: "${ADMIN_PASSWORD}"
+> ```
+>
+> …and export `ADMIN_PASSWORD` from your secret store / vault /
+> systemd `EnvironmentFile`. Alternatively, restrict 9081 via
+> `ufw` / `iptables` to known admin IPs.
+
+| Field       | Type     | Default          | Required | Notes |
+| ----------- | -------- | ---------------- | -------- | ----- |
+| `addr`      | `string` | `0.0.0.0:9081`   | no       | Full `host:port` string for the admin HTTP server. Override to `127.0.0.1:9081` for local-only access. |
+| `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
+| `password`  | `string` | `admin`          | no       | HTTP basic auth password. Override via `${ADMIN_PASSWORD}` in any non-trusted environment. |
 
 ### `[cache]` — response cache
 
@@ -181,13 +195,13 @@ addr:
 workers: 2              # fix workers for predictable debug output
 
 tunnel:
-  addr: 127.0.0.1:9001
+  addr: 0.0.0.0:9001    # default
   ws_path: /tunnel
 
 admin:
-  addr: 127.0.0.1:9081
+  addr: 0.0.0.0:9081    # default
   username: admin
-  password: admin       # dev only
+  password: admin       # dev only — change for any real deploy
 
 cache:
   enabled: false
@@ -233,11 +247,12 @@ host: default           # use ./certs/default/ for the cert
 workers: null           # auto = number of CPUs
 
 tunnel:
-  addr: 127.0.0.1:9001  # loopback + SSH-tunnel for single-host
+  addr: 0.0.0.0:9001    # default
   ws_path: /tunnel
 
 admin:
-  addr: 127.0.0.1:9081  # SSH-tunnel for remote access
+  addr: 0.0.0.0:9081    # default — restrict via ufw/iptables if
+                        # exposing to a non-trusted network
   username: admin
   password: "${ADMIN_PASSWORD}"   # injected from secret store
 

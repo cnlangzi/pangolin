@@ -103,7 +103,7 @@ fn default_ws_path() -> String {
     "/tunnel".into()
 }
 fn default_tunnel_addr() -> String {
-    "127.0.0.1:9001".into()
+    "0.0.0.0:9001".into()
 }
 
 impl Default for TunnelConfig {
@@ -150,7 +150,7 @@ pub struct AdminConfig {
 }
 
 fn default_admin_addr() -> String {
-    "127.0.0.1:9081".into()
+    "0.0.0.0:9081".into()
 }
 fn default_admin_username() -> String {
     "admin".into()
@@ -362,11 +362,20 @@ mod tests {
         // A regression to 127.0.0.1 would silently bind loopback.
         assert_eq!(c.addr.http, "0.0.0.0:80");
         assert_eq!(c.addr.https, "0.0.0.0:443");
-        // tunnel default — must be 127.0.0.1:9001 (loopback) so dev /
-        // SSH-tunnel production is safe. A regression to 0.0.0.0
-        // would silently expose the WS endpoint to any interface.
-        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
+        // tunnel default — must be 0.0.0.0:9001 so a multi-host
+        // deploy (tun on a separate host) works out of the box.
+        // Loopback still works because 0.0.0.0 accepts 127.0.0.1
+        // connections; a regression to 127.0.0.1 would silently
+        // exclude remote tun clients.
+        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
         assert_eq!(c.tunnel.ws_path, "/tunnel");
+        // admin default — same reasoning: 0.0.0.0:9081 so a remote
+        // admin (e.g. via SSH-tunneled port forward or a separate
+        // mgmt network) works without an explicit override. The
+        // shipped default password is `admin` and must be changed
+        // in any environment that exposes this on a non-trusted
+        // network — see docs/configuration.md.
+        assert_eq!(c.admin.addr, "0.0.0.0:9081");
         // v2: cert.autorenew removed; per-domain auto_issue in DB
         assert_eq!(c.acme.renew_threshold_days, 30);
         assert_eq!(c.acme.key_type, "ecdsa");
@@ -459,25 +468,40 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_default_addr_is_loopback() {
+    fn tunnel_default_addr_is_any() {
+        // Defaults to 0.0.0.0:9001 so a multi-host deploy (tun
+        // running on a separate host) connects without an explicit
+        // override. Loopback connections still work because
+        // 0.0.0.0 accepts 127.0.0.1.
         let c = Config::default();
-        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
+        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
     }
 
     #[test]
-    fn tunnel_addr_overridable() {
-        // The addr is a full host:port string so production
-        // deployments with tun on a separate host can bind to
-        // 0.0.0.0 (or a specific public IP) without going through
-        // a host+port → string assembly in the binary.
+    fn tunnel_addr_overridable_to_loopback() {
+        // Operators who want the old "tun is local-only" semantics
+        // (e.g. dev or SSH-tunnel production) can override to
+        // 127.0.0.1:9001.
         let s = r#"
             tunnel:
-              addr: "0.0.0.0:9001"
+              addr: "127.0.0.1:9001"
               ws_path: /tunnel
         "#;
         let c = Config::from_str(s).unwrap();
-        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
+        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
         assert_eq!(c.tunnel.ws_path, "/tunnel");
+    }
+
+    #[test]
+    fn admin_default_addr_is_any() {
+        // Defaults to 0.0.0.0:9081 so a remote admin (e.g. via
+        // SSH-tunneled port forward, or on a mgmt network) works
+        // without an explicit override. The default password is
+        // `admin` and **must** be changed via env-var injection
+        // (${ADMIN_PASSWORD}) before any production deploy that
+        // exposes 9081 to a non-trusted network.
+        let c = Config::default();
+        assert_eq!(c.admin.addr, "0.0.0.0:9081");
     }
 
     #[test]
