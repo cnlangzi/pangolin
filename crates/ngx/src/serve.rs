@@ -105,6 +105,34 @@ fn serve_css() -> http::Response<Vec<u8>> {
         .body(css)
         .unwrap()
 }
+
+/// Serve the single admin UI client bundle (`assets/app.js`).
+///
+/// The bundle contains all client logic (mobile nav, DNS kind sync,
+/// password reveal, mask/replace, test-connection, htmx modal + toast)
+/// and imports the vendored htmx from `assets/vendor/htmx-1.9.0.min.js`.
+///
+/// Lookup mirrors `serve_css()`: try a few relative paths from the
+/// current working directory so the binary works whether it's invoked
+/// from the workspace root, the crate directory, or the target dir.
+fn serve_js() -> http::Response<Vec<u8>> {
+    let js = std::fs::read("assets/app.js")
+        .or_else(|_| std::fs::read("../assets/app.js"))
+        .or_else(|_| std::fs::read("../../assets/app.js"))
+        .unwrap_or_else(|_| {
+            // Fallback: embedded at build time.
+            include_str!("../../../assets/app.js")
+                .as_bytes()
+                .to_vec()
+        });
+
+    http::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/javascript; charset=utf-8")
+        .header("Cache-Control", "no-cache, must-revalidate")
+        .body(js)
+        .unwrap()
+}
 async fn serve_admin_ui(
     http_session: &mut ServerSession,
     app: &Arc<App>,
@@ -115,6 +143,12 @@ async fn serve_admin_ui(
     // Static CSS file
     if path == "/admin/app.css" || path == "/admin/assets/app.css" {
         return serve_css();
+    }
+
+    // Static JS bundle (`assets/app.js`). The browser fetches it with
+    // `?v=<hash>` for cache busting; the query string is ignored here.
+    if path == "/admin/app.js" || path == "/admin/assets/app.js" {
+        return serve_js();
     }
 
     // Get cookie header
