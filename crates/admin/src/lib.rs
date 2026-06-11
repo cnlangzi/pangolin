@@ -155,6 +155,31 @@ pub async fn handle(
             routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
         "tun" => routes::tun::render(&app, &csrf_token).await?,
+        "tun/new" if method == "GET" => routes::tun::render_create_page(&app, &csrf_token).await?,
+        "tun/new" if method == "POST" => {
+            routes::tun::handle_create(&app, &merged_params, &csrf_token).await?
+        }
+        "tun/edit" if method == "GET" => {
+            routes::tun::render_edit_page(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+            )
+            .await?
+        }
+        "tun/edit" if method == "POST" => {
+            routes::tun::handle_update(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &merged_params,
+                &csrf_token,
+            )
+            .await?
+        }
+        "tun/delete" if method == "POST" => {
+            routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
+                .await?
+        }
         "certs" if method == "GET" => routes::certs::render(&app, &csrf_token).await?,
         "certs/new" if method == "GET" => routes::certs::render_create_page(&csrf_token).await?,
         "certs/new" if method == "POST" => {

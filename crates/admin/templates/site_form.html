@@ -17,7 +17,7 @@
     </p>
   </div>
 
-  <form method="POST" action="{% if action == "update" %}/admin/sites/edit?name={% if let Some(s) = site %}{{ s.name }}{% endif %}{% else %}/admin/sites/new{% endif %}" class="card p-6 space-y-5">
+  <form method="POST" action="{% if action == "update" %}/admin/sites/edit?name={% if let Some(s) = site %}{{ s.name }}{% endif %}{% else %}/admin/sites/new{% endif %}" class="card p-6 space-y-5" data-backend-form>
     <input type="hidden" name="_csrf" value="__CSRF__">
     {# The actual backend string sent to the server. JS keeps this in sync
        with the hierarchical form below — the server-side parser is the
@@ -86,8 +86,7 @@
           <div class="grid grid-cols-2 gap-2">
             <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
               <input type="radio" name="route_mode" value="direct" class="mt-0.5 text-accent-600 focus:ring-accent-500"
-                {% if self.initial_route_mode() == "direct" %}checked{% endif %}
-                onchange="toggleBackendMode()">
+                {% if self.initial_route_mode() == "direct" %}checked{% endif %}>
               <div class="flex-1 min-w-0">
                 <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Direct</div>
                 <div class="text-xs text-slate-500 dark:text-slate-400">Connect straight to the URL — no tunnel</div>
@@ -95,8 +94,7 @@
             </label>
             <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
               <input type="radio" name="route_mode" value="tunnel" class="mt-0.5 text-accent-600 focus:ring-accent-500"
-                {% if self.initial_route_mode() == "tunnel" %}checked{% endif %}
-                onchange="toggleBackendMode()">
+                {% if self.initial_route_mode() == "tunnel" %}checked{% endif %}>
               <div class="flex-1 min-w-0">
                 <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Tunnel</div>
                 <div class="text-xs text-slate-500 dark:text-slate-400">Forward through a registered tunnel node</div>
@@ -152,10 +150,10 @@
         {# Tunnel mode: tunnel dropdown + protocol + host:port #}
         <div id="backend-tunnel-fields" {% if self.initial_route_mode() != "tunnel" %}class="hidden"{% endif %}>
           {% if tunnels.is_empty() %}
-          <div class="px-3 py-2.5 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
-            No tunnel nodes are registered yet. Switch to <strong>Direct</strong>, or register a tunnel under <a href="/admin/tun" class="underline">Tunnels</a> first.
+          <div class="mb-2 px-3 py-2 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
+            No tunnel nodes registered yet. <a href="/admin/tun" class="underline">Register a tunnel</a> first.
           </div>
-          {% else %}
+          {% endif %}
           <div class="grid grid-cols-3 gap-2">
             <div>
               <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
@@ -166,9 +164,13 @@
                   {% else %}
   border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
                   {% endif %}">
+                {% if tunnels.is_empty() %}
+                <option value="" disabled selected>— no tunnels registered —</option>
+                {% else %}
                 {% for t in tunnels %}
                 <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} (online){% else %} (offline){% endif %}</option>
                 {% endfor %}
+                {% endif %}
               </select>
             </div>
             <div>
@@ -210,7 +212,6 @@
           {% else %}
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
           {% endif %}
-          {% endif %}
         </div>
       </div>
     </div>
@@ -218,16 +219,14 @@
     <div>
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
       <select name="host_mode" id="host-mode"
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        hx-get="/admin/sites/host-custom-field" hx-target="#host-custom-wrapper" hx-swap="innerHTML">
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
         <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
         <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
       </select>
     </div>
 
-    <div id="host-custom-wrapper">
-      {% if self.show_host_custom() %}
+    <div id="host-custom-wrapper" {% if !self.show_host_custom() %}class="hidden"{% endif %}>
       <div>
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
         <input type="text" name="host_custom" id="host-custom"
@@ -236,7 +235,6 @@
           placeholder="e.g. internal.example.com">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
-      {% endif %}
     </div>
 
     <div class="flex gap-2 pt-1">
@@ -245,115 +243,4 @@
     </div>
   </form>
 </main>
-{% endblock %}
-
-{# Keep the hidden backend field in sync with whichever UI group is shown.
-   Also: client-side guard against submitting an empty backend (e.g. user
-   picked Direct/File but didn't fill in the host:port). #}
-{% block scripts %}
-<script>
-(function() {
-  const form = document.querySelector('form[method="POST"]');
-  const directFields = document.getElementById('backend-direct-fields');
-  const tunnelFields = document.getElementById('backend-tunnel-fields');
-  const hidden = document.getElementById('site-backend-hidden');
-  const directProto = document.getElementById('site-backend-direct-protocol');
-  const directInput = document.getElementById('site-backend-direct');
-  const tunnelSelect = document.getElementById('site-backend-tunnel');
-  const protocolSelect = document.getElementById('site-backend-protocol');
-  const hostInput = document.getElementById('site-backend-host');
-  const preview = document.getElementById('backend-preview');
-
-  // htmx may not load on the simple-edit page; expose a global so the
-  // `hx-on:change="toggleBackendMode()"` calls work either way.
-  window.toggleBackendMode = function() {
-    const mode = document.querySelector('input[name="route_mode"]:checked').value;
-    if (mode === 'direct') {
-      directFields.classList.remove('hidden');
-      tunnelFields.classList.add('hidden');
-    } else {
-      directFields.classList.add('hidden');
-      tunnelFields.classList.remove('hidden');
-    }
-    updateHidden();
-  };
-
-  /// Build `<scheme>://<host>` for http/https, or `file:///<path>` for file.
-  function assembleUrl(scheme, host) {
-    if (scheme === 'file') {
-      const path = host.replace(/^\/+/, '');
-      return 'file:///' + path;
-    }
-    return scheme + '://' + host;
-  }
-
-  function updateHidden() {
-    const mode = document.querySelector('input[name="route_mode"]:checked');
-    const modeValue = mode ? mode.value : 'direct';
-    let value = '';
-    if (modeValue === 'direct') {
-      const proto = directProto ? directProto.value : 'http';
-      const host = directInput ? directInput.value.trim() : '';
-      value = assembleUrl(proto, host);
-    } else {
-      const tun = tunnelSelect ? tunnelSelect.value : '';
-      const proto = protocolSelect ? protocolSelect.value : 'http';
-      const host = hostInput ? hostInput.value.trim() : '';
-      value = tun + ':' + assembleUrl(proto, host);
-      if (preview) preview.textContent = value || '(empty)';
-    }
-    hidden.value = value;
-  }
-
-  if (directProto) directProto.addEventListener('change', updateHidden);
-  if (directInput) directInput.addEventListener('input', updateHidden);
-  if (tunnelSelect) tunnelSelect.addEventListener('change', updateHidden);
-  if (protocolSelect) protocolSelect.addEventListener('change', updateHidden);
-  if (hostInput) hostInput.addEventListener('input', updateHidden);
-
-  // Client-side guard: never let an empty backend reach the server. If the
-  // user picked Direct/File but left host:port blank (or picked Tunnel
-  // without selecting one), show an inline error and stop the submit.
-  // This handles the case where the JS update race causes the hidden
-  // field to be empty even though the user thinks they filled it in.
-  if (form) {
-    form.addEventListener('submit', function(e) {
-      updateHidden();
-      if (!hidden.value || hidden.value === '://' || hidden.value.endsWith('://')) {
-        e.preventDefault();
-        showBackendError('Backend is required — fill in the host:port (or file path) field');
-        // Focus the empty input so the user can fix it immediately.
-        if (directInput && !directFields.classList.contains('hidden') && !directInput.value.trim()) {
-          directInput.focus();
-        } else if (hostInput && !hostInput.value.trim()) {
-          hostInput.focus();
-        }
-      }
-    });
-  }
-
-  function showBackendError(msg) {
-    // Reuse the server-rendered error display: inject a top summary + a
-    // red border on the host:port inputs.
-    let summary = document.getElementById('form-error-summary');
-    if (!summary) {
-      summary = document.createElement('div');
-      summary.id = 'form-error-summary';
-      summary.setAttribute('role', 'alert');
-      summary.className = 'flex items-start gap-3 p-3.5 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-500/30 rounded-lg';
-      summary.innerHTML = '<svg class="w-5 h-5 flex-shrink-0 text-red-500 dark:text-red-400 mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg><div class="flex-1 min-w-0"><p class="text-sm font-medium text-red-800 dark:text-red-200"></p></div>';
-      form.insertBefore(summary, form.firstChild);
-    }
-    summary.querySelector('p').textContent = msg;
-    // Highlight the empty input(s).
-    if (directInput) directInput.classList.add('border-red-500', 'border-2', 'bg-red-50', 'dark:bg-red-900/20');
-    if (hostInput) hostInput.classList.add('border-red-500', 'border-2', 'bg-red-50', 'dark:bg-red-900/20');
-  }
-
-  // Initialise on page load so the hidden field always matches the visible
-  // form (handles the edit case where the server pre-filled the hidden
-  // input with the existing backend string).
-  updateHidden();
-})();
-</script>
 {% endblock %}
