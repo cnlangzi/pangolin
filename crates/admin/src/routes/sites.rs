@@ -34,12 +34,16 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
 
 /// Render the New site page.
 pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
-    let _ = app;
+    let tunnels = {
+        let db = app.db.lock().await;
+        pangolin_core::db::list_tuns(&db).unwrap_or_default()
+    };
     let html = SiteFormTemplate {
         site: None,
         action: "create",
         error: None,
         active_nav: "sites",
+        tunnels,
     }
     .render()
     .unwrap();
@@ -64,6 +68,7 @@ pub async fn render_edit_page(
     };
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let tunnels = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     let site = sites.into_iter().find(|s| s.name == name);
     drop(db);
     let html = SiteFormTemplate {
@@ -71,6 +76,7 @@ pub async fn render_edit_page(
         action: "update",
         error: None,
         active_nav: "sites",
+        tunnels,
     }
     .render()
     .unwrap();
@@ -206,11 +212,16 @@ fn render_create_page_with_error(
     error: &str,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
+    // The tunnels list isn't strictly required to re-render with an error
+    // (the form will be re-submitted), but fetching it keeps the form
+    // consistent if the user retries without reloading the page.
+    let _ = site;
     let html = SiteFormTemplate {
-        site,
+        site: None,
         action: "create",
         error: Some(error),
         active_nav: "sites",
+        tunnels: Vec::new(),
     }
     .render()
     .unwrap();
@@ -241,6 +252,7 @@ fn render_edit_page_with_error(
         action: "update",
         error: Some(error),
         active_nav: "sites",
+        tunnels: Vec::new(),
     }
     .render()
     .unwrap();

@@ -75,6 +75,114 @@ impl Site {
     pub fn is_host_mode_custom(&self) -> bool {
         self.host_mode == HostMode::Custom
     }
+
+    /// Parses the `backend` field into its three display components for the
+    /// hierarchical site form:
+    ///   - `route_mode`: "direct" if no `tun:` prefix, "tunnel" otherwise.
+    ///   - `tun_name`: the tunnel name prefix (empty for direct).
+    ///   - `scheme`: the URL scheme ("http", "https", "file", or "" if
+    ///     unparseable — we keep the field empty rather than erroring at
+    ///     render time so a malformed stored value still loads the page).
+    ///   - `host_port`: the part after `scheme://` (e.g. `127.0.0.1:8080`).
+    ///
+    /// See `parse::parse_backend` for the canonical parser. These helpers
+    /// exist for templates that want to pre-fill the three-step UI without
+    /// round-tripping through `parse_backend`'s `Result`.
+    pub fn backend_route_mode(&self) -> &'static str {
+        if self.backend.is_empty() {
+            return "direct";
+        }
+        if self.backend.starts_with("http://")
+            || self.backend.starts_with("https://")
+            || self.backend.starts_with("file:///")
+        {
+            "direct"
+        } else {
+            // Anything else with a colon is assumed to be `tun_name:scheme://...`.
+            // We don't try to validate here; the form submit will be rejected
+            // server-side if malformed.
+            "tunnel"
+        }
+    }
+
+    /// Tunnel name prefix. Empty string for direct mode.
+    pub fn backend_tun_name(&self) -> &str {
+        if self.backend_route_mode() != "tunnel" {
+            return "";
+        }
+        match self.backend.find(':') {
+            Some(idx) => &self.backend[..idx],
+            None => "",
+        }
+    }
+
+    /// URL scheme (lowercased): "http", "https", "file", or "".
+    /// For tunnel backends (`tun:scheme://...`), returns the scheme of the
+    /// URL portion, not the tunnel name.
+    pub fn backend_scheme(&self) -> &str {
+        if self.backend.starts_with("https://") {
+            return "https";
+        }
+        if self.backend.starts_with("http://") {
+            return "http";
+        }
+        if self.backend.starts_with("file:///") {
+            return "file";
+        }
+        // Tunnel case: strip the `tun:` prefix and re-check.
+        if self.backend_route_mode() == "tunnel" {
+            if let Some(colon_idx) = self.backend.find(':') {
+                let url = &self.backend[colon_idx + 1..];
+                if url.starts_with("https://") {
+                    return "https";
+                }
+                if url.starts_with("http://") {
+                    return "http";
+                }
+                if url.starts_with("file:///") {
+                    return "file";
+                }
+            }
+        }
+        ""
+    }
+
+    /// Host (and optional port) portion of the URL, i.e. the part after
+    /// `scheme://` and before any path. For `file:///var/www` this returns
+    /// `var/www` (no host), which is what the user types into the
+    /// hierarchical form's host:port field.
+    pub fn backend_host_port(&self) -> &str {
+        if let Some(rest) = self.backend.strip_prefix("https://") {
+            return split_host_path(rest);
+        }
+        if let Some(rest) = self.backend.strip_prefix("http://") {
+            return split_host_path(rest);
+        }
+        if let Some(rest) = self.backend.strip_prefix("file://") {
+            // file:///var/www → host is empty, path is /var/www.
+            // We want to show the path part in the form so users can edit
+            // it directly. Drop the leading slash for display (the form
+            // re-adds it on submit by concatenating `file:///` + value).
+            return rest.trim_start_matches('/');
+        }
+        if self.backend_route_mode() == "tunnel" {
+            // Format: `tun_name:scheme://host:port[/path]`
+            if let Some(colon_idx) = self.backend.find(':') {
+                return split_host_path(&self.backend[colon_idx + 1..]);
+            }
+        }
+        ""
+    }
+}
+
+/// Splits an `host[:port][/path]` string at the first `/`, returning the
+/// `host[:port]` portion. Used by `Site::backend_host_port` to strip paths
+/// from URLs like `https://example.com/api` → `example.com`.
+fn split_host_path(s: &str) -> &str {
+    match s.find('/') {
+        Some(idx) => &s[..idx],
+        None => s,
+    }
 }
 
 /// Domain (domains table). domain is the primary key.

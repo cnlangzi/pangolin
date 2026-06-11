@@ -148,6 +148,12 @@ pub async fn handle(
             )
             .await?
         }
+        "api/domains" if method == "POST" => {
+            // Generic create endpoint (used by the site_domains form when
+            // the site is locked — site_name is taken from the form body,
+            // which already has the correct preselected value).
+            routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
+        }
         "tun" => routes::tun::render(&app, &csrf_token).await?,
         "tokens" if method == "GET" => routes::tokens::render(&app, &csrf_token).await?,
         "tokens/new" if method == "GET" => {
@@ -240,6 +246,37 @@ pub async fn handle(
                                 &csrf_token,
                             )
                             .await?
+                        }
+                        _ => not_found(),
+                    }
+                } else {
+                    not_found()
+                }
+            } else if let Some(rest) = path.strip_prefix("api/domains/") {
+                // Global domain-scoped endpoints (no site context).
+                // Path: api/domains/{domain}/{action}
+                if let Some((domain, action)) = rest.split_once('/') {
+                    match (action, method) {
+                        ("edit", "GET") => {
+                            routes::domains::api_render_form_edit(
+                                &app,
+                                domain,
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        ("edit", "POST") => {
+                            routes::domains::handle_update(
+                                &app,
+                                domain,
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        ("toggle", "POST") => {
+                            routes::domains::handle_toggle(&app, domain, &csrf_token).await?
                         }
                         _ => not_found(),
                     }

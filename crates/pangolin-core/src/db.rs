@@ -142,6 +142,17 @@ pub fn delete_domain(conn: &Connection, domain: &str) -> rusqlite::Result<bool> 
     Ok(n > 0)
 }
 
+/// Toggle / set the `enabled` flag on a single domain row. Returns true
+/// if the row existed and was updated. Used by the admin UI's per-row
+/// toggle switch (POST /admin/api/domains/{domain}/toggle).
+pub fn set_domain_enabled(conn: &Connection, domain: &str, enabled: bool) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE domains SET enabled = ?1 WHERE domain = ?2",
+        params![enabled as i32, domain],
+    )?;
+    Ok(n > 0)
+}
+
 // ---- Tun CRUD ----
 
 pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {

@@ -43,6 +43,53 @@ pub struct SiteFormTemplate<'a> {
     pub action: &'a str,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// Available tunnel names, for the hierarchical backend URL form's
+    /// "Tunnel" dropdown. Templates should never render an empty list
+    /// without a clear "no tunnels registered" hint, since the form
+    /// becomes useless otherwise.
+    pub tunnels: Vec<Tun>,
+}
+
+impl<'a> SiteFormTemplate<'a> {
+    /// Returns the initial `route_mode` for the hierarchical backend form:
+    /// "tunnel" if the existing backend is a `tun:scheme://...` URL,
+    /// "direct" otherwise (including the new-site empty case).
+    pub fn initial_route_mode(&self) -> &'static str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_route_mode())
+            .unwrap_or("direct")
+    }
+    /// Returns the initial tunnel name selection, or empty string for
+    /// direct / new-site.
+    pub fn initial_tun_name(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_tun_name())
+            .unwrap_or("")
+    }
+    /// Returns the initial scheme selection (http/https/file), defaulting
+    /// to "http" for the new-site case.
+    pub fn initial_scheme(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| {
+                let s = s.backend_scheme();
+                if s.is_empty() {
+                    "http"
+                } else {
+                    s
+                }
+            })
+            .unwrap_or("http")
+    }
+    /// Returns the initial host:port value, or empty string for new-site.
+    pub fn initial_host_port(&self) -> &str {
+        self.site
+            .as_ref()
+            .map(|s| s.backend_host_port())
+            .unwrap_or("")
+    }
 }
 
 // ─── Domains ───────────────────────────────────────────────────────────────────
@@ -73,6 +120,13 @@ pub struct DomainFormTemplate<'a> {
     /// Defaults to `false` for the "new" form, mirroring the v2 design rule
     /// that operators must explicitly opt in to auto-issuance.
     pub auto_issue_checked: bool,
+    /// When `Some(domain)`, render in edit mode. The domain name becomes
+    /// a read-only display (primary key), the site field is locked to the
+    /// domain's current site_name, and the form action is the update
+    /// endpoint instead of the create endpoint.
+    pub edit_domain: Option<String>,
+    /// Pre-filled `auto_issue` value when editing an existing domain.
+    pub current_auto_issue: bool,
 }
 
 impl<'a> DomainFormTemplate<'a> {
@@ -80,6 +134,91 @@ impl<'a> DomainFormTemplate<'a> {
     /// This is a helper to avoid Option<String> == String comparisons in templates.
     pub fn is_site_preselected(&self, site_name: &str) -> bool {
         self.preselected_site_name.as_deref() == Some(site_name)
+    }
+
+    /// Form action URL: edit endpoint when in edit mode, create endpoint
+    /// otherwise. When invoked from a site-specific sub-page (site is
+    /// preselected), the new-domain form posts to the generic create
+    /// endpoint so the redirect can land back on the site_domains page.
+    pub fn form_action(&self) -> String {
+        if let Some(domain) = &self.edit_domain {
+            return format!("/admin/api/domains/{}/edit", domain);
+        }
+        if self.preselected_site_name.is_some() {
+            return "/admin/api/domains".to_string();
+        }
+        "/admin/domains/new".to_string()
+    }
+
+    /// Submit-button label: "Save" in edit mode, "Save" otherwise. Kept as
+    /// a method for symmetry with future variants (e.g. "Create and add another").
+    pub fn submit_label(&self) -> &'static str {
+        if self.edit_domain.is_some() {
+            "Save"
+        } else {
+            "Save"
+        }
+    }
+
+    /// Form title: "Edit domain" or "New domain".
+    pub fn form_title(&self) -> &'static str {
+        if self.edit_domain.is_some() {
+            "Edit domain"
+        } else {
+            "New domain"
+        }
+    }
+
+    /// Whether the site field should be locked to the preselected site
+    /// (hidden input + read-only label instead of an editable dropdown).
+    /// True when editing an existing domain or when invoked from a
+    /// site-specific sub-page that already establishes the site context.
+    pub fn lock_site(&self) -> bool {
+        self.edit_domain.is_some() || self.preselected_site_name.is_some()
+    }
+
+    /// Whether the domain name field should be locked (read-only display +
+    /// hidden field). Only true in edit mode.
+    pub fn lock_domain(&self) -> bool {
+        self.edit_domain.is_some()
+    }
+
+    /// Returns true if the given DNS provider name is the currently-selected
+    /// one for this domain. Used by the <select> dropdown to mark the
+    /// matching <option> as selected.
+    pub fn is_dns_provider_selected(&self, name: &str) -> bool {
+        self.dns_provider_value == name
+    }
+
+    /// Returns the current edit-domain name (or empty string if not in
+    /// edit mode). Used by templates to render the read-only domain badge
+    /// and the hidden field value.
+    pub fn edit_domain_value(&self) -> &str {
+        self.edit_domain.as_deref().unwrap_or("")
+    }
+
+    /// Returns the current preselected site name (or empty string).
+    pub fn preselected_site_name_value(&self) -> &str {
+        self.preselected_site_name.as_deref().unwrap_or("")
+    }
+
+    /// Returns the URL to redirect to after a successful form submit.
+    /// When invoked from a site-specific sub-page (preselected site set),
+    /// this is the site_domains page. When editing, also the site_domains
+    /// page (since edit is always invoked from a row on that page).
+    /// Otherwise (the global new form), returns /admin/domains.
+    pub fn next_redirect(&self) -> String {
+        if let Some(site) = &self.preselected_site_name {
+            return format!("/admin/site/{}/domains", site);
+        }
+        if let Some(domain) = &self.edit_domain {
+            // For edit, we don't have site_name in the template (it's
+            // already locked via preselected_site_name when editing), so
+            // this branch is rarely hit. Fall back to global domains.
+            let _ = domain;
+            return "/admin/domains".to_string();
+        }
+        "/admin/domains".to_string()
     }
 }
 
@@ -89,6 +228,7 @@ pub struct SiteDomainsTemplate {
     pub site: Site,
     pub domains: Vec<Domain>,
     pub sites: Vec<Site>,
+    pub active_nav: &'static str,
 }
 
 // ─── Tunnels ────────────────────────────────────────────────────────────────────

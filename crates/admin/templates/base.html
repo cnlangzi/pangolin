@@ -63,6 +63,9 @@
 
 {% block content %}{% endblock %}
 
+<script src="https://unpkg.com/htmx.org@1.9.0"></script>
+{% block scripts %}{% endblock %}
+
 <script>
 document.getElementById('menu-toggle').addEventListener('click', function() {
   document.getElementById('mobile-nav').classList.toggle('hidden');
