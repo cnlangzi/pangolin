@@ -1,7 +1,6 @@
 //! Tunnels route — list / new / edit / delete.
 
 use askama::Template;
-use std::io::Read;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -63,7 +62,7 @@ pub async fn handle_create(
     if name.len() > 64 {
         return render_create_page_with_error(None, "Name must be 64 characters or less", csrf);
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !name.chars().all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-') {
         return render_create_page_with_error(None, "Name may only contain letters, digits, underscores, and hyphens", csrf);
     }
 
@@ -263,11 +262,10 @@ fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {
 /// Generate a random 32-byte hex token (64 hex characters).
 fn generate_token() -> Result<String, String> {
     let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .map_err(|e| format!("failed to read random bytes: {}", e))?;
+    rand::rngs::OsRng.fill(&mut buf);
     Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
 }
+
 
 /// Parse a `datetime-local` input value (YYYY-MM-DDTHH:MM) into an Option<DateTime<Utc>>.
 fn parse_datetime(s: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
