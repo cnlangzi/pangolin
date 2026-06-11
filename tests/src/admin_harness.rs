@@ -55,18 +55,18 @@ impl AdminClient {
         // GET login page to get initial state (not strictly needed, but realistic)
         let login_page = self
             .client
-            .get(&format!("{}/admin/login", self.base_url))
+            .get(&format!("{}/login", self.base_url))
             .send()
             .await?;
 
         if !login_page.status().is_success() {
-            anyhow::bail!("GET /admin/login returned {}", login_page.status());
+            anyhow::bail!("GET /login returned {}", login_page.status());
         }
 
         // POST credentials
         let resp = self
             .client
-            .post(&format!("{}/admin/login", self.base_url))
+            .post(&format!("{}/login", self.base_url))
             .form(&[("username", username), ("password", password)])
             .send()
             .await?;

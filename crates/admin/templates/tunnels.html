@@ -5,9 +5,17 @@
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 md:py-6 max-w-7xl mx-auto">
-  <div class="mb-6">
-    <h1 class="text-2xl font-bold text-slate-900">Tunnels</h1>
-    <p class="text-slate-500 text-sm mt-1">Each row is one tun node — the <code class="text-xs">token</code> column is the credential the WS server checks. Provision both via <code class="text-xs">POST /api/tun</code> before the tun starts; the server does not auto-register new tuns.</p>
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-bold text-slate-900">Tunnels</h1>
+      <p class="text-slate-500 text-sm mt-1">Each row is one tun node — the <code class="text-xs">token</code> column is the credential the WS server checks. Register a new node before it starts; the server does not auto-register new tuns.</p>
+    </div>
+    <a href="/tun/new" class="inline-flex items-center justify-center gap-2 w-full sm:w-auto rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/>
+      </svg>
+      New tun
+    </a>
   </div>
 
   <div class="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
@@ -18,6 +26,7 @@
           <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Status</th>
           <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Token</th>
           <th class="text-left text-xs font-semibold text-slate-500 uppercase tracking-wider px-4 py-3">Last seen</th>
+          <th class="text-right px-4 py-3"></th>
         </tr>
       </thead>
       <tbody class="divide-y divide-slate-100">
@@ -48,9 +57,27 @@
             {% if let Some(t) = tun.token %}<code>{{ t }}</code>{% else %}<span class="text-slate-400">—</span>{% endif %}
           </td>
           <td class="px-4 py-3 text-sm text-slate-500">{% if let Some(t) = tun.last_seen_at %}{{ t.format("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</td>
+          <td class="px-4 py-3">
+            <div class="flex items-center justify-end gap-1">
+              <a href="/tun/{{ tun.name }}/edit"
+                class="text-slate-400 hover:text-accent-500 p-1.5 rounded hover:bg-accent-50 transition-colors"
+                title="Edit"
+                aria-label="Edit {{ tun.name }}">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931z"/></svg>
+              </a>
+              <form method="POST" action="/tun/{{ tun.name }}/delete" onsubmit="return confirm('Delete tun {{ tun.name }}?');" class="inline">
+                <input type="hidden" name="_csrf" value="__CSRF__">
+                <button type="submit"
+                  class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 transition-colors"
+                  title="Delete">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
+                </button>
+              </form>
+            </div>
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="4" class="px-4 py-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet.</td></tr>
+        <tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/tun/new" class="text-accent-500 hover:underline">Register one</a> before it starts.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -77,9 +104,17 @@
           <div>Token: {% if let Some(t) = tun.token %}<code class="font-mono">{{ t }}</code>{% else %}—{% endif %}</div>
           <div>Last seen: {% if let Some(t) = tun.last_seen_at %}{{ t.format("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</div>
         </div>
+        <div class="flex gap-1 mt-3">
+          <a href="/tun/{{ tun.name }}/edit"
+            class="flex-1 text-center text-sm text-accent-600 hover:text-accent-700 border border-accent-200 hover:bg-accent-50 rounded-lg py-1.5 transition-colors">Edit</a>
+          <form method="POST" action="/tun/{{ tun.name }}/delete" onsubmit="return confirm('Delete tun {{ tun.name }}?');" class="flex-1">
+            <input type="hidden" name="_csrf" value="__CSRF__">
+            <button type="submit" class="w-full text-sm text-red-500 hover:text-red-600 border border-red-100 hover:bg-red-50 rounded-lg py-1.5 transition-colors">Delete</button>
+          </form>
+        </div>
       </div>
       {% else %}
-      <div class="p-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet.</div>
+      <div class="p-8 text-center text-slate-400 text-sm">No tunnel nodes registered yet. <a href="/tun/new" class="text-accent-500 hover:underline">Register one</a> before it starts.</div>
       {% endfor %}
     </div>
   </div>

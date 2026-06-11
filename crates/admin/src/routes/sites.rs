@@ -56,7 +56,7 @@ pub async fn render_edit_page(
         Some(n) if !n.is_empty() => n,
         _ => {
             let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing site name.</p><a href="/admin/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing site name.</p><a href="/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
             )));
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(resp);
@@ -124,7 +124,7 @@ pub async fn handle_create(
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/sites"))
+            Ok(redirect_response("/sites"))
         }
         Err(e) => render_create_page_with_error(None, &format!("Database error: {}", e), csrf),
     }
@@ -140,7 +140,7 @@ pub async fn handle_update(
         Some(n) if !n.is_empty() => n,
         _ => {
             let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing site name.</p><a href="/admin/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
+                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing site name.</p><a href="/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
             )));
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             return Ok(resp);
@@ -179,7 +179,7 @@ pub async fn handle_update(
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/sites"))
+            Ok(redirect_response("/sites"))
         }
         Err(e) => render_edit_page_with_error(app, &name, &format!("Database error: {}", e), csrf),
     }
@@ -198,7 +198,7 @@ pub async fn handle_delete(
             app.reload_indexes().await;
         }
     }
-    Ok(redirect_response("/admin/sites"))
+    Ok(redirect_response("/sites"))
 }
 
 fn render_create_page_with_error(

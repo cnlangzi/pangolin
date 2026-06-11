@@ -123,7 +123,7 @@ pub async fn render_table_for_site(
   </td>
   <td class="py-3 px-3">
     <div class="flex items-center gap-1">
-      <form method="POST" action="/admin/domains/delete" onsubmit="return confirm('Delete domain {}?');" class="inline">
+      <form method="POST" action="/domains/delete" onsubmit="return confirm('Delete domain {}?');" class="inline">
         <input type="hidden" name="domain" value="{}">
         <input type="hidden" name="_csrf" value="__CSRF__">
         <button type="submit"
@@ -266,7 +266,7 @@ pub async fn handle_create(
     match result {
         Ok(()) => {
             app.reload_indexes().await;
-            Ok(redirect_response("/admin/domains"))
+            Ok(redirect_response("/domains"))
         }
         Err(e) => {
             render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None).await
@@ -312,7 +312,32 @@ pub async fn handle_delete(
             app.reload_indexes().await;
         }
     }
-    Ok(redirect_response("/admin/domains"))
+    Ok(redirect_response("/domains"))
+}
+
+/// HTMX DELETE /api/domains/{domain} — returns an empty 200 body so HTMX
+/// (with hx-swap="delete") can drop the row. JSON API is gone, but this
+/// HTMX endpoint exists for the same reason `render_table_for_site` does:
+/// to support in-place UI updates without a full-page round trip.
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    domain: String,
+    _csrf: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    if !domain.is_empty() {
+        let db = app.db.lock().await;
+        let _ = pangolin_core::db::delete_domain(&db, &domain);
+        drop(db);
+        app.reload_indexes().await;
+        return Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::new()))
+            .expect("200 response builder is infallible"));
+    }
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::NOT_FOUND;
+    Ok(resp)
 }
 
 fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {

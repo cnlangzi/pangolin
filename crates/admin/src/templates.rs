@@ -99,6 +99,14 @@ pub struct TunnelsTemplate<'a> {
     pub active_nav: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "tun_form.html")]
+pub struct TunFormTemplate<'a> {
+    pub tun: Option<Tun>,
+    pub error: Option<&'a str>,
+    pub active_nav: &'a str,
+}
+
 // ─── Certs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -210,5 +218,19 @@ impl<'a> DnsProviderFormTemplate<'a> {
     /// Pre-filled Tencent secret id for the edit form.
     pub fn tencent_secret_id_value(&self) -> &str {
         self.tencent_secret_id.as_deref().unwrap_or("")
+    }
+    /// Form POST target. Edit forms POST to `/dns/{name}/edit` (path-param
+    /// style, as specified in the dashboard URL brief). New forms POST to
+    /// `/dns/new`. The name is embedded directly in the URL because the
+    /// route is a path-param style endpoint.
+    pub fn form_action(&self) -> String {
+        if self.is_edit {
+            match &self.provider {
+                Some(p) => format!("/dns/{}/edit", p.name),
+                None => "/dns/edit".to_string(),
+            }
+        } else {
+            "/dns/new".to_string()
+        }
     }
 }

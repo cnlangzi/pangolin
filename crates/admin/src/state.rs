@@ -128,7 +128,7 @@ fn parse_cookie_named(cookie_header: &str, name: &str) -> Option<String> {
 /// Build a Set-Cookie header value for the session token.
 pub fn make_session_cookie(token: &str) -> String {
     format!(
-        "pangolin_session={}; HttpOnly; Path=/admin; SameSite=Strict; Max-Age=86400",
+        "pangolin_session={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=86400",
         token
     )
 }
@@ -138,17 +138,17 @@ pub fn make_session_cookie(token: &str) -> String {
 /// The token is also embedded in the rendered HTML form, so JS access is a defense in depth.
 pub fn make_csrf_cookie(csrf: &str) -> String {
     format!(
-        "pangolin_csrf={}; Path=/admin; SameSite=Strict; Max-Age=86400",
+        "pangolin_csrf={}; Path=/; SameSite=Strict; Max-Age=86400",
         csrf
     )
 }
 
 /// Build a Set-Cookie header that expires the session immediately.
 pub fn make_logout_cookie() -> String {
-    "pangolin_session=; HttpOnly; Path=/admin; SameSite=Strict; Max-Age=0".to_string()
+    "pangolin_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0".to_string()
 }
 
 /// Build a Set-Cookie header that expires the CSRF cookie.
 pub fn make_logout_csrf_cookie() -> String {
-    "pangolin_csrf=; Path=/admin; SameSite=Strict; Max-Age=0".to_string()
+    "pangolin_csrf=; Path=/; SameSite=Strict; Max-Age=0".to_string()
 }

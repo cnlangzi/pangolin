@@ -25,12 +25,12 @@ async fn unauth_redirect_dashboard() {
     let ngx = start_ngx().await;
     let client = new_client_no_redirect();
     for path in &[
-        "/admin/",
-        "/admin/sites",
-        "/admin/sites/new",
-        "/admin/domains",
-        "/admin/tun",
-        "/admin/certs",
+        "/",
+        "/sites",
+        "/sites/new",
+        "/domains",
+        "/tun",
+        "/certs",
     ] {
         let resp = client.get(&ngx.admin_url(path)).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 302, "path {} should redirect", path);
@@ -40,8 +40,8 @@ async fn unauth_redirect_dashboard() {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            loc.contains("/admin/login"),
-            "path {} redirect should point to /admin/login, got: {}",
+            loc.contains("/login"),
+            "path {} redirect should point to /login, got: {}",
             path,
             loc
         );
@@ -54,7 +54,7 @@ async fn unauth_redirect_dashboard() {
 async fn login_page_renders() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
-    let resp = client.get("/admin/login").await.unwrap();
+    let resp = client.get("/login").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     client
@@ -73,7 +73,7 @@ async fn login_bad_password() {
     let client = AdminClient::new(&ngx);
     let resp = client
         .post_form(
-            "/admin/login",
+            "/login",
             &[("username", "admin"), ("password", "wrongpassword")],
         )
         .await
@@ -93,7 +93,7 @@ async fn login_correct_sets_cookies() {
     let ngx = start_ngx().await;
     let client = new_client_no_redirect();
     let resp = client
-        .post(&ngx.admin_url("/admin/login"))
+        .post(&ngx.admin_url("/login"))
         .form(&[("username", "admin"), ("password", "admin")])
         .send()
         .await
@@ -118,7 +118,7 @@ async fn dashboard_renders_after_login() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
-    let resp = client.get("/admin/").await.unwrap();
+    let resp = client.get("/").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("Dashboard"), "missing Dashboard text");
@@ -131,7 +131,7 @@ async fn sites_list_empty() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
-    let resp = client.get("/admin/sites").await.unwrap();
+    let resp = client.get("/sites").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("Sites"), "missing Sites heading");
@@ -148,10 +148,10 @@ async fn sites_new_page_is_full_page() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
-    let resp = client.get("/admin/sites/new").await.unwrap();
+    let resp = client.get("/sites/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    // Full page: should have <html>, base layout, and a back-link to /admin/sites
+    // Full page: should have <html>, base layout, and a back-link to /sites
     assert!(
         body.contains("<html"),
         "new site page should be a full HTML page"
@@ -177,7 +177,7 @@ async fn sites_create_valid() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -187,7 +187,7 @@ async fn sites_create_valid() {
 
     let resp = client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "test-site"),
@@ -208,8 +208,8 @@ async fn sites_create_valid() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(
-        loc.contains("/admin/sites"),
-        "create should redirect to /admin/sites, got: {}",
+        loc.contains("/sites"),
+        "create should redirect to /sites, got: {}",
         loc
     );
 }
@@ -223,7 +223,7 @@ async fn sites_create_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
     let resp = client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "test-site"),
@@ -248,7 +248,7 @@ async fn sites_create_invalid_backend() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -258,7 +258,7 @@ async fn sites_create_invalid_backend() {
 
     let resp = client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "notaurl"),
                 ("name", "test-site"),
@@ -284,7 +284,7 @@ async fn sites_edit_page_prefilled() {
 
     // Create a site first
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -293,7 +293,7 @@ async fn sites_edit_page_prefilled() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "edit-me"),
@@ -303,7 +303,7 @@ async fn sites_edit_page_prefilled() {
         .await
         .unwrap();
 
-    let resp = client.get("/admin/sites/edit?name=edit-me").await.unwrap();
+    let resp = client.get("/sites/edit?name=edit-me").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -325,7 +325,7 @@ async fn sites_update() {
 
     // Create
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -334,7 +334,7 @@ async fn sites_update() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "update-me"),
@@ -346,7 +346,7 @@ async fn sites_update() {
 
     // Update
     let page2 = client
-        .get("/admin/sites/edit?name=update-me")
+        .get("/sites/edit?name=update-me")
         .await
         .unwrap()
         .text()
@@ -355,7 +355,7 @@ async fn sites_update() {
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
         .post_form(
-            "/admin/sites/edit?name=update-me",
+            "/sites/edit?name=update-me",
             &[
                 ("backend", "http://127.0.0.1:9090"),
                 ("name", "update-me"),
@@ -381,7 +381,7 @@ async fn sites_delete_with_csrf() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -390,7 +390,7 @@ async fn sites_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "delete-me"),
@@ -402,7 +402,7 @@ async fn sites_delete_with_csrf() {
 
     let resp = client
         .post_form(
-            "/admin/sites/delete",
+            "/sites/delete",
             &[("name", "delete-me"), ("_csrf", &csrf)],
         )
         .await
@@ -424,7 +424,7 @@ async fn sites_delete_no_csrf_forbidden() {
     client.login("admin", "admin").await.unwrap();
 
     let resp = client
-        .post_form("/admin/sites/delete", &[("name", "nonexistent")])
+        .post_form("/sites/delete", &[("name", "nonexistent")])
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
@@ -439,7 +439,7 @@ async fn sites_delete_verified_in_list() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -448,7 +448,7 @@ async fn sites_delete_verified_in_list() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "verify-delete"),
@@ -460,13 +460,13 @@ async fn sites_delete_verified_in_list() {
 
     client
         .post_form(
-            "/admin/sites/delete",
+            "/sites/delete",
             &[("name", "verify-delete"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
 
-    let resp = client.get("/admin/sites").await.unwrap();
+    let resp = client.get("/sites").await.unwrap();
     let body = resp.text().await.unwrap();
     assert!(
         !body.contains("verify-delete"),
@@ -477,11 +477,11 @@ async fn sites_delete_verified_in_list() {
 // ── §8.5 — Full "New site" UI flow ───────────────────────────────────────────
 //
 // Exercises the same path the user clicks in the browser:
-//   1. GET /admin/sites → confirm the "New site" link is present (a <a>, not a button).
-//   2. GET /admin/sites/new → confirm the full-page form is rendered (with
+//   1. GET /sites → confirm the "New site" link is present (a <a>, not a button).
+//   2. GET /sites/new → confirm the full-page form is rendered (with
 //      the fields the user types into: name, backend, _csrf).
-//   3. POST /admin/sites/new with valid data → 302 redirect.
-//   4. GET /admin/sites → confirm the new site row is in the list.
+//   3. POST /sites/new with valid data → 302 redirect.
+//   4. GET /sites → confirm the new site row is in the list.
 
 #[tokio::test]
 async fn sites_create_full_ui_flow() {
@@ -491,7 +491,7 @@ async fn sites_create_full_ui_flow() {
 
     // 1. Sites page renders a "New site" link.
     let sites_page = client
-        .get("/admin/sites")
+        .get("/sites")
         .await
         .unwrap()
         .text()
@@ -502,13 +502,13 @@ async fn sites_create_full_ui_flow() {
         "sites page should expose a 'New site' link"
     );
     assert!(
-        sites_page.contains("href=\"/admin/sites/new\""),
-        "sites page should link to /admin/sites/new (not open a modal)"
+        sites_page.contains("href=\"/sites/new\""),
+        "sites page should link to /sites/new (not open a modal)"
     );
 
     // 2. Clicking the link loads a full-page form.
     let new_form = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -516,7 +516,7 @@ async fn sites_create_full_ui_flow() {
         .unwrap();
     assert!(
         new_form.contains("<html"),
-        "/admin/sites/new should be a full HTML page (not a modal fragment)"
+        "/sites/new should be a full HTML page (not a modal fragment)"
     );
     client
         .assert_selector_exists(&new_form, "input[name=backend]")
@@ -530,10 +530,10 @@ async fn sites_create_full_ui_flow() {
 
     let csrf = client.csrf_token(&new_form).expect("extract CSRF token");
 
-    // 3. Submit the form → 302 redirect to /admin/sites.
+    // 3. Submit the form → 302 redirect to /sites.
     let resp = client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "ui-flow-site"),
@@ -551,7 +551,7 @@ async fn sites_create_full_ui_flow() {
 
     // 4. The site now appears in the sites list.
     let list_after = client
-        .get("/admin/sites")
+        .get("/sites")
         .await
         .unwrap()
         .text()
@@ -575,7 +575,7 @@ async fn sites_create_full_ui_flow_unique_names() {
 
     for site_name in &["flow-a", "flow-b"] {
         let form = client
-            .get("/admin/sites/new")
+            .get("/sites/new")
             .await
             .unwrap()
             .text()
@@ -585,7 +585,7 @@ async fn sites_create_full_ui_flow_unique_names() {
 
         let resp = client
             .post_form(
-                "/admin/sites/new",
+                "/sites/new",
                 &[
                     ("backend", "http://127.0.0.1:8080"),
                     ("name", site_name),
@@ -604,7 +604,7 @@ async fn sites_create_full_ui_flow_unique_names() {
     }
 
     let list = client
-        .get("/admin/sites")
+        .get("/sites")
         .await
         .unwrap()
         .text()
@@ -624,7 +624,7 @@ async fn domains_create_and_list() {
 
     // Create a site first (domain needs a site_name)
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -633,7 +633,7 @@ async fn domains_create_and_list() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "mysite"),
@@ -645,7 +645,7 @@ async fn domains_create_and_list() {
 
     // Create domain
     let page2 = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -654,7 +654,7 @@ async fn domains_create_and_list() {
     let csrf2 = client.csrf_token(&page2).unwrap_or_default();
     let resp = client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "example.com"),
                 ("site_name", "mysite"),
@@ -672,7 +672,7 @@ async fn domains_create_and_list() {
 
     // Verify in list
     let list = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -689,7 +689,7 @@ async fn domains_create_no_csrf_forbidden() {
 
     let resp = client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "example.com"),
                 ("site_name", "mysite"),
@@ -709,7 +709,7 @@ async fn domains_delete_with_csrf() {
 
     // Setup: site + domain
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -718,7 +718,7 @@ async fn domains_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "sitefordomain"),
@@ -729,7 +729,7 @@ async fn domains_delete_with_csrf() {
         .unwrap();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "delete-me.com"),
                 ("site_name", "sitefordomain"),
@@ -741,7 +741,7 @@ async fn domains_delete_with_csrf() {
 
     let resp = client
         .post_form(
-            "/admin/domains/delete",
+            "/domains/delete",
             &[("domain", "delete-me.com"), ("_csrf", &csrf)],
         )
         .await
@@ -761,7 +761,7 @@ async fn domains_delete_verified_removed() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -770,7 +770,7 @@ async fn domains_delete_verified_removed() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "site2"),
@@ -781,7 +781,7 @@ async fn domains_delete_verified_removed() {
         .unwrap();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "gone.com"),
                 ("site_name", "site2"),
@@ -792,14 +792,14 @@ async fn domains_delete_verified_removed() {
         .unwrap();
     client
         .post_form(
-            "/admin/domains/delete",
+            "/domains/delete",
             &[("domain", "gone.com"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
 
     let list = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -826,7 +826,7 @@ async fn certs_create_and_list() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/certs")
+        .get("/certs")
         .await
         .unwrap()
         .text()
@@ -836,7 +836,7 @@ async fn certs_create_and_list() {
 
     let resp = client
         .post_form(
-            "/admin/certs/new",
+            "/certs/new",
             &[
                 ("domain", "testcert.example.com"),
                 ("cert_file", "/tmp/test.pem"),
@@ -860,7 +860,7 @@ async fn certs_new_page_is_full_page() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let resp = client.get("/admin/certs/new").await.unwrap();
+    let resp = client.get("/certs/new").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -886,7 +886,7 @@ async fn certs_create_no_csrf_forbidden() {
 
     let resp = client
         .post_form(
-            "/admin/certs/new",
+            "/certs/new",
             &[
                 ("domain", "test.example.com"),
                 ("cert_file", "/tmp/cert.pem"),
@@ -904,7 +904,7 @@ async fn certs_list_page_renders() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let resp = client.get("/admin/certs").await.unwrap();
+    let resp = client.get("/certs").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -920,7 +920,7 @@ async fn certs_delete_with_csrf() {
     client.login("admin", "admin").await.unwrap();
 
     let page = client
-        .get("/admin/certs")
+        .get("/certs")
         .await
         .unwrap()
         .text()
@@ -929,7 +929,7 @@ async fn certs_delete_with_csrf() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/certs/new",
+            "/certs/new",
             &[
                 ("domain", "delete-cert.example.com"),
                 ("cert_file", "/tmp/cert.pem"),
@@ -942,7 +942,7 @@ async fn certs_delete_with_csrf() {
 
     let resp = client
         .post_form(
-            "/admin/certs/delete",
+            "/certs/delete",
             &[("domain", "delete-cert.example.com"), ("_csrf", &csrf)],
         )
         .await
@@ -963,7 +963,7 @@ async fn tunnels_readonly_page_renders() {
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
 
-    let resp = client.get("/admin/tun").await.unwrap();
+    let resp = client.get("/tun").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
     assert!(
@@ -981,7 +981,7 @@ async fn logout_redirects_to_login() {
 
     // Login first
     let login_resp = no_redirect
-        .post(&ngx.admin_url("/admin/login"))
+        .post(&ngx.admin_url("/login"))
         .form(&[("username", "admin"), ("password", "admin")])
         .send()
         .await
@@ -1005,7 +1005,7 @@ async fn logout_redirects_to_login() {
 
     // Logout
     let resp = no_redirect
-        .post(&ngx.admin_url("/admin/logout"))
+        .post(&ngx.admin_url("/logout"))
         .form(&[("_csrf", csrf_val.as_str())])
         .send()
         .await
@@ -1017,7 +1017,7 @@ async fn logout_redirects_to_login() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(
-        loc.contains("/admin/login"),
+        loc.contains("/login"),
         "logout should redirect to login"
     );
 }
@@ -1031,13 +1031,13 @@ async fn after_logout_redirects_to_login() {
     client.login("admin", "admin").await.unwrap();
 
     // Confirm access
-    let resp = client.get("/admin/").await.unwrap();
+    let resp = client.get("/").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
     // Now check that without session, we'd redirect (fresh client)
     let fresh_client = new_client_no_redirect();
     let resp2 = fresh_client
-        .get(&ngx.admin_url("/admin/"))
+        .get(&ngx.admin_url("/"))
         .send()
         .await
         .unwrap();
@@ -1053,10 +1053,10 @@ async fn nav_active_state_per_page() {
     client.login("admin", "admin").await.unwrap();
 
     let pages = [
-        ("/admin/sites", "Sites"),
-        ("/admin/domains", "Domains"),
-        ("/admin/tun", "Tunnels"),
-        ("/admin/certs", "Certs"),
+        ("/sites", "Sites"),
+        ("/domains", "Domains"),
+        ("/tun", "Tunnels"),
+        ("/certs", "Certs"),
     ];
 
     for (path, label) in &pages {
@@ -1086,7 +1086,7 @@ async fn site_domains_subpage_renders() {
 
     // Create a site
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -1095,7 +1095,7 @@ async fn site_domains_subpage_renders() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "subpage-test-site"),
@@ -1107,7 +1107,7 @@ async fn site_domains_subpage_renders() {
 
     // Create two domains for this site
     let domains_page = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -1116,7 +1116,7 @@ async fn site_domains_subpage_renders() {
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "subdomain1.example.com"),
                 ("site_name", "subpage-test-site"),
@@ -1127,7 +1127,7 @@ async fn site_domains_subpage_renders() {
         .unwrap();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "subdomain2.example.com"),
                 ("site_name", "subpage-test-site"),
@@ -1139,7 +1139,7 @@ async fn site_domains_subpage_renders() {
 
     // Visit the site-specific domains sub-page
     let resp = client
-        .get("/admin/site/subpage-test-site/domains")
+        .get("/site/subpage-test-site/domains")
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
@@ -1171,7 +1171,7 @@ async fn site_domains_count_link_in_sites_table() {
 
     // Create a site with one domain
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -1180,7 +1180,7 @@ async fn site_domains_count_link_in_sites_table() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "count-link-test"),
@@ -1190,7 +1190,7 @@ async fn site_domains_count_link_in_sites_table() {
         .await
         .unwrap();
     let domains_page = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -1199,7 +1199,7 @@ async fn site_domains_count_link_in_sites_table() {
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "countlink.test.example.com"),
                 ("site_name", "count-link-test"),
@@ -1211,7 +1211,7 @@ async fn site_domains_count_link_in_sites_table() {
 
     // Sites table should have a link with the domain count
     let sites_body = client
-        .get("/admin/sites")
+        .get("/sites")
         .await
         .unwrap()
         .text()
@@ -1219,7 +1219,7 @@ async fn site_domains_count_link_in_sites_table() {
         .unwrap();
     // Should contain a link to the site domains sub-page
     assert!(
-        sites_body.contains("/admin/site/count-link-test/domains"),
+        sites_body.contains("/site/count-link-test/domains"),
         "sites table should have a link to site-specific domains sub-page"
     );
 }
@@ -1231,7 +1231,7 @@ async fn site_domains_subpage_unauth_redirects() {
     let ngx = start_ngx().await;
     let client = new_client_no_redirect();
     let resp = client
-        .get(&ngx.admin_url("/admin/site/test-site/domains"))
+        .get(&ngx.admin_url("/site/test-site/domains"))
         .send()
         .await
         .unwrap();
@@ -1242,7 +1242,7 @@ async fn site_domains_subpage_unauth_redirects() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(
-        loc.contains("/admin/login"),
+        loc.contains("/login"),
         "unauthenticated request should redirect to login, got: {}",
         loc
     );
@@ -1258,7 +1258,7 @@ async fn site_domains_api_table_for_site() {
 
     // Create a site and a domain
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -1267,7 +1267,7 @@ async fn site_domains_api_table_for_site() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "hx-table-test"),
@@ -1277,7 +1277,7 @@ async fn site_domains_api_table_for_site() {
         .await
         .unwrap();
     let domains_page = client
-        .get("/admin/domains")
+        .get("/domains")
         .await
         .unwrap()
         .text()
@@ -1286,7 +1286,7 @@ async fn site_domains_api_table_for_site() {
     let csrf2 = client.csrf_token(&domains_page).unwrap_or_default();
     client
         .post_form(
-            "/admin/domains/new",
+            "/domains/new",
             &[
                 ("domain", "hx-test.example.com"),
                 ("site_name", "hx-table-test"),
@@ -1298,7 +1298,7 @@ async fn site_domains_api_table_for_site() {
 
     // HTMX endpoint should return only the table rows
     let resp = client
-        .get("/admin/site/hx-table-test/api/domains")
+        .get("/api/site/hx-table-test/domains")
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
@@ -1324,7 +1324,7 @@ async fn site_domains_new_modal_preselected() {
 
     // Create a site
     let page = client
-        .get("/admin/sites/new")
+        .get("/sites/new")
         .await
         .unwrap()
         .text()
@@ -1333,7 +1333,7 @@ async fn site_domains_new_modal_preselected() {
     let csrf = client.csrf_token(&page).unwrap_or_default();
     client
         .post_form(
-            "/admin/sites/new",
+            "/sites/new",
             &[
                 ("backend", "http://127.0.0.1:8080"),
                 ("name", "preselect-test-site"),
@@ -1345,7 +1345,7 @@ async fn site_domains_new_modal_preselected() {
 
     // Open the new domain modal from the site sub-page
     let resp = client
-        .get("/admin/site/preselect-test-site/api/domains/new")
+        .get("/api/site/preselect-test-site/domains/new")
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
@@ -1355,5 +1355,164 @@ async fn site_domains_new_modal_preselected() {
     assert!(
         body.contains(r#"<option value="preselect-test-site" selected"#),
         "Expected preselected site option to be selected in the domains modal"
+    );
+}
+
+// ── §37 — Tunnels: new page renders ─────────────────────────────────────────
+
+#[tokio::test]
+async fn tun_new_page_renders() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client.get("/tun/new").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=name]")
+        .unwrap();
+    client
+        .assert_selector_exists(&body, "input[name=token]")
+        .unwrap();
+}
+
+// ── §38 — Tunnels: create + edit + delete (full CRUD UI flow) ───────────────
+
+#[tokio::test]
+async fn tun_crud_full_ui_flow() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // GET /tun/new page, capture CSRF.
+    let page = client
+        .get("/tun/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+
+    // POST /tun/new with name + token + enabled.
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "office"),
+                ("token", "secret-token-123"),
+                ("enabled", "1"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create tun should redirect, got {}",
+        resp.status()
+    );
+
+    // Verify the new tun is listed on /tun.
+    let list_body = client.get("/tun").await.unwrap().text().await.unwrap();
+    assert!(
+        list_body.contains("office"),
+        "tunnels list should contain 'office' after create, got: {}",
+        list_body
+    );
+
+    // GET /tun/office/edit page.
+    let edit_page = client
+        .get("/tun/office/edit")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let edit_csrf = client.csrf_token(&edit_page).unwrap_or_default();
+    // The form should have the tun name visible (readonly style).
+    assert!(
+        edit_page.contains("office"),
+        "edit page should show tun name, got: {}",
+        edit_page
+    );
+
+    // POST /tun/office/edit to update the token.
+    let update_resp = client
+        .post_form(
+            "/tun/office/edit",
+            &[
+                ("token", "rotated-token-456"),
+                ("enabled", "1"),
+                ("_csrf", &edit_csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        update_resp.status().as_u16(),
+        302,
+        "update tun should redirect, got {}",
+        update_resp.status()
+    );
+
+    // POST /tun/office/delete.
+    let list_page_after = client
+        .get("/tun")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let delete_csrf = client.csrf_token(&list_page_after).unwrap_or_default();
+    let del_resp = client
+        .post_form(
+            "/tun/office/delete",
+            &[("_csrf", &delete_csrf)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        del_resp.status().as_u16(),
+        302,
+        "delete tun should redirect, got {}",
+        del_resp.status()
+    );
+
+    // Confirm deletion in the list.
+    let final_body = client.get("/tun").await.unwrap().text().await.unwrap();
+    assert!(
+        !final_body.contains(r#"id="tun-office""#)
+            && !final_body.contains(">office<"),
+        "tunnels list should no longer contain 'office' after delete, got: {}",
+        final_body
+    );
+}
+
+// ── §39 — Tunnels: create with no CSRF → 403 ────────────────────────────────
+
+#[tokio::test]
+async fn tun_create_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "no-csrf-tun"),
+                ("token", "tok"),
+                ("enabled", "1"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "missing CSRF should be forbidden"
     );
 }

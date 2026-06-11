@@ -4,13 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ site.name }}: Domains — Pangolin</title>
-<link href="/admin/app.css?v=__CSS_HASH__" rel="stylesheet">
+<link href="/assets/app.css?v=__CSS_HASH__" rel="stylesheet">
 </head>
 <body class="bg-slate-100 dark:bg-slate-900 min-h-screen font-sans antialiased text-slate-900 dark:text-slate-100">
 
 <header class="sticky top-0 z-50 bg-slate-900 dark:bg-slate-800 border-b border-slate-700 shadow-sm">
   <div class="flex items-center justify-between px-4 py-3 max-w-7xl mx-auto">
-    <a href="/admin/" class="flex items-center gap-2.5 text-white font-bold text-lg">
+    <a href="/" class="flex items-center gap-2.5 text-white font-bold text-lg">
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent-500 to-accent-600 flex items-center justify-center shadow">
         <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
@@ -19,14 +19,14 @@
       <span class="hidden sm:inline">Pangolin</span>
     </a>
     <nav class="hidden md:flex items-center gap-1">
-      <a href="/admin/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Dashboard</a>
-      <a href="/admin/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
-      <a href="/admin/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Domains</a>
-      <a href="/admin/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Tunnels</a>
-      <a href="/admin/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Certs</a>
+      <a href="/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Dashboard</a>
+      <a href="/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
+      <a href="/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Domains</a>
+      <a href="/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Tunnels</a>
+      <a href="/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Certs</a>
     </nav>
     <div class="flex items-center gap-2">
-      <form method="POST" action="/admin/logout" class="hidden md:block">
+      <form method="POST" action="/logout" class="hidden md:block">
         <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-1.5 rounded hover:bg-slate-700">Sign out</button>
       </form>
       <button id="menu-toggle" class="md:hidden text-slate-300 hover:text-white p-1">
@@ -35,12 +35,12 @@
     </div>
   </div>
   <nav id="mobile-nav" class="hidden md:hidden border-t border-slate-700 px-4 py-3 space-y-1">
-    <a href="/admin/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Dashboard</a>
-    <a href="/admin/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
-    <a href="/admin/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Domains</a>
-    <a href="/admin/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Tunnels</a>
-    <a href="/admin/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Certs</a>
-    <form method="POST" action="/admin/logout" class="pt-2 border-t border-slate-700 mt-2">
+    <a href="/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Dashboard</a>
+    <a href="/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
+    <a href="/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Domains</a>
+    <a href="/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Tunnels</a>
+    <a href="/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Certs</a>
+    <form method="POST" action="/logout" class="pt-2 border-t border-slate-700 mt-2">
       <button type="submit" class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-slate-800">Sign out</button>
     </form>
   </nav>
@@ -48,7 +48,7 @@
 
 <main class="px-4 py-6 md:px-6 max-w-7xl mx-auto">
   <div class="flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400 mb-4">
-    <a href="/admin/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
+    <a href="/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
     <span class="text-slate-800 dark:text-slate-200 font-medium">{{ site.name }}</span>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
@@ -63,7 +63,7 @@
         — {{ domains.len() }} domain{% if domains.len() != 1 %}s{% endif %}
       </p>
     </div>
-    <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
+    <button hx-get="/api/site/{{ site.name }}/domains/new"
       hx-target="#modal-body"
       class="hidden md:inline-flex items-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
@@ -71,7 +71,7 @@
     </button>
   </div>
 
-  <button hx-get="/admin/site/{{ site.name }}/api/domains/new"
+  <button hx-get="/api/site/{{ site.name }}/domains/new"
     hx-target="#modal-body"
     class="md:hidden mb-4 w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm">
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
@@ -101,8 +101,8 @@
             </td>
             <td class="px-4 py-3">
               <div class="flex items-center justify-end gap-1">
-                <button hx-delete="/admin/api/domains"
-                  hx-vals='{"domain": "{{ domain.domain }}", "_csrf": "__CSRF__"}'
+                <button hx-delete="/api/domains/{{ domain.domain }}"
+                  hx-vals='{"_csrf": "__CSRF__"}'
                   hx-confirm="Delete domain {{ domain.domain }}?"
                   hx-swap="delete"
                   class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
@@ -131,8 +131,8 @@
             <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">off</span>
             {% endif %}
           </div>
-          <button hx-delete="/admin/api/domains"
-            hx-vals='{"domain": "{{ domain.domain }}", "_csrf": "__CSRF__"}'
+          <button hx-delete="/api/domains/{{ domain.domain }}"
+            hx-vals='{"_csrf": "__CSRF__"}'
             hx-confirm="Delete domain {{ domain.domain }}?"
             class="w-full text-center text-sm text-red-500 hover:text-red-600 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
             Delete
@@ -151,6 +151,6 @@
 </main>
 
 <div id="toast" class="fixed bottom-4 right-4 z-50"></div>
-<script src="/admin/app.js?v=__JS_HASH__" defer></script>
+<script src="/assets/app.js?v=__JS_HASH__" defer></script>
 </body>
 </html>

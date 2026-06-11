@@ -5,7 +5,7 @@
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
   <div class="mb-6">
-    <a href="/admin/sites" class="text-sm text-slate-600 dark:text-slate-300 hover:text-accent-500 inline-flex items-center gap-1">
+    <a href="/sites" class="text-sm text-slate-600 dark:text-slate-300 hover:text-accent-500 inline-flex items-center gap-1">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
       Back to sites
     </a>
@@ -17,7 +17,7 @@
     </p>
   </div>
 
-  <form method="POST" action="{% if let Some(s) = site %}/admin/sites/edit?name={{ s.name }}{% else %}/admin/sites/new{% endif %}" class="card p-6 space-y-4">
+  <form method="POST" action="{% if let Some(s) = site %}/sites/edit?name={{ s.name }}{% else %}/sites/new{% endif %}" class="card p-6 space-y-4">
     <input type="hidden" name="_csrf" value="__CSRF__">
 
     {% if let Some(s) = site %}
@@ -48,24 +48,22 @@
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
       <select name="host_mode" id="host-mode"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        hx-get="/admin/sites/host-custom-field" hx-target="#host-custom-wrapper" hx-swap="innerHTML">
+        onchange="document.getElementById('host-custom-wrapper').classList.toggle('hidden', this.value !== 'custom')">
         <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
         <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
         <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
       </select>
     </div>
 
-    <div id="host-custom-wrapper">
-      {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}
+    <div id="host-custom-wrapper" class="{% if let Some(s) = site %}{% if !s.is_host_mode_custom() %}hidden{% endif %}{% else %}hidden{% endif %}">
       <div>
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
         <input type="text" name="host_custom" id="host-custom"
-          value="{% if let Some(hc) = s.host_custom %}{{ hc }}{% endif %}"
+          value="{% if let Some(s) = site %}{% if let Some(hc) = s.host_custom %}{{ hc }}{% endif %}{% endif %}"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
           placeholder="e.g. internal.example.com">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
-      {% endif %}{% endif %}
     </div>
 
     {% if let Some(e) = error %}
@@ -79,7 +77,7 @@
 
     <div class="flex gap-2 pt-2">
       <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">{% if let Some(_) = site %}Update{% else %}Create{% endif %}</button>
-      <a href="/admin/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
+      <a href="/sites" class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-100 text-sm font-medium rounded-lg">Cancel</a>
     </div>
   </form>
 </main>
