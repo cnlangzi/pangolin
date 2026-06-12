@@ -104,6 +104,22 @@ pub struct TunnelConfig {
     /// WebSocket endpoint path (e.g. `/tunnel`).
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
+    /// Optional path to a PEM-encoded TLS certificate (fullchain)
+    /// for `wss://` (TLS-wrapped WebSocket) on the tunnel listener.
+    /// When unset, the listener accepts plaintext `ws://` connections
+    /// only. The cert + key are loaded at startup; if either file is
+    /// missing or unreadable, the gateway fails to start (fail-fast)
+    /// rather than silently degrading to plaintext.
+    ///
+    /// Added in issue #39 (commit 0): schema extension only; no
+    /// behavior change when both fields are empty. The TLS wrap is
+    /// wired up in commit 1.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Optional path to a PEM-encoded TLS private key matching
+    /// `tls_cert`. See `tls_cert` for the loading semantics.
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 fn default_proxy_host() -> Option<String> {
@@ -121,6 +137,8 @@ impl Default for TunnelConfig {
         Self {
             addr: default_tunnel_addr(),
             ws_path: default_ws_path(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -479,6 +497,48 @@ mod tests {
         let c = Config::from_str(s).unwrap();
         assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
         assert_eq!(c.tunnel.ws_path, "/tunnel");
+    }
+
+    #[test]
+    fn tunnel_tls_fields_default_to_none() {
+        // Commit 0 schema extension: new optional TLS fields. When
+        // absent, both must default to None (plaintext ws:// mode)
+        // and NOT break the parse.
+        let c = Config::default();
+        assert!(c.tunnel.tls_cert.is_none());
+        assert!(c.tunnel.tls_key.is_none());
+
+        let parsed = Config::from_str(
+            r#"
+                tunnel:
+                  addr: "0.0.0.0:9001"
+                  ws_path: /tunnel
+            "#,
+        )
+        .unwrap();
+        assert!(parsed.tunnel.tls_cert.is_none());
+        assert!(parsed.tunnel.tls_key.is_none());
+    }
+
+    #[test]
+    fn tunnel_tls_fields_parse_when_set() {
+        // Both fields populated, both should round-trip through YAML.
+        let s = r#"
+            tunnel:
+              addr: "0.0.0.0:9001"
+              ws_path: /tunnel
+              tls_cert: /etc/pangolin/tunnel.crt
+              tls_key:  /etc/pangolin/tunnel.key
+        "#;
+        let c = Config::from_str(s).unwrap();
+        assert_eq!(
+            c.tunnel.tls_cert.as_deref(),
+            Some("/etc/pangolin/tunnel.crt")
+        );
+        assert_eq!(
+            c.tunnel.tls_key.as_deref(),
+            Some("/etc/pangolin/tunnel.key")
+        );
     }
 
     #[test]

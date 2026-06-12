@@ -5,6 +5,43 @@
   environment:
     ansible_ssh_common_args: "-o ServerAliveInterval=60"
 
+  # Bridge from `.env` (sourced by the Makefile via `set -a; . .env;
+  # set +a`) to the lowercase `ngx_*` names that this role's Jinja2
+  # templates expect.
+  #
+  # `.env` uses `NGX_<SECTION>__<KEY>` (figment's nested-key schema
+  # in crates/pangolin-core/src/config.rs) so the same `.env` works
+  # for `make start-ngx` (binary reads it directly) and `make
+  # play-ngx` (this bridge feeds it into ansible).
+  #
+  # Ansible does NOT auto-inject env vars into the template
+  # namespace — `{{ NGX_ADMIN__PASSWORD }}` would not resolve on its
+  # own. The lookup() calls below are the single place that knows
+  # about the casing/naming mismatch; templates and group_vars stay
+  # clean.
+  #
+  # `default('…', true)` (boolean = omit empty strings) means a
+  # partial `.env` still produces a valid deploy; missing entries
+  # fall through to the same defaults that the Jinja2 templates
+  # carry, so behaviour matches the "no .env at all" path.
+  vars:
+    ngx_addr_http: "{{ lookup('env', 'NGX_ADDR__HTTP') | default('0.0.0.0:80', true) }}"
+    ngx_addr_https: "{{ lookup('env', 'NGX_ADDR__HTTPS') | default('0.0.0.0:443', true) }}"
+    ngx_host: "{{ lookup('env', 'NGX_HOST') | default('', true) }}"
+    ngx_tunnel_addr: "{{ lookup('env', 'NGX_TUNNEL__ADDR') | default('0.0.0.0:9001', true) }}"
+    ngx_tunnel_ws_path: "{{ lookup('env', 'NGX_TUNNEL__WS_PATH') | default('/tunnel', true) }}"
+    ngx_admin_addr: "{{ lookup('env', 'NGX_ADMIN__ADDR') | default('0.0.0.0:9081', true) }}"
+    ngx_admin_username: "{{ lookup('env', 'NGX_ADMIN__USERNAME') | default('admin', true) }}"
+    ngx_admin_password: "{{ lookup('env', 'NGX_ADMIN__PASSWORD') | default('admin', true) }}"
+    ngx_acme_email: "{{ lookup('env', 'NGX_ACME__EMAIL') | default('', true) }}"
+    ngx_acme_cert_dir: "{{ lookup('env', 'NGX_ACME__CERT_DIR') | default('/opt/pangolin/certs', true) }}"
+    ngx_acme_directory: "{{ lookup('env', 'NGX_ACME__ACME_DIRECTORY') | default('https://acme-v02.api.letsencrypt.org/directory', true) }}"
+    ngx_acme_renew_threshold_days: "{{ lookup('env', 'NGX_ACME__RENEW_THRESHOLD_DAYS') | default('30', true) }}"
+    ngx_acme_renew_check_interval_hours: "{{ lookup('env', 'NGX_ACME__RENEW_CHECK_INTERVAL_HOURS') | default('6', true) }}"
+    ngx_acme_renew_max_retries: "{{ lookup('env', 'NGX_ACME__RENEW_MAX_RETRIES') | default('3', true) }}"
+    ngx_acme_key_type: "{{ lookup('env', 'NGX_ACME__KEY_TYPE') | default('ecdsa', true) }}"
+    ngx_log_level: "{{ lookup('env', 'NGX_LOG__LEVEL') | default('info', true) }}"
+
   roles:
     - role: ngx
       when: inventory_hostname in groups.ngx

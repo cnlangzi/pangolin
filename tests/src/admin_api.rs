@@ -112,6 +112,7 @@ fn admin_tun_crud() {
     let tun = Tun {
         name: "office".into(),
         token: Some("secret-token-123".into()),
+        token_hash: None,
         enabled: true,
         online: false,
         registered_at: None,
@@ -154,6 +155,7 @@ fn admin_tun_auth() {
         &Tun {
             name: "office".into(),
             token: Some("secret-token-123".into()),
+            token_hash: None,
             enabled: true,
             online: false,
             registered_at: None,

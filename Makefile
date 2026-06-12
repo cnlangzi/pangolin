@@ -7,9 +7,39 @@ TOOLCHAIN := 1.96
 
 APP_NAME := pangolin
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun
+# ── .env auto-loading ────────────────────────────────────────────────────
+# `.env` is git-ignored; `.env.example` is the tracked template.
+# Two layers of integration:
+#
+#   (a) `-include .env`  — make itself parses the file, so
+#       `$(ngx_admin_password)` works in any recipe line below.
+#       This is for *make-level* expansion only (currently unused
+#       in recipes, but keeps `.env` discoverable from `make -p`).
+#
+#   (b) `env-load` target — prints `export FOO=bar ...` so a recipe
+#       can prepend `$(ENV_LOAD)` and have every var from `.env`
+#       reach the subprocess. Ansible picks them up automatically
+#       (host facts from env), and the Rust binaries pick them up
+#       via their existing `NGX_*` / `TUN_*` env-override layer
+#       (see the mapping table in `.env.example`).
+#
+# Already-exported shell vars win over `.env` (make's `-include`
+# semantics: existing env-vars override vars set in the file).
+ENV_FILE := .env
+ifeq ($(wildcard $(ENV_FILE)),)
+ENV_LOAD :=
+else
+ENV_LOAD := set -a; . $(ENV_FILE); set +a;
+include $(ENV_FILE)
+export
+endif
+
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
+	@echo "=== Config ==="
+	@echo "  make env-show      # Print effective vars loaded from .env"
+	@echo ""
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release)"
 	@echo "  make build-ngx     # Local build ngx only"
@@ -200,21 +230,41 @@ ci-full: fmt-check clippy test test-e2e build build-dist
 
 play: play-ngx play-tun
 
+# Ansible picks up every exported env var as a host fact, so `ngx_*`
+# and `tun_*` defined in `.env` flow straight into the
+# `{{ ngx_admin_password }}` template substitutions without touching
+# `deploy/playbooks/hosts`. `ANSIBLE_LOAD_CALLBACK_PLUGINS=1` is not
+# needed — plain env vars are auto-injected by Ansible since 2.x.
 play-ngx:
-	cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts
+	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; fi
+	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./ngx.yml -i hosts
 
 play-tun:
-	cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
+	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; fi
+	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./tun.yml -i hosts
 
 # ── Local Run (no sudo) ───────────────────────────────────────────────────────
 # Run the locally-built binary directly. Foreground — Ctrl-C to stop.
 # No sudo, no systemd. For a daemon-mode install see install-* below.
 
+# `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
+# binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
+# see ngx.yml / tun.yml header comments for the env-var schema).
 start-ngx: build-ui build-ngx
-	./bin/pangolin-ngx
+	$(ENV_LOAD) ./bin/pangolin-ngx
 
 start-tun: build-tun
-	./bin/pangolin-tun
+	$(ENV_LOAD) ./bin/pangolin-tun
+
+# Debug helper: show which env vars are being injected. Useful for
+# "why isn't my .env value reaching the binary?" questions.
+env-show:
+	@if [ ! -f $(ENV_FILE) ]; then \
+		echo "$(ENV_FILE) not found — copy .env.example to .env first"; \
+		exit 1; \
+	fi
+	@echo "Loaded from $(ENV_FILE):"
+	@grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 

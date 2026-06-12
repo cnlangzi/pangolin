@@ -30,9 +30,27 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
 use crate::types::{Cert, DnsProvider, Domain, Site, Tun};
+
+/// SHA-256 hex of an auth token. Lowercase, 64 chars.
+/// Used as the on-disk form of `tun.token` (V3 migration); the WS
+/// server hashes the incoming Authorization header and compares
+/// against this value, so a DB dump no longer leaks the cleartext
+/// credential.
+pub fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
+}
 /// Open a connection with sensible defaults (WAL, foreign keys on).
 pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
@@ -48,7 +66,12 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
 /// Run pending refinery migrations. Safe to call on every startup —
 /// already-applied migrations are skipped (tracked in schema_version table).
 pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
-    run_migrations(conn)
+    run_migrations(conn)?;
+    // V3: backfill `token_hash` for any tun row that pre-dates V3.
+    // Done after refinery so the column exists. `backfill_tun_token_hashes`
+    // is idempotent — re-running it on a populated DB is a no-op.
+    backfill_tun_token_hashes(conn)?;
+    Ok(())
 }
 
 // ---- Site CRUD ----
@@ -193,7 +216,7 @@ pub fn set_domain_enabled(
 
 pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {
     let mut stmt = conn.prepare(
-        "SELECT name, token, enabled, online, registered_at, last_seen_at, expires_at
+        "SELECT name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at
          FROM tun ORDER BY name",
     )?;
     let rows = stmt.query_map([], row_to_tun)?;
@@ -202,18 +225,29 @@ pub fn list_tuns(conn: &Connection) -> rusqlite::Result<Vec<Tun>> {
 
 pub fn get_tun(conn: &Connection, name: &str) -> rusqlite::Result<Option<Tun>> {
     let mut stmt = conn.prepare(
-        "SELECT name, token, enabled, online, registered_at, last_seen_at, expires_at
+        "SELECT name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at
          FROM tun WHERE name = ?1",
     )?;
     stmt.query_row(params![name], row_to_tun).optional()
 }
 
 pub fn upsert_tun(conn: &Connection, tun: &Tun) -> rusqlite::Result<()> {
+    // V3 stores the credential as `sha256(token)`. The legacy `token`
+    // column is kept (V4 drop pending operator verification that no
+    // tooling is reading it); we still write the cleartext there so a
+    // downgrade path stays viable.
+    let token_hash = tun.token_hash.clone().or_else(|| {
+        tun.token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(sha256_hex)
+    });
     conn.execute(
-        "INSERT INTO tun (name, token, enabled, online, registered_at, last_seen_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(name) DO UPDATE SET
             token = excluded.token,
+            token_hash = excluded.token_hash,
             enabled = excluded.enabled,
             online = excluded.online,
             last_seen_at = excluded.last_seen_at,
@@ -221,6 +255,7 @@ pub fn upsert_tun(conn: &Connection, tun: &Tun) -> rusqlite::Result<()> {
         params![
             tun.name,
             tun.token.as_deref().unwrap_or(""),
+            token_hash.unwrap_or_default(),
             tun.enabled as i32,
             tun.online as i32,
             tun.registered_at.map(|t| t.to_rfc3339()),
@@ -248,23 +283,58 @@ pub fn set_tun_online(conn: &Connection, name: &str, online: bool) -> rusqlite::
 /// Returns the row's enabled flag and expires_at if it matched.
 /// This is the only auth check the WS server needs; there's no
 /// two-table validation step anymore.
+///
+/// V3: `token` is matched as `sha256(token)` against the
+/// `token_hash` column. Empty cleartext hashes to the empty-string
+/// sha256, which still rejects an Authorization header that supplies
+/// the empty bearer — because `auth_tun` is called with whatever
+/// the client presented (typically a 32-char random token), and
+/// that hash will not collide with the empty-hash legacy default.
 pub fn auth_tun(
     conn: &Connection,
     name: &str,
     token: &str,
 ) -> rusqlite::Result<Option<(bool, Option<DateTime<Utc>>)>> {
+    let token_hash = sha256_hex(token);
     let mut stmt = conn.prepare(
         "SELECT enabled, expires_at FROM tun
-         WHERE name = ?1 AND token = ?2",
+         WHERE name = ?1 AND token_hash = ?2",
     )?;
     let row = stmt
-        .query_row(params![name, token], |r| {
+        .query_row(params![name, token_hash], |r| {
             let enabled: i32 = r.get(0)?;
             let expires_at: Option<String> = r.get(1)?;
             Ok((enabled != 0, expires_at.as_deref().and_then(parse_dt_opt)))
         })
         .optional()?;
     Ok(row)
+}
+
+/// Backfill `token_hash` for any rows that pre-date V3. Called once
+/// from `migrate` after refinery runs V3. Idempotent: rows that
+/// already have a non-empty hash are skipped.
+///
+/// Empty `token` (the legacy default for never-provisioned rows)
+/// hashes to the sha256 of the empty string, which is also what
+/// `auth_tun` computes for an empty bearer — so backfilled empty
+/// rows will not match any real client (no false positives).
+pub fn backfill_tun_token_hashes(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT name, token FROM tun
+         WHERE token_hash IS NULL OR token_hash = ''",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let n = rows.len();
+    for (name, token) in rows {
+        let hash = sha256_hex(&token);
+        conn.execute(
+            "UPDATE tun SET token_hash = ?1 WHERE name = ?2",
+            params![hash, name],
+        )?;
+    }
+    Ok(n)
 }
 
 // ---- Cert CRUD ----
@@ -456,11 +526,12 @@ fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider>
 fn row_to_tun(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tun> {
     let name: String = row.get(0)?;
     let token: Option<String> = row.get(1)?;
-    let enabled: i32 = row.get(2)?;
-    let online: i32 = row.get(3)?;
-    let registered_at: Option<String> = row.get(4)?;
-    let last_seen_at: Option<String> = row.get(5)?;
-    let expires_at: Option<String> = row.get(6)?;
+    let token_hash: Option<String> = row.get(2)?;
+    let enabled: i32 = row.get(3)?;
+    let online: i32 = row.get(4)?;
+    let registered_at: Option<String> = row.get(5)?;
+    let last_seen_at: Option<String> = row.get(6)?;
+    let expires_at: Option<String> = row.get(7)?;
     Ok(Tun {
         name,
         token: if token.as_deref().unwrap_or("").is_empty() {
@@ -468,6 +539,7 @@ fn row_to_tun(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tun> {
         } else {
             token
         },
+        token_hash: token_hash.filter(|h| !h.is_empty()),
         enabled: enabled != 0,
         online: online != 0,
         registered_at: registered_at.as_deref().and_then(parse_dt_opt),
@@ -543,14 +615,14 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1 + V2 as applied (V2 merges tokens
-        // into tun).
+        // it's there and lists V1 + V2 + V3 as applied (V2 merges tokens
+        // into tun; V3 stores token as sha256).
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
-        assert_eq!(count, 2, "expected V1 + V2 to be applied");
+        assert_eq!(count, 3, "expected V1 + V2 + V3 to be applied");
 
         // Verify V2 is recorded.
         let v2_present: i64 = conn
@@ -561,6 +633,80 @@ mod tests {
             )
             .expect("version column present");
         assert_eq!(v2_present, 1, "V2 (merge tokens into tun) must be applied");
+    }
+
+    #[test]
+    fn sha256_hex_is_lowercase_64_chars() {
+        // Empty input is the well-known sha256("") — regression pin.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // sha256("abc") — well-known.
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Length + character-class invariant.
+        let h = sha256_hex("anything");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn backfill_populates_token_hash_for_legacy_rows() {
+        // Simulate a v2 database with a tun whose `token` is cleartext
+        // but `token_hash` is empty (the post-V3 starting state). The
+        // backfill helper should compute sha256(token) and write it.
+        let conn = make_conn();
+        conn.execute(
+            "INSERT INTO tun (name, token, enabled, online) VALUES (?1, ?2, 1, 0)",
+            params!["legacy", "cleartext-credential"],
+        )
+        .unwrap();
+        let n = backfill_tun_token_hashes(&conn).unwrap();
+        assert_eq!(n, 1, "backfilled exactly the one legacy row");
+        let stored: String = conn
+            .query_row(
+                "SELECT token_hash FROM tun WHERE name = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, sha256_hex("cleartext-credential"));
+
+        // Idempotent: a second call should skip the row because
+        // `token_hash` is now non-empty.
+        let n2 = backfill_tun_token_hashes(&conn).unwrap();
+        assert_eq!(n2, 0, "no rows to backfill on second pass");
+    }
+
+    #[test]
+    fn upsert_tun_populates_token_hash_from_cleartext() {
+        // Inserting a tun via the public API must end up with a
+        // matching token_hash even if the caller didn't set it.
+        let conn = make_conn();
+        upsert_tun(
+            &conn,
+            &Tun {
+                name: "auto".into(),
+                token: Some("caller-supplied".into()),
+                token_hash: None,
+                enabled: true,
+                online: false,
+                registered_at: None,
+                last_seen_at: None,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        let back = get_tun(&conn, "auto").unwrap().unwrap();
+        assert_eq!(
+            back.token_hash.as_deref(),
+            Some(sha256_hex("caller-supplied").as_str())
+        );
     }
 
     #[test]
@@ -724,6 +870,7 @@ mod tests {
         let t = Tun {
             name: "office".into(),
             token: Some("dev".into()),
+            token_hash: None,
             enabled: true,
             online: false,
             registered_at: None,
@@ -734,6 +881,8 @@ mod tests {
         let back = get_tun(&conn, "office").unwrap().unwrap();
         assert!(!back.online);
         assert_eq!(back.token.as_deref(), Some("dev"));
+        // V3: upsert populated token_hash from sha256(token).
+        assert_eq!(back.token_hash.as_deref(), Some(sha256_hex("dev").as_str()));
         set_tun_online(&conn, "office", true).unwrap();
         let back = get_tun(&conn, "office").unwrap().unwrap();
         assert!(back.online);
@@ -745,6 +894,7 @@ mod tests {
         let t = Tun {
             name: "office".into(),
             token: Some("dev".into()),
+            token_hash: None,
             enabled: true,
             online: false,
             registered_at: None,
@@ -775,6 +925,7 @@ mod tests {
             &Tun {
                 name: "office".into(),
                 token: Some("dev".into()),
+                token_hash: None,
                 enabled: false,
                 online: false,
                 registered_at: None,

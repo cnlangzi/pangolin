@@ -16,7 +16,6 @@
 //! See `README.md` for the design rationale.
 
 pub mod app;
-pub mod compress;
 pub mod config;
 pub mod db;
 pub(crate) mod embedded_migrations;
@@ -25,6 +24,7 @@ pub mod events;
 pub mod index;
 pub mod normalize;
 pub mod parse;
+pub mod tunnel;
 pub mod types;
 
 pub use app::{plan_issuance, App, CertManager, DnsIndex, IssuancePlan, TunnelMessage};
@@ -36,10 +36,9 @@ pub use parse::{
     detect_scheme, file_url_to_path, is_valid_domain, is_valid_tun_name, matches_tun_name_charset,
     parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
 };
+pub use tunnel::{TunnelRole, YamuxTunnel};
 pub use types::{
-    deserialize_msgpack, serialize_frames, serialize_msgpack, BackendKind, Cert, ChallengeType,
-    DnsProvider, DnsProviderKind, Domain, Site, Tun, TunnelFrame, TunnelRequestFrame,
-    TunnelResponseFrame,
+    BackendKind, Cert, ChallengeType, DnsProvider, DnsProviderKind, Domain, Site, Tun,
 };
 
 /// Library version, e.g. for admin templates and log lines.

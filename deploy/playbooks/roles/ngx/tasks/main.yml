@@ -1,4 +1,7 @@
 ---
+# The .env → Ansible bridge lives in the parent playbook's `vars:`
+# block (`deploy/playbooks/ngx.yml`), not here. `vars:` is a play-
+# level keyword and is not allowed inside a task file.
 - name: Create pangolin user
   become: true
   user:

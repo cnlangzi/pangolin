@@ -12,9 +12,6 @@ use clap::Parser;
 
 mod client;
 mod config;
-mod frame;
-#[cfg(test)]
-mod test_ws_server;
 
 use client::TunnelClient;
 use config::TunConfig;

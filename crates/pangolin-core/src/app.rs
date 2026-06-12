@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
+use crate::tunnel::YamuxTunnel;
 use crate::{
     config::Config,
     db,
@@ -170,8 +171,14 @@ pub struct App {
     pub config: Config,
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
     pub ws_path: String,
-    /// Active tunnel sessions: tun_name → sender channel
-    pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, mpsc::Sender<TunnelMessage>>>>,
+    /// Active tunnel sessions: tun_name → yamux control handle.
+    /// Holds the per-tun control plane used to open new yamux
+    /// streams from ngx to that tun.
+    pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, YamuxTunnel>>>,
+    /// Per-tun last-seen timestamp (Unix seconds), used by the
+    /// admin UI's tun list. Updated by the tunnel accept loop
+    /// on each new request.
+    pub tun_last_seen: Arc<RwLock<std::collections::HashMap<String, i64>>>,
     /// TLS cert manager (ACME + manual upload)
     pub cert_manager: CertManager,
     /// In-memory event buffer for dashboard activity feed
@@ -206,6 +213,7 @@ impl App {
             dns_index: Arc::new(RwLock::new(dns_index)),
             config,
             tun_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            tun_last_seen: Arc::new(RwLock::new(std::collections::HashMap::new())),
             cert_manager,
             events: Arc::new(EventBuffer::new()),
             dns_change_notify: Arc::new(tokio::sync::Notify::new()),
@@ -230,8 +238,8 @@ impl App {
     }
 
     /// Register a live tunnel session. Called when a tun node connects via WS.
-    pub async fn register_tun(&self, name: String, sender: mpsc::Sender<TunnelMessage>) {
-        self.tun_sessions.write().await.insert(name, sender);
+    pub async fn register_tun(&self, name: String, tunnel: YamuxTunnel) {
+        self.tun_sessions.write().await.insert(name, tunnel);
     }
 
     /// Unregister a tunnel session. Called on WS disconnect.
@@ -256,14 +264,19 @@ impl App {
 }
 
 /// Message sent over a tunnel WebSocket from proxy to a remote tun node.
-#[derive(Debug)]
+///
+/// As of issue #39, the tunnel carries raw HTTP/1.1 bytes inside
+/// yamux streams, and HTTP/WS responses are matched by stream
+/// (not by an rid). The data-plane control message of the old
+/// msgpack protocol is gone; only the registration lifecycle
+/// remains.
+#[derive(Debug, Clone)]
 pub struct TunnelMessage {
-    /// Unique request ID to match response
-    pub rid: String,
-    /// Serialized TunnelRequestFrame msgpack bytes
-    pub body: Vec<u8>,
-    /// Response channel (filled by write_task when tun sends response frame)
-    pub resp_tx: tokio::sync::oneshot::Sender<crate::types::TunnelResponseFrame>,
+    /// Reserved for future per-stream control-plane messages.
+    /// Currently unused — kept so external callers can still
+    /// construct a placeholder value when interfacing with the
+    /// admin UI, which expects a stable message type.
+    pub _reserved: (),
 }
 
 /// TLS certificate manager — disk blob layout + ACME issuance metadata.

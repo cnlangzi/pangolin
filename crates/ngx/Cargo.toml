@@ -21,7 +21,7 @@ default = []
 integration = []
 
 [dependencies]
-pangolin-core = { path = "../pangolin-core", features = ["rt"] }
+pangolin-core = { path = "../pangolin-core" }
 admin = { path = "../admin" }
 pingora = { workspace = true, features = ["openssl"] }
 pingora-core = "0.8"
@@ -48,8 +48,8 @@ hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-rustls = "0.27"
 
 # WebSocket
-tokio-tungstenite.workspace = true
-flate2.workspace = true
+fastwebsockets.workspace = true
+tokio-yamux.workspace = true
 futures-util.workspace = true
 
 # TLS / ACME

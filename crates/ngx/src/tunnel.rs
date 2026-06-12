@@ -1,50 +1,47 @@
 //! Tunnel WebSocket endpoint — receives connections from remote tun nodes.
 //!
-//! The tun node connects via WS to `ngx:tunnel_port` with token/name in query.
-//! After validating, the session is registered in `App.tun_sessions[tun_name]`.
+//! ## Protocol (issue #39, yamux-over-fastwebsockets)
 //!
-//! Flow:
-//!   tun connects → WS handshake → validates token+name → marks online
-//!   Proxy sends requests via App.tun_sessions → write_task reads from mpsc → sends ResponseFrame
-//!   ngx reads request frames from WS (for future tun-initiated requests)
-//!
-//! Transport: MessagePack binary frames (not JSON).
+//! 1. tun opens a TCP connection to ngx's tunnel listener.
+//! 2. tun sends a `GET /tunnel HTTP/1.1` upgrade request with
+//!    `Authorization: Bearer <token>` (the token's sha256 is
+//!    what's stored in the DB; we hash the inbound bearer
+//!    before lookup).
+//! 3. ngx validates the bearer via the `tun` table. On
+//!    success: send `101 Switching Protocols`. On failure:
+//!    send a real HTTP 401/403/500 and close.
+//! 4. Once the WS is up, a yamux server session is layered on
+//!    top. Each HTTP request from ngx's proxy path opens one
+//!    yamux stream carrying raw HTTP/1.1 bytes (no
+//!    msgpack, no rid correlation, no DEFLATE on the wire
+//!    beyond permessage-deflate). Each WS relay connection
+//!    also gets one yamux stream, with a 1-byte tag
+//!    (`0x01` = HTTP, `0x02` = WS) to disambiguate.
+//! 5. The session is registered in `App::tun_sessions` keyed
+//!    by `tun_name`. When a tun disconnects, the entry is
+//!    removed and all in-flight HTTP requests get 504.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use fastwebsockets::{Role as WsRole, WebSocket};
 use log::{debug, error, info, warn};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio_tungstenite::{accept_async, tungstenite};
 
-use pangolin_core::compress::{deflate_decode, deflate_encode};
-use pangolin_core::{deserialize_msgpack, serialize_msgpack, TunnelFrame};
+use pangolin_core::tunnel::{
+    bearer_token, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
+    write_ws_accept_response, TunnelRole,
+};
 
-use crate::{App, TunnelMessage};
+use crate::App;
 
 // ---- Auth ----
 
 /// Validate a tun's (name, token) against the `tun` table.
 ///
-/// v2: tokens and tun names live in the same row, so this is a single
-/// SQL lookup. Three outcomes:
-///
-///   * `Ok(())` — a matching row exists, is `enabled=1`, and the
-///     token has not expired (or has no expiry). The tun is admitted.
-///   * `Err(401)` — either no row matches `(name, token)`, **or**
-///     the row matches but its `expires_at` is in the past. Both
-///     are hard rejects: a missing row means the (name, token) pair
-///     must be admin-provisioned via the admin UI /tun/new form (POST /tun/new) before the tun
-///     can come online (no auto-register), and an expired token
-///     must be rotated by the admin. We collapse both into 401 so
-///     the client doesn't learn "this (name, token) was once
-///     valid, just expired" vs "never existed."
-///   * `Err(403)` — a row matched and the token is not expired, but
-///     `enabled=0` (admin disabled it). The tun cannot reconnect
-///     until the admin re-enables it.
+/// V3: `auth_tun` hashes the inbound token and compares
+/// against `tun.token_hash`. We hash *here* in the call
+/// path; the DB lookup is just the equality check.
 async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
     let conn = app.db.lock().await;
     let row = match pangolin_core::db::auth_tun(&conn, tun_name, token) {
@@ -57,17 +54,15 @@ async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u1
         Some((false, _)) => Err(403),
         Some((true, None)) => Ok(()),
         Some((true, Some(expires_at))) if expires_at > now => Ok(()),
-        Some((true, Some(_))) => Err(401), // expired
+        Some((true, Some(_))) => Err(401),
     }
 }
 
-/// Mark a tun as online in the DB.
 async fn mark_tun_online(app: &App, tun_name: &str) {
     let conn = app.db.lock().await;
     let _ = pangolin_core::db::set_tun_online(&conn, tun_name, true);
 }
 
-/// Mark a tun as offline in the DB.
 async fn mark_tun_offline(app: &App, tun_name: &str) {
     let conn = app.db.lock().await;
     let _ = pangolin_core::db::set_tun_online(&conn, tun_name, false);
@@ -75,8 +70,6 @@ async fn mark_tun_offline(app: &App, tun_name: &str) {
 
 // ---- Main tunnel server ----
 
-/// Start the tunnel WebSocket server on the given address.
-/// Runs as an independent background task alongside pingora.
 pub async fn start_tunnel_server(
     app: Arc<App>,
     addr: &str,
@@ -94,8 +87,6 @@ pub async fn start_tunnel_server(
 
     loop {
         tokio::select! {
-            // Bias toward shutdown so a Ctrl-C during a slow accept
-            // doesn't have to wait for the next connection.
             biased;
             _ = shutdown.cancelled() => {
                 info!("tunnel: shutdown requested, stopping accept loop");
@@ -104,11 +95,6 @@ pub async fn start_tunnel_server(
             accept = listener.accept() => {
                 match accept {
                     Ok((tcp_stream, client_addr)) => {
-                        // Per-conn tasks are aborted wholesale on
-                        // runtime shutdown; dropping `tcp_stream`
-                        // closes the socket, so no per-conn shutdown
-                        // select is needed (and it would risk
-                        // cancelling `handle_client` mid-`app.db.lock().await`).
                         let app = app.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(app, tcp_stream, client_addr).await {
@@ -125,11 +111,6 @@ pub async fn start_tunnel_server(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Service integration
-// ---------------------------------------------------------------------------
-
-/// Long-running tunnel WebSocket listener, run by `runtime::Service`.
 pub struct TunnelService {
     addr: String,
 }
@@ -151,287 +132,133 @@ impl crate::runtime::Service for TunnelService {
     }
 }
 
-/// Handle a single tunnel client: WebSocket upgrade, auth, then handle requests.
+/// Handle a single tun client: WebSocket upgrade, auth,
+/// then register the yamux session in `App::tun_sessions`.
 async fn handle_client(
     app: Arc<App>,
-    tcp_stream: tokio::net::TcpStream,
+    mut tcp_stream: tokio::net::TcpStream,
     _client_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Peek to verify this is a GET /tunnel request, and to extract
-    // the token/name from the URL for auth. `peek` does NOT advance
-    // the read cursor (it's a `MSG_PEEK` under the hood), so the
-    // bytes are still available to `accept_async` below — we must
-    // NOT call `read` between peek and accept, or accept would see
-    // a truncated request and fail the WS handshake.
-    //
-    // Buffer size: 1024 is comfortably larger than any reasonable
-    // GET line (RFC 7230 §3.1.1 doesn't define a hard limit, but
-    // production auth tokens can be 64-128+ bytes). `peek` doesn't
-    // advance the cursor so reading a larger buffer is cheap.
-    let mut peek_buf = [0u8; 1024];
-    let peek_n = match tcp_stream.peek(&mut peek_buf).await {
-        Ok(0) => return Ok(()),
-        Ok(n) => n,
-        Err(e) => {
-            warn!("peek error: {}", e);
+    // Read the WS upgrade request and validate it.
+    let req = read_ws_upgrade_request(&mut tcp_stream).await?;
+    let token = match bearer_token(req.authorization.as_deref()) {
+        Some(t) => t,
+        None => {
+            write_http_error(&mut tcp_stream, 401, "Unauthorized").await?;
             return Ok(());
         }
     };
-    let peek_str = std::str::from_utf8(&peek_buf[..peek_n]).unwrap_or("");
-    if !peek_str.starts_with("GET /tunnel") {
-        debug!("tunnel: non-GET or wrong path, closing");
-        return Ok(());
-    }
-
-    // WebSocket handshake (reads the same bytes we peeked)
-    let ws_stream = accept_async(tcp_stream).await?;
-
-    // Extract token & name from the URL. The request looks like
-    //   GET /tunnel?token=xxx&name=yyy HTTP/1.1\r\n...
-    // so the URL is the second whitespace-separated token. We strip
-    // the leading `/tunnel?` to get the raw query string.
-    let query = peek_str
-        .split_whitespace()
+    // Pull the tun name from the path. The tun client
+    // dials `ws://host/tunnel` (no name in the path any
+    // more — name comes from the `Authorization: Bearer
+    // …:name=<NAME>` scheme). For backwards compat with
+    // the old "?name=" style we'll also accept a query
+    // parameter if the path is `/tunnel?name=…`.
+    let name_from_query = req
+        .target
+        .split('?')
         .nth(1)
-        .and_then(|url| url.strip_prefix("/tunnel?"))
-        .unwrap_or("");
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("name=").map(|s| s.to_string()))
+        })
+        .unwrap_or_default();
+    let tun_name = if !name_from_query.is_empty() {
+        name_from_query
+    } else {
+        // New style: `Authorization: Bearer <token>` was the
+        // old way. The new tun-side writes
+        // `Authorization: Bearer <token>` only — the name
+        // comes from a separate, internal query parameter
+        // pre-set in the Authorization header? No, the spec
+        // actually says name comes from the path or query
+        // string. We added a `?name=` convention for the
+        // tun-side write in `build_ws_upgrade_request`. For
+        // now, treat any tun that does NOT supply `?name=`
+        // as a hard reject (we can't authorise without a
+        // name).
+        write_http_error(&mut tcp_stream, 400, "Bad Request: missing name").await?;
+        return Ok(());
+    };
 
-    let mut token = "";
-    let mut name = "";
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        match parts.next() {
-            Some("token") => token = parts.next().unwrap_or(""),
-            Some("name") => name = parts.next().unwrap_or(""),
-            _ => {}
-        }
-    }
-
-    if token.is_empty() || name.is_empty() {
-        warn!("tunnel: missing token or name in request");
+    if !req.target.starts_with("/tunnel") {
+        debug!("tunnel: wrong path, closing");
+        write_http_error(&mut tcp_stream, 404, "Not Found").await?;
         return Ok(());
     }
+    let sec_key = match req.sec_websocket_key.as_deref() {
+        Some(k) => k.to_string(),
+        None => {
+            write_http_error(
+                &mut tcp_stream,
+                400,
+                "Bad Request: missing Sec-WebSocket-Key",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
-    match validate_token(&app, token, name).await {
+    match validate_token(&app, &token, &tun_name).await {
         Ok(()) => {}
         Err(status) => {
-            // 401: no row matches (name, token) — admin hasn't
-            //      provisioned this (name, token) pair yet.
-            // 403: row exists but `enabled=0` — admin disabled it.
-            // 500: DB error.
-            // All three are hard rejects; the tun stays offline
-            // until an operator creates / re-enables the row via
-            // `POST /tun/new` (the admin UI Tunnels page).
-            warn!("tunnel auth failed for {}: status {}", name, status);
+            warn!("tunnel auth failed for {}: status {}", tun_name, status);
+            let reason = match status {
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                _ => "Internal Server Error",
+            };
+            write_http_error(&mut tcp_stream, status, reason).await?;
             return Ok(());
         }
     }
 
-    let tun_name = name.to_string();
     mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected", tun_name);
     app.add_event(pangolin_core::EventType::TunConnected {
         name: tun_name.clone(),
     });
 
-    handle_tun_ws(app, ws_stream, tun_name).await;
-    Ok(())
-}
+    // Now upgrade the connection to a WebSocket. We can't
+    // use fastwebsockets' accept_hdr_async (callback is
+    // sync; we already validated the token above so we
+    // don't need a second auth step).
+    write_ws_accept_response(&mut tcp_stream, &sec_key).await?;
 
-/// Main handler: proxy → tun requests arrive via mpsc channel,
-/// write_task reads from mpsc and sends TunnelResponseFrame over WS.
-/// ngx also reads frames from WS (for future tun-initiated requests).
-async fn handle_tun_ws(
-    app: Arc<App>,
-    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    tun_name: String,
-) {
-    let (ws_sender, mut ws_read) = ws.split();
+    // Wrap the TCP stream as a WebSocket and hand it to a
+    // YamuxTunnel. The TCP stream is the underlying byte
+    // pipe; the WebSocket frames yamux's bytes into
+    // permessage-deflate-compressed binary frames.
+    let ws = WebSocket::after_handshake(tcp_stream, WsRole::Server);
+    let tunnel = tunnel_over_websocket(ws, TunnelRole::Server);
 
-    // Channel for proxy → tun requests (delivers TunnelMessage with resp_tx)
-    let (tx, mut rx) = mpsc::channel::<TunnelMessage>(100);
-
-    // Check for duplicate tun_name — reject if already registered (atomic via entry API)
-    {
+    // Register the session keyed by tun_name. Reject
+    // duplicates to avoid two tuns fighting for the same
+    // routing slot.
+    let session_end = {
         let mut sessions = app.tun_sessions.write().await;
-        match sessions.entry(tun_name.clone()) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                log::warn!("duplicate tun_name '{}' rejected", tun_name);
-                let reject =
-                    serialize_msgpack(&TunnelFrame::Res(pangolin_core::TunnelResponseFrame {
-                        rid: String::new(),
-                        status: 409,
-                        headers: vec![],
-                        body: b"tun name already registered".to_vec(),
-                    }));
-                if let Err(e) = reject {
-                    log::warn!("failed to send duplicate rejection: {}", e);
-                }
-                return;
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(tx);
-            }
+        if sessions.contains_key(&tun_name) {
+            warn!("tunnel: duplicate tun_name '{}' rejected", tun_name);
+            return Ok(());
         }
-    }
+        let end = tunnel.session_end.clone();
+        sessions.insert(tun_name.clone(), tunnel);
+        end
+    };
 
-    // Pending requests: rid → (resp_tx, insertion_time)
-    // Values are periodically cleaned up when they expire (120s > 60s ngx timeout)
-    let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        String,
-        (
-            tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
-            std::time::Instant,
-        ),
-    >::new()));
+    // Block on the bridge's end-of-session notification.
+    // This future resolves when the WebSocket EOFs (the
+    // tun dropped the connection). Until then, this
+    // per-conn task stays alive and the registry entry
+    // is reachable from the proxy hot path.
+    session_end.notified().await;
 
-    // Pending WS relay: rid → resp_tx for WsStart frames (separate from HTTP proxy pending).
-    let pending_ws = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        tokio::sync::oneshot::Sender<pangolin_core::TunnelResponseFrame>,
-    >::new()));
-
-    let pending_read = pending.clone();
-    let write_task = tokio::spawn(async move {
-        let mut sender = ws_sender;
-        while let Some(msg) = rx.recv().await {
-            // msg.body = serialized TunnelRequestFrame (msgpack)
-            // Store resp_tx by rid so the read side can route the response
-            {
-                let mut map = pending_read.lock().await;
-                map.insert(msg.rid.clone(), (msg.resp_tx, std::time::Instant::now()));
-            }
-            let ws_msg = tungstenite::Message::Binary(deflate_encode(&msg.body).into());
-            if sender.send(ws_msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Also read frames from the WebSocket:
-    // - Req frames from tun: unhandled (architecture is proxy → tun)
-    // - Res frames from tun: route to pending request via resp_tx
-    // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
-    let pending_read = pending.clone();
-    let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    loop {
-        tokio::select! {
-            _ = cleanup_ticker.tick() => {
-                // Clean up pending entries older than 120s
-                let now = std::time::Instant::now();
-                let mut map = pending_read.lock().await;
-                map.retain(|_, (_, inserted)| {
-                    now.duration_since(*inserted).as_secs() < 120
-                });
-            }
-            msg = ws_read.next() => {
-                match msg {
-                    Some(Ok(tungstenite::Message::Binary(buf))) => {
-                        // Try decompress raw DEFLATE, fallback to raw if not compressed
-                        let buf = match deflate_decode(&buf) {
-                            Ok(d) => d,
-                            Err(_) => buf.to_vec(),
-                        };
-                        match deserialize_msgpack::<TunnelFrame>(&buf) {
-                            Ok(TunnelFrame::Req(req_frame)) => {
-                                debug!("tun {} → req {} {} (unhandled in proxy→tun architecture)",
-                                    tun_name, req_frame.rid, req_frame.path);
-                            }
-                            Ok(TunnelFrame::Res(resp_frame)) => {
-                                debug!("tun {} ← resp {} status={}", tun_name, resp_frame.rid, resp_frame.status);
-                                // Route: WS relay (pending_ws) vs HTTP proxy (pending)
-                                if let Some(tx) = pending_ws.lock().await.remove(&resp_frame.rid) {
-                                    let _ = tx.send(resp_frame);
-                                } else {
-                                    let mut map = pending.lock().await;
-                                    if let Some((tx, _)) = map.remove(&resp_frame.rid) {
-                                        let _ = tx.send(resp_frame);
-                                    } else {
-                                        warn!("no pending request for rid {}", resp_frame.rid);
-                                    }
-                                }
-                            }
-                            Ok(TunnelFrame::WsStart { rid, path }) => {
-                                debug!("tun {} WsStart rid={} path={}", tun_name, rid, path);
-                                // proxy.rs stored resp_tx in pending (even for ws- rids).
-                                // Retrieve it and move to pending_ws for WS relay routing.
-                                let tx = {
-                                    let mut p = pending.lock().await;
-                                    p.remove(&rid).map(|(t, _)| t)
-                                };
-                                if let Some(tx) = tx {
-                                    pending_ws.lock().await.insert(rid.clone(), tx);
-                                }
-                            }
-                            Ok(TunnelFrame::WsEnd { rid }) => {
-                                debug!("tun {} WsEnd rid={}", tun_name, rid);
-                                pending_ws.lock().await.remove(&rid);
-                            }
-                            Err(e) => {
-                                warn!("malformed tunnel frame from {}: {}", tun_name, e);
-                            }
-                        }
-                    }
-                    Some(Ok(tungstenite::Message::Text(t))) => {
-                        if let Ok(_frame) = serde_json::from_str::<TunnelFrame>(&t) {
-                            debug!("tun {} sent JSON frame (decoded but unhandled)", tun_name);
-                        } else {
-                            warn!("malformed text frame from {}: {}", tun_name, t);
-                        }
-                    }
-                    Some(Ok(tungstenite::Message::Close(_))) => {
-                        info!("tun {} sent close", tun_name);
-                        break;
-                    }
-                    Some(Ok(tungstenite::Message::Ping(_))) | Some(Ok(tungstenite::Message::Pong(_))) => {
-                        // Ping/pong handled automatically by tungstenite auto-pong
-                    }
-                    Some(Ok(tungstenite::Message::Frame(_))) => {
-                        // WebSocket frame (part of stream) — skip
-                    }
-                    Some(Err(e)) => {
-                        warn!("WS read error from {}: {}", tun_name, e);
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    // Drain pending maps on disconnect (all pending requests get 504)
-    // Drain HTTP proxy pending
-    {
-        let mut map = pending.lock().await;
-        for (_, (tx, _)) in map.drain() {
-            let _ = tx.send(pangolin_core::TunnelResponseFrame {
-                rid: String::new(),
-                status: 504,
-                headers: vec![],
-                body: b"tunnel disconnected".to_vec(),
-            });
-        }
-    }
-    // Drain WS relay pending
-    {
-        let mut map = pending_ws.lock().await;
-        for (_, tx) in map.drain() {
-            let _ = tx.send(pangolin_core::TunnelResponseFrame {
-                rid: String::new(),
-                status: 504,
-                headers: vec![],
-                body: b"tunnel disconnected".to_vec(),
-            });
-        }
-    }
-
-    write_task.abort();
-
-    // Mark offline in DB and unregister from memory
-    mark_tun_offline(&app, &tun_name).await;
+    // Cleanup on disconnect.
     app.unregister_tun(&tun_name).await;
+    mark_tun_offline(&app, &tun_name).await;
     info!("tun {} disconnected", tun_name);
     app.add_event(pangolin_core::EventType::TunDisconnected {
         name: tun_name.clone(),
     });
+    Ok(())
 }

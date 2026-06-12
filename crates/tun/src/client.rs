@@ -1,86 +1,64 @@
-//! Pangolin tunnel node (tun) — WebSocket client implementation.
+//! Pangolin tunnel node (tun) — yamux-over-fastwebsockets client.
+//!
+//! Replaces the previous msgpack-framed WebSocket client with
+//! a yamux multiplexer. Per-HTTP-request and per-WS-connection
+//! a fresh yamux stream is opened against the ngx side; the
+//! stream carries raw HTTP/1.1 bytes (or WS frame bytes for
+//! relay) without any custom framing on top.
+//!
+//! ## Connection lifecycle
+//!
+//! 1. TCP-connect to the configured ngx address.
+//! 2. Manual WS upgrade (RFC 6455), `Authorization: Bearer
+//!    <sha256-of-token>` is sent in the upgrade request
+//!    headers — auth happens before the 101 response.
+//! 3. yamux client session on top of the resulting WS.
+//! 4. A background task accepts new yamux streams from
+//!    ngx, dispatching each to either the HTTP path
+//!    (`handle_http_stream`) or the WS relay path
+//!    (`handle_ws_stream`).
+//! 5. On stream closure, drop the handle. On tunnel
+//!    closure, the loop reconnects with backoff.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
-use log::warn;
-use reqwest::{
-    header::{HeaderName, HeaderValue},
-    Client,
+use log::{info, warn};
+
+use pangolin_core::tunnel::{
+    build_ws_upgrade_request, pump_ws_relay, read_http_request, read_ws_accept_response,
+    tunnel_over_websocket, HttpRequest, TunnelRole, WsRole, YamuxTunnel,
 };
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::{interval, sleep};
-use tokio_tungstenite::{connect_async, tungstenite};
+
+use fastwebsockets::WebSocket;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 use crate::config::TunConfig;
-use crate::frame::{
-    deflate_decode, deflate_encode, deserialize_msgpack, serialize_msgpack, TunnelFrame,
-    TunnelRequestFrame, TunnelResponseFrame,
-};
 
-struct PendingRequest;
-
-/// Outcome of a single connect + session cycle, used by [`TunnelClient::run`]
-/// to drive the reconnect loop. Distinguishing "we never got past the
-/// handshake" from "we connected and then the session ended" is what
-/// lets the loop reset the backoff only when a session actually ran.
+/// Outcome of a single connect + session cycle, used by
+/// [`TunnelClient::run`] to drive the reconnect loop.
 enum SessionOutcome {
-    /// WS handshake completed, then the session ended.
-    /// `Ok(())` = clean stream close; `Err(e)` = session errored
-    /// mid-flight (the underlying cause is logged, not surfaced).
     EstablishedAndEnded(Result<()>),
-    /// Could not establish the WS connection at all (ngx offline,
-    /// DNS failure, auth rejection, …).
     NeverConnected(anyhow::Error),
 }
 
 pub struct TunnelClient {
     config: TunConfig,
-    http_client: Client,
-    pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
 }
 
 impl TunnelClient {
     pub fn new(config: TunConfig) -> Self {
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(16)
-            .build()
-            .expect("reqwest client should build");
-
-        Self {
-            config,
-            http_client,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self { config }
     }
 
     pub async fn run(&self) {
-        log::info!(
+        info!(
             "tun {} starting, target {}",
-            self.config.name,
-            self.config.server
+            self.config.name, self.config.server
         );
 
-        // Reconnect policy:
-        //   - Never exit on a dropped session. ngx may restart, the
-        //     network may flap, or ngx may simply not be online yet
-        //     (e.g. a tun that boots before its gateway). Any of those
-        //     is recoverable; the operator controls lifecycle via
-        //     systemd, not via the tun's idea of "done".
-        //   - Exponential backoff with a 30s ceiling for connect
-        //     failures (ngx offline).
-        //   - Reset backoff to 1s after a session actually established
-        //     (got past the WS handshake). A network blip that drops a
-        //     healthy session should not leave us at 30s between every
-        //     subsequent reconnect.
-        //   - Small jitter (0..=500ms) so a fleet of tun clients
-        //     reconnecting after an ngx restart doesn't synchronize
-        //     their retries (thundering herd).
         const INITIAL_BACKOFF_SECS: u64 = 1;
         const MAX_BACKOFF_SECS: u64 = 30;
         const MAX_JITTER_MS: u64 = 500;
@@ -91,17 +69,13 @@ impl TunnelClient {
             let session_outcome = self.connect_and_handle().await;
             match session_outcome {
                 SessionOutcome::EstablishedAndEnded(Ok(())) => {
-                    log::info!("tun {} disconnected, will reconnect", self.config.name);
-                    // We got past the handshake, so a session ran.
-                    // Reset backoff — the next drop is a fresh event,
-                    // not a continuation of an outage.
+                    info!("tun {} disconnected, will reconnect", self.config.name);
                     backoff_secs = INITIAL_BACKOFF_SECS;
                 }
                 SessionOutcome::EstablishedAndEnded(Err(e)) => {
-                    log::warn!(
+                    warn!(
                         "tun {} session errored ({}), will reconnect",
-                        self.config.name,
-                        e
+                        self.config.name, e
                     );
                     backoff_secs = INITIAL_BACKOFF_SECS;
                 }
@@ -112,7 +86,6 @@ impl TunnelClient {
                         e,
                         backoff_secs
                     );
-                    // Backoff not reset — keep doubling up to the cap.
                 }
             }
 
@@ -126,424 +99,458 @@ impl TunnelClient {
         }
     }
 
-    /// One connect+session cycle. Returns whether the WebSocket
-    /// handshake ever completed, so the caller can decide whether
-    /// to reset the reconnect backoff.
     async fn connect_and_handle(&self) -> SessionOutcome {
-        let ws_url = format!(
-            "ws://{}/tunnel?token={}&name={}",
-            self.config.server, self.config.token, self.config.name
-        );
-
-        log::info!(
-            "tun {} connecting to ws://{}/tunnel?token=***&name={}",
-            self.config.name,
-            self.config.server,
-            self.config.name
-        );
-        let (ws_stream, _) = match connect_async(&ws_url).await {
+        let tcp = match TcpStream::connect(&self.config.server).await {
             Ok(s) => s,
-            Err(e) => return SessionOutcome::NeverConnected(e.into()),
+            Err(e) => {
+                return SessionOutcome::NeverConnected(anyhow::anyhow!(
+                    "tcp connect to {}: {}",
+                    self.config.server,
+                    e
+                ));
+            }
         };
-        log::info!("tun {} connected to ngx", self.config.name);
-
-        match self.handle_stream(ws_stream).await {
+        info!(
+            "tun {} connected to ngx {}, starting WS upgrade",
+            self.config.name, self.config.server
+        );
+        match self.handshake_and_serve(tcp).await {
             Ok(()) => SessionOutcome::EstablishedAndEnded(Ok(())),
             Err(e) => SessionOutcome::EstablishedAndEnded(Err(e)),
         }
     }
 
-    async fn handle_stream(
-        &self,
-        ws: tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> Result<()> {
-        let (ws_sender, mut ws_read) = ws.split();
-        let pending = self.pending.clone();
-        let name = self.config.name.clone();
-        let http_client = self.http_client.clone();
+    /// Perform the WebSocket upgrade against the connected TCP
+    /// stream, hand the resulting WebSocket to a `YamuxTunnel`,
+    /// and run the per-stream dispatcher until the tunnel ends.
+    async fn handshake_and_serve(&self, tcp: TcpStream) -> Result<()> {
+        let (mut tcp_read, mut tcp_write) = tcp.into_split();
+        // Client-side WS upgrade. The path includes the
+        // tun name as a query parameter (the server uses it
+        // to authorise against the `tun` table row; auth
+        // token rides in the `Authorization: Bearer …`
+        // header).
+        let path = format!("/tunnel?name={}", self.config.name);
+        let host = &self.config.server;
+        let (req_bytes, key) = build_ws_upgrade_request(&path, host, &self.config.token);
+        tcp_write.write_all(&req_bytes).await?;
+        tcp_write.flush().await?;
+        // Read the 101 response and validate the accept hash.
+        read_ws_accept_response(&mut tcp_read, &key).await?;
+        // Wrap the now-WS-framed halves as a WebSocket. We use
+        // owned halves so the WebSocket can be moved into the
+        // bridge task that yamux runs alongside.
+        let ws = WebSocket::after_handshake(
+            OwnedTcpHalf {
+                reader: tcp_read,
+                writer: tcp_write,
+            },
+            WsRole::Client,
+        );
+        let tunnel = tunnel_over_websocket(ws, TunnelRole::Client);
+        info!("tun {} WS upgrade ok, yamux session live", self.config.name);
+        serve_tun_session(&self.config, tunnel).await
+    }
+}
 
-        // Arc-wrapped sender so multiple concurrent request handlers can send
-        let ws_sender = Arc::new(Mutex::new(ws_sender));
+/// Adapter so the split TCP halves can be reassembled into a
+/// single `AsyncRead + AsyncWrite + Unpin` value for the
+/// fastwebsockets `WebSocket::after_handshake` constructor.
+struct OwnedTcpHalf {
+    reader: tokio::net::tcp::OwnedReadHalf,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+}
 
-        // Batch channel: handle_request sends response frames here
-        let (batch_tx, mut batch_rx) = mpsc::channel::<TunnelResponseFrame>(1000);
+impl AsyncRead for OwnedTcpHalf {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
 
-        // Batch flush task — collects frames for up to 10ms then sends in one WS write
-        let ws_sender_batch = ws_sender.clone();
-        let batch_handle = tokio::spawn(async move {
-            const BATCH_DELAY_MS: u64 = 10;
-            let mut batch: Vec<TunnelResponseFrame> = Vec::with_capacity(64);
-            let mut flush_interval = tokio::time::interval(Duration::from_millis(BATCH_DELAY_MS));
-
-            // Drain the current batch over the WS. Returns `false` if
-            // the underlying send errors (in which case the caller
-            // exits the loop and abandons the channel).
-            let mut alive = true;
-            while alive {
-                tokio::select! {
-                    Some(resp) = batch_rx.recv() => {
-                        batch.push(resp);
-                        if batch.len() < 64 {
-                            continue;
-                        }
-                    }
-                    _ = flush_interval.tick() => {
-                        if batch.is_empty() {
-                            continue;
-                        }
-                    }
-                }
-                // Flush the current batch.
-                let mut send_failed = false;
-                for frame in batch.drain(..).map(TunnelFrame::Res) {
-                    if let Ok(buf) = serialize_msgpack(&frame) {
-                        let compressed = deflate_encode(&buf);
-                        let mut s = ws_sender_batch.lock().await;
-                        if s.send(tungstenite::Message::Binary(compressed.into()))
-                            .await
-                            .is_err()
-                        {
-                            send_failed = true;
-                            break;
-                        }
-                    }
-                }
-                if send_failed {
-                    alive = false;
-                }
-            }
-            // Best-effort drain of any remaining frames on exit.
-            for frame in batch.drain(..).map(TunnelFrame::Res) {
-                if let Ok(buf) = serialize_msgpack(&frame) {
-                    let compressed = deflate_encode(&buf);
-                    let mut s = ws_sender_batch.lock().await;
-                    let _ = s
-                        .send(tungstenite::Message::Binary(compressed.into()))
-                        .await;
-                }
-            }
-        });
-
-        // Keepalive ping task
-        let ws_sender_ping = ws_sender.clone();
-        let ping_handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                let mut sender = ws_sender_ping.lock().await;
-                if sender
-                    .send(tungstenite::Message::Ping(vec![].into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        // Status logger task
-        let log_handle = tokio::spawn({
-            let pending = pending.clone();
-            let name = name.clone();
-            async move {
-                let mut ticker = interval(Duration::from_secs(60));
-                loop {
-                    ticker.tick().await;
-                    let count = pending.lock().await.len();
-                    log::info!("tun {} connected, pending={}", name, count);
-                }
-            }
-        });
-
-        // Main read loop
-        while let Some(msg) = ws_read.next().await {
-            match msg {
-                Ok(tungstenite::Message::Binary(buf)) => {
-                    // Try decompress raw DEFLATE, fallback to raw if not compressed
-                    let buf = match deflate_decode(&buf) {
-                        Ok(d) => d,
-                        Err(_) => buf.to_vec(),
-                    };
-                    match deserialize_msgpack::<TunnelFrame>(&buf) {
-                        Ok(TunnelFrame::Req(req)) => {
-                            let pending = pending.clone();
-                            let batch_tx = batch_tx.clone();
-                            let http_client = http_client.clone();
-                            let name = name.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    Self::handle_request(req, http_client, batch_tx, pending).await
-                                {
-                                    log::warn!("tun {} handle_request error: {}", name, e);
-                                }
-                            });
-                        }
-                        Ok(TunnelFrame::Res(_)) => {
-                            log::warn!("unexpected response frame from ngx");
-                        }
-                        Ok(TunnelFrame::WsStart { rid, path }) => {
-                            // WS relay: ngx requests that we connect to a backend.
-                            // ngx expects 101 response via the msgpack channel (pending_ws map).
-                            log::info!("WsStart rid={} path={}", rid, path);
-                            let (resp_tx, _resp_rx) =
-                                tokio::sync::oneshot::channel::<TunnelResponseFrame>();
-                            tokio::spawn(async move {
-                                Self::handle_ws_start(rid, path, resp_tx).await;
-                            });
-                        }
-                        Ok(TunnelFrame::WsEnd { rid }) => {
-                            // TODO: implement WS relay end
-                            log::debug!("WsEnd rid={}", rid);
-                        }
-                        Err(e) => {
-                            log::warn!("malformed frame from ngx: {}", e);
-                        }
-                    }
-                }
-                Ok(tungstenite::Message::Text(t)) => {
-                    log::warn!(
-                        "received text frame from ngx (expected binary msgpack): {}",
-                        t
-                    );
-                }
-                Ok(tungstenite::Message::Close(_)) => {
-                    log::info!("tun {} received close from ngx", name);
-                    break;
-                }
-                Ok(tungstenite::Message::Ping(_)) | Ok(tungstenite::Message::Pong(_)) => {
-                    // Auto-handled by tungstenite
-                }
-                Err(e) => {
-                    log::warn!("WS read error from ngx: {}", e);
-                    break;
-                }
-                _ => continue,
-            }
-        }
-
-        batch_handle.abort();
-        ping_handle.abort();
-        log_handle.abort();
-
-        Ok(())
+impl AsyncWrite for OwnedTcpHalf {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, buf)
     }
 
-    async fn handle_request(
-        req: TunnelRequestFrame,
-        http_client: Client,
-        batch_tx: mpsc::Sender<TunnelResponseFrame>,
-        pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
-    ) -> Result<()> {
-        let rid = req.rid.clone();
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
 
-        // Track pending request
-        pending.lock().await.insert(rid.clone(), PendingRequest);
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
 
-        // Proxy to backend
-        let result = Self::proxy_request(req, &http_client).await;
-
-        // Remove from pending
-        pending.lock().await.remove(&rid);
-
-        let resp_frame = match result {
-            Ok(frame) => frame,
-            Err(e) => {
-                warn!("tun proxy error for rid {}: {}", rid, e);
-                TunnelResponseFrame {
-                    rid,
-                    status: 502,
-                    headers: vec![],
-                    body: e.to_string().into_bytes(),
-                }
+/// Run the tun-side per-stream dispatcher.
+async fn serve_tun_session(config: &TunConfig, tunnel: YamuxTunnel) -> Result<()> {
+    let name = config.name.clone();
+    loop {
+        let stream = match tunnel.accept_stream().await {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                warn!("tun {} accept error: {}", name, e);
+                continue;
+            }
+            None => {
+                info!("tun {} yamux session ended", name);
+                return Ok(());
             }
         };
 
-        batch_tx
-            .send(resp_frame)
-            .await
-            .map_err(|_| anyhow::anyhow!("batch channel closed"))?;
-        Ok(())
-    }
-
-    async fn handle_ws_start(
-        rid: String,
-        path: String,
-        resp_tx: tokio::sync::oneshot::Sender<TunnelResponseFrame>,
-    ) {
-        // Parse backend URL from path.
-        // path format: "http://host:port/path", "https://...", "ws://...", "wss://..."
-        // or just "/path" (implies http://localhost:8080).
-        let backend_url = if path.starts_with("http://")
-            || path.starts_with("https://")
-            || path.starts_with("ws://")
-            || path.starts_with("wss://")
-        {
-            path.clone()
-        } else {
-            format!("http://127.0.0.1:8080{}", path)
-        };
-
-        // Determine scheme: wss:// if original was https:// or wss://, otherwise ws://
-        let ws_scheme = if backend_url.starts_with("https://") || backend_url.starts_with("wss://")
-        {
-            "wss"
-        } else {
-            "ws"
-        };
-        let backend_host = backend_url
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_start_matches("ws://")
-            .trim_start_matches("wss://");
-        let ws_url = format!("{}://{}", ws_scheme, backend_host);
-        log::info!("connecting to backend WS: {}", ws_url);
-
-        match tokio_tungstenite::connect_async(&ws_url).await {
-            Ok((_ws_backend, _)) => {
-                log::info!("WS connected to backend: {}", ws_url);
-                // Send the full URL (with scheme) so ngx can use correct ws/wss
-                let resp = TunnelResponseFrame {
-                    rid,
-                    status: 101,
-                    headers: vec![],
-                    body: ws_url.into_bytes(),
-                };
-                let _ = resp_tx.send(resp);
-            }
-            Err(e) => {
-                log::warn!("WS connect to backend {} failed: {}", ws_url, e);
-            }
-        }
-    }
-
-    async fn proxy_request(
-        req: TunnelRequestFrame,
-        http_client: &Client,
-    ) -> Result<TunnelResponseFrame> {
-        // req.path contains the full backend URL built by ngx:
-        //   http://127.0.0.1:9020/some/path   (http backend)
-        //   https://backend.internal/path      (https backend)
-        //   file:///var/www/static/some/path   (static file backend)
+        // Distinguish HTTP vs WS at the top byte of the first
+        // yamux frame. We could add a 1-byte tag, but the
+        // simplest disambiguation is to look at the first
+        // line: `HTTP/1.1 …` is a response (we never receive
+        // that here), `GET /… HTTP/1.1` is HTTP, and anything
+        // else (binary frame from ngx) is WS. In practice, we
+        // treat the first bytes as a discriminator:
         //
-        // Fallback for legacy frames that only carry a bare path (e.g. "/"):
-        // use Host header to build a local http:// URL so old behaviour is preserved.
-        let path = req.path.as_str();
-        let backend_url = if path.starts_with("http://") || path.starts_with("https://") {
-            // HTTP/HTTPS: proxy via reqwest as usual
-            path.to_string()
-        } else if path.starts_with("file:///") {
-            // Static file: handled specially below — return early
-            return Self::serve_static_file(&req.rid, path).await;
-        } else {
-            // Bare path — legacy fallback: use Host header as the origin
-            let host = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("127.0.0.1");
-            format!("http://{}{}", host, path)
-        };
+        //   - If the first 4 bytes are "GET " → HTTP request.
+        //   - Otherwise → WS relay.
+        //
+        // The 1-byte tag is the simpler approach: ngx writes
+        // `0x01` for HTTP, `0x02` for WS as the very first
+        // byte of the stream. We do the same.
+        let config = config.clone();
+        let mut stream_obj = stream;
+        let name_for_log = name.clone();
+        tokio::spawn(async move {
+            // Read the 1-byte tag.
+            use tokio::io::AsyncReadExt;
+            let mut tag = [0u8; 1];
+            if stream_obj.read_exact(&mut tag).await.is_err() {
+                return;
+            }
+            let mut tagged = TaggedStream {
+                tag: tag[0],
+                inner: stream_obj,
+            };
+            match tag[0] {
+                TAG_HTTP => {
+                    if let Err(e) = handle_http_stream(&mut tagged, &config, &name_for_log).await {
+                        warn!("tun {} http stream error: {}", name_for_log, e);
+                    }
+                }
+                TAG_WS => {
+                    if let Err(e) = handle_ws_stream(&mut tagged, &config, &name_for_log).await {
+                        warn!("tun {} ws stream error: {}", name_for_log, e);
+                    }
+                }
+                other => {
+                    warn!("tun {} unknown stream tag 0x{:02x}", name_for_log, other);
+                }
+            }
+        });
+    }
+}
 
-        // Build HTTP/HTTPS request
-        let method = http::Method::from_bytes(req.method.as_bytes())
-            .map_err(|_| anyhow::anyhow!("invalid HTTP method"))?;
-        let url = url::Url::parse(&backend_url)
-            .map_err(|e| anyhow::anyhow!("invalid URL '{}': {}", backend_url, e))?;
-        let mut request = reqwest::Request::new(method, url);
+const TAG_HTTP: u8 = 0x01;
+const TAG_WS: u8 = 0x02;
 
-        for (k, v) in req.headers {
-            let header_name = HeaderName::from_bytes(k.as_bytes())
-                .map_err(|e| anyhow::anyhow!("invalid header name '{}': {}", k, e))?;
-            let header_value = HeaderValue::from_str(&v)
-                .map_err(|e| anyhow::anyhow!("invalid header value for '{}': {}", k, e))?;
-            request.headers_mut().insert(header_name, header_value);
-        }
+/// A yamux stream with a 1-byte tag already read off the
+/// front. After consuming the tag, the rest of the stream
+/// is the payload (raw HTTP request bytes, or raw WS frame
+/// bytes).
+struct TaggedStream<S> {
+    #[allow(dead_code)]
+    tag: u8,
+    inner: S,
+}
 
-        if !req.body.is_empty() {
-            *request.body_mut() = Some(reqwest::Body::from(req.body));
-        }
+impl<S: AsyncRead + Unpin> AsyncRead for TaggedStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 
-        let resp = http_client.execute(request).await?;
-
-        let status = resp.status().as_u16();
-        let headers: Vec<(String, String)> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let body = resp.bytes().await?.to_vec();
-
-        Ok(TunnelResponseFrame {
-            rid: req.rid,
-            status,
-            headers,
-            body,
-        })
+impl<S: AsyncWrite + Unpin> AsyncWrite for TaggedStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    /// Serve a local static file for a `file:///` backend URL.
-    ///
-    /// The URL is the full path built by ngx, e.g.:
-    ///   `file:///var/www/static/index.html`
-    ///   `file:///home/alice/public/`
-    ///
-    /// Returns 200 with file contents, 404 if not found, 403 for directory
-    /// requests without an index, or 500 on read error.
-    async fn serve_static_file(rid: &str, file_url: &str) -> Result<TunnelResponseFrame> {
-        // Strip "file://" prefix → absolute filesystem path
-        let fs_path = file_url.strip_prefix("file://").unwrap_or(file_url);
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
 
-        // Resolve index.html/index.htm for directory requests
-        let resolved = if fs_path.ends_with('/') || std::path::Path::new(fs_path).is_dir() {
-            let html = format!("{}/index.html", fs_path.trim_end_matches('/'));
-            let htm = format!("{}/index.htm", fs_path.trim_end_matches('/'));
-            if std::path::Path::new(&html).exists() {
-                html
-            } else if std::path::Path::new(&htm).exists() {
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Handle a single HTTP request stream from ngx. The flow:
+///
+///   1. Read the raw HTTP/1.1 request bytes (head + body)
+///      off the stream.
+///   2. Resolve the backend URL from the request target
+///      (the issue spec has ngx writing the full URL into
+///      the request target; a bare `/path` falls back to
+///      the Host header).
+///   3. Use reqwest to actually call the backend.
+///   4. Re-serialise the response and write it back on
+///      the stream.
+async fn handle_http_stream<S>(stream: &mut S, config: &TunConfig, name: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = read_http_request(stream).await?;
+    info!("tun {} http {} {}", name, req.method, req.target);
+    // For tun-side this is identical to before: the
+    // request target is already a full URL (ngx builds it
+    // from the site backend + request URI). Bare paths
+    // are a legacy fallback using the Host header.
+    let url = if req.target.starts_with("http://") || req.target.starts_with("https://") {
+        req.target.clone()
+    } else if req.target.starts_with("file:///") {
+        return serve_static_file(stream, &req, &req.target, name).await;
+    } else {
+        let host = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        format!("http://{}{}", host, req.target)
+    };
+
+    // Build and send the request via reqwest.
+    let response_bytes = match proxy_via_reqwest(&req, &url, config).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("tun {} proxy error: {}", name, e);
+            synth_502(&e.to_string())
+        }
+    };
+
+    stream.write_all(&response_bytes).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Handle a single WS relay stream from ngx. The flow:
+///
+///   1. Read the WS target URL from the first message
+///      framed as a length-prefixed UTF-8 string.
+///   2. Connect to the backend using a plain TCP stream
+///      and do the WS upgrade manually — this gives us a
+///      raw `AsyncRead + AsyncWrite` TCP stream carrying
+///      WS frames.
+///   3. Pump bytes bidirectionally between the TCP stream
+///      and the yamux stream with the hand-written
+///      half-close pump. The yamux stream itself carries
+///      raw bytes that are WS frame payloads (one frame
+///      per chunk); the bridge task inside YamuxTunnel
+///      handles framing at the yamux side.
+async fn handle_ws_stream<S>(stream: &mut S, _config: &TunConfig, name: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Length-prefixed URL: u16 BE + UTF-8 bytes.
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut url_buf = vec![0u8; len];
+    stream.read_exact(&mut url_buf).await?;
+    let backend_url = String::from_utf8_lossy(&url_buf).into_owned();
+    info!("tun {} ws relay to {}", name, backend_url);
+
+    let mut backend = TcpStream::connect(backend_addr_from_url(&backend_url)?).await?;
+    let (req_bytes, key) = build_ws_upgrade_request(
+        backend_path_from_url(&backend_url),
+        backend_host_from_url(&backend_url),
+        "",
+    );
+    backend.write_all(&req_bytes).await?;
+    backend.flush().await?;
+    read_ws_accept_response(&mut backend, &key).await?;
+
+    pump_ws_relay(stream, backend, "ngx", "backend").await?;
+    Ok(())
+}
+
+// ---- helpers ----
+
+fn synth_502(err: &str) -> Vec<u8> {
+    let body = err.as_bytes().to_vec();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"HTTP/1.1 502 Bad Gateway\r\n");
+    out.extend_from_slice(b"Content-Type: text/plain\r\n");
+    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(b"Connection: close\r\n");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
+    out
+}
+
+async fn proxy_via_reqwest(req: &HttpRequest, url: &str, _config: &TunConfig) -> Result<Vec<u8>> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(16)
+        .build()?;
+    let parsed = url::Url::parse(url)?;
+    let method = reqwest::Method::from_bytes(req.method.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid method"))?;
+    let mut request = reqwest::Request::new(method, parsed);
+    for (k, v) in &req.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            request.headers_mut().insert(name, value);
+        }
+    }
+    if !req.body.is_empty() {
+        *request.body_mut() = Some(reqwest::Body::from(req.body.clone()));
+    }
+    let resp = client.execute(request).await?;
+    let status = resp.status();
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!(
+            "HTTP/1.1 {} {}\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        )
+        .as_bytes(),
+    );
+    for (k, v) in resp.headers() {
+        if let Ok(v) = v.to_str() {
+            out.extend_from_slice(k.as_str().as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(v.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    if !out.windows(2).any(|w| w == b"\r\n") {
+        // never empty — guaranteed by status line
+    }
+    let body = resp.bytes().await?.to_vec();
+    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+async fn serve_static_file<S>(
+    stream: &mut S,
+    _req: &HttpRequest,
+    file_url: &str,
+    _name: &str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let path = file_url.strip_prefix("file://").unwrap_or(file_url);
+    let resolved = if path.ends_with('/')
+        || tokio::fs::metadata(path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    {
+        let html = format!("{}/index.html", path.trim_end_matches('/'));
+        if tokio::fs::metadata(&html).await.is_ok() {
+            html
+        } else {
+            let htm = format!("{}/index.htm", path.trim_end_matches('/'));
+            if tokio::fs::metadata(&htm).await.is_ok() {
                 htm
             } else {
-                return Ok(TunnelResponseFrame {
-                    rid: rid.to_string(),
-                    status: 404,
-                    headers: vec![("Content-Type".into(), "text/plain".into())],
-                    body: b"Not Found".to_vec(),
-                });
+                return write_404(stream).await;
             }
-        } else {
-            fs_path.to_string()
-        };
-
-        match tokio::fs::read(&resolved).await {
-            Ok(content) => {
-                let mime = mime_guess::from_path(&resolved)
-                    .first_or_octet_stream()
-                    .to_string();
-                Ok(TunnelResponseFrame {
-                    rid: rid.to_string(),
-                    status: 200,
-                    headers: vec![
-                        ("Content-Type".into(), mime),
-                        ("Content-Length".into(), content.len().to_string()),
-                    ],
-                    body: content,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TunnelResponseFrame {
-                rid: rid.to_string(),
-                status: 404,
-                headers: vec![("Content-Type".into(), "text/plain".into())],
-                body: b"Not Found".to_vec(),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(TunnelResponseFrame {
-                rid: rid.to_string(),
-                status: 403,
-                headers: vec![("Content-Type".into(), "text/plain".into())],
-                body: b"Forbidden".to_vec(),
-            }),
-            Err(e) => Err(anyhow::anyhow!("file read error {}: {}", resolved, e)),
         }
+    } else {
+        path.to_string()
+    };
+    match tokio::fs::read(&resolved).await {
+        Ok(content) => {
+            let mime = mime_guess::from_path(&resolved)
+                .first_or_octet_stream()
+                .to_string();
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+            out.extend_from_slice(format!("Content-Type: {}\r\n", mime).as_bytes());
+            out.extend_from_slice(format!("Content-Length: {}\r\n", content.len()).as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(&content);
+            stream.write_all(&out).await?;
+            stream.shutdown().await?;
+            Ok(())
+        }
+        Err(_) => write_404(stream).await,
     }
+}
+
+async fn write_404<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+    let body = b"Not Found".to_vec();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\n");
+    out.extend_from_slice(b"Content-Type: text/plain\r\n");
+    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
+    stream.write_all(&out).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+fn backend_addr_from_url(url: &str) -> Result<std::net::SocketAddr> {
+    // Strip scheme and path, leaving host:port.
+    let after_scheme = url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let addr: std::net::SocketAddr = host_port.parse()?;
+    Ok(addr)
+}
+
+fn backend_host_from_url(url: &str) -> &str {
+    let after_scheme = url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    after_scheme.split('/').next().unwrap_or(after_scheme)
+}
+
+fn backend_path_from_url(url: &str) -> &str {
+    let after_scheme = url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    after_scheme
+        .find('/')
+        .map(|i| &after_scheme[i..])
+        .unwrap_or("/")
 }

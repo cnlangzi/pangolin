@@ -758,6 +758,22 @@ NGX_TUNNEL__ADDR=0.0.0.0:9001 ./ngx
 
 未设置的 env 变量**不影响** YAML 值;loader 不会扫描 YAML 文本里的 `$VAR` 占位符,所以注释里写 `${EXAMPLE}` 也不会被误解析(替代了旧的 `expand_env_vars` 文本替换方案)。详细字段表见 `docs/configuration.md`。
 
+### `.env` 文件(本地 + 部署共享配置)
+
+不想每次跑命令都手敲一长串 `NGX_*=…`?把常用值写进仓库根的 `.env` 文件,**Makefile 会在所有目标执行前自动加载**(用 `set -a; . .env; set +a` 导出)。`.env` 本身进了 `.gitignore`,不会污染仓库;`.env.example` 是被跟踪的模板。
+
+```bash
+cp .env.example .env        # 首次:复制模板
+$EDITOR .env                # 改值,例如改 NGX_ADMIN__PASSWORD、NGX_ACME__EMAIL
+
+make env-show               # 查看 .env 当前生效的变量
+make start-ngx              # 自动注入 NGX_*
+make start-tun              # 自动注入 TUN_*
+make play-ngx               # 注入后通过 Ansible vars: 桥接,渲染 j2 模板
+```
+
+**与 Rust env-override 完全同构** — `.env` 里写 `NGX_ADMIN__PASSWORD=hunter2` 与手敲 `NGX_ADMIN__PASSWORD=hunter2 ./bin/pangolin-ngx` 等价,所以一份 `.env` 同时给本地 `make start-ngx` 和远程 `make play-ngx` 用,deploy 端的 `lookup('env', 'NGX_*')` 桥接在 `deploy/playbooks/ngx.yml` 和 `tun.yml` 的 `vars:` 块里。优先级:shell 已 export 的 env > `.env` > YAML 默认值。
+
 ### 关键配置项说明
 
 - `domains.auto_issue` (DB,per-domain):**单域名 ACME 开关**。v2 不再有全局 `cert.autorenew`。
