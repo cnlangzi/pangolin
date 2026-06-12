@@ -275,7 +275,97 @@ async fn real_e2e_tunnel_http_request_through_tun() {
     );
 }
 
-/// `file:///` backend reached via the tunnel (not just direct).
+/// **Regression test for the GET-without-Content-Length hang.**
+///
+/// Symptom (from production): `curl -v http://yaitoo.cn` against a
+/// site whose backend is `tun:http://127.0.0.1:9020` hangs forever —
+/// `pangolin-ngx` logs `PROXY: Tunnel routing: yaitoo.cn → tun local`
+/// and then nothing further, while the yamux session emits its 30 s
+/// keep-alive pings.
+///
+/// Cause: `AppProxy::request_filter` was calling
+/// `session.read_body_or_idle(false).await` to grab the request body
+/// before opening the yamux stream. `read_body_or_idle` is pingora's
+/// internal body-pump primitive; on a body-less request (no
+/// `Content-Length`, no `Transfer-Encoding`) it deliberately stays
+/// pending forever waiting for FIN, because in pingora's normal flow
+/// it sits inside a `select!` whose other branch handles the
+/// upstream-write side. Awaiting it sequentially is a deadlock — the
+/// request body bytes never come, and FIN never arrives because curl
+/// is also waiting on the response.
+///
+/// Why the existing tunnel e2e suite missed it: `harness::raw_request`
+/// always emits `Content-Length: 0`, which makes pingora initialise
+/// the body reader with `cl=0` and return `Ok(None)` on the first
+/// poll. Real curl GETs ship no body-framing headers at all, taking
+/// the `cl=None` → idle-wait branch (RFC 9112 §6.3) that hangs.
+///
+/// Fix: switch to `session.read_request_body()` in a loop. That call
+/// returns `Ok(None)` immediately when there is no more body to read,
+/// regardless of which header path pingora initialised. The loop is
+/// because chunked or streamed bodies arrive as multiple chunks.
+///
+/// This test uses `raw_request_no_content_length` — a deliberately
+/// header-minimal request — to mirror what curl actually puts on the
+/// wire. A regression that re-introduces `read_body_or_idle(false)`
+/// (or any other call that idles on FIN) trips the 5 s read timeout
+/// in the helper and fails the test rather than hanging the suite.
+#[tokio::test]
+async fn real_e2e_tunnel_get_without_content_length() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // GET with NO `Content-Length`, NO `Transfer-Encoding`, NO body.
+    // Pre-fix this hung the entire request flow; the 5 s read timeout
+    // in `raw_request_no_content_length` would surface it as a panic.
+    let (status, body) = crate::harness::raw_request_no_content_length(
+        &addr,
+        "office.test",
+        "GET",
+        "/",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        200,
+        "GET without Content-Length must complete (not hang). \
+         got status={status}, body={body:?}. ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Backend must have actually received the request — proves ngx
+    // forwarded it through the tun rather than silently dropping it
+    // on the way.
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have seen exactly 1 request, saw {}. ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].path, "/");
+}
+
+
 ///
 /// Regression test for the static-file path through the tunnel.
 /// With the new `tun::client::proxy_request` accepting `file:///`

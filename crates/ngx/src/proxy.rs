@@ -205,15 +205,39 @@ impl ProxyHttp for AppProxy {
                 );
 
                 // Read body first.
-                let body_bytes = match session.read_body_or_idle(false).await {
-                    Ok(Some(data)) => data.to_vec(),
-                    Ok(None) => Vec::new(),
-                    Err(e) => {
-                        error!("failed to read request body: {}", e);
-                        let _ = session.respond_error(400).await;
-                        return Ok(true);
+                //
+                // **Why `read_request_body()` and not `read_body_or_idle()`**:
+                // `read_body_or_idle` is pingora's internal body-pump
+                // primitive — it is designed to live inside a `select!`
+                // alongside the upstream-write branch, and on a body-less
+                // keep-alive request (e.g. `curl http://...` GET with no
+                // `Content-Length` and no `Transfer-Encoding`) it stays
+                // pending forever waiting for FIN (see
+                // `pingora-core/src/protocols/http/v1/server.rs::read_body_or_idle`
+                // → `std::future::pending().await`). Awaiting it sequentially
+                // hangs the entire request.
+                //
+                // `read_request_body()` returns `Ok(None)` immediately when
+                // there is nothing more to read (pingora initialises the body
+                // reader with `cl=0` per RFC 9112 §6.3 when neither header is
+                // present), so a body-less GET completes the loop on the
+                // first poll. The harness's `raw_request` always sends
+                // `Content-Length: 0`, which is why the existing e2e suite
+                // never caught this — real curl GETs omit the header
+                // entirely. See `real_e2e_tunnel_get_without_content_length`
+                // for the regression test.
+                let mut body_bytes = Vec::new();
+                loop {
+                    match session.read_request_body().await {
+                        Ok(Some(data)) => body_bytes.extend_from_slice(&data),
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("failed to read request body: {}", e);
+                            let _ = session.respond_error(400).await;
+                            return Ok(true);
+                        }
                     }
-                };
+                }
 
                 // Build the HTTP/1.1 request bytes.
                 let mut headers: Vec<(String, String)> = Vec::new();
