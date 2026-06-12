@@ -38,12 +38,8 @@ export
 endif
 
 # Fail-loud guard for targets that need $(ENV_FILE) to be present.
-# Centralized so the error wording and exit behavior stay consistent
-# across every consumer of $(ENV_LOAD) — see the audit comment above
-# the ifeq block for why this is a prerequisite everywhere, including
-# the Ansible play-* targets (Ansible silently falls back to inventory
-# defaults when no env vars are set, which would mask misconfig).
-.PHONY: require-env
+# Used as a prerequisite by every target that consumes $(ENV_LOAD) so
+# the error wording and exit behavior stay consistent.
 require-env:
 	@if [ ! -f $(ENV_FILE) ]; then \
 		echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; \
@@ -99,6 +95,17 @@ OUT_DIR ?= ./bin
 # unset) so CI builds that relocate the target dir still produce
 # binaries that the `mv` steps below can find.
 CARGO_TARGET_DIR ?= ./target
+
+# Output binary basenames (built from cargo crates `ngx` and `tun`).
+# Single source of truth so `clean` doesn't silently rot when a new
+# binary is added — append to this list and the cargo `-p` flags below.
+BINS := pangolin-ngx pangolin-tun
+
+# Shared curl flags for the two UI tool downloads: fail on HTTP error
+# (-f), follow redirects (-L, GitHub release URL → release-assets
+# host), show a progress bar (--progress-bar), and resume from any
+# existing partial file (-C -).
+CURL_FLAGS := -fL --progress-bar -C -
 
 # Release builds embed admin assets via rust-embed; building UI assets
 # first is required — without it the binary serves empty CSS/JS.
@@ -161,7 +168,7 @@ download-ui-tools:
 	fi; \
 	if [ ! -x bin/tailwindcss ]; then \
 		echo "Downloading tailwindcss v3.4.17 for $$TAILWIND_PLATFORM (from GitHub releases)..."; \
-		if ! curl -fL --progress-bar -C - -o bin/tailwindcss.tmp \
+		if ! curl $(CURL_FLAGS) -o bin/tailwindcss.tmp \
 			"https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-$$TAILWIND_PLATFORM"; then \
 			echo "  ERROR: failed to download tailwindcss" >&2; \
 			rm -f bin/tailwindcss.tmp; \
@@ -173,7 +180,7 @@ download-ui-tools:
 	fi; \
 	if [ ! -x bin/esbuild ]; then \
 		echo "Downloading esbuild v0.28.0 for $$ESBUILD_PACKAGE (via jsDelivr)..."; \
-		if ! curl -fL --progress-bar -C - -o bin/esbuild.tmp \
+		if ! curl $(CURL_FLAGS) -o bin/esbuild.tmp \
 			"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@0.28.0/bin/esbuild"; then \
 			echo "  ERROR: failed to download esbuild" >&2; \
 			rm -f bin/esbuild.tmp; \
@@ -200,13 +207,11 @@ debian:
 dist:
 	./build/dist.sh
 
-# Preserve downloaded UI tools (./bin/tailwindcss, ./bin/esbuild) so a
-# `make clean` doesn't trigger a re-download — only remove the locally
-# built pangolin-* binaries.  Downloaded CLIs are restored by
-# `make download-ui-tools` (or implicitly via `build-ui`).
+# Keep downloaded CLIs (./bin/tailwindcss, ./bin/esbuild); restored by
+# download-ui-tools. Only strip locally-built outputs.
 clean:
 	rm -rf ./build/output
-	rm -f ./bin/pangolin-ngx ./bin/pangolin-tun
+	rm -f $(addprefix $(OUT_DIR)/,$(BINS))
 	$(CARGO) clean
 
 # ── Lint / Test ──────────────────────────────────────────────────────────────
