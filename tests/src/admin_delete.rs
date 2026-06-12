@@ -90,6 +90,7 @@ fn admin_delete_tun() {
     let tun = Tun {
         name: "del-tun".into(),
         token: None,
+        token_hash: None,
         enabled: true,
         online: false,
         registered_at: None,

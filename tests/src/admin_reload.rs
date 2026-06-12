@@ -143,6 +143,7 @@ fn admin_reload_tun() {
     let tun = pangolin_core::types::Tun {
         name: "office".into(),
         token: None,
+        token_hash: None,
         enabled: true,
         online: false,
         registered_at: None,

@@ -25,6 +25,7 @@ fn insert(conn: &Connection, name: &str, token: &str, enabled: bool) {
         &Tun {
             name: name.into(),
             token: Some(token.into()),
+            token_hash: None,
             enabled,
             online: false,
             registered_at: None,

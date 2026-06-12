@@ -65,6 +65,19 @@ figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 # Logging / errors
 flate2 = "1.0"
 
+# WebSocket / multiplexing — issue #39
+# fastwebsockets: minimal WS server/client, replaces tokio-tungstenite.
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+# tokio-yamux: yamux multiplexer used over the WS byte stream.
+tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-timer"] }
+
+# TLS root store for tun `tls.verify=true`. webpki-roots bundles Mozilla CA
+# roots so tun clients can validate production certs without operator setup.
+webpki-roots = "0.26"
+
+# Hashing — issue #39 stores `tun.token` as `sha256(token)` hex (V3 migration).
+sha2 = "0.10"
+
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"

@@ -77,6 +77,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     let tun = Tun {
         name: name.clone(),
         token: Some(token),
+        token_hash: None,
         enabled,
         online: false,
         registered_at: None,

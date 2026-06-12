@@ -225,7 +225,16 @@ pub struct Tun {
     /// The auth credential this tun presents in the WS query string.
     /// `None` until the tun has been seen at least once or an admin
     /// has provisioned the row via the admin API.
+    ///
+    /// V3: this is now the legacy cleartext column. The on-disk
+    /// source of truth is `token_hash` (sha256 hex); this field
+    /// is kept populated for UI display + downgrade safety.
     pub token: Option<String>,
+    /// sha256(token) hex (lowercase, 64 chars). Populated by
+    /// `db::upsert_tun` whenever a token is set. Compared by
+    /// `db::auth_tun` against the sha256 of the inbound bearer.
+    #[serde(default)]
+    pub token_hash: Option<String>,
     pub enabled: bool,
     pub online: bool,
     pub registered_at: Option<DateTime<Utc>>,

@@ -1,0 +1,31 @@
+-- V3: hash `tun.token` with sha256.
+--
+-- v2 stored the auth token as plaintext in the `tun` table — fine for
+-- dev / single-tenant, but a DB dump or backup would leak every tun's
+-- credential in the clear. Issue #39 promotes the on-disk form to
+-- `sha256(token)` hex (lowercase, 64 chars).
+--
+-- This migration:
+--   1. Adds `token_hash TEXT` to `tun`. Nullable for the duration of
+--      backfill so existing rows can be populated in place without a
+--      temporary table.
+--   2. Backfills: every existing row's `token` is hashed in place. Empty
+--      tokens (the v2 default for never-used rows) become empty hashes.
+--   3. Leaves the legacy `token` column in place but unused. New writes
+--      go through `tun_hash` and the `tun` table is no longer the
+--      source of truth for the cleartext credential.
+--
+-- After commit 1 the WS server compares the Authorization header's
+-- bearer token against `token_hash` (sha256 hex) instead of the cleartext
+-- column. The legacy `token` column is dropped in a future V4 once
+-- we're confident no operator is still reading it.
+--
+-- The sqlite session has no built-in sha256, so we compute the hash in
+-- application code (db.rs::backfill_tun_token_hashes) and update via
+-- parameterized SQL.
+
+ALTER TABLE tun ADD COLUMN token_hash TEXT;
+
+-- Backfill is done in db.rs at migration time. We add the column here
+-- so refinery records V3 as applied; the actual UPDATE runs once
+-- `db::migrate` finishes and `db::backfill_tun_token_hashes` is called.

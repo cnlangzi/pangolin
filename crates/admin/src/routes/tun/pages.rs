@@ -104,6 +104,7 @@ pub(super) fn render_edit_page_with_error(
     let stub = pangolin_core::types::Tun {
         name: name.to_string(),
         token: None,
+        token_hash: None,
         enabled: true,
         online: false,
         registered_at: None,

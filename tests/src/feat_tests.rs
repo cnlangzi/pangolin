@@ -131,6 +131,7 @@ fn tun_online_offline_db() {
     let tun = Tun {
         name: "office".into(),
         token: None,
+        token_hash: None,
         enabled: true,
         online: false,
         registered_at: None,

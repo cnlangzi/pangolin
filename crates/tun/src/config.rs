@@ -36,8 +36,38 @@ pub struct TunConfig {
     /// proxied domains to a specific tun.
     pub name: String,
 
+    /// TLS settings for the WS connection to ngx. When `tls` is
+    /// absent or empty, the tun speaks plaintext `ws://` to the
+    /// server. When populated, the tun dials `wss://` and validates
+    /// (or skips validation of) the server certificate.
+    ///
+    /// Added in issue #39 (commit 0): schema extension only; the
+    /// TLS dial path is wired up in commit 1.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
     #[serde(default)]
     pub log: LogConfig,
+}
+
+/// TLS client config for the tun → ngx WebSocket connection.
+///
+/// `verify = false` accepts any server certificate (dev / staging
+/// against a self-signed ngx). `verify = true` validates against
+/// either `ca_file` (PEM bundle) or the system trust store when
+/// `ca_file` is `None`. Production deploys SHOULD set `verify = true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    /// Verify server certificate against `ca_file` (or the system
+    /// trust store when `ca_file` is `None`). Default `false` to
+    /// preserve the dev-friendly "accept anything" stance of the
+    /// pre-TLS build; operators MUST flip this on for production.
+    #[serde(default)]
+    pub verify: bool,
+    /// Optional path to a PEM-encoded CA bundle used to validate
+    /// the ngx server certificate. `None` = use system roots.
+    #[serde(default)]
+    pub ca_file: Option<String>,
 }
 
 impl TunConfig {
@@ -154,6 +184,51 @@ mod tests {
         assert_eq!(c.name, "home");
         assert_eq!(c.log.level, "debug");
         assert_eq!(c.log.file, "/var/log/pangolin-tun.log");
+    }
+
+    #[test]
+    fn tls_section_optional_and_defaults_to_plaintext() {
+        // Commit 0 schema extension: `tls` is optional. Without it,
+        // the tun speaks plaintext ws://.
+        let s = r#"
+            server: gateway.example.com:9001
+            token: t
+            name: home
+        "#;
+        let c = TunConfig::from_str(s).unwrap();
+        assert!(c.tls.is_none(), "no tls: tun should use plaintext ws://");
+    }
+
+    #[test]
+    fn tls_section_parses_with_verify_and_ca_file() {
+        let s = r#"
+            server: gateway.example.com:9443
+            token: t
+            name: home
+            tls:
+              verify: true
+              ca_file: /etc/pangolin/ca.pem
+        "#;
+        let c = TunConfig::from_str(s).unwrap();
+        let tls = c.tls.expect("tls section must parse when present");
+        assert!(tls.verify);
+        assert_eq!(tls.ca_file.as_deref(), Some("/etc/pangolin/ca.pem"));
+    }
+
+    #[test]
+    fn tls_section_parses_with_verify_false_no_ca_file() {
+        // `verify: false` is the dev-mode "accept any cert" stance.
+        let s = r#"
+            server: gateway.example.com:9443
+            token: t
+            name: home
+            tls:
+              verify: false
+        "#;
+        let c = TunConfig::from_str(s).unwrap();
+        let tls = c.tls.unwrap();
+        assert!(!tls.verify);
+        assert!(tls.ca_file.is_none());
     }
 
     #[test]
