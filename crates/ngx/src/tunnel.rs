@@ -314,7 +314,7 @@ async fn handle_tun_ws(
     // Also periodically clean up expired pending entries (120s > 60s ngx timeout)
     let pending_read = pending.clone();
     let mut cleanup_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-    while let Some(_msg) = ws_read.next().await {
+    loop {
         tokio::select! {
             _ = cleanup_ticker.tick() => {
                 // Clean up pending entries older than 120s
@@ -324,7 +324,7 @@ async fn handle_tun_ws(
                     now.duration_since(*inserted).as_secs() < 120
                 });
             }
-            msg = futures_util::StreamExt::next(&mut ws_read) => {
+            msg = ws_read.next() => {
                 match msg {
                     Some(Ok(tungstenite::Message::Binary(buf))) => {
                         // Try decompress raw DEFLATE, fallback to raw if not compressed

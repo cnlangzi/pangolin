@@ -1,0 +1,198 @@
+{# views/dns/_form_fields.html — DNS provider form internal fields. #}
+{# Stateless fragment: included by pages/dns/new.html and pages/dns/edit.html. #}
+{# Requires parent context fields: is_edit, error, cf_token_set, aliyun_ak_secret_set, tencent_secret_key_set #}
+{# plus helper methods: name_value, is_kind, enabled_checked, aliyun_ak_id_value, aliyun_region_value, tencent_secret_id_value #}
+{# The "kind" is selected from one of cloudflare / aliyun / tencent. #}
+
+    <div role="note" class="flex items-start gap-3 rounded-lg border-l-4 border-amber-500 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3-1.5-3-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <span><strong>Credentials are stored in plaintext</strong> in the <code class="font-mono text-xs">dns_providers.config</code> column. Restrict database access at the OS level.</span>
+    </div>
+
+    {% if let Some(e) = error %}
+    <div role="alert" class="flex items-start gap-3 rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-900 dark:text-red-100">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3-1.5-3-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <span>{{ e }}</span>
+    </div>
+    {% endif %}
+
+    <section class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-6 space-y-5">
+      <h2 class="text-sm font-semibold text-slate-900 dark:text-slate-100">① Basic</h2>
+
+      <div>
+        <label for="name" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Name (id)</label>
+        <input id="name" name="name" type="text" required pattern="[a-z0-9_-]+" maxlength="64"
+          value="{{ self.name_value() }}"
+          {% if is_edit %}readonly{% endif %}
+          placeholder="main-cf"
+          class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10 disabled:bg-slate-50 disabled:text-slate-500 read-only:bg-slate-50 read-only:text-slate-500">
+        <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-400">Lowercase letters, digits, _, -. Used in <code class="font-mono text-[0.7rem] bg-slate-100 dark:bg-slate-700 px-1 rounded">domains.dns_provider</code>.</p>
+      </div>
+
+      <div>
+        <span class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Provider</span>
+        <div role="radiogroup" aria-label="DNS provider kind" class="grid grid-cols-1 sm:grid-cols-3 gap-3" data-kind-group>
+          <label class="cursor-pointer">
+            <input type="radio" name="kind" value="cloudflare" class="sr-only peer" {% if self.is_kind("cloudflare") %}checked{% endif %} {% if is_edit %}disabled{% endif %} data-kind-radio>
+            <div class="rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 transition-colors hover:border-slate-300 dark:hover:border-slate-600 peer-checked:border-accent-500 peer-checked:bg-accent-50 dark:peer-checked:bg-accent-500/10 peer-disabled:opacity-50 peer-disabled:cursor-not-allowed peer-focus-visible:ring-2 peer-focus-visible:ring-accent-500 peer-focus-visible:ring-offset-2">
+              <div class="text-2xl">☁</div>
+              <div class="mt-2 font-semibold text-slate-900 dark:text-slate-100">Cloudflare</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400">API token</div>
+            </div>
+          </label>
+          <label class="cursor-pointer">
+            <input type="radio" name="kind" value="aliyun" class="sr-only peer" {% if self.is_kind("aliyun") %}checked{% endif %} {% if is_edit %}disabled{% endif %} data-kind-radio>
+            <div class="rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 transition-colors hover:border-slate-300 dark:hover:border-slate-600 peer-checked:border-accent-500 peer-checked:bg-accent-50 dark:peer-checked:bg-accent-500/10 peer-disabled:opacity-50 peer-disabled:cursor-not-allowed peer-focus-visible:ring-2 peer-focus-visible:ring-accent-500 peer-focus-visible:ring-offset-2">
+              <div class="text-2xl font-bold text-orange-500">阿</div>
+              <div class="mt-2 font-semibold text-slate-900 dark:text-slate-100">Aliyun DNS</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400">AK / SK + region</div>
+            </div>
+          </label>
+          <label class="cursor-pointer">
+            <input type="radio" name="kind" value="tencent" class="sr-only peer" {% if self.is_kind("tencent") %}checked{% endif %} {% if is_edit %}disabled{% endif %} data-kind-radio>
+            <div class="rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 transition-colors hover:border-slate-300 dark:hover:border-slate-600 peer-checked:border-accent-500 peer-checked:bg-accent-50 dark:peer-checked:bg-accent-500/10 peer-disabled:opacity-50 peer-disabled:cursor-not-allowed peer-focus-visible:ring-2 peer-focus-visible:ring-accent-500 peer-focus-visible:ring-offset-2">
+              <div class="text-2xl font-bold text-blue-500">腾</div>
+              <div class="mt-2 font-semibold text-slate-900 dark:text-slate-100">Tencent DNSPod</div>
+              <div class="text-xs text-slate-500 dark:text-slate-400">Secret ID / Key</div>
+            </div>
+          </label>
+        </div>
+        <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-400">Cannot be changed after creation.</p>
+      </div>
+
+      <label class="flex items-center gap-2">
+        <input type="checkbox" name="enabled" value="1" {% if self.enabled_checked() %}checked{% endif %} class="h-4 w-4 rounded border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <span class="text-sm text-slate-700 dark:text-slate-200">Enabled — active in the issuance pipeline</span>
+      </label>
+    </section>
+
+    <section class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-6 space-y-5">
+      <h2 class="text-sm font-semibold text-slate-900 dark:text-slate-100">② Credentials</h2>
+
+      <div data-kind-panel="cloudflare" class="space-y-4">
+        <div>
+          <label for="api_token" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">
+            API Token
+            <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener" class="ml-2 text-xs font-normal text-accent-600 dark:text-accent-400 hover:underline">How to get ↗</a>
+          </label>
+          {% if is_edit && cf_token_set %}
+          <div data-secret-mask>
+            <div data-mask-view class="flex items-center justify-between rounded-lg border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900 px-3 py-2.5">
+              <code class="font-mono text-sm text-slate-500 dark:text-slate-400">••••••••••••</code>
+              <button type="button" data-show-replace class="text-sm text-accent-600 dark:text-accent-400 hover:underline">Replace</button>
+            </div>
+            <div data-replace-view class="hidden">
+              <div class="relative">
+                <input id="api_token" name="api_token" type="password" autocomplete="off" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+                <button type="button" data-toggle-password="api_token" aria-label="Show or hide token" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+                  <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                </button>
+              </div>
+              <button type="button" data-show-mask class="mt-1 text-xs text-slate-500 hover:underline">Cancel</button>
+            </div>
+          </div>
+          {% else %}
+          <div class="relative">
+            <input id="api_token" name="api_token" type="password" autocomplete="off" required placeholder="••••••••" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+            <button type="button" data-toggle-password="api_token" aria-label="Show or hide token" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+              <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </button>
+          </div>
+          {% endif %}
+          <p class="mt-1.5 text-xs text-slate-500 dark:text-slate-400">Required permission: <code class="font-mono">Zone &gt; DNS: Edit</code></p>
+        </div>
+      </div>
+
+      <div data-kind-panel="aliyun" class="space-y-4 hidden">
+        <div>
+          <label for="access_key_id" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">
+            Access Key ID
+            <a href="https://ram.console.aliyun.com/manage/ak" target="_blank" rel="noopener" class="ml-2 text-xs font-normal text-accent-600 dark:text-accent-400 hover:underline">How to get ↗</a>
+          </label>
+          <input id="access_key_id" name="access_key_id" type="text" required value="{{ self.aliyun_ak_id_value() }}" placeholder="LTAI..." class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+        </div>
+        <div>
+          <label for="access_key_secret" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Access Key Secret</label>
+          {% if is_edit && aliyun_ak_secret_set %}
+          <div data-secret-mask>
+            <div data-mask-view class="flex items-center justify-between rounded-lg border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900 px-3 py-2.5">
+              <code class="font-mono text-sm text-slate-500 dark:text-slate-400">••••••••••••</code>
+              <button type="button" data-show-replace class="text-sm text-accent-600 dark:text-accent-400 hover:underline">Replace</button>
+            </div>
+            <div data-replace-view class="hidden">
+              <div class="relative">
+                <input id="access_key_secret" name="access_key_secret" type="password" autocomplete="off" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+                <button type="button" data-toggle-password="access_key_secret" aria-label="Show or hide secret" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+                  <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                </button>
+              </div>
+              <button type="button" data-show-mask class="mt-1 text-xs text-slate-500 hover:underline">Cancel</button>
+            </div>
+          </div>
+          {% else %}
+          <div class="relative">
+            <input id="access_key_secret" name="access_key_secret" type="password" autocomplete="off" required placeholder="••••••••" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+            <button type="button" data-toggle-password="access_key_secret" aria-label="Show or hide secret" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+              <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </button>
+          </div>
+          {% endif %}
+        </div>
+        <div>
+          <label for="region" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Region</label>
+          <select id="region" name="region" class="w-full appearance-none rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 text-sm text-slate-900 dark:text-slate-100 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10 cursor-pointer" style="background-image: url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3E%3Cpath stroke='%236B7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='m6 8 4 4 4-4'/%3E%3C/svg%3E&quot;); background-size: 1.25rem; background-position: right 0.75rem center; background-repeat: no-repeat;">
+            <option value="cn-hangzhou" {% if self.aliyun_region_value() == "cn-hangzhou" %}selected{% endif %}>cn-hangzhou (default)</option>
+            <option value="cn-beijing" {% if self.aliyun_region_value() == "cn-beijing" %}selected{% endif %}>cn-beijing</option>
+            <option value="cn-shanghai" {% if self.aliyun_region_value() == "cn-shanghai" %}selected{% endif %}>cn-shanghai</option>
+            <option value="cn-shenzhen" {% if self.aliyun_region_value() == "cn-shenzhen" %}selected{% endif %}>cn-shenzhen</option>
+            <option value="cn-qingdao" {% if self.aliyun_region_value() == "cn-qingdao" %}selected{% endif %}>cn-qingdao</option>
+            <option value="ap-southeast-1" {% if self.aliyun_region_value() == "ap-southeast-1" %}selected{% endif %}>ap-southeast-1 (Singapore)</option>
+            <option value="us-west-1" {% if self.aliyun_region_value() == "us-west-1" %}selected{% endif %}>us-west-1</option>
+          </select>
+        </div>
+      </div>
+
+      <div data-kind-panel="tencent" class="space-y-4 hidden">
+        <div>
+          <label for="secret_id" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">
+            Secret ID
+            <a href="https://console.cloud.tencent.com/cam/capi" target="_blank" rel="noopener" class="ml-2 text-xs font-normal text-accent-600 dark:text-accent-400 hover:underline">How to get ↗</a>
+          </label>
+          <input id="secret_id" name="secret_id" type="text" required value="{{ self.tencent_secret_id_value() }}" placeholder="AKID..." class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+        </div>
+        <div>
+          <label for="secret_key" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Secret Key</label>
+          {% if is_edit && tencent_secret_key_set %}
+          <div data-secret-mask>
+            <div data-mask-view class="flex items-center justify-between rounded-lg border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900 px-3 py-2.5">
+              <code class="font-mono text-sm text-slate-500 dark:text-slate-400">••••••••••••</code>
+              <button type="button" data-show-replace class="text-sm text-accent-600 dark:text-accent-400 hover:underline">Replace</button>
+            </div>
+            <div data-replace-view class="hidden">
+              <div class="relative">
+                <input id="secret_key" name="secret_key" type="password" autocomplete="off" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+                <button type="button" data-toggle-password="secret_key" aria-label="Show or hide key" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+                  <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                </button>
+              </div>
+              <button type="button" data-show-mask class="mt-1 text-xs text-slate-500 hover:underline">Cancel</button>
+            </div>
+          </div>
+          {% else %}
+          <div class="relative">
+            <input id="secret_key" name="secret_key" type="password" autocomplete="off" required placeholder="••••••••" class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 pl-3 pr-10 py-2.5 font-mono text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+            <button type="button" data-toggle-password="secret_key" aria-label="Show or hide key" class="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">
+              <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+            </button>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div id="test-result"></div>
+
+      <button type="button" data-test-connection class="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        Test connection
+      </button>
+    </section>

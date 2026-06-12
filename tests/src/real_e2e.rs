@@ -146,6 +146,186 @@ fn seed_tun_with_token(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Full HTTP request flow through the tunnel.
+///
+/// **This is the regression test for three bugs that the original
+/// `real_e2e_tunnel_full` test missed**:
+///
+/// 1. The tunnel WS read loop in `tunnel.rs` was a `while let` that
+///    consumed every message from the stream, leaving the inner
+///    `select!` to read the *next* (non-existent) message — every
+///    request was silently dropped. Fixed by switching to a flat
+///    `loop { select! { msg = ws_read.next() => ... } }`.
+///
+/// 2. `proxy.rs` was sending a bare `TunnelRequestFrame` (msgpack),
+///    but `tun::client::handle_stream` deserializes into `TunnelFrame`
+///    and matches on the `Req` variant. The two types are NOT
+///    wire-compatible: a serialized `TunnelRequestFrame` is not
+///    decodable as a `TunnelFrame::Req`. Fixed by wrapping the frame
+///    in `TunnelFrame::Req` before serializing.
+///
+/// 3. `proxy.rs` was sending `req.path` as the request line (e.g.
+///    `/foo?bar`). The tun client then built the backend URL by
+///    prepending the `Host` header — so a request to host
+///    `yaitoo.cn` with a `tun local → http://127.0.0.1:9020`
+///    backend ended up at `http://yaitoo.cn/foo?bar` (DNS failure
+///    or wrong-server connection). Fixed by having ngx send the
+///    full backend URL (e.g. `http://127.0.0.1:9020/foo?bar`) in
+///    the `path` field.
+///
+/// This test catches all three by performing a real HTTP request
+/// end-to-end: client → ngx → tun → backend. A regression on any
+/// of the three bugs causes the request to hang/timeout.
+#[tokio::test]
+async fn real_e2e_tunnel_http_request_through_tun() {
+    // Start a real mock HTTP backend that echoes the request method,
+    // path, and Host header. We verify ALL THREE of (method, path,
+    // Host) reach the backend unchanged, so a regression in URL
+    // construction (Bug 3) is immediately visible.
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        // Backend format: `tun_name:url`. The `office` prefix tells
+        // ngx to route through the "office" tun session. The URL is
+        // the real destination — the tun client must use it as the
+        // origin, NOT the Host header (Bug 3 regression check).
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    // Spin up a real `pangolin-tun` binary. It connects to ngx's
+    // tunnel port, performs the WS handshake + auth, and registers
+    // itself in `app.tun_sessions["office"]`. After this returns,
+    // every request to host `office.test` is supposed to flow
+    // through this tun.
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // Make a real HTTP request to the proxy, with a path + query
+    // and a method other than GET to make the assertions stronger.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, body) =
+        raw_request(&addr, "office.test", "POST", "/api/echo?x=1&y=2", b"hello").await;
+
+    // 1) Status must be 200 (not 502, not 504 timeout) — proves
+    //    the request reached the backend and the response came
+    //    back. A timeout here would mean the request was dropped
+    //    (Bug 1) or malformed (Bug 2) on the wire.
+    assert_eq!(
+        status,
+        200,
+        "expected 200 from backend via tunnel, got {status} (body={body:?}). \
+         ngx log:\n{}\ntun log:\n(proxied)",
+        ngx.log_string()
+    );
+
+    // 2) Backend must have actually received the request — proves
+    //    ngx forwarded it through the tun to the configured
+    //    backend, not to some default / wrong host (Bug 3).
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have seen exactly 1 request, saw {}. \
+         If 0, the request never reached the backend (Bug 3 — \
+         wrong URL, or Bug 1/2 — request dropped before sending). \
+         ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+    let req = &seen[0];
+    assert_eq!(req.method, "POST", "method must survive tunnel");
+    assert_eq!(req.path, "/api/echo", "path part must survive tunnel");
+    assert_eq!(
+        req.query, "x=1&y=2",
+        "query string must survive tunnel byte-exact"
+    );
+    assert_eq!(
+        req.body, b"hello",
+        "POST body must reach backend byte-exact through tunnel"
+    );
+    // Host header should be the public host (`office.test`) as
+    // sent by the client — the proxy does NOT rewrite Host to
+    // the backend's authority (it's a transparent forward proxy
+    // for the Host header).
+    let host_header = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        host_header, "office.test",
+        "Host header must pass through tunnel to backend as sent by client"
+    );
+}
+
+/// `file:///` backend reached via the tunnel (not just direct).
+///
+/// Regression test for the static-file path through the tunnel.
+/// With the new `tun::client::proxy_request` accepting `file:///`
+/// URLs (in addition to `http://`/`https://`), a site configured
+/// with `office:file:///tmp/somedir` must be served correctly when
+/// the request goes through the tun.
+///
+/// Verifies:
+///   - The tun decodes the `file:///` URL from the request frame
+///   - It reads the local file and returns 200 with the body
+///   - The body is returned to the client through the response frame
+#[tokio::test]
+async fn real_e2e_tunnel_file_backend() {
+    // Build a temp directory holding a single file we want the
+    // tun to serve. The path passed to seed_site must be the
+    // **absolute** path (file:/// requires absolute).
+    let static_dir = tempfile::Builder::new()
+        .prefix("pangolin-e2e-tunnel-file-")
+        .tempdir()
+        .expect("tempdir for tunnel file backend");
+    let index_path = static_dir.path().join("index.html");
+    std::fs::write(&index_path, "tunnel-served-static-file").expect("write index.html");
+    let backend_url = format!("file://{}", static_dir.path().display());
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(&conn, "file-site", &format!("office:{backend_url}"));
+        seed_domain(&conn, "file.test", "file-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // Use POST with a body so the proxy's `read_body_or_idle`
+    // path completes immediately (the GET-without-body case is a
+    // separate `read_body_or_idle(false)` behavior that's still
+    // being investigated). What we're testing here is the
+    // file:// backend through the tunnel — the body is irrelevant
+    // for that, we just need the path to flow through the tun.
+    let (status, body) = raw_request(&addr, "file.test", "POST", "/index.html", b"x").await;
+    assert_eq!(
+        status,
+        200,
+        "expected 200 for tunnel-served file, got {status} (body={body:?}). \
+         ngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        body.contains("tunnel-served-static-file"),
+        "expected file body, got: {body} (ngx log: {})",
+        ngx.log_string()
+    );
+}
+
 /// `file:///` backend serves a static file. Pre-seeds a `data/static/index.html`
 /// and a site/domain mapping to it, then GETs via the public proxy.
 #[tokio::test]

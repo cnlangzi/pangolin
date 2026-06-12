@@ -1,0 +1,68 @@
+{# login.html — standalone login page (no base.html inheritance) #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — Pangolin</title>
+<link href="/assets/app.css?v=__CSS_HASH__" rel="stylesheet">
+</head>
+<body class="bg-slate-50 dark:bg-slate-950 min-h-screen flex items-center justify-center px-4 antialiased">
+  <div class="w-full max-w-sm">
+    <div class="flex justify-center mb-8">
+      <div class="w-16 h-16 rounded-2xl bg-accent-500 flex items-center justify-center shadow-xl shadow-accent-500/20">
+        <svg class="w-9 h-9 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+          <path d="M2 17l10 5 10-5"/>
+          <path d="M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="text-center mb-8">
+      <h1 class="text-2xl font-bold text-slate-900 dark:text-white">Pangolin</h1>
+      <p class="text-slate-600 dark:text-slate-400 text-sm mt-1">Sign in to your admin panel</p>
+    </div>
+
+    <div class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-6 shadow-sm">
+      <form method="POST" action="/login" class="space-y-5">
+        {% if error != "" %}
+        <div class="flex items-start gap-3 rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-900 dark:text-red-100">
+          <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+          </svg>
+          <span>{{ error }}</span>
+        </div>
+        {% endif %}
+
+        {% if next != "" %}
+        <input type="hidden" name="next" value="{{ next }}">
+        {% endif %}
+
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2" for="username">Username</label>
+          <input type="text" name="username" id="username" required autocomplete="username"
+            placeholder="admin"
+            class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2" for="password">Password</label>
+          <input type="password" name="password" id="password" required autocomplete="current-password"
+            placeholder="••••••••"
+            class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2.5 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-4 focus:ring-accent-500/10">
+        </div>
+
+        <button type="submit" class="inline-flex items-center justify-center w-full gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
+          Sign in
+        </button>
+      </form>
+    </div>
+
+    <p class="text-center text-xs text-slate-500 dark:text-slate-500 mt-8">
+      Pangolin — 内网穿透与反向代理
+    </p>
+  </div>
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.9/dist/htmx.min.js"></script>
+</body>
+</html>

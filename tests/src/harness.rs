@@ -469,6 +469,22 @@ log:
         let mut cmd = Command::new(&bin);
         cmd.arg("--config").arg(&config_path);
         cmd.kill_on_drop(true);
+        // Strip HTTP_PROXY/HTTPS_PROXY/all_proxy/NO_PROXY: the tun's
+        // reqwest client honors them by default, and a user with a
+        // SOCKS/HTTP proxy configured in their shell would otherwise
+        // see tunneled backend requests routed through the proxy
+        // (e.g. `127.0.0.1:1087`), making the test fail with
+        // ECONNREFUSED in environments that look fine on the surface.
+        // The tun is supposed to make DIRECT outbound connections
+        // to the configured backend, exactly as production expects.
+        cmd.env_remove("HTTP_PROXY");
+        cmd.env_remove("HTTPS_PROXY");
+        cmd.env_remove("http_proxy");
+        cmd.env_remove("https_proxy");
+        cmd.env_remove("ALL_PROXY");
+        cmd.env_remove("all_proxy");
+        cmd.env_remove("NO_PROXY");
+        cmd.env_remove("no_proxy");
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
         // Tun's own "connected to ngx" log is the cleanest readiness

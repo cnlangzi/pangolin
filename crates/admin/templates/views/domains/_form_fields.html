@@ -1,0 +1,82 @@
+{# views/domains/_form_fields.html — domain form internal fields. #}
+{# Stateless fragment: included by pages/domains/new.html and pages/domains/edit.html. #}
+{# Requires parent context fields: sites, dns_providers, error, preselected_site, preselected_site_name, dns_provider_value, auto_issue_checked, edit_domain, current_auto_issue #}
+
+    {# Optional redirect target after a successful submit. Used to land the
+       user back on the site_domains page when the form was opened from
+       there. `handle_create` validates this against /* before use. #}
+    <input type="hidden" name="next" value="{{ self.next_redirect() }}">
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-name">Domain name</label>
+      {% if self.lock_domain() %}
+        {# Edit mode: domain is the primary key, render as read-only text + hidden field. #}
+        <div class="flex items-center gap-2">
+          <code class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm font-mono text-slate-700 dark:text-slate-200 flex-1 truncate">{{ self.edit_domain_value() }}</code>
+        </div>
+        <input type="hidden" name="domain" value="{{ self.edit_domain_value() }}">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">The domain name is the primary key and cannot be changed.</p>
+      {% else %}
+        <input type="text" name="domain" id="domain-name" required
+          placeholder="example.com"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      {% endif %}
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-site">Site</label>
+      {% if self.lock_site() %}
+        {# Site is locked when editing, or when invoked from a site-specific
+           sub-page. Render as read-only text + hidden field so the value
+           still gets POSTed. #}
+        <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-700 dark:text-slate-200 font-mono">
+          {{ self.preselected_site_name_value() }}
+        </div>
+        <input type="hidden" name="site_name" value="{{ self.preselected_site_name_value() }}">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Site is fixed for this form.</p>
+      {% else %}
+        <select name="site_name" id="domain-site" required
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <option value="">Select a site...</option>
+          {% for site in sites %}
+          <option value="{{ site.name }}"{% if self.is_site_preselected(site.name) %} selected{% endif %}>{{ site.name }} — {{ site.backend }}</option>
+          {% endfor %}
+        </select>
+      {% endif %}
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-auto-issue">Cert management</label>
+      <label class="inline-flex items-center gap-2">
+        <input type="checkbox" name="auto_issue" value="1" id="domain-auto-issue"
+          {% if auto_issue_checked %}checked{% endif %}
+          class="rounded border-slate-300 text-accent-600 focus:ring-accent-500">
+        <span class="text-sm text-slate-700 dark:text-slate-200">
+          Auto-issue cert via ACME
+          <span class="text-xs text-slate-500 dark:text-slate-400">(uncheck for manual upload; required for wildcard domains)</span>
+        </span>
+      </label>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-dns-provider">DNS provider (DNS-01 challenge)</label>
+      <select name="dns_provider" id="domain-dns-provider"
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <option value="">(none — use HTTP-01)</option>
+        {% for p in dns_providers %}
+        <option value="{{ p.name }}"{% if self.is_dns_provider_selected(p.name) %} selected{% endif %}>{{ p.name }} ({{ p.kind }})</option>
+        {% endfor %}
+      </select>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        Required for wildcard domains. Manage providers under <a href="/dns" class="text-accent-600 dark:text-accent-400 hover:underline">DNS</a>.
+      </p>
+    </div>
+
+    {% if let Some(e) = error %}
+    <div class="alert-error text-sm">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+      </svg>
+      <span>{{ e }}</span>
+    </div>
+    {% endif %}
