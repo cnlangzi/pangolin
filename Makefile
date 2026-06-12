@@ -144,9 +144,9 @@ download-ui-tools:
 # Build admin UI CSS and JS bundles.
 build-ui: download-ui-tools
 	@echo "Building admin UI CSS..."
-	bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify
+	bin/tailwindcss -i ./crates/admin/templates/public/tailwindcss.css -o ./crates/admin/templates/public/app.css --minify
 	@echo "Building admin UI JS bundle..."
-	bin/esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js
+	bin/esbuild ./crates/admin/templates/public/app.js --bundle --minify --format=esm --target=es2020 --outfile=./crates/admin/templates/public/app.min.js
 	@echo "  build-ui done"
 
 build-dist: debian dist

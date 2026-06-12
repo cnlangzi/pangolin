@@ -20,13 +20,13 @@ use std::sync::LazyLock;
 use rust_embed::Embed;
 use sha2::{Digest, Sha256};
 
-/// Snapshot of every file in the workspace `assets/` directory.
+/// Snapshot of every file in the `crates/admin/templates/public/` directory.
 ///
 /// - **Release**: bytes are embedded into the binary.
 /// - **Debug** (`debug-embed`): `Asset::get()` reads from the filesystem at
 ///   runtime, so `make build-ui` takes effect on the next process restart.
 #[derive(Embed)]
-#[folder = "../../assets/"]
+#[folder = "templates/public/"]
 pub struct Asset;
 
 /// Active JS bundle filename, selected from `PANGOLIN_ADMIN_JS` at startup.

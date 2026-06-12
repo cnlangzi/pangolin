@@ -1,5 +1,4 @@
 {# login.html — standalone login page (no base.html inheritance) #}
-{# Note: Datastar remains the only exception; it does not consume assets/app.js. #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7,7 +6,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sign in — Pangolin</title>
 <link href="/assets/app.css?v=__CSS_HASH__" rel="stylesheet">
-<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"></script>
 </head>
 <body class="bg-slate-50 dark:bg-slate-950 min-h-screen flex items-center justify-center px-4 antialiased">
   <div class="w-full max-w-sm">
@@ -65,5 +63,6 @@
       Pangolin — 内网穿透与反向代理
     </p>
   </div>
+<script src="https://unpkg.com/htmx.org@2.0.9"></script>
 </body>
 </html>

@@ -46,6 +46,18 @@ pub async fn handle(
     _body: Bytes,
     merged_params: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
+    // ── Static assets: serve immediately without auth ──────────────
+    // Static resources (CSS, JS, images) are served directly from the
+    // embedded public/ directory without requiring authentication.
+    // This prevents 302 redirects to /login for asset requests.
+    let trimmed_path = path.trim_start_matches('/');
+    if trimmed_path.starts_with("assets/") {
+        return Ok(match serve_static_asset(trimmed_path) {
+            Some(resp) => resp,
+            None => not_found(),
+        });
+    }
+
     // ── Auth check ──────────────────────────────────────────────────
     let parsed_cookie = cookie_header.and_then(state::parse_session_cookie);
     let session_token = match parsed_cookie {
@@ -53,12 +65,8 @@ pub async fn handle(
         _ => None,
     };
 
-    // Only the login page is publicly accessible. Everything else (UI,
-    // /api, /assets) requires a session. (The only exception is static
-    // assets, but those don't need to be behind auth at the moment —
-    // they're cosmetic; the auth check above is fine to apply to them
-    // because real browsers load them with the session cookie attached
-    // automatically.)
+    // Only the login page is publicly accessible. Everything else (UI, /api)
+    // requires a session.
     let is_auth_page = path == "/login" || path == "/login/";
 
     if session_token.is_none() && !is_auth_page {
@@ -120,17 +128,6 @@ pub async fn handle(
     };
 
     let res: Response<Full<Bytes>> = match (path, method) {
-        // ── /assets/... : static resources (no auth needed; the
-        // auth check above already gated everything) ───────────────
-        (p, _) if p.starts_with("assets/") => {
-            // Serve from embedded assets at compile time.
-            // Falling through to 404 if not found.
-            match serve_static_asset(p) {
-                Some(resp) => resp,
-                None => not_found(),
-            }
-        }
-
         // ── /api/... : HTMX HTML fragments ─────────────────────────
         // The brief splits /api/site/{name}/domains (GET) and
         // /api/domains/{domain} (DELETE). Both are HTMX endpoints that
