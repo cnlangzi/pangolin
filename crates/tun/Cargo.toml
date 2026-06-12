@@ -16,7 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio.workspace = true
-tokio-tungstenite.workspace = true
+fastwebsockets.workspace = true
+tokio-yamux.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -28,10 +31,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 chrono.workspace = true
-reqwest = { version = "0.13.4", features = ["json"] }
-rmp-serde.workspace = true
-pangolin-core = { version = "0.2.0", path = "../pangolin-core", features = ["rt"] }
-flate2.workspace = true
+pangolin-core = { version = "0.2.0", path = "../pangolin-core" }
 http = "1.4.1"
 url = "2.5.8"
 mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }

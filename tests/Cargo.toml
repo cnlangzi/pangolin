@@ -26,7 +26,6 @@ scraper = "0.20"
 
 # Async / ws
 futures-util = "0.3"
-tokio-tungstenite = "0.29"
 
 # Crypto provider init + time
 ctor = "0.1"
@@ -39,6 +38,7 @@ serde_json = "1"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+sha2 = "0.10"
 
 # WebSocket (for Sec-WebSocket-Accept in tests)
 sha1 = "0.10"

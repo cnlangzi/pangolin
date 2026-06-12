@@ -134,10 +134,19 @@ fn seed_tun_with_token(
     expires_at: Option<&str>,
 ) {
     let now = Utc::now().to_rfc3339();
+    // V3 (issue #39): `tun.token` is no longer the comparison
+    // value — `tun.token_hash = sha256(token)` is. The WS server
+    // hashes the inbound bearer and matches against the hash.
+    // Compute it here so the test exercises the same path as
+    // production.
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    let hash = format!("{:x}", h.finalize());
     conn.execute(
-        "INSERT INTO tun (name, token, enabled, online, registered_at, last_seen_at, expires_at)
-         VALUES (?1, ?2, ?3, 0, ?4, ?4, ?5)",
-        rusqlite::params![name, token, enabled as i32, now, expires_at],
+        "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?6)",
+        rusqlite::params![name, token, hash, enabled as i32, now, expires_at],
     )
     .expect("insert tun");
 }
@@ -209,8 +218,6 @@ async fn real_e2e_tunnel_http_request_through_tun() {
     // through this tun.
     let _tun = TunProcess::start(&ngx, "office", "test-token").await;
 
-    // Make a real HTTP request to the proxy, with a path + query
-    // and a method other than GET to make the assertions stronger.
     let addr = format!("127.0.0.1:{}", ngx.http_port);
     let (status, body) =
         raw_request(&addr, "office.test", "POST", "/api/echo?x=1&y=2", b"hello").await;

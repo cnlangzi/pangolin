@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 
 [dependencies]
-pangolin-core = { path = "../pangolin-core", features = ["rt"] }
+pangolin-core = { path = "../pangolin-core" }
 askama = "0.12"
 serde = { workspace = true }
 tokio.workspace = true

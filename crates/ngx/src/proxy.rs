@@ -3,11 +3,18 @@
 //! `AppProxy` implements `ProxyHttp` and handles domain-routed proxying.
 //! `request_filter` short-circuits for admin API / tunnel routes.
 //! Otherwise falls through to `upstream_peer` for direct backends.
+//!
+//! ## Tunnel path (issue #39)
+//!
+//! HTTP requests are forwarded to the live tun as one yamux
+//! stream per request, carrying raw HTTP/1.1 bytes. The
+//! stream is tagged with `0x01` so the tun side knows it's
+//! HTTP. WS connections get a separate stream tagged with
+//! `0x02`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use log::{debug, error, info, warn};
@@ -15,22 +22,18 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
-use sha1::Digest;
-use sha1::Sha1;
+use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
-use tokio_tungstenite::tungstenite::protocol::Role;
 
-use crate::{App, TunnelMessage};
+use pangolin_core::tunnel::{
+    compute_ws_accept, encode_http_request, pump_ws_relay, read_http_response,
+    strip_hop_by_hop_headers, HttpRequest,
+};
 
-/// RFC 6454 Sec-WebSocket-Accept computation.
-/// Takes the Sec-WebSocket-Key value and returns the correct Accept response.
-fn compute_ws_accept(key: &str) -> Option<String> {
-    const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let mut sha = Sha1::new();
-    sha.update(format!("{}{}", key.trim(), MAGIC).as_bytes());
-    let hash = sha.finalize();
-    Some(base64::engine::general_purpose::STANDARD.encode(hash))
-}
+use crate::App;
+
+const TAG_HTTP: u8 = 0x01;
+const TAG_WS: u8 = 0x02;
 
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
@@ -43,32 +46,16 @@ impl ProxyHttp for AppProxy {
 
     fn new_ctx(&self) -> Self::CTX {}
 
-    /// Request filter — short-circuit for tunnel WebSocket routes only.
-    ///
-    /// The proxy is **transparent** with respect to the request URI:
-    /// whatever `Host` maps to which `Site` (per the domains table)
-    /// gets the request, including any path the upstream serves
-    /// under `/api/...`.  The admin API lives on a *separate* HTTP
-    /// server bound to a different port (see `HttpServer` /
-    /// `handle_api_http`); the proxy port must never short-circuit
-    /// `/api/*` paths, or any backend whose public surface also
-    /// lives under `/api/` (e.g. frtpilot's
-    /// `POST /api/channels/weixin/qr/start`) would 404 through the
-    /// proxy while returning 200 directly.
-    ///
-    /// Returns `Ok(true)` if we handled the response locally (no upstream proxy).
-    /// Returns `Ok(false)` to continue to `upstream_peer`.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
-
-        // WebSocket upgrade detection: check Upgrade header
         let is_ws_upgrade = session.is_upgrade_req();
+        log::debug!(
+            "PROXY: request_filter path={} is_ws_upgrade={}",
+            path,
+            is_ws_upgrade
+        );
 
-        // WebSocket upgrade detected — determine routing and handle accordingly.
-        // Direct WS: return Ok(false) and let pingora's proxy_to_h1_upstream handle 101 upgrade.
-        // Tunnel WS: write 101, extract stream, relay through tunnel msgpack channel.
         if is_ws_upgrade && path == self.app.ws_path {
-            // Determine if this is a tunnel WS (host has tun_name) or direct WS.
             let host = session
                 .get_header("Host")
                 .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
@@ -87,196 +74,81 @@ impl ProxyHttp for AppProxy {
             drop(indexes);
 
             if !tun_name.is_empty() {
-                // Tunnel WS: relay through existing tun session.
-                // 1. Write 101 Switching Protocols to client.
-                // 2. Extract stream via into_inner().
-                // 3. Send WsStart to tun, relay frames bidirectionally.
-                // 4. Send WsEnd when done.
+                // Tunnel WS: write 101, then run a half-close
+                // byte pump between the H1 client stream and a
+                // yamux stream over to the tun.
                 info!("Tunnel WS relay: {} → tun {}", host, tun_name);
                 let mut hdr = ResponseHeader::build(101, None).unwrap();
-                hdr.insert_header("Upgrade", "websocket").unwrap();
-                hdr.insert_header("Connection", "Upgrade").unwrap();
-                // Compute Sec-WebSocket-Accept per RFC 6454
+                hdr.insert_header("Upgrade", "websocket").ok();
+                hdr.insert_header("Connection", "Upgrade").ok();
                 if let Some(sec_key) = session.get_header("Sec-WebSocket-Key") {
                     if let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes()) {
-                        if let Some(accept) = compute_ws_accept(key_str) {
-                            hdr.insert_header("Sec-WebSocket-Accept", accept.as_bytes())
-                                .ok();
-                        }
+                        let accept = compute_ws_accept(key_str);
+                        hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
                     }
                 }
                 if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol") {
                     if let Ok(v) = std::str::from_utf8(protocols.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Protocol", v.as_bytes())
-                            .ok();
+                        hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
                     }
                 }
                 if let Some(version) = session.get_header("Sec-WebSocket-Version") {
                     if let Ok(v) = std::str::from_utf8(version.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Version", v.as_bytes())
-                            .ok();
+                        hdr.insert_header("Sec-WebSocket-Version", v).ok();
                     }
                 }
                 session.write_response_header(Box::new(hdr), false).await?;
 
-                // Extract stream using take_stream() from our patched pingora fork.
-                // This takes &mut self (not ownership), making it safe for request_filter use.
-                // After this, the session is inert — we return Ok(true) immediately,
-                // so pingora's finish() sees an empty stream and handles it safely.
                 let stream = {
                     let h1 = session.as_http1_mut().expect("not HTTP/1 session");
                     h1.take_stream()
                 };
 
-                // Get or check tunnel sender.
-                let sender = {
+                let tunnel = {
                     let sessions = self.app.tun_sessions.read().await;
                     sessions.get(&tun_name).cloned()
                 };
-                let Some(sender) = sender else {
+                let Some(tunnel) = tunnel else {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
 
-                // Spawn bidirectional relay task.
-                // We cannot capture session across await (Session is !Send), but we extracted
-                // the stream before the await, so this is safe: stream is owned by 'static task.
-                let rid = format!(
-                    "ws-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                );
+                // Open a new yamux stream tagged for WS relay.
+                // Send a length-prefixed URL (the request path
+                // the client used) so the tun knows where to
+                // connect.
+                let mut yamux_stream = match tunnel.open_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("open yamux stream for WS relay: {}", e);
+                        return Ok(true);
+                    }
+                };
+                // Tag + URL.
+                let url_field = format!("/{}", path);
+                let url_bytes = url_field.as_bytes();
+                let len = url_bytes.len() as u16;
+                if let Err(e) = async {
+                    yamux_stream.write_u8(TAG_WS).await?;
+                    yamux_stream.write_all(&len.to_be_bytes()).await?;
+                    yamux_stream.write_all(url_bytes).await?;
+                    yamux_stream.flush().await?;
+                    Ok::<(), std::io::Error>(())
+                }
+                .await
+                {
+                    warn!("failed to write WS relay tag/url: {}", e);
+                    return Ok(true);
+                }
+
+                // Spawn a task that does the half-close byte
+                // pump. After this, both `stream` and the
+                // yamux stream's other end are moved into the
+                // task.
                 tokio::spawn(async move {
-                    use futures_util::{SinkExt, StreamExt};
-                    use tokio_tungstenite::{connect_async, WebSocketStream};
-
-                    use tokio_tungstenite::tungstenite::Message;
-
-                    // Establish connection to backend through tunnel.
-                    // First, send WsStart to tunnel via existing msgpack channel.
-                    let (resp_tx, resp_rx) =
-                        tokio::sync::oneshot::channel::<pangolin_core::TunnelResponseFrame>();
-                    let ws_start_frame = pangolin_core::TunnelFrame::WsStart {
-                        rid: rid.clone(),
-                        path: path.clone(),
-                    };
-                    let start_body =
-                        pangolin_core::serialize_msgpack(&ws_start_frame).unwrap_or_default();
-                    let msg = TunnelMessage {
-                        rid: rid.clone(),
-                        body: start_body,
-                        resp_tx,
-                    };
-                    if sender.send(msg).await.is_err() {
-                        return;
-                    }
-                    // Wait for tunnel to establish backend connection.
-                    let backend_addr = match resp_rx.await {
-                        Ok(resp) if resp.status == 101 => {
-                            // resp.body contains "host:port" of backend
-                            String::from_utf8_lossy(&resp.body).to_string()
-                        }
-                        Ok(resp) => {
-                            error!("tunnel WS start failed: status {}", resp.status);
-                            return;
-                        }
-                        Err(_) => {
-                            error!("tunnel WS start: no response");
-                            return;
-                        }
-                    };
-
-                    // Connect to backend WebSocket (URL now includes ws:// or wss:// scheme).
-                    let (ws_outbound, _) = match connect_async(&backend_addr).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("WS connect to backend {} failed: {}", backend_addr, e);
-                            return;
-                        }
-                    };
-
-                    // Wrap our stream in a tokio_tungstenite WebSocketStream.
-                    let (client_ws_sender, mut client_ws_read) = {
-                        let ws_stream =
-                            WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
-                        ws_stream.split()
-                    };
-
-                    // Bidirectional relay: client ↔ backend.
-                    let (mut out_sender, mut out_read) = ws_outbound.split();
-                    let mut client_sender = client_ws_sender;
-
-                    loop {
-                        tokio::select! {
-                            // Client → Backend
-                            msg = client_ws_read.next() => {
-                                match msg {
-                                    Some(Ok(Message::Binary(data))) => {
-                                        // Forward raw WS frame to backend (no msgpack wrapping).
-                                        if out_sender.send(Message::Binary(data)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Some(Ok(Message::Text(data))) => {
-                                        if out_sender.send(Message::Text(data)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Some(Ok(Message::Close(_))) | None => {
-                                        let _ = out_sender.send(Message::Close(None)).await;
-                                        break;
-                                    }
-                                    Some(Ok(Message::Ping(d))) => {
-                                        if out_sender.send(Message::Pong(d)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-                                    Some(Err(e)) => {
-                                        error!("client WS read error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            // Backend → Client
-                            msg = out_read.next() => {
-                                match msg {
-                                    Some(Ok(Message::Binary(data))) => {
-                                        // Forward raw WS frame to client (no msgpack parsing).
-                                        let _ = client_sender.send(Message::Binary(data)).await;
-                                    }
-                                    Some(Ok(Message::Text(t))) => {
-                                        let _ = client_sender.send(Message::Text(t)).await;
-                                    }
-                                    Some(Ok(Message::Close(_))) | None => {
-                                        let _ = client_sender.send(Message::Close(None)).await;
-                                        break;
-                                    }
-                                    Some(Ok(Message::Ping(d))) => {
-                                        let _ = client_sender.send(Message::Pong(d)).await;
-                                    }
-                                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-                                    Some(Err(e)) => {
-                                        error!("backend WS read error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Send WsEnd to tunnel.
-                    let ws_end = pangolin_core::TunnelFrame::WsEnd { rid };
-                    let end_body = pangolin_core::serialize_msgpack(&ws_end).unwrap_or_default();
-                    let _ = sender
-                        .send(TunnelMessage {
-                            rid: "ws-end".into(),
-                            body: end_body,
-                            resp_tx: tokio::sync::oneshot::channel().0,
-                        })
-                        .await;
+                    // The yamux StreamHandle implements
+                    // AsyncRead+AsyncWrite.
+                    let _ = pump_ws_relay(stream, yamux_stream, "ngx", "tun").await;
                 });
 
                 return Ok(true);
@@ -285,11 +157,7 @@ impl ProxyHttp for AppProxy {
             return Ok(false);
         }
 
-        // Look up site by Host header. HTTP/2 clients don't send
-        // `Host` — the equivalent is the `:authority` pseudo-header,
-        // which pingora exposes via the request URI's `authority`
-        // field. Fall back to it when `Host` is absent so H2
-        // clients (browsers, modern curl) route correctly.
+        // Look up site by Host header.
         let host = host_from_session(session);
 
         let indexes = self.app.indexes.read().await;
@@ -314,47 +182,18 @@ impl ProxyHttp for AppProxy {
             }
         };
 
-        // Tunnel path: forward request to the live tun session
+        // Tunnel path: open a yamux stream, write the raw
+        // HTTP/1.1 request, read the raw response, write it
+        // back to the client.
         if !tun_name.is_empty() {
-            let sender = {
+            let tunnel = {
                 let sessions = self.app.tun_sessions.read().await;
                 sessions.get(&tun_name).cloned()
             };
-            if let Some(sender) = sender {
+            if let Some(tunnel) = tunnel {
                 debug!("Tunnel routing: {} → tun {}", host, tun_name);
-                let rid = format!(
-                    "req-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                );
-
-                // Build full request frame with all headers and body.
-                let body_bytes = {
-                    match session.read_body_or_idle(false).await {
-                        Ok(Some(data)) => data.to_vec(),
-                        Ok(None) => Vec::new(),
-                        Err(e) => {
-                            error!("failed to read request body: {}", e);
-                            let _ = session.respond_error(400).await;
-                            return Ok(true);
-                        }
-                    }
-                };
-
-                let req_header = session.req_header();
-                let method = req_header.method.as_str().to_string();
-                let mut headers: Vec<(String, String)> = Vec::new();
-                for (k, v) in &req_header.headers {
-                    headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
-                }
-
-                // Build the full backend URL so the tun client knows where to
-                // proxy: strip trailing slash from url then append the request
-                // path+query.  e.g. backend="http://127.0.0.1:9020" + req="/foo?bar"
-                // → "http://127.0.0.1:9020/foo?bar"
-                let req_path = req_header.uri.to_string();
+                let method = session.req_header().method.as_str().to_string();
+                let req_path = session.req_header().uri.to_string();
                 let full_url = format!(
                     "{}{}",
                     url.trim_end_matches('/'),
@@ -365,51 +204,67 @@ impl ProxyHttp for AppProxy {
                     }
                 );
 
-                let req_frame = pangolin_core::TunnelRequestFrame {
-                    rid: rid.clone(),
-                    method: method.clone(),
-                    path: full_url,
-                    headers,
-                    body: body_bytes,
-                };
-
-                // Wrap in TunnelFrame::Req before serializing
-                let tunnel_frame = pangolin_core::TunnelFrame::Req(req_frame);
-
-                let buf = match pangolin_core::serialize_msgpack(&tunnel_frame) {
-                    Ok(b) => b,
+                // Read body first.
+                let body_bytes = match session.read_body_or_idle(false).await {
+                    Ok(Some(data)) => data.to_vec(),
+                    Ok(None) => Vec::new(),
                     Err(e) => {
-                        error!("failed to serialize request: {}", e);
-                        let _ = session.respond_error(500).await;
+                        error!("failed to read request body: {}", e);
+                        let _ = session.respond_error(400).await;
                         return Ok(true);
                     }
                 };
 
-                // Create oneshot channel to receive response
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                // Build the HTTP/1.1 request bytes.
+                let mut headers: Vec<(String, String)> = Vec::new();
+                for (k, v) in &session.req_header().headers {
+                    headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
+                }
+                // Strip RFC 7230 §6.1 hop-by-op headers before
+                // re-serialising to the backend.
+                strip_hop_by_hop_headers(&mut headers);
 
-                let msg = TunnelMessage {
-                    rid: rid.clone(),
-                    body: buf,
-                    resp_tx,
+                let req = HttpRequest {
+                    method: method.clone(),
+                    target: full_url,
+                    version: "HTTP/1.1".to_string(),
+                    headers,
+                    body: body_bytes,
                 };
+                let req_bytes = encode_http_request(&req);
 
-                // Send request and wait for response (with timeout)
-                let response = async {
-                    sender.send(msg).await.map_err(|_| "tun disconnected")?;
-                    resp_rx.await.map_err(|_| "response channel closed")
+                // Open a new yamux stream tagged for HTTP.
+                let mut yamux_stream = match tunnel.open_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("open yamux stream for HTTP: {}", e);
+                        let _ = session.respond_error(503).await;
+                        return Ok(true);
+                    }
                 };
+                if let Err(e) = async {
+                    yamux_stream.write_u8(TAG_HTTP).await?;
+                    yamux_stream.write_all(&req_bytes).await?;
+                    yamux_stream.flush().await?;
+                    // Shutdown the write side so the tun
+                    // knows the request is complete.
+                    yamux_stream.shutdown().await?;
+                    Ok::<(), std::io::Error>(())
+                }
+                .await
+                {
+                    warn!("failed to write HTTP request: {}", e);
+                    let _ = session.respond_error(503).await;
+                    return Ok(true);
+                }
 
-                match timeout(Duration::from_secs(60), response).await {
-                    Ok(Ok(response_frame)) => {
-                        // Got response from tun — write it to client
-                        debug!(
-                            "tunnel response {} bytes for rid {}",
-                            response_frame.body.len(),
-                            rid
-                        );
-
-                        let status = response_frame.status;
+                // Read the response with timeout.
+                let response = read_http_response(&mut yamux_stream);
+                let response = timeout(Duration::from_secs(60), response).await;
+                match response {
+                    Ok(Ok(resp)) => {
+                        // Write the response back to the client.
+                        let status = parse_status_from_line(&resp.status_line);
                         let mut hdr = match ResponseHeader::build(status, None) {
                             Ok(h) => h,
                             Err(e) => {
@@ -418,7 +273,7 @@ impl ProxyHttp for AppProxy {
                                 return Ok(true);
                             }
                         };
-                        for (k, v) in response_frame.headers.iter() {
+                        for (k, v) in &resp.headers {
                             if let (Ok(name), Ok(value)) = (
                                 HeaderName::from_bytes(k.as_bytes()),
                                 HeaderValue::from_str(v.as_str()),
@@ -426,13 +281,21 @@ impl ProxyHttp for AppProxy {
                                 hdr.insert_header(name, value).ok();
                             }
                         }
-                        if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
+                        // Ensure Content-Length is set.
+                        if resp
+                            .headers
+                            .iter()
+                            .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
+                        {
+                            hdr.insert_header("Content-Length", resp.body.len().to_string())
+                                .ok();
+                        }
+                        if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
                             error!("failed to write tunnel response header: {}", e);
-                            let _ = session.respond_error(500).await;
                             return Ok(true);
                         }
                         if let Err(e) = session
-                            .write_response_body(Some(Bytes::from(response_frame.body)), true)
+                            .write_response_body(Some(Bytes::from(resp.body)), true)
                             .await
                         {
                             error!("failed to write tunnel response body: {}", e);
@@ -440,8 +303,8 @@ impl ProxyHttp for AppProxy {
                         Ok(true)
                     }
                     Ok(Err(e)) => {
-                        warn!("tunnel send error: {}", e);
-                        let _ = session.respond_error(503).await;
+                        warn!("tunnel response read error: {}", e);
+                        let _ = session.respond_error(502).await;
                         Ok(true)
                     }
                     Err(_) => {
@@ -704,6 +567,17 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Parse the status code from a status line like
+/// "HTTP/1.1 200 OK" → 200.
+fn parse_status_from_line(status_line: &str) -> u16 {
+    let mut parts = status_line.splitn(3, ' ');
+    let _version = parts.next();
+    match parts.next().and_then(|s| s.parse::<u16>().ok()) {
+        Some(n) => n,
+        None => 502,
     }
 }
 

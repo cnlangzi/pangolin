@@ -338,65 +338,14 @@ pub enum BackendKind {
     Tunnel { tun_name: String },
 }
 
-// ---- Tunnel frames (used by both ngx and tun) ----
-
-/// HTTP request frame: ngx → tun (via WS).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TunnelRequestFrame {
-    pub rid: String,
-    pub method: String,
-    pub path: String, // includes query string
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// HTTP response frame: tun → ngx (via WS).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TunnelResponseFrame {
-    pub rid: String,
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-/// Unified tunnel frame (request or response or WS relay).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum TunnelFrame {
-    Req(TunnelRequestFrame),
-    Res(TunnelResponseFrame),
-    /// Start a WebSocket relay session: ngx → tun.
-    WsStart {
-        rid: String,
-        path: String,
-    },
-    /// End a WebSocket relay session: ngx → tun.
-    WsEnd {
-        rid: String,
-    },
-}
-
-/// Serialize a struct to msgpack bytes using rmp-serde.
-pub fn serialize_msgpack<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let mut buf = Vec::new();
-    v.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-    Ok(buf)
-}
-
-/// Serialize a slice of tunnel frames as a msgpack array.
-pub fn serialize_frames(frames: &[TunnelFrame]) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let mut buf = Vec::new();
-    frames.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-    Ok(buf)
-}
-
-/// Deserialize msgpack bytes to a struct using rmp-serde.
-pub fn deserialize_msgpack<T: serde::de::DeserializeOwned>(
-    buf: &[u8],
-) -> Result<T, rmp_serde::decode::Error> {
-    let mut de = rmp_serde::Deserializer::new(buf);
-    T::deserialize(&mut de)
-}
+// ---- Tunnel messages (used by both ngx and tun) ----
+//
+// As of issue #39, the tunnel carries raw HTTP/1.1 bytes inside
+// yamux streams (one stream per request, or per WS connection).
+// There is no longer a custom frame layer, so the only
+// cross-process control-plane message left is the tunnel
+// registration event surfaced to the admin UI. The actual
+// request/response payload is opaque bytes on a yamux stream.
 
 #[cfg(test)]
 mod tests {

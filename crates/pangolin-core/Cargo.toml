@@ -16,14 +16,21 @@ log.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 env_logger.workspace = true
-rmp-serde.workspace = true
-flate2.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, optional = true }
-
-[features]
-default = []
-rt = ["tokio/rt", "tokio/sync"]
+tokio = { workspace = true }
+futures.workspace = true
+futures-util.workspace = true
+# Tunnel transport (issue #39): yamux over fastwebsockets, plus
+# permessage-deflate (built into fastwebsockets) and rustls for
+# wss:// on the tun side.
+tokio-yamux.workspace = true
+fastwebsockets.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+# Manual WS upgrade helpers (Sec-WebSocket-Key / Accept).
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
