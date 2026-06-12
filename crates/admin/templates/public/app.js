@@ -32,7 +32,21 @@
     var cur = group.querySelector('input[name="kind"]:checked');
     var v = cur ? cur.value : null;
     document.querySelectorAll('[data-kind-panel]').forEach(function (p) {
-      p.classList.toggle('hidden', p.dataset.kindPanel !== v);
+      var isActive = p.dataset.kindPanel === v;
+      p.classList.toggle('hidden', !isActive);
+      // Disable inputs in inactive panels so:
+      //   (1) browsers don't block submit with `required` fields the user
+      //       can't see ("invalid form control is not focusable"), and
+      //   (2) FormData / URLSearchParams don't pick up stale hidden values
+      //       when the user switches provider kind mid-form.
+      p.querySelectorAll('input, select, textarea').forEach(function (el) {
+        // Preserve the original disabled state set by the template (e.g.
+        // `disabled` on kind radios in edit mode) — toggle from there.
+        if (el.dataset.originalDisabled === undefined) {
+          el.dataset.originalDisabled = el.disabled ? '1' : '0';
+        }
+        el.disabled = !isActive || el.dataset.originalDisabled === '1';
+      });
     });
   }
   document.addEventListener('change', function (e) {
@@ -74,32 +88,41 @@
     var btn = e.target.closest('[data-test-connection]');
     if (!btn) return;
     e.preventDefault();
-    var form = btn.closest('form');
+    // The Test button lives OUTSIDE the create form (so the page only has
+    // a single submit-capable form and Chrome stops warning about
+    // "multiple forms"). Locate the create form by data attribute.
+    var form = document.querySelector('form[data-dns-form]');
     if (!form) return;
-    var fd = new FormData(form);
-    var resultEl = document.getElementById('test-result');
+    // Encode the form as application/x-www-form-urlencoded so the
+    // server's URL-encoded CSRF/body parser can read _csrf. A raw FormData
+    // would force `Content-Type: multipart/form-data; boundary=…` and
+    // `query_param_opt` (which splits on `&`) would silently see no fields.
+    var params = new URLSearchParams(new FormData(form));
+    var resultEl = document.querySelector('[data-test-target]');
     if (resultEl) {
       resultEl.innerHTML =
         '<span class="text-slate-500">Verifying…</span>';
     }
     btn.disabled = true;
-    fetch('/admin/dns/test', {
+    fetch('/dns/test', {
       method: 'POST',
-      body: fd,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
       credentials: 'same-origin',
     })
       .then(function (r) {
-        return r.json();
+        return r.json().then(function (j) { return { ok: r.ok, body: j }; });
       })
-      .then(function (j) {
+      .then(function (resp) {
         if (!resultEl) return;
-        if (j.ok) {
+        var j = resp.body || {};
+        if (resp.ok && j.ok) {
           resultEl.innerHTML =
             '<div class="rounded-lg border-l-4 border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 px-4 py-2 text-sm text-emerald-900 dark:text-emerald-100">✓ Credentials verified</div>';
         } else {
           resultEl.innerHTML =
             '<div class="rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-900 dark:text-red-100">✗ ' +
-            (j.error || 'Verification failed') +
+            (j.error || ('HTTP ' + (j.status || 'error'))) +
             '</div>';
         }
       })
