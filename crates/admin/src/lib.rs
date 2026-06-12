@@ -221,6 +221,9 @@ pub async fn handle(
         }
         ("dns/test", "POST") => routes::dns::handle_test(&app, &merged_params).await?,
 
+        // ── System operations ───────────────────────────────────────
+        ("api/reload", "POST") => routes::system::handle_reload(&app).await?,
+
         // ── Auth ────────────────────────────────────────────────────
         ("login", "GET") => {
             routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref()).await?

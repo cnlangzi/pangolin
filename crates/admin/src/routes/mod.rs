@@ -23,4 +23,5 @@ pub mod dns;
 pub mod domains;
 pub mod helpers;
 pub mod sites;
+pub mod system;
 pub mod tun;
