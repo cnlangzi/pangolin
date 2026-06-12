@@ -33,7 +33,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
-use crate::types::{Cert, DnsProvider, Domain, Site, Tun};
+use crate::types::{Cert, CertStatus, DnsProvider, Domain, Site, Tun};
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
 /// Used as the on-disk form of `tun.token` (V3 migration); the WS
@@ -342,19 +342,135 @@ pub fn backfill_tun_token_hashes(conn: &Connection) -> rusqlite::Result<usize> {
 pub fn list_certs(conn: &Connection) -> rusqlite::Result<Vec<Cert>> {
     let mut stmt = conn.prepare(
         "SELECT domain, cert_file, key_file, expires_at, created_at,
-                sans, source, acme_dns_provider, acme_account_id, issued_at
+                sans, source, acme_dns_provider, acme_account_id, issued_at,
+                status, started_at, last_error
          FROM certs ORDER BY domain",
     )?;
     let rows = stmt.query_map([], row_to_cert)?;
     rows.collect()
 }
 
+/// List certs whose `status` is one of the given values, ordered by
+/// most-recent activity first (`started_at` DESC, NULLs last) so the
+/// status-filtered table view surfaces freshly attempted rows at the top.
+///
+/// Empty `statuses` returns an empty Vec (no rows) — the caller should
+/// use [`list_certs`] for the unfiltered case.
+pub fn list_certs_by_status(
+    conn: &Connection,
+    statuses: &[CertStatus],
+) -> rusqlite::Result<Vec<Cert>> {
+    if statuses.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build the IN-clause inline: `status IN (?, ?, ?)`. Status values
+    // are well-known constants (`CertStatus::as_str`) so this is a
+    // safe parameter list, not user input concatenation.
+    let placeholders: Vec<&str> = statuses.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT domain, cert_file, key_file, expires_at, created_at,
+                sans, source, acme_dns_provider, acme_account_id, issued_at,
+                status, started_at, last_error
+         FROM certs
+         WHERE status IN ({})
+         ORDER BY COALESCE(started_at, created_at) DESC, domain",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let values: Vec<String> = statuses.iter().map(|s| s.as_str().to_string()).collect();
+    let params_iter = rusqlite::params_from_iter(values.iter());
+    let rows = stmt.query_map(params_iter, row_to_cert)?;
+    rows.collect()
+}
+
+/// Atomically transition a cert row to a new status, recording the
+/// `last_error` (cleared on success) and optionally bumping `started_at`.
+///
+/// Returns `true` when the row existed and was updated, `false` when the
+/// domain has no row in `certs` (caller must `upsert_cert` first — this
+/// helper deliberately does not insert because the schema's NOT NULL
+/// `cert_file`/`key_file` columns have no sensible default).
+///
+/// `started_at` semantics: set to `Some(now)` whenever a new ACME attempt
+/// begins (Pending → Issuing transition, manual retry). Pass `None` to
+/// keep the existing value (e.g. on the Issuing → Issued/Failed transition).
+pub fn set_cert_status_atomic(
+    conn: &Connection,
+    domain: &str,
+    status: CertStatus,
+    last_error: Option<&str>,
+    started_at: Option<DateTime<Utc>>,
+) -> rusqlite::Result<bool> {
+    // Two SQL shapes: one that touches `started_at`, one that leaves
+    // it alone. Using a single statement with a CASE WHEN would be
+    // shorter, but the row-touched count would still differ from the
+    // semantics callers want (they pass `None` precisely so the
+    // existing timestamp is preserved).
+    let n = match started_at {
+        Some(ts) => conn.execute(
+            "UPDATE certs
+                SET status = ?1, last_error = ?2, started_at = ?3
+              WHERE domain = ?4",
+            params![status.as_str(), last_error, ts.to_rfc3339(), domain],
+        )?,
+        None => conn.execute(
+            "UPDATE certs
+                SET status = ?1, last_error = ?2
+              WHERE domain = ?3",
+            params![status.as_str(), last_error, domain],
+        )?,
+    };
+    Ok(n > 0)
+}
+
+/// Aggregate count of rows per [`CertStatus`]. Every variant appears in
+/// the result (zero-valued when no rows match) so dashboard rendering
+/// doesn't have to special-case missing keys.
+///
+/// Backed by `idx_certs_status` (V4) so this stays O(distinct statuses)
+/// rather than O(rows).
+pub fn count_certs_by_status(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashMap<CertStatus, usize>> {
+    let mut counts: std::collections::HashMap<CertStatus, usize> = CertStatus::all()
+        .iter()
+        .map(|s| (*s, 0_usize))
+        .collect();
+    let mut stmt =
+        conn.prepare("SELECT status, COUNT(*) FROM certs GROUP BY status")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        let n: i64 = row.get(1)?;
+        // Unknown statuses (e.g. data from a downgrade) are silently
+        // dropped — the UI would render them as a fifth bucket with no
+        // meaning anyway.
+        if let Ok(s) = raw.parse::<CertStatus>() {
+            *counts.entry(s).or_insert(0) = n as usize;
+        }
+    }
+    Ok(counts)
+}
+
+/// Look up a single cert row by domain. Cheaper than `list_certs()
+/// .find()` when only one row is needed.
+pub fn get_cert(conn: &Connection, domain: &str) -> rusqlite::Result<Option<Cert>> {
+    let mut stmt = conn.prepare(
+        "SELECT domain, cert_file, key_file, expires_at, created_at,
+                sans, source, acme_dns_provider, acme_account_id, issued_at,
+                status, started_at, last_error
+         FROM certs WHERE domain = ?1",
+    )?;
+    stmt.query_row(params![domain], row_to_cert).optional()
+}
+
 pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
     let sans_json = serde_json::to_string(&cert.sans).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "INSERT INTO certs (domain, cert_file, key_file, expires_at, created_at,
-                             sans, source, acme_dns_provider, acme_account_id, issued_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                             sans, source, acme_dns_provider, acme_account_id, issued_at,
+                             status, started_at, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(domain) DO UPDATE SET
             cert_file = excluded.cert_file,
             key_file = excluded.key_file,
@@ -363,7 +479,10 @@ pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
             source = excluded.source,
             acme_dns_provider = excluded.acme_dns_provider,
             acme_account_id = excluded.acme_account_id,
-            issued_at = excluded.issued_at",
+            issued_at = excluded.issued_at,
+            status = excluded.status,
+            started_at = excluded.started_at,
+            last_error = excluded.last_error",
         params![
             cert.domain,
             cert.cert_file,
@@ -375,6 +494,9 @@ pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
             cert.acme_dns_provider,
             cert.acme_account_id,
             cert.issued_at,
+            cert.status.as_str(),
+            cert.started_at.map(|t| t.to_rfc3339()),
+            cert.last_error,
         ],
     )?;
     Ok(())
@@ -559,7 +681,16 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
     let acme_dns_provider: Option<String> = row.get(7)?;
     let acme_account_id: Option<String> = row.get(8)?;
     let issued_at: i64 = row.get(9)?;
+    let status_raw: String = row.get(10)?;
+    let started_at: Option<String> = row.get(11)?;
+    let last_error: Option<String> = row.get(12)?;
     let sans: Vec<String> = serde_json::from_str(&sans_json).unwrap_or_default();
+    // Unknown statuses (downgrade artefact, manual SQL edit) fall back to
+    // the conservative `Issued` default — the cert is still on disk, so
+    // hiding it would be worse than showing it without a fresh badge.
+    let status = status_raw
+        .parse::<CertStatus>()
+        .unwrap_or(CertStatus::Issued);
     Ok(Cert {
         domain,
         cert_file,
@@ -571,6 +702,9 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
         acme_dns_provider,
         acme_account_id,
         issued_at,
+        status,
+        started_at: started_at.as_deref().and_then(parse_dt_opt),
+        last_error,
     })
 }
 
@@ -615,14 +749,15 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1 + V2 + V3 as applied (V2 merges tokens
-        // into tun; V3 stores token as sha256).
+        // it's there and lists V1 + V2 + V3 + V4 as applied. (V2 merges
+        // tokens into tun; V3 stores token as sha256; V4 adds the
+        // ACME-lifecycle columns on `certs` for issue #45.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
-        assert_eq!(count, 3, "expected V1 + V2 + V3 to be applied");
+        assert_eq!(count, 4, "expected V1 + V2 + V3 + V4 to be applied");
 
         // Verify V2 is recorded.
         let v2_present: i64 = conn
@@ -633,6 +768,16 @@ mod tests {
             )
             .expect("version column present");
         assert_eq!(v2_present, 1, "V2 (merge tokens into tun) must be applied");
+
+        // Verify V4 is recorded.
+        let v4_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 4",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version column present");
+        assert_eq!(v4_present, 1, "V4 (cert status lifecycle) must be applied");
     }
 
     #[test]
@@ -955,12 +1100,158 @@ mod tests {
             acme_dns_provider: None,
             acme_account_id: None,
             issued_at: 0,
+            status: CertStatus::Issued,
+            started_at: None,
+            last_error: None,
         };
         upsert_cert(&conn, &c).unwrap();
         let list = list_certs(&conn).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].sans, vec!["example.com", "www.example.com"]);
+        assert_eq!(list[0].status, CertStatus::Issued);
+        assert!(list[0].started_at.is_none());
+        assert!(list[0].last_error.is_none());
         assert!(delete_cert(&conn, "example.com").unwrap());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // V4 — cert status lifecycle helpers (issue #45).
+    // ──────────────────────────────────────────────────────────────────
+
+    fn make_cert(domain: &str, status: CertStatus, last_error: Option<&str>) -> Cert {
+        Cert {
+            domain: domain.into(),
+            cert_file: format!("/blob/{}", domain),
+            key_file: format!("/blob/{}", domain),
+            expires_at: None,
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+            sans: vec![domain.into()],
+            source: "acme".into(),
+            acme_dns_provider: None,
+            acme_account_id: None,
+            issued_at: 0,
+            status,
+            started_at: None,
+            last_error: last_error.map(String::from),
+        }
+    }
+
+    #[test]
+    fn cert_status_defaults_to_issued_for_legacy_rows() {
+        // A row inserted before V4 carried no `status` column. V4's
+        // `DEFAULT 'issued'` should leave that row valid and visible.
+        let conn = make_conn();
+        conn.execute(
+            "INSERT INTO certs (domain, cert_file, key_file, created_at, sans, source, issued_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', 'manual', 0)",
+            params![
+                "legacy.example.com",
+                "/blob/legacy.example.com",
+                "/blob/legacy.example.com",
+                "2026-01-01T00:00:00+00:00",
+            ],
+        )
+        .unwrap();
+        let list = list_certs(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, CertStatus::Issued);
+        assert!(list[0].last_error.is_none());
+    }
+
+    #[test]
+    fn set_cert_status_atomic_updates_existing_row() {
+        let conn = make_conn();
+        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        let updated = set_cert_status_atomic(
+            &conn,
+            "a.example.com",
+            CertStatus::Issuing,
+            None,
+            Some(dt("2026-06-01T00:00:00+00:00")),
+        )
+        .unwrap();
+        assert!(updated);
+        let c = get_cert(&conn, "a.example.com").unwrap().unwrap();
+        assert_eq!(c.status, CertStatus::Issuing);
+        assert_eq!(c.started_at, Some(dt("2026-06-01T00:00:00+00:00")));
+        assert!(c.last_error.is_none());
+
+        // Transition to Failed — last_error captured, started_at preserved
+        // (None means "don't touch").
+        let updated =
+            set_cert_status_atomic(&conn, "a.example.com", CertStatus::Failed, Some("boom"), None)
+                .unwrap();
+        assert!(updated);
+        let c = get_cert(&conn, "a.example.com").unwrap().unwrap();
+        assert_eq!(c.status, CertStatus::Failed);
+        assert_eq!(c.last_error.as_deref(), Some("boom"));
+        assert_eq!(c.started_at, Some(dt("2026-06-01T00:00:00+00:00")));
+
+        // Transition to Issued clears last_error.
+        let updated =
+            set_cert_status_atomic(&conn, "a.example.com", CertStatus::Issued, None, None)
+                .unwrap();
+        assert!(updated);
+        let c = get_cert(&conn, "a.example.com").unwrap().unwrap();
+        assert_eq!(c.status, CertStatus::Issued);
+        assert!(c.last_error.is_none());
+    }
+
+    #[test]
+    fn set_cert_status_atomic_returns_false_for_missing_row() {
+        let conn = make_conn();
+        let updated =
+            set_cert_status_atomic(&conn, "ghost.example.com", CertStatus::Failed, None, None)
+                .unwrap();
+        assert!(!updated);
+    }
+
+    #[test]
+    fn list_certs_by_status_returns_only_matching_rows() {
+        let conn = make_conn();
+        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        upsert_cert(
+            &conn,
+            &make_cert("b.example.com", CertStatus::Failed, Some("err")),
+        )
+        .unwrap();
+        upsert_cert(&conn, &make_cert("c.example.com", CertStatus::Issued, None)).unwrap();
+
+        let only_failed = list_certs_by_status(&conn, &[CertStatus::Failed]).unwrap();
+        assert_eq!(only_failed.len(), 1);
+        assert_eq!(only_failed[0].domain, "b.example.com");
+
+        let in_flight =
+            list_certs_by_status(&conn, &[CertStatus::Pending, CertStatus::Issuing]).unwrap();
+        assert_eq!(in_flight.len(), 1);
+        assert_eq!(in_flight[0].domain, "a.example.com");
+
+        // Empty status list → empty result (caller's responsibility to
+        // use list_certs() for the unfiltered case).
+        let empty = list_certs_by_status(&conn, &[]).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn count_certs_by_status_includes_zero_buckets() {
+        let conn = make_conn();
+        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        upsert_cert(
+            &conn,
+            &make_cert("b.example.com", CertStatus::Failed, Some("err")),
+        )
+        .unwrap();
+        upsert_cert(&conn, &make_cert("c.example.com", CertStatus::Issued, None)).unwrap();
+        upsert_cert(&conn, &make_cert("d.example.com", CertStatus::Issued, None)).unwrap();
+
+        let counts = count_certs_by_status(&conn).unwrap();
+        // Every variant present, including the zero-valued ones.
+        assert_eq!(counts.len(), 5);
+        assert_eq!(counts[&CertStatus::Pending], 1);
+        assert_eq!(counts[&CertStatus::Issuing], 0);
+        assert_eq!(counts[&CertStatus::Issued], 2);
+        assert_eq!(counts[&CertStatus::Failed], 1);
+        assert_eq!(counts[&CertStatus::Skipped], 0);
     }
 
     #[test]

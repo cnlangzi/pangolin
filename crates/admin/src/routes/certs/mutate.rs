@@ -49,6 +49,11 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         acme_dns_provider: None,
         acme_account_id: None,
         issued_at: 0,
+        // Manual uploads bypass the ACME flow entirely, so the row goes
+        // straight to `Issued` with no `started_at` / `last_error`.
+        status: pangolin_core::types::CertStatus::Issued,
+        started_at: None,
+        last_error: None,
     };
 
     let db = app.db.lock().await;
