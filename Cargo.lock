@@ -4153,6 +4153,7 @@ dependencies = [
  "futures-util",
  "http 1.4.1",
  "log",
+ "mime_guess",
  "pangolin-core",
  "reqwest 0.13.4",
  "rmp-serde",

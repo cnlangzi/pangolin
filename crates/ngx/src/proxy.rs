@@ -350,15 +350,29 @@ impl ProxyHttp for AppProxy {
                     headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
                 }
 
+                // Build the full backend URL so the tun client knows where to
+                // proxy: strip trailing slash from url then append the request
+                // path+query.  e.g. backend="http://127.0.0.1:9020" + req="/foo?bar"
+                // → "http://127.0.0.1:9020/foo?bar"
+                let req_path = req_header.uri.to_string();
+                let full_url = format!(
+                    "{}{}",
+                    url.trim_end_matches('/'),
+                    if req_path.starts_with('/') { req_path.clone() } else { format!("/{}", req_path) }
+                );
+
                 let req_frame = pangolin_core::TunnelRequestFrame {
                     rid: rid.clone(),
                     method: method.clone(),
-                    path: req_header.uri.to_string(),
+                    path: full_url,
                     headers,
                     body: body_bytes,
                 };
 
-                let buf = match pangolin_core::serialize_msgpack(&req_frame) {
+                // Wrap in TunnelFrame::Req before serializing
+                let tunnel_frame = pangolin_core::TunnelFrame::Req(req_frame);
+
+                let buf = match pangolin_core::serialize_msgpack(&tunnel_frame) {
                     Ok(b) => b,
                     Err(e) => {
                         error!("failed to serialize request: {}", e);
