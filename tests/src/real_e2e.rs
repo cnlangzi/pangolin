@@ -334,13 +334,8 @@ async fn real_e2e_tunnel_get_without_content_length() {
     // GET with NO `Content-Length`, NO `Transfer-Encoding`, NO body.
     // Pre-fix this hung the entire request flow; the 5 s read timeout
     // in `raw_request_no_content_length` would surface it as a panic.
-    let (status, body) = crate::harness::raw_request_no_content_length(
-        &addr,
-        "office.test",
-        "GET",
-        "/",
-    )
-    .await;
+    let (status, body) =
+        crate::harness::raw_request_no_content_length(&addr, "office.test", "GET", "/").await;
 
     assert_eq!(
         status,
@@ -429,12 +424,21 @@ async fn real_e2e_tunnel_h2_path_preserved() {
     let cert_path = cert_dir.join("office.test");
     let status = std::process::Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "ec", "-pkeyopt",
-            "ec_paramgen_curve:prime256v1", "-nodes",
-            "-keyout", "/tmp/office_tunnel.key",
-            "-out", "/tmp/office_tunnel.crt",
-            "-days", "36500",
-            "-subj", "/CN=office.test",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "/tmp/office_tunnel.key",
+            "-out",
+            "/tmp/office_tunnel.crt",
+            "-days",
+            "36500",
+            "-subj",
+            "/CN=office.test",
         ])
         .status()
         .expect("spawn openssl");
@@ -457,17 +461,23 @@ async fn real_e2e_tunnel_h2_path_preserved() {
         .arg("--http2")
         .arg("--http2-prior-knowledge")
         .arg("--insecure")
-        .arg("--max-time").arg("5")
+        .arg("--max-time")
+        .arg("5")
         .arg("--silent")
         .arg("--show-error")
-        .arg("--output").arg("-")
-        .arg("--write-out").arg("HTTP_CODE:%{http_code}\n")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
         .arg("--resolve")
         .arg(format!("office.test:{}:127.0.0.1", ngx.tls_port))
         .arg(&url)
-        .env_remove("HTTPS_PROXY").env_remove("https_proxy")
-        .env_remove("HTTP_PROXY").env_remove("http_proxy")
-        .env_remove("ALL_PROXY").env_remove("all_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -483,9 +493,16 @@ async fn real_e2e_tunnel_h2_path_preserved() {
             ngx.log_string()
         )
     });
-    let status: u16 = meta.trim().lines().next().unwrap_or("0").parse().expect("parse http_code");
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "HTTPS+H2 → tunnel should return 200, got {status}. \
          If 404, the proxy probably built the backend URL from a full \
          URI (https://office.test/api/profile?id=42) and the backend \
@@ -515,7 +532,6 @@ async fn real_e2e_tunnel_h2_path_preserved() {
         "H2 query string must reach the backend byte-exact"
     );
 }
-
 
 ///
 /// Regression test for the static-file path through the tunnel.

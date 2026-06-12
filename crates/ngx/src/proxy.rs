@@ -193,24 +193,11 @@ impl ProxyHttp for AppProxy {
             if let Some(tunnel) = tunnel {
                 debug!("Tunnel routing: {} → tun {}", host, tun_name);
                 let method = session.req_header().method.as_str().to_string();
-                // `uri.to_string()` does NOT round-trip cleanly across
-                // HTTP/1.1 and HTTP/2:
-                //
-                //   * H1: `GET /api?x=1 HTTP/1.1` → `uri.to_string()`
-                //     returns `"/api?x=1"` (path + query only).
-                //   * H2: pingora reconstructs the URI from `:scheme`,
-                //     `:authority`, `:path` pseudo-headers, so the same
-                //     request lands with `uri.to_string() ==
-                //     "https://yaitoo.cn/api?x=1"` (absolute form).
-                //
-                // The tunnel then builds the backend URL by concatenating
-                // it onto the configured backend prefix, giving
-                // `http://127.0.0.1:9020/https://yaitoo.cn/api?x=1` for
-                // HTTPS requests — which the backend's router answers
-                // with 404. Use `path_and_query()` so both versions
-                // produce the same on-the-wire path. See
-                // `real_e2e_tunnel_h2_path_preserved` for the regression
-                // test.
+                // path_and_query() (not uri.to_string()) so H1 and H2
+                // produce the same on-the-wire path. H2's URI is
+                // absolute-form, so to_string() returns
+                // "https://host/path" and the backend gets 404. See
+                // `real_e2e_tunnel_h2_path_preserved`.
                 let req_path = session
                     .req_header()
                     .uri
@@ -227,28 +214,11 @@ impl ProxyHttp for AppProxy {
                     }
                 );
 
-                // Read body first.
-                //
-                // **Why `read_request_body()` and not `read_body_or_idle()`**:
-                // `read_body_or_idle` is pingora's internal body-pump
-                // primitive — it is designed to live inside a `select!`
-                // alongside the upstream-write branch, and on a body-less
-                // keep-alive request (e.g. `curl http://...` GET with no
-                // `Content-Length` and no `Transfer-Encoding`) it stays
-                // pending forever waiting for FIN (see
-                // `pingora-core/src/protocols/http/v1/server.rs::read_body_or_idle`
-                // → `std::future::pending().await`). Awaiting it sequentially
-                // hangs the entire request.
-                //
-                // `read_request_body()` returns `Ok(None)` immediately when
-                // there is nothing more to read (pingora initialises the body
-                // reader with `cl=0` per RFC 9112 §6.3 when neither header is
-                // present), so a body-less GET completes the loop on the
-                // first poll. The harness's `raw_request` always sends
-                // `Content-Length: 0`, which is why the existing e2e suite
-                // never caught this — real curl GETs omit the header
-                // entirely. See `real_e2e_tunnel_get_without_content_length`
-                // for the regression test.
+                // read_request_body() (not read_body_or_idle()): the
+                // latter is pingora's internal body-pump primitive and
+                // stays pending forever on a body-less keep-alive
+                // request (e.g. curl GET with no Content-Length). See
+                // `real_e2e_tunnel_get_without_content_length`.
                 let mut body_bytes = Vec::new();
                 loop {
                     match session.read_request_body().await {

@@ -36,3 +36,9 @@ http = "1.4.1"
 url = "2.5.8"
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
+
+[dev-dependencies]
+# `figment::Jail` lives behind the `test` feature flag — used by the
+# config tests to sandbox `TUN_*` env vars that the Makefile's
+# `.env`-export step would otherwise leak in.
+figment = { workspace = true, features = ["test"] }
