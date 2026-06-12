@@ -211,7 +211,6 @@ dist:
 # download-ui-tools. Only strip locally-built outputs.
 clean:
 	rm -rf ./build/output
-	rm -f $(addprefix $(OUT_DIR)/,$(BINS))
 	$(CARGO) clean
 
 # ── Lint / Test ──────────────────────────────────────────────────────────────

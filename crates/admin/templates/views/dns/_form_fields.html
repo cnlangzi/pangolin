@@ -5,13 +5,13 @@
 {# The "kind" is selected from one of cloudflare / aliyun / tencent. #}
 
     <div role="note" class="flex items-start gap-3 rounded-lg border-l-4 border-amber-500 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
-      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3-1.5-3-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
       <span><strong>Credentials are stored in plaintext</strong> in the <code class="font-mono text-xs">dns_providers.config</code> column. Restrict database access at the OS level.</span>
     </div>
 
     {% if let Some(e) = error %}
     <div role="alert" class="flex items-start gap-3 rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-900 dark:text-red-100">
-      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3-1.5-3-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
       <span>{{ e }}</span>
     </div>
     {% endif %}
@@ -21,7 +21,7 @@
 
       <div>
         <label for="name" class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-1.5">Name (id)</label>
-        <input id="name" name="name" type="text" required pattern="[a-z0-9_-]+" maxlength="64"
+        <input id="name" name="name" type="text" required pattern="[a-z0-9_\-]+" maxlength="64"
           value="{{ self.name_value() }}"
           {% if is_edit %}readonly{% endif %}
           placeholder="main-cf"
@@ -189,10 +189,5 @@
         </div>
       </div>
 
-      <div id="test-result"></div>
-
-      <button type="button" data-test-connection class="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-        Test connection
-      </button>
+      <div id="test-result" data-test-target></div>
     </section>

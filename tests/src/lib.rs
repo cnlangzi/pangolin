@@ -72,3 +72,6 @@ mod real_e2e;
 
 #[cfg(feature = "integration")]
 mod admin_ui_e2e;
+
+#[cfg(feature = "integration")]
+mod admin_dns_e2e;
