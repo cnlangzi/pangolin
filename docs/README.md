@@ -1,20 +1,25 @@
 # Pangolin documentation
 
-Reference documentation for Pangolin, a Rust reverse-proxy with WebSocket tunnel support.
+Reference docs for Pangolin, a Rust reverse-proxy with WebSocket tunnel support.
 
-## Configuration and operations
+## Getting started
 
-- [Configuration](configuration.md) — `ngx.yml` and `tun.yml` field reference, env-var overrides, file lookup
-- [Database Migrations](migrations.md) — how the SQLite schema is versioned and applied
+New to Pangolin? Start here:
 
-## Admin
+- **Local dev setup** → [Configuration: Example A](configuration.md#a-local-development-no-tls-no-acme-no-dns) — run `make start-ngx` and `make start-tun` on your laptop
+- **Production deploy** → [Configuration: Example B](configuration.md#b-single-host-production-https--acme-http-01) — single gateway with HTTPS + ACME
 
-- [Reload API](admin/reload-api.md) — `POST /api/reload` endpoint for refreshing the in-memory config after out-of-band DB edits
+## Configuration & operations
+
+- [Configuration](configuration.md) — `ngx.yml` / `tun.yml` field reference, env-var overrides, file lookup, real-world examples
+- [Database migrations](migrations.md) — how the SQLite schema is versioned and applied (refinery)
+- [Reload API](admin/reload-api.md) — `POST /api/reload` for refreshing the in-memory config after out-of-band DB edits
 
 ## Design
 
-- [Tunnel design comparison](design/tunnel-comparison.md) — Pangolin's WebSocket tunnel vs rathole and bore, and the improvement roadmap
+- [Tunnel](design/tunnel.md) — WebSocket tunnel design choices, implementation map, known gaps
 
-## Frontend (zh)
+## Admin UI (zh)
 
-- [Admin UI 开发规范](vi/README.md) — index for the Admin UI conventions, color tokens, component idioms, and changelog
+- [开发规范](vi/README.md) — 技术栈、目录、配色 token、组件 utility 配方、Tailwind idioms
+- [字体排版](vi/typography.md) — 字号 / 字重 / 字体栈
