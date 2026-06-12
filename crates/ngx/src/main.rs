@@ -111,7 +111,9 @@ fn main() -> anyhow::Result<()> {
 
     // ---- 3. Build the ACME state. The actual DNS reload + initial
     //         cert scan run inside `AcmeService::run`, so a startup
-    //         failure there fails the process (fail-fast).
+    //         failure there fails the process (fail-fast). The
+    //         `CertRetrier` bridge that wires admin's `POST /certs/retry`
+    //         to this state is installed inside the host runtime below.
     let acme_state = Arc::new(crate::acme::AcmeState::empty());
 
     // ---- 4. Spawn pingora on its own std::thread ---------------------------
@@ -137,9 +139,17 @@ fn main() -> anyhow::Result<()> {
         // OS signal handlers cancel the shared token.
         runtime::install_signal_handlers(shutdown.clone());
 
+        // Wire admin's `POST /certs/retry` to the ACME state (issue #45).
+        // Lives inside the host runtime so the trait-object's
+        // `RwLock::write` does not need its own runtime to drive.
+        // `AcmeService` takes ownership of the same Arc below — the
+        // clone is just two `Arc::increment`s, not a duplicate state.
+        let acme_for_service = acme_state.clone();
+        acme_state.install_on(&app).await;
+
         // Build & start services (fail-fast on startup error).
         let services: Vec<Box<dyn runtime::Service>> = vec![
-            Box::new(acme::AcmeService::new(acme_state)),
+            Box::new(acme::AcmeService::new(acme_for_service)),
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
         ];
 

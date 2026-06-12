@@ -158,6 +158,26 @@ pub fn plan_issuance(
     })
 }
 
+/// Cross-crate bridge from the admin UI to the ACME issuance pipeline
+/// (issue #45). The retry route lives in `admin`, but the only code
+/// that knows how to drive an issuance is `ngx::acme::AcmeState`, and
+/// `admin` cannot depend on `ngx` (it would pull pingora + TLS into
+/// the admin lib's compile tree). This trait is the seam: ngx
+/// implements it on `AcmeState`, registers an `Arc<dyn CertRetrier>`
+/// on the `App`, and admin's `POST /certs/retry` dispatches through it.
+///
+/// `retry` is fire-and-forget from the HTTP caller's perspective — it
+/// returns once the issuance has finished (or errored). The HTTP
+/// handler can choose to await it for sync UX or spawn it for async.
+#[async_trait::async_trait]
+pub trait CertRetrier: Send + Sync {
+    /// Run a one-shot ACME attempt for `domain`. The implementor is
+    /// expected to drive the status row (`Pending`/`Issuing`/…) via
+    /// `db::set_cert_status_atomic` so the admin UI converges without
+    /// the caller having to do its own bookkeeping.
+    async fn retry(&self, domain: &str) -> anyhow::Result<()>;
+}
+
 /// Shared application state. Owned by `ngx` at runtime; `admin` receives it
 /// via `Arc<App>` when handling HTTP requests.
 pub struct App {
@@ -188,6 +208,12 @@ pub struct App {
     /// `AcmeState` background loop subscribes and reloads on each tick.
     /// Cheap (just a permit); no shared state.
     pub dns_change_notify: Arc<tokio::sync::Notify>,
+    /// Bridge from admin's `POST /certs/retry` to the ACME pipeline
+    /// (issue #45). Wired by `ngx::main` after `AcmeState` is built.
+    /// `None` in process modes that don't run the ACME service (e.g.
+    /// admin-only unit tests), in which case the retry endpoint returns
+    /// a 503 with a clear message.
+    pub cert_retrier: RwLock<Option<Arc<dyn CertRetrier>>>,
 }
 
 impl App {
@@ -217,7 +243,17 @@ impl App {
             cert_manager,
             events: Arc::new(EventBuffer::new()),
             dns_change_notify: Arc::new(tokio::sync::Notify::new()),
+            cert_retrier: RwLock::new(None),
         })
+    }
+
+    /// Install the [`CertRetrier`] bridge once the ACME pipeline is built.
+    /// Called from `ngx::main` after `AcmeState::empty()` produces the
+    /// concrete retrier. Idempotent — re-installing replaces the prior
+    /// retrier (useful for tests that swap a real `AcmeState` for a
+    /// fake during one process lifetime).
+    pub async fn set_cert_retrier(&self, retrier: Arc<dyn CertRetrier>) {
+        *self.cert_retrier.write().await = Some(retrier);
     }
 
     /// Reload indexes from DB. Called after every admin write operation.

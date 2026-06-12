@@ -761,6 +761,10 @@ pub struct AcmeState {
     pub dns_providers: RwLock<HashMap<String, Arc<dyn DnsProvider>>>,
     /// The AcmeClient. Built lazily on first issuance; reused for renew.
     pub client: RwLock<Option<Arc<AcmeClient>>>,
+    /// Back-reference to the shared `App` so the `CertRetrier` impl can
+    /// drive an out-of-band issuance from an admin HTTP handler without
+    /// the caller passing `app` in. `None` until `install_on(app)` runs.
+    app: RwLock<Option<Arc<App>>>,
 }
 
 impl AcmeState {
@@ -770,7 +774,18 @@ impl AcmeState {
         Self {
             dns_providers: RwLock::new(HashMap::new()),
             client: RwLock::new(None),
+            app: RwLock::new(None),
         }
+    }
+
+    /// Install this `AcmeState` as the [`pangolin_core::CertRetrier`] on
+    /// the given `App` and stash a back-reference so the retrier method
+    /// can drive an issuance without the caller passing `app` in.
+    /// Called once at process startup from `ngx::main`.
+    pub async fn install_on(self: &Arc<Self>, app: &Arc<App>) {
+        *self.app.write().await = Some(app.clone());
+        app.set_cert_retrier(self.clone() as Arc<dyn pangolin_core::CertRetrier>)
+            .await;
     }
 
     /// Rebuild the DNS provider registry from the DB. Cheap — re-reads
@@ -867,7 +882,7 @@ impl AcmeState {
         }
     }
 
-    async fn ensure_one(
+    pub(crate) async fn ensure_one(
         &self,
         app: &App,
         domain: &Domain,
@@ -881,12 +896,37 @@ impl AcmeState {
             vec![domain.domain.clone()]
         };
 
+        // Issue #45 phase-1 (status transitions): seed the row if missing
+        // (catches legacy auto_issue domains that pre-date V4), then plan.
+        {
+            let conn = app.db.lock().await;
+            let _ = pangolin_core::db::ensure_pending_cert_row(
+                &conn,
+                &domain.domain,
+                &app.cert_manager.cert_dir,
+            );
+        }
+
         let plan = match pangolin_core::plan_issuance(&sans, domain, dns_index) {
             Ok(p) => p,
             Err(e) => {
-                // Wildcard without DNS association: log + skip; the
-                // operator must associate a provider or disable auto_issue.
+                // Wildcard without DNS association: surface this as a
+                // visible `Skipped` row with the reason so the operator
+                // can act on it from the admin UI instead of having to
+                // tail the log. `Skipped` is distinct from `Failed`
+                // because retrying without fixing the DNS config will
+                // not help.
                 log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
+                let reason = e.to_string();
+                let conn = app.db.lock().await;
+                let _ = pangolin_core::db::set_cert_status_atomic(
+                    &conn,
+                    &domain.domain,
+                    pangolin_core::CertStatus::Skipped,
+                    Some(&reason),
+                    None,
+                );
+                drop(conn);
                 return Ok(());
             }
         };
@@ -909,6 +949,20 @@ impl AcmeState {
             return Ok(());
         }
 
+        // Transition Pending → Issuing (or anything else → Issuing) with
+        // a fresh `started_at` so the UI's "x seconds ago" relative
+        // timestamp reflects this attempt.
+        {
+            let conn = app.db.lock().await;
+            let _ = pangolin_core::db::set_cert_status_atomic(
+                &conn,
+                &domain.domain,
+                pangolin_core::CertStatus::Issuing,
+                None,
+                Some(chrono::Utc::now()),
+            );
+        }
+
         let client = self.client(app).await?;
         let dns_providers = self.dns_providers.read().await.clone();
         log::info!(
@@ -917,17 +971,141 @@ impl AcmeState {
             plan.challenges.len(),
             plan.dns_provider_name
         );
-        let _ = client.issue_with_plan(&sans, &plan, &dns_providers).await?;
-        app.add_event(pangolin_core::EventType::CertIssued {
-            domain: domain.domain.clone(),
-        });
-        Ok(())
+        match client.issue_with_plan(&sans, &plan, &dns_providers).await {
+            Ok(written) => {
+                // Persist the on-disk cert blob path in the certs row so
+                // /certs reflects the actual location, then flip to
+                // `Issued`. `last_error` is cleared by passing None.
+                let blob_path = written
+                    .first()
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| {
+                        app.cert_manager
+                            .cert_dir
+                            .join(&domain.domain)
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                let issued_at = chrono::Utc::now();
+                // Parse expiry from the freshly issued blob so the certs
+                // row shows the right "Expires" column without waiting
+                // for a renewal scan.
+                let expires_at = tokio::fs::read_to_string(&blob_path)
+                    .await
+                    .ok()
+                    .and_then(|blob| parse_blob_expiry(&blob).ok());
+                let conn = app.db.lock().await;
+                let existing = pangolin_core::db::get_cert(&conn, &domain.domain)
+                    .unwrap_or(None);
+                let created_at = existing
+                    .as_ref()
+                    .map(|c| c.created_at)
+                    .unwrap_or(issued_at);
+                let started_at = existing.as_ref().and_then(|c| c.started_at);
+                let cert_row = pangolin_core::Cert {
+                    domain: domain.domain.clone(),
+                    cert_file: blob_path.clone(),
+                    key_file: blob_path,
+                    expires_at,
+                    created_at,
+                    sans: sans.clone(),
+                    source: "acme".into(),
+                    acme_dns_provider: plan.dns_provider_name.clone(),
+                    acme_account_id: None,
+                    issued_at: issued_at.timestamp(),
+                    status: pangolin_core::CertStatus::Issued,
+                    started_at,
+                    last_error: None,
+                };
+                let _ = pangolin_core::db::upsert_cert(&conn, &cert_row);
+                drop(conn);
+                app.add_event(pangolin_core::EventType::CertIssued {
+                    domain: domain.domain.clone(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                // Surface the failure in the certs table so the operator
+                // can see it without grepping logs. The bubbled-up error
+                // still drives the existing event buffer + CertRenewFailed
+                // event so renew callers and dashboards see both.
+                let err_msg = e.to_string();
+                let conn = app.db.lock().await;
+                let _ = pangolin_core::db::set_cert_status_atomic(
+                    &conn,
+                    &domain.domain,
+                    pangolin_core::CertStatus::Failed,
+                    Some(&err_msg),
+                    None,
+                );
+                drop(conn);
+                Err(e)
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Service integration
 // ---------------------------------------------------------------------------
+
+/// `CertRetrier` bridge from the admin UI's `POST /certs/retry` to
+/// `AcmeState::ensure_one`. Looks up the domain row, stamps
+/// `started_at=now` so the UI's relative-time column reflects this
+/// attempt even if `ensure_one` itself is slow (or returns `Skipped`),
+/// and forwards to the same renewal-scan code path so failures /
+/// transitions land in the same place.
+#[async_trait::async_trait]
+impl pangolin_core::CertRetrier for AcmeState {
+    async fn retry(&self, domain: &str) -> anyhow::Result<()> {
+        let app = self
+            .app
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("AcmeState not installed on App; cannot retry"))?;
+
+        // Load the domain row (we need its auto_issue / dns_provider for
+        // `plan_issuance`).
+        let (domain_row, dns_index_snapshot) = {
+            let conn = app.db.lock().await;
+            let row = pangolin_core::db::get_domain(&conn, domain).map_err(|e| {
+                anyhow::anyhow!("db lookup failed for {}: {}", domain, e)
+            })?;
+            drop(conn);
+            let dns_index = app.dns_index.read().await.clone();
+            (row, dns_index)
+        };
+
+        let d = match domain_row {
+            Some(d) => d,
+            None => anyhow::bail!("domain {} not found", domain),
+        };
+        if !d.auto_issue {
+            anyhow::bail!(
+                "domain {} does not have auto_issue enabled; \
+                 enable it on the Domains page before retrying",
+                domain
+            );
+        }
+
+        // Bump `started_at` so the UI's "x seconds ago" column moves
+        // the moment the operator clicks ↻ — even before `ensure_one`
+        // has a chance to transition the row to `Issuing`.
+        {
+            let conn = app.db.lock().await;
+            let _ = pangolin_core::db::set_cert_status_atomic(
+                &conn,
+                domain,
+                pangolin_core::CertStatus::Pending,
+                None,
+                Some(chrono::Utc::now()),
+            );
+        }
+
+        self.ensure_one(&app, &d, &dns_index_snapshot).await
+    }
+}
 
 /// Long-running ACME renewal loop, run by `runtime::Service`.
 pub struct AcmeService {

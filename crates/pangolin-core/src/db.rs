@@ -507,6 +507,67 @@ pub fn delete_cert(conn: &Connection, domain: &str) -> rusqlite::Result<bool> {
     Ok(n > 0)
 }
 
+/// Insert a `Pending` placeholder cert row for `domain` if and only if no
+/// cert row already exists. Used by `handle_create` immediately after
+/// `upsert_domain` (when `auto_issue=true`) and by `AcmeState::ensure_one`
+/// at the start of every renewal scan, so the admin UI sees a row from
+/// the moment auto-issue is enabled — no vacuum window between domain
+/// creation and the first ACME tick.
+///
+/// Idempotent: if a row exists in any status (Issued, Failed, Skipped,
+/// Pending, Issuing) this is a no-op. The lifecycle is then driven by
+/// `set_cert_status_atomic` from `ensure_one`. Specifically, toggling
+/// `auto_issue=false` does NOT delete the row, and toggling it back on
+/// does NOT reset a prior Failed status — operators see the history
+/// until they explicitly retry or delete.
+///
+/// Returns `true` if a row was inserted, `false` if a row already existed.
+///
+/// `cert_file`/`key_file` are populated with placeholder paths under the
+/// configured cert_dir; the real blob path is written by ACME on success
+/// via `upsert_cert`. Placeholder paths never reach the TLS handshake
+/// because the row's `status` is not `Issued` until then.
+pub fn ensure_pending_cert_row(
+    conn: &Connection,
+    domain: &str,
+    cert_dir: &Path,
+) -> rusqlite::Result<bool> {
+    // Check first — both because we want a precise return value and
+    // because `INSERT OR IGNORE` would silently swallow the conflict
+    // without telling us whether anything changed.
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM certs WHERE domain = ?1",
+            params![domain],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        return Ok(false);
+    }
+    // Placeholder blob path — same convention as `CertManager::resolve_cert`
+    // so that, once ACME writes the real blob, the path matches what TLS
+    // handshake expects to read.
+    let blob_path = cert_dir.join(domain).to_string_lossy().into_owned();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, created_at,
+                            sans, source, issued_at,
+                            status, started_at, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'acme', 0, 'pending', ?6, NULL)",
+        params![
+            domain,
+            blob_path,
+            blob_path,
+            now,
+            serde_json::to_string(&[domain]).unwrap_or_else(|_| "[]".into()),
+            now,
+        ],
+    )?;
+    Ok(true)
+}
+
 // ---- DNS provider CRUD ----
 
 pub fn list_dns_providers(conn: &Connection) -> rusqlite::Result<Vec<DnsProvider>> {
@@ -1252,6 +1313,44 @@ mod tests {
         assert_eq!(counts[&CertStatus::Issued], 2);
         assert_eq!(counts[&CertStatus::Failed], 1);
         assert_eq!(counts[&CertStatus::Skipped], 0);
+    }
+
+    #[test]
+    fn ensure_pending_cert_row_inserts_when_missing() {
+        let conn = make_conn();
+        let dir = std::path::Path::new("/tmp/certs");
+        let inserted =
+            ensure_pending_cert_row(&conn, "new.example.com", dir).unwrap();
+        assert!(inserted);
+        let c = get_cert(&conn, "new.example.com").unwrap().unwrap();
+        assert_eq!(c.status, CertStatus::Pending);
+        assert!(c.started_at.is_some());
+        assert!(c.last_error.is_none());
+        assert_eq!(c.source, "acme");
+        // Placeholder blob path follows CertManager::resolve_cert's
+        // host-named convention so the row's path matches the eventual
+        // ACME-written blob.
+        assert!(c.cert_file.ends_with("/new.example.com"));
+        assert_eq!(c.cert_file, c.key_file);
+    }
+
+    #[test]
+    fn ensure_pending_cert_row_preserves_existing_history() {
+        let conn = make_conn();
+        let dir = std::path::Path::new("/tmp/certs");
+        // Pre-existing Failed row: must NOT be overwritten back to
+        // Pending — the operator needs to see the failure history.
+        upsert_cert(
+            &conn,
+            &make_cert("old.example.com", CertStatus::Failed, Some("boom")),
+        )
+        .unwrap();
+        let inserted =
+            ensure_pending_cert_row(&conn, "old.example.com", dir).unwrap();
+        assert!(!inserted, "second call must be a no-op");
+        let c = get_cert(&conn, "old.example.com").unwrap().unwrap();
+        assert_eq!(c.status, CertStatus::Failed);
+        assert_eq!(c.last_error.as_deref(), Some("boom"));
     }
 
     #[test]

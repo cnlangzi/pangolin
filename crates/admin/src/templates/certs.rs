@@ -12,6 +12,15 @@ pub struct CertsListTemplate<'a> {
     pub certs: Vec<Cert>,
     pub active_nav: &'a str,
     pub now: &'a DateTime<Utc>,
+    /// Raw `?status=` query value, kept so the chip-bar can highlight
+    /// the active selection without re-parsing.
+    pub status_filter_raw: String,
+    pub count_total: usize,
+    pub count_pending: usize,
+    pub count_issuing: usize,
+    pub count_issued: usize,
+    pub count_failed: usize,
+    pub count_skipped: usize,
 }
 
 // ─── New page (GET /certs/new) ──────────────────────────────────────────────────
