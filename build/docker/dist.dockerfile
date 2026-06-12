@@ -25,8 +25,8 @@ RUN mkdir -p bin && \
     curl -fsSL -o bin/tailwindcss \
         https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
     chmod +x bin/tailwindcss && \
-    curl -fsSL https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.0.tgz | \
-    tar -xzOf - package/bin/esbuild > bin/esbuild && \
+    curl -fsSL -o bin/esbuild \
+        https://cdn.jsdelivr.net/npm/@esbuild/linux-x64@0.28.0/bin/esbuild && \
     chmod +x bin/esbuild
 
 # ── Stage B: produce recipe.json ───────────────────────────────────────────
