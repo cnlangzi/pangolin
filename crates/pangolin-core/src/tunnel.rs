@@ -63,11 +63,10 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::sync::Arc;
 
 use fastwebsockets::{Frame, OpCode, Payload, WebSocket};
-use futures_util::StreamExt;
 use log::debug;
 use std::task::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 pub use tokio_yamux as yamux;
 use yamux::{Config as YamuxConfig, Session, StreamHandle};
@@ -92,9 +91,10 @@ pub enum TunnelRole {
 /// of the code we own (not a yamux-default that could change
 /// between versions).
 fn yamux_config() -> YamuxConfig {
-    let mut cfg = YamuxConfig::default();
-    cfg.max_stream_count = 4096;
-    cfg
+    YamuxConfig {
+        max_stream_count: 4096,
+        ..YamuxConfig::default()
+    }
 }
 
 /// A live tunnel: yamux session over a fastwebsockets
@@ -169,7 +169,7 @@ impl YamuxTunnel {
             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "tunnel closed"))?;
         match reply_rx.await {
             Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(Error::new(ErrorKind::Other, format!("open_stream: {e}"))),
+            Ok(Err(e)) => Err(Error::other(format!("open_stream: {e}"))),
             Err(_) => Err(Error::new(ErrorKind::BrokenPipe, "open_stream: no reply")),
         }
     }
@@ -183,10 +183,7 @@ impl YamuxTunnel {
         }
         match reply_rx.await {
             Ok(Ok(s)) => Some(Ok(s)),
-            Ok(Err(e)) => Some(Err(Error::new(
-                ErrorKind::Other,
-                format!("accept_stream: {e}"),
-            ))),
+            Ok(Err(e)) => Some(Err(Error::other(format!("accept_stream: {e}")))),
             Err(_) => None,
         }
     }
@@ -289,10 +286,7 @@ async fn session_driver(
                         // Surface the error to the next
                         // pending acceptor and continue.
                         if let Some(reply) = pending_accepts.pop_front() {
-                            let _ = reply.send(Err(Error::new(
-                                ErrorKind::Other,
-                                format!("accept error: {_e}"),
-                            )));
+                            let _ = reply.send(Err(Error::other(format!("accept error: {_e}"))));
                         }
                     }
                     None => break,

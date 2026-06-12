@@ -575,10 +575,10 @@ impl ProxyHttp for AppProxy {
 fn parse_status_from_line(status_line: &str) -> u16 {
     let mut parts = status_line.splitn(3, ' ');
     let _version = parts.next();
-    match parts.next().and_then(|s| s.parse::<u16>().ok()) {
-        Some(n) => n,
-        None => 502,
-    }
+    parts
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(502)
 }
 
 /// Extract the effective host from the request, preferring the
