@@ -275,7 +275,264 @@ async fn real_e2e_tunnel_http_request_through_tun() {
     );
 }
 
-/// `file:///` backend reached via the tunnel (not just direct).
+/// **Regression test for the GET-without-Content-Length hang.**
+///
+/// Symptom (from production): `curl -v http://yaitoo.cn` against a
+/// site whose backend is `tun:http://127.0.0.1:9020` hangs forever —
+/// `pangolin-ngx` logs `PROXY: Tunnel routing: yaitoo.cn → tun local`
+/// and then nothing further, while the yamux session emits its 30 s
+/// keep-alive pings.
+///
+/// Cause: `AppProxy::request_filter` was calling
+/// `session.read_body_or_idle(false).await` to grab the request body
+/// before opening the yamux stream. `read_body_or_idle` is pingora's
+/// internal body-pump primitive; on a body-less request (no
+/// `Content-Length`, no `Transfer-Encoding`) it deliberately stays
+/// pending forever waiting for FIN, because in pingora's normal flow
+/// it sits inside a `select!` whose other branch handles the
+/// upstream-write side. Awaiting it sequentially is a deadlock — the
+/// request body bytes never come, and FIN never arrives because curl
+/// is also waiting on the response.
+///
+/// Why the existing tunnel e2e suite missed it: `harness::raw_request`
+/// always emits `Content-Length: 0`, which makes pingora initialise
+/// the body reader with `cl=0` and return `Ok(None)` on the first
+/// poll. Real curl GETs ship no body-framing headers at all, taking
+/// the `cl=None` → idle-wait branch (RFC 9112 §6.3) that hangs.
+///
+/// Fix: switch to `session.read_request_body()` in a loop. That call
+/// returns `Ok(None)` immediately when there is no more body to read,
+/// regardless of which header path pingora initialised. The loop is
+/// because chunked or streamed bodies arrive as multiple chunks.
+///
+/// This test uses `raw_request_no_content_length` — a deliberately
+/// header-minimal request — to mirror what curl actually puts on the
+/// wire. A regression that re-introduces `read_body_or_idle(false)`
+/// (or any other call that idles on FIN) trips the 5 s read timeout
+/// in the helper and fails the test rather than hanging the suite.
+#[tokio::test]
+async fn real_e2e_tunnel_get_without_content_length() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // GET with NO `Content-Length`, NO `Transfer-Encoding`, NO body.
+    // Pre-fix this hung the entire request flow; the 5 s read timeout
+    // in `raw_request_no_content_length` would surface it as a panic.
+    let (status, body) =
+        crate::harness::raw_request_no_content_length(&addr, "office.test", "GET", "/").await;
+
+    assert_eq!(
+        status,
+        200,
+        "GET without Content-Length must complete (not hang). \
+         got status={status}, body={body:?}. ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Backend must have actually received the request — proves ngx
+    // forwarded it through the tun rather than silently dropping it
+    // on the way.
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have seen exactly 1 request, saw {}. ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].path, "/");
+}
+
+/// **Regression test for the HTTPS+H2 → tunnel path-construction bug.**
+///
+/// Symptom (from production): `curl http://yaitoo.cn` works, but
+/// `curl https://yaitoo.cn` returns HTTP/2 404 with body
+/// `404 page not found` (Go `http.NotFound`'s signature: 19 bytes,
+/// `content-type: text/plain; charset=utf-8`,
+/// `x-content-type-options: nosniff`). TLS, ALPN, cert, routing all
+/// look fine — the backend simply doesn't recognise the path it
+/// received.
+///
+/// Cause: `AppProxy::request_filter` was building the tunnel-side URL
+/// from `session.req_header().uri.to_string()`. That call does NOT
+/// round-trip across HTTP/1.1 and HTTP/2:
+///
+///   * H1 `GET /api HTTP/1.1` → `uri.to_string() == "/api"`.
+///   * H2 `:scheme=https`, `:authority=yaitoo.cn`, `:path=/api` →
+///     pingora reconstructs an absolute-form URI, so
+///     `uri.to_string() == "https://yaitoo.cn/api"`.
+///
+/// The proxy then concatenated that onto the backend prefix, giving
+/// `http://127.0.0.1:9020/https://yaitoo.cn/api` — a path the backend
+/// has never heard of, hence 404.
+///
+/// Fix: use `uri.path_and_query()` (always path-only,
+/// regardless of how the request arrived) when building the tunnel
+/// target.
+///
+/// Why this test catches it: we drive a real HTTPS+H2 request through
+/// curl (`--http2 --http2-prior-knowledge`) against the proxy's TLS
+/// port. The mock backend records the path it actually received; the
+/// assertion `path == "/api/profile"` (not `path ==
+/// "/https://office.test/api/profile"`) fails immediately on the
+/// pre-fix proxy.
+#[tokio::test]
+async fn real_e2e_tunnel_h2_path_preserved() {
+    use std::process::Stdio;
+
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // Generate a self-signed ECDSA cert for `office.test` and install
+    // it as `{cert_dir}/office.test` in autocert DirCache blob layout
+    // (key PEM, then cert chain). Mirrors `real_e2e_h2_authority_fallback`
+    // — the cert pipeline doesn't care that the request is going through
+    // the tunnel rather than direct backend.
+    let cert_dir = ngx.cert_dir();
+    let cert_path = cert_dir.join("office.test");
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "/tmp/office_tunnel.key",
+            "-out",
+            "/tmp/office_tunnel.crt",
+            "-days",
+            "36500",
+            "-subj",
+            "/CN=office.test",
+        ])
+        .status()
+        .expect("spawn openssl");
+    assert!(status.success(), "openssl cert generation failed");
+    let key = std::fs::read_to_string("/tmp/office_tunnel.key").expect("read key");
+    let crt = std::fs::read_to_string("/tmp/office_tunnel.crt").expect("read crt");
+    std::fs::write(
+        &cert_path,
+        format!("{}\n{}", key.trim_end(), crt.trim_end()),
+    )
+    .expect("write cert blob");
+
+    // `--http2 --http2-prior-knowledge` skips the H1→H2 upgrade and
+    // ships native H2 framing from the first byte, exercising the
+    // pseudo-header → URI reconstruction path that hides the bug.
+    // `--resolve` so we don't touch /etc/hosts; `--insecure` because
+    // the cert is self-signed.
+    let url = format!("https://office.test:{}/api/profile?id=42", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--http2")
+        .arg("--http2-prior-knowledge")
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("--resolve")
+        .arg(format!("office.test:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn curl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (_body, meta) = stdout.split_once("HTTP_CODE:").unwrap_or_else(|| {
+        panic!(
+            "curl did not emit HTTP_CODE marker. exit={:?}\nstdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+            output.status,
+            ngx.log_string()
+        )
+    });
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    assert_eq!(
+        status,
+        200,
+        "HTTPS+H2 → tunnel should return 200, got {status}. \
+         If 404, the proxy probably built the backend URL from a full \
+         URI (https://office.test/api/profile?id=42) and the backend \
+         didn't recognise it. stdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // The decisive assertion: the backend must have seen the path
+    // exactly as the client sent it, NOT `/https://office.test/...`.
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have seen exactly 1 request, saw {}. ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+    assert_eq!(
+        seen[0].path, "/api/profile",
+        "H2 path leaked through unchanged: the proxy must use path_and_query() \
+         (not uri.to_string()) when building the tunnel target, otherwise the \
+         backend sees `/https://office.test/api/profile`. Actual: {:?}",
+        seen[0].path
+    );
+    assert_eq!(
+        seen[0].query, "id=42",
+        "H2 query string must reach the backend byte-exact"
+    );
+}
+
 ///
 /// Regression test for the static-file path through the tunnel.
 /// With the new `tun::client::proxy_request` accepting `file:///`

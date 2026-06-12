@@ -99,6 +99,43 @@ pub async fn raw_request(
     path: &str,
     body: &[u8],
 ) -> (u16, String) {
+    raw_request_inner(
+        addr, host, method, path, body, /* send_content_length */ true,
+    )
+    .await
+}
+
+/// Issue a raw HTTP/1.1 request **without** a `Content-Length` header.
+///
+/// `raw_request` always emits `Content-Length: 0`, which is enough to
+/// keep the existing test suite green but **masks a real bug**: a
+/// genuine curl GET ships zero body-framing headers, and the proxy
+/// must still treat that as "no body". This helper exercises exactly
+/// that path, mirroring what `curl -v http://…` puts on the wire.
+pub async fn raw_request_no_content_length(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> (u16, String) {
+    raw_request_inner(
+        addr, host, method, path, b"", /* send_content_length */ false,
+    )
+    .await
+}
+
+/// Shared low-level path for the two `raw_request*` helpers. The only
+/// thing they vary on is whether the `Content-Length` framing header
+/// is emitted; everything else (timeout, headers, response parsing)
+/// is the same.
+async fn raw_request_inner(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    send_content_length: bool,
+) -> (u16, String) {
     let timeout = Duration::from_secs(5);
 
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
@@ -106,10 +143,13 @@ pub async fn raw_request(
         .expect("connect to addr (5s timeout)")
         .expect("connect to addr");
 
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\nAccept: */*\r\nContent-Length: {len}\r\n\r\n",
-        len = body.len()
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\nAccept: */*\r\n",
     );
+    if send_content_length {
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    req.push_str("\r\n");
     stream
         .write_all(req.as_bytes())
         .await

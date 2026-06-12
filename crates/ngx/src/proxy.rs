@@ -193,7 +193,17 @@ impl ProxyHttp for AppProxy {
             if let Some(tunnel) = tunnel {
                 debug!("Tunnel routing: {} → tun {}", host, tun_name);
                 let method = session.req_header().method.as_str().to_string();
-                let req_path = session.req_header().uri.to_string();
+                // path_and_query() (not uri.to_string()) so H1 and H2
+                // produce the same on-the-wire path. H2's URI is
+                // absolute-form, so to_string() returns
+                // "https://host/path" and the backend gets 404. See
+                // `real_e2e_tunnel_h2_path_preserved`.
+                let req_path = session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
                 let full_url = format!(
                     "{}{}",
                     url.trim_end_matches('/'),
@@ -204,16 +214,23 @@ impl ProxyHttp for AppProxy {
                     }
                 );
 
-                // Read body first.
-                let body_bytes = match session.read_body_or_idle(false).await {
-                    Ok(Some(data)) => data.to_vec(),
-                    Ok(None) => Vec::new(),
-                    Err(e) => {
-                        error!("failed to read request body: {}", e);
-                        let _ = session.respond_error(400).await;
-                        return Ok(true);
+                // read_request_body() (not read_body_or_idle()): the
+                // latter is pingora's internal body-pump primitive and
+                // stays pending forever on a body-less keep-alive
+                // request (e.g. curl GET with no Content-Length). See
+                // `real_e2e_tunnel_get_without_content_length`.
+                let mut body_bytes = Vec::new();
+                loop {
+                    match session.read_request_body().await {
+                        Ok(Some(data)) => body_bytes.extend_from_slice(&data),
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("failed to read request body: {}", e);
+                            let _ = session.respond_error(400).await;
+                            return Ok(true);
+                        }
                     }
-                };
+                }
 
                 // Build the HTTP/1.1 request bytes.
                 let mut headers: Vec<(String, String)> = Vec::new();

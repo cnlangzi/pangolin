@@ -34,3 +34,7 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `figment::Jail` lives behind the `test` feature flag — used by the
+# config tests to sandbox `NGX_*` env vars that the Makefile's
+# `.env`-export step would otherwise leak in.
+figment = { workspace = true, features = ["test"] }

@@ -125,15 +125,20 @@ pub fn validate(c: &TunConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // `figment::Jail` returns `Result<(), figment::Error>` from its
+    // closure; the Err variant is large, but it's test-only code so
+    // we silence the lint.
+    #![allow(clippy::result_large_err)]
     use super::*;
-    use std::sync::Mutex;
 
-    // Env vars are process-global, but cargo runs tests in parallel
-    // by default. Every test that touches TUN_TOKEN / TUN_LOG__LEVEL
-    // must hold this mutex for its full duration (set → load →
-    // assert → remove) so a parallel runner never sees a leaked
-    // value.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Tests that exercise `TunConfig::from_str` are wrapped in
+    // `figment::Jail::expect_with`. The jail (a) clears the ambient
+    // env so a leaked `TUN_*` from the developer's shell or the
+    // Makefile's `.env`-export can't pollute the YAML expectations,
+    // and (b) holds a process-wide lock so parallel tests don't race
+    // on env state. This replaces the hand-rolled `ENV_LOCK` mutex
+    // the file used to keep and the `std::env::set_var` /
+    // `std::env::remove_var` dance that ignored ambient state.
 
     #[test]
     fn default_config_uses_empty_required_fields() {
@@ -149,146 +154,181 @@ mod tests {
 
     #[test]
     fn parse_minimal_yaml() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let s = r#"
-            server: gateway.local:8080
-            token: "secret-abc"
-            name: office
-        "#;
-        let c = TunConfig::from_str(s).unwrap();
-        assert_eq!(c.server, "gateway.local:8080");
-        assert_eq!(c.token, "secret-abc");
-        assert_eq!(c.name, "office");
-        assert_eq!(c.log.level, "info");
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: "secret-abc"
+                name: office
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            assert_eq!(c.server, "gateway.local:8080");
+            assert_eq!(c.token, "secret-abc");
+            assert_eq!(c.name, "office");
+            assert_eq!(c.log.level, "info");
+            Ok(())
+        });
     }
 
     #[test]
     fn parse_full_yaml() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let s = r#"
-            server: gateway.example.com:8443
-            token: file-token
-            name: home
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.example.com:8443
+                token: file-token
+                name: home
 
-            log:
-              level: debug
-              file: "/var/log/pangolin-tun.log"
-        "#;
-        // Env override beats the file value: TUN_TOKEN wins over
-        // `token: file-token`.
-        std::env::set_var("TUN_TOKEN", "injected-token");
-        let c = TunConfig::from_str(s).unwrap();
-        std::env::remove_var("TUN_TOKEN");
-        assert_eq!(c.server, "gateway.example.com:8443");
-        assert_eq!(c.token, "injected-token");
-        assert_eq!(c.name, "home");
-        assert_eq!(c.log.level, "debug");
-        assert_eq!(c.log.file, "/var/log/pangolin-tun.log");
+                log:
+                  level: debug
+                  file: "/var/log/pangolin-tun.log"
+            "#;
+            // Env override beats the file value: TUN_TOKEN wins over
+            // `token: file-token`. `jail.set_env` is scoped to the
+            // jail's lifetime — no manual cleanup needed.
+            jail.set_env("TUN_TOKEN", "injected-token");
+            let c = TunConfig::from_str(s).unwrap();
+            assert_eq!(c.server, "gateway.example.com:8443");
+            assert_eq!(c.token, "injected-token");
+            assert_eq!(c.name, "home");
+            assert_eq!(c.log.level, "debug");
+            assert_eq!(c.log.file, "/var/log/pangolin-tun.log");
+            Ok(())
+        });
     }
 
     #[test]
     fn tls_section_optional_and_defaults_to_plaintext() {
         // Commit 0 schema extension: `tls` is optional. Without it,
         // the tun speaks plaintext ws://.
-        let s = r#"
-            server: gateway.example.com:9001
-            token: t
-            name: home
-        "#;
-        let c = TunConfig::from_str(s).unwrap();
-        assert!(c.tls.is_none(), "no tls: tun should use plaintext ws://");
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.example.com:9001
+                token: t
+                name: home
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            assert!(c.tls.is_none(), "no tls: tun should use plaintext ws://");
+            Ok(())
+        });
     }
 
     #[test]
     fn tls_section_parses_with_verify_and_ca_file() {
-        let s = r#"
-            server: gateway.example.com:9443
-            token: t
-            name: home
-            tls:
-              verify: true
-              ca_file: /etc/pangolin/ca.pem
-        "#;
-        let c = TunConfig::from_str(s).unwrap();
-        let tls = c.tls.expect("tls section must parse when present");
-        assert!(tls.verify);
-        assert_eq!(tls.ca_file.as_deref(), Some("/etc/pangolin/ca.pem"));
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.example.com:9443
+                token: t
+                name: home
+                tls:
+                  verify: true
+                  ca_file: /etc/pangolin/ca.pem
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            let tls = c.tls.expect("tls section must parse when present");
+            assert!(tls.verify);
+            assert_eq!(tls.ca_file.as_deref(), Some("/etc/pangolin/ca.pem"));
+            Ok(())
+        });
     }
 
     #[test]
     fn tls_section_parses_with_verify_false_no_ca_file() {
         // `verify: false` is the dev-mode "accept any cert" stance.
-        let s = r#"
-            server: gateway.example.com:9443
-            token: t
-            name: home
-            tls:
-              verify: false
-        "#;
-        let c = TunConfig::from_str(s).unwrap();
-        let tls = c.tls.unwrap();
-        assert!(!tls.verify);
-        assert!(tls.ca_file.is_none());
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.example.com:9443
+                token: t
+                name: home
+                tls:
+                  verify: false
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            let tls = c.tls.unwrap();
+            assert!(!tls.verify);
+            assert!(tls.ca_file.is_none());
+            Ok(())
+        });
     }
 
     #[test]
     fn env_overrides_nested_log_level() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // TUN_LOG__LEVEL splits on `__` → `log.level`.
-        let s = r#"
-            server: x:1
-            token: t
-            name: office
-        "#;
-        std::env::set_var("TUN_LOG__LEVEL", "warn");
-        let c = TunConfig::from_str(s).unwrap();
-        std::env::remove_var("TUN_LOG__LEVEL");
-        assert_eq!(c.log.level, "warn");
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: x:1
+                token: t
+                name: office
+            "#;
+            jail.set_env("TUN_LOG__LEVEL", "warn");
+            let c = TunConfig::from_str(s).unwrap();
+            assert_eq!(c.log.level, "warn");
+            Ok(())
+        });
     }
 
     #[test]
     fn rejects_invalid_name() {
-        let s = r#"
-            server: x:1
-            token: t
-            name: "Office"
-        "#;
-        let err = TunConfig::from_str(s).unwrap_err().to_string();
-        assert!(err.contains("lowercase"), "unexpected: {}", err);
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: x:1
+                token: t
+                name: "Office"
+            "#;
+            let err = TunConfig::from_str(s).unwrap_err().to_string();
+            assert!(err.contains("lowercase"), "unexpected: {}", err);
+            Ok(())
+        });
     }
 
     #[test]
     fn rejects_purely_numeric_name() {
-        let s = r#"
-            server: x:1
-            token: t
-            name: "12345"
-        "#;
-        let err = TunConfig::from_str(s).unwrap_err().to_string();
-        assert!(err.contains("purely numeric"), "unexpected: {}", err);
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: x:1
+                token: t
+                name: "12345"
+            "#;
+            let err = TunConfig::from_str(s).unwrap_err().to_string();
+            assert!(err.contains("purely numeric"), "unexpected: {}", err);
+            Ok(())
+        });
     }
 
     #[test]
     fn rejects_empty_token() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let s = r#"
-            server: x:1
-            token: ""
-            name: office
-        "#;
-        let err = TunConfig::from_str(s).unwrap_err().to_string();
-        assert!(err.contains("token"), "unexpected: {}", err);
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: x:1
+                token: ""
+                name: office
+            "#;
+            let err = TunConfig::from_str(s).unwrap_err().to_string();
+            assert!(err.contains("token"), "unexpected: {}", err);
+            Ok(())
+        });
     }
 
     #[test]
     fn rejects_empty_server() {
-        let s = r#"
-            server: ""
-            token: t
-            name: office
-        "#;
-        let err = TunConfig::from_str(s).unwrap_err().to_string();
-        assert!(err.contains("server"), "unexpected: {}", err);
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: ""
+                token: t
+                name: office
+            "#;
+            let err = TunConfig::from_str(s).unwrap_err().to_string();
+            assert!(err.contains("server"), "unexpected: {}", err);
+            Ok(())
+        });
     }
 
     #[test]

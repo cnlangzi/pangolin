@@ -369,6 +369,12 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    // `figment::Jail::expect_with`'s closure returns `Result<(),
+    // figment::Error>`. clippy flags the large Err variant
+    // (`result_large_err`), but we don't care about it in tests —
+    // the figment API is what it is, and these results are not
+    // propagated through hot paths.
+    #![allow(clippy::result_large_err)]
     use super::*;
 
     #[test]
@@ -411,61 +417,72 @@ mod tests {
     #[test]
     fn parse_addr_overrides() {
         // Operators can override just one of the two addresses.
-        let s = r#"
-            addr:
-              https: ":0"
-        "#;
-        let c = Config::from_str(s).unwrap();
-        assert_eq!(c.addr.http, "0.0.0.0:80"); // default
-        assert_eq!(c.addr.https, ":0"); // disabled
+        // Wrap in `figment::Jail` so that an ambient `NGX_*` from the
+        // shell `.env` (auto-exported by the Makefile) doesn't leak
+        // into the env layer and clobber the YAML expectations.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                addr:
+                  https: ":0"
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert_eq!(c.addr.http, "0.0.0.0:80"); // default
+            assert_eq!(c.addr.https, ":0"); // disabled
+            Ok(())
+        });
     }
 
     #[test]
     fn parse_full_yaml() {
-        let s = r#"
-            addr:
-              http: "0.0.0.0:80"
-              https: "0.0.0.0:443"
-            workers: 4
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                addr:
+                  http: "0.0.0.0:80"
+                  https: "0.0.0.0:443"
+                workers: 4
 
-            tunnel:
-              addr: "0.0.0.0:9001"
-              ws_path: "/tunnel"
+                tunnel:
+                  addr: "0.0.0.0:9001"
+                  ws_path: "/tunnel"
 
-            admin:
-              username: "root"
-              password: "secret"
+                admin:
+                  username: "root"
+                  password: "secret"
 
-            cache:
-              enabled: true
-              dir: "/var/cache/pangolin"
+                cache:
+                  enabled: true
+                  dir: "/var/cache/pangolin"
 
-            acme:
-              email: "ops@example.com"
-              cert_dir: "/etc/pangolin/certs"
-              acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
-              renew_threshold_days: 14
-              renew_check_interval_hours: 12
-              renew_max_retries: 5
-              key_type: "rsa"
+                acme:
+                  email: "ops@example.com"
+                  cert_dir: "/etc/pangolin/certs"
+                  acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
+                  renew_threshold_days: 14
+                  renew_check_interval_hours: 12
+                  renew_max_retries: 5
+                  key_type: "rsa"
 
-            log:
-              level: "debug"
-              file: "/var/log/pangolin.log"
-        "#;
-        let c = Config::from_str(s).unwrap();
-        assert_eq!(c.workers, Some(4));
-        assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
-        assert_eq!(c.tunnel.ws_path, "/tunnel");
-        assert_eq!(c.admin.username, "root");
-        assert!(c.cache.enabled);
-        assert_eq!(c.acme.renew_threshold_days, 14);
-        assert_eq!(c.acme.key_type, "rsa");
-        assert_eq!(
-            c.acme.acme_directory,
-            "https://acme-staging-v02.api.letsencrypt.org/directory"
-        );
-        assert_eq!(c.log.level, "debug");
+                log:
+                  level: "debug"
+                  file: "/var/log/pangolin.log"
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert_eq!(c.workers, Some(4));
+            assert_eq!(c.tunnel.addr, "0.0.0.0:9001");
+            assert_eq!(c.tunnel.ws_path, "/tunnel");
+            assert_eq!(c.admin.username, "root");
+            assert!(c.cache.enabled);
+            assert_eq!(c.acme.renew_threshold_days, 14);
+            assert_eq!(c.acme.key_type, "rsa");
+            assert_eq!(
+                c.acme.acme_directory,
+                "https://acme-staging-v02.api.letsencrypt.org/directory"
+            );
+            assert_eq!(c.log.level, "debug");
+            Ok(())
+        });
     }
 
     #[test]
@@ -476,12 +493,16 @@ mod tests {
 
     #[test]
     fn key_type_explicit_rsa() {
-        let s = r#"
-            acme:
-              key_type: rsa
-        "#;
-        let c = Config::from_str(s).unwrap();
-        assert_eq!(c.acme.key_type, "rsa");
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                acme:
+                  key_type: rsa
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert_eq!(c.acme.key_type, "rsa");
+            Ok(())
+        });
     }
 
     #[test]
@@ -489,14 +510,18 @@ mod tests {
         // Operators who want the old "tun is local-only" semantics
         // (e.g. dev or SSH-tunnel production) can override to
         // 127.0.0.1:9001.
-        let s = r#"
-            tunnel:
-              addr: "127.0.0.1:9001"
-              ws_path: /tunnel
-        "#;
-        let c = Config::from_str(s).unwrap();
-        assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
-        assert_eq!(c.tunnel.ws_path, "/tunnel");
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                tunnel:
+                  addr: "127.0.0.1:9001"
+                  ws_path: /tunnel
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
+            assert_eq!(c.tunnel.ws_path, "/tunnel");
+            Ok(())
+        });
     }
 
     #[test]
