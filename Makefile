@@ -29,7 +29,10 @@ ENV_FILE := .env
 ifeq ($(wildcard $(ENV_FILE)),)
 ENV_LOAD :=
 else
-ENV_LOAD := set -a; . $(ENV_FILE); set +a;
+# `./$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves it as a
+# path instead of searching `$PATH` — otherwise `/bin/sh: .env: No such
+# file or directory` even when the file is right there.
+ENV_LOAD := set -a; . ./$(ENV_FILE); set +a;
 include $(ENV_FILE)
 export
 endif
@@ -251,9 +254,11 @@ play-tun:
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
 start-ngx: build-ui build-ngx
+	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; exit 1; fi
 	$(ENV_LOAD) ./bin/pangolin-ngx
 
 start-tun: build-tun
+	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; exit 1; fi
 	$(ENV_LOAD) ./bin/pangolin-tun
 
 # Debug helper: show which env vars are being injected. Useful for
