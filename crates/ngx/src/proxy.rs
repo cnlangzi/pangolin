@@ -193,7 +193,30 @@ impl ProxyHttp for AppProxy {
             if let Some(tunnel) = tunnel {
                 debug!("Tunnel routing: {} → tun {}", host, tun_name);
                 let method = session.req_header().method.as_str().to_string();
-                let req_path = session.req_header().uri.to_string();
+                // `uri.to_string()` does NOT round-trip cleanly across
+                // HTTP/1.1 and HTTP/2:
+                //
+                //   * H1: `GET /api?x=1 HTTP/1.1` → `uri.to_string()`
+                //     returns `"/api?x=1"` (path + query only).
+                //   * H2: pingora reconstructs the URI from `:scheme`,
+                //     `:authority`, `:path` pseudo-headers, so the same
+                //     request lands with `uri.to_string() ==
+                //     "https://yaitoo.cn/api?x=1"` (absolute form).
+                //
+                // The tunnel then builds the backend URL by concatenating
+                // it onto the configured backend prefix, giving
+                // `http://127.0.0.1:9020/https://yaitoo.cn/api?x=1` for
+                // HTTPS requests — which the backend's router answers
+                // with 404. Use `path_and_query()` so both versions
+                // produce the same on-the-wire path. See
+                // `real_e2e_tunnel_h2_path_preserved` for the regression
+                // test.
+                let req_path = session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
                 let full_url = format!(
                     "{}{}",
                     url.trim_end_matches('/'),
