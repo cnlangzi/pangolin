@@ -37,7 +37,20 @@ include $(ENV_FILE)
 export
 endif
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+# Fail-loud guard for targets that need $(ENV_FILE) to be present.
+# Centralized so the error wording and exit behavior stay consistent
+# across every consumer of $(ENV_LOAD) — see the audit comment above
+# the ifeq block for why this is a prerequisite everywhere, including
+# the Ansible play-* targets (Ansible silently falls back to inventory
+# defaults when no env vars are set, which would mask misconfig).
+.PHONY: require-env
+require-env:
+	@if [ ! -f $(ENV_FILE) ]; then \
+		echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; \
+		exit 1; \
+	fi
+
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
@@ -148,7 +161,7 @@ download-ui-tools:
 	fi; \
 	if [ ! -x bin/tailwindcss ]; then \
 		echo "Downloading tailwindcss v3.4.17 for $$TAILWIND_PLATFORM (from GitHub releases)..."; \
-		if ! curl -fsSL -o bin/tailwindcss.tmp \
+		if ! curl -fL --progress-bar -C - -o bin/tailwindcss.tmp \
 			"https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-$$TAILWIND_PLATFORM"; then \
 			echo "  ERROR: failed to download tailwindcss" >&2; \
 			rm -f bin/tailwindcss.tmp; \
@@ -159,16 +172,13 @@ download-ui-tools:
 		echo "  tailwindcss downloaded"; \
 	fi; \
 	if [ ! -x bin/esbuild ]; then \
-		echo "Downloading esbuild v0.28.0 for $$ESBUILD_PACKAGE (from npm registry)..."; \
-		NPM_PACKAGE=$$(echo "$$ESBUILD_PACKAGE" | sed 's/@/%40/g' | sed 's/\//%2F/g'); \
-		if ! curl -fsSL -o bin/esbuild.tgz \
-			"https://registry.npmjs.org/$$ESBUILD_PACKAGE/-/$${ESBUILD_PACKAGE##*/}-0.28.0.tgz"; then \
+		echo "Downloading esbuild v0.28.0 for $$ESBUILD_PACKAGE (via jsDelivr)..."; \
+		if ! curl -fL --progress-bar -C - -o bin/esbuild.tmp \
+			"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@0.28.0/bin/esbuild"; then \
 			echo "  ERROR: failed to download esbuild" >&2; \
-			rm -f bin/esbuild.tgz; \
+			rm -f bin/esbuild.tmp; \
 			exit 1; \
 		fi; \
-		tar -xzOf bin/esbuild.tgz package/bin/esbuild > bin/esbuild.tmp; \
-		rm -f bin/esbuild.tgz; \
 		chmod +x bin/esbuild.tmp; \
 		mv bin/esbuild.tmp bin/esbuild; \
 		echo "  esbuild downloaded"; \
@@ -190,9 +200,13 @@ debian:
 dist:
 	./build/dist.sh
 
+# Preserve downloaded UI tools (./bin/tailwindcss, ./bin/esbuild) so a
+# `make clean` doesn't trigger a re-download — only remove the locally
+# built pangolin-* binaries.  Downloaded CLIs are restored by
+# `make download-ui-tools` (or implicitly via `build-ui`).
 clean:
 	rm -rf ./build/output
-	rm -rf ./bin
+	rm -f ./bin/pangolin-ngx ./bin/pangolin-tun
 	$(CARGO) clean
 
 # ── Lint / Test ──────────────────────────────────────────────────────────────
@@ -238,12 +252,10 @@ play: play-ngx play-tun
 # `{{ ngx_admin_password }}` template substitutions without touching
 # `deploy/playbooks/hosts`. `ANSIBLE_LOAD_CALLBACK_PLUGINS=1` is not
 # needed — plain env vars are auto-injected by Ansible since 2.x.
-play-ngx:
-	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; fi
+play-ngx: require-env
 	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./ngx.yml -i hosts
 
-play-tun:
-	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; fi
+play-tun: require-env
 	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./tun.yml -i hosts
 
 # ── Local Run (no sudo) ───────────────────────────────────────────────────────
@@ -253,21 +265,15 @@ play-tun:
 # `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
-start-ngx: build-ui build-ngx
-	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; exit 1; fi
+start-ngx: build-ui build-ngx require-env
 	$(ENV_LOAD) ./bin/pangolin-ngx
 
-start-tun: build-tun
-	@if [ ! -f $(ENV_FILE) ]; then echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; exit 1; fi
+start-tun: build-tun require-env
 	$(ENV_LOAD) ./bin/pangolin-tun
 
 # Debug helper: show which env vars are being injected. Useful for
 # "why isn't my .env value reaching the binary?" questions.
-env-show:
-	@if [ ! -f $(ENV_FILE) ]; then \
-		echo "$(ENV_FILE) not found — copy .env.example to .env first"; \
-		exit 1; \
-	fi
+env-show: require-env
 	@echo "Loaded from $(ENV_FILE):"
 	@grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'
 
