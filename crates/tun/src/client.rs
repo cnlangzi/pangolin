@@ -177,49 +177,51 @@ impl TunnelClient {
             let mut batch: Vec<TunnelResponseFrame> = Vec::with_capacity(64);
             let mut flush_interval = tokio::time::interval(Duration::from_millis(BATCH_DELAY_MS));
 
-            loop {
+            // Drain the current batch over the WS. Returns `false` if
+            // the underlying send errors (in which case the caller
+            // exits the loop and abandons the channel).
+            let mut alive = true;
+            while alive {
                 tokio::select! {
                     Some(resp) = batch_rx.recv() => {
                         batch.push(resp);
-                        // Flush immediately once batch reaches capacity
-                        if batch.len() >= 64 {
-                            for frame in batch.drain(..).map(TunnelFrame::Res) {
-                                if let Ok(buf) = serialize_msgpack(&frame) {
-                                    let compressed = deflate_encode(&buf);
-                                    let mut sender = ws_sender_batch.lock().await;
-                                    if sender.send(tungstenite::Message::Binary(compressed.into())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
+                        if batch.len() < 64 {
+                            continue;
                         }
                     }
                     _ = flush_interval.tick() => {
                         if batch.is_empty() {
                             continue;
                         }
-                        for frame in batch.drain(..).map(TunnelFrame::Res) {
-                            if let Ok(buf) = serialize_msgpack(&frame) {
-                                let compressed = deflate_encode(&buf);
-                                let mut sender = ws_sender_batch.lock().await;
-                                if sender.send(tungstenite::Message::Binary(compressed.into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
                     }
                 }
-            }
-            // Drain remaining on exit
-            if !batch.is_empty() {
+                // Flush the current batch.
+                let mut send_failed = false;
                 for frame in batch.drain(..).map(TunnelFrame::Res) {
                     if let Ok(buf) = serialize_msgpack(&frame) {
                         let compressed = deflate_encode(&buf);
-                        let mut sender = ws_sender_batch.lock().await;
-                        let _ = sender
-                            .send(tungstenite::Message::Binary(compressed.into()))
-                            .await;
+                        let mut s = ws_sender_batch.lock().await;
+                        if s.send(tungstenite::Message::Binary(compressed.into()))
+                            .await
+                            .is_err()
+                        {
+                            send_failed = true;
+                            break;
+                        }
                     }
+                }
+                if send_failed {
+                    alive = false;
+                }
+            }
+            // Best-effort drain of any remaining frames on exit.
+            for frame in batch.drain(..).map(TunnelFrame::Res) {
+                if let Ok(buf) = serialize_msgpack(&frame) {
+                    let compressed = deflate_encode(&buf);
+                    let mut s = ws_sender_batch.lock().await;
+                    let _ = s
+                        .send(tungstenite::Message::Binary(compressed.into()))
+                        .await;
                 }
             }
         });
@@ -428,9 +430,7 @@ impl TunnelClient {
         // Fallback for legacy frames that only carry a bare path (e.g. "/"):
         // use Host header to build a local http:// URL so old behaviour is preserved.
         let path = req.path.as_str();
-        let backend_url = if path.starts_with("http://")
-            || path.starts_with("https://")
-        {
+        let backend_url = if path.starts_with("http://") || path.starts_with("https://") {
             // HTTP/HTTPS: proxy via reqwest as usual
             path.to_string()
         } else if path.starts_with("file:///") {

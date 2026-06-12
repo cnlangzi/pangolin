@@ -220,7 +220,8 @@ async fn real_e2e_tunnel_http_request_through_tun() {
     //    back. A timeout here would mean the request was dropped
     //    (Bug 1) or malformed (Bug 2) on the wire.
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "expected 200 from backend via tunnel, got {status} (body={body:?}). \
          ngx log:\n{}\ntun log:\n(proxied)",
         ngx.log_string()
@@ -289,8 +290,7 @@ async fn real_e2e_tunnel_file_backend() {
         .tempdir()
         .expect("tempdir for tunnel file backend");
     let index_path = static_dir.path().join("index.html");
-    std::fs::write(&index_path, "tunnel-served-static-file")
-        .expect("write index.html");
+    std::fs::write(&index_path, "tunnel-served-static-file").expect("write index.html");
     let backend_url = format!("file://{}", static_dir.path().display());
 
     let ngx = NgxProcess::start(move |db_path| {
@@ -311,10 +311,10 @@ async fn real_e2e_tunnel_file_backend() {
     // being investigated). What we're testing here is the
     // file:// backend through the tunnel — the body is irrelevant
     // for that, we just need the path to flow through the tun.
-    let (status, body) =
-        raw_request(&addr, "file.test", "POST", "/index.html", b"x").await;
+    let (status, body) = raw_request(&addr, "file.test", "POST", "/index.html", b"x").await;
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "expected 200 for tunnel-served file, got {status} (body={body:?}). \
          ngx log:\n{}",
         ngx.log_string()

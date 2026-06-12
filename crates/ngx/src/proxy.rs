@@ -358,7 +358,11 @@ impl ProxyHttp for AppProxy {
                 let full_url = format!(
                     "{}{}",
                     url.trim_end_matches('/'),
-                    if req_path.starts_with('/') { req_path.clone() } else { format!("/{}", req_path) }
+                    if req_path.starts_with('/') {
+                        req_path.clone()
+                    } else {
+                        format!("/{}", req_path)
+                    }
                 );
 
                 let req_frame = pangolin_core::TunnelRequestFrame {
