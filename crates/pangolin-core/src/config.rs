@@ -531,8 +531,14 @@ mod tests {
               tls_key:  /etc/pangolin/tunnel.key
         "#;
         let c = Config::from_str(s).unwrap();
-        assert_eq!(c.tunnel.tls_cert.as_deref(), Some("/etc/pangolin/tunnel.crt"));
-        assert_eq!(c.tunnel.tls_key.as_deref(), Some("/etc/pangolin/tunnel.key"));
+        assert_eq!(
+            c.tunnel.tls_cert.as_deref(),
+            Some("/etc/pangolin/tunnel.crt")
+        );
+        assert_eq!(
+            c.tunnel.tls_key.as_deref(),
+            Some("/etc/pangolin/tunnel.key")
+        );
     }
 
     #[test]

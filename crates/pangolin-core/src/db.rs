@@ -236,15 +236,12 @@ pub fn upsert_tun(conn: &Connection, tun: &Tun) -> rusqlite::Result<()> {
     // column is kept (V4 drop pending operator verification that no
     // tooling is reading it); we still write the cleartext there so a
     // downgrade path stays viable.
-    let token_hash = tun
-        .token_hash
-        .clone()
-        .or_else(|| {
-            tun.token
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .map(sha256_hex)
-        });
+    let token_hash = tun.token_hash.clone().or_else(|| {
+        tun.token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(sha256_hex)
+    });
     conn.execute(
         "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -327,9 +324,7 @@ pub fn backfill_tun_token_hashes(conn: &Connection) -> rusqlite::Result<usize> {
          WHERE token_hash IS NULL OR token_hash = ''",
     )?;
     let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let n = rows.len();
     for (name, token) in rows {
@@ -655,7 +650,9 @@ mod tests {
         // Length + character-class invariant.
         let h = sha256_hex("anything");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -706,7 +703,10 @@ mod tests {
         )
         .unwrap();
         let back = get_tun(&conn, "auto").unwrap().unwrap();
-        assert_eq!(back.token_hash.as_deref(), Some(sha256_hex("caller-supplied").as_str()));
+        assert_eq!(
+            back.token_hash.as_deref(),
+            Some(sha256_hex("caller-supplied").as_str())
+        );
     }
 
     #[test]
