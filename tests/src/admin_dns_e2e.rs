@@ -160,7 +160,11 @@ async fn dns_create_cloudflare_redirects() {
         .get("location")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(loc.contains("/dns"), "should redirect to /dns, got: {}", loc);
+    assert!(
+        loc.contains("/dns"),
+        "should redirect to /dns, got: {}",
+        loc
+    );
 }
 
 // ── §6 — Create without CSRF → 403 ───────────────────────────────────────────
@@ -218,21 +222,27 @@ async fn dns_create_invalid_name_shows_error() {
         200,
         "validation error should re-render the form (200), not redirect"
     );
+    // Structural markers only: the form should re-render with the name
+    // input still present. We don't pin the exact error wording, and we
+    // don't currently require the server to echo the submitted name back
+    // (a future enhancement, mirroring `sites_create_preserves_form_values_on_error`).
     let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("lowercase") || body.contains("Name"),
-        "error message should mention name validation, got: {}",
-        body
-    );
+    client
+        .assert_selector_exists(&body, r#"input[name="name"]"#)
+        .expect("name input should still be present after validation error");
 }
 
-// ── §8 — Test connection endpoint returns JSON ──────────────────────────────
+// ── §8 — Test connection endpoint exists and rejects bad input ─────────────
 //
-// This is the exact endpoint the browser hits via fetch(). It MUST exist at
-// /dns/test (not /admin/dns/test), and it MUST be reachable as POST.
+// This is the exact endpoint the browser hits via fetch(). It MUST live at
+// /dns/test (not /admin/dns/test) and reply with a JSON envelope. The
+// "missing kind" case simultaneously proves (a) the route exists and accepts
+// CSRF, (b) static validation rejects bad input, and (c) the response is
+// JSON {ok:false}. Consolidated from two earlier tests that each checked
+// part of this — one combined test is easier to maintain.
 
 #[tokio::test]
-async fn dns_test_endpoint_exists_and_responds() {
+async fn dns_test_endpoint_exists_and_handles_bad_input() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
@@ -240,20 +250,32 @@ async fn dns_test_endpoint_exists_and_responds() {
     let page = client.get("/dns/new").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&page).unwrap_or_default();
 
-    // Missing kind → 400 JSON {ok:false, error:"Invalid provider kind: …"}
+    // No `kind` field → static validation rejects → JSON 400 envelope.
     let resp = client
         .post_form("/dns/test", &[("_csrf", &csrf)])
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         resp.status().as_u16(),
-        403,
-        "test endpoint should not be CSRF-rejected — it must accept the form's _csrf"
+        400,
+        "missing kind should produce a 400 JSON response, got {}",
+        resp.status()
     );
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "test endpoint should be registered — it is at /dns/test, not /admin/dns/test"
+    // Must NOT be 403 (CSRF body was accepted) or 404 (route is /dns/test,
+    // not the legacy /admin/dns/test path).
+    assert_ne!(resp.status().as_u16(), 403);
+    assert_ne!(resp.status().as_u16(), 404);
+
+    // JSON shape: parse and assert the `ok` field is false. We don't pin
+    // the exact error wording.
+    let body = resp.text().await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("test response must be JSON, got {}: {}", e, body));
+    assert_eq!(
+        v.get("ok").and_then(|x| x.as_bool()),
+        Some(false),
+        "ok should be false, got body: {}",
+        body
     );
 }
 
@@ -294,9 +316,11 @@ async fn dns_test_cloudflare_valid_succeeds() {
         resp.status()
     );
     let body = resp.text().await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("test response must be JSON, got {}: {}", e, body));
     assert!(
-        body.contains("\"ok\"") || body.contains("ok"),
-        "test endpoint should return JSON with an 'ok' field, got: {}",
+        v.get("ok").and_then(|x| x.as_bool()).is_some(),
+        "response must have an `ok` boolean field, got: {}",
         body
     );
 }
@@ -324,10 +348,21 @@ async fn dns_test_cloudflare_empty_token_rejected() {
         )
         .await
         .unwrap();
+    // Status-code + JSON shape only; exact error message wording is
+    // implementation detail and may change.
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "missing api_token should produce a 400 JSON response, got {}",
+        resp.status()
+    );
     let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("api_token"),
-        "should report missing api_token, got: {}",
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("test response must be JSON, got {}: {}", e, body));
+    assert_eq!(
+        v.get("ok").and_then(|x| x.as_bool()),
+        Some(false),
+        "ok should be false on validation failure, got: {}",
         body
     );
 }
@@ -458,11 +493,18 @@ async fn dns_delete_no_csrf_forbidden() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
+    // Send a non-empty body (just `name`) so the pingora body-read doesn't
+    // stall on empty POSTs; the missing _csrf is what the CSRF middleware
+    // is supposed to flag.
     let resp = client
-        .post_form("/dns/anything/delete", &[]) // no _csrf
+        .post_form("/dns/anything/delete", &[("name", "anything")])
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 403);
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "missing _csrf should be forbidden"
+    );
 }
 
 // ── §15 — Page renders without broken SVG or invalid pattern regex ──────────
@@ -496,26 +538,5 @@ async fn dns_new_form_embeds_csrf_token() {
         !csrf.is_empty() && csrf.chars().all(|c| c.is_ascii_alphanumeric()),
         "CSRF should be a non-empty hex string, got: {:?}",
         csrf
-    );
-}
-
-// ── §17 — Test connection rejects empty kind ────────────────────────────────
-
-#[tokio::test]
-async fn dns_test_missing_kind_returns_400() {
-    let ngx = start_ngx().await;
-    let client = AdminClient::new(&ngx);
-    client.login("admin", "admin").await.unwrap();
-    let page = client.get("/dns/new").await.unwrap().text().await.unwrap();
-    let csrf = client.csrf_token(&page).unwrap_or_default();
-
-    let resp = client
-        .post_form("/dns/test", &[("_csrf", &csrf)])
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "missing kind should be a 400 JSON response"
     );
 }

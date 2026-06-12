@@ -84,24 +84,48 @@
   });
 
   // ── DNS Test connection ───────────────────────────────────────────────
+  // Build the result banner with DOM APIs (createElement + textContent)
+  // rather than innerHTML, because the user-supplied error string can come
+  // straight from the server's JSON body and we never want it parsed as
+  // markup.
+  function setTestResult(resultEl, kind, msg) {
+    if (!resultEl) return;
+    var box = document.createElement('div');
+    box.className =
+      kind === 'ok'
+        ? 'rounded-lg border-l-4 border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 px-4 py-2 text-sm text-emerald-900 dark:text-emerald-100'
+        : 'rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-900 dark:text-red-100';
+    box.appendChild(document.createTextNode(kind === 'ok' ? '✓ ' : '✗ '));
+    // msg may be undefined → render an empty suffix without crashing.
+    box.appendChild(document.createTextNode(msg != null ? String(msg) : ''));
+    resultEl.replaceChildren(box);
+  }
+
   document.addEventListener('click', function (e) {
     var btn = e.target.closest('[data-test-connection]');
     if (!btn) return;
     e.preventDefault();
     // The Test button lives OUTSIDE the create form (so the page only has
     // a single submit-capable form and Chrome stops warning about
-    // "multiple forms"). Locate the create form by data attribute.
-    var form = document.querySelector('form[data-dns-form]');
+    // "multiple forms"). Scope the lookup to the same <main> as the button
+    // so it cannot accidentally pick up a future form on the page that
+    // isn't the create form for this DNS provider.
+    var scope = btn.closest('main') || document;
+    var form = scope.querySelector('form[data-dns-form]');
     if (!form) return;
     // Encode the form as application/x-www-form-urlencoded so the
     // server's URL-encoded CSRF/body parser can read _csrf. A raw FormData
     // would force `Content-Type: multipart/form-data; boundary=…` and
     // `query_param_opt` (which splits on `&`) would silently see no fields.
     var params = new URLSearchParams(new FormData(form));
-    var resultEl = document.querySelector('[data-test-target]');
+    var resultEl = scope.querySelector('[data-test-target]');
     if (resultEl) {
-      resultEl.innerHTML =
-        '<span class="text-slate-500">Verifying…</span>';
+      resultEl.replaceChildren(
+        Object.assign(document.createElement('span'), {
+          className: 'text-slate-500',
+          textContent: 'Verifying…',
+        })
+      );
     }
     btn.disabled = true;
     fetch('/dns/test', {
@@ -111,27 +135,36 @@
       credentials: 'same-origin',
     })
       .then(function (r) {
-        return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+        // Preserve HTTP status so we can surface it in the error banner
+        // when the server's JSON envelope doesn't include one. A failing
+        // .json() (e.g. HTML error page, empty body) must not throw — fall
+        // back to an empty body and let the HTTP status do the talking.
+        return r
+          .json()
+          .then(function (j) {
+            return { ok: r.ok, status: r.status, body: j };
+          })
+          .catch(function () {
+            return { ok: r.ok, status: r.status, body: {} };
+          });
       })
       .then(function (resp) {
-        if (!resultEl) return;
-        var j = resp.body || {};
-        if (resp.ok && j.ok) {
-          resultEl.innerHTML =
-            '<div class="rounded-lg border-l-4 border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 px-4 py-2 text-sm text-emerald-900 dark:text-emerald-100">✓ Credentials verified</div>';
+        var body = resp.body || {};
+        // Backfill `status` from the HTTP code when the server didn't echo
+        // it. The body itself never gets rendered as HTML, only its text
+        // fields via setTestResult's textContent path.
+        var httpStatus = body.status != null ? body.status : resp.status;
+        if (resp.ok && body.ok) {
+          setTestResult(resultEl, 'ok', 'Credentials verified');
         } else {
-          resultEl.innerHTML =
-            '<div class="rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-900 dark:text-red-100">✗ ' +
-            (j.error || ('HTTP ' + (j.status || 'error'))) +
-            '</div>';
+          var msg = body.error || ('HTTP ' + (httpStatus != null ? httpStatus : 'error'));
+          setTestResult(resultEl, 'err', msg);
         }
       })
       .catch(function (err) {
-        if (!resultEl) return;
-        resultEl.innerHTML =
-          '<div class="rounded-lg border-l-4 border-red-500 bg-red-50 dark:bg-red-900/20 px-4 py-2 text-sm text-red-900 dark:text-red-100">✗ ' +
-          err.message +
-          '</div>';
+        // Network failure (DNS resolution, abort, CORS, etc.). Never inject
+        // err.message into HTML — textContent via setTestResult handles it.
+        setTestResult(resultEl, 'err', err && err.message ? err.message : 'request failed');
       })
       .finally(function () {
         btn.disabled = false;
