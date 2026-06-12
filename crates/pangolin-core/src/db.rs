@@ -432,12 +432,9 @@ pub fn set_cert_status_atomic(
 pub fn count_certs_by_status(
     conn: &Connection,
 ) -> rusqlite::Result<std::collections::HashMap<CertStatus, usize>> {
-    let mut counts: std::collections::HashMap<CertStatus, usize> = CertStatus::all()
-        .iter()
-        .map(|s| (*s, 0_usize))
-        .collect();
-    let mut stmt =
-        conn.prepare("SELECT status, COUNT(*) FROM certs GROUP BY status")?;
+    let mut counts: std::collections::HashMap<CertStatus, usize> =
+        CertStatus::all().iter().map(|s| (*s, 0_usize)).collect();
+    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM certs GROUP BY status")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let raw: String = row.get(0)?;
@@ -1222,7 +1219,11 @@ mod tests {
     #[test]
     fn set_cert_status_atomic_updates_existing_row() {
         let conn = make_conn();
-        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        upsert_cert(
+            &conn,
+            &make_cert("a.example.com", CertStatus::Pending, None),
+        )
+        .unwrap();
         let updated = set_cert_status_atomic(
             &conn,
             "a.example.com",
@@ -1239,9 +1240,14 @@ mod tests {
 
         // Transition to Failed — last_error captured, started_at preserved
         // (None means "don't touch").
-        let updated =
-            set_cert_status_atomic(&conn, "a.example.com", CertStatus::Failed, Some("boom"), None)
-                .unwrap();
+        let updated = set_cert_status_atomic(
+            &conn,
+            "a.example.com",
+            CertStatus::Failed,
+            Some("boom"),
+            None,
+        )
+        .unwrap();
         assert!(updated);
         let c = get_cert(&conn, "a.example.com").unwrap().unwrap();
         assert_eq!(c.status, CertStatus::Failed);
@@ -1250,8 +1256,7 @@ mod tests {
 
         // Transition to Issued clears last_error.
         let updated =
-            set_cert_status_atomic(&conn, "a.example.com", CertStatus::Issued, None, None)
-                .unwrap();
+            set_cert_status_atomic(&conn, "a.example.com", CertStatus::Issued, None, None).unwrap();
         assert!(updated);
         let c = get_cert(&conn, "a.example.com").unwrap().unwrap();
         assert_eq!(c.status, CertStatus::Issued);
@@ -1270,7 +1275,11 @@ mod tests {
     #[test]
     fn list_certs_by_status_returns_only_matching_rows() {
         let conn = make_conn();
-        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        upsert_cert(
+            &conn,
+            &make_cert("a.example.com", CertStatus::Pending, None),
+        )
+        .unwrap();
         upsert_cert(
             &conn,
             &make_cert("b.example.com", CertStatus::Failed, Some("err")),
@@ -1296,7 +1305,11 @@ mod tests {
     #[test]
     fn count_certs_by_status_includes_zero_buckets() {
         let conn = make_conn();
-        upsert_cert(&conn, &make_cert("a.example.com", CertStatus::Pending, None)).unwrap();
+        upsert_cert(
+            &conn,
+            &make_cert("a.example.com", CertStatus::Pending, None),
+        )
+        .unwrap();
         upsert_cert(
             &conn,
             &make_cert("b.example.com", CertStatus::Failed, Some("err")),
@@ -1319,8 +1332,7 @@ mod tests {
     fn ensure_pending_cert_row_inserts_when_missing() {
         let conn = make_conn();
         let dir = std::path::Path::new("/tmp/certs");
-        let inserted =
-            ensure_pending_cert_row(&conn, "new.example.com", dir).unwrap();
+        let inserted = ensure_pending_cert_row(&conn, "new.example.com", dir).unwrap();
         assert!(inserted);
         let c = get_cert(&conn, "new.example.com").unwrap().unwrap();
         assert_eq!(c.status, CertStatus::Pending);
@@ -1345,8 +1357,7 @@ mod tests {
             &make_cert("old.example.com", CertStatus::Failed, Some("boom")),
         )
         .unwrap();
-        let inserted =
-            ensure_pending_cert_row(&conn, "old.example.com", dir).unwrap();
+        let inserted = ensure_pending_cert_row(&conn, "old.example.com", dir).unwrap();
         assert!(!inserted, "second call must be a no-op");
         let c = get_cert(&conn, "old.example.com").unwrap().unwrap();
         assert_eq!(c.status, CertStatus::Failed);

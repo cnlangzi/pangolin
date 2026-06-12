@@ -39,7 +39,7 @@ pub mod tun;
 // Re-export per-resource template structs for ergonomic use at the call site:
 // `use crate::templates::SitesListTemplate;`
 pub use auth::LoginTemplate;
-pub use certs::{CertsListTemplate, CertsNewTemplate, CertsTableView};
+pub use certs::{CertRow, CertsListTemplate, CertsNewTemplate};
 pub use dashboard::DashboardTemplate;
 pub use dns::{
     DnsProvidersEditTemplate, DnsProvidersFormFieldsView, DnsProvidersListTemplate,
@@ -55,3 +55,58 @@ pub use sites::{
 pub use tun::{
     TunnelsEditTemplate, TunnelsFormFieldsView, TunnelsListTemplate, TunnelsNewTemplate,
 };
+
+/// Format `then` as a coarse "x seconds/minutes/hours/days ago" relative to
+/// `now`. Used by `views/certs/_table.html` for the Started column so an
+/// operator can tell at a glance how stale a Pending / Failed row is.
+///
+/// Granularity: the smallest unit whose value is ≥1; future timestamps
+/// (clock skew) get an "in the future" string rather than a negative
+/// number so the column never reads as garbage.
+pub fn relative_time(
+    then: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let secs = (now - then).num_seconds();
+    if secs < 0 {
+        return "in the future".to_string();
+    }
+    if secs < 60 {
+        return format!("{}s ago", secs);
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m ago", mins);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{}h ago", hours);
+    }
+    let days = hours / 24;
+    format!("{}d ago", days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_time;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn relative_time_buckets() {
+        let now = Utc::now();
+        assert_eq!(relative_time(now - Duration::seconds(5), now), "5s ago");
+        assert_eq!(relative_time(now - Duration::seconds(59), now), "59s ago");
+        assert_eq!(relative_time(now - Duration::seconds(60), now), "1m ago");
+        assert_eq!(relative_time(now - Duration::minutes(59), now), "59m ago");
+        assert_eq!(relative_time(now - Duration::minutes(60), now), "1h ago");
+        assert_eq!(relative_time(now - Duration::hours(23), now), "23h ago");
+        assert_eq!(relative_time(now - Duration::hours(24), now), "1d ago");
+        assert_eq!(relative_time(now - Duration::days(30), now), "30d ago");
+        // Clock skew falls back to a literal string rather than printing
+        // a negative number.
+        assert_eq!(
+            relative_time(now + Duration::seconds(10), now),
+            "in the future"
+        );
+    }
+}

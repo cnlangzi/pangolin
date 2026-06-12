@@ -415,6 +415,21 @@ acme:
         self.cert_dir.clone()
     }
 
+    /// Path to the SQLite database backing this `pangolin-ngx`. Lives
+    /// in the per-test tempdir (NOT `data_dir`; the binary writes
+    /// `pangolin.db` directly to its CWD, which the harness sets to
+    /// `tmpdir`, see `start()` above). Each test gets its own DB and
+    /// can poke rows directly via rusqlite without interfering with
+    /// the running process (the process opens the same file with WAL).
+    pub fn db_path(&self) -> PathBuf {
+        // data_dir is `tmpdir/data`; pangolin.db is `tmpdir/pangolin.db`.
+        // Walk up one level to land on tmpdir.
+        self.data_dir
+            .parent()
+            .expect("data_dir under tmpdir")
+            .join("pangolin.db")
+    }
+
     /// Drain the captured log into a String for diagnostic asserts.
     pub fn log_string(&self) -> String {
         String::from_utf8_lossy(&self.log.lock().unwrap()).into_owned()

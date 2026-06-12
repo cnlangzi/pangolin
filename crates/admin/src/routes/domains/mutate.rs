@@ -117,11 +117,8 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // so the operator's history isn't clobbered by a re-save of the
     // domain form.
     if matches!(result, Ok(())) && d.auto_issue {
-        let _ = pangolin_core::db::ensure_pending_cert_row(
-            &db,
-            &d.domain,
-            &app.cert_manager.cert_dir,
-        );
+        let _ =
+            pangolin_core::db::ensure_pending_cert_row(&db, &d.domain, &app.cert_manager.cert_dir);
     }
     drop(db);
 

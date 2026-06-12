@@ -2297,3 +2297,361 @@ async fn tun_create_duplicate_fails_without_overwriting() {
         "edit page should NOT contain 'second-token' — existing tun must be unchanged"
     );
 }
+
+// ── §issue-45: Unified certs lifecycle (status badges, retry, summary) ──
+
+/// Manual cert upload via `POST /certs/new` lands in the table with
+/// `status=issued` (regression: pre-V4, the row didn't carry a status
+/// column at all; backward-compat is V4's `DEFAULT 'issued'` plus the
+/// admin form's explicit `CertStatus::Issued`).
+#[tokio::test]
+async fn certs_manual_upload_lands_as_issued() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/certs/new",
+            &[
+                ("domain", "manual.example.com"),
+                ("cert_file", "/tmp/manual.pem"),
+                ("key_file", "/tmp/manual.key"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let body = client.get("/certs").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
+    // The row carries `data-status="issued"` (driven by `CertRow::status`)
+    // even though the form posted no explicit status — the route
+    // handler defaults to `CertStatus::Issued` for manual rows.
+    let sel = Selector::parse(r#"tr[data-domain="manual.example.com"]"#).unwrap();
+    let row = doc.select(&sel).next().expect("row exists");
+    assert_eq!(
+        row.value().attr("data-status"),
+        Some("issued"),
+        "manual upload must land as Issued"
+    );
+}
+
+/// Enabling `auto_issue=true` on a domain immediately writes a `pending`
+/// row in `certs`, so the operator sees the lifecycle from the moment
+/// they save the form — no vacuum window where /certs is empty for an
+/// enabled domain.
+#[tokio::test]
+async fn domain_with_auto_issue_writes_pending_cert_row() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site to anchor the domain.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "auto-issue-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Create domain with auto_issue=true. The DNS provider field is
+    // intentionally empty — plan_issuance for a bare FQDN without DNS
+    // association picks HTTP-01, which is a valid (non-wildcard) plan,
+    // so the domains form will not reject it.
+    let page2 = client
+        .get("/domains/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf2 = client.csrf_token(&page2).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "autoissue.example.com"),
+                ("site_name", "auto-issue-site"),
+                ("auto_issue", "on"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // Confirm the certs page now has a row for this domain. The status
+    // is a race against the ACME background loop, which may have ticked
+    // and transitioned the row past `pending` to `issuing` or `failed`
+    // by the time we read /certs. All three states confirm the seeding
+    // worked — the issue brief's contract is "the operator immediately
+    // sees a row", not specifically "the operator sees a pending row".
+    let body = client.get("/certs").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
+    let sel = Selector::parse(r#"tr[data-domain="autoissue.example.com"]"#).unwrap();
+    let row = doc.select(&sel).next().expect("seeded row exists");
+    let observed = row.value().attr("data-status").unwrap_or_default();
+    assert!(
+        matches!(observed, "pending" | "issuing" | "failed"),
+        "auto_issue=true must seed a lifecycle row (got {observed:?})"
+    );
+}
+
+/// `GET /certs?status=failed` filters the table to only failed rows.
+/// Verifies both the listing semantics and the chip-bar highlighting.
+#[tokio::test]
+async fn certs_table_filter_by_status() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Seed two manual certs (both Issued) and one Failed row via direct
+    // DB write. Direct DB poke is the path of least resistance: making
+    // a real ACME failure inside the e2e harness would require a Pebble
+    // round-trip just to assert the filter.
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    for d in ["alpha.example.com", "beta.example.com"] {
+        client
+            .post_form(
+                "/certs/new",
+                &[
+                    ("domain", d),
+                    ("cert_file", "/tmp/x.pem"),
+                    ("key_file", "/tmp/x.key"),
+                    ("_csrf", &csrf),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+    // Direct DB write for the failed row — same SQLite file the ngx
+    // process is using (see `init_pangolin_db` / `NgxProcess::start`).
+    let conn = rusqlite::Connection::open(ngx.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, sans, source, issued_at, status, last_error)
+         VALUES (?1, '/tmp/f.pem', '/tmp/f.key', '[]', 'acme', 0, 'failed', 'mock failure')",
+        rusqlite::params!["broken.example.com"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Unfiltered view shows all three.
+    let all = client.get("/certs").await.unwrap().text().await.unwrap();
+    let doc_all = Html::parse_document(&all);
+    let row_sel = Selector::parse("tr[data-domain]").unwrap();
+    let all_rows: Vec<_> = doc_all.select(&row_sel).collect();
+    assert_eq!(all_rows.len(), 3, "unfiltered table shows every row");
+
+    // Filtered to failed: just the broken row, plus the chip-bar entry
+    // for `failed` carries the active-style class.
+    let only_failed = client
+        .get("/certs?status=failed")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let doc = Html::parse_document(&only_failed);
+    let rows: Vec<_> = doc.select(&row_sel).collect();
+    assert_eq!(rows.len(), 1, "filtered table shows only failed rows");
+    assert_eq!(
+        rows[0].value().attr("data-domain"),
+        Some("broken.example.com")
+    );
+    // Failed row exposes the inline detail with the recorded error.
+    let err_sel = Selector::parse(r#"code[data-error="broken.example.com"]"#).unwrap();
+    let err = doc.select(&err_sel).next().expect("error detail rendered");
+    assert!(err.text().any(|t| t.contains("mock failure")));
+
+    // CSV filter: pending + issuing returns nothing (no in-flight rows).
+    let empty = client
+        .get("/certs?status=pending,issuing")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let doc_empty = Html::parse_document(&empty);
+    let empty_rows: Vec<_> = doc_empty.select(&row_sel).collect();
+    assert!(empty_rows.is_empty());
+}
+
+/// `GET /api/certs/summary` returns the dashboard JSON with every
+/// status bucket present (zero-valued buckets included) so the
+/// dashboard template doesn't have to special-case missing keys.
+#[tokio::test]
+async fn certs_summary_endpoint_returns_status_counts() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Seed one Issued (via the manual form) + one Failed (direct DB).
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/certs/new",
+            &[
+                ("domain", "ok.example.com"),
+                ("cert_file", "/tmp/x.pem"),
+                ("key_file", "/tmp/x.key"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(ngx.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, sans, source, issued_at, status, last_error)
+         VALUES (?1, '/tmp/f.pem', '/tmp/f.key', '[]', 'acme', 0, 'failed', 'boom')",
+        rusqlite::params!["bad.example.com"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let body = client
+        .get("/api/certs/summary")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["issued"], 1);
+    assert_eq!(v["failed"], 1);
+    // Zero-valued buckets MUST be present.
+    assert_eq!(v["pending"], 0);
+    assert_eq!(v["issuing"], 0);
+    assert_eq!(v["skipped"], 0);
+}
+
+/// Dashboard surfaces the cert summary card with status-link badges.
+/// When `failed > 0` the dashboard exposes a clickable badge that points
+/// at `/certs?status=failed`; this is the "一目了然" goal from the issue.
+#[tokio::test]
+async fn dashboard_badge_clickable_when_failed_or_in_flight() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Empty state: no failed badge.
+    let body = client.get("/").await.unwrap().text().await.unwrap();
+    assert!(
+        !body.contains("cert-failed-badge"),
+        "no failed badge when nothing has failed"
+    );
+
+    // Seed a failed row.
+    let conn = rusqlite::Connection::open(ngx.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, sans, source, issued_at, status, last_error)
+         VALUES (?1, '/tmp/f.pem', '/tmp/f.key', '[]', 'acme', 0, 'failed', 'mock failure')",
+        rusqlite::params!["badge.example.com"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let body = client.get("/").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
+    let badge_sel = Selector::parse("#cert-failed-badge").unwrap();
+    let badge = doc
+        .select(&badge_sel)
+        .next()
+        .expect("dashboard exposes failed badge");
+    assert_eq!(
+        badge.value().attr("href"),
+        Some("/certs?status=failed"),
+        "badge links to status-filtered certs page"
+    );
+    assert!(
+        badge.text().any(|t| t.contains("1")),
+        "badge text reflects the count"
+    );
+
+    // Seed an in-flight row too; the in-flight badge appears.
+    let conn = rusqlite::Connection::open(ngx.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, sans, source, issued_at, status)
+         VALUES (?1, '/tmp/p.pem', '/tmp/p.key', '[]', 'acme', 0, 'pending')",
+        rusqlite::params!["inflight.example.com"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let body = client.get("/").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
+    let inflight_sel = Selector::parse("#cert-inflight-badge").unwrap();
+    let inflight = doc
+        .select(&inflight_sel)
+        .next()
+        .expect("in-flight badge present");
+    assert_eq!(
+        inflight.value().attr("href"),
+        Some("/certs?status=pending,issuing")
+    );
+}
+
+/// `POST /certs/retry` requires the CSRF token. Without it the request
+/// is rejected with 403 (same shape as the other mutating endpoints).
+#[tokio::test]
+async fn certs_retry_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client
+        .post_form("/certs/retry", &[("domain", "missing.example.com")])
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+/// `POST /certs/retry` with a valid CSRF redirects back to /certs even
+/// when the domain doesn't exist — the route is fire-and-forget by
+/// design (it spawns the retrier so the operator doesn't wait for a
+/// slow ACME round-trip).
+#[tokio::test]
+async fn certs_retry_redirects_back_to_certs() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/certs/retry",
+            &[("domain", "ghost.example.com"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "retry handler always 302s back; spawned task may no-op"
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(loc, "/certs");
+}

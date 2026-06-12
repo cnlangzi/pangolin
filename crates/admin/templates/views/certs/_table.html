@@ -3,31 +3,85 @@
     <thead class="bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
       <tr>
         <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Domain</th>
-        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Expires</th>
         <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Status</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Started</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Expires</th>
         <th class="text-right px-4 py-3"></th>
       </tr>
     </thead>
     <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
-      {% for cert in certs %}
-      <tr id="cert-{{ cert.domain }}" class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
-        <td class="px-4 py-3"><code class="text-sm text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded">{{ cert.domain }}</code></td>
-        <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400">{% if let Some(e) = cert.expires_at %}{{ e.format("%Y-%m-%d") }}{% else %}—{% endif %}</td>
+      {% for row in rows %}
+      {# Row id is a stable handle for e2e tests; using `cert-row-` (not    #}
+      {# `cert-`) avoids colliding with any future per-domain id the old   #}
+      {# layout used. `data-status` mirrors the status string so e2e tests #}
+      {# can assert without scraping the badge text.                       #}
+      <tr id="cert-row-{{ row.domain }}" data-status="{{ row.status }}" data-domain="{{ row.domain }}"
+          class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
+        <td class="px-4 py-3"><code class="text-sm text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded">{{ row.domain }}</code></td>
         <td class="px-4 py-3">
-          {% if let Some(e) = cert.expires_at %}
-            {% if e < now %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">Expired</span>
-            {% else %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">Valid</span>
-            {% endif %}
+          {# Five-color badge — same palette as the chip-bar so the visual #}
+          {# link between filter and row is obvious.                      #}
+          {% if row.status == "issued" %}
+          <span data-status="issued" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>Issued
+          </span>
+          {% else if row.status == "failed" %}
+          <span data-status="failed" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>Failed
+          </span>
+          {% else if row.status == "pending" %}
+          <span data-status="pending" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>Pending
+          </span>
+          {% else if row.status == "issuing" %}
+          <span data-status="issuing" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>Issuing
+          </span>
           {% else %}
-          <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">No expiry</span>
+          <span data-status="skipped" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">
+            <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Skipped
+          </span>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-xs text-slate-500 dark:text-slate-400">
+          {# Failed rows are emphasised in red so a stale failure         #}
+          {# ("3 days ago") is obvious at a glance.                       #}
+          {% if row.started_rel == "" %}
+          —
+          {% else if row.status == "failed" %}
+          <span class="text-red-600 dark:text-red-400">{{ row.started_rel }}</span>
+          {% else %}
+          {{ row.started_rel }}
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400">
+          {% if row.expires_at_fmt == "" %}
+          —
+          {% else if row.expired %}
+          <span class="text-red-600 dark:text-red-400">{{ row.expires_at_fmt }}</span>
+          {% else %}
+          {{ row.expires_at_fmt }}
           {% endif %}
         </td>
         <td class="px-4 py-3">
-          <div class="flex items-center justify-end">
-            <form method="POST" action="/certs/delete" onsubmit="return confirm('Delete cert for {{ cert.domain }}?');" class="inline">
-              <input type="hidden" name="domain" value="{{ cert.domain }}">
+          <div class="flex items-center justify-end gap-1">
+            {% if row.retryable %}
+            <form method="POST" action="/certs/retry" class="inline">
+              <input type="hidden" name="domain" value="{{ row.domain }}">
+              {% include "components/_csrf.html" %}
+              <button type="submit"
+                class="text-slate-400 dark:text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 p-1.5 rounded hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors"
+                title="Retry ACME issuance for {{ row.domain }}"
+                data-action="retry">
+                {# Counter-clockwise arrow — the canonical "retry" glyph. #}
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0011.667 0l3.181-3.183m-15.36-2.401a8.25 8.25 0 0111.667-3.183l3.181 3.183V4.5"/>
+                </svg>
+              </button>
+            </form>
+            {% endif %}
+            <form method="POST" action="/certs/delete" onsubmit="return confirm('Delete cert for {{ row.domain }}?');" class="inline">
+              <input type="hidden" name="domain" value="{{ row.domain }}">
               {% include "components/_csrf.html" %}
               <button type="submit"
                 class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
@@ -38,38 +92,82 @@
           </div>
         </td>
       </tr>
+      {# Inline detail row — only when there is an error to surface. Kept #}
+      {# inline (no JS modal) so the e2e harness can read it straight     #}
+      {# out of the DOM without scripting.                                #}
+      {% if let Some(err) = row.last_error %}
+      <tr class="bg-red-50/50 dark:bg-red-900/10 border-t border-red-100 dark:border-red-900/30">
+        <td colspan="5" class="px-4 py-2 text-xs text-red-700 dark:text-red-300">
+          <span class="font-medium">Last error:</span>
+          <code data-error="{{ row.domain }}" class="ml-1 break-all">{{ err }}</code>
+        </td>
+      </tr>
+      {% endif %}
       {% else %}
-      <tr><td colspan="4" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No certificates yet. <a href="/certs/new" class="text-accent-500 hover:underline">Add one</a>.</td></tr>
+      <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">
+        {% if status_filter_raw == "" %}
+        No certificates yet. <a href="/certs/new" class="text-accent-500 hover:underline">Add one</a>.
+        {% else %}
+        No certs match this filter. <a href="/certs" class="text-accent-500 hover:underline">Clear filter</a>.
+        {% endif %}
+      </td></tr>
       {% endfor %}
     </tbody>
   </table>
 
   <div class="block md:hidden divide-y divide-slate-100 dark:divide-slate-700">
-    {% for cert in certs %}
-    <div class="p-4">
+    {% for row in rows %}
+    <div class="p-4" data-status="{{ row.status }}" data-domain="{{ row.domain }}">
       <div class="flex items-center justify-between mb-2">
-        <code class="text-xs text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded">{{ cert.domain }}</code>
-        {% if let Some(e) = cert.expires_at %}
-          {% if e < now %}
-          <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">Expired</span>
-          {% else %}
-          <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">Valid</span>
-          {% endif %}
+        <code class="text-xs text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded">{{ row.domain }}</code>
+        {% if row.status == "issued" %}
+        <span data-status="issued" class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">Issued</span>
+        {% else if row.status == "failed" %}
+        <span data-status="failed" class="text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">Failed</span>
+        {% else if row.status == "pending" %}
+        <span data-status="pending" class="text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">Pending</span>
+        {% else if row.status == "issuing" %}
+        <span data-status="issuing" class="text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">Issuing</span>
         {% else %}
-        <span class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">No expiry</span>
+        <span data-status="skipped" class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">Skipped</span>
         {% endif %}
       </div>
-      <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">Expires {% if let Some(e) = cert.expires_at %}{{ e.format("%Y-%m-%d") }}{% else %}never{% endif %}</div>
-      <form method="POST" action="/certs/delete" onsubmit="return confirm('Delete cert for {{ cert.domain }}?');">
-        <input type="hidden" name="domain" value="{{ cert.domain }}">
-        {% include "components/_csrf.html" %}
-        <button type="submit" class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
-          Delete
-        </button>
-      </form>
+      <div class="text-xs text-slate-500 dark:text-slate-400 mb-1">
+        Started {% if row.started_rel == "" %}—{% else %}{{ row.started_rel }}{% endif %}
+      </div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        Expires {% if row.expires_at_fmt == "" %}never{% else %}{{ row.expires_at_fmt }}{% endif %}
+      </div>
+      {% if let Some(err) = row.last_error %}
+      <div class="text-xs text-red-600 dark:text-red-400 mb-2 break-all"><span class="font-medium">Last error:</span> {{ err }}</div>
+      {% endif %}
+      <div class="flex gap-2">
+        {% if row.retryable %}
+        <form method="POST" action="/certs/retry" class="flex-1">
+          <input type="hidden" name="domain" value="{{ row.domain }}">
+          {% include "components/_csrf.html" %}
+          <button type="submit" class="w-full text-center text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 border border-blue-200 dark:border-blue-500/30 hover:bg-blue-50 dark:hover:bg-blue-500/10 rounded-lg py-1.5 transition-colors">
+            Retry
+          </button>
+        </form>
+        {% endif %}
+        <form method="POST" action="/certs/delete" onsubmit="return confirm('Delete cert for {{ row.domain }}?');" class="flex-1">
+          <input type="hidden" name="domain" value="{{ row.domain }}">
+          {% include "components/_csrf.html" %}
+          <button type="submit" class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
+            Delete
+          </button>
+        </form>
+      </div>
     </div>
     {% else %}
-    <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm">No certificates yet.</div>
+    <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm">
+      {% if status_filter_raw == "" %}
+      No certificates yet.
+      {% else %}
+      No certs match this filter. <a href="/certs" class="text-accent-500 hover:underline">Clear filter</a>.
+      {% endif %}
+    </div>
     {% endfor %}
   </div>
 </div>

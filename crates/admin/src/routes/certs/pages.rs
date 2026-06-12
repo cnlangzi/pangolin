@@ -8,7 +8,7 @@ use http::Response;
 use http_body_util::Full;
 use pangolin_core::CertStatus;
 
-use crate::templates::{CertsListTemplate, CertsNewTemplate};
+use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 use crate::App;
 
 type Resp = Response<Full<Bytes>>;
@@ -30,11 +30,7 @@ fn ok_html(body: String) -> http::Result<Resp> {
 /// unknown values are silently dropped (the chip-bar in the template
 /// only emits valid ones, and an operator pasting `status=garbage`
 /// gets the empty-list fallback rather than a 400).
-pub async fn render(
-    app: &Arc<App>,
-    status_filter: Option<&str>,
-    csrf: &str,
-) -> http::Result<Resp> {
+pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> http::Result<Resp> {
     let parsed: Vec<CertStatus> = parse_status_filter(status_filter);
     let db = app.db.lock().await;
     let certs = if parsed.is_empty() {
@@ -45,12 +41,15 @@ pub async fn render(
     let counts = pangolin_core::db::count_certs_by_status(&db).unwrap_or_default();
     drop(db);
     let now = chrono::Utc::now();
-    // Pre-compute per-bucket counts so the template stays simple. Order
-    // matches the chip bar in views/certs/_table.html.
+    // Pre-compute view-model rows: status as string, retryable bool,
+    // pre-formatted relative-time + expires-at. Keeps the template free
+    // of Rust path expressions (Askama's expression parser can't follow
+    // `crate::templates::relative_time(...)` or
+    // `pangolin_core::CertStatus::Failed`).
+    let rows: Vec<CertRow> = certs.iter().map(|c| CertRow::from_cert(c, now)).collect();
     let html = CertsListTemplate {
-        certs,
+        rows,
         active_nav: "certs",
-        now: &now,
         status_filter_raw: status_filter.unwrap_or("").to_string(),
         count_total: counts.values().sum(),
         count_pending: counts.get(&CertStatus::Pending).copied().unwrap_or(0),

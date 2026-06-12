@@ -27,7 +27,9 @@ pub mod parse;
 pub mod tunnel;
 pub mod types;
 
-pub use app::{plan_issuance, App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage};
+pub use app::{
+    plan_issuance, App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage,
+};
 pub use config::{init_logger, Config, LogConfig};
 pub use error::{PangolinError, Result};
 pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};

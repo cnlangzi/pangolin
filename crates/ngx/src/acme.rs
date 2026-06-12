@@ -995,12 +995,8 @@ impl AcmeState {
                     .ok()
                     .and_then(|blob| parse_blob_expiry(&blob).ok());
                 let conn = app.db.lock().await;
-                let existing = pangolin_core::db::get_cert(&conn, &domain.domain)
-                    .unwrap_or(None);
-                let created_at = existing
-                    .as_ref()
-                    .map(|c| c.created_at)
-                    .unwrap_or(issued_at);
+                let existing = pangolin_core::db::get_cert(&conn, &domain.domain).unwrap_or(None);
+                let created_at = existing.as_ref().map(|c| c.created_at).unwrap_or(issued_at);
                 let started_at = existing.as_ref().and_then(|c| c.started_at);
                 let cert_row = pangolin_core::Cert {
                     domain: domain.domain.clone(),
@@ -1069,9 +1065,8 @@ impl pangolin_core::CertRetrier for AcmeState {
         // `plan_issuance`).
         let (domain_row, dns_index_snapshot) = {
             let conn = app.db.lock().await;
-            let row = pangolin_core::db::get_domain(&conn, domain).map_err(|e| {
-                anyhow::anyhow!("db lookup failed for {}: {}", domain, e)
-            })?;
+            let row = pangolin_core::db::get_domain(&conn, domain)
+                .map_err(|e| anyhow::anyhow!("db lookup failed for {}: {}", domain, e))?;
             drop(conn);
             let dns_index = app.dns_index.read().await.clone();
             (row, dns_index)

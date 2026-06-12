@@ -96,11 +96,7 @@ pub async fn handle_delete(
 /// the operator's browser doesn't hang. The status row is updated
 /// asynchronously by the spawned task; the UI converges on the next
 /// page load (or the future htmx auto-refresh).
-pub async fn handle_retry(
-    app: &Arc<App>,
-    body: &[u8],
-    _csrf: &str,
-) -> http::Result<Resp> {
+pub async fn handle_retry(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     if domain.is_empty() {
