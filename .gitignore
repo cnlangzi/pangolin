@@ -34,6 +34,11 @@ Cargo.lock.bak
 *.local.yaml
 *.local.yml
 
+# Local secrets / per-developer environment overrides.
+# Copy `.env.example` → `.env` and edit; the Makefile auto-loads it.
+/.env
+.env.local
+
 # SQLite databases created at runtime by `pangolin-ngx` (e.g. from `make start-ngx`)
 /pangolin.db
 /pangolin.db-shm

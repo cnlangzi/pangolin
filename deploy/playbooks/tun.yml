@@ -5,6 +5,16 @@
   environment:
     ansible_ssh_common_args: "-o ServerAliveInterval=60"
 
+  # Bridge from `.env` (sourced by the Makefile via `set -a; . .env;
+  # set +a`) to the lowercase `tun_*` names that this role's Jinja2
+  # templates expect. See deploy/playbooks/ngx.yml for the full
+  # rationale — the same pattern, smaller surface.
+  vars:
+    tun_server: "{{ lookup('env', 'TUN_SERVER') | default('localhost:9001', true) }}"
+    tun_token: "{{ lookup('env', 'TUN_TOKEN') | default('dev', true) }}"
+    tun_name: "{{ lookup('env', 'TUN_NAME') | default('local', true) }}"
+    tun_log_level: "{{ lookup('env', 'TUN_LOG__LEVEL') | default('info', true) }}"
+
   roles:
     - role: tun
       when: inventory_hostname in groups.tun
