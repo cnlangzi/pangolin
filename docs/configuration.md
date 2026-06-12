@@ -12,14 +12,12 @@ fields.
 
 ## File lookup
 
-Both binaries follow the same lookup chain (overridable with
-`--config <path>`):
-
-1. `./<file>.yml` (current working directory)
-2. `/etc/pangolin/<file>.yml` (system-wide)
-
-The first file that exists wins; there is no merging. Missing files
-produce a clear startup error, not a silent default.
+Both binaries take a single `--config <path>` flag (`clap`).
+Defaults: `--config ngx.yml` for `pangolin-ngx`, `--config tun.yml`
+for `pangolin-tun`. The path is resolved relative to the current
+working directory. The file must exist or startup fails with
+`config error: …` — there is **no fallback chain** and **no
+system-wide default location**.
 
 ## Environment variable override
 
@@ -93,7 +91,7 @@ because they apply to the whole file, not just one section.
 
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
-| `addr`      | `string` | `0.0.0.0:9001`   | no       | Full `host:port` string for the tun WebSocket listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **This is also the address `tun.yml: server:` must point at from the tun client side.** |
+| `tunnel.addr` | `string` | `0.0.0.0:9001` | no | Full `host:port` string for the tun WebSocket listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **The tun client's `tun.yml: server:` field must resolve to this listener** — if `addr` is `0.0.0.0:9001`, use the gateway's public hostname or IP + port 9001 in `server`. |
 | `ws_path`   | `string` | `/tunnel`        | no       | WebSocket path on the listen port. Change it if you proxy the WS port through another path-aware reverse proxy. |
 
 ### `[admin]` — admin UI / API
@@ -107,7 +105,7 @@ without an explicit override.
 | ----------- | -------- | ---------------- | -------- | ----- |
 | `addr`      | `string` | `0.0.0.0:9081`   | no       | Full `host:port` string for the admin HTTP server. Override to `127.0.0.1:9081` for local-only access. |
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
-| `password`  | `string` | `admin`          | no       | HTTP basic auth password. Write the real password directly in this file. Restrict access via `ufw` / `iptables` if exposing 9081 to a non-trusted network. |
+| `password`  | `string` | `admin`          | no       | HTTP basic auth password. **Security**: stored in plaintext in `ngx.yml`; use `NGX_ADMIN__PASSWORD` env var to avoid committing secrets. Restrict port 9081 access via firewall (`ufw` / `iptables`) if exposing to untrusted networks. |
 
 ### `[cache]` — response cache
 
@@ -155,13 +153,20 @@ Two certificate modes coexist at runtime:
 ### `domains` table (DB) — per-domain auto-issuance
 
 These columns control per-domain cert behaviour and live in SQLite,
-not `ngx.yml`. They are managed via the admin UI or the
-`/domains` UI pages and `/api/domains/{domain}` HTMX endpoints.
+not `ngx.yml`. They are managed via the admin UI at `/domains` (the
+UI internally calls `POST /domains/new` to create and `POST /domains/delete`
+to remove; there is also an HTMX-driven `DELETE /api/domains/{domain}`
+for the same delete operation).
+
+**To modify `auto_issue` or `dns_provider` after creation:**
+domains are currently immutable via the UI — use direct SQL `UPDATE`
+on the `domains` table, then call `POST /api/reload` to refresh the
+in-memory config (see [admin/reload-api.md](admin/reload-api.md)).
 
 | Column         | Type      | Default  | Notes |
 | -------------- | --------- | -------- | ----- |
 | `auto_issue`   | `bool`    | `false`  | When `true`, the gateway issues + renews a cert for this domain via ACME. When `false`, the cert is expected to be present on disk in `cert_dir` (manual upload) and the gateway will not contact the CA. |
-| `dns_provider` | `string`  | `""`     | Optional FK to a row in `dns_providers`. If set, DNS-01 challenge is used with that provider's credentials (required for `*.example.com` wildcards). If empty, HTTP-01 is used. |
+| `dns_provider` | `string \| null` | `null` | Optional FK to a row in `dns_providers`. If set (non-empty), DNS-01 challenge is used with that provider's credentials (required for `*.example.com` wildcards). If `null` or empty, HTTP-01 is used. |
 
 ### `dns_providers` table (DB) — DNS provider credentials
 
@@ -169,11 +174,19 @@ DNS provider credentials are **not** in `ngx.yml` in v2. They are
 managed in the admin UI under **DNS Providers** and stored in the
 `dns_providers` table:
 
-| Column         | Type     | Notes |
-| -------------- | -------- | ----- |
-| `name`         | `string` | Display name. |
-| `kind`         | `string` | `cloudflare` / `aliyun` / `tencent`. |
-| `api_token` / `access_key_id`+`access_key_secret` / `secret_id`+`secret_key` | `string` | Provider-specific credential fields. Stored in plaintext in SQLite; restrict DB file permissions and disk access. |
+| Column      | Type    | Notes |
+| ----------- | ------- | ----- |
+| `name`      | `string` (PK) | Display name. |
+| `kind`      | `string` | `cloudflare` / `aliyun` / `tencent`. |
+| `enabled`   | `bool`   | Default `true`. Disabled rows are kept but never consulted by ACME. |
+| `config`    | `string` (JSON) | Kind-specific credential blob. Stored in plaintext in SQLite; restrict DB file permissions and disk access. |
+| `created_at` / `updated_at` | `string` | ISO-8601 timestamps. |
+
+Shape of the `config` JSON per kind:
+
+- `cloudflare`: `{"api_token": "..."}`
+- `aliyun`: `{"access_key_id": "...", "access_key_secret": "...", "region": "..."}`
+- `tencent`: `{"secret_id": "...", "secret_key": "..."}`
 
 ### `[log]`
 
@@ -369,18 +382,23 @@ in a site then routes traffic through the `home` tun.
   per-domain `auto_issue` flag `false` on a laptop. In production
   flip it to `true` for the public-facing domains only.
 - **Wildcards require DNS-01.** HTTP-01 cannot validate
-  `*.example.com` — set the domain's `dns_provider` in the DB to
-  point at a `dns_providers` row whose credentials can add the
-  `_acme-challenge` TXT record for the zone.
+  `*.example.com` — HTTP-01 validates by serving a file at
+  `http://<domain>/.well-known/acme-challenge/`, which cannot work
+  for wildcards (no single HTTP endpoint matches all subdomains). Set
+  the domain's `dns_provider` in the DB to point at a `dns_providers`
+  row whose credentials can add the `_acme-challenge` TXT record for
+  the zone.
 - **`name` validation runs at load time.** A typo (`Office` with
   uppercase, `12345` all-digit) refuses to start with a clear error
   message — no silent fallback to an empty name.
-- **`${VAR}` without `:-default` is fail-fast.** If your secret isn't
-  exported, you get a clear error to stderr and exit code 1. This is
-  intentional: silent defaults would let a misconfigured tun run
-  with no auth.
+- **`${VAR}` in the YAML is not expanded.** The `figment`-based loader
+  only ever reads parsed values; raw `${VAR}` in YAML stays literal
+  (and is harmless inside comments). Use the `NGX_*` / `TUN_*`
+  env-var names described in "Environment variable override" above.
 - **The two files share no fields.** Do not duplicate `[log]` content
   from `ngx.yml` into `tun.yml`; they control different processes.
 - **Config reload:** not implemented. Both binaries read their
   config once at startup. To change a field, edit the file and
-  restart the binary (or use `make restart-ngx` / `make restart-tun`).
+  restart the binary (`make install-ngx` / `make install-tun` will
+  reinstall + restart the systemd unit if you deployed via the
+  Makefile; otherwise restart the process manually).

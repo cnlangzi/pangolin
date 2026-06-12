@@ -72,7 +72,10 @@ curl -b cookies.txt -X POST "http://127.0.0.1:9081/api/reload?_csrf=$CSRF"
 ## Security
 
 - **Authentication required** — must have a valid Admin UI session
-- **CSRF protected** — request must include a valid `_csrf` token
+- **CSRF protected** — request must include a valid `_csrf` token.
+  The handler accepts it from the **request body** (preferred) **or**
+  the URL query string; both are merged before the check
+  (`crates/admin/src/lib.rs`).
 - **Audit logged** — the reload is recorded as `Configuration reloaded via POST /api/reload` in the server log
 
 ## Code locations
@@ -94,7 +97,11 @@ After the reload, `dns_change_notify` fires, so the ACME background task picks u
 
 ## Caveats
 
-- **Active tun connections are not reloaded.** Established tunnel WebSocket sessions keep using whatever config they had at connect time. New requests on a fresh request path will pick up the new config.
+- **Active tunnel WebSocket sessions are not reloaded.** Established tun
+  client connections keep their auth state and channel. New tun
+  connections after reload will use the updated `tun` table. HTTP
+  requests routed through existing tunnels will pick up the new site/domain
+  config on the next request.
 - **No service restart.** Only the in-memory index is refreshed; running connections are not dropped.
 - **Not real-time.** The new config takes effect on the next request through the affected code path. In-flight requests complete with the old config.
 - **Thread-safe.** The index is guarded by an `RwLock`, so `reload_indexes()` is safe to call while requests are being served.

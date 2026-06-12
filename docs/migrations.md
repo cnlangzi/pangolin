@@ -27,7 +27,7 @@ Version numbers must be sequential integers. The description (after `__`) is hum
 
 When you run `pangolin-ngx` for the first time:
 
-1. It creates `pangolin.db` (or whatever `DATABASE_URL` points to)
+1. It creates `pangolin.db` (in the current working directory)
 2. Runs all migrations in order (V1, V2, ...)
 3. Records each in `refinery_schema_history`
 
@@ -102,7 +102,12 @@ The binary will recreate the database with the current migrations.
    WHERE version = 2;
    ```
 
-   Refinery checksums are computed as `i64` from the file bytes. There is no built-in CLI to compute them; if you need this, write a small Rust program using `refinery::Migration::from_filename()`.
+   Refinery checksums are `i64` hashes of file bytes. There is no
+   CLI to compute them. If you must update a checksum, use `sqlite3`
+   to inspect the current value, verify the schema matches your
+   migration file exactly, then manually update the row. This is
+   dangerous and should be a **last resort** — you are bypassing
+   refinery's integrity check.
 
 ### Rolling back a migration
 
@@ -178,17 +183,25 @@ rm pangolin.db-shm pangolin.db-wal
 
 ### Migrations run on every startup (slow)
 
-This is expected behavior — refinery checks `refinery_schema_history` on every start. Skipping already-applied migrations is fast (a `SELECT` per migration). If you see actual SQL execution on every start, the migrations are not being recorded — check that `db::migrate()` completes without error.
+This is expected behavior — refinery checks `refinery_schema_history`
+on every start. Skipping already-applied migrations is fast (a `SELECT`
+per migration, typically <10 ms total for a few migrations). If you
+see actual SQL execution on every start, the migrations are not being
+recorded — check that `db::migrate()` completes without error.
 
-## Environment-specific databases
+## Database location
 
-The `pangolin-ngx` binary opens `./pangolin.db` by default (relative to the working directory). Override with the `DATABASE_URL` environment variable if you need a different location:
+`pangolin-ngx` opens `pangolin.db` in the current working directory
+(see `crates/ngx/src/main.rs`, `let db_path = PathBuf::from("pangolin.db")`).
+There is currently **no environment variable or CLI flag to override
+the path** — run the binary from the directory that holds the database
+you want to use, or symlink/`cd` into it from your service unit.
 
-```bash
-DATABASE_URL=/var/lib/pangolin/prod.db ./bin/pangolin-ngx
-```
-
-Different environments (dev, staging, prod) can have separate databases. Migrations apply to each independently — starting a new staging instance from a prod snapshot will only run migrations that are newer than the snapshot's `refinery_schema_history`.
+If you need per-environment databases (dev, staging, prod), run each
+binary in a different working directory. Migrations apply to each
+database independently — starting a new staging instance from a prod
+snapshot will only run migrations newer than that snapshot's
+`refinery_schema_history`.
 
 ## Further reading
 
