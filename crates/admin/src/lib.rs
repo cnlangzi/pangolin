@@ -158,6 +158,8 @@ pub async fn handle(
             )
             .await?
         }
+        // DEPRECATED: use DELETE /api/sites/{name}. Kept as a fallback during the
+        // migration window (issue #48).
         ("sites/delete", "POST") => {
             routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
@@ -167,6 +169,8 @@ pub async fn handle(
         ("domains/new", "POST") => {
             routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
         }
+        // DEPRECATED: use DELETE /api/domains/{domain}. Kept as a fallback during the
+        // migration window (issue #48).
         ("domains/delete", "POST") => {
             routes::domains::handle_delete(
                 &app,
@@ -197,6 +201,8 @@ pub async fn handle(
             )
             .await?
         }
+        // DEPRECATED: use DELETE /api/tun/{name}. Kept as a fallback during the
+        // migration window (issue #48).
         ("tun/delete", "POST") => {
             routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
@@ -216,6 +222,8 @@ pub async fn handle(
         ("certs/retry", "POST") => {
             routes::certs::handle_retry(&app, &merged_params, &csrf_token).await?
         }
+        // DEPRECATED: use DELETE /api/certs/{domain}. Kept as a fallback during the
+        // migration window (issue #48).
         ("certs/delete", "POST") => {
             routes::certs::handle_delete(
                 &app,
@@ -262,6 +270,10 @@ pub async fn handle(
                 // /api/site/{name}/domains       GET   (HTML partial: site-specific domain table rows)
                 // /api/site/{name}/domains/new   GET   (HTML partial: new-domain form, preselected)
                 // /api/domains/{domain}          DELETE (HTML fragment — empty body on success)
+                // /api/sites/{name}              DELETE (HTML fragment — empty body on success)
+                // /api/certs/{domain}            DELETE (HTML fragment — empty body on success)
+                // /api/tun/{name}                DELETE (HTML fragment — empty body on success)
+                // /api/dns/{name}                DELETE (HTML fragment — empty body on success)
                 if let Some(rest2) = rest.strip_prefix("site/") {
                     if let Some((site_name, suffix)) = rest2.split_once('/') {
                         match (suffix, method) {
@@ -298,13 +310,61 @@ pub async fn handle(
                     } else {
                         not_found()
                     }
+                } else if let Some(name) = rest.strip_prefix("sites/") {
+                    if method == "DELETE" {
+                        if name.is_empty() {
+                            not_found()
+                        } else {
+                            routes::sites::api_handle_delete(&app, name.to_string(), &csrf_token)
+                                .await?
+                        }
+                    } else {
+                        not_found()
+                    }
+                } else if let Some(domain) = rest.strip_prefix("certs/") {
+                    if method == "DELETE" {
+                        if domain.is_empty() {
+                            not_found()
+                        } else {
+                            routes::certs::api_handle_delete(
+                                &app,
+                                domain.to_string(),
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                    } else {
+                        not_found()
+                    }
+                } else if let Some(name) = rest.strip_prefix("tun/") {
+                    if method == "DELETE" {
+                        if name.is_empty() {
+                            not_found()
+                        } else {
+                            routes::tun::api_handle_delete(&app, name.to_string(), &csrf_token)
+                                .await?
+                        }
+                    } else {
+                        not_found()
+                    }
+                } else if let Some(name) = rest.strip_prefix("dns/") {
+                    if method == "DELETE" {
+                        if name.is_empty() {
+                            not_found()
+                        } else {
+                            routes::dns::api_handle_delete(&app, name.to_string(), &csrf_token)
+                                .await?
+                        }
+                    } else {
+                        not_found()
+                    }
                 } else {
                     not_found()
                 }
             } else if let Some(rest) = path.strip_prefix("dns/") {
                 // /dns/{name}/edit   GET   (render edit form)
                 // /dns/{name}/edit   POST  (update)
-                // /dns/{name}/delete POST  (delete)
+                // /dns/{name}/delete POST  (delete) — DEPRECATED: use DELETE /api/dns/{name}.
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
@@ -320,6 +380,8 @@ pub async fn handle(
                             )
                             .await?
                         }
+                        // DEPRECATED: use DELETE /api/dns/{name}. Kept as a fallback during
+                        // the migration window (issue #48).
                         ("delete", "POST") => {
                             routes::dns::handle_delete(&app, Some(name.to_string()), &csrf_token)
                                 .await?
@@ -332,7 +394,7 @@ pub async fn handle(
             } else if let Some(rest) = path.strip_prefix("tun/") {
                 // /tun/{name}/edit   GET   (render edit form)
                 // /tun/{name}/edit   POST  (update)
-                // /tun/{name}/delete POST  (delete)
+                // /tun/{name}/delete POST  (delete) — DEPRECATED: use DELETE /api/tun/{name}.
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
@@ -348,6 +410,8 @@ pub async fn handle(
                             )
                             .await?
                         }
+                        // DEPRECATED: use DELETE /api/tun/{name}. Kept as a fallback during
+                        // the migration window (issue #48).
                         ("delete", "POST") => {
                             routes::tun::handle_delete(&app, Some(name.to_string()), &csrf_token)
                                 .await?

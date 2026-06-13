@@ -12,6 +12,6 @@ pub mod pages;
 pub mod summary;
 pub mod views;
 
-pub use mutate::{handle_create, handle_delete, handle_retry};
+pub use mutate::{api_handle_delete, handle_create, handle_delete, handle_retry};
 pub use pages::{render, render_create_page};
 pub use summary::handle_summary;

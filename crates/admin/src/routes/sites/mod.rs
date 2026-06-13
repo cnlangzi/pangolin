@@ -16,5 +16,5 @@ pub mod views;
 //   `routes::sites::handle_create`
 //   `routes::sites::handle_update`
 //   `routes::sites::handle_delete`
-pub use mutate::{handle_create, handle_delete, handle_update};
+pub use mutate::{api_handle_delete, handle_create, handle_delete, handle_update};
 pub use pages::{render, render_create_page, render_edit_page};

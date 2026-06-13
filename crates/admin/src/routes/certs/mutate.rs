@@ -66,6 +66,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     }
 }
 
+// NOTE: `handle_delete` is the legacy form-POST endpoint. It will be removed
+// once all admin UIs migrate to the HTMX `hx-delete` button (see
+// `api_handle_delete` below and the `templates/components/_hx_delete_button.html`
+// partial). Tracked by issue #48.
 pub async fn handle_delete(
     app: &Arc<App>,
     domain: Option<String>,
@@ -80,6 +84,31 @@ pub async fn handle_delete(
         }
     }
     Ok(redirect_response("/certs"))
+}
+
+/// HTMX `DELETE /api/certs/{domain}` — returns an empty 200 body so HTMX
+/// (with `hx-swap="delete"`) can drop the row without a full page reload.
+///
+/// This is the unified delete endpoint for certs; the form-POST
+/// `/certs/delete` route above is kept for now as a fallback during the
+/// migration window (issue #48).
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    domain: String,
+    _csrf: &str,
+) -> http::Result<Resp> {
+    if domain.is_empty() {
+        return Ok(crate::not_found());
+    }
+    let db = app.db.lock().await;
+    let _ = pangolin_core::db::delete_cert(&db, &domain);
+    drop(db);
+    app.reload_indexes().await;
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
 
 /// `POST /certs/retry` — operator-driven ACME retry (issue #45).

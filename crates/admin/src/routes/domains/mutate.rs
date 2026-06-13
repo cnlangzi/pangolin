@@ -165,6 +165,10 @@ async fn render_create_page_with_error(
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
+/// DEPRECATED: use `DELETE /api/domains/{domain}` (`api_handle_delete`
+/// below). This form-POST handler is kept as a fallback during the
+/// migration window (issue #48). All admin UIs now use the
+/// `templates/components/_hx_delete_button.html` partial instead.
 pub async fn handle_delete(
     app: &Arc<App>,
     domain: Option<String>,

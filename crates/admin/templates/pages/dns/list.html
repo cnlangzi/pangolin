@@ -38,10 +38,12 @@
             <td class="px-4 py-3 text-sm text-slate-600 dark:text-slate-400">{{ self.count_for(p.name) }}</td>
             <td class="px-4 py-3 text-right text-sm space-x-2">
               <a href="/dns/{{ p.name }}/edit" class="text-accent-600 dark:text-accent-400 hover:underline">Edit</a>
-              <form method="POST" action="/dns/{{ p.name }}/delete" class="inline" onsubmit="return confirm('Delete DNS provider {{ p.name }}? Domains referencing it will fall back to no-association (HTTP-01).');">
-                {% include "components/_csrf.html" %}
-                <button type="submit" class="text-red-600 dark:text-red-400 hover:underline">Delete</button>
-              </form>
+              <button hx-delete="/api/dns/{{ p.name }}"
+                hx-vals='{"_csrf": "__CSRF__"}'
+                hx-confirm="Delete DNS provider {{ p.name }}? Domains referencing it will fall back to no-association (HTTP-01)."
+                hx-swap="delete"
+                hx-target="closest tr"
+                class="text-red-600 dark:text-red-400 hover:underline">Delete</button>
             </td>
           </tr>
           {% endfor %}

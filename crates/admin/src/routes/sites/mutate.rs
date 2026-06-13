@@ -224,6 +224,10 @@ pub async fn handle_update(
     }
 }
 
+// NOTE: `handle_delete` is the legacy form-POST endpoint. It will be removed
+// once all admin UIs migrate to the HTMX `hx-delete` button (see
+// `api_handle_delete` below and the `templates/components/_hx_delete_button.html`
+// partial). Tracked by issue #48.
 pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
@@ -238,4 +242,29 @@ pub async fn handle_delete(
         }
     }
     Ok(redirect_response("/sites"))
+}
+
+/// HTMX `DELETE /api/sites/{name}` — returns an empty 200 body so HTMX
+/// (with `hx-swap="delete"`) can drop the row without a full page reload.
+///
+/// This is the unified delete endpoint for sites; the form-POST
+/// `/sites/delete` route above is kept for now as a fallback during the
+/// migration window (issue #48).
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    name: String,
+    _csrf: &str,
+) -> http::Result<Resp> {
+    if name.is_empty() {
+        return Ok(crate::not_found());
+    }
+    let db = app.db.lock().await;
+    let _ = pangolin_core::db::delete_site(&db, &name);
+    drop(db);
+    app.reload_indexes().await;
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
