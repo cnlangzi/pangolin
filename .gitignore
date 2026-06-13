@@ -21,6 +21,7 @@ Cargo.lock.bak
 
 # Generated certs (test or runtime)
 /certs
+/certs-staging
 *.pem
 !testdata/**/*.pem
 

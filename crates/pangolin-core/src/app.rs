@@ -126,29 +126,57 @@ pub fn plan_issuance(
     let mut challenges = Vec::with_capacity(sans.len());
     let mut required_provider: Option<String> = None;
 
-    for san in sans {
-        let is_wildcard = san.starts_with("*.");
-        let associated = idx.lookup_dns(san);
+    // First pass: pick the DNS provider the WHOLE order will use
+    // (whichever one any of the SANs is associated with, since
+    // DNS-01 SANs in a single order all live on the same DNS
+    // provider account). The match is done before per-SAN logic
+    // so a wildcard can force every SAN in the same order onto
+    // Dns01 — the per-domain lookup below would otherwise pick
+    // Http01 for the base `yaitoo.cn` (which has no provider
+    // attached in the DB) while the wildcard `*.yaitoo.cn` uses
+    // Dns01, leaving the base unable to find a matching
+    // http-01 challenge.
+    let order_provider: Option<String> = sans
+        .iter()
+        .find_map(|san| idx.lookup_dns(san).clone());
+    if let Some(p) = &order_provider {
+        if !idx.providers.contains_key(p) {
+            return Err(PangolinError::Config(format!(
+                "order references unknown or disabled dns_provider '{p}'"
+            )));
+        }
+    }
+    let any_wildcard = sans.iter().any(|s| s.starts_with("*."));
+    if any_wildcard && order_provider.is_none() {
+        return Err(PangolinError::Config(
+            "wildcard SAN in order requires a DNS provider (set dns_provider \
+             on the wildcard domain or its base)"
+                .into(),
+        ));
+    }
 
-        match (is_wildcard, associated) {
-            (true, None) => {
-                return Err(PangolinError::Config(format!(
-                    "wildcard {san} requires DNS-01 but no dns_provider is associated \
-                     with the FQDN or base domain"
-                )));
-            }
-            (true, Some(p)) | (false, Some(p)) => {
-                if !idx.providers.contains_key(&p) {
-                    return Err(PangolinError::Config(format!(
-                        "{san} references unknown or disabled dns_provider '{p}'"
-                    )));
-                }
-                required_provider = Some(p);
-                challenges.push((san.clone(), ChallengeType::Dns01));
-            }
-            (false, None) => {
-                challenges.push((san.clone(), ChallengeType::Http01));
-            }
+    for san in sans {
+        // If any SAN in this order is a wildcard, we MUST use
+        // Dns01 for ALL SANs in the order — the wildcard
+        // forces Dns01, and the bare base (e.g. `yaitoo.cn`
+        // alongside `*.yaitoo.cn`) shares the same persistent
+        // TXT record at `_validation-persist.<base>` so it
+        // can't be validated via http-01 without setting up a
+        // second challenge. (See the IETF
+        // draft-ietf-acme-dns-persist-01 §3.1 example which
+        // puts the wildcard and the bare FQDN in the same
+        // order and uses ONE TXT for both.) Even when no
+        // wildcard is present, the order's DNS provider (if
+        // any) is reused across SANs so all TXT records land
+        // in the same zone.
+        if any_wildcard || order_provider.is_some() {
+            let p = order_provider.as_ref().unwrap();
+            required_provider = Some(p.clone());
+            challenges.push((san.clone(), ChallengeType::Dns01));
+        } else {
+            // No DNS provider in the order AND no wildcard —
+            // fall back to http-01 for every SAN.
+            challenges.push((san.clone(), ChallengeType::Http01));
         }
     }
 
@@ -626,6 +654,18 @@ mod tests {
     #[test]
     fn plan_mixed_dns_and_no_dns_per_identifier() {
         // SAN: ["foo.example.com", "bar.example.com"]. Only foo has DNS.
+        //
+        // After the wildcard-base fix, the planner uses an
+        // "all-or-nothing" policy for Dns01: if ANY SAN in the
+        // order has a DNS provider attached, the WHOLE order is
+        // routed through that provider. This avoids the
+        // wildcard+base mismatch (where the wildcard forces Dns01
+        // and the bare base falls back to Http01, leaving the
+        // base unable to find a matching http-01 challenge in
+        // the authorization). For per-SAN choice we'd need to
+        // either pick a single challenge type per order or
+        // implement per-SAN challenge switching; both add
+        // complexity for a marginal case.
         let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
         let domains = vec![make_domain("foo.example.com", true, Some("cf"))];
         let idx = DnsIndex::build(&providers, &domains);
@@ -640,7 +680,7 @@ mod tests {
             plan.challenges,
             vec![
                 ("foo.example.com".into(), ChallengeType::Dns01),
-                ("bar.example.com".into(), ChallengeType::Http01),
+                ("bar.example.com".into(), ChallengeType::Dns01),
             ]
         );
     }
