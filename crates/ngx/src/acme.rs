@@ -904,10 +904,12 @@ fn parse_blob_metadata(blob: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, Vec<
     .map_err(|e| anyhow::anyhow!("base64 decode: {}", e))?;
     let (_, cert) = x509_parser::parse_x509_certificate(&der)
         .map_err(|e| anyhow::anyhow!("X509 parse: {}", e))?;
-    let not_before = DateTime::from_timestamp(cert.tbs_certificate.validity.not_before.timestamp(), 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid NotBefore"))?;
-    let not_after = DateTime::from_timestamp(cert.tbs_certificate.validity.not_after.timestamp(), 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid NotAfter"))?;
+    let not_before =
+        DateTime::from_timestamp(cert.tbs_certificate.validity.not_before.timestamp(), 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid NotBefore"))?;
+    let not_after =
+        DateTime::from_timestamp(cert.tbs_certificate.validity.not_after.timestamp(), 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid NotAfter"))?;
 
     // Extract SANs from the `SubjectAltName` X.509 extension. Falls back
     // to the cert's CN if no SAN extension is present (very old / hand-

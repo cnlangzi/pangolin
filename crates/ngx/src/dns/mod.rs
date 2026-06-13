@@ -17,10 +17,18 @@ use pangolin_core::DnsProviderKind;
 /// TLS, TCP refused, timeout) instead of reqwest's outer
 /// `"error sending request for url (...)"` wrapper.
 ///
+/// **Every layer's `Display` output is run through `scrub_url_query`
+/// before being included.** reqwest's `Display` impl carries the full
+/// request URL, and the Tencent API puts `SecretId` in the query
+/// string — without scrubbing, a single `log::warn!` of the error
+/// chain leaks the credential to admin logs and the dashboard
+/// activity panel. The scrubber strips everything after `?` from any
+/// URL appearing in the message so only host + path remain.
+///
 /// Stops after a small ceiling so a malicious or pathological cause
 /// chain can't produce unbounded log output.
 fn chain_message<E: std::error::Error + ?Sized>(e: &E) -> String {
-    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut parts: Vec<String> = vec![scrub_url_query(&e.to_string())];
     let mut src = e.source();
     let mut depth = 0;
     while let Some(s) = src {
@@ -28,13 +36,66 @@ fn chain_message<E: std::error::Error + ?Sized>(e: &E) -> String {
             parts.push("…".to_string());
             break;
         }
-        parts.push(s.to_string());
+        parts.push(scrub_url_query(&s.to_string()));
         src = s.source();
         depth += 1;
     }
     // Deduplicate — reqwest sometimes nests the same message twice.
     parts.dedup();
     parts.join(" → ")
+}
+
+/// Strip `?query` from any URL appearing in a message. Used because
+/// Tencent's API takes `SecretId` in the query string (cleartext) and
+/// reqwest's `Display` impl naïvely includes the full URL in its
+/// error message — so anything that propagates a reqwest error
+/// without scrubbing leaks the credential to logs.
+///
+/// Conservative — only strips between `?` and the next whitespace /
+/// `)` / end-of-string, so non-URL text containing `?` (e.g. an
+/// English sentence) is unaffected as long as the suffix doesn't
+/// look like a URL path.
+///
+/// Replaces the stripped query with `?…` so the message reads
+/// naturally and the reader knows redaction happened.
+fn scrub_url_query(msg: &str) -> String {
+    // Walk the string finding `://...?...<terminator>` runs and
+    // substituting the query span with `?…`. Implementation uses
+    // `find`/`split_at` on string slices so multi-byte UTF-8
+    // (e.g. the `→` chain separator) round-trips unchanged.
+    let mut remaining = msg;
+    let mut out = String::with_capacity(msg.len());
+    while !remaining.is_empty() {
+        match remaining.find("://") {
+            None => {
+                out.push_str(remaining);
+                break;
+            }
+            Some(scheme_idx) => {
+                // Copy everything up to and including `://`.
+                let scheme_end = scheme_idx + 3;
+                out.push_str(&remaining[..scheme_end]);
+                let rest = &remaining[scheme_end..];
+                // Find the URL-end terminator (space/paren/newline/tab)
+                // and the optional `?` inside the run.
+                let terminator = rest.find([' ', ')', '\n', '\t']).unwrap_or(rest.len());
+                let run = &rest[..terminator];
+                match run.find('?') {
+                    None => {
+                        // No query — copy the URL as-is.
+                        out.push_str(run);
+                    }
+                    Some(q) => {
+                        // Copy host+path+`?`, then redact the query.
+                        out.push_str(&run[..=q]);
+                        out.push('…');
+                    }
+                }
+                remaining = &rest[terminator..];
+            }
+        }
+    }
+    out
 }
 
 /// Trait for DNS providers that can create/delete TXT records.
@@ -59,10 +120,7 @@ pub trait DnsProvider: Send + Sync {
     /// surfaces the real cause to the admin UI. Providers can override
     /// for cheaper / more targeted checks.
     async fn probe(&self) -> Result<String> {
-        match self
-            .find_zone("__pangolin-check__.local.invalid")
-            .await
-        {
+        match self.find_zone("__pangolin-check__.local.invalid").await {
             Ok((z, _)) => Ok(format!(
                 "credentials work; probe matched zone {} (unexpected — \
                  check the probe domain isn't actually registered)",
@@ -93,13 +151,43 @@ pub struct CloudflareDnsProvider {
     client: reqwest::Client,
 }
 
+/// Build a reqwest client for DNS provider API calls (Cloudflare,
+/// DNSPod, Aliyun).
+///
+/// **TLS verification is intentionally DISABLED.** The workspace uses
+/// `rustls-tls-manual-roots` (no CA bundle compiled in, no OS trust
+/// store reader) so the default reqwest client has zero trusted
+/// roots and rejects every public CA with `UnknownIssuer`. Loading
+/// roots would mean adding `webpki-roots` (bundled Mozilla CA) or
+/// `rustls-native-certs` (OS trust store) — both bring deployment
+/// complexity that the user explicitly declined: pangolin is
+/// deployed to a trusted server environment, the DNS provider hosts
+/// (`dnspod.tencentcloudapi.com` / `api.cloudflare.com` /
+/// `alidns.aliyuncs.com`) are themselves trusted infrastructure,
+/// and the operator owns both sides.
+///
+/// A one-line WARN at construction makes the choice visible in the
+/// startup log so the next person reading it doesn't wonder why
+/// MITM doesn't trip an alert.
+fn build_dns_client(provider: &str) -> reqwest::Client {
+    log::warn!(
+        "DNS[{}] reqwest client: timeout=15s, TLS cert verification DISABLED \
+         (trusted environment — see crates/ngx/src/dns/mod.rs::build_dns_client)",
+        provider
+    );
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|e| panic!("{} client builder: {}", provider, e))
+}
+
 impl CloudflareDnsProvider {
     pub fn new(api_token: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("Cloudflare client builder");
-        Self { api_token, client }
+        Self {
+            api_token,
+            client: build_dns_client("Cloudflare"),
+        }
     }
 
     async fn zone_by_name(&self, name: &str) -> Result<Option<(String, String)>> {
@@ -254,10 +342,6 @@ pub struct AliyunDnsProvider {
 
 impl AliyunDnsProvider {
     pub fn new(access_key_id: String, access_key_secret: String, region: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("Aliyun client builder");
         Self {
             access_key_id,
             access_key_secret,
@@ -266,7 +350,7 @@ impl AliyunDnsProvider {
             } else {
                 region
             },
-            client,
+            client: build_dns_client("Aliyun"),
         }
     }
 
@@ -411,14 +495,10 @@ pub struct TencentDnsProvider {
 
 impl TencentDnsProvider {
     pub fn new(secret_id: String, secret_key: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("Tencent client builder");
         Self {
             secret_id,
             secret_key,
-            client,
+            client: build_dns_client("DNSPod"),
         }
     }
 
@@ -623,11 +703,7 @@ impl DnsProvider for TencentDnsProvider {
             match self.do_request("DescribeRecords", params).await {
                 Ok(resp) => {
                     if resp.pointer("/Response/RecordList").is_some() {
-                        log::info!(
-                            "Tencent find_zone: matched {} for fqdn {}",
-                            candidate,
-                            fqdn
-                        );
+                        log::info!("Tencent find_zone: matched {} for fqdn {}", candidate, fqdn);
                         return Ok((candidate.clone(), candidate));
                     }
                     // 200 OK but no RecordList — odd, treat as miss.
@@ -814,10 +890,51 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{chain_message, is_zone_not_on_account};
+    use super::{chain_message, is_zone_not_on_account, scrub_url_query};
+
+    #[test]
+    fn scrub_url_query_strips_query_string() {
+        // Tencent's SecretId travels in URL query — must not survive
+        // into log/event messages. Real-world reqwest error string
+        // (verbatim from the user's bug report, credential redacted).
+        let in_ = "error sending request for url \
+                   (https://dnspod.tencentcloudapi.com/?Action=Describe&SecretId=AKID123&Domain=foo) \
+                   → invalid peer certificate";
+        let out = scrub_url_query(in_);
+        assert!(!out.contains("SecretId"), "must redact: {out}");
+        assert!(!out.contains("AKID"), "must redact: {out}");
+        assert!(out.contains("dnspod.tencentcloudapi.com/?…"), "{out}");
+        // Preserve everything outside the URL — multibyte arrow
+        // included.
+        assert!(out.contains(" → invalid peer certificate"), "{out}");
+    }
+
+    #[test]
+    fn scrub_url_query_passes_through_non_url_text() {
+        // English sentences with `?` are not URLs; do not redact.
+        let in_ = "what is this? — a question";
+        let out = scrub_url_query(in_);
+        assert_eq!(out, in_);
+    }
+
+    #[test]
+    fn scrub_url_query_handles_url_without_query() {
+        let in_ = "GET https://example.com/path/here failed";
+        let out = scrub_url_query(in_);
+        assert_eq!(out, in_, "URL without `?` is unchanged");
+    }
+
+    #[test]
+    fn scrub_url_query_handles_multiple_urls() {
+        let in_ = "first https://a.com/?k=1 then https://b.com/?j=2 done";
+        let out = scrub_url_query(in_);
+        assert!(out.contains("https://a.com/?…"), "{out}");
+        assert!(out.contains("https://b.com/?…"), "{out}");
+        assert!(!out.contains("k=1"), "{out}");
+        assert!(!out.contains("j=2"), "{out}");
+    }
 
     #[test]
     fn chain_message_flattens_source_chain() {
