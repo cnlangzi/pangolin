@@ -502,89 +502,143 @@ impl TencentDnsProvider {
         }
     }
 
-    fn sign(&self, params: &mut HashMap<String, String>) -> String {
+    /// TC3-HMAC-SHA256 signing per Tencent Cloud API 3.0 spec.
+    /// See: https://cloud.tencent.com/document/api/1427/56188
+    ///
+    /// Returns the `Signature` hex string that goes into the
+    /// `Authorization: TC3-HMAC-SHA256 ... Signature=<this>` header.
+    ///
+    /// **Body and headers, NOT query string.** The previous Frankenstein
+    /// impl signed sigv1-style (`key=value&...` joined, base64 output,
+    /// empty-body hash hard-coded) but advertised TC3 in the
+    /// Authorization header. Tencent dutifully reported "MissingParameter
+    /// X-TC-Action" because the action lived in the URL query instead of
+    /// the required header. Operators saw "find_zone failed" with no clue
+    /// it was our signer.
+    fn sign_tc3(&self, date: &str, timestamp: i64, action_lower: &str, body_json: &str) -> String {
         use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
+        use sha2::{Digest, Sha256};
+        type HmacSha256 = Hmac<Sha256>;
 
-        let mut sorted: Vec<_> = params.iter().collect();
-        sorted.sort_by_key(|p| p.0);
+        let sha256_hex = |bytes: &[u8]| -> String {
+            let mut h = Sha256::new();
+            h.update(bytes);
+            let digest = h.finalize();
+            let mut s = String::with_capacity(64);
+            for b in digest {
+                use std::fmt::Write;
+                let _ = write!(&mut s, "{:02x}", b);
+            }
+            s
+        };
 
-        let string_to_sign = sorted
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&");
+        let payload_hash = sha256_hex(body_json.as_bytes());
 
-        let body_hash = "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string();
-        let data = format!("{}\n{}", string_to_sign, body_hash);
+        // CanonicalRequest — order and case matter exactly.
+        let canonical_req = format!(
+            "POST\n\
+             /\n\
+             \n\
+             content-type:application/json; charset=utf-8\n\
+             host:{HOST}\n\
+             x-tc-action:{action}\n\
+             \n\
+             content-type;host;x-tc-action\n\
+             {payload_hash}",
+            HOST = "dnspod.tencentcloudapi.com",
+            action = action_lower,
+        );
+        let credential_scope = format!("{date}/dnspod/tc3_request");
+        let canonical_hash = sha256_hex(canonical_req.as_bytes());
+        let string_to_sign =
+            format!("TC3-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{canonical_hash}");
 
-        let mut mac = HmacSha256::new_from_slice(self.secret_key.as_bytes()).expect("HMAC init");
-        mac.update(data.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        // Derive signing key: SK4 chain (per Tencent spec).
+        let mut mac = HmacSha256::new_from_slice(format!("TC3{}", self.secret_key).as_bytes())
+            .expect("HMAC init");
+        mac.update(date.as_bytes());
+        let secret_date = mac.finalize().into_bytes();
+
+        let mut mac = HmacSha256::new_from_slice(&secret_date).expect("HMAC init");
+        mac.update(b"dnspod");
+        let secret_service = mac.finalize().into_bytes();
+
+        let mut mac = HmacSha256::new_from_slice(&secret_service).expect("HMAC init");
+        mac.update(b"tc3_request");
+        let secret_signing = mac.finalize().into_bytes();
+
+        let mut mac = HmacSha256::new_from_slice(&secret_signing).expect("HMAC init");
+        mac.update(string_to_sign.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(64);
+        for b in sig {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{:02x}", b);
+        }
+        hex
     }
 
     async fn do_request(
         &self,
         action: &str,
-        mut params: HashMap<String, String>,
+        payload: HashMap<String, String>,
     ) -> Result<serde_json::Value> {
         use std::time::SystemTime;
-
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let nonce = uuid::Uuid::new_v4().to_string();
-
-        params.insert("SecretId".to_string(), self.secret_id.clone());
-        params.insert("Timestamp".to_string(), timestamp);
-        params.insert("Nonce".to_string(), nonce);
-        params.insert("Action".to_string(), action.to_string());
-        params.insert("Version".to_string(), "2021-03-23".to_string());
-
-        let signature = self.sign(&mut params);
-
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        let url = format!("https://dnspod.tencentcloudapi.com/?{}", query);
+        const HOST: &str = "dnspod.tencentcloudapi.com";
+        const SERVICE: &str = "dnspod";
+        const VERSION: &str = "2021-03-23";
 
         // ── SECURITY: any error message that flows from here MUST
-        // strip the URL's query string. The query carries `SecretId`
-        // in cleartext (Tencent signs the request, doesn't hide the
-        // ID), and reqwest's `Display` impl helpfully includes the
-        // full URL — so a naive `?` propagation leaks the credential
-        // to admin logs and the dashboard activity panel. `?` is NOT
-        // safe here. Match explicitly and report only `action` +
-        // a redacted SecretId (last 4 chars).
-        let safe_url = "https://dnspod.tencentcloudapi.com/";
-        let secret_id_tail = self
-            .secret_id
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
+        // never include the SecretId in cleartext. Keep a 4-char
+        // tail (helps operators match it against their console)
+        // and a constant `safe_url` (no query string at all under
+        // TC3 — payload is in body, headers carry the metadata).
+        let safe_url = format!("https://{HOST}/");
+        let secret_id_tail: String = self.secret_id.chars().rev().take(4).collect();
+        let secret_id_tail: String = secret_id_tail.chars().rev().collect();
+
+        // Build JSON body from the payload HashMap. Order doesn't
+        // matter for Tencent; the signature is over the exact
+        // string bytes we send.
+        let body_value = serde_json::Value::Object(
+            payload
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect(),
+        );
+        let body_json = serde_json::to_string(&body_value).unwrap_or_else(|_| "{}".to_string());
+
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp(now_secs, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid timestamp"))?
+            .format("%Y-%m-%d")
+            .to_string();
+        let action_lower = action.to_ascii_lowercase();
+        let signature = self.sign_tc3(&date, now_secs, &action_lower, &body_json);
+        let auth = format!(
+            "TC3-HMAC-SHA256 Credential={sid}/{date}/{SERVICE}/tc3_request, \
+             SignedHeaders=content-type;host;x-tc-action, Signature={signature}",
+            sid = self.secret_id,
+        );
+
         let resp = match self
             .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("TC3-HMAC-SHA256 {}", signature))
+            .post(&safe_url)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .header("Host", HOST)
+            .header("X-TC-Action", action)
+            .header("X-TC-Timestamp", now_secs.to_string())
+            .header("X-TC-Version", VERSION)
+            .header("Authorization", auth)
+            .body(body_json)
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                // Walk `.source()` chain so the operator sees the
-                // real cause (DNS lookup, TLS handshake, TCP refused,
-                // timeout) instead of reqwest's outer "error sending
-                // request" wrapper.
                 let chain = chain_message(&e);
                 return Err(anyhow::anyhow!(
                     "Tencent {} HTTP failure ({}, SecretId=…{}): {}",
