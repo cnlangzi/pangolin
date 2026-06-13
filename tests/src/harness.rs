@@ -303,7 +303,11 @@ impl NgxProcess {
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
         let cert_dir = tmpdir.path().join("certs");
         std::fs::create_dir_all(&cert_dir).expect("mkdir certs");
-        gen_self_signed(&["localhost", "127.0.0.1"], "default", &cert_dir);
+        // No `default` blob: v2 has no `default` SNI fallback
+        // (see `pangolin_core::app::resolve_cert_fails_without_default_fallback`).
+        // Generating one here would be auto-imported into the
+        // `certs` table on every test boot, polluting cert counts
+        // in unrelated tests.
 
         let http_port = free_port();
         let tls_port = free_port();

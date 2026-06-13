@@ -600,11 +600,7 @@ impl TencentDnsProvider {
         // Build JSON body from the payload HashMap. Order doesn't
         // matter for Tencent; the signature is over the exact
         // string bytes we send.
-        let body_value = serde_json::Value::Object(
-            payload
-                .into_iter()
-                .collect(),
-        );
+        let body_value = serde_json::Value::Object(payload.into_iter().collect());
         let body_json = serde_json::to_string(&body_value).unwrap_or_else(|_| "{}".to_string());
 
         let now_secs = SystemTime::now()
@@ -720,9 +716,7 @@ impl DnsProvider for TencentDnsProvider {
 
         if let Some(recs) = records {
             for record in recs {
-                let record_id = record
-                    .pointer("/RecordId")
-                    .and_then(|v| v.as_i64());
+                let record_id = record.pointer("/RecordId").and_then(|v| v.as_i64());
                 if let Some(rid) = record_id {
                     // DeleteRecord requires both Domain and RecordId per API docs:
                     // https://cloud.tencent.com/document/api/1427/56176

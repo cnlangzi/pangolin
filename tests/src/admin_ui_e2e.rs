@@ -2452,7 +2452,10 @@ async fn certs_table_filter_by_status() {
     .unwrap();
     drop(conn);
 
-    // Unfiltered view shows all three.
+    // Unfiltered view shows all three. (The `default` v1 blob
+    // is NOT imported into the certs table — `scan_and_import_blobs`
+    // explicitly skips the `default` filename because v2 has no
+    // `default` SNI fallback; see `acme::scan_and_import_blobs`.)
     let all = client.get("/certs").await.unwrap().text().await.unwrap();
     let doc_all = Html::parse_document(&all);
     let row_sel = Selector::parse("tr[data-domain]").unwrap();
@@ -2534,6 +2537,12 @@ async fn certs_summary_endpoint_returns_status_counts() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    // `scan_and_import_blobs` skips the `default` filename
+    // (v2 has no `default` SNI fallback, so the v1
+    // autocert-DirCache `default` blob should not show up
+    // in the certs table), so the baseline counts are
+    // `total=2, issued=1, failed=1` — exactly the rows the
+    // test itself inserted.
     assert_eq!(v["total"], 2);
     assert_eq!(v["issued"], 1);
     assert_eq!(v["failed"], 1);

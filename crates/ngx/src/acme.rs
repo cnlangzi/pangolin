@@ -303,7 +303,9 @@ impl AcmeClient {
                     "ACME: loaded existing account from {}",
                     cert_dir.join(ACCOUNT_KEY_FILE).display()
                 );
-                Account::builder_with_http(http).from_credentials(cred).await?
+                Account::builder_with_http(http)
+                    .from_credentials(cred)
+                    .await?
             }
             None => {
                 log::info!("ACME: registering new account for {}", email);
@@ -367,7 +369,7 @@ impl AcmeClient {
         let mut auths = order.authorizations();
         while let Some(auth_result) = auths.next().await {
             let mut auth = auth_result?;
-            let identifier_str = dns_id(&auth.identifier().identifier);
+            let identifier_str = dns_id(auth.identifier().identifier);
             log::info!("auth: identifier={}", identifier_str);
 
             if use_dns01 {
@@ -411,7 +413,7 @@ impl AcmeClient {
                 // `auth.challenge(...)` call above for the
                 // borrow-checker rationale that blocks a dns-01
                 // fallback in the same scope.
-                self.setup_dns_persist_txt(&identifier_str, &self.account.id().to_string())
+                self.setup_dns_persist_txt(&identifier_str, self.account.id())
                     .await?;
                 log::info!("dns-persist-01 challenge ready: {}", identifier_str);
                 challenge.set_ready().await?;
@@ -450,8 +452,10 @@ impl AcmeClient {
                 let mut auths_stream = order.authorizations();
                 while let Some(res) = auths_stream.next().await {
                     let Ok(mut handle) = res else { continue };
-                    let Ok(state) = handle.refresh().await else { continue };
-                    let id = dns_id(&state.identifier().identifier);
+                    let Ok(state) = handle.refresh().await else {
+                        continue;
+                    };
+                    let id = dns_id(state.identifier().identifier);
                     for ch in &state.challenges {
                         if let Some(line) = format_challenge_error(&id, ch) {
                             detail_lines.push(line);
@@ -459,8 +463,7 @@ impl AcmeClient {
                     }
                 }
                 let auth_detail = if detail_lines.is_empty() {
-                    "(no per-auth error surfaced — order invalidated without detail)"
-                        .to_string()
+                    "(no per-auth error surfaced — order invalidated without detail)".to_string()
                 } else {
                     detail_lines.join(" | ")
                 };
@@ -542,8 +545,10 @@ impl AcmeClient {
         let mut auths_stream = order.authorizations();
         while let Some(res) = auths_stream.next().await {
             let Ok(mut handle) = res else { continue };
-            let Ok(state) = handle.refresh().await else { continue };
-            let id = dns_id(&state.identifier().identifier);
+            let Ok(state) = handle.refresh().await else {
+                continue;
+            };
+            let id = dns_id(state.identifier().identifier);
             for ch in &state.challenges {
                 if matches!(ch.r#type, ChallengeType::Http01) && !ch.token.is_empty() {
                     log::info!("cleanup HTTP-01 challenge: {}", id);
@@ -685,10 +690,7 @@ impl AcmeClient {
     /// Read the sidecar JSON recording what we last provisioned
     /// for this domain. `None` when the sidecar is missing or
     /// unparseable — both treated as "needs (re)creation".
-    async fn read_persist_record(
-        &self,
-        identifier: &str,
-    ) -> Option<serde_json::Value> {
+    async fn read_persist_record(&self, identifier: &str) -> Option<serde_json::Value> {
         let path = self.persist_record_path(identifier);
         let bytes = tokio::fs::read(&path).await.ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -698,12 +700,7 @@ impl AcmeClient {
     /// for this domain. Best-effort: a write failure is logged
     /// but doesn't fail the cert flow (the next renewal will
     /// simply recreate the TXT, which is correct).
-    async fn write_persist_record(
-        &self,
-        identifier: &str,
-        account_uri: &str,
-        value: &str,
-    ) {
+    async fn write_persist_record(&self, identifier: &str, account_uri: &str, value: &str) {
         let path = self.persist_record_path(identifier);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -744,7 +741,9 @@ impl AcmeClient {
                 }
             })
             .collect();
-        self.cert_dir.join(".persist").join(format!("{}.json", safe))
+        self.cert_dir
+            .join(".persist")
+            .join(format!("{}.json", safe))
     }
 
     /// Idempotent: ensure `_validation-persist.<base_domain>` is
@@ -779,12 +778,11 @@ impl AcmeClient {
         // exact (account, issuer, value) for this base domain —
         // skip the DNS API call entirely.
         if let Some(record) = self.read_persist_record(base_domain).await {
-            let same_account = record.get("account_uri").and_then(|v| v.as_str())
-                == Some(account_uri);
-            let same_issuer = record.get("issuer").and_then(|v| v.as_str())
-                == Some(Self::PERSIST_ISSUER_LE);
-            let same_value = record.get("value").and_then(|v| v.as_str())
-                == Some(&expected_value);
+            let same_account =
+                record.get("account_uri").and_then(|v| v.as_str()) == Some(account_uri);
+            let same_issuer =
+                record.get("issuer").and_then(|v| v.as_str()) == Some(Self::PERSIST_ISSUER_LE);
+            let same_value = record.get("value").and_then(|v| v.as_str()) == Some(&expected_value);
             if same_account && same_issuer && same_value {
                 log::info!(
                     "dns-persist: {} already provisioned (account={}, issuer={}) — skip",
@@ -825,14 +823,11 @@ impl AcmeClient {
     /// doesn't take a `dyn DnsProvider` separately; uses the
     /// stored default provider. Kept as a thin shim so the
     /// legacy non-plan path still works.
-    async fn setup_dns_persist_txt(
-        &self,
-        identifier: &str,
-        account_uri: &str,
-    ) -> Result<()> {
-        let provider = self.dns_provider.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("dns-persist-01 requires a DNS provider")
-        })?;
+    async fn setup_dns_persist_txt(&self, identifier: &str, account_uri: &str) -> Result<()> {
+        let provider = self
+            .dns_provider
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dns-persist-01 requires a DNS provider"))?;
         self.ensure_dns_persist_txt(provider.as_ref(), identifier, account_uri)
             .await
     }
@@ -921,10 +916,15 @@ impl AcmeClient {
         let mut i = 0usize;
         while let Some(auth_result) = auths.next().await {
             let mut auth = auth_result?;
-            let identifier_str = dns_id(&auth.identifier().identifier);
+            let identifier_str = dns_id(auth.identifier().identifier);
             emit(
                 "authz-fetched",
-                format!("{}/{} identifier={}", i + 1, plan.challenges.len(), identifier_str),
+                format!(
+                    "{}/{} identifier={}",
+                    i + 1,
+                    plan.challenges.len(),
+                    identifier_str
+                ),
             );
             let (_, plan_ct) = plan
                 .challenges
@@ -953,11 +953,11 @@ impl AcmeClient {
                             identifier_str
                         )
                     })?,
-                pangolin_core::ChallengeType::Http01 => auth
-                    .challenge(ChallengeType::Http01)
-                    .ok_or_else(|| {
+                pangolin_core::ChallengeType::Http01 => {
+                    auth.challenge(ChallengeType::Http01).ok_or_else(|| {
                         anyhow::anyhow!("no http-01 challenge for {}", identifier_str)
-                    })?,
+                    })?
+                }
             };
 
             // Inspect the chosen challenge type once so we know which
@@ -1002,6 +1002,10 @@ impl AcmeClient {
                         )
                     })?;
                     let account_uri = self.account.id().to_string();
+                    // (clippy suggests `self.account.id()`; that returns &str which
+                    //  also fits `ensure_dns_persist_txt` — keeping the explicit
+                    //  String here is a no-op clone; revisit if the
+                    //  `expected_value` storage ever stops being a String.)
                     emit(
                         "dns-persist",
                         format!("ensuring persistent TXT for {}", identifier_str),
@@ -1021,8 +1025,7 @@ impl AcmeClient {
                             plan.dns_provider_name
                         )
                     })?;
-                    let key_auth =
-                        challenge.key_authorization().as_str().to_string();
+                    let key_auth = challenge.key_authorization().as_str().to_string();
                     let txt_name = format!("_acme-challenge.{}", identifier_str);
                     let txt_value = key_auth;
                     emit(
@@ -1077,8 +1080,7 @@ impl AcmeClient {
                     }
                 }
                 "http-01" => {
-                    let key_auth =
-                        challenge.key_authorization().as_str().to_string();
+                    let key_auth = challenge.key_authorization().as_str().to_string();
                     self.write_challenge(&challenge.token, &key_auth).await?;
                     emit(
                         "http01",
@@ -1091,7 +1093,10 @@ impl AcmeClient {
             challenge.set_ready().await?;
             emit(
                 "challenge-ready",
-                format!("notified ACME server for {} ({})", identifier_str, challenge_kind),
+                format!(
+                    "notified ACME server for {} ({})",
+                    identifier_str, challenge_kind
+                ),
             );
             i += 1;
         }
@@ -1122,8 +1127,10 @@ impl AcmeClient {
                 let mut auths_stream = order.authorizations();
                 while let Some(res) = auths_stream.next().await {
                     let Ok(mut handle) = res else { continue };
-                    let Ok(state) = handle.refresh().await else { continue };
-                    let id = dns_id(&state.identifier().identifier);
+                    let Ok(state) = handle.refresh().await else {
+                        continue;
+                    };
+                    let id = dns_id(state.identifier().identifier);
                     let mut auth_msgs: Vec<String> = Vec::new();
                     for ch in &state.challenges {
                         if let Some(line) = format_challenge_error(&id, ch) {
@@ -1140,8 +1147,7 @@ impl AcmeClient {
                     }
                 }
                 let auth_detail = if detail_lines.is_empty() {
-                    "(no per-auth error surfaced — order invalidated without detail)"
-                        .to_string()
+                    "(no per-auth error surfaced — order invalidated without detail)".to_string()
                 } else {
                     detail_lines.join(" | ")
                 };
@@ -1251,7 +1257,9 @@ impl AcmeClient {
         let mut auths_stream = order.authorizations();
         while let Some(res) = auths_stream.next().await {
             let Ok(mut handle) = res else { continue };
-            let Ok(state) = handle.refresh().await else { continue };
+            let Ok(state) = handle.refresh().await else {
+                continue;
+            };
             for ch in &state.challenges {
                 if matches!(ch.r#type, ChallengeType::Http01) && !ch.token.is_empty() {
                     self.remove_challenge(&ch.token).await;
@@ -1802,8 +1810,8 @@ mod tests {
                 Some(400),
             )),
         );
-        let out = format_challenge_error("frtpilot.yaitoo.cn", &ch)
-            .expect("error present → must format");
+        let out =
+            format_challenge_error("frtpilot.yaitoo.cn", &ch).expect("error present → must format");
         assert!(out.contains("frtpilot.yaitoo.cn"), "{out}");
         assert!(out.contains("Dns01"), "{out}");
         assert!(out.contains("Invalid"), "{out}"); // challenge_status
@@ -1824,8 +1832,7 @@ mod tests {
             instant_acme::ChallengeStatus::Invalid,
             Some(make_problem(Some("urn:acme:error:malformed"), None, None)),
         );
-        let out = format_challenge_error("example.com", &ch)
-            .expect("error present → must format");
+        let out = format_challenge_error("example.com", &ch).expect("error present → must format");
         assert!(out.contains("(no detail)"), "{out}");
         assert!(out.contains("[HTTP ?]"), "{out}");
         assert!(out.contains("urn:acme:error:malformed"), "{out}");
@@ -1848,8 +1855,8 @@ mod tests {
                 Some(400),
             )),
         );
-        let out = format_challenge_error("frtpilot.yaitoo.cn", &ch)
-            .expect("error present → must format");
+        let out =
+            format_challenge_error("frtpilot.yaitoo.cn", &ch).expect("error present → must format");
         assert!(
             out.contains("dns-persist-01"),
             "must surface the Unknown variant's inner string, got: {out}"
@@ -1868,16 +1875,10 @@ mod tests {
         // The method is associated with the impl (no `&self`),
         // call it as `AcmeClient::persist_base_domain`.
         assert_eq!(AcmeClient::persist_base_domain("yaitoo.cn"), "yaitoo.cn");
-        assert_eq!(
-            AcmeClient::persist_base_domain("*.yaitoo.cn"),
-            "yaitoo.cn"
-        );
+        assert_eq!(AcmeClient::persist_base_domain("*.yaitoo.cn"), "yaitoo.cn");
         // Edge case: `*` not followed by `.` is left alone
         // (the IETF draft only defines `*.` for wildcards).
-        assert_eq!(
-            AcmeClient::persist_base_domain("*yaitoo.cn"),
-            "*yaitoo.cn"
-        );
+        assert_eq!(AcmeClient::persist_base_domain("*yaitoo.cn"), "*yaitoo.cn");
     }
 
     #[test]
@@ -1907,9 +1908,8 @@ mod tests {
             )
         };
         assert!(expected("https://example/acct/1").contains("policy=wildcard"));
-        assert!(expected("https://example/acct/1").contains(
-            "letsencrypt.org; accounturi=https://example/acct/1"
-        ));
+        assert!(expected("https://example/acct/1")
+            .contains("letsencrypt.org; accounturi=https://example/acct/1"));
         // The expected value for the bare and wildcard cases is
         // identical — the helper intentionally doesn't branch.
         assert_eq!(

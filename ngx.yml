@@ -84,7 +84,7 @@ acme:
                           # (autocert DirCache native layout: {host} or {host}+rsa)
                           # v2 has NO `default` blob fallback — each host
                           # must have its own cert on disk.
-  acme_directory: https://acme-staging-v02.api.letsencrypt.org/directory  # staging (test) - switch to https://acme-v02.api.letsencrypt.org/directory for production
+  acme_directory: https://acme-v02.api.letsencrypt.org/directory  # Production LE. Override with NGX_ACME__ACME_DIRECTORY env (e.g. https://acme-staging-v02.api.letsencrypt.org/directory for testing).
   renew_threshold_days: 30
   renew_check_interval_hours: 6
   renew_max_retries: 3

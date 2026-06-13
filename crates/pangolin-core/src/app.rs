@@ -136,9 +136,7 @@ pub fn plan_issuance(
     // attached in the DB) while the wildcard `*.yaitoo.cn` uses
     // Dns01, leaving the base unable to find a matching
     // http-01 challenge.
-    let order_provider: Option<String> = sans
-        .iter()
-        .find_map(|san| idx.lookup_dns(san).clone());
+    let order_provider: Option<String> = sans.iter().find_map(|san| idx.lookup_dns(san).clone());
     if let Some(p) = &order_provider {
         if !idx.providers.contains_key(p) {
             return Err(PangolinError::Config(format!(

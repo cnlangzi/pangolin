@@ -77,15 +77,30 @@ fn patch_authz_response(body: Vec<u8>) -> Vec<u8> {
 }
 
 /// Wrap reqwest to implement `instant_acme::HttpClient`.
+///
+/// Only compiled when the `integration` feature is on (Pebble
+/// test runs are gated by this feature in the workspace
+/// `make test-e2e` target). The 0.8.x `HttpClient` trait
+/// uses `Request<BodyWrapper<Bytes>>` as the request body
+/// type (not `Full<Bytes>` as in 0.7.x) — we extract the
+/// raw bytes from the incoming BodyWrapper via
+/// `http_body_util::BodyExt::collect` and feed them to
+/// reqwest, then re-wrap the response as `BodyWrapper<Bytes>`
+/// via the `From<Vec<u8>>` impl for the response.
+#[cfg(feature = "integration")]
 struct AcmeHttpClient(reqwest::Client);
 
+#[cfg(feature = "integration")]
 impl instant_acme::HttpClient for AcmeHttpClient {
     fn request(
         &self,
-        req: http::Request<Full<Bytes>>,
-    ) -> futures_util::future::BoxFuture<
-        'static,
-        Result<instant_acme::BytesResponse, instant_acme::Error>,
+        req: http::Request<instant_acme::BodyWrapper<Bytes>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<instant_acme::BytesResponse, instant_acme::Error>,
+                > + Send,
+        >,
     > {
         let client = self.0.clone();
         Box::pin(async move {
@@ -141,6 +156,7 @@ impl instant_acme::HttpClient for AcmeHttpClient {
 }
 
 /// Build an AcmeClient configured for ECDSA HTTP-01 (matches previous test setup).
+#[cfg(feature = "integration")]
 async fn build_ecdsa_http01_client(
     cert_dir: std::path::PathBuf,
 ) -> anyhow::Result<Arc<ngx::acme::AcmeClient>> {
@@ -162,6 +178,7 @@ async fn build_ecdsa_http01_client(
 }
 
 /// Build an AcmeClient configured for RSA HTTP-01.
+#[cfg(feature = "integration")]
 async fn build_rsa_http01_client(
     cert_dir: std::path::PathBuf,
 ) -> anyhow::Result<Arc<ngx::acme::AcmeClient>> {
