@@ -159,6 +159,17 @@ fn main() -> anyhow::Result<()> {
         let acme_for_service = acme_state.clone();
         acme_state.install_on(&app).await;
 
+        // Scan `cert_dir` for cert blobs (manually placed by an
+        // operator, or left over from a pre-V4 install) and import
+        // missing rows into the `certs` table. Idempotent — existing
+        // rows are not touched, so a re-scan after operator edits is
+        // safe.
+        match crate::acme::scan_and_import_blobs(&app).await {
+            Ok(n) if n > 0 => log::info!("ACME: scanned cert_dir, imported {} blob row(s)", n),
+            Ok(_) => log::info!("ACME: cert_dir scan complete, no new blobs"),
+            Err(e) => log::warn!("ACME: cert_dir scan failed: {}", e),
+        }
+
         // Build & start services (fail-fast on startup error).
         let services: Vec<Box<dyn runtime::Service>> = vec![
             Box::new(acme::AcmeService::new(acme_for_service)),

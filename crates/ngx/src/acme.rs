@@ -116,6 +116,16 @@ fn parse_account_credentials(content: &str, path: &Path) -> Result<AccountCreden
     })
 }
 
+/// Per-stage callback used by [`AcmeClient::issue_with_plan`] to emit
+/// progress events to whoever is interested — typically the in-memory
+/// `EventBuffer` so the dashboard activity panel surfaces the trace
+/// live. Each call is `(stage, detail)`; the implementor decides
+/// where to send it (stdout log is always emitted in addition).
+///
+/// Boxed and Arc'd so the same callback can be cheaply shared across
+/// the `await`s inside `issue_with_plan` without lifetime juggling.
+pub type IssueTrace = Arc<dyn Fn(&str, String) + Send + Sync>;
+
 /// ACME client for issuing and renewing certificates.
 pub struct AcmeClient {
     account: Account,
@@ -531,11 +541,20 @@ impl AcmeClient {
     /// per SAN. (Current code path: all DNS-01 SANs share the single
     /// provider named in `plan.dns_provider_name`; future work can extend
     /// to per-SAN provider lookup if needed.)
+    /// `IssueTrace` is the per-stage callback `issue_with_plan` emits
+    /// to whenever it crosses a boundary that an operator might want
+    /// to see in real time — DNS-01 TXT set, DNS propagation polling,
+    /// ACME order ready polling, cert-ready polling, blob write.
+    /// `ensure_one` wires it up to push each event into the in-memory
+    /// `EventBuffer` so the dashboard activity panel surfaces the
+    /// trace live. `None` is the test-harness path — no surface to
+    /// emit to.
     pub async fn issue_with_plan(
         &self,
         domains: &[String],
         plan: &pangolin_core::IssuancePlan,
         dns_providers: &std::collections::HashMap<String, Arc<dyn DnsProvider>>,
+        trace: Option<&IssueTrace>,
     ) -> Result<Vec<(PathBuf, PathBuf)>> {
         if plan.challenges.is_empty() {
             anyhow::bail!("issue_with_plan called with empty plan (auto_issue=false?)");
@@ -548,10 +567,27 @@ impl AcmeClient {
             );
         }
 
-        log::info!(
-            "ACME v2: issuing cert for {:?} via plan {} entries",
-            domains,
-            plan.challenges.len()
+        // `emit` is the single channel for "tell the operator
+        // something happened" — always logs to stdout, and ALSO
+        // pushes to the dashboard EventBuffer when `trace` is Some.
+        // Keeping the two paths in one closure makes "spinner stuck,
+        // no event" structurally impossible.
+        let started = std::time::Instant::now();
+        let emit = |stage: &str, detail: String| {
+            let elapsed = started.elapsed().as_secs();
+            log::info!("ACME {} [{}s] {}", stage, elapsed, detail);
+            if let Some(t) = trace {
+                t(stage, format!("[{}s] {}", elapsed, detail));
+            }
+        };
+
+        emit(
+            "issue-begin",
+            format!(
+                "{} SAN(s), {} challenge(s)",
+                domains.len(),
+                plan.challenges.len()
+            ),
         );
 
         // Build identifier list (must match domains ordering).
@@ -561,10 +597,13 @@ impl AcmeClient {
             identifiers: &identifiers,
         };
         let mut order = self.account.new_order(&new_order).await?;
-        log::info!("ACME order created: {}", order.url());
+        emit("order-created", order.url().to_string());
 
         let authorizations = order.authorizations().await?;
-        log::info!("authorizations count: {}", authorizations.len());
+        emit(
+            "authz-fetched",
+            format!("{} authorization(s)", authorizations.len()),
+        );
 
         // Pick the DNS provider once for the whole order. (All DNS-01
         // SANs in the plan must reference the same provider; the planner
@@ -608,42 +647,103 @@ impl AcmeClient {
                     let key_auth = order.key_authorization(challenge).as_str().to_string();
                     let txt_name = format!("_acme-challenge.{}", identifier_str);
                     let txt_value = key_auth;
-                    let (zone, _zone_id) = p.find_zone(&identifier_str).await?;
-                    p.create_txt(&zone, &txt_name, &txt_value, 60).await?;
-                    log::info!(
-                        "DNS-01 challenge set: {} = {} (zone: {})",
-                        txt_name,
-                        txt_value,
-                        zone
+                    emit(
+                        "dns-zone",
+                        format!("looking up zone for {}", identifier_str),
                     );
+                    let (zone, _zone_id) = p.find_zone(&identifier_str).await?;
+                    emit("dns-zone", format!("zone={}", zone));
+                    // The DNS provider call itself can take seconds
+                    // (Cloudflare API, retries) — bracket it so the
+                    // operator sees both ends.
+                    emit(
+                        "dns-set",
+                        format!("creating TXT {} (zone={}, ttl=60)", txt_name, zone),
+                    );
+                    p.create_txt(&zone, &txt_name, &txt_value, 60).await?;
+                    emit(
+                        "dns-set",
+                        format!("TXT {} created (zone={})", txt_name, zone),
+                    );
+                    // The 120 s propagation wait is the longest synchronous
+                    // step in the whole flow — the user's primary
+                    // complaint was "stuck here, dashboard silent". Now
+                    // we emit both ends.
+                    emit(
+                        "dns-wait",
+                        format!("polling propagation: max 120s, every 5s ({})", txt_name),
+                    );
+                    let wait_started = std::time::Instant::now();
                     let propagated =
                         wait_for_txt_propagation(&txt_name, &txt_value, 120, 5).await?;
-                    if !propagated {
+                    let wait_elapsed = wait_started.elapsed().as_secs();
+                    if propagated {
+                        emit("dns-wait", format!("propagated in {}s", wait_elapsed));
+                    } else {
+                        emit(
+                            "dns-wait",
+                            format!(
+                                "timeout after {}s — proceeding anyway (may fail upstream)",
+                                wait_elapsed
+                            ),
+                        );
                         log::warn!("DNS-01 TXT may not be fully propagated, proceeding");
                     }
                 }
                 pangolin_core::ChallengeType::Http01 => {
                     let key_auth = order.key_authorization(challenge).as_str().to_string();
                     self.write_challenge(&challenge.token, &key_auth).await?;
+                    emit(
+                        "http01",
+                        format!("wrote challenge file token={}", challenge.token),
+                    );
                 }
             }
 
             order.set_challenge_ready(&challenge.url).await?;
+            emit(
+                "challenge-ready",
+                format!("notified ACME server for {}", identifier_str),
+            );
         }
 
         // Poll until order is ready or invalid.
+        emit("order-poll", "starting (max 10 × 5s = 50s)".to_string());
         let mut retries = 0u8;
         loop {
             let state = order.state();
             if state.status == OrderStatus::Ready {
+                emit(
+                    "order-ready",
+                    format!("status=Ready after {} poll(s)", retries),
+                );
                 break;
             }
             if state.status == OrderStatus::Invalid {
+                emit(
+                    "order-invalid",
+                    format!("status=Invalid error={:?}", state.error),
+                );
                 anyhow::bail!("ACME order invalid: {:?}", state.error);
             }
             if retries >= 10 {
+                emit(
+                    "order-timeout",
+                    format!(
+                        "still {:?} after {} polls, giving up",
+                        state.status, retries
+                    ),
+                );
                 anyhow::bail!("ACME order timeout waiting for ready");
             }
+            emit(
+                "order-poll",
+                format!(
+                    "attempt {}/10: status={:?}, sleeping 5s",
+                    retries + 1,
+                    state.status
+                ),
+            );
             sleep(Duration::from_secs(5)).await;
             order.refresh().await?;
             retries += 1;
@@ -651,16 +751,37 @@ impl AcmeClient {
 
         // Generate CSR + finalize.
         let (key_pem, csr_der) = self.generate_csr(domains)?;
+        emit("csr", format!("generated for {} SAN(s)", domains.len()));
         order.finalize(&csr_der).await?;
+        emit("finalize", "submitted CSR to ACME server".to_string());
 
         // Poll for certificate.
+        emit(
+            "cert-poll",
+            "waiting for cert chain (max 30 × 5s = 150s)".to_string(),
+        );
         let mut retries = 0u8;
         let cert_chain_pem = loop {
             if let Some(cert) = order.certificate().await? {
+                emit(
+                    "cert-ready",
+                    format!("received {} bytes after {} poll(s)", cert.len(), retries),
+                );
                 break cert;
             }
             if retries >= 30 {
+                emit(
+                    "cert-timeout",
+                    format!("no cert after {} polls, giving up", retries),
+                );
                 anyhow::bail!("ACME order timeout waiting for certificate");
+            }
+            if retries.is_multiple_of(3) {
+                // Don't spam: emit every 3rd poll (≈15s intervals).
+                emit(
+                    "cert-poll",
+                    format!("attempt {}/30: not ready, sleeping 5s", retries + 1),
+                );
             }
             sleep(Duration::from_secs(5)).await;
             retries += 1;
@@ -678,7 +799,7 @@ impl AcmeClient {
             write_file_0600(&path, blob.as_bytes())
                 .await
                 .with_context(|| format!("write blob for {}", domain))?;
-            log::info!("ACME blob written: {}", path.display());
+            emit("blob-write", format!("{}", path.display()));
             written.push((path.clone(), path));
         }
 
@@ -693,6 +814,7 @@ impl AcmeClient {
             }
         }
 
+        emit("issue-done", "complete".to_string());
         Ok(written)
     }
 
@@ -757,6 +879,135 @@ fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
 
     let not_after = cert.tbs_certificate.validity.not_after.timestamp();
     DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
+}
+
+/// Scan `app.cert_manager.cert_dir` for cert blob files and import any
+/// whose domain isn't already in the `certs` table.
+///
+/// Two motivations (both reported by operators):
+///
+/// 1. Pre-V4 installs and operator-managed deployments may have
+///    blob files on disk that were never reflected in the `certs`
+///    table. Without import, the admin UI shows an empty cert list
+///    even though TLS works.
+/// 2. After the rename to `acme_account.json`, a fresh re-registered
+///    account will issue NEW blobs alongside the old ones; without
+///    a scan, the certs table would only contain the new ones and
+///    the old SAN coverage would be invisible.
+///
+/// Conservative semantics:
+/// - **Don't clobber existing rows.** A domain that already appears
+///   in `certs` (in any status) is left alone — the operator's manual
+///   status, last_error, etc. take precedence over what's on disk.
+/// - **`source = 'disk-import'`** distinguishes these rows from
+///   manual uploads (`manual`) and ACME-issued (`acme`).
+/// - Skips `acme_account.json`, the legacy `acme_account+key`,
+///   dotfiles, directories (so `.well-known/` is invisible), and
+///   files that don't parse as a cert chain.
+///
+/// Idempotent — safe to call on every restart. Returns the count of
+/// rows actually inserted.
+pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
+    let cert_dir = &app.cert_manager.cert_dir;
+    if !cert_dir.exists() {
+        return Ok(0);
+    }
+    let mut entries = match tokio::fs::read_dir(cert_dir).await {
+        Ok(e) => e,
+        Err(e) => anyhow::bail!("read_dir {}: {}", cert_dir.display(), e),
+    };
+    let mut imported = 0usize;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let filename = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip the account credentials files (canonical + legacy) and
+        // any hidden file (`.DS_Store`, editor swap files, …).
+        if filename == ACCOUNT_KEY_FILE
+            || filename == "acme_account+key"
+            || filename.starts_with('.')
+        {
+            continue;
+        }
+        // Derive the domain from the filename. `+rsa` suffix marks
+        // the RSA companion blob (same content as the ECDSA file,
+        // just a different on-disk format). Either form represents
+        // the same logical cert; importing both as the same row is
+        // fine because `upsert_cert` is keyed on domain.
+        let domain = filename
+            .strip_suffix("+rsa")
+            .unwrap_or(filename)
+            .to_string();
+
+        // Skip if a row already exists — operator-owned, don't touch.
+        let existing = {
+            let conn = app.db.lock().await;
+            pangolin_core::db::get_cert(&conn, &domain).unwrap_or(None)
+        };
+        if existing.is_some() {
+            continue;
+        }
+
+        // Read the blob; if it doesn't look like a cert chain, skip
+        // (could be random operator file — we don't want to import
+        // those as 'issued').
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("scan: skip {} (read failed: {})", path.display(), e);
+                continue;
+            }
+        };
+        if !content.contains("-----BEGIN CERTIFICATE-----") {
+            // Not a cert blob — skip silently. The cert_dir holds
+            // mixed files (challenge tokens, account JSON, etc.); a
+            // log line per skipped file would be noisy.
+            continue;
+        }
+        let expires_at = parse_blob_expiry(&content).ok();
+
+        let now = chrono::Utc::now();
+        let cert = pangolin_core::Cert {
+            domain: domain.clone(),
+            cert_file: path.to_string_lossy().into_owned(),
+            key_file: path.to_string_lossy().into_owned(),
+            expires_at,
+            created_at: now,
+            sans: vec![domain.clone()],
+            // `disk-import` is a distinct source so the admin UI can
+            // tell at a glance "this row was reconstructed from a
+            // file, not from ACME or a manual upload form".
+            source: "disk-import".into(),
+            acme_dns_provider: None,
+            acme_account_id: None,
+            issued_at: 0,
+            status: pangolin_core::CertStatus::Issued,
+            started_at: None,
+            last_error: None,
+        };
+        {
+            let conn = app.db.lock().await;
+            if let Err(e) = pangolin_core::db::upsert_cert(&conn, &cert) {
+                log::warn!("scan: upsert {} failed: {}", domain, e);
+                continue;
+            }
+        }
+        imported += 1;
+        log::info!(
+            "scan: imported blob → {} (expires_at={:?})",
+            domain,
+            expires_at.map(|d| d.format("%Y-%m-%d").to_string())
+        );
+        app.add_event(pangolin_core::EventType::Info {
+            message: format!("scan: imported blob → {}", domain),
+        });
+    }
+    Ok(imported)
 }
 
 // The `mod tests` block below sits before some non-test items (the
@@ -1231,7 +1482,25 @@ impl AcmeState {
             ),
         );
         let issue_started = chrono::Utc::now();
-        match client.issue_with_plan(&sans, &plan, &dns_providers).await {
+        // Build an Arc'd trace closure to hand down into `issue_with_plan`
+        // so its per-stage emits (DNS-01 set, propagation wait, order
+        // poll, cert poll, blob write) land in the same EventBuffer
+        // operators read on the dashboard. The closure clones `events`
+        // (an Arc internally) so it can outlive this stack frame —
+        // `issue_with_plan` holds it across many awaits.
+        let events_for_trace = app.events.clone();
+        let domain_for_trace = domain.domain.clone();
+        let inner_trace: IssueTrace = Arc::new(move |stage: &str, detail: String| {
+            let line = format!("ACME[{}] {}: {}", domain_for_trace, stage, detail);
+            log::info!("{}", line);
+            events_for_trace.push(pangolin_core::Event::new(pangolin_core::EventType::Info {
+                message: line,
+            }));
+        });
+        match client
+            .issue_with_plan(&sans, &plan, &dns_providers, Some(&inner_trace))
+            .await
+        {
             Ok(written) => {
                 let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
                 trace(
