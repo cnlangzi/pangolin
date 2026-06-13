@@ -21,12 +21,11 @@ use tokio::time::{timeout, Duration};
 // rustls 0.23 auto-detects, but when both ring and aws-lc-rs are linked
 // (ring via rcgen; aws-lc-rs via rustls-native-certs from hyper-rustls),
 // we must select explicitly. Registration is per-process, first wins.
+// Delegated to `pangolin_core::install_crypto_provider` so the binary
+// + every test harness routes through one helper.
 #[ctor::ctor]
 fn init_crypto() {
-    use rustls::crypto::ring;
-    let provider = ring::default_provider();
-    rustls::crypto::CryptoProvider::install_default(provider)
-        .expect("install ring as default crypto provider");
+    pangolin_core::install_crypto_provider();
 }
 
 /// Pebble root CA (self-signed, from letsencrypt/pebble test/config/pebble-root.cert.pem).

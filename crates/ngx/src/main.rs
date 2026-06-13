@@ -69,6 +69,18 @@ struct Args {
 // wiring now lives in PR-2 (issuance pipeline) under `App::dns_providers`.
 
 fn main() -> anyhow::Result<()> {
+    // ---- 0. Install the rustls crypto provider --------------------
+    // rustls 0.23 refuses to construct any TLS config without a
+    // process-level CryptoProvider. The first reqwest call (inside
+    // instant-acme when registering a new ACME account) would
+    // otherwise panic with the famously unhelpful
+    //   "Could not automatically determine the process-level
+    //    CryptoProvider from Rustls crate features."
+    // Single helper lives in pangolin_core so the same line runs in
+    // every binary + test harness; switching providers (aws-lc-rs
+    // etc.) is then a one-line change.
+    pangolin_core::install_crypto_provider();
+
     // ---- 1. Blocking init --------------------------------------------------
     let args = Args::parse();
     let config =

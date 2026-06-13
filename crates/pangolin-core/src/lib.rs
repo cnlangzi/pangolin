@@ -45,3 +45,29 @@ pub use types::{
 
 /// Library version, e.g. for admin templates and log lines.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Install the rustls process-level [`CryptoProvider`] this workspace
+/// uses (`ring`).
+///
+/// rustls 0.23 refuses to build any TLS config until a CryptoProvider
+/// is installed; without this call, the first TLS-touching code
+/// (e.g. `instant-acme` registering an ACME account, or `tun`
+/// connecting to ngx over `wss://`) panics with the famously
+/// unhelpful "Could not automatically determine the process-level
+/// CryptoProvider from Rustls crate features." Single helper rather
+/// than re-typing `rustls::crypto::ring::default_provider().install_default()`
+/// in every binary + test harness — when we eventually switch
+/// providers (aws-lc-rs etc.) there is exactly one line to touch.
+///
+/// Idempotent in practice: a second install attempt returns `Err`
+/// (rustls deduplicates), which we swallow — the test harness, the
+/// `ngx` binary, and the `tun` binary may all call this on the same
+/// process boundary in some test layouts.
+///
+/// Must be called from `main()` (or a `#[ctor]` for tests) BEFORE any
+/// code that touches rustls. Calling it from a library constructor
+/// of `pangolin-core` itself would be a hidden global side effect at
+/// link time — explicitly worse than asking each binary to call it.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
