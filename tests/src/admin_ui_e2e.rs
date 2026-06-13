@@ -2759,3 +2759,303 @@ async fn dashboard_activity_panel_shows_recent_events() {
     let badge = doc.select(&badge_sel).next().expect("failed badge renders");
     assert!(badge.text().any(|t| t.contains("1")));
 }
+
+// ── §issue-48 — Unified hx-delete endpoint tests ────────────────────────────
+//
+// Issue #48 unifies all "delete" actions on a single mechanism: the
+// HTMX `hx-delete` button fires `DELETE /api/{resource}/{id}` with the
+// CSRF token carried in the request body (via `hx-vals`), and the
+// server returns an empty 200 so `hx-swap="delete"` can drop the row.
+//
+// Each test below exercises one resource's new DELETE API endpoint:
+//   • happy path (returns 200)
+//   • missing CSRF (returns 403)
+//   • DB row is actually removed
+//
+// The companion form-POST routes (`/sites/delete`, `/tun/delete`, …)
+// remain as a fallback during the migration window — see lib.rs for the
+// `#[deprecated_note]` comments and §issue-48 for the rollout plan.
+
+/// DELETE /api/sites/{name} with body CSRF removes the site row
+/// (issue #48, sites migration).
+#[tokio::test]
+async fn sites_hx_delete_with_body_csrf_works() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // 1. Create a site via the legacy form-POST path so we don't
+    //    require a separate DELETE-create round trip in this test.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "hx-delete-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // 2. Capture CSRF from the list page (where the hx-delete button
+    //    lives after migration).
+    let list_page = client.get("/sites").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&list_page).unwrap_or_default();
+
+    // 3. HTMX DELETE with body CSRF — should return 200 + empty body.
+    let resp = client
+        .delete_form("/api/sites/hx-delete-site", &[("_csrf", &csrf2)])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTMX DELETE /api/sites/{{name}} with body CSRF should return 200, got {}",
+        resp.status()
+    );
+
+    // 4. Verify the row is gone from the rendered list.
+    let list_after = client.get("/sites").await.unwrap().text().await.unwrap();
+    assert!(
+        !list_after.contains("hx-delete-site"),
+        "site should be gone after HTMX DELETE",
+    );
+}
+
+/// DELETE /api/sites/{name} without CSRF → 403 (issue #48).
+#[tokio::test]
+async fn sites_hx_delete_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Send a non-empty body so the pingora body-read doesn't stall
+    // on an empty DELETE; the missing _csrf is what the CSRF
+    // middleware is supposed to flag (mirrors dns_delete_no_csrf_forbidden).
+    let resp = client
+        .delete_form("/api/sites/any-name", &[("name", "any-name")])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "DELETE /api/sites/{{name}} without CSRF should be forbidden, got {}",
+        resp.status()
+    );
+}
+
+/// DELETE /api/tun/{name} with body CSRF removes the tun row
+/// (issue #48, tun migration).
+#[tokio::test]
+async fn tun_hx_delete_with_body_csrf_works() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // 1. Create a tun via the form-POST route.
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/tun/new",
+            &[
+                ("name", "hx-delete-tun"),
+                ("token", "tok"),
+                ("enabled", "1"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // 2. Capture CSRF from the list page.
+    let list_page = client.get("/tun").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&list_page).unwrap_or_default();
+
+    // 3. HTMX DELETE with body CSRF.
+    let resp = client
+        .delete_form("/api/tun/hx-delete-tun", &[("_csrf", &csrf2)])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTMX DELETE /api/tun/{{name}} with body CSRF should return 200, got {}",
+        resp.status()
+    );
+
+    // 4. Verify gone from list.
+    let list_after = client.get("/tun").await.unwrap().text().await.unwrap();
+    assert!(
+        !list_after.contains("hx-delete-tun"),
+        "tun should be gone after HTMX DELETE",
+    );
+}
+
+/// DELETE /api/tun/{name} without CSRF → 403 (issue #48).
+#[tokio::test]
+async fn tun_hx_delete_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Send a non-empty body so the pingora body-read doesn't stall.
+    let resp = client
+        .delete_form("/api/tun/any-name", &[("name", "any-name")])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "DELETE /api/tun/{{name}} without CSRF should be forbidden, got {}",
+        resp.status()
+    );
+}
+
+/// DELETE /api/certs/{domain} with body CSRF removes the cert row
+/// (issue #48, certs migration).
+#[tokio::test]
+async fn certs_hx_delete_with_body_csrf_works() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // 1. Create a cert via the form-POST route.
+    let page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/certs/new",
+            &[
+                ("domain", "hx-delete-cert.example.com"),
+                ("cert_file", "/tmp/cert.pem"),
+                ("key_file", "/tmp/key.pem"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // 2. Capture CSRF from the list page.
+    let list_page = client.get("/certs").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&list_page).unwrap_or_default();
+
+    // 3. HTMX DELETE with body CSRF.
+    let resp = client
+        .delete_form(
+            "/api/certs/hx-delete-cert.example.com",
+            &[("_csrf", &csrf2)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTMX DELETE /api/certs/{{domain}} with body CSRF should return 200, got {}",
+        resp.status()
+    );
+
+    // 4. Verify gone from list.
+    let list_after = client.get("/certs").await.unwrap().text().await.unwrap();
+    assert!(
+        !list_after.contains("hx-delete-cert.example.com"),
+        "cert should be gone after HTMX DELETE",
+    );
+}
+
+/// DELETE /api/certs/{domain} without CSRF → 403 (issue #48).
+#[tokio::test]
+async fn certs_hx_delete_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Send a non-empty body so the pingora body-read doesn't stall.
+    let resp = client
+        .delete_form("/api/certs/any.example.com", &[("domain", "any.example.com")])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "DELETE /api/certs/{{domain}} without CSRF should be forbidden, got {}",
+        resp.status()
+    );
+}
+
+/// DELETE /api/dns/{name} with body CSRF removes the DNS provider row
+/// (issue #48, dns migration).
+#[tokio::test]
+async fn dns_hx_delete_with_body_csrf_works() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // 1. Create a provider via the form-POST route.
+    let page = client.get("/dns/new").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/dns/new",
+            &[
+                ("name", "hx-delete-dns"),
+                ("kind", "cloudflare"),
+                ("api_token", "tok"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // 2. Capture CSRF from the list page.
+    let list_page = client.get("/dns").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&list_page).unwrap_or_default();
+
+    // 3. HTMX DELETE with body CSRF.
+    let resp = client
+        .delete_form("/api/dns/hx-delete-dns", &[("_csrf", &csrf2)])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "HTMX DELETE /api/dns/{{name}} with body CSRF should return 200, got {}",
+        resp.status()
+    );
+
+    // 4. Verify gone from list.
+    let list_after = client.get("/dns").await.unwrap().text().await.unwrap();
+    assert!(
+        !list_after.contains("hx-delete-dns"),
+        "dns provider should be gone after HTMX DELETE",
+    );
+}
+
+/// DELETE /api/dns/{name} without CSRF → 403 (issue #48).
+#[tokio::test]
+async fn dns_hx_delete_no_csrf_forbidden() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Send a non-empty body so the pingora body-read doesn't stall.
+    let resp = client
+        .delete_form("/api/dns/any-name", &[("name", "any-name")])
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "DELETE /api/dns/{{name}} without CSRF should be forbidden, got {}",
+        resp.status()
+    );
+}
