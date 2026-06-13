@@ -1,113 +1,63 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{ site.name }}: Domains — Pangolin</title>
-<link href="/assets/app.css?v=__CSS_HASH__" rel="stylesheet">
-</head>
-<body class="bg-slate-100 dark:bg-slate-900 min-h-screen font-sans antialiased text-slate-900 dark:text-slate-100">
+{% extends "layouts/base.html" %}
 
-<header class="sticky top-0 z-50 bg-slate-900 dark:bg-slate-800 border-b border-slate-700 shadow-sm">
-  <div class="flex items-center justify-between px-4 py-3 max-w-7xl mx-auto">
-    <a href="/" class="flex items-center gap-2.5 text-white font-bold text-lg">
-      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent-500 to-accent-600 flex items-center justify-center shadow">
-        <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-          <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-        </svg>
-      </div>
-      <span class="hidden sm:inline">Pangolin</span>
-    </a>
-    <nav class="hidden md:flex items-center gap-1">
-      <a href="/" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Dashboard</a>
-      <a href="/sites" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
-      <a href="/domains" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Domains</a>
-      <a href="/tun" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Tunnels</a>
-      <a href="/certs" class="px-3 py-2 rounded-lg text-sm font-medium text-slate-300 transition-colors hover:text-white hover:bg-slate-800">Certs</a>
-    </nav>
-    <div class="flex items-center gap-2">
-      <form method="POST" action="/logout" class="hidden md:block">
-        <button type="submit" class="text-slate-300 hover:text-white text-sm transition-colors px-3 py-1.5 rounded hover:bg-slate-700">Sign out</button>
-      </form>
-      <button id="menu-toggle" class="md:hidden text-slate-300 hover:text-white p-1">
-        <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/></svg>
-      </button>
-    </div>
-  </div>
-  <nav id="mobile-nav" class="hidden md:hidden border-t border-slate-700 px-4 py-3 space-y-1">
-    <a href="/" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Dashboard</a>
-    <a href="/sites" class="block px-3 py-2 rounded-lg text-sm font-medium text-white bg-slate-800">Sites</a>
-    <a href="/domains" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Domains</a>
-    <a href="/tun" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Tunnels</a>
-    <a href="/certs" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800">Certs</a>
-    <form method="POST" action="/logout" class="pt-2 border-t border-slate-700 mt-2">
-      <button type="submit" class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-slate-800">Sign out</button>
-    </form>
-  </nav>
-</header>
+{% block title %}{{ site.name }}: Domains — Pangolin{% endblock %}
 
-<main class="px-4 py-6 md:px-6 max-w-7xl mx-auto">
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   {% include "components/_csrf.html" %}
 
   <div class="flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400 mb-4">
     <a href="/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-    <span class="text-slate-800 dark:text-slate-200 font-medium">{{ site.name }}</span>
+    <a href="/sites/edit?name={{ self.site_name_encoded() }}" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">{{ site.name }}</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-    <span>Domains</span>
+    <span class="text-slate-800 dark:text-slate-200 font-medium">Domains</span>
   </div>
 
-  <div class="mb-6 flex items-center justify-between">
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl font-bold text-slate-900 dark:text-white">{{ site.name }}</h1>
-      <p class="text-slate-500 dark:text-slate-400 text-sm mt-1">
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ site.name }}</h1>
+      <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
         <code class="font-mono text-xs bg-slate-100 dark:bg-slate-700 px-1.5 py-0.5 rounded">{{ site.backend }}</code>
         — {{ domains.len() }} domain{% if domains.len() != 1 %}s{% endif %}
       </p>
     </div>
     <button hx-get="/api/site/{{ site.name }}/domains/new"
       hx-target="#modal-body"
-      class="hidden md:inline-flex items-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
+      class="inline-flex items-center justify-center gap-2 w-full sm:w-auto rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
       New domain
     </button>
   </div>
 
-  <button hx-get="/api/site/{{ site.name }}/domains/new"
-    hx-target="#modal-body"
-    class="md:hidden mb-4 w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm">
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-    New domain
-  </button>
-
   <div id="site-domains-table">
     <div class="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-sm">
-      <table class="hidden md:table table-auto w-full border-collapse">
-        <thead class="bg-slate-50 dark:bg-slate-800/40 border-b-2 border-slate-200 dark:border-slate-700">
+      <table class="hidden md:table table-auto w-full">
+        <thead class="bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
           <tr>
-            <th class="text-left text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide px-4 py-3">Domain</th>
-            <th class="text-left text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide px-4 py-3">Status</th>
+            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Domain</th>
+            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Status</th>
             <th class="text-right px-4 py-3"></th>
           </tr>
         </thead>
-        <tbody id="site-domains-tbody" class="divide-y divide-slate-200 dark:divide-slate-700">
+        <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
           {% for domain in domains %}
-          <tr id="domain-{{ domain.domain }}" class="hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors">
-            <td class="px-4 py-3"><span class="font-mono text-sm text-slate-800 dark:text-slate-200">{{ domain.domain }}</span></td>
+          <tr id="domain-{{ domain.domain }}" class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
+            <td class="px-4 py-3"><span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span></td>
             <td class="px-4 py-3">
               {% if domain.enabled %}
-              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300">enabled</span>
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">enabled</span>
               {% else %}
-              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 line-through">disabled</span>
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">disabled</span>
               {% endif %}
             </td>
             <td class="px-4 py-3">
-              <div class="flex items-center justify-end gap-1">
+              <div class="flex items-center justify-end">
                 <button hx-delete="/api/domains/{{ domain.domain }}"
                   hx-vals='{"_csrf": "__CSRF__"}'
                   hx-confirm="Delete domain {{ domain.domain }}?"
                   hx-swap="delete"
-                  class="text-slate-400 hover:text-red-500 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                  class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
                   title="Delete">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
                 </button>
@@ -116,32 +66,41 @@
           </tr>
           {% else %}
           <tr>
-            <td colspan="3" class="px-4 py-8 text-center text-slate-400 text-sm">No domains for this site yet. Add one to get started.</td>
+            <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No domains for this site yet. <button hx-get="/api/site/{{ site.name }}/domains/new" hx-target="#modal-body" class="text-accent-500 hover:underline">Add one</button>.</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
 
-      <div class="block md:hidden divide-y divide-slate-200 dark:divide-slate-700">
+      <div class="block md:hidden divide-y divide-slate-100 dark:divide-slate-700">
         {% for domain in domains %}
         <div class="p-4">
           <div class="flex items-center justify-between mb-2">
-            <span class="font-mono text-sm text-slate-800 dark:text-slate-200">{{ domain.domain }}</span>
+            <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
             {% if domain.enabled %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300">on</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">enabled</span>
             {% else %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">off</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">disabled</span>
             {% endif %}
           </div>
           <button hx-delete="/api/domains/{{ domain.domain }}"
             hx-vals='{"_csrf": "__CSRF__"}'
             hx-confirm="Delete domain {{ domain.domain }}?"
-            class="w-full text-center text-sm text-red-500 hover:text-red-600 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
+            class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
             Delete
           </button>
         </div>
         {% else %}
-        <div class="p-8 text-center text-slate-400 text-sm">No domains for this site yet.</div>
+        <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm flex flex-col items-center gap-3">
+          <span>No domains for this site yet.</span>
+          <button type="button"
+            hx-get="/api/site/{{ site.name }}/domains/new"
+            hx-target="#modal-body"
+            class="inline-flex items-center gap-1 text-accent-600 dark:text-accent-400 hover:underline">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+            Add one
+          </button>
+        </div>
         {% endfor %}
       </div>
     </div>
@@ -151,8 +110,4 @@
     <div id="modal-body" class="bg-white rounded-t-2xl md:rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto"></div>
   </dialog>
 </main>
-
-<div id="toast" class="fixed bottom-4 right-4 z-50"></div>
-<script src="/assets/__JS_FILE__?v=__JS_HASH__" defer></script>
-</body>
-</html>
+{% endblock %}

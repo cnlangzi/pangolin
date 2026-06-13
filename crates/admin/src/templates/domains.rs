@@ -164,6 +164,18 @@ pub struct SiteDomainsTemplate {
     pub active_nav: &'static str,
 }
 
+impl SiteDomainsTemplate {
+    /// URL-encoded `site.name` for use inside `href="..."` attributes.
+    /// Site names are the natural primary key, but they can contain
+    /// spaces, dots, hyphens, etc.; embedding them raw in a query
+    /// string produces invalid links for anything outside
+    /// `[A-Za-z0-9_-]`. Encoding at render time keeps the template
+    /// declarative and the URL well-formed.
+    pub fn site_name_encoded(&self) -> String {
+        urlencoding::encode(&self.site.name).into_owned()
+    }
+}
+
 // ─── Table view (HTMX partial) ────────────────────────────────────────────────
 
 #[derive(Template)]
