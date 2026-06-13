@@ -888,6 +888,21 @@ impl AcmeState {
         domain: &Domain,
         dns_index: &pangolin_core::DnsIndex,
     ) -> anyhow::Result<()> {
+        // Per-stage trace helper: log to stdout AND push to the
+        // EventBuffer so the dashboard's activity feed surfaces the
+        // same trace operators see in the log. Keeping the two emit
+        // paths in one helper avoids the temptation to call only one
+        // (which is exactly how 'spinner stuck forever, no log line'
+        // happens — issue #45 follow-up).
+        let trace = |stage: &str, detail: String| {
+            log::info!("ACME[{}] {}: {}", domain.domain, stage, detail);
+            app.add_event(pangolin_core::EventType::Info {
+                message: format!("ACME[{}] {}: {}", domain.domain, stage, detail),
+            });
+        };
+
+        trace("start", format!("auto_issue=true san={}", domain.domain));
+
         // Build the SAN list: for a wildcard, include the base domain too
         // (browsers won't trust a `*.example.com` cert without the base).
         let sans: Vec<String> = if let Some(base) = domain.domain.strip_prefix("*.") {
@@ -908,7 +923,17 @@ impl AcmeState {
         }
 
         let plan = match pangolin_core::plan_issuance(&sans, domain, dns_index) {
-            Ok(p) => p,
+            Ok(p) => {
+                trace(
+                    "plan",
+                    format!(
+                        "{} challenge(s), dns_provider={:?}",
+                        p.challenges.len(),
+                        p.dns_provider_name
+                    ),
+                );
+                p
+            }
             Err(e) => {
                 // Wildcard without DNS association: surface this as a
                 // visible `Skipped` row with the reason so the operator
@@ -916,8 +941,9 @@ impl AcmeState {
                 // tail the log. `Skipped` is distinct from `Failed`
                 // because retrying without fixing the DNS config will
                 // not help.
-                log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
                 let reason = e.to_string();
+                trace("skipped", reason.clone());
+                log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
                 let conn = app.db.lock().await;
                 let _ = pangolin_core::db::set_cert_status_atomic(
                     &conn,
@@ -937,11 +963,28 @@ impl AcmeState {
             match parse_blob_expiry(&tokio::fs::read_to_string(&cert_path).await?) {
                 Ok(expiry) => {
                     let days = (expiry - chrono::Utc::now()).num_days();
-                    days <= app.config.acme.renew_threshold_days as i64
+                    let need = days <= app.config.acme.renew_threshold_days as i64;
+                    trace(
+                        "expiry-check",
+                        format!(
+                            "existing cert expires in {}d (threshold {}d) — {}",
+                            days,
+                            app.config.acme.renew_threshold_days,
+                            if need { "will renew" } else { "skip" }
+                        ),
+                    );
+                    need
                 }
-                Err(_) => true,
+                Err(_) => {
+                    trace(
+                        "expiry-check",
+                        "existing cert unreadable — will issue".into(),
+                    );
+                    true
+                }
             }
         } else {
+            trace("expiry-check", "no existing cert blob — will issue".into());
             true
         };
 
@@ -962,17 +1005,25 @@ impl AcmeState {
                 Some(chrono::Utc::now()),
             );
         }
+        trace("transition", "Pending/Failed → Issuing".into());
 
         let client = self.client(app).await?;
         let dns_providers = self.dns_providers.read().await.clone();
-        log::info!(
-            "issuing cert for {:?} (plan: {} entries, provider: {:?})",
-            sans,
-            plan.challenges.len(),
-            plan.dns_provider_name
+        trace(
+            "acme-call",
+            format!(
+                "issue_with_plan sans={:?} provider={:?}",
+                sans, plan.dns_provider_name
+            ),
         );
+        let issue_started = chrono::Utc::now();
         match client.issue_with_plan(&sans, &plan, &dns_providers).await {
             Ok(written) => {
+                let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
+                trace(
+                    "acme-call",
+                    format!("ok in {}s ({} blob path(s))", elapsed, written.len()),
+                );
                 // Persist the on-disk cert blob path in the certs row so
                 // /certs reflects the actual location, then flip to
                 // `Issued`. `last_error` is cleared by passing None.
@@ -1015,17 +1066,26 @@ impl AcmeState {
                 };
                 let _ = pangolin_core::db::upsert_cert(&conn, &cert_row);
                 drop(conn);
+                trace(
+                    "issued",
+                    format!(
+                        "blob persisted, expires_at={:?}",
+                        expires_at.map(|d| d.format("%Y-%m-%d").to_string())
+                    ),
+                );
                 app.add_event(pangolin_core::EventType::CertIssued {
                     domain: domain.domain.clone(),
                 });
                 Ok(())
             }
             Err(e) => {
+                let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
                 // Surface the failure in the certs table so the operator
                 // can see it without grepping logs. The bubbled-up error
                 // still drives the existing event buffer + CertRenewFailed
                 // event so renew callers and dashboards see both.
                 let err_msg = e.to_string();
+                trace("failed", format!("after {}s: {}", elapsed, err_msg));
                 let conn = app.db.lock().await;
                 let _ = pangolin_core::db::set_cert_status_atomic(
                     &conn,

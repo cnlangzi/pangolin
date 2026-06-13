@@ -40,7 +40,7 @@ pub mod tun;
 // `use crate::templates::SitesListTemplate;`
 pub use auth::LoginTemplate;
 pub use certs::{CertRow, CertsListTemplate, CertsNewTemplate};
-pub use dashboard::DashboardTemplate;
+pub use dashboard::{ActivityRow, DashboardTemplate};
 pub use dns::{
     DnsProvidersEditTemplate, DnsProvidersFormFieldsView, DnsProvidersListTemplate,
     DnsProvidersNewTemplate,

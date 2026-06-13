@@ -565,6 +565,53 @@ pub fn ensure_pending_cert_row(
     Ok(true)
 }
 
+/// Stale-`Issuing` watchdog (issue #45 follow-up).
+///
+/// `ensure_one` transitions a cert row to `Issuing` BEFORE awaiting the
+/// blocking ACME call. If the process is killed / panics / OOMs between
+/// those two moments, the row is left in `Issuing` forever — the next
+/// renewal scan won't ever come back to it because there's no
+/// out-of-band timer that says "this took too long, give up". The
+/// row sits there showing a blue spinner until an operator either
+/// retries manually or restarts and waits `renew_check_interval_hours`.
+///
+/// This helper, called once at `App::new` startup, demotes every row
+/// whose `status = 'issuing'` and `started_at` is older than `threshold`
+/// to `Failed` with a `last_error` of "issuance interrupted (process
+/// restart or timeout)". Rows whose `started_at` is recent (or NULL,
+/// which is the case after a manual DB poke) are left alone — that
+/// would race against an actually-in-flight issuance on a fast restart.
+///
+/// Returns the domains that were swept so the caller can surface them
+/// in startup logs.
+pub fn recover_stuck_issuing_rows(
+    conn: &Connection,
+    threshold: chrono::Duration,
+) -> rusqlite::Result<Vec<String>> {
+    let cutoff = (chrono::Utc::now() - threshold).to_rfc3339();
+    // Two-step (SELECT then UPDATE) so we can return the swept domains.
+    // RETURNING would be cleaner but rusqlite's `execute` doesn't expose
+    // it; a small SELECT + UPDATE matches the rest of the helper module.
+    let mut stmt = conn.prepare(
+        "SELECT domain FROM certs
+         WHERE status = 'issuing' AND started_at IS NOT NULL AND started_at < ?1",
+    )?;
+    let stuck: Vec<String> = stmt
+        .query_map(params![cutoff], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if stuck.is_empty() {
+        return Ok(stuck);
+    }
+    conn.execute(
+        "UPDATE certs
+            SET status = 'failed',
+                last_error = 'issuance interrupted (process restart or timeout)'
+          WHERE status = 'issuing' AND started_at IS NOT NULL AND started_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(stuck)
+}
+
 // ---- DNS provider CRUD ----
 
 pub fn list_dns_providers(conn: &Connection) -> rusqlite::Result<Vec<DnsProvider>> {
@@ -1362,6 +1409,58 @@ mod tests {
         let c = get_cert(&conn, "old.example.com").unwrap().unwrap();
         assert_eq!(c.status, CertStatus::Failed);
         assert_eq!(c.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn recover_stuck_issuing_demotes_old_rows_only() {
+        // The startup watchdog must sweep rows whose Issuing transition
+        // happened long ago (process restart / OOM / panic), but leave
+        // recent rows alone — a fresh restart on a still-running ACME
+        // call would otherwise stomp on an in-flight issuance.
+        let conn = make_conn();
+        // Stale row: started_at well past the 10-minute window.
+        let mut stale = make_cert("stale.example.com", CertStatus::Issuing, None);
+        stale.started_at = Some(dt("2026-01-01T00:00:00+00:00"));
+        upsert_cert(&conn, &stale).unwrap();
+        // Recent row: started_at "now" — should NOT be touched.
+        let mut recent = make_cert("recent.example.com", CertStatus::Issuing, None);
+        recent.started_at = Some(chrono::Utc::now());
+        upsert_cert(&conn, &recent).unwrap();
+        // Unrelated row in a different status — never touched regardless.
+        upsert_cert(
+            &conn,
+            &make_cert("ok.example.com", CertStatus::Issued, None),
+        )
+        .unwrap();
+
+        let swept = recover_stuck_issuing_rows(&conn, chrono::Duration::minutes(10)).unwrap();
+        assert_eq!(swept, vec!["stale.example.com".to_string()]);
+
+        let stale_after = get_cert(&conn, "stale.example.com").unwrap().unwrap();
+        assert_eq!(stale_after.status, CertStatus::Failed);
+        assert_eq!(
+            stale_after.last_error.as_deref(),
+            Some("issuance interrupted (process restart or timeout)")
+        );
+        let recent_after = get_cert(&conn, "recent.example.com").unwrap().unwrap();
+        assert_eq!(recent_after.status, CertStatus::Issuing);
+        let ok_after = get_cert(&conn, "ok.example.com").unwrap().unwrap();
+        assert_eq!(ok_after.status, CertStatus::Issued);
+    }
+
+    #[test]
+    fn recover_stuck_issuing_skips_null_started_at() {
+        // Rows poked directly into the DB without `started_at` (e.g. a
+        // manual SQL repair) must NOT be swept — we can't tell whether
+        // they're old or new. Operator can still hit Retry.
+        let conn = make_conn();
+        let mut row = make_cert("nullstart.example.com", CertStatus::Issuing, None);
+        row.started_at = None;
+        upsert_cert(&conn, &row).unwrap();
+        let swept = recover_stuck_issuing_rows(&conn, chrono::Duration::seconds(0)).unwrap();
+        assert!(swept.is_empty(), "NULL started_at must be left alone");
+        let after = get_cert(&conn, "nullstart.example.com").unwrap().unwrap();
+        assert_eq!(after.status, CertStatus::Issuing);
     }
 
     #[test]

@@ -226,6 +226,28 @@ impl App {
         let mut conn = db::open(db_path.as_ref())?;
         db::migrate(&mut conn)?;
 
+        // Issue #45 follow-up: sweep any cert row left in `Issuing` by a
+        // prior process that died mid-ACME-call (panic / OOM / SIGKILL).
+        // The row would otherwise spin in `Issuing` until the next
+        // renewal scan (default 6 hours), giving operators no
+        // self-recovery path. 10 minutes is a safe ceiling on the
+        // legitimate ACME wall clock: DNS-01 propagation (≤120s) +
+        // order-ready poll (10×5s) + cert poll (30×5s) ≈ 5 minutes
+        // worst case, doubled for slack.
+        match db::recover_stuck_issuing_rows(&conn, chrono::Duration::minutes(10)) {
+            Ok(swept) if !swept.is_empty() => {
+                log::warn!(
+                    "ACME startup watchdog: reset {} stuck Issuing row(s) to Failed: {}",
+                    swept.len(),
+                    swept.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("ACME startup watchdog failed: {}", e);
+            }
+        }
+
         let sites = db::list_sites(&conn)?;
         let domains = db::list_domains(&conn)?;
         let providers = db::list_dns_providers(&conn)?;
