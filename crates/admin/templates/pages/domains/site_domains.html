@@ -91,7 +91,16 @@
           </button>
         </div>
         {% else %}
-        <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm">No domains for this site yet.</div>
+        <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm flex flex-col items-center gap-3">
+          <span>No domains for this site yet.</span>
+          <button type="button"
+            hx-get="/api/site/{{ site.name }}/domains/new"
+            hx-target="#modal-body"
+            class="inline-flex items-center gap-1 text-accent-600 dark:text-accent-400 hover:underline">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+            Add one
+          </button>
+        </div>
         {% endfor %}
       </div>
     </div>
