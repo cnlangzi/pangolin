@@ -809,17 +809,28 @@ impl DnsProvider for TencentDnsProvider {
 ///   - `DomainRecordNotExist` (modern)
 ///   - `InvalidParameter.DomainInvalid` (when probing a non-zone label)
 ///   - `ResourceNotFound.NoDataOfDomain`
+///   - `InvalidParameterValue.DomainNotExists` ("当前域名未添加解析")
 ///   - "domain not found" / "no permission" with a not-on-account hint
 ///
 /// Anything else (signature failure, rate limit, network) returns
 /// false so the caller bubbles the error.
 fn is_zone_not_on_account(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("domainrecordnotexist")
+    // `domainnotexist` (with optional final `s`) is a substring of
+    // both `DomainNotExists` (DNSPod v3) and `DomainRecordNotExist`
+    // (v2 / Aliyun-style), so it subsumes the older test pattern.
+    // We keep `not exist` (with space) for the rare provider that
+    // sends a human-readable message rather than an error code.
+    lower.contains("domainnotexist")
         || lower.contains("domaininvalid")
         || lower.contains("nodataofdomain")
         || lower.contains("domain not found")
         || lower.contains("not exist")
+        // Tencent ships the Chinese translation alongside the code.
+        // Matching on the message text (not the code) is brittle —
+        // Tencent could rephrase tomorrow — but it costs nothing as
+        // a belt-and-braces fallback.
+        || err.contains("当前域名未添加解析")
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1049,14 @@ mod tests {
             "ResourceNotFound.NoDataOfDomain",
             "domain not found",
             "the resource does not exist",
+            // DNSPod v3 (2021-03-23) — exact message that broke
+            // frtpilot.yaitoo.cn until the classifier learned to
+            // accept `domainnotexist` (with optional trailing `s`).
+            "Tencent DescribeRecordList failed (SecretId=…PBk8): \
+             InvalidParameterValue.DomainNotExists — 当前域名未添加解析",
+            // The bare Chinese fallback (in case Tencent ever drops
+            // the error code from the response by mistake).
+            "当前域名未添加解析,请返回域名列表。",
         ] {
             assert!(is_zone_not_on_account(msg), "should be skippable: {msg}");
         }
