@@ -699,7 +699,7 @@ impl DnsProvider for TencentDnsProvider {
         params.insert("SubDomain".to_string(), "_acme-challenge".to_string());
         params.insert("RecordType".to_string(), "TXT".to_string());
 
-        let resp = self.do_request("DescribeRecords", params).await?;
+        let resp = self.do_request("DescribeRecordList", params).await?;
         let records = resp
             .pointer("/Response/RecordList")
             .and_then(|r| r.as_array());
@@ -754,7 +754,7 @@ impl DnsProvider for TencentDnsProvider {
             let mut params = HashMap::new();
             params.insert("Domain".to_string(), candidate.clone());
             log::debug!("Tencent find_zone: probing {}", candidate);
-            match self.do_request("DescribeRecords", params).await {
+            match self.do_request("DescribeRecordList", params).await {
                 Ok(resp) => {
                     if resp.pointer("/Response/RecordList").is_some() {
                         log::info!("Tencent find_zone: matched {} for fqdn {}", candidate, fqdn);
@@ -781,7 +781,7 @@ impl DnsProvider for TencentDnsProvider {
                     return Err(anyhow::anyhow!(
                         "Tencent find_zone probe for {} failed: {}. \
                          Common causes: SecretId/SecretKey wrong, \
-                         credential lacks DNSPod DescribeRecords permission, \
+                         credential lacks DNSPod DescribeRecordList permission, \
                          or DNSPod API outage. Check the Tencent console.",
                         candidate,
                         msg
