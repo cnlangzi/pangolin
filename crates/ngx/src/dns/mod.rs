@@ -581,7 +581,7 @@ impl TencentDnsProvider {
     async fn do_request(
         &self,
         action: &str,
-        payload: HashMap<String, String>,
+        payload: HashMap<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         use std::time::SystemTime;
         const HOST: &str = "dnspod.tencentcloudapi.com";
@@ -603,7 +603,6 @@ impl TencentDnsProvider {
         let body_value = serde_json::Value::Object(
             payload
                 .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
                 .collect(),
         );
         let body_json = serde_json::to_string(&body_value).unwrap_or_else(|_| "{}".to_string());
@@ -680,24 +679,39 @@ impl TencentDnsProvider {
 
 #[async_trait]
 impl DnsProvider for TencentDnsProvider {
-    async fn create_txt(&self, _zone: &str, name: &str, value: &str, ttl: u32) -> Result<()> {
+    async fn create_txt(&self, zone: &str, name: &str, value: &str, ttl: u32) -> Result<()> {
+        // Extract subdomain from full name. For example:
+        //   name="_acme-challenge.frtpilot.yaitoo.cn", zone="yaitoo.cn"
+        //   → subdomain="_acme-challenge.frtpilot"
+        let subdomain = name
+            .strip_suffix(&format!(".{}", zone))
+            .ok_or_else(|| anyhow::anyhow!("name {} does not end with zone {}", name, zone))?;
+
         let mut params = HashMap::new();
-        params.insert("Domain".to_string(), name.to_string());
-        params.insert("SubDomain".to_string(), "_acme-challenge".to_string());
-        params.insert("RecordType".to_string(), "TXT".to_string());
-        params.insert("Value".to_string(), value.to_string());
-        params.insert("TTL".to_string(), ttl.to_string());
+        params.insert("Domain".to_string(), serde_json::json!(zone));
+        params.insert("SubDomain".to_string(), serde_json::json!(subdomain));
+        params.insert("RecordType".to_string(), serde_json::json!("TXT"));
+        params.insert("RecordLine".to_string(), serde_json::json!("默认"));
+        params.insert("Value".to_string(), serde_json::json!(value));
+        params.insert("TTL".to_string(), serde_json::json!(ttl));
 
         self.do_request("CreateRecord", params).await?;
         log::info!("Tencent TXT created: {} for {}", value, name);
         Ok(())
     }
 
-    async fn delete_txt(&self, _zone: &str, name: &str) -> Result<()> {
+    async fn delete_txt(&self, zone: &str, name: &str) -> Result<()> {
+        // Extract subdomain from full name (same logic as create_txt).
+        let subdomain = name
+            .strip_suffix(&format!(".{}", zone))
+            .ok_or_else(|| anyhow::anyhow!("name {} does not end with zone {}", name, zone))?;
+
+        // Use Subdomain parameter to filter records (DNSPod API v3).
+        // Per official docs: https://cloud.tencent.com/document/api/1427/56166
         let mut params = HashMap::new();
-        params.insert("Domain".to_string(), name.to_string());
-        params.insert("SubDomain".to_string(), "_acme-challenge".to_string());
-        params.insert("RecordType".to_string(), "TXT".to_string());
+        params.insert("Domain".to_string(), serde_json::json!(zone));
+        params.insert("Subdomain".to_string(), serde_json::json!(subdomain));
+        params.insert("RecordType".to_string(), serde_json::json!("TXT"));
 
         let resp = self.do_request("DescribeRecordList", params).await?;
         let records = resp
@@ -708,12 +722,15 @@ impl DnsProvider for TencentDnsProvider {
             for record in recs {
                 let record_id = record
                     .pointer("/RecordId")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v.to_string());
+                    .and_then(|v| v.as_i64());
                 if let Some(rid) = record_id {
+                    // DeleteRecord requires both Domain and RecordId per API docs:
+                    // https://cloud.tencent.com/document/api/1427/56176
                     let mut dp = HashMap::new();
-                    dp.insert("RecordId".to_string(), rid);
+                    dp.insert("Domain".to_string(), serde_json::json!(zone));
+                    dp.insert("RecordId".to_string(), serde_json::json!(rid));
                     self.do_request("DeleteRecord", dp).await?;
+                    log::info!("Tencent TXT deleted: RecordId={} for {}", rid, name);
                 }
             }
         }
@@ -752,7 +769,7 @@ impl DnsProvider for TencentDnsProvider {
         for i in 0..upper {
             let candidate = parts[i..].join(".");
             let mut params = HashMap::new();
-            params.insert("Domain".to_string(), candidate.clone());
+            params.insert("Domain".to_string(), serde_json::json!(candidate.clone()));
             log::debug!("Tencent find_zone: probing {}", candidate);
             match self.do_request("DescribeRecordList", params).await {
                 Ok(resp) => {
@@ -851,10 +868,8 @@ pub async fn wait_for_txt_propagation(
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    let fqdn_clean = fqdn.trim_start_matches('_').trim_start_matches('.');
-
     loop {
-        match resolver.txt_lookup(fqdn_clean).await {
+        match resolver.txt_lookup(fqdn).await {
             Ok(lookup) => {
                 for rdata in lookup.iter() {
                     for txt_slice in rdata.txt_data() {
@@ -862,7 +877,7 @@ pub async fn wait_for_txt_propagation(
                             if txt_str.contains(expected_value) {
                                 log::info!(
                                     "DNS-01 TXT record found for {} after propagation",
-                                    fqdn_clean
+                                    fqdn
                                 );
                                 return Ok(true);
                             }
@@ -871,14 +886,14 @@ pub async fn wait_for_txt_propagation(
                 }
             }
             Err(e) => {
-                log::debug!("DNS lookup for {} not yet visible: {}", fqdn_clean, e);
+                log::debug!("DNS lookup for {} not yet visible: {}", fqdn, e);
             }
         }
 
         if std::time::Instant::now() >= deadline {
             log::warn!(
                 "DNS-01 propagation timeout for {} after {}s",
-                fqdn_clean,
+                fqdn,
                 timeout_secs
             );
             return Ok(false);
