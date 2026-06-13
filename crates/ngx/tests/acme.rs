@@ -21,12 +21,11 @@ use tokio::time::{timeout, Duration};
 // rustls 0.23 auto-detects, but when both ring and aws-lc-rs are linked
 // (ring via rcgen; aws-lc-rs via rustls-native-certs from hyper-rustls),
 // we must select explicitly. Registration is per-process, first wins.
+// Delegated to `pangolin_core::install_crypto_provider` so the binary
+// + every test harness routes through one helper.
 #[ctor::ctor]
 fn init_crypto() {
-    use rustls::crypto::ring;
-    let provider = ring::default_provider();
-    rustls::crypto::CryptoProvider::install_default(provider)
-        .expect("install ring as default crypto provider");
+    pangolin_core::install_crypto_provider();
 }
 
 /// Pebble root CA (self-signed, from letsencrypt/pebble test/config/pebble-root.cert.pem).
@@ -78,15 +77,30 @@ fn patch_authz_response(body: Vec<u8>) -> Vec<u8> {
 }
 
 /// Wrap reqwest to implement `instant_acme::HttpClient`.
+///
+/// Only compiled when the `integration` feature is on (Pebble
+/// test runs are gated by this feature in the workspace
+/// `make test-e2e` target). The 0.8.x `HttpClient` trait
+/// uses `Request<BodyWrapper<Bytes>>` as the request body
+/// type (not `Full<Bytes>` as in 0.7.x) — we extract the
+/// raw bytes from the incoming BodyWrapper via
+/// `http_body_util::BodyExt::collect` and feed them to
+/// reqwest, then re-wrap the response as `BodyWrapper<Bytes>`
+/// via the `From<Vec<u8>>` impl for the response.
+#[cfg(feature = "integration")]
 struct AcmeHttpClient(reqwest::Client);
 
+#[cfg(feature = "integration")]
 impl instant_acme::HttpClient for AcmeHttpClient {
     fn request(
         &self,
-        req: http::Request<Full<Bytes>>,
-    ) -> futures_util::future::BoxFuture<
-        'static,
-        Result<instant_acme::BytesResponse, instant_acme::Error>,
+        req: http::Request<instant_acme::BodyWrapper<Bytes>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<instant_acme::BytesResponse, instant_acme::Error>,
+                > + Send,
+        >,
     > {
         let client = self.0.clone();
         Box::pin(async move {
@@ -142,6 +156,7 @@ impl instant_acme::HttpClient for AcmeHttpClient {
 }
 
 /// Build an AcmeClient configured for ECDSA HTTP-01 (matches previous test setup).
+#[cfg(feature = "integration")]
 async fn build_ecdsa_http01_client(
     cert_dir: std::path::PathBuf,
 ) -> anyhow::Result<Arc<ngx::acme::AcmeClient>> {
@@ -163,6 +178,7 @@ async fn build_ecdsa_http01_client(
 }
 
 /// Build an AcmeClient configured for RSA HTTP-01.
+#[cfg(feature = "integration")]
 async fn build_rsa_http01_client(
     cert_dir: std::path::PathBuf,
 ) -> anyhow::Result<Arc<ngx::acme::AcmeClient>> {
@@ -239,9 +255,11 @@ async fn acme_issue_ecdsa_single_domain() {
             cert_blocks
         );
 
-        // acme_account+key file written.
-        let account_file = cert_dir_path.join("acme_account+key");
-        assert!(account_file.exists(), "acme_account+key not written");
+        // acme_account.json file written (renamed from acme_account+key
+        // in issue #45 follow-up — the new extension makes the format
+        // obvious to operators / tooling).
+        let account_file = cert_dir_path.join("acme_account.json");
+        assert!(account_file.exists(), "acme_account.json not written");
         assert_eq!(file_mode(&account_file), 0o600, "account file 0600");
         let account = std::fs::read_to_string(&account_file).expect("read account");
         // instant-acme AccountCredentials JSON fields: id, key_pkcs8 (base64 string), directory
@@ -367,7 +385,7 @@ async fn acme_issue_multi_san_blob_copy() {
 }
 
 // =============================================================================
-// E2E: ACME account persistence — acme_account+key survives restart
+// E2E: ACME account persistence — acme_account.json survives restart
 // =============================================================================
 #[cfg(feature = "integration")]
 #[tokio::test]
@@ -381,11 +399,11 @@ async fn acme_account_persistence_across_restart() {
             .await
             .expect("first boot client");
         // Don't even need to issue a cert — just init the client.
-        // The AcmeClient::new writes acme_account+key on first init.
+        // The AcmeClient::new writes acme_account.json on first init.
         drop(client);
     }
 
-    let account_file = cert_dir_path.join("acme_account+key");
+    let account_file = cert_dir_path.join("acme_account.json");
     assert!(account_file.exists(), "account file written on first init");
     let first_contents = std::fs::read_to_string(&account_file).expect("read account");
     assert!(first_contents.contains("\"id\""));

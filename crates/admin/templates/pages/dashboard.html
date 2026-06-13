@@ -38,9 +38,35 @@
     </div>
 
     <!-- Certs -->
-    <div class="card p-4 md:p-5">
-      <div class="text-2xl md:text-3xl font-bold text-gray-900 dark:text-white">{{ cert_count }}</div>
-      <div class="text-xs md:text-sm text-gray-600 dark:text-gray-400 mt-1 md:mt-2">Certs</div>
+    {# Card pulls double duty when there is in-flight or failed ACME work: #}
+    {# the headline number is the same, but two inline badges link the    #}
+    {# operator directly to the status-filtered /certs view. Keeps the   #}
+    {# card compact when nothing is wrong (issue #45).                   #}
+    <div class="card p-4 md:p-5 {% if cert_failed_count > 0 %}border-red-300 dark:border-red-700{% else if cert_in_flight_count > 0 %}border-yellow-300 dark:border-yellow-700{% endif %}">
+      <a href="/certs" class="block">
+        <div class="text-2xl md:text-3xl font-bold text-gray-900 dark:text-white">{{ cert_count }}</div>
+        <div class="text-xs md:text-sm text-gray-600 dark:text-gray-400 mt-1 md:mt-2">Certs</div>
+      </a>
+      {% if cert_failed_count > 0 || cert_in_flight_count > 0 %}
+      <div class="mt-2 flex flex-wrap items-center gap-1.5">
+        {% if cert_failed_count > 0 %}
+        <a id="cert-failed-badge" href="/certs?status=failed"
+           data-status="failed"
+           class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors">
+          <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+          <span class="tabular-nums">{{ cert_failed_count }}</span> failed
+        </a>
+        {% endif %}
+        {% if cert_in_flight_count > 0 %}
+        <a id="cert-inflight-badge" href="/certs?status=pending,issuing"
+           data-status="in_flight"
+           class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 hover:bg-yellow-200 dark:hover:bg-yellow-900/50 transition-colors">
+          <span class="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse"></span>
+          <span class="tabular-nums">{{ cert_in_flight_count }}</span> in flight
+        </a>
+        {% endif %}
+      </div>
+      {% endif %}
     </div>
   </div>
 
@@ -81,5 +107,38 @@
       </a>
     </div>
   </div>
+
+  {# Recent activity panel (issue #45 follow-up). Drained from the      #}
+  {# in-memory EventBuffer so operators can see the ACME flow happen   #}
+  {# live without tailing stdout: `ACME[foo.com] plan → transition →   #}
+  {# acme-call → issued`. Empty state stays hidden so a brand-new      #}
+  {# install doesn't get a confusing dead panel.                       #}
+  {% if !activity.is_empty() %}
+  <div id="dashboard-activity" class="mt-8">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Recent ACME activity</h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">Last {{ activity.len() }} event(s) — in-memory, cleared on restart</span>
+    </div>
+    <div class="card overflow-hidden">
+      <ul class="divide-y divide-slate-100 dark:divide-slate-700">
+        {% for row in activity %}
+        <li data-kind="{{ row.kind }}" data-error="{{ row.is_error }}"
+            class="flex items-start gap-3 px-4 py-2.5 {% if row.is_error %}bg-red-50/40 dark:bg-red-900/10{% endif %}">
+          <span class="shrink-0 mt-0.5 text-xs font-medium px-2 py-0.5 rounded-full
+            {% if row.kind == "ACME" %}{% if row.is_error %}bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300{% else %}bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300{% endif %}
+            {% else if row.kind == "Tun" %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300
+            {% else if row.kind == "Site" %}bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300
+            {% else if row.kind == "Domain" %}bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300
+            {% else %}bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300{% endif %}">
+            {{ row.kind }}
+          </span>
+          <span class="flex-1 text-sm text-slate-700 dark:text-slate-200 break-words font-mono">{{ row.message }}</span>
+          <span class="shrink-0 text-xs text-slate-400 dark:text-slate-500 tabular-nums">{{ row.when }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  {% endif %}
 </main>
 {% endblock %}

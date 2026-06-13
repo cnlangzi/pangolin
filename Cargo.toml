@@ -56,7 +56,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # TLS / ACME
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"
-instant-acme = "0.7"
+instant-acme = { version = "0.8", features = ["hyper-rustls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

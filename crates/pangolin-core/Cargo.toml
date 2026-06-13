@@ -20,6 +20,8 @@ sha2.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
 # Tunnel transport (issue #39): yamux over fastwebsockets, plus
 # permessage-deflate (built into fastwebsockets) and rustls for
 # wss:// on the tun side.

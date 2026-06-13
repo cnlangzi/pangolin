@@ -194,6 +194,9 @@ fn admin_certs_crud() {
         acme_dns_provider: None,
         acme_account_id: None,
         issued_at: 0,
+        status: pangolin_core::CertStatus::Issued,
+        started_at: None,
+        last_error: None,
     };
 
     // Create

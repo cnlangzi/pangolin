@@ -28,6 +28,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the rustls crypto provider before any TLS work. See
+    // `pangolin_core::install_crypto_provider` for the rationale —
+    // tun connects to ngx over `wss://` when `tunnel.tls.enabled = true`,
+    // which goes through rustls and panics without a provider.
+    pangolin_core::install_crypto_provider();
+
     let args = Args::parse();
     let tun_cfg = TunConfig::from_file(&args.config)?;
     init_logger(&tun_cfg.log);

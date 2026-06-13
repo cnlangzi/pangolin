@@ -49,6 +49,11 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         acme_dns_provider: None,
         acme_account_id: None,
         issued_at: 0,
+        // Manual uploads bypass the ACME flow entirely, so the row goes
+        // straight to `Issued` with no `started_at` / `last_error`.
+        status: pangolin_core::types::CertStatus::Issued,
+        started_at: None,
+        last_error: None,
     };
 
     let db = app.db.lock().await;
@@ -72,6 +77,54 @@ pub async fn handle_delete(
             let _ = pangolin_core::db::delete_cert(&db, &d);
             drop(db);
             app.reload_indexes().await;
+        }
+    }
+    Ok(redirect_response("/certs"))
+}
+
+/// `POST /certs/retry` — operator-driven ACME retry (issue #45).
+///
+/// Looks up the domain row and dispatches through the [`pangolin_core::CertRetrier`]
+/// bridge so this handler stays decoupled from `ngx::acme::AcmeState`
+/// (admin would otherwise have to depend on ngx + pingora). The
+/// retrier itself drives the status row (`Pending`/`Issuing`/…), so
+/// this handler just kicks the work off and redirects back.
+///
+/// We do NOT await the full issuance here — ACME flows can take
+/// seconds (DNS-01 propagation, polling for the cert). Instead we
+/// spawn the retrier on the host runtime and respond immediately so
+/// the operator's browser doesn't hang. The status row is updated
+/// asynchronously by the spawned task; the UI converges on the next
+/// page load (or the future htmx auto-refresh).
+pub async fn handle_retry(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
+    let params = parse_form(body);
+    let domain = params.get("domain").cloned().unwrap_or_default();
+    if domain.is_empty() {
+        return Ok(redirect_response("/certs"));
+    }
+
+    // Take a clone of the retrier so we can drop the read guard
+    // immediately. The spawned task owns the Arc for the duration of
+    // the issuance.
+    let retrier = app.cert_retrier.read().await.clone();
+    match retrier {
+        Some(retrier) => {
+            let domain_for_task = domain.clone();
+            tokio::spawn(async move {
+                if let Err(e) = retrier.retry(&domain_for_task).await {
+                    log::warn!("cert retry {} failed: {}", domain_for_task, e);
+                }
+            });
+        }
+        None => {
+            // Process started without an ACME pipeline (e.g. admin-only
+            // unit-test harness). Surface this rather than silently
+            // succeeding so the operator knows the click did nothing.
+            log::warn!(
+                "POST /certs/retry but no CertRetrier installed (acme service \
+                 not running?); domain={}",
+                domain
+            );
         }
     }
     Ok(redirect_response("/certs"))

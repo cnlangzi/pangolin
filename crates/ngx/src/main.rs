@@ -69,6 +69,18 @@ struct Args {
 // wiring now lives in PR-2 (issuance pipeline) under `App::dns_providers`.
 
 fn main() -> anyhow::Result<()> {
+    // ---- 0. Install the rustls crypto provider --------------------
+    // rustls 0.23 refuses to construct any TLS config without a
+    // process-level CryptoProvider. The first reqwest call (inside
+    // instant-acme when registering a new ACME account) would
+    // otherwise panic with the famously unhelpful
+    //   "Could not automatically determine the process-level
+    //    CryptoProvider from Rustls crate features."
+    // Single helper lives in pangolin_core so the same line runs in
+    // every binary + test harness; switching providers (aws-lc-rs
+    // etc.) is then a one-line change.
+    pangolin_core::install_crypto_provider();
+
     // ---- 1. Blocking init --------------------------------------------------
     let args = Args::parse();
     let config =
@@ -111,7 +123,9 @@ fn main() -> anyhow::Result<()> {
 
     // ---- 3. Build the ACME state. The actual DNS reload + initial
     //         cert scan run inside `AcmeService::run`, so a startup
-    //         failure there fails the process (fail-fast).
+    //         failure there fails the process (fail-fast). The
+    //         `CertRetrier` bridge that wires admin's `POST /certs/retry`
+    //         to this state is installed inside the host runtime below.
     let acme_state = Arc::new(crate::acme::AcmeState::empty());
 
     // ---- 4. Spawn pingora on its own std::thread ---------------------------
@@ -137,9 +151,28 @@ fn main() -> anyhow::Result<()> {
         // OS signal handlers cancel the shared token.
         runtime::install_signal_handlers(shutdown.clone());
 
+        // Wire admin's `POST /certs/retry` to the ACME state (issue #45).
+        // Lives inside the host runtime so the trait-object's
+        // `RwLock::write` does not need its own runtime to drive.
+        // `AcmeService` takes ownership of the same Arc below — the
+        // clone is just two `Arc::increment`s, not a duplicate state.
+        let acme_for_service = acme_state.clone();
+        acme_state.install_on(&app).await;
+
+        // Scan `cert_dir` for cert blobs (manually placed by an
+        // operator, or left over from a pre-V4 install) and import
+        // missing rows into the `certs` table. Idempotent — existing
+        // rows are not touched, so a re-scan after operator edits is
+        // safe.
+        match crate::acme::scan_and_import_blobs(&app).await {
+            Ok(n) if n > 0 => log::info!("ACME: scanned cert_dir, imported {} blob row(s)", n),
+            Ok(_) => log::info!("ACME: cert_dir scan complete, no new blobs"),
+            Err(e) => log::warn!("ACME: cert_dir scan failed: {}", e),
+        }
+
         // Build & start services (fail-fast on startup error).
         let services: Vec<Box<dyn runtime::Service>> = vec![
-            Box::new(acme::AcmeService::new(acme_state)),
+            Box::new(acme::AcmeService::new(acme_for_service)),
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
         ];
 

@@ -42,14 +42,14 @@ mod reload_indexes;
 #[cfg(feature = "integration")]
 mod upstream_host;
 
-// Force ring as crypto provider for tests (same pattern as acme.rs in ngx crate).
+// Force the workspace's `ring` provider as the process-level rustls
+// CryptoProvider before any test touches TLS. Delegated to
+// `pangolin_core::install_crypto_provider` so every binary + test
+// harness routes through the same helper.
 #[cfg(feature = "integration")]
 #[ctor::ctor]
 fn init_crypto() {
-    use rustls::crypto::ring;
-    let provider = ring::default_provider();
-    rustls::crypto::CryptoProvider::install_default(provider)
-        .expect("install ring as default crypto provider");
+    pangolin_core::install_crypto_provider();
 }
 
 #[cfg(feature = "integration")]

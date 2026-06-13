@@ -109,6 +109,17 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_domain(&db, &d);
+    // Phase-1 lifecycle write (issue #45): an auto-issue domain gets a
+    // Pending placeholder row in `certs` immediately, so the dashboard
+    // and `/certs` table reflect the operator's intent before the
+    // background ACME loop has had a chance to tick. The helper is
+    // idempotent — pre-existing rows (Issued, Failed, …) are preserved
+    // so the operator's history isn't clobbered by a re-save of the
+    // domain form.
+    if matches!(result, Ok(())) && d.auto_issue {
+        let _ =
+            pangolin_core::db::ensure_pending_cert_row(&db, &d.domain, &app.cert_manager.cert_dir);
+    }
     drop(db);
 
     match result {

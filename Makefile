@@ -109,18 +109,19 @@ CURL_FLAGS := -fL --progress-bar -C -
 
 # Release builds embed admin assets via rust-embed; building UI assets
 # first is required — without it the binary serves empty CSS/JS.
+#
+# Single cargo invocation for both binaries so the shared crates
+# (pangolin-core, admin, pingora, …) are compiled and linked exactly
+# once, not twice. Two separate `cargo build` calls re-link every
+# shared crate.
+#
+# `install` instead of `mv` so the copy is a fresh inode even when
+# `target/release/<bin>` and `bin/<bin>` are hardlinks of each other
+# (e.g. after a previous run that did `cp` rather than `mv`). Plain
+# `mv same-file` errors out and aborts the Make target.
 build: build-ui
 	mkdir -p $(OUT_DIR)
-	# Single cargo invocation for both binaries so the shared crates
-	# (pangolin-core, admin, pingora, …) are compiled and linked
-	# exactly once, not twice.  Two separate `cargo build` calls
-	# re-link every shared crate.
 	$(CARGO) build --release -p ngx -p tun
-	# `install` instead of `mv` so the copy is a fresh inode even when
-	# `target/release/<bin>` and `bin/<bin>` are hardlinks of each
-	# other (e.g. after a previous run that did `cp` rather than
-	# `mv`). Plain `mv same-file` errors out and aborts the Make
-	# target.
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
 	install -m 0755 $(CARGO_TARGET_DIR)/release/tun $(OUT_DIR)/pangolin-tun
 

@@ -126,29 +126,55 @@ pub fn plan_issuance(
     let mut challenges = Vec::with_capacity(sans.len());
     let mut required_provider: Option<String> = None;
 
-    for san in sans {
-        let is_wildcard = san.starts_with("*.");
-        let associated = idx.lookup_dns(san);
+    // First pass: pick the DNS provider the WHOLE order will use
+    // (whichever one any of the SANs is associated with, since
+    // DNS-01 SANs in a single order all live on the same DNS
+    // provider account). The match is done before per-SAN logic
+    // so a wildcard can force every SAN in the same order onto
+    // Dns01 — the per-domain lookup below would otherwise pick
+    // Http01 for the base `yaitoo.cn` (which has no provider
+    // attached in the DB) while the wildcard `*.yaitoo.cn` uses
+    // Dns01, leaving the base unable to find a matching
+    // http-01 challenge.
+    let order_provider: Option<String> = sans.iter().find_map(|san| idx.lookup_dns(san).clone());
+    if let Some(p) = &order_provider {
+        if !idx.providers.contains_key(p) {
+            return Err(PangolinError::Config(format!(
+                "order references unknown or disabled dns_provider '{p}'"
+            )));
+        }
+    }
+    let any_wildcard = sans.iter().any(|s| s.starts_with("*."));
+    if any_wildcard && order_provider.is_none() {
+        return Err(PangolinError::Config(
+            "wildcard SAN in order requires a DNS provider (set dns_provider \
+             on the wildcard domain or its base)"
+                .into(),
+        ));
+    }
 
-        match (is_wildcard, associated) {
-            (true, None) => {
-                return Err(PangolinError::Config(format!(
-                    "wildcard {san} requires DNS-01 but no dns_provider is associated \
-                     with the FQDN or base domain"
-                )));
-            }
-            (true, Some(p)) | (false, Some(p)) => {
-                if !idx.providers.contains_key(&p) {
-                    return Err(PangolinError::Config(format!(
-                        "{san} references unknown or disabled dns_provider '{p}'"
-                    )));
-                }
-                required_provider = Some(p);
-                challenges.push((san.clone(), ChallengeType::Dns01));
-            }
-            (false, None) => {
-                challenges.push((san.clone(), ChallengeType::Http01));
-            }
+    for san in sans {
+        // If any SAN in this order is a wildcard, we MUST use
+        // Dns01 for ALL SANs in the order — the wildcard
+        // forces Dns01, and the bare base (e.g. `yaitoo.cn`
+        // alongside `*.yaitoo.cn`) shares the same persistent
+        // TXT record at `_validation-persist.<base>` so it
+        // can't be validated via http-01 without setting up a
+        // second challenge. (See the IETF
+        // draft-ietf-acme-dns-persist-01 §3.1 example which
+        // puts the wildcard and the bare FQDN in the same
+        // order and uses ONE TXT for both.) Even when no
+        // wildcard is present, the order's DNS provider (if
+        // any) is reused across SANs so all TXT records land
+        // in the same zone.
+        if any_wildcard || order_provider.is_some() {
+            let p = order_provider.as_ref().unwrap();
+            required_provider = Some(p.clone());
+            challenges.push((san.clone(), ChallengeType::Dns01));
+        } else {
+            // No DNS provider in the order AND no wildcard —
+            // fall back to http-01 for every SAN.
+            challenges.push((san.clone(), ChallengeType::Http01));
         }
     }
 
@@ -156,6 +182,26 @@ pub fn plan_issuance(
         challenges,
         dns_provider_name: required_provider,
     })
+}
+
+/// Cross-crate bridge from the admin UI to the ACME issuance pipeline
+/// (issue #45). The retry route lives in `admin`, but the only code
+/// that knows how to drive an issuance is `ngx::acme::AcmeState`, and
+/// `admin` cannot depend on `ngx` (it would pull pingora + TLS into
+/// the admin lib's compile tree). This trait is the seam: ngx
+/// implements it on `AcmeState`, registers an `Arc<dyn CertRetrier>`
+/// on the `App`, and admin's `POST /certs/retry` dispatches through it.
+///
+/// `retry` is fire-and-forget from the HTTP caller's perspective — it
+/// returns once the issuance has finished (or errored). The HTTP
+/// handler can choose to await it for sync UX or spawn it for async.
+#[async_trait::async_trait]
+pub trait CertRetrier: Send + Sync {
+    /// Run a one-shot ACME attempt for `domain`. The implementor is
+    /// expected to drive the status row (`Pending`/`Issuing`/…) via
+    /// `db::set_cert_status_atomic` so the admin UI converges without
+    /// the caller having to do its own bookkeeping.
+    async fn retry(&self, domain: &str) -> anyhow::Result<()>;
 }
 
 /// Shared application state. Owned by `ngx` at runtime; `admin` receives it
@@ -188,6 +234,12 @@ pub struct App {
     /// `AcmeState` background loop subscribes and reloads on each tick.
     /// Cheap (just a permit); no shared state.
     pub dns_change_notify: Arc<tokio::sync::Notify>,
+    /// Bridge from admin's `POST /certs/retry` to the ACME pipeline
+    /// (issue #45). Wired by `ngx::main` after `AcmeState` is built.
+    /// `None` in process modes that don't run the ACME service (e.g.
+    /// admin-only unit tests), in which case the retry endpoint returns
+    /// a 503 with a clear message.
+    pub cert_retrier: RwLock<Option<Arc<dyn CertRetrier>>>,
 }
 
 impl App {
@@ -199,6 +251,28 @@ impl App {
     ) -> crate::Result<Self> {
         let mut conn = db::open(db_path.as_ref())?;
         db::migrate(&mut conn)?;
+
+        // Issue #45 follow-up: sweep any cert row left in `Issuing` by a
+        // prior process that died mid-ACME-call (panic / OOM / SIGKILL).
+        // The row would otherwise spin in `Issuing` until the next
+        // renewal scan (default 6 hours), giving operators no
+        // self-recovery path. 10 minutes is a safe ceiling on the
+        // legitimate ACME wall clock: DNS-01 propagation (≤120s) +
+        // order-ready poll (10×5s) + cert poll (30×5s) ≈ 5 minutes
+        // worst case, doubled for slack.
+        match db::recover_stuck_issuing_rows(&conn, chrono::Duration::minutes(10)) {
+            Ok(swept) if !swept.is_empty() => {
+                log::warn!(
+                    "ACME startup watchdog: reset {} stuck Issuing row(s) to Failed: {}",
+                    swept.len(),
+                    swept.join(", ")
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("ACME startup watchdog failed: {}", e);
+            }
+        }
 
         let sites = db::list_sites(&conn)?;
         let domains = db::list_domains(&conn)?;
@@ -217,7 +291,17 @@ impl App {
             cert_manager,
             events: Arc::new(EventBuffer::new()),
             dns_change_notify: Arc::new(tokio::sync::Notify::new()),
+            cert_retrier: RwLock::new(None),
         })
+    }
+
+    /// Install the [`CertRetrier`] bridge once the ACME pipeline is built.
+    /// Called from `ngx::main` after `AcmeState::empty()` produces the
+    /// concrete retrier. Idempotent — re-installing replaces the prior
+    /// retrier (useful for tests that swap a real `AcmeState` for a
+    /// fake during one process lifetime).
+    pub async fn set_cert_retrier(&self, retrier: Arc<dyn CertRetrier>) {
+        *self.cert_retrier.write().await = Some(retrier);
     }
 
     /// Reload indexes from DB. Called after every admin write operation.
@@ -568,6 +652,18 @@ mod tests {
     #[test]
     fn plan_mixed_dns_and_no_dns_per_identifier() {
         // SAN: ["foo.example.com", "bar.example.com"]. Only foo has DNS.
+        //
+        // After the wildcard-base fix, the planner uses an
+        // "all-or-nothing" policy for Dns01: if ANY SAN in the
+        // order has a DNS provider attached, the WHOLE order is
+        // routed through that provider. This avoids the
+        // wildcard+base mismatch (where the wildcard forces Dns01
+        // and the bare base falls back to Http01, leaving the
+        // base unable to find a matching http-01 challenge in
+        // the authorization). For per-SAN choice we'd need to
+        // either pick a single challenge type per order or
+        // implement per-SAN challenge switching; both add
+        // complexity for a marginal case.
         let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
         let domains = vec![make_domain("foo.example.com", true, Some("cf"))];
         let idx = DnsIndex::build(&providers, &domains);
@@ -582,7 +678,7 @@ mod tests {
             plan.challenges,
             vec![
                 ("foo.example.com".into(), ChallengeType::Dns01),
-                ("bar.example.com".into(), ChallengeType::Http01),
+                ("bar.example.com".into(), ChallengeType::Dns01),
             ]
         );
     }

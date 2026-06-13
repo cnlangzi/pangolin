@@ -15,6 +15,54 @@
     </a>
   </div>
 
+  {# Filter chip-bar — clicking a chip navigates to /certs?status=<name>. #}
+  {# `All` clears the filter. Active chip is highlighted via the matching #}
+  {# class block; counts come from `count_certs_by_status` so a chip      #}
+  {# always shows current state even when the chip's bucket is empty.    #}
+  <div id="certs-filter-bar" class="mb-4 flex flex-wrap items-center gap-2">
+    <a href="/certs" data-status=""
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "" %}bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white
+              {% else %}bg-white text-slate-700 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700 dark:hover:bg-slate-700{% endif %}">
+      All <span class="font-semibold tabular-nums">{{ count_total }}</span>
+    </a>
+    <a href="/certs?status=pending" data-status="pending"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "pending" %}bg-yellow-200 text-yellow-900 border-yellow-400 dark:bg-yellow-900/40 dark:text-yellow-100 dark:border-yellow-700
+              {% else %}bg-white text-yellow-700 border-yellow-200 hover:bg-yellow-50 dark:bg-slate-800 dark:text-yellow-300 dark:border-yellow-700/40 dark:hover:bg-yellow-900/20{% endif %}">
+      <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>
+      Pending <span class="font-semibold tabular-nums">{{ count_pending }}</span>
+    </a>
+    <a href="/certs?status=issuing" data-status="issuing"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "issuing" %}bg-blue-200 text-blue-900 border-blue-400 dark:bg-blue-900/40 dark:text-blue-100 dark:border-blue-700
+              {% else %}bg-white text-blue-700 border-blue-200 hover:bg-blue-50 dark:bg-slate-800 dark:text-blue-300 dark:border-blue-700/40 dark:hover:bg-blue-900/20{% endif %}">
+      <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
+      Issuing <span class="font-semibold tabular-nums">{{ count_issuing }}</span>
+    </a>
+    <a href="/certs?status=issued" data-status="issued"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "issued" %}bg-green-200 text-green-900 border-green-400 dark:bg-green-900/40 dark:text-green-100 dark:border-green-700
+              {% else %}bg-white text-green-700 border-green-200 hover:bg-green-50 dark:bg-slate-800 dark:text-green-300 dark:border-green-700/40 dark:hover:bg-green-900/20{% endif %}">
+      <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+      Issued <span class="font-semibold tabular-nums">{{ count_issued }}</span>
+    </a>
+    <a href="/certs?status=failed" data-status="failed"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "failed" %}bg-red-200 text-red-900 border-red-400 dark:bg-red-900/40 dark:text-red-100 dark:border-red-700
+              {% else %}bg-white text-red-700 border-red-200 hover:bg-red-50 dark:bg-slate-800 dark:text-red-300 dark:border-red-700/40 dark:hover:bg-red-900/20{% endif %}">
+      <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+      Failed <span class="font-semibold tabular-nums">{{ count_failed }}</span>
+    </a>
+    <a href="/certs?status=skipped" data-status="skipped"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
+              {% if status_filter_raw == "skipped" %}bg-slate-300 text-slate-900 border-slate-400 dark:bg-slate-700 dark:text-slate-100 dark:border-slate-500
+              {% else %}bg-white text-slate-600 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 dark:hover:bg-slate-700{% endif %}">
+      <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+      Skipped <span class="font-semibold tabular-nums">{{ count_skipped }}</span>
+    </a>
+  </div>
+
   <div id="certs-table" class="scrollbar-thin">
     {% include "views/certs/_table.html" %}
   </div>

@@ -303,7 +303,11 @@ impl NgxProcess {
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
         let cert_dir = tmpdir.path().join("certs");
         std::fs::create_dir_all(&cert_dir).expect("mkdir certs");
-        gen_self_signed(&["localhost", "127.0.0.1"], "default", &cert_dir);
+        // No `default` blob: v2 has no `default` SNI fallback
+        // (see `pangolin_core::app::resolve_cert_fails_without_default_fallback`).
+        // Generating one here would be auto-imported into the
+        // `certs` table on every test boot, polluting cert counts
+        // in unrelated tests.
 
         let http_port = free_port();
         let tls_port = free_port();
@@ -413,6 +417,21 @@ acme:
     /// install a per-host cert before connecting with TLS+SNI.
     pub fn cert_dir(&self) -> PathBuf {
         self.cert_dir.clone()
+    }
+
+    /// Path to the SQLite database backing this `pangolin-ngx`. Lives
+    /// in the per-test tempdir (NOT `data_dir`; the binary writes
+    /// `pangolin.db` directly to its CWD, which the harness sets to
+    /// `tmpdir`, see `start()` above). Each test gets its own DB and
+    /// can poke rows directly via rusqlite without interfering with
+    /// the running process (the process opens the same file with WAL).
+    pub fn db_path(&self) -> PathBuf {
+        // data_dir is `tmpdir/data`; pangolin.db is `tmpdir/pangolin.db`.
+        // Walk up one level to land on tmpdir.
+        self.data_dir
+            .parent()
+            .expect("data_dir under tmpdir")
+            .join("pangolin.db")
     }
 
     /// Drain the captured log into a String for diagnostic asserts.

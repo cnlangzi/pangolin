@@ -201,10 +201,20 @@ pub async fn handle(
             routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
                 .await?
         }
-        ("certs", "GET") => routes::certs::render(&app, &csrf_token).await?,
+        ("certs", "GET") => {
+            routes::certs::render(
+                &app,
+                query_param_opt(&merged_params, "status").as_deref(),
+                &csrf_token,
+            )
+            .await?
+        }
         ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
         ("certs/new", "POST") => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
+        }
+        ("certs/retry", "POST") => {
+            routes::certs::handle_retry(&app, &merged_params, &csrf_token).await?
         }
         ("certs/delete", "POST") => {
             routes::certs::handle_delete(
@@ -214,6 +224,7 @@ pub async fn handle(
             )
             .await?
         }
+        ("api/certs/summary", "GET") => routes::certs::handle_summary(&app).await?,
         ("dns", "GET") => routes::dns::render(&app, &csrf_token).await?,
         ("dns/new", "GET") => routes::dns::render_create_page(&app, &csrf_token).await?,
         ("dns/new", "POST") => {

@@ -243,6 +243,110 @@ pub struct Tun {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Lifecycle state of a `certs` row (issue #45).
+///
+/// Until v3 the `certs` table only carried fully-issued rows. With auto-issue
+/// becoming the normal path, the table has to surface in-flight and failed
+/// rows too — otherwise the dashboard reports a false sense of completeness
+/// and operators cannot retry without SSH/restart. The five-state machine
+/// below is the minimum that covers the full lifecycle without ambiguity:
+///
+/// ```text
+///   upsert_domain(auto_issue=true) ──► Pending
+///                                          │ ensure_one() starts ACME
+///                                          ▼
+///                                       Issuing
+///                              success  ╱        ╲  failure
+///                                      ▼          ▼
+///                                   Issued     Failed
+///   plan_issuance() returns "no plan possible" ──► Skipped
+///   Manual upload via /certs/new ─────────────► Issued (direct)
+/// ```
+///
+/// All variants serialize as lowercase to match the on-disk DB representation
+/// (`certs.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CertStatus {
+    /// Auto-issue requested but ACME hasn't started yet. Set by
+    /// `upsert_domain` when `auto_issue=true` so the operator immediately
+    /// sees the row on the dashboard.
+    Pending,
+    /// ACME flow is currently running (DNS-01 / HTTP-01 challenge,
+    /// CSR submission, polling for the issued cert).
+    Issuing,
+    /// Cert is on disk and valid. Default for backward compatibility:
+    /// pre-V4 manual rows migrate cleanly to this state.
+    Issued,
+    /// Last ACME attempt errored. `last_error` carries the failure
+    /// message; an operator can retry via `POST /certs/retry`.
+    Failed,
+    /// `plan_issuance` decided the row cannot be issued (e.g. wildcard
+    /// without DNS association). `last_error` carries the reason. Distinct
+    /// from `Failed` because retrying without fixing config will not help.
+    Skipped,
+}
+
+impl CertStatus {
+    /// Lowercase string used in the DB (matches `serde(rename_all = "lowercase")`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CertStatus::Pending => "pending",
+            CertStatus::Issuing => "issuing",
+            CertStatus::Issued => "issued",
+            CertStatus::Failed => "failed",
+            CertStatus::Skipped => "skipped",
+        }
+    }
+
+    /// Default for pre-V4 rows (in the DB via `DEFAULT 'issued'`).
+    pub fn default_for_legacy() -> Self {
+        CertStatus::Issued
+    }
+
+    /// True when an operator-facing retry button makes sense. The UI uses
+    /// this to decide whether to render the ↻ icon next to the row.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            CertStatus::Failed | CertStatus::Pending | CertStatus::Skipped
+        )
+    }
+
+    /// Every status variant in DB-storage order. Used by `count_certs_by_status`
+    /// to ensure every key is present in the result map (zero-valued when no
+    /// rows match) — the dashboard summary endpoint relies on this.
+    pub fn all() -> [CertStatus; 5] {
+        [
+            CertStatus::Pending,
+            CertStatus::Issuing,
+            CertStatus::Issued,
+            CertStatus::Failed,
+            CertStatus::Skipped,
+        ]
+    }
+}
+
+impl std::fmt::Display for CertStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for CertStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(CertStatus::Pending),
+            "issuing" => Ok(CertStatus::Issuing),
+            "issued" => Ok(CertStatus::Issued),
+            "failed" => Ok(CertStatus::Failed),
+            "skipped" => Ok(CertStatus::Skipped),
+            other => Err(format!("unknown cert status: {other}")),
+        }
+    }
+}
+
 /// Certificate (certs table). domain is the primary key (1:1).
 /// In the new blob layout, cert_file == key_file (both point to the same blob path).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,10 +373,26 @@ pub struct Cert {
     /// When the cert was issued (Unix timestamp seconds).
     #[serde(default)]
     pub issued_at: i64,
+    /// Lifecycle state (V4). Manual rows default to `Issued`; ACME rows go
+    /// through `Pending`→`Issuing`→`Issued`/`Failed`/`Skipped`.
+    #[serde(default = "default_cert_status")]
+    pub status: CertStatus,
+    /// When the most recent ACME attempt started (V4). `None` on manual
+    /// uploads. Updated to `Utc::now()` on each `POST /certs/retry`.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Most recent failure / skip reason (V4). Cleared on successful
+    /// transition to `Issued`.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 fn default_cert_source() -> String {
     "manual".to_string()
+}
+
+fn default_cert_status() -> CertStatus {
+    CertStatus::default_for_legacy()
 }
 
 /// DNS provider kind.
@@ -398,6 +518,50 @@ mod tests {
         assert_eq!(d, back);
         assert!(back.auto_issue);
         assert_eq!(back.dns_provider.as_deref(), Some("main-cf"));
+    }
+
+    #[test]
+    fn cert_status_roundtrip() {
+        // Lowercase serde repr matches what V4's DEFAULT 'issued' stores.
+        for status in CertStatus::all() {
+            let s = status.as_str();
+            // Display, as_str, and serde all agree.
+            assert_eq!(s, format!("{status}").as_str());
+            assert_eq!(s.parse::<CertStatus>().unwrap(), status);
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{s}\""));
+            let back: CertStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+        assert!("nope".parse::<CertStatus>().is_err());
+    }
+
+    #[test]
+    fn cert_status_is_retryable() {
+        assert!(CertStatus::Pending.is_retryable());
+        assert!(CertStatus::Failed.is_retryable());
+        assert!(CertStatus::Skipped.is_retryable());
+        // Issued + Issuing don't get a retry button — issuing is already
+        // running and issued is the success state.
+        assert!(!CertStatus::Issued.is_retryable());
+        assert!(!CertStatus::Issuing.is_retryable());
+    }
+
+    #[test]
+    fn cert_default_status_is_issued() {
+        // Manual rows constructed without an explicit status (deserialized
+        // from a pre-V4 JSON dump, e.g. CLI tooling) must remain visible.
+        let json = r#"{
+            "domain": "example.com",
+            "cert_file": "/blob",
+            "key_file": "/blob",
+            "expires_at": null,
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let c: Cert = serde_json::from_str(json).unwrap();
+        assert_eq!(c.status, CertStatus::Issued);
+        assert!(c.started_at.is_none());
+        assert!(c.last_error.is_none());
     }
 
     #[test]
