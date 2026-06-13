@@ -239,9 +239,11 @@ async fn acme_issue_ecdsa_single_domain() {
             cert_blocks
         );
 
-        // acme_account+key file written.
-        let account_file = cert_dir_path.join("acme_account+key");
-        assert!(account_file.exists(), "acme_account+key not written");
+        // acme_account.json file written (renamed from acme_account+key
+        // in issue #45 follow-up — the new extension makes the format
+        // obvious to operators / tooling).
+        let account_file = cert_dir_path.join("acme_account.json");
+        assert!(account_file.exists(), "acme_account.json not written");
         assert_eq!(file_mode(&account_file), 0o600, "account file 0600");
         let account = std::fs::read_to_string(&account_file).expect("read account");
         // instant-acme AccountCredentials JSON fields: id, key_pkcs8 (base64 string), directory
@@ -367,7 +369,7 @@ async fn acme_issue_multi_san_blob_copy() {
 }
 
 // =============================================================================
-// E2E: ACME account persistence — acme_account+key survives restart
+// E2E: ACME account persistence — acme_account.json survives restart
 // =============================================================================
 #[cfg(feature = "integration")]
 #[tokio::test]
@@ -381,11 +383,11 @@ async fn acme_account_persistence_across_restart() {
             .await
             .expect("first boot client");
         // Don't even need to issue a cert — just init the client.
-        // The AcmeClient::new writes acme_account+key on first init.
+        // The AcmeClient::new writes acme_account.json on first init.
         drop(client);
     }
 
-    let account_file = cert_dir_path.join("acme_account+key");
+    let account_file = cert_dir_path.join("acme_account.json");
     assert!(account_file.exists(), "account file written on first init");
     let first_contents = std::fs::read_to_string(&account_file).expect("read account");
     assert!(first_contents.contains("\"id\""));

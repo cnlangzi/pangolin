@@ -31,9 +31,90 @@ use tokio::time::sleep;
 
 use crate::dns::{wait_for_txt_propagation, DnsProvider};
 
-/// Account credentials file — instant-acme AccountCredentials JSON.
-/// Named `acme_account+key` to match autocert DirCache convention.
-const ACCOUNT_KEY_FILE: &str = "acme_account+key";
+/// Account credentials file — instant-acme `AccountCredentials` JSON.
+///
+/// Renamed from the original `acme_account+key` (autocert DirCache
+/// convention) to `acme_account.json` after issue #45 follow-up:
+/// the old name had no extension, which made operators mistake it
+/// for a PEM file and clobber it with `cp some.pem ./acme_account+key`
+/// — at which point `serde_json::from_str` choked with the famously
+/// unhelpful `"invalid number at line 1 column 2"` (the JSON parser
+/// sees `-` from `-----BEGIN ...` and tries to parse a number).
+/// The `.json` extension makes the format obvious to tooling and
+/// operators alike.
+///
+/// This is the ONLY filename the loader honours. Files under any other
+/// name in `cert_dir` — including the historical `acme_account+key` —
+/// are ignored entirely; the loader does not read them, migrate them,
+/// or warn about them. Operators upgrading from a pre-rename install
+/// must `mv acme_account+key acme_account.json` themselves.
+const ACCOUNT_KEY_FILE: &str = "acme_account.json";
+
+/// Load credentials from `cert_dir/acme_account.json`. Returns `None`
+/// when the file does not exist (caller registers a fresh account).
+/// Returns `Err` with a human-readable, file-path-tagged message when
+/// the file exists but cannot be parsed — the prior code produced
+/// `"invalid number at line 1 column 2"` with no file path, which hid
+/// which file to fix.
+///
+/// No legacy filenames are honoured: the contract is "either there is
+/// an `acme_account.json` and we use it, or there isn't and we register
+/// fresh." Any other `acme_account*` file is invisible to the loader.
+async fn load_account_credentials(cert_dir: &Path) -> Result<Option<AccountCredentials>> {
+    let path = cert_dir.join(ACCOUNT_KEY_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let cred = parse_account_credentials(&content, &path)?;
+    Ok(Some(cred))
+}
+
+/// Parse a string as `AccountCredentials`. Produces a detailed error
+/// message — including the file path, the first bytes, and a fix
+/// hint — when parsing fails. This replaces the previous bare
+/// `"invalid account credentials: invalid number at line 1 column 2"`
+/// which gave operators no clue which file to fix.
+fn parse_account_credentials(content: &str, path: &Path) -> Result<AccountCredentials> {
+    serde_json::from_str::<AccountCredentials>(content).map_err(|e| {
+        // First 40 chars of the file — enough to recognise common
+        // mistakes (PEM, HTML error page, empty file) without
+        // leaking the key.
+        let head: String = content.chars().take(40).collect();
+        if content.starts_with("-----BEGIN") {
+            anyhow::anyhow!(
+                "ACME account file {} looks like a PEM private key, not JSON \
+                 (instant-acme expects a JSON serialisation of `AccountCredentials`, \
+                 not a raw key). Most likely cause: an operator accidentally \
+                 overwrote the file. To recover, move the file aside \
+                 (`mv {} {}.bak`) and restart — a fresh ACME account will be \
+                 registered. First bytes: {:?}",
+                path.display(),
+                path.display(),
+                path.display(),
+                head,
+            )
+        } else if content.trim().is_empty() {
+            anyhow::anyhow!(
+                "ACME account file {} is empty (likely truncated by a previous \
+                 crash or disk-full event). Delete it and restart to register \
+                 a fresh account.",
+                path.display(),
+            )
+        } else {
+            anyhow::anyhow!(
+                "ACME account file {} is not valid JSON: {}. First bytes: {:?}. \
+                 If this file was corrupted, move it aside and restart to \
+                 register a fresh account.",
+                path.display(),
+                e,
+                head,
+            )
+        }
+    })
+}
 
 /// ACME client for issuing and renewing certificates.
 pub struct AcmeClient {
@@ -97,34 +178,39 @@ impl AcmeClient {
         key_type: KeyType,
         dns_provider: Option<Arc<dyn DnsProvider>>,
     ) -> Result<Self> {
-        let account_key_path = cert_dir.join(ACCOUNT_KEY_FILE);
-
-        let account = if account_key_path.exists() {
-            log::info!(
-                "loading existing ACME account from {}",
-                account_key_path.display()
-            );
-            let cred_json = tokio::fs::read_to_string(&account_key_path).await?;
-            let cred: AccountCredentials = serde_json::from_str(&cred_json)
-                .map_err(|e| anyhow::anyhow!("invalid account credentials: {}", e))?;
-            Account::from_credentials(cred).await?
-        } else {
-            log::info!("registering new ACME account for {}", email);
-            let (account, cred) = Account::create(
-                &instant_acme::NewAccount {
-                    contact: &[],
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                acme_directory,
-                None,
-            )
-            .await?;
-            tokio::fs::create_dir_all(&cert_dir).await?;
-            let cred_json = serde_json::to_string_pretty(&cred)?;
-            write_file_0600(&account_key_path, cred_json.as_bytes()).await?;
-            log::info!("ACME account registered, credentials saved");
-            account
+        // Three-state semantics, locked by the user:
+        //   Some(cred) → load and continue
+        //   Err(...)   → fail-fast, do NOT overwrite, do NOT re-register
+        //   None       → ONLY THEN register a fresh account
+        // The `?` propagates the corrupt-file Err, which is exactly what
+        // we want — clobbering a half-corrupt file would lose the
+        // operator's existing Let's Encrypt account binding.
+        let account = match load_account_credentials(&cert_dir).await? {
+            Some(cred) => {
+                log::info!(
+                    "ACME: loaded existing account from {}",
+                    cert_dir.join(ACCOUNT_KEY_FILE).display()
+                );
+                Account::from_credentials(cred).await?
+            }
+            None => {
+                log::info!("ACME: registering new account for {}", email);
+                let (account, cred) = Account::create(
+                    &instant_acme::NewAccount {
+                        contact: &[],
+                        terms_of_service_agreed: true,
+                        only_return_existing: false,
+                    },
+                    acme_directory,
+                    None,
+                )
+                .await?;
+                tokio::fs::create_dir_all(&cert_dir).await?;
+                let cred_json = serde_json::to_string_pretty(&cred)?;
+                write_file_0600(&cert_dir.join(ACCOUNT_KEY_FILE), cred_json.as_bytes()).await?;
+                log::info!("ACME: account registered, credentials saved");
+                account
+            }
         };
 
         Ok(Self {
@@ -150,35 +236,34 @@ impl AcmeClient {
         key_type: KeyType,
         dns_provider: Option<Arc<dyn DnsProvider>>,
     ) -> Result<Self> {
-        let account_key_path = cert_dir.join(ACCOUNT_KEY_FILE);
-
-        let account = if account_key_path.exists() {
-            log::info!(
-                "loading existing ACME account from {}",
-                account_key_path.display()
-            );
-            let cred_json = tokio::fs::read_to_string(&account_key_path).await?;
-            let cred: AccountCredentials = serde_json::from_str(&cred_json)
-                .map_err(|e| anyhow::anyhow!("invalid account credentials: {}", e))?;
-            Account::from_credentials_and_http(cred, http).await?
-        } else {
-            log::info!("registering new ACME account for {}", email);
-            let (account, cred) = Account::create_with_http(
-                &instant_acme::NewAccount {
-                    contact: &[],
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                acme_directory,
-                None,
-                http,
-            )
-            .await?;
-            tokio::fs::create_dir_all(&cert_dir).await?;
-            let cred_json = serde_json::to_string_pretty(&cred)?;
-            write_file_0600(&account_key_path, cred_json.as_bytes()).await?;
-            log::info!("ACME account registered, credentials saved");
-            account
+        // Same three-state semantics as `new` — see comment there.
+        let account = match load_account_credentials(&cert_dir).await? {
+            Some(cred) => {
+                log::info!(
+                    "ACME: loaded existing account from {}",
+                    cert_dir.join(ACCOUNT_KEY_FILE).display()
+                );
+                Account::from_credentials_and_http(cred, http).await?
+            }
+            None => {
+                log::info!("ACME: registering new account for {}", email);
+                let (account, cred) = Account::create_with_http(
+                    &instant_acme::NewAccount {
+                        contact: &[],
+                        terms_of_service_agreed: true,
+                        only_return_existing: false,
+                    },
+                    acme_directory,
+                    None,
+                    http,
+                )
+                .await?;
+                tokio::fs::create_dir_all(&cert_dir).await?;
+                let cred_json = serde_json::to_string_pretty(&cred)?;
+                write_file_0600(&cert_dir.join(ACCOUNT_KEY_FILE), cred_json.as_bytes()).await?;
+                log::info!("ACME: account registered, credentials saved");
+                account
+            }
         };
 
         Ok(Self {
@@ -737,6 +822,135 @@ mod tests {
         let blob = build_blob(key_pem, cert_pem);
         assert!(blob.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
         assert!(blob.contains("-----BEGIN CERTIFICATE-----"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ACME account credentials loader (issue #45 follow-up).
+    // ──────────────────────────────────────────────────────────────────
+
+    use std::path::Path;
+
+    fn parse_err_message(content: &str, path: &Path) -> String {
+        match parse_account_credentials(content, path) {
+            Ok(_) => panic!("expected parse error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_account_credentials_pem_detected() {
+        // Most common cause of the historical 'invalid number at line 1
+        // column 2': operator clobbered the file with a PEM. Error
+        // must name the file, hint at the cause, and tell the operator
+        // to MANUALLY move it aside — the code itself must never
+        // overwrite or auto-re-register (user policy).
+        //
+        // Path comes from `tempdir()` rather than a hardcoded string so
+        // the test is independent of the operator's deploy layout
+        // (`/opt/pangolin/certs/...` is one possible layout, not the
+        // contract).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----";
+        let msg = parse_err_message(pem, &path);
+        let path_display = path.display().to_string();
+        assert!(msg.contains(&path_display), "must name file path: {msg}");
+        assert!(msg.contains("PEM"), "{msg}");
+        assert!(
+            msg.contains("mv "),
+            "must hint at the mv command, got: {msg}"
+        );
+        // The hint mentions that AFTER the operator moves the file, a
+        // fresh account will be registered. That's instruction text,
+        // not auto-behaviour — the loader still propagates Err and
+        // the caller refuses to overwrite. The behaviour assertion is
+        // in `load_account_credentials_errors_on_corrupt_canonical`.
+    }
+
+    #[test]
+    fn parse_account_credentials_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let msg = parse_err_message("", &path);
+        let path_display = path.display().to_string();
+        assert!(msg.contains("empty"), "{msg}");
+        assert!(msg.contains(&path_display), "must name file path: {msg}");
+    }
+
+    #[test]
+    fn parse_account_credentials_garbled_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let msg = parse_err_message("not really json", &path);
+        let path_display = path.display().to_string();
+        assert!(msg.contains(&path_display), "must name file path: {msg}");
+        assert!(
+            msg.contains("not really json") || msg.contains("First bytes"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_account_credentials_none_when_dir_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = load_account_credentials(dir.path()).await.unwrap();
+        // `unwrap` is OK because Ok(None) flattens via `assert!(is_none())`.
+        assert!(
+            res.is_none(),
+            "no file → Ok(None) so caller can register fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_account_credentials_errors_on_corrupt_canonical() {
+        // Locked by user: corrupt file must propagate as Err. The caller
+        // (AcmeClient::new) must NOT catch this and re-register, which
+        // would silently lose the operator's existing Let's Encrypt
+        // account binding.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        tokio::fs::write(
+            &path,
+            "-----BEGIN PRIVATE KEY-----\nbad\n-----END PRIVATE KEY-----",
+        )
+        .await
+        .unwrap();
+        // `AccountCredentials` doesn't implement Debug, so `unwrap_err`
+        // won't compile. Match the Result explicitly instead.
+        let msg = match load_account_credentials(dir.path()).await {
+            Ok(_) => panic!("corrupt file must Err, not Ok"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("PEM"), "PEM detection must fire: {msg}");
+        assert!(msg.contains(ACCOUNT_KEY_FILE), "must name the file: {msg}");
+    }
+
+    #[tokio::test]
+    async fn load_account_credentials_ignores_non_canonical_files() {
+        // Locked by user: only `acme_account.json` participates in the
+        // loader. The historical `acme_account+key`, a stray PEM, or
+        // any other `acme_account*` file in `cert_dir` is invisible
+        // — the loader returns `None` (caller registers fresh) rather
+        // than reading them, migrating them, or warning about them.
+        let dir = tempfile::tempdir().unwrap();
+        // Drop several files that previous code paths or operators
+        // might have left behind. None of them should be honoured.
+        for noise in [
+            "acme_account+key",
+            "acme_account.key",
+            "acme_account.pem",
+            "acme_account.bak",
+        ] {
+            tokio::fs::write(dir.path().join(noise), "garbage")
+                .await
+                .unwrap();
+        }
+        let res = load_account_credentials(dir.path()).await.unwrap();
+        // `None`, not `Err` — the noise files are simply not seen.
+        assert!(
+            res.is_none(),
+            "non-canonical files must not be read or trigger an error"
+        );
     }
 }
 
