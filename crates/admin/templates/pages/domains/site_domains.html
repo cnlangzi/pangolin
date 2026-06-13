@@ -9,7 +9,7 @@
   <div class="flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400 mb-4">
     <a href="/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-    <a href="/sites/edit?name={{ site.name }}" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">{{ site.name }}</a>
+    <a href="/sites/edit?name={{ self.site_name_encoded() }}" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">{{ site.name }}</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
     <span class="text-slate-800 dark:text-slate-200 font-medium">Domains</span>
   </div>
@@ -78,9 +78,9 @@
           <div class="flex items-center justify-between mb-2">
             <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
             {% if domain.enabled %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">on</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">enabled</span>
             {% else %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500">off</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">disabled</span>
             {% endif %}
           </div>
           <button hx-delete="/api/domains/{{ domain.domain }}"
