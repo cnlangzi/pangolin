@@ -483,19 +483,109 @@ impl DnsProvider for TencentDnsProvider {
     }
 
     async fn find_zone(&self, fqdn: &str) -> Result<(String, String)> {
+        // Walk up the FQDN one label at a time, asking the DNSPod API
+        // "does this candidate exist as a zone on the account?" The
+        // first hit wins — for `frtpilot.yaitoo.cn` we try
+        //   1. frtpilot.yaitoo.cn  (operator zone? unlikely)
+        //   2. yaitoo.cn           (typical apex zone)
+        //   3. cn                  (TLD, will always miss)
+        //
+        // The previous implementation used `if let Ok(resp)` and
+        // silently dropped EVERY error — so a SignatureFailure or
+        // network outage produced the same "no Tencent zone found"
+        // as a legitimate miss. Operators couldn't tell if their
+        // credentials were wrong, their zone wasn't on this account,
+        // or the API was down.
+        //
+        // The new contract:
+        //   - `DomainRecordNotExist` / "domain not found" style
+        //     errors are non-fatal: this candidate isn't on the
+        //     account, try the parent label.
+        //   - Any other error (signature, auth, rate limit, 5xx,
+        //     network) is fatal — bubbled up immediately so the
+        //     operator sees the real cause instead of a misleading
+        //     "no zone found".
+        //   - Every probe is logged so a `tail -f` reveals the walk.
         let parts: Vec<_> = fqdn.split('.').collect();
-        for i in 0..parts.len() {
+        // First label cannot be a zone on its own (Tencent doesn't
+        // accept TLD-level zones), skip i=parts.len()-1.
+        let upper = parts.len().saturating_sub(1);
+        let mut last_miss: Option<String> = None;
+        for i in 0..upper {
             let candidate = parts[i..].join(".");
             let mut params = HashMap::new();
             params.insert("Domain".to_string(), candidate.clone());
-            if let Ok(resp) = self.do_request("DescribeRecords", params).await {
-                if resp.pointer("/Response/RecordList").is_some() {
-                    return Ok((candidate.clone(), candidate));
+            log::debug!("Tencent find_zone: probing {}", candidate);
+            match self.do_request("DescribeRecords", params).await {
+                Ok(resp) => {
+                    if resp.pointer("/Response/RecordList").is_some() {
+                        log::info!(
+                            "Tencent find_zone: matched {} for fqdn {}",
+                            candidate,
+                            fqdn
+                        );
+                        return Ok((candidate.clone(), candidate));
+                    }
+                    // 200 OK but no RecordList — odd, treat as miss.
+                    last_miss = Some(format!("{}: empty response", candidate));
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_zone_not_on_account(&msg) {
+                        // Expected miss — continue walking.
+                        log::debug!(
+                            "Tencent find_zone: {} not on account ({}), trying parent",
+                            candidate,
+                            msg
+                        );
+                        last_miss = Some(format!("{}: {}", candidate, msg));
+                        continue;
+                    }
+                    // Real error (auth, signature, rate limit, 5xx,
+                    // network). Bail with the underlying cause so the
+                    // operator sees what's actually wrong.
+                    return Err(anyhow::anyhow!(
+                        "Tencent find_zone probe for {} failed: {}. \
+                         Common causes: SecretId/SecretKey wrong, \
+                         credential lacks DNSPod DescribeRecords permission, \
+                         or DNSPod API outage. Check the Tencent console.",
+                        candidate,
+                        msg
+                    ));
                 }
             }
         }
-        Err(anyhow::anyhow!("no Tencent zone found for {}", fqdn))
+        Err(anyhow::anyhow!(
+            "no Tencent zone found for {} after probing {} candidate(s); \
+             last miss: {}. Verify the apex zone is registered on this \
+             Tencent account.",
+            fqdn,
+            upper,
+            last_miss.unwrap_or_else(|| "n/a".into())
+        ))
     }
+}
+
+/// Tencent DNSPod returns specific error codes when a domain isn't
+/// registered on the account, vs auth/system errors. Treat the former
+/// as "try the next candidate"; everything else is a real failure
+/// that the operator needs to see.
+///
+/// Codes / phrases observed:
+///   - `DomainRecordNotExist` (modern)
+///   - `InvalidParameter.DomainInvalid` (when probing a non-zone label)
+///   - `ResourceNotFound.NoDataOfDomain`
+///   - "domain not found" / "no permission" with a not-on-account hint
+///
+/// Anything else (signature failure, rate limit, network) returns
+/// false so the caller bubbles the error.
+fn is_zone_not_on_account(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("domainrecordnotexist")
+        || lower.contains("domaininvalid")
+        || lower.contains("nodataofdomain")
+        || lower.contains("domain not found")
+        || lower.contains("not exist")
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +706,44 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
                 ));
             }
             Ok(Arc::new(TencentDnsProvider::new(secret_id, secret_key)))
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::is_zone_not_on_account;
+
+    #[test]
+    fn classifier_treats_missing_domain_as_skip() {
+        // Known Tencent error codes / phrases that mean "this label
+        // is not a zone on the account" — caller should walk to the
+        // parent label, not bail.
+        for msg in [
+            "Tencent DescribeRecords failed: DomainRecordNotExist — domain not found",
+            "InvalidParameter.DomainInvalid — bad input",
+            "ResourceNotFound.NoDataOfDomain",
+            "domain not found",
+            "the resource does not exist",
+        ] {
+            assert!(is_zone_not_on_account(msg), "should be skippable: {msg}");
+        }
+    }
+
+    #[test]
+    fn classifier_keeps_real_errors_as_fatal() {
+        // Auth / signature / rate-limit / 5xx — caller must bubble
+        // these so the operator sees the real cause instead of a
+        // misleading "no zone found".
+        for msg in [
+            "Tencent DescribeRecords failed: AuthFailure.SignatureFailure — wrong secret",
+            "RequestLimitExceeded",
+            "InternalError",
+            "connection reset by peer",
+            "503 Service Unavailable",
+        ] {
+            assert!(!is_zone_not_on_account(msg), "must be fatal: {msg}");
         }
     }
 }

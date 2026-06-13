@@ -881,6 +881,62 @@ fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp(not_after, 0).ok_or_else(|| anyhow::anyhow!("invalid timestamp"))
 }
 
+/// Richer parse: pulls every piece of metadata the `certs` row wants
+/// out of the leaf cert in a blob — `(not_before, not_after, SANs)`.
+///
+/// Used by [`scan_and_import_blobs`] so the imported row carries the
+/// real issuance date (cert's `NotBefore`), real expiry (`NotAfter`),
+/// and the actual SAN list (multi-SAN / wildcard / IP) instead of
+/// guessing from the filename. A multi-SAN cert like
+/// `example.com + www.example.com` imported from disk previously
+/// recorded only the filename's domain — operators couldn't tell the
+/// row covered `www.` too.
+fn parse_blob_metadata(blob: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, Vec<String>)> {
+    let cert_block = blob
+        .split("-----BEGIN CERTIFICATE-----")
+        .nth(1)
+        .and_then(|s| s.split("-----END CERTIFICATE-----").next())
+        .ok_or_else(|| anyhow::anyhow!("no certificate block in blob"))?;
+    let der = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        cert_block.trim(),
+    )
+    .map_err(|e| anyhow::anyhow!("base64 decode: {}", e))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| anyhow::anyhow!("X509 parse: {}", e))?;
+    let not_before = DateTime::from_timestamp(cert.tbs_certificate.validity.not_before.timestamp(), 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid NotBefore"))?;
+    let not_after = DateTime::from_timestamp(cert.tbs_certificate.validity.not_after.timestamp(), 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid NotAfter"))?;
+
+    // Extract SANs from the `SubjectAltName` X.509 extension. Falls back
+    // to the cert's CN if no SAN extension is present (very old / hand-
+    // rolled certs). We only emit DNS names — IP SANs / email SANs /
+    // URI SANs don't map onto our `domain` PK.
+    let mut sans: Vec<String> = Vec::new();
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for gn in &san_ext.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(name) = gn {
+                sans.push(name.to_string());
+            }
+        }
+    }
+    if sans.is_empty() {
+        // Fall back to CN. Best-effort: split the subject DN and grab
+        // the CN attribute. Wildcard CNs with multi-SAN are rare in
+        // modern certs but possible in legacy on-disk files.
+        if let Some(cn) = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|attr| attr.as_str().ok())
+        {
+            sans.push(cn.to_string());
+        }
+    }
+    Ok((not_before, not_after, sans))
+}
+
 /// Scan `app.cert_manager.cert_dir` for cert blob files and import any
 /// whose domain isn't already in the `certs` table.
 ///
@@ -969,23 +1025,45 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
             // log line per skipped file would be noisy.
             continue;
         }
-        let expires_at = parse_blob_expiry(&content).ok();
+        // Parse the leaf cert for real metadata — NotBefore (used as
+        // both `created_at` and `issued_at` so the table reflects when
+        // the cert was actually issued, not when we ran the scan),
+        // NotAfter (the expiry the operator cares about), and the
+        // SAN list (multi-SAN / wildcard coverage that would otherwise
+        // be lost). On parse failure: log loudly so operators can
+        // diagnose weird blob formats (`-----BEGIN TRUSTED ...`,
+        // BOM-prefixed PEM, etc.) instead of silently importing a row
+        // with no expiry.
+        let (not_before, not_after, sans) = match parse_blob_metadata(&content) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "scan: {} metadata parse failed: {} — importing row with no expiry/SANs",
+                    path.display(),
+                    e
+                );
+                // Conservative fallback: register the existence of the
+                // blob anyway so the operator sees the file in /certs;
+                // expiry + SANs are blank and a renewal scan can fill
+                // them in later.
+                (chrono::Utc::now(), chrono::Utc::now(), vec![domain.clone()])
+            }
+        };
 
-        let now = chrono::Utc::now();
         let cert = pangolin_core::Cert {
             domain: domain.clone(),
             cert_file: path.to_string_lossy().into_owned(),
             key_file: path.to_string_lossy().into_owned(),
-            expires_at,
-            created_at: now,
-            sans: vec![domain.clone()],
+            expires_at: Some(not_after),
+            created_at: not_before,
+            sans,
             // `disk-import` is a distinct source so the admin UI can
             // tell at a glance "this row was reconstructed from a
             // file, not from ACME or a manual upload form".
             source: "disk-import".into(),
             acme_dns_provider: None,
             acme_account_id: None,
-            issued_at: 0,
+            issued_at: not_before.timestamp(),
             status: pangolin_core::CertStatus::Issued,
             started_at: None,
             last_error: None,
@@ -999,12 +1077,18 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         }
         imported += 1;
         log::info!(
-            "scan: imported blob → {} (expires_at={:?})",
+            "scan: imported blob → {} (expires_at={}, SANs={:?})",
             domain,
-            expires_at.map(|d| d.format("%Y-%m-%d").to_string())
+            not_after.format("%Y-%m-%d"),
+            cert.sans,
         );
         app.add_event(pangolin_core::EventType::Info {
-            message: format!("scan: imported blob → {}", domain),
+            message: format!(
+                "scan: imported {} (expires {}, {} SAN(s))",
+                domain,
+                not_after.format("%Y-%m-%d"),
+                cert.sans.len()
+            ),
         });
     }
     Ok(imported)
