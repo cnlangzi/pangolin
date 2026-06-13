@@ -11,6 +11,32 @@ use async_trait::async_trait;
 use hickory_resolver::TokioAsyncResolver;
 use pangolin_core::DnsProviderKind;
 
+/// Flatten an error and its `source()` chain into a single
+/// human-readable string. Used by the Tencent / Aliyun / Cloudflare
+/// transports so the operator sees the real underlying cause (DNS,
+/// TLS, TCP refused, timeout) instead of reqwest's outer
+/// `"error sending request for url (...)"` wrapper.
+///
+/// Stops after a small ceiling so a malicious or pathological cause
+/// chain can't produce unbounded log output.
+fn chain_message<E: std::error::Error + ?Sized>(e: &E) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut src = e.source();
+    let mut depth = 0;
+    while let Some(s) = src {
+        if depth >= 6 {
+            parts.push("…".to_string());
+            break;
+        }
+        parts.push(s.to_string());
+        src = s.source();
+        depth += 1;
+    }
+    // Deduplicate — reqwest sometimes nests the same message twice.
+    parts.dedup();
+    parts.join(" → ")
+}
+
 /// Trait for DNS providers that can create/delete TXT records.
 #[async_trait]
 #[allow(dead_code)]
@@ -23,6 +49,38 @@ pub trait DnsProvider: Send + Sync {
 
     /// Find the zone apex for a given FQDN.
     async fn find_zone(&self, fqdn: &str) -> Result<(String, String)>;
+
+    /// Live credential / connectivity probe used by `POST /dns/test`.
+    ///
+    /// The default impl tries `find_zone` against a domain that is
+    /// statistically unlikely to be on the account (`__pangolin-check__.local`):
+    /// a successful API call that returns "not on account" proves the
+    /// credentials work, while an auth/network/permission failure
+    /// surfaces the real cause to the admin UI. Providers can override
+    /// for cheaper / more targeted checks.
+    async fn probe(&self) -> Result<String> {
+        match self
+            .find_zone("__pangolin-check__.local.invalid")
+            .await
+        {
+            Ok((z, _)) => Ok(format!(
+                "credentials work; probe matched zone {} (unexpected — \
+                 check the probe domain isn't actually registered)",
+                z
+            )),
+            Err(e) => {
+                let msg = e.to_string();
+                // "no zone found" is the expected probe outcome: the
+                // API responded, parsed our response, said "not on
+                // account". That means credentials + network are OK.
+                if msg.contains("no ") && msg.contains("zone found") {
+                    Ok("credentials and network OK (probe returned 'no zone' as expected)".into())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,23 +473,69 @@ impl TencentDnsProvider {
 
         let url = format!("https://dnspod.tencentcloudapi.com/?{}", query);
 
-        let resp = self
+        // ── SECURITY: any error message that flows from here MUST
+        // strip the URL's query string. The query carries `SecretId`
+        // in cleartext (Tencent signs the request, doesn't hide the
+        // ID), and reqwest's `Display` impl helpfully includes the
+        // full URL — so a naive `?` propagation leaks the credential
+        // to admin logs and the dashboard activity panel. `?` is NOT
+        // safe here. Match explicitly and report only `action` +
+        // a redacted SecretId (last 4 chars).
+        let safe_url = "https://dnspod.tencentcloudapi.com/";
+        let secret_id_tail = self
+            .secret_id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let resp = match self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("TC3-HMAC-SHA256 {}", signature))
             .send()
-            .await?;
-
-        let body: serde_json::Value = resp.json().await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Walk `.source()` chain so the operator sees the
+                // real cause (DNS lookup, TLS handshake, TCP refused,
+                // timeout) instead of reqwest's outer "error sending
+                // request" wrapper.
+                let chain = chain_message(&e);
+                return Err(anyhow::anyhow!(
+                    "Tencent {} HTTP failure ({}, SecretId=…{}): {}",
+                    action,
+                    safe_url,
+                    secret_id_tail,
+                    chain
+                ));
+            }
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Tencent {} body parse failure ({}, SecretId=…{}): {}",
+                    action,
+                    safe_url,
+                    secret_id_tail,
+                    chain_message(&e)
+                ));
+            }
+        };
         if let Some(code) = body.pointer("/Response/Error/Code") {
             let msg = body
                 .pointer("/Response/Error/Message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("?");
             return Err(anyhow::anyhow!(
-                "Tencent {} failed: {} — {}",
+                "Tencent {} failed (SecretId=…{}): {} — {}",
                 action,
+                secret_id_tail,
                 code.as_str().unwrap_or("?"),
                 msg
             ));
@@ -713,7 +817,44 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
 
 #[cfg(test)]
 mod tests {
-    use super::is_zone_not_on_account;
+    use super::{chain_message, is_zone_not_on_account};
+
+    #[test]
+    fn chain_message_flattens_source_chain() {
+        // Simulate a reqwest-style nested error: outer "error sending
+        // request" wraps an inner DNS / TLS / IO error. The flatten
+        // helper must surface both so operators see the real cause
+        // instead of the outer wrapper alone.
+        use std::error::Error;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Inner;
+        impl fmt::Display for Inner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("connection refused")
+            }
+        }
+        impl Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer;
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl Error for Outer {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&Inner)
+            }
+        }
+
+        let msg = chain_message(&Outer);
+        assert!(msg.contains("error sending request"), "{msg}");
+        assert!(msg.contains("connection refused"), "{msg}");
+        assert!(msg.contains(" → "), "{msg}");
+    }
 
     #[test]
     fn classifier_treats_missing_domain_as_skip() {
