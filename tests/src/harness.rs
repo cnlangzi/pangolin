@@ -177,16 +177,30 @@ async fn raw_request_inner(
 
 /// Async readiness check — keep trying `TcpStream::connect` until
 /// either it succeeds or the timeout elapses.
-async fn wait_for_port(port: u16, timeout: Duration) {
+///
+/// `log` is the captured stdout+stderr of the child process. When the
+/// timeout fires, the captured log is dumped into the panic message
+/// so a flaky startup on CI is debuggable from the test failure alone
+/// (no need to re-run with --nocapture and hope the timing reproduces).
+async fn wait_for_port(port: u16, timeout: Duration, log: &Arc<Mutex<Vec<u8>>>) {
     let deadline = Instant::now() + timeout;
     loop {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return;
         }
         if Instant::now() >= deadline {
+            let captured = {
+                let buf = log.lock().unwrap();
+                String::from_utf8_lossy(&buf).into_owned()
+            };
             panic!(
-                "pangolin-ngx did not start listening on port {} within {:?}",
-                port, timeout
+                "pangolin-ngx did not start listening on port {} within {:?}.\n\
+                 --- captured stdout+stderr ---\n{}\n--- end ---\n\
+                 Common causes: cold-start of a release binary under CI load \
+                 (the 30s budget here replaces the original 5s, which flaked \
+                 in #56); port already in use (look for 'Address already in use' \
+                 in the log above); config file parse error.",
+                port, timeout, captured
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -382,12 +396,17 @@ acme:
         // tests that exercise the admin API call `ngx.admin_url(...)`
         // immediately after `start_ngx()`, and hitting a port that the
         // binary hasn't `bind()`'d yet surfaces as a flaky
-        // "Connection reset by peer" error. 5s per port is plenty for
-        // a warm cache; if the binary fails to boot (bad config,
-        // panic), we'll see it in the captured log via the panic
-        // message from `wait_for_port`.
+        // "Connection reset by peer" error.
+        //
+        // Budget: 30s per port. The previous 5s flaked on CI when
+        // cargo test ran many tests in parallel and the OS scheduler
+        // starved the cold-starting binaries (see PR #56). Local
+        // warm-cache runs finish in <1s, so the extra budget is free.
+        // If the binary still fails to boot, the captured log is
+        // dumped into the panic message — no more guessing why
+        // startup timed out.
         for &port in &[http_port, tls_port, tunnel_port, admin_port] {
-            wait_for_port(port, Duration::from_secs(5)).await;
+            wait_for_port(port, Duration::from_secs(30), &log).await;
         }
 
         Self {

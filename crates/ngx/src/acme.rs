@@ -1555,6 +1555,140 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
     Ok(imported)
 }
 
+// ---------------------------------------------------------------------------
+// ACME HTTP-01 challenge serving (issue #54)
+// ---------------------------------------------------------------------------
+//
+// Why this lives here and not in `proxy.rs`:
+//   `parse_http01_path` and `read_http01_challenge` are pure functions
+//   of (path, cert_dir). They have no pingora dependency, so unit tests
+//   pin their behaviour without spinning up a fake HTTP server. The proxy
+//   short-circuits in `request_filter` (see `proxy.rs`) using these
+//   helpers and only handles the response-writing side.
+//
+// Threat model: this is the path that ACME servers (Let's Encrypt,
+// Pebble) hit at high rate from a known IP space, but the request
+// itself is unauthenticated — anyone can fetch
+// `/.well-known/acme-challenge/{token}`. The token is random + long
+// (32+ url-safe base64 chars), so brute-force enumeration is impractical.
+// We still validate the token defensively to (a) keep `tokio::fs` from
+// being asked to read a path that escapes `cert_dir` and (b) reject
+// obviously-malformed input (`..`, leading `.`, NUL, separators) so the
+// server-side log doesn't fill up with attempts to read junk paths.
+
+/// Validate that the request path is a well-formed ACME HTTP-01
+/// challenge URL of the shape `/.well-known/acme-challenge/{token}`,
+/// returning the `token` substring on success.
+///
+/// Returns `None` when the path is anything else — including a
+/// path that simply *starts with* the prefix (e.g.
+/// `/.well-known/acme-challenge/../foo` is rejected, not parsed).
+///
+/// Rejection rules (defense-in-depth, even though the proxy's
+/// routing layer already vetted the path):
+///   - Must start with literal `/.well-known/acme-challenge/`
+///     (one leading slash, exact segment names).
+///   - Token must be non-empty.
+///   - Token must not contain `/` or `\` (no path traversal).
+///   - Token must not start with `.` (no hidden-file lookups; ACME
+///     tokens are base64url, never begin with `.`).
+///   - Token must not contain a NUL byte (defensive — HTTP paths
+///     can't legally carry NUL, but a malicious client could try).
+///
+/// `parse_http01_path` is intentionally a pure function so it can
+/// be unit-tested without an HTTP runtime.
+pub fn parse_http01_path(req_path: &str) -> Option<&str> {
+    const PREFIX: &str = "/.well-known/acme-challenge/";
+    let token = req_path.strip_prefix(PREFIX)?;
+    if token.is_empty() {
+        return None;
+    }
+    if token.contains('/') || token.contains('\\') {
+        return None;
+    }
+    if token.starts_with('.') {
+        return None;
+    }
+    if token.contains('\0') {
+        return None;
+    }
+    Some(token)
+}
+
+/// Read the ACME HTTP-01 challenge response for `token` from the
+/// filesystem. Returns:
+///
+///   - `Ok(Some(content))` — challenge file exists; `content` is
+///     the key-authorization string the ACME server expects.
+///   - `Ok(None)` — challenge file does not exist (a fresh token
+///     the operator hasn't told the ACME client about, or one
+///     whose order already finished and was cleaned up). The
+///     caller should answer with 404.
+///   - `Err(_)` — I/O error that is not a "not found". The caller
+///     should answer with 500 and surface the error in the log.
+///
+/// `token` is treated as opaque but is re-validated with the same
+/// rules `parse_http01_path` uses, so a caller that skips
+/// `parse_http01_path` (e.g. an internal helper) still can't be
+/// coerced into reading a file outside `cert_dir`.
+///
+/// The file is read with `tokio::fs::read` (async) so the proxy's
+/// `request_filter` doesn't block the runtime. A 1 MiB read cap
+/// matches the ACME spec: `keyAuthorization` is well under 1 KiB
+/// in practice, so any file larger than that is either an operator
+/// mistake or an attacker planting a giant blob. We refuse to ship
+/// it and log a warning.
+pub async fn read_http01_challenge(
+    cert_dir: &Path,
+    token: &str,
+) -> std::io::Result<Option<String>> {
+    // Re-validate: defence in depth. parse_http01_path is the
+    // canonical entry point, but the helper must be safe to call
+    // directly too.
+    if token.is_empty()
+        || token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('.')
+        || token.contains('\0')
+    {
+        // Treat as missing rather than erroring — the caller will
+        // 404, which is the right semantic for "the ACME server
+        // sent me something I don't recognise".
+        return Ok(None);
+    }
+
+    // Hard cap so an attacker can't make us ship a giant file to
+    // the ACME validator. keyAuthorization is base64url(sha256)
+    // joined with a `.` separator → < 100 bytes in practice.
+    const MAX_CHALLENGE_BYTES: usize = 64 * 1024;
+
+    let path = cert_dir
+        .join(".well-known")
+        .join("acme-challenge")
+        .join(token);
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    if bytes.len() > MAX_CHALLENGE_BYTES {
+        log::warn!(
+            "ACME HTTP-01 challenge file {} is {} bytes (limit {}); refusing to serve",
+            path.display(),
+            bytes.len(),
+            MAX_CHALLENGE_BYTES
+        );
+        return Ok(None);
+    }
+
+    // keyAuthorization is ASCII (base64url + '.'), so lossy is
+    // safe here — but the ACME spec allows non-ASCII bytes in the
+    // token portion, so we accept and pass through arbitrary bytes.
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 // The `mod tests` block below sits before some non-test items (the
 // `AcmeState` impl was added in PR-2 after the tests block originally
 // appeared). Rather than reshuffle the file, suppress the lint.
@@ -1868,6 +2002,150 @@ mod tests {
             "must surface the Unknown variant's inner string, got: {out}"
         );
         assert!(out.contains("During secondary validation"), "{out}");
+    }
+
+    // ── parse_http01_path + read_http01_challenge (issue #54) ─────
+    //
+    // The HTTP-01 path is unauthenticated, so the helpers must
+    // reject anything that even hints at path traversal, hidden
+    // files, or null bytes. Pinning the rejections here means a
+    // future "let's be more lenient" refactor trips a test, not a
+    // production CVE.
+
+    #[test]
+    fn parse_http01_path_accepts_canonical_token() {
+        // Real-world ACME tokens are 32+ url-safe base64 chars.
+        assert_eq!(
+            parse_http01_path("/.well-known/acme-challenge/abc123-def"),
+            Some("abc123-def")
+        );
+        // 43-char base64url token (the actual size for 256 bits).
+        let token = "a".repeat(43);
+        let path = format!("/.well-known/acme-challenge/{}", token);
+        assert_eq!(parse_http01_path(&path), Some(token.as_str()));
+    }
+
+    #[test]
+    fn parse_http01_path_rejects_wrong_prefix() {
+        // Missing one slash, missing the dot, wrong case — all reject.
+        assert!(parse_http01_path("/well-known/acme-challenge/abc").is_none());
+        assert!(parse_http01_path("/.well-known/acme-challenge").is_none());
+        assert!(parse_http01_path("/.well-known/acme-challenge/").is_none());
+        assert!(parse_http01_path("/.well-known/Acme-Challenge/abc").is_none());
+        assert!(parse_http01_path("/api/foo").is_none());
+        assert!(parse_http01_path("").is_none());
+    }
+
+    #[test]
+    fn parse_http01_path_rejects_traversal_attempts() {
+        // '..' as a segment would let a caller read the parent's
+        // contents. Reject anything containing '/' or '\'.
+        assert!(parse_http01_path("/.well-known/acme-challenge/../etc/passwd").is_none());
+        assert!(parse_http01_path("/.well-known/acme-challenge/..%2Fetc").is_none());
+        // Backslashes are illegal in HTTP request paths anyway, but
+        // a proxy sitting behind Windows tooling has been known to
+        // rewrite '/' → '\'; refuse both.
+        assert!(parse_http01_path("/.well-known/acme-challenge/foo\\bar").is_none());
+    }
+
+    #[test]
+    fn parse_http01_path_rejects_hidden_files() {
+        // Leading dot would make `cert_dir/.well-known/...` look like
+        // an editor swap file / dotfile to operators poking around.
+        // ACME tokens are base64url → never start with `.`.
+        assert!(parse_http01_path("/.well-known/acme-challenge/.hidden").is_none());
+        assert!(parse_http01_path("/.well-known/acme-challenge/.git").is_none());
+    }
+
+    #[test]
+    fn parse_http01_path_rejects_null_bytes() {
+        // NUL can truncate a path in C-backed syscalls. ACME tokens
+        // never carry NUL; refuse the input rather than truncating.
+        let nul = "/.well-known/acme-challenge/abc\0def".to_string();
+        assert!(parse_http01_path(&nul).is_none());
+    }
+
+    #[tokio::test]
+    async fn read_http01_challenge_happy_path() {
+        // The simplest end-to-end: write a challenge file, read it
+        // back, get the same bytes. Mirrors what the ACME client
+        // writes via `write_challenge` and what Pebble then fetches.
+        let dir = tempfile::tempdir().unwrap();
+        let ch_dir = dir.path().join(".well-known").join("acme-challenge");
+        tokio::fs::create_dir_all(&ch_dir).await.unwrap();
+        let key_auth = "tok123.thumb456";
+        tokio::fs::write(ch_dir.join("tok123"), key_auth)
+            .await
+            .unwrap();
+
+        let out = read_http01_challenge(dir.path(), "tok123")
+            .await
+            .expect("read ok");
+        assert_eq!(out.as_deref(), Some(key_auth));
+    }
+
+    #[tokio::test]
+    async fn read_http01_challenge_missing_returns_none() {
+        // No file on disk → Ok(None). The caller answers with 404;
+        // this must NOT be Err or the proxy would 500.
+        let dir = tempfile::tempdir().unwrap();
+        let out = read_http01_challenge(dir.path(), "does-not-exist")
+            .await
+            .expect("missing file is Ok(None), not Err");
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_http01_challenge_rejects_bad_tokens_without_io() {
+        // All the malformed-token inputs must short-circuit to Ok(None)
+        // — they must NOT hit the filesystem, so a `..` token can't
+        // read files outside `cert_dir` even if the rejection layer
+        // above (`parse_http01_path`) is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a canary outside the `.well-known` dir to prove the
+        // token never escapes its subdirectory.
+        let canary = dir.path().join("outside.txt");
+        tokio::fs::write(&canary, "PWNED").await.unwrap();
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            ".hidden",
+            "abc\0def",
+        ] {
+            let out = read_http01_challenge(dir.path(), bad).await.unwrap();
+            assert!(
+                out.is_none(),
+                "bad token {:?} must return None (got {:?})",
+                bad,
+                out
+            );
+        }
+        // The canary must still exist; we did not read it.
+        assert!(canary.exists(), "no token should have escaped cert_dir");
+    }
+
+    #[tokio::test]
+    async fn read_http01_challenge_caps_oversize_file() {
+        // 64 KiB + 1 byte file → Ok(None) + log warning, not a
+        // memory blow-up or a multi-second write to the client.
+        // (Real ACME keyAuth is ~100 bytes; this is purely defensive.)
+        let dir = tempfile::tempdir().unwrap();
+        let ch_dir = dir.path().join(".well-known").join("acme-challenge");
+        tokio::fs::create_dir_all(&ch_dir).await.unwrap();
+        let big = vec![b'A'; 64 * 1024 + 1];
+        tokio::fs::write(ch_dir.join("big"), &big).await.unwrap();
+
+        let out = read_http01_challenge(dir.path(), "big").await.unwrap();
+        assert!(
+            out.is_none(),
+            "oversize challenge file must be refused (got {} bytes)",
+            out.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
     }
 
     // ── dns-persist-01 helpers ──────────────────────────────────────

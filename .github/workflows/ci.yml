@@ -101,6 +101,37 @@ jobs:
 
   # ----------------------------------------------------------------
   # E2E tests — requires Pebble ACME server
+  #
+  # Issue #54 regression check strategy:
+  #   Pebble's `PEBBLE_VA_ALWAYS_VALID=1` (the historical setting)
+  #   silently accepts every challenge WITHOUT actually performing the
+  #   HTTP fetch. That's why the missing proxy-side ACME HTTP-01
+  #   handler went unnoticed for so long — the validator never
+  #   probed the URL, so the cert was issued regardless.
+  #
+  #   Two complementary tests now cover the server-side regression:
+  #
+  #   1. `real_e2e_acme_http01_challenge_served` and
+  #      `real_e2e_acme_http01_missing_returns_404` (default-on, run
+  #      via `make test-e2e`): these are deterministic HTTP-level
+  #      simulations of what Pebble's validator would send. They plant
+  #      a challenge file, GET it through the proxy, and assert the
+  #      byte-exact response — no Pebble dependency, no port-80
+  #      binding, runs on every CI green.
+  #
+  #   2. `real_e2e_acme_http01_full_pebble_flow` (`#[ignore]`'d):
+  #      drives an actual issuance through Pebble with
+  #      `PEBBLE_VA_ALWAYS_VALID=0`. We do NOT run this in CI because
+  #      Pebble's VA hardcodes port 80 for HTTP-01 (RFC 8555 §8.3),
+  #      and neither the service container nor the test job can bind
+  #      it from CI. The test is runnable locally with sudo on a
+  #      workstation that runs Pebble on the host network — see the
+  #      docstring in `tests/src/real_e2e.rs` for the exact commands.
+  #
+  # The Pebble service below stays in `PEBBLE_VA_ALWAYS_VALID=1`
+  # mode for the *client*-side tests (acme.rs::tests::acme_*), which
+  # only need an ACME server that will sign certificates — they
+  # don't care about challenge validation.
   # ----------------------------------------------------------------
   e2e:
     name: E2E tests (Pebble)
