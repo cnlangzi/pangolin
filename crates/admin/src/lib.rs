@@ -118,6 +118,11 @@ pub async fn handle(
 
     // ── Route dispatch ───────────────────────────────────────────────
     let path = path.trim_start_matches('/');
+    // Percent-decode the path so URL-encoded path parameters (e.g.
+    // `%2A.wildcard.com` for `*.wildcard.com`) reach the DB layer in
+    // their canonical form. pingora/ngx hands us the raw URI path
+    // without decoding it.
+    let path = percent_decode_path(path);
 
     // Look up the CSRF token for the current session (if any). For unauthenticated
     // requests (login page), this is empty.
@@ -127,7 +132,7 @@ pub async fn handle(
         String::new()
     };
 
-    let res: Response<Full<Bytes>> = match (path, method) {
+    let res: Response<Full<Bytes>> = match (path.as_str(), method) {
         // ── /api/... : HTMX HTML fragments ─────────────────────────
         // The brief splits /api/site/{name}/domains (GET) and
         // /api/domains/{domain} (DELETE). Both are HTMX endpoints that
@@ -307,6 +312,28 @@ pub async fn handle(
                             )
                             .await?
                         }
+                    } else if method == "POST" {
+                        // POST /api/domains/{domain}/edit — issue #57.
+                        // The edit form's `form_action()` resolves to
+                        // this URL (see `DomainsEditTemplate::form_action`).
+                        // We also accept POST /domains/{domain}/edit (see
+                        // the `domains/` prefix branch below) for parity
+                        // with the dns/tun resource pattern.
+                        if let Some((name, suffix)) = domain.split_once('/') {
+                            if name.is_empty() || suffix != "edit" {
+                                not_found()
+                            } else {
+                                routes::domains::handle_update(
+                                    &app,
+                                    Some(name.to_string()),
+                                    &merged_params,
+                                    &csrf_token,
+                                )
+                                .await?
+                            }
+                        } else {
+                            not_found()
+                        }
                     } else {
                         not_found()
                     }
@@ -353,6 +380,47 @@ pub async fn handle(
                         }
                     } else {
                         not_found()
+                    }
+                } else {
+                    not_found()
+                }
+            } else if let Some(rest) = path.strip_prefix("domains/") {
+                // /domains/{domain}/edit   GET   (render edit form — issue #57)
+                // /domains/{domain}/edit   POST  (update — issue #57; see also
+                //                              the /api/domains/{domain}/edit
+                //                              alias used by the form's
+                //                              `form_action()` in the template)
+                // /domains/{domain}/delete POST  (delete) — DEPRECATED: use DELETE /api/domains/{domain}.
+                if let Some((name, suffix)) = rest.split_once('/') {
+                    match (suffix, method) {
+                        ("edit", "GET") => {
+                            routes::domains::render_edit_page(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        ("edit", "POST") => {
+                            routes::domains::handle_update(
+                                &app,
+                                Some(name.to_string()),
+                                &merged_params,
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        // DEPRECATED: use DELETE /api/domains/{domain}. Kept as a fallback during
+                        // the migration window (issue #48).
+                        ("delete", "POST") => {
+                            routes::domains::handle_delete(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                            )
+                            .await?
+                        }
+                        _ => not_found(),
                     }
                 } else {
                     not_found()
@@ -504,6 +572,29 @@ fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == key).then_some(urlencoding::decode(v).ok()?.to_string())
     })
+}
+
+/// Percent-decode each `/`-separated segment of `path` so route params
+/// resolve to their canonical form (e.g. `%2A.wildcard.com` →
+/// `*.wildcard.com`). ngx/pingora passes the raw URI path without
+/// decoding, so URL-encoded path params otherwise mismatch the DB.
+/// Decoding is per-segment to avoid treating `/` as decodable.
+fn percent_decode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, segment) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        // urlencoding::decode never expands the result; safe to push
+        // raw bytes (the crate emits valid UTF-8 for valid escapes).
+        match urlencoding::decode(segment) {
+            Ok(decoded) => out.push_str(&decoded),
+            // Fall back to the raw segment on decode failure so a
+            // malformed path returns 404 (not 500).
+            Err(_) => out.push_str(segment),
+        }
+    }
+    out
 }
 
 fn not_found() -> Response<Full<Bytes>> {
