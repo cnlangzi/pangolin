@@ -29,6 +29,7 @@ use pangolin_core::tunnel::{
     compute_ws_accept, encode_http_request, pump_ws_relay, read_http_response,
     strip_hop_by_hop_headers, HttpRequest,
 };
+use pangolin_core::types::{HostMode, Site};
 
 use crate::App;
 
@@ -307,6 +308,17 @@ impl ProxyHttp for AppProxy {
                 // Strip RFC 7230 §6.1 hop-by-op headers before
                 // re-serialising to the backend.
                 strip_hop_by_hop_headers(&mut headers);
+                // Apply the site's `host_mode` policy to the
+                // headers we're about to ship through the yamux
+                // stream. Without this, the inbound `Host`
+                // (e.g. `dev.yaitoo.cn`) reaches the backend
+                // verbatim and SPAs that route by Host collapse
+                // every request into their "unknown host" fallback
+                // (issue #61: kinnit returns its default page for
+                // every `<path>` under `dev.yaitoo.cn`). This
+                // mirrors what `upstream_request_filter` does on
+                // the direct path.
+                apply_host_mode(&mut headers, &site, &host);
 
                 let req = HttpRequest {
                     method: method.clone(),
@@ -586,6 +598,16 @@ impl ProxyHttp for AppProxy {
     }
 
     /// Set Host header per site.host_mode, add X-Forwarded-Host when mode=custom.
+    ///
+    /// The Host (and X-Forwarded-Host, when host_mode=custom) writes
+    /// are funneled through the shared [`apply_host_mode`] helper so
+    /// that the **direct** path (this method) and the **tunnel** path
+    /// (in `request_filter`) compute the same headers for the same
+    /// `(site, original_host)` inputs. Issue #61: the helper
+    /// previously lived inline here only, so tunnel-routed requests
+    /// reached the backend with the original public `Host` and were
+    /// SPA-misrouted (e.g. `dev.yaitoo.cn/<path>` hitting kinnit's
+    /// "unknown host" fallback).
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -598,7 +620,11 @@ impl ProxyHttp for AppProxy {
         let site = match pangolin_core::index::lookup_site(&indexes, &original_host) {
             Some(s) => s.clone(),
             None => {
-                // Fall back to passthrough
+                // No site configured for this host — preserve the
+                // pre-refactor behaviour: pass the inbound Host
+                // through verbatim. This matches the legacy passthrough
+                // semantics and keeps the direct path's behaviour
+                // unchanged for hosts that haven't been routed.
                 if !original_host.is_empty() {
                     upstream
                         .insert_header("Host", original_host.as_bytes())
@@ -609,35 +635,41 @@ impl ProxyHttp for AppProxy {
         };
         drop(indexes);
 
-        let backend_host = extract_host_from_backend(&site.backend);
-
-        match site.host_mode {
-            pangolin_core::types::HostMode::Backend => {
-                // Use backend URL's host (IP or domain) as-is
-                if let Some(h) = backend_host {
-                    upstream.insert_header("Host", h.as_bytes()).ok();
+        // The shared helper is defined against the
+        // `Vec<(String, String)>` shape (the natural shape for the
+        // tunnel-side header buffer). For the direct path we
+        // round-trip through the helper on a small `Vec` of just
+        // the Host / X-Forwarded-Host headers, then upsert the
+        // result into the pingora `RequestHeader` via the same
+        // `insert_header` API the legacy inline match used. This
+        // keeps direct-path behaviour identical (the helper is
+        // a pure refactor of the inline match) and ensures the
+        // tunnel branch and direct branch compute the same
+        // Host / X-Forwarded-Host for the same `(site,
+        // original_host)` pair (issue #61).
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for (name, value) in &upstream.headers {
+            let name_str = name.as_str();
+            if name_str.eq_ignore_ascii_case("Host")
+                || name_str.eq_ignore_ascii_case("X-Forwarded-Host")
+            {
+                if let Ok(s) = std::str::from_utf8(value.as_bytes()) {
+                    headers.push((name_str.to_string(), s.to_string()));
                 }
             }
-            pangolin_core::types::HostMode::Passthrough => {
-                // Pass through original Host header (default / legacy behavior)
-                if !original_host.is_empty() {
-                    upstream
-                        .insert_header("Host", original_host.as_bytes())
-                        .ok();
-                }
-            }
-            pangolin_core::types::HostMode::Custom => {
-                // Use custom Host, and add X-Forwarded-Host with the original
-                if let Some(ref custom) = site.host_custom {
-                    if !custom.is_empty() {
-                        upstream.insert_header("Host", custom.as_bytes()).ok();
-                    }
-                }
-                if !original_host.is_empty() {
-                    upstream
-                        .insert_header("X-Forwarded-Host", original_host.as_bytes())
-                        .ok();
-                }
+        }
+        apply_host_mode(&mut headers, &site, &original_host);
+        for (k, v) in headers {
+            // `insert_header` takes `name: impl Into<HeaderName>`
+            // which requires a `'static` (owned) name; clone here
+            // to satisfy the bound. This is on the hot path of every
+            // proxied request through `upstream_request_filter`,
+            // but the loop runs at most twice (Host + optionally
+            // X-Forwarded-Host).
+            let name = HeaderName::from_bytes(k.as_bytes()).ok();
+            let value = HeaderValue::from_str(&v).ok();
+            if let (Some(name), Some(value)) = (name, value) {
+                upstream.insert_header(name, value).ok();
             }
         }
         Ok(())
@@ -651,6 +683,61 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Insert or replace a header in a flat `Vec<(String, String)>` header
+/// list. Comparison is **case-insensitive on the name** per RFC 7230
+/// §3.2 ("field names are case-insensitive"); the new value keeps
+/// its supplied casing. Used by the shared [`apply_host_mode`] helper
+/// when rewriting Host / X-Forwarded-Host on the tunnel path.
+fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    for (k, v) in headers.iter_mut() {
+        if k.eq_ignore_ascii_case(name) {
+            *v = value.to_string();
+            return;
+        }
+    }
+    headers.push((name.to_string(), value.to_string()));
+}
+
+/// Apply the site's `host_mode` policy to a header list.
+///
+/// Writes (and, for `Custom`, also adds `X-Forwarded-Host`) on the
+/// supplied `headers` buffer. The semantics mirror the inline match
+/// that used to live in [`AppProxy::upstream_request_filter`], so the
+/// direct path's behaviour is unchanged; the new caller is the
+/// tunnel branch in [`AppProxy::request_filter`], which previously
+/// forwarded the inbound `Host` byte-for-byte into the yamux stream
+/// and broke SPAs that route by Host.
+///
+/// Modes:
+///   * `Passthrough` — set `Host: <original_host>` if non-empty.
+///   * `Backend` — set `Host: <backend URL's host>` if extractable.
+///   * `Custom` — set `Host: <site.host_custom>` if non-empty AND
+///     append `X-Forwarded-Host: <original_host>` (when non-empty).
+fn apply_host_mode(headers: &mut Vec<(String, String)>, site: &Site, original_host: &str) {
+    match site.host_mode {
+        HostMode::Passthrough => {
+            if !original_host.is_empty() {
+                upsert_header(headers, "Host", original_host);
+            }
+        }
+        HostMode::Backend => {
+            if let Some(h) = extract_host_from_backend(&site.backend) {
+                upsert_header(headers, "Host", &h);
+            }
+        }
+        HostMode::Custom => {
+            if let Some(ref c) = site.host_custom {
+                if !c.is_empty() {
+                    upsert_header(headers, "Host", c);
+                }
+            }
+            if !original_host.is_empty() {
+                upsert_header(headers, "X-Forwarded-Host", original_host);
+            }
+        }
     }
 }
 

@@ -110,6 +110,34 @@ fn seed_site(conn: &Connection, name: &str, backend: &str) {
     .expect("insert site");
 }
 
+/// Variant of [`seed_site`] that also sets `host_mode` and
+/// (when relevant) `host_custom`. Used by the
+/// `real_e2e_tunnel_host_mode_preserves_path` regression test
+/// (issue #61) to exercise all three HostMode variants through
+/// the tunnel path. Going through `pangolin_core::db::upsert_site`
+/// (instead of raw SQL) keeps this helper in sync with the
+/// canonical column order and the `host_mode TEXT` parser.
+fn seed_site_with_host_mode(
+    conn: &Connection,
+    name: &str,
+    backend: &str,
+    host_mode: pangolin_core::types::HostMode,
+    host_custom: Option<&str>,
+) {
+    let now = Utc::now();
+    let site = pangolin_core::types::Site {
+        name: name.to_string(),
+        backend: backend.to_string(),
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+        host_mode,
+        host_custom: host_custom.map(|s| s.to_string()),
+        domain_count: 0,
+    };
+    pangolin_core::db::upsert_site(conn, &site).expect("upsert site with host_mode");
+}
+
 fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
     let now = Utc::now().to_rfc3339();
     conn.execute(
@@ -272,6 +300,246 @@ async fn real_e2e_tunnel_http_request_through_tun() {
     assert_eq!(
         host_header, "office.test",
         "Host header must pass through tunnel to backend as sent by client"
+    );
+}
+
+/// **Regression test for issue #61: tunnel path ignored `host_mode`.**
+///
+/// Symptom (from production): `dev.yaitoo.cn/<path>` (a tunnel-routed
+/// site whose backend is the `kinnit` SPA) returned kinnit's default
+/// landing page for every `<path>`, regardless of what the URL bar
+/// showed. Operators saw the public hostname in their address bar but
+/// the SPA's "no host match" fallback in the body.
+///
+/// Cause: `host_mode` was applied on the **direct** proxy path
+/// (`AppProxy::upstream_request_filter`) but **not** on the
+/// **tunnel** path (`AppProxy::request_filter`, the yamux branch).
+/// The inbound `Host: dev.yaitoo.cn` was copied byte-for-byte into
+/// the yamux stream; the tun forwarded it to kinnit unchanged; kinnit
+/// routes by Host, doesn't recognise `dev.yaitoo.cn`, and falls back
+/// to its default page. Every `<path>` collapsed to the same body
+/// because the SPA was making the routing decision, not the proxy.
+///
+/// Why this is the right shape for the regression test:
+///   * Each variant (`passthrough` / `backend` / `custom`) gets its
+///     own subdomain so we can run them in sequence against a single
+///     `InspectingBackend` without one test's site state leaking into
+///     another (the proxy's `indexes` are populated at boot from the
+///     DB and there is no per-test reload_indexes admin call here).
+///   * `InspectingBackend` records the full request including the
+///     `Host` header it actually received, so we can assert the
+///     policy matched: `passthrough` → client host, `backend` →
+///     backend URL's authority, `custom` → the literal `host_custom`
+///     value plus an `X-Forwarded-Host` of the client host.
+///   * We assert the `path` round-trips byte-exact under every mode
+///     so the fix doesn't accidentally regress the unrelated path
+///     forwarding from issue #39 (`real_e2e_tunnel_http_request_through_tun`).
+///   * The expected Host for `backend` is the **127.0.0.1:<port>**
+///     string from `InspectingBackend::addr()`. `extract_host_from_backend`
+///     strips the port, so we assert against just the host part.
+#[tokio::test]
+async fn real_e2e_tunnel_host_mode_preserves_path() {
+    use pangolin_core::types::HostMode;
+
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+    let backend_host_only = {
+        // Match what `extract_host_from_backend` does: strip the
+        // "http://" prefix and any trailing ":port". The proxy
+        // writes this into `Host` when `host_mode = backend`.
+        let trimmed = backend_addr
+            .strip_prefix("http://")
+            .unwrap_or(&backend_addr);
+        trimmed.split(':').next().unwrap_or(trimmed).to_string()
+    };
+    // Custom Host value chosen to be distinct from both the
+    // public hostname and the backend's authority, so an accidental
+    // passthrough or backend-mode leak is immediately visible in
+    // the assertion failure message.
+    let custom_host = "spa.internal.example";
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        // All three sites route through the same `office` tun to
+        // the same backend; what varies is `host_mode` (and the
+        // custom host for `custom`). The backend in each case is
+        // `office:http://<backend_addr>`, so the tun's `reqwest`
+        // ends up connecting to `InspectingBackend` regardless of
+        // what the proxy writes into `Host`.
+        let backend_url = format!("office:http://{backend_addr}");
+        seed_site_with_host_mode(
+            &conn,
+            "passthrough-site",
+            &backend_url,
+            HostMode::Passthrough,
+            None,
+        );
+        seed_domain(&conn, "passthrough.test", "passthrough-site");
+
+        seed_site_with_host_mode(&conn, "backend-site", &backend_url, HostMode::Backend, None);
+        seed_domain(&conn, "backend.test", "backend-site");
+
+        seed_site_with_host_mode(
+            &conn,
+            "custom-site",
+            &backend_url,
+            HostMode::Custom,
+            Some(custom_host),
+        );
+        seed_domain(&conn, "custom.test", "custom-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // -----------------------------------------------------------------
+    // Case 1: host_mode = passthrough — Host must reach the backend
+    // as the client sent it (`passthrough.test`).
+    // -----------------------------------------------------------------
+    let (status, body) = raw_request(&addr, "passthrough.test", "GET", "/chat?msg=hi", b"").await;
+    assert_eq!(
+        status,
+        200,
+        "passthrough.mode: expected 200 from backend via tunnel, \
+         got {status} (body={body:?}). ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // -----------------------------------------------------------------
+    // Case 2: host_mode = backend — Host must be rewritten to the
+    // backend URL's authority (`127.0.0.1:<port>`'s host portion).
+    // -----------------------------------------------------------------
+    let (status, body) = raw_request(&addr, "backend.test", "GET", "/api/profile", b"").await;
+    assert_eq!(
+        status,
+        200,
+        "backend.mode: expected 200 from backend via tunnel, \
+         got {status} (body={body:?}). ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // -----------------------------------------------------------------
+    // Case 3: host_mode = custom — Host must be `custom_host`
+    // AND `X-Forwarded-Host` must be the original client host
+    // (`custom.test`). This is the SPA-style flow described in the
+    // issue: `dev.yaitoo.cn` → kinnit with `Host: kinnit-internal`,
+    // `X-Forwarded-Host: dev.yaitoo.cn`. Operators can still see the
+    // public host in `X-Forwarded-Host` for logging / cert-SNI / etc.
+    // -----------------------------------------------------------------
+    let (status, body) = raw_request(&addr, "custom.test", "GET", "/dashboard", b"").await;
+    assert_eq!(
+        status,
+        200,
+        "custom.mode: expected 200 from backend via tunnel, \
+         got {status} (body={body:?}). ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // -----------------------------------------------------------------
+    // Cross-mode assertions on what the backend actually saw.
+    //
+    // `InspectingBackend` records one entry per accepted connection.
+    // We made three sequential `raw_request` calls (one per host);
+    // each one opens a fresh TCP connection and therefore a fresh
+    // `accept()` on the backend. The Vec order matches the order
+    // we issued the requests: passthrough, backend, custom.
+    // -----------------------------------------------------------------
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        3,
+        "backend should have seen exactly 3 requests (one per host_mode), \
+         saw {}. ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+
+    // Helper closure: pull the (case-insensitive) header value out of
+    // a RecordedRequest's header list, or empty string if absent.
+    fn hdr<'a>(req: &'a RecordedRequest, name: &str) -> &'a str {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+
+    // ---- Passthrough: Host == public hostname from the client ----
+    let pt = &seen[0];
+    assert_eq!(pt.method, "GET", "passthrough: method must survive tunnel");
+    assert_eq!(
+        pt.path, "/chat",
+        "passthrough: path must survive tunnel byte-exact (the path-loss \
+         symptom from issue #61 looks like every URL collapsing to \
+         the SPA fallback; we MUST keep the path)"
+    );
+    assert_eq!(
+        pt.query, "msg=hi",
+        "passthrough: query string must survive tunnel byte-exact"
+    );
+    assert_eq!(
+        hdr(pt, "Host"),
+        "passthrough.test",
+        "passthrough.mode: Host must reach backend as sent by client. \
+         Pre-fix this would have been correct here ONLY because \
+         passthrough was already the default behaviour; the bug \
+         was that backend/custom modes were silently treated as \
+         passthrough on the tunnel path."
+    );
+    // No X-Forwarded-Host for passthrough.
+    assert_eq!(
+        hdr(pt, "X-Forwarded-Host"),
+        "",
+        "passthrough.mode: X-Forwarded-Host must NOT be set (only \
+         host_mode=custom adds it)"
+    );
+
+    // ---- Backend: Host == backend URL's host (port stripped) ----
+    let be = &seen[1];
+    assert_eq!(be.method, "GET");
+    assert_eq!(
+        be.path, "/api/profile",
+        "backend.mode: path must survive tunnel byte-exact"
+    );
+    assert_eq!(be.query, "", "backend.mode: no query string expected");
+    assert_eq!(
+        hdr(be, "Host"),
+        backend_host_only,
+        "backend.mode: Host must be rewritten to backend URL's host \
+         (`{}`), not the public hostname. \
+         Pre-fix the inbound `backend.test` reached the backend \
+         unchanged — the exact bug from issue #61.",
+        backend_host_only
+    );
+    assert_eq!(
+        hdr(be, "X-Forwarded-Host"),
+        "",
+        "backend.mode: X-Forwarded-Host must NOT be set"
+    );
+
+    // ---- Custom: Host == site.host_custom, X-Forwarded-Host == public ----
+    let cu = &seen[2];
+    assert_eq!(cu.method, "GET");
+    assert_eq!(
+        cu.path, "/dashboard",
+        "custom.mode: path must survive tunnel byte-exact"
+    );
+    assert_eq!(
+        hdr(cu, "Host"),
+        custom_host,
+        "custom.mode: Host must be rewritten to site.host_custom \
+         (`{custom_host}`). Pre-fix the inbound `custom.test` \
+         reached the backend unchanged."
+    );
+    assert_eq!(
+        hdr(cu, "X-Forwarded-Host"),
+        "custom.test",
+        "custom.mode: X-Forwarded-Host must carry the original client host \
+         so backends can log the public hostname for SNI / audit / etc."
     );
 }
 
