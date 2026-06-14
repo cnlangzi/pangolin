@@ -580,6 +580,12 @@ fn query_param_opt(body: &[u8], key: &str) -> Option<String> {
 /// decoding, so URL-encoded path params otherwise mismatch the DB.
 /// Decoding is per-segment to avoid treating `/` as decodable.
 fn percent_decode_path(path: &str) -> String {
+    // Fast path: the common case (login page, list pages, static
+    // assets) has no percent escapes, so skip the alloc + per-segment
+    // decode work entirely.
+    if !path.contains('%') {
+        return path.to_string();
+    }
     let mut out = String::with_capacity(path.len());
     for (i, segment) in path.split('/').enumerate() {
         if i > 0 {

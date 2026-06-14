@@ -159,9 +159,6 @@ pub async fn handle_update(
     let Some(domain_pk) = domain else {
         return Ok(crate::not_found());
     };
-    if domain_pk.is_empty() {
-        return Ok(crate::not_found());
-    }
     let params = parse_form(body);
 
     // Look up the existing row — 404 if absent. The PK is immutable;

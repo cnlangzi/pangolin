@@ -26,7 +26,7 @@ impl<'a> DomainsListTemplate<'a> {
     /// characters must be percent-encoded for the Edit link
     /// (`/domains/{domain}/edit`).
     pub fn domain_encoded(&self, domain: &str) -> String {
-        urlencoding::encode(domain).into_owned()
+        crate::templates::domains::domain_encoded(domain)
     }
 }
 
@@ -203,6 +203,20 @@ impl SiteDomainsTemplate {
 }
 
 // ─── Table view (HTMX partial) ────────────────────────────────────────────────
+//
+// `views/domains/_table.html` is only `{% include %}`-d by
+// `pages/domains/list.html`, so askama resolves `self.*` against the
+// `DomainsListTemplate` parent. The struct only exists to register the
+// template path with askama; the `domain_encoded` helper is provided by
+// `DomainsListTemplate`.
+
+/// Shared URL-encoder for `domain` names. Wildcard domains
+/// (`*.example.com`) and any other name with URL-reserved characters
+/// must be percent-encoded for the Edit link
+/// (`/domains/{domain}/edit`).
+fn domain_encoded(domain: &str) -> String {
+    urlencoding::encode(domain).into_owned()
+}
 
 #[derive(Template)]
 #[template(path = "views/domains/_table.html")]
@@ -213,11 +227,8 @@ pub struct DomainsTableView<'a> {
 
 impl<'a> DomainsTableView<'a> {
     /// URL-encoded `domain.domain` for use inside `href="..."` attributes.
-    /// Wildcard domains (`*.example.com`) and any other name with URL-
-    /// reserved characters must be percent-encoded for the Edit link
-    /// (`/domains/{domain}/edit`).
     pub fn domain_encoded(&self, domain: &str) -> String {
-        urlencoding::encode(domain).into_owned()
+        crate::templates::domains::domain_encoded(domain)
     }
 }
 
