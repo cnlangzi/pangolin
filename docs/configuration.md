@@ -139,9 +139,8 @@ Two certificate modes coexist at runtime:
 | `email`                      | `string` | `""`                                                 | yes if any domain has `auto_issue = true` | ACME registration contact. |
 | `cert_dir`                   | `string` | `./certs`                                            | no       | Where `CertManager` reads autocert DirCache blobs from: `{host}` (ECDSA) or `{host}+rsa` (RSA). **No `default` blob fallback in v2** — each host you serve TLS for needs its own blob. |
 | `acme_directory`             | `string` | `https://acme-v02.api.letsencrypt.org/directory`    | no       | Point to LE staging for testing. |
-| `renew_threshold_days`       | `u32`    | `30`                                                 | no       | Renew when remaining validity ≤ this. |
+| `renew_threshold_days`       | `u32`    | `14`                                                 | no       | Renew when remaining validity ≤ this. |
 | `renew_check_interval_hours` | `u32`    | `6`                                                  | no       | Background renew check cadence. |
-| `renew_max_retries`          | `u32`    | `3`                                                  | no       | Per-renewal retry budget before giving up until next check. |
 | `key_type`                   | `string` | `ecdsa`                                              | no       | `ecdsa` (P-256) or `rsa`. ECDSA is faster and smaller; choose `rsa` only for legacy clients. |
 
 > **HTTP-01 vs DNS-01** is **per-domain** in v2: each domain's
@@ -298,9 +297,8 @@ acme:
   email: "ops@example.com"
   cert_dir: /etc/pangolin/certs
   acme_directory: https://acme-v02.api.letsencrypt.org/directory
-  renew_threshold_days: 30
+  renew_threshold_days: 14
   renew_check_interval_hours: 6
-  renew_max_retries: 3
   key_type: ecdsa
   # v2: per-domain `auto_issue` is set in the DB for each domain this
   # gateway serves. In production, enable auto_issue for the public
