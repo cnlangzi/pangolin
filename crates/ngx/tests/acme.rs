@@ -165,7 +165,7 @@ async fn build_ecdsa_http01_client(
         ngx::acme::AcmeClient::with_http_client(
             Box::new(AcmeHttpClient(http_client)),
             cert_dir,
-            TEST_EMAIL.to_string(),
+            Some(TEST_EMAIL.to_string()),
             ACME_DIR,
             7,
             24,
@@ -187,7 +187,7 @@ async fn build_rsa_http01_client(
         ngx::acme::AcmeClient::with_http_client(
             Box::new(AcmeHttpClient(http_client)),
             cert_dir,
-            TEST_EMAIL.to_string(),
+            Some(TEST_EMAIL.to_string()),
             ACME_DIR,
             7,
             24,
@@ -415,7 +415,7 @@ async fn acme_account_persistence_across_restart() {
         let client = ngx::acme::AcmeClient::with_http_client(
             Box::new(AcmeHttpClient(http_client)),
             cert_dir_path.clone(),
-            TEST_EMAIL.to_string(),
+            Some(TEST_EMAIL.to_string()),
             ACME_DIR,
             7,
             24,
@@ -452,7 +452,7 @@ async fn cert_manager_resolve_blob_ecdsa() {
 
     let cm = ngx::CertManager::new(
         cert_dir_path.clone(),
-        TEST_EMAIL.to_string(),
+        Some(TEST_EMAIL.to_string()),
         ACME_DIR.to_string(),
         7,
         24,
@@ -477,7 +477,7 @@ async fn cert_manager_resolve_blob_falls_back_to_rsa() {
 
     let cm = ngx::CertManager::new(
         cert_dir_path.clone(),
-        TEST_EMAIL.to_string(),
+        Some(TEST_EMAIL.to_string()),
         ACME_DIR.to_string(),
         7,
         24,
@@ -501,7 +501,7 @@ async fn cert_manager_resolve_blob_prefers_ecdsa_over_rsa() {
 
     let cm = ngx::CertManager::new(
         cert_dir_path.clone(),
-        TEST_EMAIL.to_string(),
+        Some(TEST_EMAIL.to_string()),
         ACME_DIR.to_string(),
         7,
         24,
@@ -531,7 +531,7 @@ async fn cert_manager_no_default_fallback_in_v2() {
 
     let cm = ngx::CertManager::new(
         cert_dir_path.clone(),
-        TEST_EMAIL.to_string(),
+        Some(TEST_EMAIL.to_string()),
         ACME_DIR.to_string(),
         7,
         24,

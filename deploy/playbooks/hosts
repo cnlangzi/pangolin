@@ -1,5 +1,7 @@
 [ngx]
-xiajie ansible_host=xiajie ansible_user=dayi ansible_ssh_private_key_file=~/.ssh/id_rsa
+#ny-us ansible_host=ny-us ansible_user=yaitoo ansible_ssh_private_key_file=~/.ssh/id_rsa
+sh-ali ansible_host=sh-ali ansible_user=ecs-user ansible_ssh_private_key_file=~/.ssh/id_rsa
+
 
 [ngx:vars]
 ansible_python_interpreter=auto_silent
@@ -12,7 +14,7 @@ ngx_acme=false
 ngx_acme_email=
 
 # tun defaults
-tun_server=localhost:8080
+tun_server=0.0.0.0:9001
 tun_token=
 tun_name=default
 tun_log_level=info

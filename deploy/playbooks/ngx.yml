@@ -34,7 +34,7 @@
     ngx_admin_username: "{{ lookup('env', 'NGX_ADMIN__USERNAME') | default('admin', true) }}"
     ngx_admin_password: "{{ lookup('env', 'NGX_ADMIN__PASSWORD') | default('admin', true) }}"
     ngx_acme_email: "{{ lookup('env', 'NGX_ACME__EMAIL') | default('', true) }}"
-    ngx_acme_cert_dir: "{{ lookup('env', 'NGX_ACME__CERT_DIR') | default('/opt/pangolin/certs', true) }}"
+    ngx_acme_cert_dir: "{{ lookup('env', 'NGX_ACME__CERT_DIR') | default('/usr/local/pangolin/certs', true) }}"
     ngx_acme_directory: "{{ lookup('env', 'NGX_ACME__ACME_DIRECTORY') | default('https://acme-v02.api.letsencrypt.org/directory', true) }}"
     ngx_acme_renew_threshold_days: "{{ lookup('env', 'NGX_ACME__RENEW_THRESHOLD_DAYS') | default('30', true) }}"
     ngx_acme_renew_check_interval_hours: "{{ lookup('env', 'NGX_ACME__RENEW_CHECK_INTERVAL_HOURS') | default('6', true) }}"

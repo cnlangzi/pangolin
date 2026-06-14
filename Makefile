@@ -29,10 +29,12 @@ ENV_FILE := .env
 ifeq ($(wildcard $(ENV_FILE)),)
 ENV_LOAD :=
 else
-# `./$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves it as a
-# path instead of searching `$PATH` — otherwise `/bin/sh: .env: No such
-# file or directory` even when the file is right there.
-ENV_LOAD := set -a; . ./$(ENV_FILE); set +a;
+# `$(CURDIR)/$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves
+# it as a path instead of searching `$PATH` — otherwise
+# `/bin/sh: .env: No such file or directory` even when the file is right
+# there. `$(CURDIR)` (not `./`) so the source still works after a
+# recipe's `cd ./deploy/playbooks` (or any other cwd change).
+ENV_LOAD := set -a; . $(CURDIR)/$(ENV_FILE); set +a;
 include $(ENV_FILE)
 export
 endif
@@ -257,11 +259,22 @@ play: play-ngx play-tun
 # `{{ ngx_admin_password }}` template substitutions without touching
 # `deploy/playbooks/hosts`. `ANSIBLE_LOAD_CALLBACK_PLUGINS=1` is not
 # needed — plain env vars are auto-injected by Ansible since 2.x.
+#
+# Each recipe sources `.env` from the project root (`$(CURDIR)`) and
+# only then `cd`s into `deploy/playbooks` — a bare `cd … && . ./.env`
+# would fail because `./.env` is relative to the new cwd, not the
+# project root.
+#
+# Subshell `( … )` keeps `set -a` / `set +a` scoped to the env-load
+# step — important because `set -a` would otherwise mark every
+# subsequently-defined variable in the ansible-playbook process as
+# auto-exported too. The final `&&` chain runs ansible-playbook
+# *after* the subshell exits and we've `cd`'d into the playbooks dir.
 play-ngx: require-env
-	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./ngx.yml -i hosts
+	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts
 
 play-tun: require-env
-	cd ./deploy/playbooks && $(ENV_LOAD) ansible-playbook ./tun.yml -i hosts
+	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
 
 # ── Local Run (no sudo) ───────────────────────────────────────────────────────
 # Run the locally-built binary directly. Foreground — Ctrl-C to stop.

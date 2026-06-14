@@ -10,24 +10,49 @@
 #   export-stage     → export binaries
 # ────────────────────────────────────────────────────────────────────────────
 
-# ── Stage A: install cargo-chef + download UI build tools ─────────────────
+# ── Stage A: download UI build CLIs first + install cargo-chef ────────────
+#
+# Why this ordering:
+#
+#  1. The two CLI tools (tailwindcss, esbuild) are downloaded as separate
+#     RUN steps so each one has its own Docker cache layer.  Bumping the
+#     tailwindcss version invalidates ONLY its layer — the esbuild layer
+#     (and everything below it) survives the bump.
+#
+#  2. Both CLI layers come BEFORE the cargo + cargo-config layers so that
+#     the very frequent edits to build/docker/cargo-config.toml (e.g.
+#     switching registry mirrors) don't invalidate the CLI download cache.
+#     CLIs are essentially immutable across builds — bumping them is a
+#     deliberate, rare action, so they're the perfect candidates for the
+#     outermost cache layers.
+#
+#  3. WORKDIR is moved to a dedicated layer right before cargo install so
+#     that the cargo step has a deterministic working directory without
+#     having to recreate it inside the RUN command.
 FROM pangolin-debian AS pangolin-chef
 
+WORKDIR /pangolin
+
+# Layer 1 — tailwindcss CLI.  Cache survives until the version/URL changes.
+RUN mkdir -p bin && \
+    curl -fsSL -o bin/tailwindcss \
+        https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
+    chmod +x bin/tailwindcss
+
+# Layer 2 — esbuild CLI.  Independent cache from layer 1.
+RUN curl -fsSL -o bin/esbuild \
+        https://cdn.jsdelivr.net/npm/@esbuild/linux-x64@0.28.0/bin/esbuild && \
+    chmod +x bin/esbuild
+
+# Layer 3 — cargo-chef (installed binary, versioned so cache survives).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo install cargo-chef --locked --version 0.1.71
 
+# Layer 4 — cargo config.  Most frequently edited layer (registry
+# mirrors, build flags, etc.); placing it last in this stage means
+# changes here invalidate only cargo's behavior, not the CLI layers.
 COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
-
-WORKDIR /pangolin
-
-RUN mkdir -p bin && \
-    curl -fsSL -o bin/tailwindcss \
-        https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
-    chmod +x bin/tailwindcss && \
-    curl -fsSL -o bin/esbuild \
-        https://cdn.jsdelivr.net/npm/@esbuild/linux-x64@0.28.0/bin/esbuild && \
-    chmod +x bin/esbuild
 
 # ── Stage B: produce recipe.json ───────────────────────────────────────────
 FROM pangolin-chef AS planner
