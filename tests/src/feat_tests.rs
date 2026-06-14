@@ -19,7 +19,7 @@ use pangolin_core::{App, CertManager, EventType};
 fn make_cert_manager() -> CertManager {
     CertManager::new(
         std::path::PathBuf::from("/tmp/test-certs"),
-        "test@example.com".into(),
+        Some("test@example.com".to_string()),
         "https://acme.example.com/directory".into(),
         30,
         6,

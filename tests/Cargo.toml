@@ -1,8 +1,8 @@
 [package]
 name = "pangolin-integration-tests"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.96"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "pangolin_integration_tests"

@@ -8,14 +8,14 @@
     name: pangolin
     system: yes
     shell: /usr/sbin/nologin
-    home: /opt/pangolin
+    home: /usr/local/pangolin
     create_home: no
     comment: "Pangolin Gateway Service User"
 
 - name: Create workdir
   become: true
   file:
-    path: /opt/pangolin
+    path: /usr/local/pangolin
     state: directory
     owner: pangolin
     group: pangolin
@@ -24,7 +24,7 @@
 - name: Create data directory
   become: true
   file:
-    path: /opt/pangolin/data
+    path: /usr/local/pangolin/data
     state: directory
     owner: pangolin
     group: pangolin
@@ -33,7 +33,7 @@
 - name: Create certs directory
   become: true
   file:
-    path: /opt/pangolin/certs
+    path: /usr/local/pangolin/certs
     state: directory
     owner: pangolin
     group: pangolin
@@ -43,7 +43,7 @@
   become: true
   copy:
     src: "{{ playbook_dir }}/../../build/output/pangolin-ngx"
-    dest: /opt/pangolin/ngx
+    dest: /usr/local/pangolin/pangolin-ngx
     owner: pangolin
     group: pangolin
     mode: 0755
@@ -54,7 +54,7 @@
   become: true
   template:
     src: ngx.yml.j2
-    dest: /opt/pangolin/ngx.yml
+    dest: /usr/local/pangolin/ngx.yml
     owner: pangolin
     group: pangolin
     mode: 0644

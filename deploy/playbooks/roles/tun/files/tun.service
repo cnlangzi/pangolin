@@ -6,11 +6,11 @@ After=network.target
 Type=simple
 User=pangolin
 Group=pangolin
-WorkingDirectory=/opt/pangolin
-# tun reads its config from /opt/pangolin/tun.yml (a single YAML file
+WorkingDirectory=/usr/local/pangolin
+# tun reads its config from /usr/local/pangolin/tun.yml (a single YAML file
 # managed by Ansible — see roles/tun/templates/tun.yml.j2). Override
 # the path with `--config` if needed.
-ExecStart=/opt/pangolin/tun --config /opt/pangolin/tun.yml
+ExecStart=/usr/local/pangolin/pangolin-tun --config /usr/local/pangolin/tun.yml
 ExecReload=/bin/kill -SIGUSR2 $MAINPID
 Restart=on-failure
 RestartSec=5s
