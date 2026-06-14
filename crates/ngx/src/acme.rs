@@ -2061,7 +2061,7 @@ mod tests {
     fn parse_http01_path_rejects_null_bytes() {
         // NUL can truncate a path in C-backed syscalls. ACME tokens
         // never carry NUL; refuse the input rather than truncating.
-        let nul = format!("/.well-known/acme-challenge/abc\0def");
+        let nul = "/.well-known/acme-challenge/abc\0def".to_string();
         assert!(parse_http01_path(&nul).is_none());
     }
 
