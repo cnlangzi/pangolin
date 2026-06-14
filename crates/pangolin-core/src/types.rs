@@ -470,7 +470,8 @@ impl CertErrorClass {
 /// multiple chances to recover from a transient outage before the
 /// cert actually expires.
 pub const ACME_BACKOFF_SCHEDULE_SECS: &[u64] = &[
-    60, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 21600, // 1m, 1m, 2m, 5m, 10m, 30m, 1h, 2h, 4h, 6h
+    60, 60, 120, 300, 600, 1800, 3600, 7200, 14400,
+    21600, // 1m, 1m, 2m, 5m, 10m, 30m, 1h, 2h, 4h, 6h
     21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h
     21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h
     21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h

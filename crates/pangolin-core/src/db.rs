@@ -505,9 +505,7 @@ pub fn set_cert_order_url(
 ///
 /// `None` means "no rows are due; the loop can sleep the full
 /// `idle_sleep` (default 6h) before re-checking".
-pub fn earliest_pending_retry(
-    conn: &Connection,
-) -> rusqlite::Result<Option<DateTime<Utc>>> {
+pub fn earliest_pending_retry(conn: &Connection) -> rusqlite::Result<Option<DateTime<Utc>>> {
     let mut stmt = conn.prepare(
         "SELECT MIN(next_retry_at)
          FROM certs

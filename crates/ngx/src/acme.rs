@@ -25,11 +25,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::TimeZone as _;
 use chrono::{DateTime, Utc};
 use instant_acme::{
     Account, AccountCredentials, Challenge, ChallengeType, Identifier, NewOrder, OrderStatus,
 };
-use chrono::TimeZone as _;
 use tokio::time::sleep;
 
 use crate::dns::{wait_for_txt_propagation, DnsProvider};
@@ -220,10 +220,8 @@ fn format_challenge_error(id: &str, ch: &Challenge) -> Option<String> {
 /// string-matching the rendered error.
 fn extract_problem(err: &anyhow::Error) -> Option<&instant_acme::Problem> {
     for cause in err.chain() {
-        if let Some(acme_err) = cause.downcast_ref::<instant_acme::Error>() {
-            if let instant_acme::Error::Api(p) = acme_err {
-                return Some(p);
-            }
+        if let Some(instant_acme::Error::Api(p)) = cause.downcast_ref::<instant_acme::Error>() {
+            return Some(p);
         }
     }
     None
@@ -294,18 +292,15 @@ pub fn classify_acme_error(
     }
 
     // ── 2. transport-level errors (no Problem attached)
-    if let Some(transport) = extract_transport_error(err) {
-        match transport {
-            instant_acme::Error::Timeout(_) | instant_acme::Error::Hyper(_) => {
-                let backoff = pangolin_core::next_backoff(0);
-                return (
-                    pangolin_core::CertErrorClass::Transient,
-                    last_error,
-                    now + backoff,
-                );
-            }
-            _ => {}
-        }
+    if let Some(instant_acme::Error::Timeout(_) | instant_acme::Error::Hyper(_)) =
+        extract_transport_error(err)
+    {
+        let backoff = pangolin_core::next_backoff(0);
+        return (
+            pangolin_core::CertErrorClass::Transient,
+            last_error,
+            now + backoff,
+        );
     }
 
     // ── 3. string fallback — covers older rows whose `last_error`
@@ -384,10 +379,7 @@ fn parse_retry_after_hint(
     }
 
     // Try relative: "retry after 1234 seconds" or "retry after 30m".
-    let num: String = tail
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
     if let Ok(n) = num.parse::<u64>() {
         // Heuristic: "1234 seconds" → seconds, "30m" → minutes, "2h" → hours.
         let unit_hint = tail[num.len()..].trim_start().to_lowercase();
@@ -2512,11 +2504,7 @@ use pangolin_core::{App, Domain};
 /// Execute a lifecycle hook command (pre_renew, post_renew, deploy).
 /// Returns Ok(()) if the hook is None or exits with status 0.
 /// Returns Err if the hook exits non-zero or fails to execute.
-async fn run_hook(
-    cmd: Option<&str>,
-    domain: &str,
-    cert_file: Option<&str>,
-) -> anyhow::Result<()> {
+async fn run_hook(cmd: Option<&str>, domain: &str, cert_file: Option<&str>) -> anyhow::Result<()> {
     let Some(cmd) = cmd else {
         return Ok(());
     };
@@ -2691,9 +2679,7 @@ impl AcmeState {
             //     automatically instead of forever sitting there.
             let existing = {
                 let conn = app.db.lock().await;
-                pangolin_core::db::get_cert(&conn, &d.domain)
-                    .ok()
-                    .flatten()
+                pangolin_core::db::get_cert(&conn, &d.domain).ok().flatten()
             };
             if let Some(ref c) = existing {
                 // Terminal — never auto-retry, regardless of
@@ -2872,13 +2858,7 @@ impl AcmeState {
 
         // Run pre_renew hook before starting ACME issuance. If the hook
         // exits non-zero, abort and mark the cert as Failed.
-        if let Err(e) = run_hook(
-            app.config.acme.pre_renew.as_deref(),
-            &domain.domain,
-            None,
-        )
-        .await
-        {
+        if let Err(e) = run_hook(app.config.acme.pre_renew.as_deref(), &domain.domain, None).await {
             trace("pre_renew", format!("hook failed: {}", e));
             let now = chrono::Utc::now();
             let class = pangolin_core::CertErrorClass::Transient;
@@ -3078,9 +3058,7 @@ impl AcmeState {
                     pangolin_core::CertErrorClass::Permanent => {
                         pangolin_core::CertStatus::Permanent
                     }
-                    pangolin_core::CertErrorClass::Transient => {
-                        pangolin_core::CertStatus::Failed
-                    }
+                    pangolin_core::CertErrorClass::Transient => pangolin_core::CertStatus::Failed,
                 };
                 trace(
                     "failed",
