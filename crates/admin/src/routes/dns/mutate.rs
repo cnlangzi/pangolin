@@ -11,7 +11,7 @@ use http_body_util::Full;
 
 use pangolin_core::DnsProviderKind;
 
-use crate::{redirect_response, App};
+use crate::{App, redirect_response};
 
 use super::helpers::{is_valid_dns_name, parse_form};
 use super::pages::build_new_form;

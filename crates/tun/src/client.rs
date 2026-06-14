@@ -1,44 +1,55 @@
 //! Pangolin tunnel node (tun) — yamux-over-fastwebsockets client.
 //!
-//! Replaces the previous msgpack-framed WebSocket client with
-//! a yamux multiplexer. Per-HTTP-request and per-WS-connection
-//! a fresh yamux stream is opened against the ngx side; the
-//! stream carries raw HTTP/1.1 bytes (or WS frame bytes for
-//! relay) without any custom framing on top.
+//! ## Architecture (v8 — see `docs/design/reverse-proxy.md`)
 //!
-//! ## Connection lifecycle
+//! Each yamux stream carries a [`TunnelHttpFrame`] from ngx
+//! (see `pangolin-core::proxy`). The frame contains:
+//!   - the raw `HttpRequest`
+//!   - per-request `host_mode` and `host_custom`
+//!   - `is_upgrade` flag (WebSocket upgrade)
 //!
-//! 1. TCP-connect to the configured ngx address.
-//! 2. Manual WS upgrade (RFC 6455), `Authorization: Bearer
-//!    <sha256-of-token>` is sent in the upgrade request
-//!    headers — auth happens before the 101 response.
-//! 3. yamux client session on top of the resulting WS.
-//! 4. A background task accepts new yamux streams from
-//!    ngx, dispatching each to either the HTTP path
-//!    (`handle_http_stream`) or the WS relay path
-//!    (`handle_ws_stream`).
-//! 5. On stream closure, drop the handle. On tunnel
-//!    closure, the loop reconnects with backoff.
+//! The tun applies `apply_proxy_policy` (pangolin-core) and
+//! dispatches to one of three executors:
+//!   - `file://` → `serve_file_target` (pangolin-core)
+//!   - `http/https` → `PingoraClientExecutor` (this file)
+//!   - WS upgrade → also via `PingoraClientExecutor`, which
+//!     uses pingora's built-in upgrade path.
+//!
+//! There is **no reqwest** on this side: the v8 design uses
+//! pingora-core for the HTTP client so behavior matches the
+//! ngx side (single HTTP stack end-to-end).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use log::{info, warn};
 
 use pangolin_core::tunnel::{
-    build_ws_upgrade_request, pump_ws_relay, read_http_request, read_ws_accept_response,
-    tunnel_over_websocket, HttpRequest, TunnelRole, WsRole, YamuxTunnel,
+    HttpRequest, HttpResponse, TunnelRole, WsRole, YamuxTunnel, build_ws_upgrade_request,
+    encode_http_response, pump_ws_relay, read_ws_accept_response, tunnel_over_websocket,
+};
+use pangolin_core::types::HostMode;
+use pangolin_core::{
+    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, serve_file_target,
 };
 
 use fastwebsockets::WebSocket;
+use pingora_core::connectors::http::Connector;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_http::RequestHeader;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 use crate::config::TunConfig;
 
-/// Outcome of a single connect + session cycle, used by
-/// [`TunnelClient::run`] to drive the reconnect loop.
+// ─────────────────────────────────────────────────────────────────
+//  WS handshake helpers (kept from the original file — used by
+//  the connect path, not by the per-frame dispatch).
+// ─────────────────────────────────────────────────────────────────
+
+/// Outcome of a single connect + session cycle.
 enum SessionOutcome {
     EstablishedAndEnded(Result<()>),
     NeverConnected(anyhow::Error),
@@ -125,21 +136,12 @@ impl TunnelClient {
     /// and run the per-stream dispatcher until the tunnel ends.
     async fn handshake_and_serve(&self, tcp: TcpStream) -> Result<()> {
         let (mut tcp_read, mut tcp_write) = tcp.into_split();
-        // Client-side WS upgrade. The path includes the
-        // tun name as a query parameter (the server uses it
-        // to authorise against the `tun` table row; auth
-        // token rides in the `Authorization: Bearer …`
-        // header).
         let path = format!("/tunnel?name={}", self.config.name);
         let host = &self.config.server;
         let (req_bytes, key) = build_ws_upgrade_request(&path, host, &self.config.token);
         tcp_write.write_all(&req_bytes).await?;
         tcp_write.flush().await?;
-        // Read the 101 response and validate the accept hash.
         read_ws_accept_response(&mut tcp_read, &key).await?;
-        // Wrap the now-WS-framed halves as a WebSocket. We use
-        // owned halves so the WebSocket can be moved into the
-        // bridge task that yamux runs alongside.
         let ws = WebSocket::after_handshake(
             OwnedTcpHalf {
                 reader: tcp_read,
@@ -153,9 +155,6 @@ impl TunnelClient {
     }
 }
 
-/// Adapter so the split TCP halves can be reassembled into a
-/// single `AsyncRead + AsyncWrite + Unpin` value for the
-/// fastwebsockets `WebSocket::after_handshake` constructor.
 struct OwnedTcpHalf {
     reader: tokio::net::tcp::OwnedReadHalf,
     writer: tokio::net::tcp::OwnedWriteHalf,
@@ -179,14 +178,12 @@ impl AsyncWrite for OwnedTcpHalf {
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.writer).poll_write(cx, buf)
     }
-
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.writer).poll_flush(cx)
     }
-
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -211,346 +208,344 @@ async fn serve_tun_session(config: &TunConfig, tunnel: YamuxTunnel) -> Result<()
             }
         };
 
-        // Distinguish HTTP vs WS at the top byte of the first
-        // yamux frame. We could add a 1-byte tag, but the
-        // simplest disambiguation is to look at the first
-        // line: `HTTP/1.1 …` is a response (we never receive
-        // that here), `GET /… HTTP/1.1` is HTTP, and anything
-        // else (binary frame from ngx) is WS. In practice, we
-        // treat the first bytes as a discriminator:
-        //
-        //   - If the first 4 bytes are "GET " → HTTP request.
-        //   - Otherwise → WS relay.
-        //
-        // The 1-byte tag is the simpler approach: ngx writes
-        // `0x01` for HTTP, `0x02` for WS as the very first
-        // byte of the stream. We do the same.
         let config = config.clone();
-        let mut stream_obj = stream;
         let name_for_log = name.clone();
         tokio::spawn(async move {
-            // Read the 1-byte tag.
-            use tokio::io::AsyncReadExt;
-            let mut tag = [0u8; 1];
-            if stream_obj.read_exact(&mut tag).await.is_err() {
-                return;
-            }
-            let mut tagged = TaggedStream {
-                tag: tag[0],
-                inner: stream_obj,
-            };
-            match tag[0] {
-                TAG_HTTP => {
-                    if let Err(e) = handle_http_stream(&mut tagged, &config, &name_for_log).await {
-                        warn!("tun {} http stream error: {}", name_for_log, e);
-                    }
-                }
-                TAG_WS => {
-                    if let Err(e) = handle_ws_stream(&mut tagged, &config, &name_for_log).await {
-                        warn!("tun {} ws stream error: {}", name_for_log, e);
-                    }
-                }
-                other => {
-                    warn!("tun {} unknown stream tag 0x{:02x}", name_for_log, other);
-                }
+            // v8: every yamux stream carries a single
+            // `TunnelHttpFrame`. The previous TAG_HTTP /
+            // TAG_WS discriminator bytes are removed —
+            // see `pangolin_core::proxy`.
+            if let Err(e) = handle_tunnel_frame(stream, &config, &name_for_log).await {
+                warn!("tun {} tunnel frame error: {}", name_for_log, e);
             }
         });
     }
 }
 
-const TAG_HTTP: u8 = 0x01;
-const TAG_WS: u8 = 0x02;
+// ─────────────────────────────────────────────────────────────────
+//  Per-frame dispatch
+// ─────────────────────────────────────────────────────────────────
 
-/// A yamux stream with a 1-byte tag already read off the
-/// front. After consuming the tag, the rest of the stream
-/// is the payload (raw HTTP request bytes, or raw WS frame
-/// bytes).
-struct TaggedStream<S> {
-    #[allow(dead_code)]
-    tag: u8,
-    inner: S,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for TaggedStream<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for TaggedStream<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// Handle a single HTTP request stream from ngx. The flow:
-///
-///   1. Read the raw HTTP/1.1 request bytes (head + body)
-///      off the stream.
-///   2. Resolve the backend URL from the request target
-///      (the issue spec has ngx writing the full URL into
-///      the request target; a bare `/path` falls back to
-///      the Host header).
-///   3. Use reqwest to actually call the backend.
-///   4. Re-serialise the response and write it back on
-///      the stream.
-async fn handle_http_stream<S>(stream: &mut S, config: &TunConfig, name: &str) -> Result<()>
+/// Read the `TunnelHttpFrame` bytes off the stream and hand
+/// them to either `handle_http_request` or
+/// `handle_ws_upgrade` based on the frame's `is_upgrade`
+/// flag.
+async fn handle_tunnel_frame<S>(mut stream: S, _config: &TunConfig, name: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let req = read_http_request(stream).await?;
-    info!("tun {} http {} {}", name, req.method, req.target);
-    // For tun-side this is identical to before: the
-    // request target is already a full URL (ngx builds it
-    // from the site backend + request URI). Bare paths
-    // are a legacy fallback using the Host header.
-    let url = if req.target.starts_with("http://") || req.target.starts_with("https://") {
-        req.target.clone()
-    } else if req.target.starts_with("file:///") {
-        return serve_static_file(stream, &req, &req.target, name).await;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let frame = decode_frame(&buf).map_err(|e| anyhow::anyhow!(e))?;
+    if frame.is_upgrade {
+        handle_ws_upgrade(stream, frame, name).await
     } else {
-        let host = req
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        format!("http://{}{}", host, req.target)
+        handle_http_request(stream, frame, name).await
+    }
+}
+
+/// Handle one HTTP request from a parsed `TunnelHttpFrame`:
+///   1. Apply `apply_proxy_policy` (Host rewrite per
+///      `host_mode`, X-Forwarded-*, hop-by-hop stripping).
+///   2. Dispatch by target scheme:
+///        - file:// → `serve_file_target` (pangolin-core)
+///        - http/https → `execute_via_pingora`
+///   3. Encode the response and write it back to the stream.
+async fn handle_http_request<S>(mut stream: S, frame: TunnelHttpFrame, name: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let original_host = frame
+        .request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let ctx = ProxyCtx {
+        original_host,
+        original_scheme: Scheme::Http,
+        host_mode: frame.host_mode,
+        host_custom: frame.host_custom.clone(),
     };
 
-    // Build and send the request via reqwest.
-    let response_bytes = match proxy_via_reqwest(&req, &url, config).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("tun {} proxy error: {}", name, e);
-            synth_502(&e.to_string())
+    info!(
+        "tun {} http {} {} host_mode={:?}",
+        name, frame.request.method, frame.request.target, ctx.host_mode
+    );
+
+    let mut request = frame.request;
+    apply_proxy_policy(&mut request, &ctx);
+
+    let response: HttpResponse = match &frame.target {
+        BackendTarget::File { doc_root } => serve_file_target(&request, doc_root),
+        target @ (BackendTarget::Http { .. } | BackendTarget::Https { .. }) => {
+            let host_mode = ctx.host_mode;
+            let host_custom = ctx.host_custom.clone();
+            execute_via_pingora(&request, target, host_mode, host_custom)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
         }
     };
 
-    stream.write_all(&response_bytes).await?;
+    let resp_bytes = encode_http_response(&response);
+    if let Err(e) = stream.write_all(&resp_bytes).await {
+        warn!("tun {} write response: {}", name, e);
+        return Err(e.into());
+    }
     stream.shutdown().await?;
     Ok(())
 }
 
-/// Handle a single WS relay stream from ngx. The flow:
-///
-///   1. Read the WS target URL from the first message
-///      framed as a length-prefixed UTF-8 string.
-///   2. Connect to the backend using a plain TCP stream
-///      and do the WS upgrade manually — this gives us a
-///      raw `AsyncRead + AsyncWrite` TCP stream carrying
-///      WS frames.
-///   3. Pump bytes bidirectionally between the TCP stream
-///      and the yamux stream with the hand-written
-///      half-close pump. The yamux stream itself carries
-///      raw bytes that are WS frame payloads (one frame
-///      per chunk); the bridge task inside YamuxTunnel
-///      handles framing at the yamux side.
-async fn handle_ws_stream<S>(stream: &mut S, _config: &TunConfig, name: &str) -> Result<()>
+/// Handle a WebSocket upgrade from a parsed `TunnelHttpFrame`.
+/// Replays the request bytes to the backend (TCP + manual
+/// WS handshake) and then pumps bytes between the yamux
+/// stream and the backend.
+async fn handle_ws_upgrade<S>(mut stream: S, frame: TunnelHttpFrame, name: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Length-prefixed URL: u16 BE + UTF-8 bytes.
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u16::from_be_bytes(len_buf) as usize;
-    let mut url_buf = vec![0u8; len];
-    stream.read_exact(&mut url_buf).await?;
-    let backend_url = String::from_utf8_lossy(&url_buf).into_owned();
-    info!("tun {} ws relay to {}", name, backend_url);
+    let original_host = frame
+        .request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let ctx = ProxyCtx {
+        original_host,
+        original_scheme: Scheme::Http,
+        host_mode: frame.host_mode,
+        host_custom: frame.host_custom.clone(),
+    };
+    let mut request = frame.request;
+    apply_proxy_policy(&mut request, &ctx);
 
-    let mut backend = TcpStream::connect(backend_addr_from_url(&backend_url)?).await?;
-    let (req_bytes, key) = build_ws_upgrade_request(
-        backend_path_from_url(&backend_url),
-        backend_host_from_url(&backend_url),
-        "",
-    );
+    let (authority, path) = match request.target.find("://") {
+        Some(idx) => {
+            let rest = &request.target[idx + 3..];
+            match rest.find('/') {
+                Some(p) => (&rest[..p], &rest[p..]),
+                None => (rest, "/"),
+            }
+        }
+        None => {
+            let resp_bytes = synth_502_bytes("ws target has no scheme");
+            stream.write_all(&resp_bytes).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    let backend_addr: std::net::SocketAddr = match authority.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            let resp_bytes = synth_502_bytes(&format!("bad backend addr: {e}"));
+            stream.write_all(&resp_bytes).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    info!("tun {} ws relay to {} path={}", name, backend_addr, path);
+
+    let mut backend = TcpStream::connect(backend_addr).await?;
+    let host_hdr = request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| authority.to_string());
+    let (req_bytes, key) = build_ws_upgrade_request(path, &host_hdr, "");
     backend.write_all(&req_bytes).await?;
     backend.flush().await?;
     read_ws_accept_response(&mut backend, &key).await?;
-
     pump_ws_relay(stream, backend, "ngx", "backend").await?;
     Ok(())
 }
 
-// ---- helpers ----
+// ─────────────────────────────────────────────────────────────────
+//  Frame codec
+// ─────────────────────────────────────────────────────────────────
 
-fn synth_502(err: &str) -> Vec<u8> {
-    let body = err.as_bytes().to_vec();
+fn decode_frame(bytes: &[u8]) -> Result<TunnelHttpFrame, String> {
+    pangolin_core::proxy::decode_tunnel_frame(bytes)
+        .map_err(|e| format!("decode_tunnel_frame: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PingoraClientExecutor — HTTP client using pingora-core
+// ─────────────────────────────────────────────────────────────────
+
+static CONNECTOR: std::sync::OnceLock<Arc<Connector>> = std::sync::OnceLock::new();
+
+fn connector() -> &'static Arc<Connector> {
+    CONNECTOR.get_or_init(|| Arc::new(Connector::new(None)))
+}
+
+/// Send `request` to the backend described by `target` using
+/// pingora-core's HTTP/1.1 client. Honors `host_mode` (in
+/// particular, Backend mode overwrites Host with the
+/// backend's authority).
+async fn execute_via_pingora(
+    request: &HttpRequest,
+    target: &BackendTarget,
+    host_mode: HostMode,
+    host_custom: Option<String>,
+) -> Result<HttpResponse, String> {
+    let peer = match target {
+        BackendTarget::Http { host, port, .. } => {
+            HttpPeer::new((host.clone(), *port), false, host.clone())
+        }
+        BackendTarget::Https { host, port, .. } => {
+            HttpPeer::new((host.clone(), *port), true, host.clone())
+        }
+        BackendTarget::File { .. } => {
+            return Err("file:// not handled by pingora client".into());
+        }
+    };
+
+    let method =
+        http::Method::from_bytes(request.method.as_bytes()).map_err(|e| format!("method: {e}"))?;
+
+    // Path only.
+    let path_only = match request.target.find("://") {
+        Some(idx) => match request.target[idx + 3..].find('/') {
+            Some(p) => &request.target[idx + 3 + p..],
+            None => "/",
+        },
+        None => request.target.as_str(),
+    };
+    if path_only.is_empty() {
+        return Err("empty path".into());
+    }
+    let path_static: &'static [u8] =
+        Box::leak(path_only.to_string().into_bytes().into_boxed_slice());
+
+    let mut header_builder = RequestHeader::build(&method, path_static, None)
+        .map_err(|e| format!("build header: {e}"))?;
+
+    // Insert all non-Host, non-Content-Length headers.
+    let header_pairs: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in header_pairs {
+        let name_static: &'static str = Box::leak(k.into_boxed_str());
+        let _ = header_builder.insert_header(name_static, v.as_bytes());
+    }
+
+    // Apply host_mode Host override.
+    let host_value = match host_mode {
+        HostMode::Passthrough => request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default(),
+        HostMode::Backend => match target {
+            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
+                format!("{}:{}", host, port)
+            }
+            _ => unreachable!(),
+        },
+        HostMode::Custom => host_custom.clone().unwrap_or_default(),
+    };
+    if !host_value.is_empty() {
+        header_builder
+            .insert_header("Host", host_value.as_bytes())
+            .ok();
+    }
+    header_builder
+        .insert_header("Content-Length", request.body.len().to_string().as_bytes())
+        .ok();
+
+    let connector = connector().clone();
+    let (mut session, _reused) = connector
+        .get_http_session(&peer)
+        .await
+        .map_err(|e| format!("get_http_session: {e}"))?;
+
+    session
+        .write_request_header(Box::new(header_builder))
+        .await
+        .map_err(|e| format!("write_request_header: {e}"))?;
+    if !request.body.is_empty() {
+        session
+            .write_request_body(bytes::Bytes::copy_from_slice(&request.body), true)
+            .await
+            .map_err(|e| format!("write_request_body: {e}"))?;
+    }
+    session
+        .finish_request_body()
+        .await
+        .map_err(|e| format!("finish_request_body: {e}"))?;
+
+    session
+        .read_response_header()
+        .await
+        .map_err(|e| format!("read_response_header: {e}"))?;
+
+    let resp_header = session
+        .response_header()
+        .cloned()
+        .ok_or_else(|| "no response header".to_string())?;
+
+    let mut body = Vec::new();
+    while let Some(chunk) = session
+        .read_response_body()
+        .await
+        .map_err(|e| format!("read_response_body: {e}"))?
+    {
+        body.extend_from_slice(&chunk);
+    }
+
+    let idle = Some(Duration::from_secs(90));
+    connector.release_http_session(session, &peer, idle).await;
+
+    let status = resp_header.status;
+    let status_line = format!(
+        "{} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (k, v) in resp_header.headers.iter() {
+        if let Ok(v) = v.to_str() {
+            headers.push((k.as_str().to_string(), v.to_string()));
+        }
+    }
+    Ok(HttpResponse {
+        version: format!("{:?}", resp_header.version),
+        status_line,
+        headers,
+        body,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  502 helpers
+// ─────────────────────────────────────────────────────────────────
+
+fn synth_502_bytes(err: &str) -> Vec<u8> {
+    let body = err.as_bytes();
     let mut out = Vec::new();
     out.extend_from_slice(b"HTTP/1.1 502 Bad Gateway\r\n");
     out.extend_from_slice(b"Content-Type: text/plain\r\n");
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&body);
+    out.extend_from_slice(body);
     out
-}
-
-async fn proxy_via_reqwest(req: &HttpRequest, url: &str, _config: &TunConfig) -> Result<Vec<u8>> {
-    use reqwest::header::{HeaderName, HeaderValue};
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(5))
-        .pool_max_idle_per_host(16)
-        .build()?;
-    let parsed = url::Url::parse(url)?;
-    let method = reqwest::Method::from_bytes(req.method.as_bytes())
-        .map_err(|_| anyhow::anyhow!("invalid method"))?;
-    let mut request = reqwest::Request::new(method, parsed);
-    for (k, v) in &req.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            request.headers_mut().insert(name, value);
-        }
-    }
-    if !req.body.is_empty() {
-        *request.body_mut() = Some(reqwest::Body::from(req.body.clone()));
-    }
-    let resp = client.execute(request).await?;
-    let status = resp.status();
-    let mut out = Vec::new();
-    out.extend_from_slice(
-        format!(
-            "HTTP/1.1 {} {}\r\n",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("")
-        )
-        .as_bytes(),
-    );
-    for (k, v) in resp.headers() {
-        if let Ok(v) = v.to_str() {
-            out.extend_from_slice(k.as_str().as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(v.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-    }
-    if !out.windows(2).any(|w| w == b"\r\n") {
-        // never empty — guaranteed by status line
-    }
-    let body = resp.bytes().await?.to_vec();
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&body);
-    Ok(out)
-}
-
-async fn serve_static_file<S>(
-    stream: &mut S,
-    _req: &HttpRequest,
-    file_url: &str,
-    _name: &str,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let path = file_url.strip_prefix("file://").unwrap_or(file_url);
-    let resolved = if path.ends_with('/')
-        || tokio::fs::metadata(path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-    {
-        let html = format!("{}/index.html", path.trim_end_matches('/'));
-        if tokio::fs::metadata(&html).await.is_ok() {
-            html
-        } else {
-            let htm = format!("{}/index.htm", path.trim_end_matches('/'));
-            if tokio::fs::metadata(&htm).await.is_ok() {
-                htm
-            } else {
-                return write_404(stream).await;
-            }
-        }
-    } else {
-        path.to_string()
-    };
-    match tokio::fs::read(&resolved).await {
-        Ok(content) => {
-            let mime = mime_guess::from_path(&resolved)
-                .first_or_octet_stream()
-                .to_string();
-            let mut out = Vec::new();
-            out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
-            out.extend_from_slice(format!("Content-Type: {}\r\n", mime).as_bytes());
-            out.extend_from_slice(format!("Content-Length: {}\r\n", content.len()).as_bytes());
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(&content);
-            stream.write_all(&out).await?;
-            stream.shutdown().await?;
-            Ok(())
-        }
-        Err(_) => write_404(stream).await,
-    }
-}
-
-async fn write_404<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
-    let body = b"Not Found".to_vec();
-    let mut out = Vec::new();
-    out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\n");
-    out.extend_from_slice(b"Content-Type: text/plain\r\n");
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&body);
-    stream.write_all(&out).await?;
-    stream.shutdown().await?;
-    Ok(())
-}
-
-fn backend_addr_from_url(url: &str) -> Result<std::net::SocketAddr> {
-    // Strip scheme and path, leaving host:port.
-    let after_scheme = url
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let addr: std::net::SocketAddr = host_port.parse()?;
-    Ok(addr)
-}
-
-fn backend_host_from_url(url: &str) -> &str {
-    let after_scheme = url
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    after_scheme.split('/').next().unwrap_or(after_scheme)
-}
-
-fn backend_path_from_url(url: &str) -> &str {
-    let after_scheme = url
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    after_scheme
-        .find('/')
-        .map(|i| &after_scheme[i..])
-        .unwrap_or("/")
 }

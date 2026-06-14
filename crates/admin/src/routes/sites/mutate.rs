@@ -10,8 +10,8 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::redirect_response;
 use crate::App;
+use crate::redirect_response;
 use pangolin_core::types::{HostMode, Site};
 
 use super::helpers::{assemble_backend_from_form, parse_form};
@@ -233,13 +233,13 @@ pub async fn handle_delete(
     name: Option<String>,
     _csrf: &str,
 ) -> http::Result<Resp> {
-    if let Some(n) = name {
-        if !n.is_empty() {
-            let db = app.db.lock().await;
-            let _ = pangolin_core::db::delete_site(&db, &n);
-            drop(db);
-            app.reload_indexes().await;
-        }
+    if let Some(n) = name
+        && !n.is_empty()
+    {
+        let db = app.db.lock().await;
+        let _ = pangolin_core::db::delete_site(&db, &n);
+        drop(db);
+        app.reload_indexes().await;
     }
     Ok(redirect_response("/sites"))
 }

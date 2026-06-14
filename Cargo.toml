@@ -5,13 +5,12 @@ members = [
     "crates/ngx",
     "crates/tun",
     "crates/admin",
-    "crates/pangolin-cli",
     "tests",
 ]
 
 [workspace.package]
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/cnlangzi/pangolin"
@@ -35,6 +34,15 @@ pingora-header-serde = { git = "https://github.com/cnlangzi/pingora", branch = "
 [workspace.dependencies]
 # Web framework / proxy
 pingora = { version = "0.8", features = ["lb"] }
+# pingora-core is the lower-level crate that the tun side
+# uses for the HTTP client. We patch it from the same
+# fork as pingora (see [patch.crates-io] above). Tun-only;
+# declared without features so the rest of the workspace
+# doesn't pick up unwanted TLS backends.
+pingora-core = { version = "0.8" }
+# pingora-http hosts the RequestHeader / ResponseHeader
+# types used by both ngx and the tun-side pingora client.
+pingora-http = { version = "0.8" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
@@ -78,6 +86,10 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 thiserror = "1"
+
+# MIME + HTTP date helpers (used by pangolin-core::file_serve)
+mime_guess = "2"
+httpdate = "1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

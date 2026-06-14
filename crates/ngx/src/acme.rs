@@ -32,7 +32,7 @@ use instant_acme::{
 };
 use tokio::time::sleep;
 
-use crate::dns::{wait_for_txt_propagation, DnsProvider};
+use crate::dns::{DnsProvider, wait_for_txt_propagation};
 
 /// Account credentials file — instant-acme `AccountCredentials` JSON.
 ///
@@ -232,10 +232,10 @@ fn extract_problem(err: &anyhow::Error) -> Option<&instant_acme::Problem> {
 /// failures as Transient.
 fn extract_transport_error(err: &anyhow::Error) -> Option<&instant_acme::Error> {
     for cause in err.chain() {
-        if let Some(acme_err) = cause.downcast_ref::<instant_acme::Error>() {
-            if !matches!(acme_err, instant_acme::Error::Api(_)) {
-                return Some(acme_err);
-            }
+        if let Some(acme_err) = cause.downcast_ref::<instant_acme::Error>()
+            && !matches!(acme_err, instant_acme::Error::Api(_))
+        {
+            return Some(acme_err);
         }
     }
     None
@@ -1760,11 +1760,11 @@ pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         // be impossible (recover_stuck_issuing_rows runs first), but
         // keep the guard for robustness if this code is ever called
         // outside the startup path.
-        if let Some(ref e) = existing {
-            if matches!(e.status, pangolin_core::CertStatus::Issuing) {
-                log::debug!("scan: skip {} — Issuing status, in-flight", domain);
-                continue;
-            }
+        if let Some(ref e) = existing
+            && matches!(e.status, pangolin_core::CertStatus::Issuing)
+        {
+            log::debug!("scan: skip {} — Issuing status, in-flight", domain);
+            continue;
         }
 
         let new_source = existing
@@ -2480,8 +2480,10 @@ mod tests {
             )
         };
         assert!(expected("https://example/acct/1").contains("policy=wildcard"));
-        assert!(expected("https://example/acct/1")
-            .contains("letsencrypt.org; accounturi=https://example/acct/1"));
+        assert!(
+            expected("https://example/acct/1")
+                .contains("letsencrypt.org; accounturi=https://example/acct/1")
+        );
         // The expected value for the bare and wildcard cases is
         // identical — the helper intentionally doesn't branch.
         assert_eq!(

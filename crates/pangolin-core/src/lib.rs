@@ -24,24 +24,29 @@ pub mod events;
 pub mod index;
 pub mod normalize;
 pub mod parse;
+pub mod proxy;
 pub mod tunnel;
 pub mod types;
 
 pub use app::{
-    plan_issuance, App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage,
+    App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage, plan_issuance,
 };
-pub use config::{init_logger, Config, LogConfig};
+pub use config::{Config, LogConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};
-pub use index::{lookup_site, Indexes};
+pub use index::{Indexes, lookup_site};
 pub use parse::{
-    detect_scheme, file_url_to_path, is_valid_domain, is_valid_tun_name, matches_tun_name_charset,
-    parse_backend, BackendScheme, ParseError, TUN_NAME_MAX,
+    BackendScheme, ParseError, TUN_NAME_MAX, detect_scheme, file_url_to_path, is_valid_domain,
+    is_valid_tun_name, matches_tun_name_charset, parse_backend,
 };
-pub use tunnel::{TunnelRole, YamuxTunnel};
+pub use proxy::{
+    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, parse_backend_to_target,
+    serve_file_target,
+};
+pub use tunnel::{TunnelRole, YamuxTunnel, parse_http_request_bytes};
 pub use types::{
-    next_backoff, BackendKind, Cert, CertErrorClass, CertStatus, ChallengeType, DnsProvider,
-    DnsProviderKind, Domain, HostMode, Site, Tun,
+    BackendKind, Cert, CertErrorClass, CertStatus, ChallengeType, DnsProvider, DnsProviderKind,
+    Domain, HostMode, Site, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

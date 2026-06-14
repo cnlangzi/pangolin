@@ -120,10 +120,10 @@ impl Site {
     /// For tunnel backends (`tun:scheme://...`), returns the scheme of the
     /// URL portion, not the tunnel name.
     pub fn backend_scheme(&self) -> &str {
-        if self.backend_route_mode() == "tunnel" {
-            if let Some(colon_idx) = self.backend.find(':') {
-                return detect_scheme(&self.backend[colon_idx + 1..]);
-            }
+        if self.backend_route_mode() == "tunnel"
+            && let Some(colon_idx) = self.backend.find(':')
+        {
+            return detect_scheme(&self.backend[colon_idx + 1..]);
         }
         detect_scheme(&self.backend)
     }
@@ -140,10 +140,10 @@ impl Site {
     /// bogus string `http:`. The form's JS round-trip relies on getting
     /// just the host:port back.
     pub fn backend_host_port(&self) -> &str {
-        if self.backend_route_mode() == "tunnel" {
-            if let Some(colon_idx) = self.backend.find(':') {
-                return strip_scheme_and_split(&self.backend[colon_idx + 1..]);
-            }
+        if self.backend_route_mode() == "tunnel"
+            && let Some(colon_idx) = self.backend.find(':')
+        {
+            return strip_scheme_and_split(&self.backend[colon_idx + 1..]);
         }
         strip_scheme_and_split(&self.backend)
     }

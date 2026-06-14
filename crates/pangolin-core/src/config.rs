@@ -25,8 +25,8 @@
 //! section here only holds operational tuning (cert_dir, directory
 //! URL, renew cadence, key type).
 
-use figment::providers::{Env, Format, Yaml};
 use figment::Figment;
+use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

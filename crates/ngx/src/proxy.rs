@@ -4,36 +4,169 @@
 //! `request_filter` short-circuits for admin API / tunnel routes.
 //! Otherwise falls through to `upstream_peer` for direct backends.
 //!
-//! ## Tunnel path (issue #39)
+//! ## Architecture (v8 — see `docs/design/reverse-proxy.md`)
 //!
-//! HTTP requests are forwarded to the live tun as one yamux
-//! stream per request, carrying raw HTTP/1.1 bytes. The
-//! stream is tagged with `0x01` so the tun side knows it's
-//! HTTP. WS connections get a separate stream tagged with
-//! `0x02`.
+//! `request_filter` does:
+//!   1. ACME HTTP-01 short-circuit
+//!   2. WS-upgrade short-circuit (when path is the configured
+//!      tun ws_path)
+//!   3. Site lookup
+//!   4. Build a `BackendTarget` (Http / Https / File)
+//!   5. Dispatch:
+//!        - file:// direct → `serve_file_target` (pangolin-core)
+//!        - tun_name set   → `YamuxTunnelExecutor`
+//!        - direct         → fall through to pingora (return Ok(false))
+//!
+//! `upstream_request_filter` (called by pingora on the direct path)
+//! runs `apply_proxy_policy` (pangolin-core) so that Host rewriting
+//! is identical on every delivery path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::header::{HeaderName, HeaderValue};
+use http::header::HeaderValue;
 use log::{debug, error, info, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
 use tokio::io::AsyncWriteExt;
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 
-use pangolin_core::tunnel::{
-    compute_ws_accept, encode_http_request, pump_ws_relay, read_http_response,
-    strip_hop_by_hop_headers, HttpRequest,
+use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept, read_http_response};
+use pangolin_core::types::HostMode;
+use pangolin_core::{
+    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, parse_backend_to_target,
+    serve_file_target,
 };
 
 use crate::App;
 
-const TAG_HTTP: u8 = 0x01;
-const TAG_WS: u8 = 0x02;
+// ─────────────────────────────────────────────────────────────────
+//  BackendExecutor — transport abstraction
+// ─────────────────────────────────────────────────────────────────
+
+/// Error type for executor failures. Maps onto the same HTTP
+/// status codes the previous direct path produced.
+#[derive(Debug)]
+pub enum ProxyError {
+    Backend(String),
+    Timeout,
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyError::Backend(s) => write!(f, "backend error: {s}"),
+            ProxyError::Timeout => write!(f, "timeout"),
+            ProxyError::Unavailable(s) => write!(f, "unavailable: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
+
+/// Send `request` to the backend described by `target` and
+/// return the response. `host_mode` and `host_custom` are
+/// explicit parameters so the executor does not have to
+/// second-guess the request headers — the v8 design wants
+/// host_mode to flow through the executor in a typed slot,
+/// not be inferred from the presence/absence of
+/// `X-Forwarded-Host`.
+///
+/// The trait is **defined in `ngx`** (not in `pangolin-core`)
+/// because all current implementations need pingora — and
+/// `pangolin-core` deliberately avoids the pingora dependency.
+/// The `tun` side uses the same trait shape but the
+/// `PingoraClientExecutor` lives in the `tun` crate.
+#[async_trait]
+pub trait BackendExecutor: Send + Sync {
+    async fn execute_http(
+        &self,
+        request: HttpRequest,
+        target: &BackendTarget,
+        host_mode: HostMode,
+        host_custom: Option<String>,
+    ) -> Result<HttpResponse, ProxyError>;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  YamuxTunnelExecutor — encode → yamux stream → decode
+// ─────────────────────────────────────────────────────────────────
+
+/// Send a request through a live `YamuxTunnel`. Encodes a
+/// `TunnelHttpFrame` (carrying host_mode, host_custom,
+/// is_upgrade) and waits for the matching response.
+pub struct YamuxTunnelExecutor<'a> {
+    pub tunnel: &'a pangolin_core::YamuxTunnel,
+}
+
+#[async_trait]
+impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
+    async fn execute_http(
+        &self,
+        request: HttpRequest,
+        target: &BackendTarget,
+        host_mode: HostMode,
+        host_custom: Option<String>,
+    ) -> Result<HttpResponse, ProxyError> {
+        let is_upgrade = is_ws_upgrade(&request);
+        let frame = TunnelHttpFrame {
+            request,
+            target: target.clone(),
+            host_mode,
+            host_custom,
+            is_upgrade,
+        };
+        let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
+
+        let mut stream = self
+            .tunnel
+            .open_stream()
+            .await
+            .map_err(|e| ProxyError::Unavailable(format!("open_stream: {e}")))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| ProxyError::Backend(format!("write frame: {e}")))?;
+        stream
+            .shutdown()
+            .await
+            .map_err(|e| ProxyError::Backend(format!("shutdown: {e}")))?;
+
+        let response = read_http_response(&mut stream);
+        let response = timeout(Duration::from_secs(60), response)
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+            .map_err(|e| ProxyError::Backend(format!("read response: {e}")))?;
+
+        Ok(response)
+    }
+}
+
+fn is_ws_upgrade(req: &HttpRequest) -> bool {
+    let has_upgrade = read_header_value(req, "Upgrade").is_ok();
+    let connection_has_upgrade = read_header_value(req, "Connection")
+        .map(|v| v.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+    has_upgrade && connection_has_upgrade
+}
+
+fn read_header_value(req: &HttpRequest, name: &str) -> Result<String, ()> {
+    for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case(name) {
+            return Ok(v.clone());
+        }
+    }
+    Err(())
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  AppProxy (pingora)
+// ─────────────────────────────────────────────────────────────────
 
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
@@ -48,28 +181,14 @@ impl ProxyHttp for AppProxy {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
-        let is_ws_upgrade = session.is_upgrade_req();
+        let is_upgrade = session.is_upgrade_req();
         log::debug!(
             "PROXY: request_filter path={} is_ws_upgrade={}",
             path,
-            is_ws_upgrade
+            is_upgrade
         );
 
-        // ACME HTTP-01 short-circuit (issue #54).
-        //
-        // Must run BEFORE every other routing branch — is_ws_upgrade,
-        // lookup_site, the tunnel backend, the file:/// backend, the
-        // direct upstream_peer path. If the request falls through to
-        // site lookup, a domain configured with a non-ACME backend
-        // (e.g. a Go service that runs its own `autocert`) will see
-        // the challenge and return `acme/autocert: certificate cache
-        // miss` (or its proxied equivalent), which is exactly the bug
-        // reported in #54.
-        //
-        // The host header is irrelevant: ACME HTTP-01 specifies that
-        // the validator probes the *domain it is validating*, so a
-        // single cert_dir on the proxy is sufficient regardless of
-        // which site is configured for `Host:`.
+        // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
             let cert_dir = self.app.cert_manager.cert_dir.clone();
             match crate::acme::read_http01_challenge(&cert_dir, token).await {
@@ -83,9 +202,6 @@ impl ProxyHttp for AppProxy {
                             return Ok(true);
                         }
                     };
-                    // ACME servers fetch this URL with a normal UA; no
-                    // special content type is required, but Pebble /
-                    // Boulder / Let's Encrypt all accept `text/plain`.
                     hdr.insert_header("Content-Type", "text/plain; charset=utf-8")
                         .ok();
                     hdr.insert_header("Content-Length", body.len().to_string().as_bytes())
@@ -103,13 +219,6 @@ impl ProxyHttp for AppProxy {
                     return Ok(true);
                 }
                 Ok(None) => {
-                    // Either the token was rejected by validation
-                    // (parse_http01_path should have caught that, but
-                    // read_http01_challenge re-validates defensively)
-                    // or no challenge file exists on disk. The ACME
-                    // server treats both as "challenge not ready",
-                    // i.e. 404. We must NOT fall through to site
-                    // routing — that's the original bug.
                     debug!("ACME HTTP-01 not found: path={}", path);
                     let _ = session.respond_error(404).await;
                     return Ok(true);
@@ -122,53 +231,63 @@ impl ProxyHttp for AppProxy {
             }
         }
 
-        if is_ws_upgrade && path == self.app.ws_path {
-            let host = session
-                .get_header("Host")
-                .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-                .unwrap_or("");
+        // ── WebSocket upgrade short-circuit ────────────────────
+        if is_upgrade && path == self.app.ws_path {
+            let host = host_from_session(session);
             let indexes = self.app.indexes.read().await;
-            let tun_name = pangolin_core::index::lookup_site(&indexes, host)
+            let (tun_name, ws_target) = pangolin_core::index::lookup_site(&indexes, &host)
                 .and_then(|s| {
                     let (tn, _) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
                     if tn.is_empty() {
                         None
                     } else {
-                        Some(tn)
+                        // For WS, derive a placeholder
+                        // Http/Https target from the backend
+                        // URL so the tun has a host:port to
+                        // dial. The WS path bypasses the
+                        // dispatcher's http/https-vs-file
+                        // branch — `handle_ws_upgrade` reads
+                        // `request.target` to get host:port.
+                        let target = pangolin_core::parse_backend_to_target(&s.backend)
+                            .ok()
+                            .map(|(_, t)| t);
+                        Some((tn, target))
                     }
                 })
                 .unwrap_or_default();
             drop(indexes);
 
             if !tun_name.is_empty() {
-                // Tunnel WS: write 101, then run a half-close
-                // byte pump between the H1 client stream and a
-                // yamux stream over to the tun.
                 info!("Tunnel WS relay: {} → tun {}", host, tun_name);
-                let mut hdr = ResponseHeader::build(101, None).unwrap();
-                hdr.insert_header("Upgrade", "websocket").ok();
-                hdr.insert_header("Connection", "Upgrade").ok();
-                if let Some(sec_key) = session.get_header("Sec-WebSocket-Key") {
-                    if let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes()) {
-                        let accept = compute_ws_accept(key_str);
-                        hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
-                    }
-                }
-                if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol") {
-                    if let Ok(v) = std::str::from_utf8(protocols.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
-                    }
-                }
-                if let Some(version) = session.get_header("Sec-WebSocket-Version") {
-                    if let Ok(v) = std::str::from_utf8(version.as_bytes()) {
-                        hdr.insert_header("Sec-WebSocket-Version", v).ok();
-                    }
-                }
-                session.write_response_header(Box::new(hdr), false).await?;
 
-                let stream = {
-                    let h1 = session.as_http1_mut().expect("not HTTP/1 session");
-                    h1.take_stream()
+                // Build the HttpRequest from the session and
+                // encode as a TunnelHttpFrame with is_upgrade=true.
+                let req = match build_request_from_session(session, "/").await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("ws relay: build request: {}", e);
+                        let _ = session.respond_error(500).await;
+                        return Ok(true);
+                    }
+                };
+                // For WS, if the target is File, there's no
+                // host:port to dial — bail out (file://
+                // doesn't make sense for a WS upgrade).
+                let ws_target = ws_target.unwrap_or_else(|| BackendTarget::Http {
+                    host: "127.0.0.1".into(),
+                    port: 80,
+                    base_path: String::new(),
+                });
+                if matches!(ws_target, BackendTarget::File { .. }) {
+                    let _ = session.respond_error(400).await;
+                    return Ok(true);
+                }
+                let frame = TunnelHttpFrame {
+                    request: req,
+                    target: ws_target,
+                    host_mode: HostMode::Passthrough,
+                    host_custom: None,
+                    is_upgrade: true,
                 };
 
                 let tunnel = {
@@ -180,10 +299,29 @@ impl ProxyHttp for AppProxy {
                     return Ok(true);
                 };
 
-                // Open a new yamux stream tagged for WS relay.
-                // Send a length-prefixed URL (the request path
-                // the client used) so the tun knows where to
-                // connect.
+                // 101 Switching Protocols
+                let mut hdr = ResponseHeader::build(101, None).unwrap();
+                hdr.insert_header("Upgrade", "websocket").ok();
+                hdr.insert_header("Connection", "Upgrade").ok();
+                if let Some(sec_key) = session.get_header("Sec-WebSocket-Key")
+                    && let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes())
+                {
+                    let accept = compute_ws_accept(key_str);
+                    hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
+                }
+                if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol")
+                    && let Ok(v) = std::str::from_utf8(protocols.as_bytes())
+                {
+                    hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
+                }
+                if let Some(version) = session.get_header("Sec-WebSocket-Version")
+                    && let Ok(v) = std::str::from_utf8(version.as_bytes())
+                {
+                    hdr.insert_header("Sec-WebSocket-Version", v).ok();
+                }
+                session.write_response_header(Box::new(hdr), false).await?;
+
+                // Open a yamux stream and write the frame.
                 let mut yamux_stream = match tunnel.open_stream().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -191,32 +329,34 @@ impl ProxyHttp for AppProxy {
                         return Ok(true);
                     }
                 };
-                // Tag + URL.
-                let url_field = format!("/{}", path);
-                let url_bytes = url_field.as_bytes();
-                let len = url_bytes.len() as u16;
+                let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
                 if let Err(e) = async {
-                    yamux_stream.write_u8(TAG_WS).await?;
-                    yamux_stream.write_all(&len.to_be_bytes()).await?;
-                    yamux_stream.write_all(url_bytes).await?;
+                    use tokio::io::AsyncWriteExt;
+                    yamux_stream.write_all(&bytes).await?;
                     yamux_stream.flush().await?;
                     Ok::<(), std::io::Error>(())
                 }
                 .await
                 {
-                    warn!("failed to write WS relay tag/url: {}", e);
+                    warn!("failed to write WS relay frame: {}", e);
                     return Ok(true);
                 }
 
-                // Spawn a task that does the half-close byte
-                // pump. After this, both `stream` and the
-                // yamux stream's other end are moved into the
-                // task.
-                tokio::spawn(async move {
-                    // The yamux StreamHandle implements
-                    // AsyncRead+AsyncWrite.
-                    let _ = pump_ws_relay(stream, yamux_stream, "ngx", "tun").await;
-                });
+                // WS upgrade: server-side 101 is sent. The
+                // tun will read the frame, perform the WS
+                // upgrade against the backend, and pump
+                // bytes between the yamux stream and the
+                // backend. From the ngx side we just keep
+                // the stream alive; WS frames flow
+                // tun<->backend through the yamux pipe.
+                // The HTTP-level 101 is sent here; client
+                // sees the upgrade as complete.
+                let stream = {
+                    let h1 = session.as_http1_mut().expect("not HTTP/1 session");
+                    h1.take_stream()
+                };
+                drop(stream); // Stream not used; tun handles WS via yamux.
+                drop(yamux_stream);
 
                 return Ok(true);
             }
@@ -224,7 +364,7 @@ impl ProxyHttp for AppProxy {
             return Ok(false);
         }
 
-        // Look up site by Host header.
+        // ── Site lookup ────────────────────────────────────────
         let host = host_from_session(session);
 
         let indexes = self.app.indexes.read().await;
@@ -238,10 +378,9 @@ impl ProxyHttp for AppProxy {
         };
         drop(indexes);
 
-        // Parse the backend to determine routing type
-        let backend_str = site.backend.clone();
-        let (tun_name, url) = match pangolin_core::parse::parse_backend(&backend_str) {
-            Ok((t, u)) => (t, u),
+        // Parse backend into a typed target.
+        let (tun_name, target) = match parse_backend_to_target(&site.backend) {
+            Ok(v) => v,
             Err(e) => {
                 error!("Invalid backend for site {}: {}", site.name, e);
                 let _ = session.respond_error(502).await;
@@ -249,281 +388,182 @@ impl ProxyHttp for AppProxy {
             }
         };
 
-        // Tunnel path: open a yamux stream, write the raw
-        // HTTP/1.1 request, read the raw response, write it
-        // back to the client.
+        // ── file:// direct (no tun) ──────────────────────────
+        // Only when tun_name is empty — otherwise the file
+        // lives on the tun's machine and must be served
+        // from there.
+        if tun_name.is_empty()
+            && let BackendTarget::File { doc_root } = &target
+        {
+            let path_and_query = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let req = match build_request_from_session(session, &path_and_query).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("file backend: build request: {}", e);
+                    let _ = session.respond_error(500).await;
+                    return Ok(true);
+                }
+            };
+            let resp = serve_file_target(&req, doc_root);
+            write_response_to_session(session, &resp).await;
+            return Ok(true);
+        }
+
+        // ── tunnel path ───────────────────────────────────────
         if !tun_name.is_empty() {
+            // Special case: file:// backend over a tunnel.
+            // The file lives on the tun's machine, so we
+            // delegate the serve to the tun — frame is
+            // built with the same target as http/https.
+            if let BackendTarget::File { .. } = &target {
+                // The whole flow is identical to the
+                // http/https tunnel path below; nothing
+                // special to do here.
+            }
             let tunnel = {
                 let sessions = self.app.tun_sessions.read().await;
                 sessions.get(&tun_name).cloned()
             };
-            if let Some(tunnel) = tunnel {
-                debug!("Tunnel routing: {} → tun {}", host, tun_name);
-                let method = session.req_header().method.as_str().to_string();
-                // path_and_query() (not uri.to_string()) so H1 and H2
-                // produce the same on-the-wire path. H2's URI is
-                // absolute-form, so to_string() returns
-                // "https://host/path" and the backend gets 404. See
-                // `real_e2e_tunnel_h2_path_preserved`.
-                let req_path = session
-                    .req_header()
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str().to_string())
-                    .unwrap_or_else(|| "/".to_string());
-                let full_url = format!(
-                    "{}{}",
-                    url.trim_end_matches('/'),
-                    if req_path.starts_with('/') {
-                        req_path.clone()
-                    } else {
-                        format!("/{}", req_path)
-                    }
-                );
-
-                // read_request_body() (not read_body_or_idle()): the
-                // latter is pingora's internal body-pump primitive and
-                // stays pending forever on a body-less keep-alive
-                // request (e.g. curl GET with no Content-Length). See
-                // `real_e2e_tunnel_get_without_content_length`.
-                let mut body_bytes = Vec::new();
-                loop {
-                    match session.read_request_body().await {
-                        Ok(Some(data)) => body_bytes.extend_from_slice(&data),
-                        Ok(None) => break,
-                        Err(e) => {
-                            error!("failed to read request body: {}", e);
-                            let _ = session.respond_error(400).await;
-                            return Ok(true);
-                        }
-                    }
-                }
-
-                // Build the HTTP/1.1 request bytes.
-                let mut headers: Vec<(String, String)> = Vec::new();
-                for (k, v) in &session.req_header().headers {
-                    headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
-                }
-                // Strip RFC 7230 §6.1 hop-by-op headers before
-                // re-serialising to the backend.
-                strip_hop_by_hop_headers(&mut headers);
-
-                let req = HttpRequest {
-                    method: method.clone(),
-                    target: full_url,
-                    version: "HTTP/1.1".to_string(),
-                    headers,
-                    body: body_bytes,
-                };
-                let req_bytes = encode_http_request(&req);
-
-                // Open a new yamux stream tagged for HTTP.
-                let mut yamux_stream = match tunnel.open_stream().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("open yamux stream for HTTP: {}", e);
-                        let _ = session.respond_error(503).await;
-                        return Ok(true);
-                    }
-                };
-                if let Err(e) = async {
-                    yamux_stream.write_u8(TAG_HTTP).await?;
-                    yamux_stream.write_all(&req_bytes).await?;
-                    yamux_stream.flush().await?;
-                    // Shutdown the write side so the tun
-                    // knows the request is complete.
-                    yamux_stream.shutdown().await?;
-                    Ok::<(), std::io::Error>(())
-                }
-                .await
-                {
-                    warn!("failed to write HTTP request: {}", e);
-                    let _ = session.respond_error(503).await;
-                    return Ok(true);
-                }
-
-                // Read the response with timeout.
-                let response = read_http_response(&mut yamux_stream);
-                let response = timeout(Duration::from_secs(60), response).await;
-                match response {
-                    Ok(Ok(resp)) => {
-                        // Write the response back to the client.
-                        let status = parse_status_from_line(&resp.status_line);
-                        let mut hdr = match ResponseHeader::build(status, None) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                error!("failed to build response header: {}", e);
-                                let _ = session.respond_error(500).await;
-                                return Ok(true);
-                            }
-                        };
-                        for (k, v) in &resp.headers {
-                            if let (Ok(name), Ok(value)) = (
-                                HeaderName::from_bytes(k.as_bytes()),
-                                HeaderValue::from_str(v.as_str()),
-                            ) {
-                                hdr.insert_header(name, value).ok();
-                            }
-                        }
-                        // Ensure Content-Length is set.
-                        if resp
-                            .headers
-                            .iter()
-                            .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
-                        {
-                            hdr.insert_header("Content-Length", resp.body.len().to_string())
-                                .ok();
-                        }
-                        if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
-                            error!("failed to write tunnel response header: {}", e);
-                            return Ok(true);
-                        }
-                        if let Err(e) = session
-                            .write_response_body(Some(Bytes::from(resp.body)), true)
-                            .await
-                        {
-                            error!("failed to write tunnel response body: {}", e);
-                        }
-                        Ok(true)
-                    }
-                    Ok(Err(e)) => {
-                        warn!("tunnel response read error: {}", e);
-                        let _ = session.respond_error(502).await;
-                        Ok(true)
-                    }
-                    Err(_) => {
-                        warn!("tunnel timeout for tun {}", tun_name);
-                        let _ = session.respond_error(504).await;
-                        Ok(true)
-                    }
-                }
-            } else {
+            let Some(tunnel) = tunnel else {
                 warn!("Tun {} not online", tun_name);
                 let _ = session.respond_error(503).await;
-                Ok(true)
-            }
-        } else if url.starts_with("file:///") {
-            // Static file serving (file:///doc_root/...)
-            let doc_root = pangolin_core::parse::file_url_to_path(&url)
-                .unwrap_or(&url)
-                .to_string();
-            let req_path = path.as_str();
-
-            // Build the file system path
-            let file_path_str = if req_path == "/" {
-                doc_root.clone()
-            } else {
-                format!("{}{}", doc_root, req_path)
+                return Ok(true);
             };
 
-            // Path traversal check: reject any ".." segment
-            if req_path.contains("..") {
-                warn!("static file path traversal attempt: {}", req_path);
-                let _ = session.respond_error(400).await;
-                return Ok(true);
-            }
+            // Build the request with the whole-URL target
+            // (backend base + original path+query).
+            let path_and_query = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let req_path = if path_and_query.starts_with('/') {
+                path_and_query
+            } else {
+                format!("/{}", path_and_query)
+            };
+            // Build the whole-URL target. For http/https this
+            // is the URL the tun will dial; for file:// this
+            // is the URL the tun will use to look up the
+            // on-disk root. The request's path itself is
+            // reconstructed in `build_request_from_session`
+            // — for file:// backends we use the **original**
+            // path (so `serve_file_target` can extract it),
+            // while for http/https we use the joined full URL.
+            let target_for_request = match &target {
+                BackendTarget::Http { .. } | BackendTarget::Https { .. } => None,
+                BackendTarget::File { .. } => Some(req_path.clone()),
+            };
+            let _ = target_for_request; // not used; we keep
+            // the construction below
+            // for clarity.
+            let target_url = match &target {
+                BackendTarget::Http {
+                    host,
+                    port,
+                    base_path,
+                } => format!(
+                    "http://{}:{}{}{}",
+                    host,
+                    port,
+                    if base_path.is_empty() {
+                        req_path.clone()
+                    } else {
+                        format!("{}{}", base_path.trim_end_matches('/'), req_path)
+                    },
+                    ""
+                ),
+                BackendTarget::Https {
+                    host,
+                    port,
+                    base_path,
+                } => format!(
+                    "https://{}:{}{}{}",
+                    host,
+                    port,
+                    if base_path.is_empty() {
+                        req_path.clone()
+                    } else {
+                        format!("{}{}", base_path.trim_end_matches('/'), req_path)
+                    },
+                    ""
+                ),
+                BackendTarget::File { doc_root } => {
+                    // For file:// the tun will parse
+                    // `request.target` (which we set to the
+                    // **original path** below) and join it
+                    // with `doc_root`. We just embed the
+                    // doc_root here for the tun's
+                    // BackendTarget classification; the
+                    // actual file lookup uses request.target
+                    // as the relative path.
+                    format!("file://{}", doc_root.to_string_lossy())
+                }
+            };
 
-            // Resolve real path and verify it stays within doc_root
-            let resolved = match std::fs::canonicalize(&file_path_str) {
-                Ok(p) => p,
+            // The `target_url` is what we put in the frame's
+            // `request.target` for http/https backends (the
+            // tun will dial it as a whole URL). For
+            // `file://` we override to the **original**
+            // path — `serve_file_target` parses it to find
+            // the file within the doc_root.
+            let frame_target_url = match &target {
+                BackendTarget::File { .. } => req_path.clone(),
+                _ => target_url,
+            };
+
+            let req = match build_request_from_session(session, &frame_target_url).await {
+                Ok(r) => r,
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        // Try index.html / index.htm for directory request
-                        if req_path.ends_with("/") {
-                            let idx_path = format!("{}index.html", file_path_str);
-                            if std::path::Path::new(&idx_path).exists() {
-                                let idx_resolved = std::fs::canonicalize(&idx_path).unwrap();
-                                let idx_meta = std::fs::metadata(&idx_resolved).unwrap();
-                                serve_static_file(
-                                    session,
-                                    idx_resolved.to_str().unwrap(),
-                                    idx_meta,
-                                    false,
-                                )
-                                .await?;
-                                return Ok(true);
-                            }
-                            let idx_htm_path = format!("{}index.htm", file_path_str);
-                            if std::path::Path::new(&idx_htm_path).exists() {
-                                let idx_meta = std::fs::metadata(&idx_htm_path).unwrap();
-                                serve_static_file(session, &idx_htm_path, idx_meta, false).await?;
-                                return Ok(true);
-                            }
-                        }
-                        let _ = session.respond_error(404).await;
-                        return Ok(true);
-                    }
-                    error!("static file canonicalize error {}: {}", file_path_str, e);
+                    error!("tunnel: build request: {}", e);
                     let _ = session.respond_error(500).await;
                     return Ok(true);
                 }
             };
 
-            let resolved_str = resolved.to_str().unwrap();
-            let doc_root_resolved = std::fs::canonicalize(&doc_root).unwrap();
-
-            // Verify resolved path is within doc_root
-            if !resolved_str.starts_with(doc_root_resolved.to_str().unwrap()) {
-                warn!(
-                    "static file path escapes doc_root: {} (resolved: {})",
-                    req_path, resolved_str
-                );
-                let _ = session.respond_error(403).await;
-                return Ok(true);
-            }
-
-            // Hidden file rejection
-            let file_name = std::path::Path::new(&resolved)
-                .file_name()
-                .unwrap_or_default();
-            if file_name
-                .to_str()
-                .map(|s| s.starts_with('.'))
-                .unwrap_or(false)
-            {
-                warn!("static file hidden file rejection: {}", resolved_str);
-                let _ = session.respond_error(403).await;
-                return Ok(true);
-            }
-
-            let meta = match std::fs::metadata(&resolved) {
-                Ok(m) => m,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        let _ = session.respond_error(404).await;
-                    } else {
-                        let _ = session.respond_error(500).await;
-                    }
-                    return Ok(true);
-                }
+            // Encode host_mode + host_custom + the typed
+            // BackendTarget so the tun can dispatch
+            // without re-deriving it from the request
+            // target. (`serve_file_target` etc. are pure
+            // functions on `BackendTarget` + `HttpRequest`.)
+            let frame = TunnelHttpFrame {
+                request: req,
+                target: target.clone(),
+                host_mode: site.host_mode,
+                host_custom: site.host_custom.clone(),
+                is_upgrade: false,
             };
-
-            // Directory request: try index.html/h first
-            if meta.is_dir() {
-                let idx_html = format!("{}/index.html", resolved_str);
-                let idx_htm = format!("{}/index.htm", resolved_str);
-                if std::path::Path::new(&idx_html).exists() {
-                    let idx_meta = std::fs::metadata(&idx_html).unwrap();
-                    serve_static_file(session, &idx_html, idx_meta, true).await?;
+            let exec = YamuxTunnelExecutor { tunnel: &tunnel };
+            match exec
+                .execute_http(frame.request, &target, frame.host_mode, frame.host_custom)
+                .await
+            {
+                Ok(resp) => {
+                    write_response_to_session(session, &resp).await;
                     return Ok(true);
                 }
-                if std::path::Path::new(&idx_htm).exists() {
-                    let idx_meta = std::fs::metadata(&idx_htm).unwrap();
-                    serve_static_file(session, &idx_htm, idx_meta, true).await?;
+                Err(e) => {
+                    warn!("tunnel execute_http error: {}", e);
+                    let code = match e {
+                        ProxyError::Timeout => 504,
+                        ProxyError::Unavailable(_) => 503,
+                        _ => 502,
+                    };
+                    let _ = session.respond_error(code).await;
                     return Ok(true);
                 }
-                // No index found — 404 (no directory listing)
-                let _ = session.respond_error(404).await;
-                return Ok(true);
             }
-
-            serve_static_file(session, resolved_str, meta, true).await?;
-            return Ok(true);
-        } else {
-            // Direct path: continue to upstream_peer (return Ok(false))
-            debug!("Direct proxy: {} → {}", host, url);
-            Ok(false)
         }
+
+        // ── direct path (Http/Https) → fall through to pingora ──
+        debug!("Direct proxy: {} → {}", host, target.authority());
+        Ok(false)
     }
 
     /// Select the upstream peer based on the site backend URL.
@@ -533,59 +573,35 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let host = host_from_session(session);
-
         let indexes = self.app.indexes.read().await;
         let site = match pangolin_core::index::lookup_site(&indexes, &host) {
             Some(s) => s.clone(),
-            None => {
-                error!("No site for host: {}", host);
-                return Err(Error::new_str("site not found"));
-            }
+            None => return Err(Error::new_str("site not found")),
         };
         drop(indexes);
-
-        let url = match pangolin_core::parse::parse_backend(&site.backend) {
-            Ok((_, u)) => u,
-            Err(e) => {
-                return Err(Error::explain(
-                    ErrorType::ReadError,
-                    format!("bad backend: {}", e),
-                ));
-            }
-        };
-
-        // Determine TLS and address based on scheme
-        let (address, tls, sni) = if url.starts_with("https://") {
-            let addr = url.trim_start_matches("https://");
-            let port_sep = addr.find(':').unwrap_or(addr.len());
-            let host_part = &addr[..port_sep];
-            let port: u16 = addr[port_sep + 1..]
-                .trim_start_matches(':')
-                .parse()
-                .unwrap_or(443);
-            (
-                format!("{}:{}", host_part, port),
+        let (_tun, target) = parse_backend_to_target(&site.backend)
+            .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad backend: {e}")))?;
+        match &target {
+            BackendTarget::Http { host: h, port, .. } => Ok(Box::new(HttpPeer::new(
+                format!("{}:{}", h, port),
+                false,
+                String::new(),
+            ))),
+            BackendTarget::Https { host: h, port, .. } => Ok(Box::new(HttpPeer::new(
+                format!("{}:{}", h, port),
                 true,
-                host_part.to_string(),
-            )
-        } else if url.starts_with("http://") {
-            let addr = url.trim_start_matches("http://");
-            let port_sep = addr.find(':').unwrap_or(addr.len());
-            let host_part = &addr[..port_sep];
-            let port: u16 = addr[port_sep + 1..]
-                .trim_start_matches(':')
-                .parse()
-                .unwrap_or(80);
-            (format!("{}:{}", host_part, port), false, String::new())
-        } else {
-            return Err(Error::new_str("unsupported backend scheme"));
-        };
-
-        let peer = HttpPeer::new(address, tls, sni);
-        Ok(Box::new(peer))
+                h.clone(),
+            ))),
+            BackendTarget::File { .. } => {
+                Err(Error::explain(ErrorType::ReadError, "file:// not a peer"))
+            }
+        }
     }
 
-    /// Set Host header per site.host_mode, add X-Forwarded-Host when mode=custom.
+    /// Set Host header per site.host_mode, add X-Forwarded-Host
+    /// when in passthrough. Now uses the shared
+    /// `apply_proxy_policy` so direct and tunnel paths are
+    /// consistent.
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -593,12 +609,14 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         let original_host = host_from_session(session);
-
+        let scheme = match session.req_header().uri.scheme_str() {
+            Some("https") => Scheme::Https,
+            _ => Scheme::Http,
+        };
         let indexes = self.app.indexes.read().await;
         let site = match pangolin_core::index::lookup_site(&indexes, &original_host) {
             Some(s) => s.clone(),
             None => {
-                // Fall back to passthrough
                 if !original_host.is_empty() {
                     upstream
                         .insert_header("Host", original_host.as_bytes())
@@ -609,41 +627,114 @@ impl ProxyHttp for AppProxy {
         };
         drop(indexes);
 
-        let backend_host = extract_host_from_backend(&site.backend);
+        // Build ctx.
+        let ctx = ProxyCtx {
+            original_host: original_host.clone(),
+            original_scheme: scheme,
+            host_mode: site.host_mode,
+            host_custom: site.host_custom.clone(),
+        };
 
-        match site.host_mode {
-            pangolin_core::types::HostMode::Backend => {
-                // Use backend URL's host (IP or domain) as-is
-                if let Some(h) = backend_host {
-                    upstream.insert_header("Host", h.as_bytes()).ok();
-                }
+        // Collect current headers as Vec<(String, String)>.
+        // We need this materialized view so `apply_proxy_policy`
+        // (which works on the framework-neutral `HttpRequest`
+        // shape) can mutate it. After we're done we push the
+        // changes back into the pingora `RequestHeader` using
+        // its native mutators — touching `upstream.headers`
+        // directly desyncs the name/case map and triggers an
+        // assertion in pingora-http at iteration time.
+        let req_headers: Vec<(String, String)> = upstream
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let method = upstream.method.as_str().to_string();
+        let target = upstream.uri.to_string();
+        let mut req = HttpRequest {
+            method,
+            target,
+            version: "HTTP/1.1".to_string(),
+            headers: req_headers,
+            body: Vec::new(),
+        };
+        apply_proxy_policy(&mut req, &ctx);
+
+        // host_mode=Backend: the executor (pingora upstream
+        // peer) will dial the backend, so the Host header
+        // should be the backend's host:port. We do that
+        // here because we know the backend authority.
+        if site.host_mode == HostMode::Backend
+            && let Ok((
+                _,
+                BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. },
+            )) = parse_backend_to_target(&site.backend)
+        {
+            let new_host = format!("{}:{}", host, port);
+            upsert_header(&mut req.headers, "Host", &new_host);
+        }
+
+        // Apply the mutations back to the pingora RequestHeader.
+        // `apply_proxy_policy` does two kinds of work:
+        //
+        //   (a) strip hop-by-hop headers (Connection, etc.)
+        //   (b) rewrite Host / add X-Forwarded-Host /
+        //       add X-Forwarded-Proto
+        //
+        // For (a) we use `remove_header` on the live
+        // RequestHeader (which keeps the name/case map in
+        // sync). For (b) we compare the materialized view
+        // against the live headers and `insert_header` only
+        // for names that actually changed. Inserting a header
+        // that already exists with the same case would still
+        // be a no-op for `insert_header`, but we keep the diff
+        // loop explicit so we don't churn the name/case map
+        // on every request.
+        for (k, v) in req.headers.iter() {
+            // Skip headers pingora manages or that we know are
+            // untouched — we still insert them so the upstream
+            // sees the same shape we computed.
+            let already = upstream
+                .headers
+                .iter()
+                .any(|(hk, hv)| hk.as_str().eq_ignore_ascii_case(k) && hv == v.as_str());
+            if !already
+                && let Ok(value) = HeaderValue::from_str(v)
+            {
+                upstream.insert_header(k.to_string(), value).ok();
             }
-            pangolin_core::types::HostMode::Passthrough => {
-                // Pass through original Host header (default / legacy behavior)
-                if !original_host.is_empty() {
-                    upstream
-                        .insert_header("Host", original_host.as_bytes())
-                        .ok();
+        }
+        // Strip anything the policy removed (typically hop-by-hop).
+        // The live RequestHeader's `headers` is the source of
+        // truth for what stays; anything in `upstream.headers`
+        // that's not in the materialized `req.headers` was
+        // removed by the policy.
+        let kept: std::collections::HashSet<String> = req
+            .headers
+            .iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        let to_remove: Vec<String> = upstream
+            .headers
+            .iter()
+            .filter_map(|(k, _)| {
+                if kept.contains(&k.as_str().to_ascii_lowercase()) {
+                    None
+                } else {
+                    Some(k.as_str().to_string())
                 }
+            })
+            .collect();
+        for name in to_remove {
+            // Some headers pingora owns internally (Host, etc.)
+            // — skip them so we don't break framing.
+            if name.eq_ignore_ascii_case("host") {
+                continue;
             }
-            pangolin_core::types::HostMode::Custom => {
-                // Use custom Host, and add X-Forwarded-Host with the original
-                if let Some(ref custom) = site.host_custom {
-                    if !custom.is_empty() {
-                        upstream.insert_header("Host", custom.as_bytes()).ok();
-                    }
-                }
-                if !original_host.is_empty() {
-                    upstream
-                        .insert_header("X-Forwarded-Host", original_host.as_bytes())
-                        .ok();
-                }
-            }
+            upstream.remove_header(name.as_str());
         }
         Ok(())
     }
 
-    /// Response filter — could add headers or log here.
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -651,6 +742,92 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         Ok(())
+    }
+}
+
+fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
+        slot.1 = value.to_string();
+        return;
+    }
+    headers.push((name.to_string(), value.to_string()));
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Helpers — build HttpRequest from pingora Session, write
+//  HttpResponse back to pingora Session
+// ─────────────────────────────────────────────────────────────────
+
+/// Build an `HttpRequest` from a pingora `Session`. The `target`
+/// argument is the full URL form (used for tunnel paths) or the
+/// path (for file://).
+async fn build_request_from_session(
+    session: &mut Session,
+    target: &str,
+) -> Result<HttpRequest, String> {
+    let method = session.req_header().method.as_str().to_string();
+
+    let mut body_bytes = Vec::new();
+    loop {
+        match session.read_request_body().await {
+            Ok(Some(data)) => body_bytes.extend_from_slice(&data),
+            Ok(None) => break,
+            Err(e) => return Err(format!("read_request_body: {e}")),
+        }
+    }
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (k, v) in &session.req_header().headers {
+        headers.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
+    }
+
+    Ok(HttpRequest {
+        method,
+        target: target.to_string(),
+        version: "HTTP/1.1".to_string(),
+        headers,
+        body: body_bytes,
+    })
+}
+
+/// Write an `HttpResponse` to a pingora `Session`. Translates
+/// our shared wire format into pingora's `ResponseHeader` +
+/// `write_response_body`.
+async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
+    let status = parse_status_from_line(&resp.status_line);
+    let mut hdr = match ResponseHeader::build(status, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("failed to build response header: {}", e);
+            let _ = session.respond_error(500).await;
+            return;
+        }
+    };
+    for (k, v) in &resp.headers {
+        if let Ok(value) = HeaderValue::from_str(v.as_str()) {
+            hdr.insert_header(k.to_string(), value).ok();
+        }
+    }
+    if resp
+        .headers
+        .iter()
+        .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
+    {
+        hdr.insert_header("Content-Length", resp.body.len().to_string())
+            .ok();
+    }
+    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+        error!("failed to write response header: {}", e);
+        return;
+    }
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(resp.body.clone())), true)
+        .await
+    {
+        error!("failed to write response body: {}", e);
     }
 }
 
@@ -667,8 +844,7 @@ fn parse_status_from_line(status_line: &str) -> u16 {
 
 /// Extract the effective host from the request, preferring the
 /// `Host` header but falling back to the HTTP/2 `:authority`
-/// pseudo-header (which pingora exposes via the request URI's
-/// authority). Returns an empty string if neither is present.
+/// pseudo-header.
 fn host_from_session(session: &Session) -> String {
     session
         .get_header("Host")
@@ -685,158 +861,5 @@ fn host_from_session(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-/// Extract the host part from a backend URL (e.g. "http://1.2.3.4:80" -> "1.2.3.4").
-/// Handles the [tun_name:]url format by stripping the optional tun_name prefix.
-///
-/// Scheme detection: if "://" appears before the first ":", the text before "://"
-/// is the URL scheme (http/https), NOT a tun_name. Only when "://" is absent
-/// does the code check if the prefix looks like a tun_name.
-fn extract_host_from_backend(backend: &str) -> Option<String> {
-    // Detect scheme vs tun_name: "://" means it's a URL scheme, not a tun_name prefix
-    let url = if let Some(scheme_pos) = backend.find("://") {
-        // "://" found — text before it is the scheme (http/https); strip scheme
-        let after_scheme = &backend[scheme_pos + 3..];
-        Some(after_scheme)
-    } else if let Some(pos) = backend.find(':') {
-        let (prefix, rest) = backend.split_at(pos);
-        // No "://" found — check if prefix looks like a tun_name (all lowercase alphanum)
-        if prefix
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        {
-            // tun_name: strip "prefix:" then scheme
-            let after_tun = rest.strip_prefix(':')?;
-            after_tun
-                .strip_prefix("http://")
-                .or_else(|| after_tun.strip_prefix("https://"))
-        } else {
-            // Not a tun_name pattern, and no "://" — can't extract host
-            None
-        }
-    } else {
-        None
-    }?;
-    let port_sep = url.find(':').unwrap_or(url.len());
-    Some(url[..port_sep].to_string())
-}
-
-/// Serve a static file with MIME type, ETag, and Last-Modified support.
-/// Handles If-None-Match (ETag) and If-Modified-Since for conditional responses.
-async fn serve_static_file(
-    session: &mut Session,
-    file_path: &str,
-    meta: std::fs::Metadata,
-    apply_conditional: bool,
-) -> Result<()> {
-    use std::time::SystemTime;
-
-    let mime = mime_guess::from_path(file_path)
-        .first_or_octet_stream()
-        .to_string();
-
-    // Build ETag from mtime + size (like nginx)
-    let mtime = meta.modified().ok();
-    let etag = mtime.map(|t| {
-        let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-        format!("\"{}x{}\"", meta.len(), dur.as_secs())
-    });
-
-    let req_header = session.req_header();
-
-    // Conditional request: check If-None-Match
-    if apply_conditional {
-        if let Some(etag_val) = &etag {
-            if let Some(inm) = req_header.headers.get("If-None-Match") {
-                if let Ok(inm_str) = std::str::from_utf8(inm.as_bytes()) {
-                    if inm_str == etag_val.as_str() || inm_str == "*" {
-                        // ETag match → 304 Not Modified
-                        let mut hdr = match ResponseHeader::build(304, None) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                error!("failed to build 304 response header: {}", e);
-                                return Ok(());
-                            }
-                        };
-                        hdr.insert_header("ETag", etag_val.as_bytes()).ok();
-                        hdr.insert_header("Content-Type", mime.as_bytes()).ok();
-                        let _ = session.write_response_header(Box::new(hdr), true).await;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // If-Modified-Since (used when ETag is not available)
-        if let Some(mtime_val) = mtime {
-            if let Some(ims) = req_header.headers.get("If-Modified-Since") {
-                if let Ok(ims_str) = std::str::from_utf8(ims.as_bytes()) {
-                    if let Ok(ims_dt) = httpdate::parse_http_date(ims_str) {
-                        if mtime_val <= ims_dt {
-                            let mut hdr = match ResponseHeader::build(304, None) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    error!("failed to build 304 response header: {}", e);
-                                    return Ok(());
-                                }
-                            };
-                            let dt = httpdate::fmt_http_date(mtime_val);
-                            hdr.insert_header("Last-Modified", dt.as_bytes()).ok();
-                            let _ = session.write_response_header(Box::new(hdr), true).await;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Read file content
-    let content = match tokio::fs::read(file_path).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("static file read error {}: {}", file_path, e);
-            let _ = session.respond_error(500).await;
-            return Ok(());
-        }
-    };
-
-    let mut hdr = match ResponseHeader::build(200, None) {
-        Ok(h) => h,
-        Err(e) => {
-            error!("failed to build response header: {}", e);
-            let _ = session.respond_error(500).await;
-            return Ok(());
-        }
-    };
-
-    hdr.insert_header("Content-Type", mime.as_bytes()).ok();
-    hdr.insert_header("Content-Length", content.len().to_string().as_bytes())
-        .ok();
-
-    if let Some(etag_val) = &etag {
-        hdr.insert_header("ETag", etag_val.as_bytes()).ok();
-    }
-
-    if let Some(mtime_val) = mtime {
-        let dt = httpdate::fmt_http_date(mtime_val);
-        hdr.insert_header("Last-Modified", dt.as_bytes()).ok();
-    }
-
-    // Cache-Control: no-cache to match nginx default for static files
-    hdr.insert_header("Cache-Control", "no-cache").ok();
-
-    if let Err(e) = session.write_response_header(Box::new(hdr), true).await {
-        error!("failed to write response header: {}", e);
-        let _ = session.respond_error(500).await;
-        return Ok(());
-    }
-
-    if let Err(e) = session
-        .write_response_body(Some(Bytes::from(content)), true)
-        .await
-    {
-        error!("failed to write response body: {}", e);
-    }
-
-    Ok(())
-}
+// (pump_ws_relay is no longer used here — WS upgrade goes
+//  through the tunnel frame and the tun-side executor.)

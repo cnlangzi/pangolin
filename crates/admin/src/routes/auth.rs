@@ -7,12 +7,12 @@ use bytes::Bytes as Buf;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 
+use crate::App;
 use crate::state::{
-    make_csrf_cookie, make_logout_cookie, make_logout_csrf_cookie, make_session_cookie,
-    SessionStore,
+    SessionStore, make_csrf_cookie, make_logout_cookie, make_logout_csrf_cookie,
+    make_session_cookie,
 };
 use crate::templates::LoginTemplate;
-use crate::App;
 
 /// Serve the login page HTML.
 pub async fn render_login(next: Option<&str>) -> http::Result<Response<Full<Buf>>> {

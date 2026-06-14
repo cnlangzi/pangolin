@@ -12,10 +12,10 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::tunnel::YamuxTunnel;
 use crate::{
+    EventBuffer, EventType, Indexes,
     config::Config,
     db,
     types::{ChallengeType, DnsProviderKind},
-    EventBuffer, EventType, Indexes,
 };
 
 /// In-memory index of DNS-related state, rebuilt from DB on startup and
@@ -137,12 +137,12 @@ pub fn plan_issuance(
     // Dns01, leaving the base unable to find a matching
     // http-01 challenge.
     let order_provider: Option<String> = sans.iter().find_map(|san| idx.lookup_dns(san).clone());
-    if let Some(p) = &order_provider {
-        if !idx.providers.contains_key(p) {
-            return Err(PangolinError::Config(format!(
-                "order references unknown or disabled dns_provider '{p}'"
-            )));
-        }
+    if let Some(p) = &order_provider
+        && !idx.providers.contains_key(p)
+    {
+        return Err(PangolinError::Config(format!(
+            "order references unknown or disabled dns_provider '{p}'"
+        )));
     }
     let any_wildcard = sans.iter().any(|s| s.starts_with("*."));
     if any_wildcard && order_provider.is_none() {
@@ -639,10 +639,11 @@ mod tests {
         let plan =
             plan_issuance(&["example.com".into(), "*.example.com".into()], &d, &idx).unwrap();
         assert_eq!(plan.challenges.len(), 2);
-        assert!(plan
-            .challenges
-            .iter()
-            .all(|(_, c)| *c == ChallengeType::Dns01));
+        assert!(
+            plan.challenges
+                .iter()
+                .all(|(_, c)| *c == ChallengeType::Dns01)
+        );
     }
 
     #[test]

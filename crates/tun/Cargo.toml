@@ -18,8 +18,15 @@ path = "src/lib.rs"
 tokio.workspace = true
 fastwebsockets.workspace = true
 tokio-yamux.workspace = true
-rustls.workspace = true
-webpki-roots.workspace = true
+bytes = "1"
+# pingora-core powers the tun-side HTTP client (v8 design).
+# We use the default features (matches ngx) — the rustls
+# feature is enabled transitively through `rustls` from
+# the workspace patch. Replacing the previous reqwest +
+# rustls + webpki-roots stack.
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+async-trait.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -33,9 +40,6 @@ clap.workspace = true
 chrono.workspace = true
 pangolin-core = { version = "0.2.0", path = "../pangolin-core" }
 http = "1.4.1"
-url = "2.5.8"
-mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
 
 [dev-dependencies]
 # `figment::Jail` lives behind the `test` feature flag — used by the

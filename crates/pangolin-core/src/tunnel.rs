@@ -72,8 +72,8 @@ pub use tokio_yamux as yamux;
 use yamux::{Config as YamuxConfig, Session, StreamHandle};
 
 // Re-exports for the manual WS handshake helpers below.
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use sha1::{Digest, Sha1};
 
 /// Marker for which side of a tunnel we are.
@@ -431,6 +431,72 @@ where
     }
 }
 
+/// Parse a complete HTTP/1.1 request from a byte slice (synchronous
+/// variant of [`read_http_request`]). Used by the tunnel frame
+/// decoder, which already has the entire request as a single
+/// `&[u8]` (no streaming reader).
+pub fn parse_http_request_bytes(bytes: &[u8]) -> IoResult<HttpRequest> {
+    let idx = find_header_end(bytes)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no CRLFCRLF in request bytes"))?;
+    let head_end = idx + 4;
+    let head_bytes = &bytes[..head_end];
+    let body_prefix = &bytes[head_end..];
+    let head = std::str::from_utf8(head_bytes)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+    let parsed = parse_request_head(head)?;
+    // Body: read from body_prefix (in-memory) instead of an
+    // AsyncRead. For Length(n) we copy n bytes; for Chunked we
+    // decode; for UntilEof we copy everything after the head.
+    let body = match parsed.body_kind {
+        BodyKind::Length(n) => {
+            if body_prefix.len() < n {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!("short body: expected {} got {}", n, body_prefix.len()),
+                ));
+            }
+            body_prefix[..n].to_vec()
+        }
+        BodyKind::Chunked => {
+            let mut out = Vec::new();
+            let mut cursor = 0usize;
+            loop {
+                let crlf = find_crlf(&body_prefix[cursor..])
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "chunked: no size CRLF"))?;
+                let size_line = std::str::from_utf8(&body_prefix[cursor..cursor + crlf])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+                let size_str = size_line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_str, 16)
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("chunk size: {e}")))?;
+                cursor += crlf + 2;
+                if size == 0 {
+                    // skip trailers + final CRLF
+                    let _ = find_crlf(&body_prefix[cursor..]);
+                    break;
+                }
+                if body_prefix.len() < cursor + size + 2 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "chunked: short body"));
+                }
+                out.extend_from_slice(&body_prefix[cursor..cursor + size]);
+                cursor += size + 2;
+            }
+            out
+        }
+        BodyKind::UntilEof => body_prefix.to_vec(),
+    };
+    Ok(HttpRequest {
+        method: parsed.method,
+        target: parsed.target,
+        version: parsed.version,
+        headers: parsed.headers,
+        body,
+    })
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|w| w == b"\r\n")
+}
+
 /// Serialise an `HttpRequest` back into a wire-format HTTP/1.1
 /// request byte buffer.
 pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
@@ -540,7 +606,7 @@ pub fn strip_hop_by_hop_headers(headers: &mut Vec<(String, String)>) {
 
 // ---- internal HTTP head/body types ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: String,
     pub target: String,
@@ -549,7 +615,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub version: String,
     pub status_line: String,
