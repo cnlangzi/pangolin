@@ -16,7 +16,7 @@ use pangolin_core::{App, CertManager};
 fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
     CertManager::new(
         cert_dir.clone(),
-        String::new(),
+        None,
         String::new(),
         30,
         24,

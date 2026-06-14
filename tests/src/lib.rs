@@ -1,5 +1,22 @@
 //! Pangolin integration tests.
 
+// Lint exceptions for the test crate.  These tests intentionally
+// scaffold helpers (`MockBackend`, `AdminClient.put_form`, etc.)
+// that are only exercised by a subset of tests in the same file;
+// marking everything `#[allow]` is cheaper than maintaining
+// `#[allow(dead_code)]` annotations on every helper, and the
+// `unused_imports` warnings here mostly come from feature-gated
+// modules whose items are used elsewhere under `#[cfg]`.  Real
+// production code (in `crates/*`) keeps the strict `-D warnings`
+// treatment.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::bool_assert_comparison)]
+
 #[cfg(feature = "integration")]
 mod routing;
 
