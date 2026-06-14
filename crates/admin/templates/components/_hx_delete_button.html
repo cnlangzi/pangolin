@@ -1,0 +1,67 @@
+{# components/_hx_delete_button.html — unified HTMX delete button macro. #}
+{#                                                                             #}
+{# This file is NOT meant to be `{% include %}`-ed directly. Instead,        #}
+{# `{% import "components/_hx_delete_button.html" as hx %}` it once per     #}
+{# template and call `{{ hx::btn(url=..., confirm=..., variant=...,           #}
+{# target=...) }}` wherever a delete button is needed.                        #}
+{#                                                                             #}
+{# Why this exists (issue #48):                                               #}
+{#   Before issue #48, every admin table had its own legacy POST wrapper    #}
+{#   around the delete button with a hidden CSRF input. The result was       #}
+{#   inconsistent UX (full page reload vs row swap) and a dual CSRF injection#}
+{#   path. This macro unifies on HTMX `hx-delete` so the row gets swapped    #}
+{#   out in place (`hx-swap="delete"`) and the CSRF token rides in the       #}
+{#   request body via `hx-vals`, matching the `__CSRF__` substitution that   #}
+{#   `render_with_csrf` already performs.                                    #}
+{#                                                                             #}
+{# Parameters:                                                                #}
+{#   url       (required) — DELETE endpoint, e.g. "/api/sites/foo"            #}
+{#   confirm   (required) — hx-confirm message, e.g. "Delete site foo?"      #}
+{#   variant   (optional) — "icon" (default; p-1.5 trash icon, desktop row)   #}
+{#                          or "text" (full-width red "Delete" button, mobile)#}
+{#   target    (optional) — hx-target selector. Defaults to "this" which     #}
+{#                          only works when the button is not inside a row   #}
+{#                          wrapper. Pass "closest tr" for table rows or     #}
+{#                          "closest div" / specific ID for mobile cards.    #}
+{#   extra_class (optional) — additional Tailwind classes appended.          #}
+{#                                                                             #}
+{# The CSRF placeholder `__CSRF__` is replaced at render time by             #}
+{# `render_with_assets_and_csrf`. See `lib.rs`.                               #}
+{#                                                                             #}
+{# Example usage:                                                             #}
+{#   {% import "components/_hx_delete_button.html" as hx %}                   #}
+{#   …                                                                        #}
+{#   {{ hx::btn(                                                             #}
+{#        url="/api/sites/foo",                                               #}
+{#        confirm="Delete site foo?",                                        #}
+{#        variant="icon",                                                     #}
+{#        target="closest tr",                                                #}
+{#   ) }}                                                                     #}
+
+{% macro btn(url, confirm, variant, target, extra_class) %}
+{% if variant == "text" %}
+{# ── Mobile / card variant — full-width red "Delete" button. ──────────── #}
+<button hx-delete="{{ url }}"
+  hx-vals='{"_csrf": "__CSRF__"}'
+  hx-confirm="{{ confirm }}"
+  hx-swap="delete"
+  {% if target %}hx-target="{{ target }}"{% endif %}
+  class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors {{ extra_class }}"
+  title="Delete">
+  Delete
+</button>
+{% else %}
+{# ── Desktop / table variant — p-1.5 trash-icon button (default). ─────── #}
+<button hx-delete="{{ url }}"
+  hx-vals='{"_csrf": "__CSRF__"}'
+  hx-confirm="{{ confirm }}"
+  hx-swap="delete"
+  {% if target %}hx-target="{{ target }}"{% endif %}
+  class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors {{ extra_class }}"
+  title="Delete">
+  {# Heroicons "trash" outline, 24x24 stroked at 2px — matches the icon #}
+  {# style used across admin tables.                                   #}
+  <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
+</button>
+{% endif %}
+{% endmacro btn %}
