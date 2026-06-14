@@ -6,6 +6,13 @@ sh-ali ansible_host=sh-ali ansible_user=ecs-user ansible_ssh_private_key_file=~/
 [ngx:vars]
 ansible_python_interpreter=auto_silent
 
+[tun]
+xiajie ansible_host=xiajie ansible_user=dayi ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+
+[tun:vars]
+ansible_python_interpreter=auto_silent
+
 # ngx defaults
 ngx_port_http=80
 ngx_port_https=0
