@@ -697,9 +697,7 @@ impl ProxyHttp for AppProxy {
                 .headers
                 .iter()
                 .any(|(hk, hv)| hk.as_str().eq_ignore_ascii_case(k) && hv == v.as_str());
-            if !already
-                && let Ok(value) = HeaderValue::from_str(v)
-            {
+            if !already && let Ok(value) = HeaderValue::from_str(v) {
                 upstream.insert_header(k.to_string(), value).ok();
             }
         }
@@ -831,12 +829,13 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     }
 }
 
-/// Parse the status code from a status line like
-/// "HTTP/1.1 200 OK" → 200.
+/// Parse the status code from an `HttpResponse::status_line`
+/// (format: `"200 OK"`, with the version carried separately in
+/// `HttpResponse::version`). Returns 502 if the line is malformed
+/// so a broken upstream cannot produce a 0-status response.
 fn parse_status_from_line(status_line: &str) -> u16 {
-    let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next();
-    parts
+    status_line
+        .split(' ')
         .next()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(502)
