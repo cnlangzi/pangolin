@@ -378,7 +378,6 @@ pub struct CertManager {
     pub acme_directory: String,
     pub renew_threshold_days: u32,
     pub renew_check_interval_hours: u32,
-    pub renew_max_retries: u32,
     /// Private key type: "ecdsa" or "rsa".
     pub key_type: String,
 }
@@ -392,7 +391,6 @@ impl CertManager {
         acme_directory: String,
         renew_threshold_days: u32,
         renew_check_interval_hours: u32,
-        renew_max_retries: u32,
         key_type: String,
     ) -> Self {
         Self {
@@ -401,7 +399,6 @@ impl CertManager {
             acme_directory,
             renew_threshold_days,
             renew_check_interval_hours,
-            renew_max_retries,
             key_type,
         }
     }
@@ -461,9 +458,8 @@ impl Default for CertManager {
             cert_dir: PathBuf::from("./certs"),
             email: None,
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
-            renew_threshold_days: 30,
+            renew_threshold_days: 14,
             renew_check_interval_hours: 6,
-            renew_max_retries: 3,
             key_type: "ecdsa".into(),
         }
     }

@@ -36,9 +36,8 @@
     ngx_acme_email: "{{ lookup('env', 'NGX_ACME__EMAIL') | default('', true) }}"
     ngx_acme_cert_dir: "{{ lookup('env', 'NGX_ACME__CERT_DIR') | default('/usr/local/pangolin/certs', true) }}"
     ngx_acme_directory: "{{ lookup('env', 'NGX_ACME__ACME_DIRECTORY') | default('https://acme-v02.api.letsencrypt.org/directory', true) }}"
-    ngx_acme_renew_threshold_days: "{{ lookup('env', 'NGX_ACME__RENEW_THRESHOLD_DAYS') | default('30', true) }}"
+    ngx_acme_renew_threshold_days: "{{ lookup('env', 'NGX_ACME__RENEW_THRESHOLD_DAYS') | default('14', true) }}"
     ngx_acme_renew_check_interval_hours: "{{ lookup('env', 'NGX_ACME__RENEW_CHECK_INTERVAL_HOURS') | default('6', true) }}"
-    ngx_acme_renew_max_retries: "{{ lookup('env', 'NGX_ACME__RENEW_MAX_RETRIES') | default('3', true) }}"
     ngx_acme_key_type: "{{ lookup('env', 'NGX_ACME__KEY_TYPE') | default('ecdsa', true) }}"
     ngx_log_level: "{{ lookup('env', 'NGX_LOG__LEVEL') | default('info', true) }}"
 

@@ -96,7 +96,6 @@ fn main() -> anyhow::Result<()> {
         config.acme.acme_directory.clone(),
         config.acme.renew_threshold_days,
         config.acme.renew_check_interval_hours,
-        config.acme.renew_max_retries,
         config.acme.key_type.clone(),
     );
     let app = Arc::new(pangolin_core::App::new(
@@ -159,15 +158,16 @@ fn main() -> anyhow::Result<()> {
         let acme_for_service = acme_state.clone();
         acme_state.install_on(&app).await;
 
-        // Scan `cert_dir` for cert blobs (manually placed by an
-        // operator, or left over from a pre-V4 install) and import
-        // missing rows into the `certs` table. Idempotent — existing
-        // rows are not touched, so a re-scan after operator edits is
-        // safe.
-        match crate::acme::scan_and_import_blobs(&app).await {
-            Ok(n) if n > 0 => log::info!("ACME: scanned cert_dir, imported {} blob row(s)", n),
-            Ok(_) => log::info!("ACME: cert_dir scan complete, no new blobs"),
-            Err(e) => log::warn!("ACME: cert_dir scan failed: {}", e),
+        // Reconcile `cert_dir` with the `certs` table. Disk is the
+        // source of truth: every parseable cert blob is upserted into
+        // the DB so a successful on-disk issuance always surfaces on
+        // the dashboard, even if the DB row was previously stuck in
+        // Failed / Pending / Skipped. Idempotent — rows that already
+        // match the file are left alone.
+        match crate::acme::scan_and_reconcile_blobs(&app).await {
+            Ok(n) if n > 0 => log::info!("ACME: cert_dir reconciled, {} row(s) updated", n),
+            Ok(_) => log::info!("ACME: cert_dir reconciliation complete, no changes"),
+            Err(e) => log::warn!("ACME: cert_dir reconciliation failed: {}", e),
         }
 
         // Build & start services (fail-fast on startup error).

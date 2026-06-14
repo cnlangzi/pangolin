@@ -264,9 +264,12 @@ pub struct Tun {
 /// ```
 ///
 /// All variants serialize as lowercase to match the on-disk DB representation
-/// (`certs.status`).
+/// (`certs.status`). The V5-added `RateLimited` uses snake_case
+/// (`rate_limited`) to keep the DB row legible when scanned by hand;
+/// the `snake_case` rename rule keeps serde's output in lockstep
+/// with [`CertStatus::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum CertStatus {
     /// Auto-issue requested but ACME hasn't started yet. Set by
     /// `upsert_domain` when `auto_issue=true` so the operator immediately
@@ -285,6 +288,19 @@ pub enum CertStatus {
     /// without DNS association). `last_error` carries the reason. Distinct
     /// from `Failed` because retrying without fixing config will not help.
     Skipped,
+    /// The ACME server told us we're being rate-limited (HTTP 429 or
+    /// `urn:ietf:params:acme:error:rateLimited`). The dashboard
+    /// renders this as a distinct color (purple vs red) and shows the
+    /// server-supplied retry timestamp from `next_retry_at`. The loop
+    /// will not touch this row until `next_retry_at` has passed.
+    RateLimited,
+    /// The ACME server returned a permanent rejection that no amount
+    /// of retrying will resolve (e.g. `rejectedIdentifier` for a
+    /// domain with no dot, `invalid` for a malformed CSR, `caa`
+    /// for a CAA-policy violation). The retry button is hidden; the
+    /// operator must fix the underlying issue and re-trigger via
+    /// `POST /certs/retry`.
+    Permanent,
 }
 
 impl CertStatus {
@@ -296,6 +312,8 @@ impl CertStatus {
             CertStatus::Issued => "issued",
             CertStatus::Failed => "failed",
             CertStatus::Skipped => "skipped",
+            CertStatus::RateLimited => "rate_limited",
+            CertStatus::Permanent => "permanent",
         }
     }
 
@@ -306,23 +324,41 @@ impl CertStatus {
 
     /// True when an operator-facing retry button makes sense. The UI uses
     /// this to decide whether to render the ↻ icon next to the row.
+    /// `Permanent` is intentionally excluded — the operator must fix
+    /// the underlying issue (domain, DNS, CA policy) first, so
+    /// "retry" would just hammer the server with the same rejected
+    /// request. `RateLimited` is included because the server has
+    /// told us when to come back.
     pub fn is_retryable(self) -> bool {
         matches!(
             self,
-            CertStatus::Failed | CertStatus::Pending | CertStatus::Skipped
+            CertStatus::Failed
+                | CertStatus::Pending
+                | CertStatus::Skipped
+                | CertStatus::RateLimited
+                | CertStatus::Permanent
         )
+    }
+
+    /// True when the renewal loop should not touch this row at all,
+    /// even if `next_retry_at` has passed. Currently only `Permanent`
+    /// — the loop requires a manual `POST /certs/retry` to clear it.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, CertStatus::Permanent)
     }
 
     /// Every status variant in DB-storage order. Used by `count_certs_by_status`
     /// to ensure every key is present in the result map (zero-valued when no
     /// rows match) — the dashboard summary endpoint relies on this.
-    pub fn all() -> [CertStatus; 5] {
+    pub fn all() -> [CertStatus; 7] {
         [
             CertStatus::Pending,
             CertStatus::Issuing,
             CertStatus::Issued,
             CertStatus::Failed,
             CertStatus::Skipped,
+            CertStatus::RateLimited,
+            CertStatus::Permanent,
         ]
     }
 }
@@ -342,9 +378,111 @@ impl std::str::FromStr for CertStatus {
             "issued" => Ok(CertStatus::Issued),
             "failed" => Ok(CertStatus::Failed),
             "skipped" => Ok(CertStatus::Skipped),
+            "rate_limited" => Ok(CertStatus::RateLimited),
+            "permanent" => Ok(CertStatus::Permanent),
             other => Err(format!("unknown cert status: {other}")),
         }
     }
+}
+
+/// Classification of an ACME attempt failure. Drives whether the next
+/// scan will retry, and how long it will wait. Modelled on
+/// [Caddy CertMagic's `ErrNoRetry` wrapper][cm] and
+/// [acme4j's `AcmeServerException.getRetryAfter()`][acme4j].
+///
+/// [cm]: https://github.com/caddyserver/certmagic/blob/master/acmeissuer.go
+/// [acme4j]: https://github.com/shred/acme4j/blob/master/acme4j-client/src/main/java/org/shredzone/acme4j/exception/AcmeServerException.java
+///
+/// Serializes into the `certs.error_class` column as a compact string:
+///   "transient"            → CertErrorClass::Transient
+///   "permanent"            → CertErrorClass::Permanent
+///   "rate_limited:<rfc3339>" → CertErrorClass::RateLimited { retry_at }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CertErrorClass {
+    /// Network timeout, 5xx, DNS lookup failure. The renewal loop
+    /// applies a backoff schedule (1m → 30m → 1h → 6h) and retries
+    /// automatically.
+    Transient,
+    /// ACME server returned a rejection that no amount of retrying
+    /// will resolve: `rejectedIdentifier` (e.g. domain with no dot),
+    /// `invalid` (malformed CSR), `unauthorized` (account not
+    /// authorized for the identifier), `caa` (CAA record blocks us),
+    /// `dns` (DNS-01 record not set up), `connection` (HTTP-01
+    /// challenge couldn't reach port 80). The renewal loop will
+    /// **not** retry this row; an operator must fix the underlying
+    /// issue and `POST /certs/retry`.
+    Permanent,
+    /// The server told us we're being rate-limited (HTTP 429 or
+    /// `urn:ietf:params:acme:error:rateLimited`). `retry_at` is the
+    /// server's hint (parsed from the `Retry-After` header when
+    /// instant-acme surfaces it, or from the ACME problem detail
+    /// string "retry after 2026-06-15 19:28:55 UTC"). The renewal
+    /// loop will not touch this row until `retry_at` has passed.
+    RateLimited { retry_at: DateTime<Utc> },
+}
+
+impl CertErrorClass {
+    /// Compact DB representation. `RateLimited` carries its retry
+    /// timestamp in the same string so the column is a single TEXT
+    /// cell — no separate `next_retry_at` is needed for the
+    /// rate-limited case, but we still write `next_retry_at` so the
+    /// renewal loop's index can find due rows cheaply.
+    pub fn as_str(&self) -> String {
+        match self {
+            CertErrorClass::Transient => "transient".to_string(),
+            CertErrorClass::Permanent => "permanent".to_string(),
+            CertErrorClass::RateLimited { retry_at } => {
+                format!("rate_limited:{}", retry_at.to_rfc3339())
+            }
+        }
+    }
+
+    /// Parse the DB representation back into an enum. Returns `None`
+    /// on unrecognized strings (forward-compatible — future classes
+    /// will simply round-trip as `None` and surface as Transient).
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "transient" {
+            Some(CertErrorClass::Transient)
+        } else if s == "permanent" {
+            Some(CertErrorClass::Permanent)
+        } else if let Some(rest) = s.strip_prefix("rate_limited:") {
+            chrono::DateTime::parse_from_rfc3339(rest)
+                .ok()
+                .map(|dt| CertErrorClass::RateLimited {
+                    retry_at: dt.with_timezone(&Utc),
+                })
+        } else {
+            None
+        }
+    }
+}
+
+/// The CertMagic-style backoff schedule. Each entry is the wait
+/// before attempt N+1, given that attempt N just failed. After
+/// 30 entries (each capped at 6h), the schedule bottoms out at
+/// 6h — the loop will keep trying every 6h until `next_retry_at`
+/// is no longer in the future or an operator intervenes.
+///
+/// Total budget from the schedule is roughly:
+///   1 + 1 + 2 + 5 + 10 + 30 + 60 + 120 + 240 + (21 × 360) = 7940 min ≈ 5.5 days.
+/// Within the 14-day `renew_threshold_days` budget, this gives
+/// multiple chances to recover from a transient outage before the
+/// cert actually expires.
+pub const ACME_BACKOFF_SCHEDULE_SECS: &[u64] = &[
+    60, 60, 120, 300, 600, 1800, 3600, 7200, 14400,
+    21600, // 1m, 1m, 2m, 5m, 10m, 30m, 1h, 2h, 4h, 6h
+    21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h
+    21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h
+    21600, 21600, 21600, 21600, 21600, 21600, 21600, 21600, // 8 × 6h
+];
+
+/// Pick the wait duration for the next retry of an attempt that
+/// just failed. `attempt_count` is the number of attempts that have
+/// already happened for this row in the current failure streak.
+pub fn next_backoff(attempt_count: u32) -> std::time::Duration {
+    let idx = (attempt_count as usize).min(ACME_BACKOFF_SCHEDULE_SECS.len() - 1);
+    std::time::Duration::from_secs(ACME_BACKOFF_SCHEDULE_SECS[idx])
 }
 
 /// Certificate (certs table). domain is the primary key (1:1).
@@ -385,6 +523,31 @@ pub struct Cert {
     /// transition to `Issued`.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Earliest UTC timestamp at which the renewal loop should retry
+    /// this row. Set on every failure (RateLimited uses the server's
+    /// `Retry-After`; Transient uses the backoff schedule). Cleared
+    /// on `Issued` and on `recover_stuck_issuing_rows`. NULL means
+    /// "no scheduled retry" (e.g. fresh `Pending` row, or `Issued`).
+    #[serde(default)]
+    pub next_retry_at: Option<DateTime<Utc>>,
+    /// Classified error from the last failed attempt. Drives both
+    /// the UI badge (rate-limited vs permanent get distinct colors)
+    /// and the renewal loop's retry policy. `None` for `Issued` rows
+    /// and for rows that have never been attempted.
+    #[serde(default)]
+    pub error_class: Option<CertErrorClass>,
+    /// Monotonic counter of failed attempts in the current failure
+    /// streak. Reset to 0 on successful `Issued` transition. Used
+    /// by `next_backoff` to pick the right slot in the schedule.
+    #[serde(default)]
+    pub attempt_count: u32,
+    /// instant-acme Order URL. Set after the order is created and
+    /// persisted across restarts so the renewal loop can resume
+    /// polling an in-flight order instead of opening a fresh one.
+    /// Cleared on `Issued`, on `recover_stuck_issuing_rows`, and on
+    /// transition to a terminal status.
+    #[serde(default)]
+    pub order_url: Option<String>,
 }
 
 fn default_cert_source() -> String {

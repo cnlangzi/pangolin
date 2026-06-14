@@ -236,12 +236,23 @@ pub struct AcmeConfig {
     pub renew_threshold_days: u32,
     #[serde(default = "default_renew_check_interval_hours")]
     pub renew_check_interval_hours: u32,
-    #[serde(default = "default_renew_max_retries")]
-    pub renew_max_retries: u32,
     /// Private key type for new certificates issued by ACME.
     /// "ecdsa" (default) or "rsa".
     #[serde(default = "default_key_type")]
     pub key_type: String,
+    /// Optional shell command to run before ACME issuance starts.
+    /// Receives domain name as $DOMAIN. Exit code 0 = proceed, non-zero = abort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_renew: Option<String>,
+    /// Optional shell command to run after successful ACME issuance.
+    /// Receives domain name as $DOMAIN, cert path as $CERT_FILE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_renew: Option<String>,
+    /// Optional shell command to run to deploy a newly issued cert.
+    /// Receives domain name as $DOMAIN, cert path as $CERT_FILE.
+    /// Runs after post_renew. Use for reloading nginx, copying to other hosts, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
 }
 
 fn default_key_type() -> String {
@@ -254,13 +265,10 @@ fn default_acme_directory() -> String {
     "https://acme-v02.api.letsencrypt.org/directory".into()
 }
 fn default_renew_threshold_days() -> u32 {
-    30
+    14
 }
 fn default_renew_check_interval_hours() -> u32 {
     6
-}
-fn default_renew_max_retries() -> u32 {
-    3
 }
 
 impl Default for AcmeConfig {
@@ -272,10 +280,12 @@ impl Default for AcmeConfig {
             email: None,
             cert_dir: "./certs".into(),
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
-            renew_threshold_days: 30,
+            renew_threshold_days: 14,
             renew_check_interval_hours: 6,
-            renew_max_retries: 3,
             key_type: default_key_type(),
+            pre_renew: None,
+            post_renew: None,
+            deploy: None,
         }
     }
 }
@@ -403,7 +413,7 @@ mod tests {
         // network — see docs/configuration.md.
         assert_eq!(c.admin.addr, "0.0.0.0:9081");
         // v2: cert.autorenew removed; per-domain auto_issue in DB
-        assert_eq!(c.acme.renew_threshold_days, 30);
+        assert_eq!(c.acme.renew_threshold_days, 14);
         assert_eq!(c.acme.key_type, "ecdsa");
     }
 
@@ -462,9 +472,8 @@ mod tests {
                   email: "ops@example.com"
                   cert_dir: "/etc/pangolin/certs"
                   acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
-                  renew_threshold_days: 14
+                  renew_threshold_days: 21
                   renew_check_interval_hours: 12
-                  renew_max_retries: 5
                   key_type: "rsa"
 
                 log:
@@ -477,7 +486,7 @@ mod tests {
             assert_eq!(c.tunnel.ws_path, "/tunnel");
             assert_eq!(c.admin.username, "root");
             assert!(c.cache.enabled);
-            assert_eq!(c.acme.renew_threshold_days, 14);
+            assert_eq!(c.acme.renew_threshold_days, 21);
             assert_eq!(c.acme.key_type, "rsa");
             assert_eq!(
                 c.acme.acme_directory,

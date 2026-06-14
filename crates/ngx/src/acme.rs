@@ -25,6 +25,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::TimeZone as _;
 use chrono::{DateTime, Utc};
 use instant_acme::{
     Account, AccountCredentials, Challenge, ChallengeType, Identifier, NewOrder, OrderStatus,
@@ -176,6 +177,226 @@ fn format_challenge_error(id: &str, ch: &Challenge) -> Option<String> {
         "{}({:?}, challenge_status={:?}): [HTTP {}] {} | type={}",
         id, ch.r#type, ch.status, http, detail, err_type
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+//
+// Maps an `anyhow::Error` from `issue_with_plan` into a
+// `pangolin_core::CertErrorClass` so the renewal loop can pick the
+// right retry policy. Modelled on CertMagic's `ErrNoRetry` wrapper
+// and acme4j's `AcmeServerException` taxonomy.
+//
+// Two sources of truth:
+//   1. `instant_acme::Error::Api(Problem).r#type` — the structured
+//      ACME problem URI, e.g. `urn:ietf:params:acme:error:rateLimited`.
+//      The most reliable signal.
+//   2. The rendered error string. We only fall back to this for
+//      errors that don't carry a Problem (network, hyper, timeout) or
+//      for backward compatibility with rows whose `last_error` is
+//      older than the V5 classifier.
+//
+// ACME problem URIs we treat as PERMANENT (no retry helps):
+//   - rejectedIdentifier  domain syntactically invalid / unsupported
+//   - invalid             malformed CSR or order
+//   - unauthorized        account not authorized for this identifier
+//   - caa                 CAA record blocks issuance
+//   - dns                 DNS-01 record could not be set
+//   - connection          HTTP-01 challenge couldn't reach port 80
+//   - malformed           request was syntactically invalid
+//   - unsupportedIdentifier  server doesn't issue for this identifier type
+//
+// Treated as RATE_LIMITED (retry-after, if present, parsed from string):
+//   - rateLimited  server explicitly told us we're being throttled
+//   - HTTP 429     in `Problem.status`
+//
+// Everything else (network, hyper, timeout, serverInternal, unknown
+// problems) is TRANSIENT — backoff schedule applies.
+
+/// Pull the structured ACME Problem out of an `anyhow::Error` chain,
+/// if there is one. The Problem carries the machine-readable type
+/// URI and the HTTP status, both of which are more reliable than
+/// string-matching the rendered error.
+fn extract_problem(err: &anyhow::Error) -> Option<&instant_acme::Problem> {
+    for cause in err.chain() {
+        if let Some(instant_acme::Error::Api(p)) = cause.downcast_ref::<instant_acme::Error>() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Walk the `anyhow::Error` chain looking for `instant_acme::Error`
+/// variants other than `Api`. Used to flag network / timeout / HTTP
+/// failures as Transient.
+fn extract_transport_error(err: &anyhow::Error) -> Option<&instant_acme::Error> {
+    for cause in err.chain() {
+        if let Some(acme_err) = cause.downcast_ref::<instant_acme::Error>() {
+            if !matches!(acme_err, instant_acme::Error::Api(_)) {
+                return Some(acme_err);
+            }
+        }
+    }
+    None
+}
+
+/// Classify an ACME failure. `attempt_count` is the current streak
+/// (used to pick the next backoff slot). Returns:
+///   - `(class, last_error, next_retry_at)` for the DB row
+///   - `last_error` is the human-readable message (the rendered
+///     `err.to_string()` so the dashboard can still show it)
+pub fn classify_acme_error(
+    err: &anyhow::Error,
+    now: DateTime<Utc>,
+) -> (pangolin_core::CertErrorClass, String, DateTime<Utc>) {
+    let last_error = err.to_string();
+
+    // ── 1. structured Problem from instant-acme
+    if let Some(problem) = extract_problem(err) {
+        let problem_type = problem.r#type.as_deref().unwrap_or("");
+        let status = problem.status.unwrap_or(0);
+        let detail = problem.detail.as_deref().unwrap_or("");
+
+        // Rate-limited via the standard ACME problem type OR HTTP 429.
+        if problem_type.ends_with("rateLimited") || status == 429 {
+            let retry_at = parse_retry_after_hint(detail, problem_type, now)
+                .unwrap_or_else(|| now + pangolin_core::next_backoff(0));
+            return (
+                pangolin_core::CertErrorClass::RateLimited { retry_at },
+                last_error,
+                retry_at,
+            );
+        }
+
+        // Permanent — server told us the request is invalid, full stop.
+        if problem_type.ends_with("rejectedIdentifier")
+            || problem_type.ends_with(":invalid")
+            || problem_type.ends_with("unauthorized")
+            || problem_type.ends_with("caa")
+            || problem_type.ends_with(":dns")
+            || problem_type.ends_with("connection")
+            || problem_type.ends_with("malformed")
+            || problem_type.ends_with("unsupportedIdentifier")
+        {
+            // No retry — set next_retry_at to far future so even a
+            // misconfigured loop won't touch this row until the
+            // operator clears the status. Use the per-row max slot
+            // of the backoff (6h) as a stable "very-future" marker.
+            return (
+                pangolin_core::CertErrorClass::Permanent,
+                last_error,
+                now + std::time::Duration::from_secs(60 * 60 * 24 * 365),
+            );
+        }
+    }
+
+    // ── 2. transport-level errors (no Problem attached)
+    if let Some(instant_acme::Error::Timeout(_) | instant_acme::Error::Hyper(_)) =
+        extract_transport_error(err)
+    {
+        let backoff = pangolin_core::next_backoff(0);
+        return (
+            pangolin_core::CertErrorClass::Transient,
+            last_error,
+            now + backoff,
+        );
+    }
+
+    // ── 3. string fallback — covers older rows whose `last_error`
+    //    predates the V5 classifier, and the case where instant-acme
+    //    wrapped a std error that doesn't downcast cleanly.
+    let lower = last_error.to_lowercase();
+    if lower.contains("ratelimited")
+        || lower.contains("rate limit")
+        || lower.contains("too many")
+        || lower.contains("retry after")
+    {
+        let retry_at = parse_retry_after_hint(&last_error, "", now)
+            .unwrap_or_else(|| now + pangolin_core::next_backoff(0));
+        return (
+            pangolin_core::CertErrorClass::RateLimited { retry_at },
+            last_error,
+            retry_at,
+        );
+    }
+    if lower.contains("rejectedidentifier")
+        || lower.contains("domain name needs at least one dot")
+        || lower.contains("caa")
+        || lower.contains("unauthorized")
+        || lower.contains("malformed")
+    {
+        return (
+            pangolin_core::CertErrorClass::Permanent,
+            last_error,
+            now + std::time::Duration::from_secs(60 * 60 * 24 * 365),
+        );
+    }
+
+    // ── 4. default: transient
+    let backoff = pangolin_core::next_backoff(0);
+    (
+        pangolin_core::CertErrorClass::Transient,
+        last_error,
+        now + backoff,
+    )
+}
+
+/// Parse the retry-after hint out of an ACME problem detail string.
+///
+/// The server puts it in the detail, not the type. Common shapes:
+///   "too many certificates (5) already issued for this exact set
+///    of identifiers in the last 168h0m0s, retry after 2026-06-15
+///    19:28:55 UTC"
+///   "rate limited; retry after 1234 seconds"
+///   "rate limited; retry after 2026-06-15T19:28:55Z"
+fn parse_retry_after_hint(
+    detail: &str,
+    problem_type: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let lower = format!("{} {}", problem_type.to_lowercase(), detail.to_lowercase());
+    let marker = "retry after";
+    let idx = lower.find(marker)?;
+    let tail = &detail[idx + marker.len()..].trim_start();
+
+    // Try absolute timestamp first: "2026-06-15 19:28:55 UTC"
+    // or "2026-06-15T19:28:55Z".
+    for fmt in &[
+        "%Y-%m-%d %H:%M:%S UTC",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        // Take the first word/date-token after "retry after".
+        let token: String = tail
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ',' && *c != ';')
+            .collect();
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&token, fmt) {
+            return Some(Utc.from_utc_datetime(&naive));
+        }
+    }
+
+    // Try relative: "retry after 1234 seconds" or "retry after 30m".
+    let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Ok(n) = num.parse::<u64>() {
+        // Heuristic: "1234 seconds" → seconds, "30m" → minutes, "2h" → hours.
+        let unit_hint = tail[num.len()..].trim_start().to_lowercase();
+        let dur = if unit_hint.starts_with("sec") {
+            std::time::Duration::from_secs(n)
+        } else if unit_hint.starts_with("min") || unit_hint.starts_with("m") {
+            std::time::Duration::from_secs(n * 60)
+        } else if unit_hint.starts_with("hour") || unit_hint.starts_with("h") {
+            std::time::Duration::from_secs(n * 60 * 60)
+        } else {
+            // Bare number — assume seconds (LE usually quotes "retry
+            // after <seconds>").
+            std::time::Duration::from_secs(n)
+        };
+        return Some(now + dur);
+    }
+    None
 }
 
 /// ACME client for issuing and renewing certificates.
@@ -900,7 +1121,15 @@ impl AcmeClient {
             domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
         let new_order = NewOrder::new(&identifiers);
         let mut order = self.account.new_order(&new_order).await?;
-        emit("order-created", order.url().to_string());
+        let order_url = order.url().to_string();
+        emit("order-created", order_url.clone());
+
+        // Return the order_url alongside the written paths so the caller
+        // can persist it in the DB after the order is created (before
+        // any awaited challenges, so a crash mid-flight lets the next
+        // startup resume from the same order_url).
+        // For now we don't actually return it — the v2 plan path will
+        // be refactored to expose it. This is the insertion point.
 
         // Pick the DNS provider once for the whole order. (All DNS-01
         // SANs in the plan must reference the same provider; the planner
@@ -1398,10 +1627,12 @@ fn parse_blob_metadata(blob: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, Vec<
     Ok((not_before, not_after, sans))
 }
 
-/// Scan `app.cert_manager.cert_dir` for cert blob files and import any
-/// whose domain isn't already in the `certs` table.
+/// Scan `app.cert_manager.cert_dir` for cert blob files and reconcile
+/// the `certs` table with what's on disk. **Disk is the source of
+/// truth:** every parseable cert blob on disk is reflected in the DB
+/// row for that domain.
 ///
-/// Two motivations (both reported by operators):
+/// Three motivations (all reported by operators):
 ///
 /// 1. Pre-V4 installs and operator-managed deployments may have
 ///    blob files on disk that were never reflected in the `certs`
@@ -1411,20 +1642,44 @@ fn parse_blob_metadata(blob: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, Vec<
 ///    account will issue NEW blobs alongside the old ones; without
 ///    a scan, the certs table would only contain the new ones and
 ///    the old SAN coverage would be invisible.
+/// 3. **A successful ACME issuance that wrote a cert blob but failed
+///    to update the DB row** (e.g. a transient DB error, a panic
+///    after the write, or — most commonly — an operator who manually
+///    placed a cert on disk) leaves the row stuck in `Failed` even
+///    though the cert is valid. The dashboard then shows the cert as
+///    failed and the operator has no way to recover except by
+///    deleting the row and triggering a re-issuance. This was the
+///    root cause of the "5 files on disk, 1 Issued + 6 Failed" state
+///    observed in production — the scan would skip the disk file
+///    because a `Failed` row already existed, and the row would
+///    never be updated.
 ///
-/// Conservative semantics:
-/// - **Don't clobber existing rows.** A domain that already appears
-///   in `certs` (in any status) is left alone — the operator's manual
-///   status, last_error, etc. take precedence over what's on disk.
-/// - **`source = 'disk-import'`** distinguishes these rows from
-///   manual uploads (`manual`) and ACME-issued (`acme`).
+/// Reconciliation semantics:
+/// - **Disk wins.** For every parseable cert blob, the DB row is
+///   upserted with `status=Issued`, `expires_at` from the leaf's
+///   `NotAfter`, `sans` from the SAN extension, `issued_at` /
+///   `created_at` from the leaf's `NotBefore`, and `last_error` /
+///   `started_at` cleared. The cert exists; the prior failure is
+///   moot.
+/// - **`source` is preserved** from the existing row if any (so
+///   `acme` stays `acme`, `manual` stays `manual`). New rows get
+///   `source = 'disk-import'` so the UI can show "this row was
+///   reconstructed from a file".
+/// - **Skip `Issuing` rows.** A row in `Issuing` status means an
+///   issuance is in flight elsewhere — we must not disturb it.
+///   (Shouldn't happen at startup because `recover_stuck_issuing_rows`
+///   runs first, but defensive.)
+/// - **Idempotent.** If the DB row already matches the file (status
+///   `Issued`, same expiry / SANs / issued_at / no error), the upsert
+///   is skipped so the log isn't noisy on every restart.
 /// - Skips `acme_account.json`, the legacy `acme_account+key`,
-///   dotfiles, directories (so `.well-known/` is invisible), and
-///   files that don't parse as a cert chain.
+///   dotfiles, directories (so `.well-known/` is invisible), files
+///   without a `-----BEGIN CERTIFICATE-----` marker, and files that
+///   don't parse as a cert chain.
 ///
-/// Idempotent — safe to call on every restart. Returns the count of
-/// rows actually inserted.
-pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
+/// Safe to call on every restart. Returns the count of rows
+/// actually upserted (new + reconciled).
+pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
     let cert_dir = &app.cert_manager.cert_dir;
     if !cert_dir.exists() {
         return Ok(0);
@@ -1433,7 +1688,7 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         Ok(e) => e,
         Err(e) => anyhow::bail!("read_dir {}: {}", cert_dir.display(), e),
     };
-    let mut imported = 0usize;
+    let mut synced = 0usize;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if path.is_dir() {
@@ -1461,15 +1716,6 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
             .unwrap_or(filename)
             .to_string();
 
-        // Skip if a row already exists — operator-owned, don't touch.
-        let existing = {
-            let conn = app.db.lock().await;
-            pangolin_core::db::get_cert(&conn, &domain).unwrap_or(None)
-        };
-        if existing.is_some() {
-            continue;
-        }
-
         // Read the blob; if it doesn't look like a cert chain, skip
         // (could be random operator file — we don't want to import
         // those as 'issued').
@@ -1491,25 +1737,42 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         // the cert was actually issued, not when we ran the scan),
         // NotAfter (the expiry the operator cares about), and the
         // SAN list (multi-SAN / wildcard coverage that would otherwise
-        // be lost). On parse failure: log loudly so operators can
-        // diagnose weird blob formats (`-----BEGIN TRUSTED ...`,
-        // BOM-prefixed PEM, etc.) instead of silently importing a row
-        // with no expiry.
+        // be lost). On parse failure: skip — we don't want to upsert
+        // a row that points at an unparseable file (operators can
+        // see the parse error in the log and fix the blob).
         let (not_before, not_after, sans) = match parse_blob_metadata(&content) {
             Ok(t) => t,
             Err(e) => {
-                log::warn!(
-                    "scan: {} metadata parse failed: {} — importing row with no expiry/SANs",
-                    path.display(),
-                    e
-                );
-                // Conservative fallback: register the existence of the
-                // blob anyway so the operator sees the file in /certs;
-                // expiry + SANs are blank and a renewal scan can fill
-                // them in later.
-                (chrono::Utc::now(), chrono::Utc::now(), vec![domain.clone()])
+                log::warn!("scan: skip {} (parse failed: {})", path.display(), e);
+                continue;
             }
         };
+
+        // Look up the existing row so we can (a) preserve the source
+        // label and ACME metadata, and (b) skip the write when the
+        // row already matches the file.
+        let existing = {
+            let conn = app.db.lock().await;
+            pangolin_core::db::get_cert(&conn, &domain).unwrap_or(None)
+        };
+
+        // Don't disturb an in-flight issuance. At startup this should
+        // be impossible (recover_stuck_issuing_rows runs first), but
+        // keep the guard for robustness if this code is ever called
+        // outside the startup path.
+        if let Some(ref e) = existing {
+            if matches!(e.status, pangolin_core::CertStatus::Issuing) {
+                log::debug!("scan: skip {} — Issuing status, in-flight", domain);
+                continue;
+            }
+        }
+
+        let new_source = existing
+            .as_ref()
+            .map(|e| e.source.clone())
+            .unwrap_or_else(|| "disk-import".into());
+        let new_acme_dns_provider = existing.as_ref().and_then(|e| e.acme_dns_provider.clone());
+        let new_acme_account_id = existing.as_ref().and_then(|e| e.acme_account_id.clone());
 
         let cert = pangolin_core::Cert {
             domain: domain.clone(),
@@ -1518,17 +1781,49 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
             expires_at: Some(not_after),
             created_at: not_before,
             sans,
-            // `disk-import` is a distinct source so the admin UI can
-            // tell at a glance "this row was reconstructed from a
-            // file, not from ACME or a manual upload form".
-            source: "disk-import".into(),
-            acme_dns_provider: None,
-            acme_account_id: None,
+            source: new_source,
+            acme_dns_provider: new_acme_dns_provider,
+            acme_account_id: new_acme_account_id,
             issued_at: not_before.timestamp(),
             status: pangolin_core::CertStatus::Issued,
             started_at: None,
             last_error: None,
+            next_retry_at: None,
+            error_class: None,
+            attempt_count: 0,
+            order_url: None,
         };
+
+        // Idempotency: if the row already reflects this file, skip
+        // the write. The cert blob hasn't changed (NotBefore unchanged
+        // means the leaf is the same cert) and the row is already
+        // `Issued` with no error. This keeps the log quiet on every
+        // restart.
+        if let Some(ref e) = existing {
+            let already_in_sync = e.status == cert.status
+                && e.expires_at == cert.expires_at
+                && e.sans == cert.sans
+                && e.issued_at == cert.issued_at
+                && e.last_error.is_none()
+                && e.started_at.is_none();
+            if already_in_sync {
+                continue;
+            }
+            log::info!(
+                "scan: reconciling {} — DB.status={:?} → file: valid cert (expires {})",
+                domain,
+                e.status,
+                not_after.format("%Y-%m-%d"),
+            );
+        } else {
+            log::info!(
+                "scan: importing {} from disk (expires {}, {} SAN(s))",
+                domain,
+                not_after.format("%Y-%m-%d"),
+                cert.sans.len(),
+            );
+        }
+
         {
             let conn = app.db.lock().await;
             if let Err(e) = pangolin_core::db::upsert_cert(&conn, &cert) {
@@ -1536,23 +1831,16 @@ pub async fn scan_and_import_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
                 continue;
             }
         }
-        imported += 1;
-        log::info!(
-            "scan: imported blob → {} (expires_at={}, SANs={:?})",
-            domain,
-            not_after.format("%Y-%m-%d"),
-            cert.sans,
-        );
+        synced += 1;
         app.add_event(pangolin_core::EventType::Info {
             message: format!(
-                "scan: imported {} (expires {}, {} SAN(s))",
+                "scan: {} → status=Issued (expires {})",
                 domain,
-                not_after.format("%Y-%m-%d"),
-                cert.sans.len()
+                not_after.format("%Y-%m-%d")
             ),
         });
     }
-    Ok(imported)
+    Ok(synced)
 }
 
 // ---------------------------------------------------------------------------
@@ -2213,6 +2501,42 @@ use tokio::sync::RwLock;
 
 use pangolin_core::{App, Domain};
 
+/// Execute a lifecycle hook command (pre_renew, post_renew, deploy).
+/// Returns Ok(()) if the hook is None or exits with status 0.
+/// Returns Err if the hook exits non-zero or fails to execute.
+async fn run_hook(cmd: Option<&str>, domain: &str, cert_file: Option<&str>) -> anyhow::Result<()> {
+    let Some(cmd) = cmd else {
+        return Ok(());
+    };
+    log::info!("hook[{}]: running: {}", domain, cmd);
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("DOMAIN", domain)
+        .env("CERT_FILE", cert_file.unwrap_or(""))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("hook spawn failed: {}", e))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow::anyhow!("hook wait failed: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "hook exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        log::info!("hook[{}]: {}", domain, stdout.trim());
+    }
+    Ok(())
+}
+
 /// Runtime state for ACME: holds the `Arc<dyn DnsProvider>` registry (loaded
 /// from the `dns_providers` table) and exposes the startup scan + renew loop.
 ///
@@ -2336,6 +2660,59 @@ impl AcmeState {
             .cloned()
             .collect::<Vec<_>>()
         {
+            // Skip certs the loop must not touch. Three cases:
+            //
+            //  1. `Failed` / `RateLimited` / `Skipped` rows whose
+            //     `next_retry_at` is in the future. The V5 backoff
+            //     schedule (rate-limit hint for `RateLimited`,
+            //     exponential cap for `Transient → Failed`, far-future
+            //     for `Skipped`) drives when to wake up.
+            //
+            //  2. `Permanent` rows. The classifier said "no retry
+            //     helps" (rejectedIdentifier, caa, unauthorized,
+            //     invalid, …); the operator must fix the issue and
+            //     click ↻ to clear the status.
+            //
+            //  3. (Removed) the prior "skip any Failed row outright"
+            //     policy — superseded by the per-row schedule, which
+            //     actually retries transient / rate-limited failures
+            //     automatically instead of forever sitting there.
+            let existing = {
+                let conn = app.db.lock().await;
+                pangolin_core::db::get_cert(&conn, &d.domain).ok().flatten()
+            };
+            if let Some(ref c) = existing {
+                // Terminal — never auto-retry, regardless of
+                // `next_retry_at`. The operator owns the recovery.
+                if c.status.is_terminal() {
+                    log::debug!(
+                        "ensure_certs({}): skipping — status={:?} (terminal)",
+                        d.domain,
+                        c.status
+                    );
+                    continue;
+                }
+                // Failure in a retryable state but not yet due.
+                if matches!(
+                    c.status,
+                    pangolin_core::CertStatus::Failed
+                        | pangolin_core::CertStatus::RateLimited
+                        | pangolin_core::CertStatus::Skipped
+                ) {
+                    let now = chrono::Utc::now();
+                    let due = c.next_retry_at.map(|t| t <= now).unwrap_or(false);
+                    if !due {
+                        log::debug!(
+                            "ensure_certs({}): skipping — status={:?}, next_retry_at={:?}",
+                            d.domain,
+                            c.status,
+                            c.next_retry_at
+                        );
+                        continue;
+                    }
+                }
+            }
+
             if let Err(e) = self.ensure_one(app, &d, &dns_index).await {
                 log::error!("ensure_certs({}): {}", d.domain, e);
                 app.add_event(pangolin_core::EventType::CertIssuanceSkipped {
@@ -2404,17 +2781,25 @@ impl AcmeState {
                 // can act on it from the admin UI instead of having to
                 // tail the log. `Skipped` is distinct from `Failed`
                 // because retrying without fixing the DNS config will
-                // not help.
+                // not help. Use the V5 set_cert_failure helper so the
+                // row also carries the `Permanent` class and a far-future
+                // `next_retry_at` — the loop won't touch this row until
+                // the operator fixes the config and clicks ↻.
+                let now = chrono::Utc::now();
                 let reason = e.to_string();
                 trace("skipped", reason.clone());
                 log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
+                let class = pangolin_core::CertErrorClass::Permanent;
+                let far_future = now + std::time::Duration::from_secs(60 * 60 * 24 * 365);
                 let conn = app.db.lock().await;
-                let _ = pangolin_core::db::set_cert_status_atomic(
+                let _ = pangolin_core::db::set_cert_failure(
                     &conn,
                     &domain.domain,
                     pangolin_core::CertStatus::Skipped,
-                    Some(&reason),
-                    None,
+                    &reason,
+                    &class,
+                    far_future,
+                    0,
                 );
                 drop(conn);
                 return Ok(());
@@ -2471,6 +2856,28 @@ impl AcmeState {
         }
         trace("transition", "Pending/Failed → Issuing".into());
 
+        // Run pre_renew hook before starting ACME issuance. If the hook
+        // exits non-zero, abort and mark the cert as Failed.
+        if let Err(e) = run_hook(app.config.acme.pre_renew.as_deref(), &domain.domain, None).await {
+            trace("pre_renew", format!("hook failed: {}", e));
+            let now = chrono::Utc::now();
+            let class = pangolin_core::CertErrorClass::Transient;
+            let next_retry = now + pangolin_core::next_backoff(0);
+            let conn = app.db.lock().await;
+            let _ = pangolin_core::db::set_cert_failure(
+                &conn,
+                &domain.domain,
+                pangolin_core::CertStatus::Failed,
+                &format!("pre_renew hook failed: {}", e),
+                &class,
+                next_retry,
+                1,
+            );
+            drop(conn);
+            return Err(e);
+        }
+        trace("pre_renew", "hook ok (or not configured)".into());
+
         let client = self.client(app).await?;
         let dns_providers = self.dns_providers.read().await.clone();
         trace(
@@ -2496,11 +2903,45 @@ impl AcmeState {
                 message: line,
             }));
         });
+
+        // Capture the order URL from the trace for DB persistence. We
+        // use a shared Arc<RwLock<Option<String>>> that the trace closure
+        // writes to when it sees "order-created", then we read after
+        // issue_with_plan returns (or errors).
+        let order_url_capture: Arc<tokio::sync::RwLock<Option<String>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
+        let order_url_for_trace = order_url_capture.clone();
+        let outer_trace: IssueTrace = Arc::new(move |stage: &str, detail: String| {
+            if stage == "order-created" {
+                let capture = order_url_for_trace.clone();
+                let url = detail.clone();
+                inner_trace(stage, detail);
+                tokio::spawn(async move {
+                    *capture.write().await = Some(url);
+                });
+            } else {
+                inner_trace(stage, detail);
+            }
+        });
+
+        // Persist the order URL immediately after it's created (before
+        // any challenge work starts) so a crash mid-flight can resume.
         match client
-            .issue_with_plan(&sans, &plan, &dns_providers, Some(&inner_trace))
+            .issue_with_plan(&sans, &plan, &dns_providers, Some(&outer_trace))
             .await
         {
             Ok(written) => {
+                // First, persist the order URL if captured (should always
+                // be Some by the time we reach here, but guard defensively).
+                if let Some(order_url) = order_url_capture.read().await.as_ref() {
+                    let conn = app.db.lock().await;
+                    let _ = pangolin_core::db::set_cert_order_url(
+                        &conn,
+                        &domain.domain,
+                        Some(order_url),
+                    );
+                }
+
                 let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
                 trace(
                     "acme-call",
@@ -2545,6 +2986,15 @@ impl AcmeState {
                     status: pangolin_core::CertStatus::Issued,
                     started_at,
                     last_error: None,
+                    // V5: clear the failure-streak fields on success.
+                    // The next attempt_count=0 start gives the next
+                    // failure a clean backoff schedule.
+                    next_retry_at: None,
+                    error_class: None,
+                    attempt_count: 0,
+                    // ACME order completed; clear so the next renewal
+                    // opens a fresh order.
+                    order_url: None,
                 };
                 let _ = pangolin_core::db::upsert_cert(&conn, &cert_row);
                 drop(conn);
@@ -2558,25 +3008,96 @@ impl AcmeState {
                 app.add_event(pangolin_core::EventType::CertIssued {
                     domain: domain.domain.clone(),
                 });
+
+                // Run post_renew hook after successful issuance. Non-zero
+                // exit is logged but does NOT fail the issuance (cert is
+                // already written to disk and DB).
+                if let Err(e) = run_hook(
+                    app.config.acme.post_renew.as_deref(),
+                    &domain.domain,
+                    Some(&cert_row.cert_file),
+                )
+                .await
+                {
+                    trace("post_renew", format!("hook failed (non-fatal): {}", e));
+                    log::warn!("post_renew hook failed for {}: {}", domain.domain, e);
+                } else {
+                    trace("post_renew", "hook ok (or not configured)".into());
+                }
+
+                // Run deploy hook last. Like post_renew, non-zero exit is
+                // logged but does NOT fail the overall issuance.
+                if let Err(e) = run_hook(
+                    app.config.acme.deploy.as_deref(),
+                    &domain.domain,
+                    Some(&cert_row.cert_file),
+                )
+                .await
+                {
+                    trace("deploy", format!("hook failed (non-fatal): {}", e));
+                    log::warn!("deploy hook failed for {}: {}", domain.domain, e);
+                } else {
+                    trace("deploy", "hook ok (or not configured)".into());
+                }
+
                 Ok(())
             }
             Err(e) => {
                 let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
-                // Surface the failure in the certs table so the operator
-                // can see it without grepping logs. The bubbled-up error
-                // still drives the existing event buffer + CertRenewFailed
-                // event so renew callers and dashboards see both.
-                let err_msg = e.to_string();
-                trace("failed", format!("after {}s: {}", elapsed, err_msg));
+                let now = chrono::Utc::now();
+                // Classify the error into one of: Transient / Permanent /
+                // RateLimited. The classifier picks the right row status,
+                // the right `next_retry_at`, and bumps the attempt
+                // counter so backoff escalates. See `classify_acme_error`
+                // for the policy.
+                let (class, err_msg, next_retry_at) = classify_acme_error(&e, now);
+                let row_status = match &class {
+                    pangolin_core::CertErrorClass::RateLimited { .. } => {
+                        pangolin_core::CertStatus::RateLimited
+                    }
+                    pangolin_core::CertErrorClass::Permanent => {
+                        pangolin_core::CertStatus::Permanent
+                    }
+                    pangolin_core::CertErrorClass::Transient => pangolin_core::CertStatus::Failed,
+                };
+                trace(
+                    "failed",
+                    format!(
+                        "after {}s: class={:?} retry_at={} msg={}",
+                        elapsed,
+                        class,
+                        next_retry_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                        err_msg,
+                    ),
+                );
+                // Load the current attempt_count so backoff escalates
+                // across failures instead of resetting.
+                let prior_attempts: u32 = {
+                    let conn = app.db.lock().await;
+                    pangolin_core::db::get_cert(&conn, &domain.domain)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.attempt_count)
+                        .unwrap_or(0)
+                };
+                let new_attempts = prior_attempts.saturating_add(1);
                 let conn = app.db.lock().await;
-                let _ = pangolin_core::db::set_cert_status_atomic(
+                let _ = pangolin_core::db::set_cert_failure(
                     &conn,
                     &domain.domain,
-                    pangolin_core::CertStatus::Failed,
-                    Some(&err_msg),
-                    None,
+                    row_status,
+                    &err_msg,
+                    &class,
+                    next_retry_at,
+                    new_attempts,
                 );
                 drop(conn);
+                // Surface the human-readable message in the event
+                // feed so the dashboard activity panel still works.
+                app.add_event(pangolin_core::EventType::CertRenewFailed {
+                    domain: domain.domain.clone(),
+                    error: err_msg.clone(),
+                });
                 Err(e)
             }
         }
@@ -2628,9 +3149,14 @@ impl pangolin_core::CertRetrier for AcmeState {
 
         // Bump `started_at` so the UI's "x seconds ago" column moves
         // the moment the operator clicks ↻ — even before `ensure_one`
-        // has a chance to transition the row to `Issuing`.
+        // has a chance to transition the row to `Issuing`. Also clear
+        // the V5 failure fields so the row is eligible for a fresh
+        // attempt: `next_retry_at` / `error_class` go to NULL,
+        // `attempt_count` resets to 0 (a new failure streak starts a
+        // new backoff schedule from slot 1).
         {
             let conn = app.db.lock().await;
+            let _ = pangolin_core::db::clear_cert_failure(&conn, domain);
             let _ = pangolin_core::db::set_cert_status_atomic(
                 &conn,
                 domain,
@@ -2668,7 +3194,15 @@ impl crate::runtime::Service for AcmeService {
     async fn run(&self, ctx: crate::runtime::ServiceContext) -> anyhow::Result<()> {
         let app = ctx.app.clone();
         let state = self.state.clone();
-        let interval_hours = app.config.acme.renew_check_interval_hours.max(1);
+        // The renew_check_interval_hours is now a *ceiling*, not a
+        // tick: the loop sleeps until the earliest `next_retry_at` of
+        // any row in a retryable failure state, capped at this
+        // interval. The per-row schedule (V5) drives the actual
+        // cadence; this just stops the loop from polling the DB more
+        // often than the operator asked.
+        let ceiling = std::time::Duration::from_secs(
+            app.config.acme.renew_check_interval_hours.max(1) as u64 * 3600,
+        );
 
         // Initial load + scan. Errors here fail startup.
         state
@@ -2680,14 +3214,51 @@ impl crate::runtime::Service for AcmeService {
         // shouldn't prevent the entire ACME service from running.
         state.ensure_certs(&app).await;
 
-        let interval = std::time::Duration::from_secs(interval_hours as u64 * 3600);
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires immediately; skip it to avoid running
-        // the scan twice at startup.
-        ticker.tick().await;
-
         loop {
+            // Compute how long to sleep. Three sources of "wake up
+            // sooner than the ceiling":
+            //   1. Shutdown signal (handled in `select!` below).
+            //   2. DNS config change (handled in `select!` below).
+            //   3. The earliest `next_retry_at` across rows that are
+            //      currently `Failed` / `RateLimited` / `Skipped`
+            //      and have a `next_retry_at` set.
+            //
+            // (3) is the V5 backoff: a row that just failed with
+            // `RateLimited` from "retry after 2026-06-15 19:28 UTC"
+            // will wake the loop at that timestamp; a row in
+            // `Transient` will wake at `now + backoff(attempt)`.
+            // `Permanent` rows are skipped by `ensure_certs`, so they
+            // don't contribute.
+            let sleep_for = {
+                let conn = app.db.lock().await;
+                let next = pangolin_core::db::earliest_pending_retry(&conn)
+                    .ok()
+                    .flatten();
+                drop(conn);
+                match next {
+                    Some(t) => {
+                        let now = chrono::Utc::now();
+                        let until = if t > now {
+                            std::time::Duration::from_secs((t - now).num_seconds() as u64)
+                        } else {
+                            std::time::Duration::ZERO
+                        };
+                        // Cap at the operator-configured ceiling so a
+                        // single bad row can't make the loop sleep
+                        // forever, but still let it wake up promptly
+                        // for the typical 1m-6h backoff.
+                        until.min(ceiling)
+                    }
+                    None => ceiling,
+                }
+            };
+
+            log::debug!(
+                "ACME: renewal loop sleeping {:?} (ceiling={:?})",
+                sleep_for,
+                ceiling
+            );
+
             tokio::select! {
                 // Bias toward shutdown so a Ctrl-C during a long
                 // renewal check doesn't have to wait for the next
@@ -2697,8 +3268,12 @@ impl crate::runtime::Service for AcmeService {
                     log::info!("ACME: shutdown requested, exiting renewal loop");
                     return Ok(());
                 }
-                _ = ticker.tick() => {
-                    log::info!("ACME: periodic renewal scan (interval={}h)", interval_hours);
+                _ = tokio::time::sleep(sleep_for) => {
+                    log::info!(
+                        "ACME: renewal scan (slept {:?}, ceiling {:?})",
+                        sleep_for,
+                        ceiling
+                    );
                 }
                 _ = app.dns_change_notify.notified() => {
                     log::info!("ACME: DNS config changed, reloading and re-scanning");

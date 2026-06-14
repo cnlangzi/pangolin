@@ -197,6 +197,10 @@ fn admin_certs_crud() {
         status: pangolin_core::CertStatus::Issued,
         started_at: None,
         last_error: None,
+        next_retry_at: None,
+        error_class: None,
+        attempt_count: 0,
+        order_url: None,
     };
 
     // Create

@@ -40,8 +40,8 @@ pub use parse::{
 };
 pub use tunnel::{TunnelRole, YamuxTunnel};
 pub use types::{
-    BackendKind, Cert, CertStatus, ChallengeType, DnsProvider, DnsProviderKind, Domain, HostMode,
-    Site, Tun,
+    next_backoff, BackendKind, Cert, CertErrorClass, CertStatus, ChallengeType, DnsProvider,
+    DnsProviderKind, Domain, HostMode, Site, Tun,
 };
 
 /// Library version, e.g. for admin templates and log lines.

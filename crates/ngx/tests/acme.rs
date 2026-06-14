@@ -456,7 +456,6 @@ async fn cert_manager_resolve_blob_ecdsa() {
         ACME_DIR.to_string(),
         7,
         24,
-        3,
         "ecdsa".to_string(),
     );
 
@@ -481,7 +480,6 @@ async fn cert_manager_resolve_blob_falls_back_to_rsa() {
         ACME_DIR.to_string(),
         7,
         24,
-        3,
         "ecdsa".to_string(),
     );
 
@@ -505,7 +503,6 @@ async fn cert_manager_resolve_blob_prefers_ecdsa_over_rsa() {
         ACME_DIR.to_string(),
         7,
         24,
-        3,
         "ecdsa".to_string(),
     );
 
@@ -535,7 +532,6 @@ async fn cert_manager_no_default_fallback_in_v2() {
         ACME_DIR.to_string(),
         7,
         24,
-        3,
         "ecdsa".to_string(),
     );
 

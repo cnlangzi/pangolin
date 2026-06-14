@@ -54,6 +54,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         status: pangolin_core::types::CertStatus::Issued,
         started_at: None,
         last_error: None,
+        next_retry_at: None,
+        error_class: None,
+        attempt_count: 0,
+        order_url: None,
     };
 
     let db = app.db.lock().await;

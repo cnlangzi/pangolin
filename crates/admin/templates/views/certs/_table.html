@@ -37,6 +37,14 @@
           <span data-status="issuing" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">
             <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>Issuing
           </span>
+          {% else if row.status == "rate_limited" %}
+          <span data-status="rate_limited" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>Rate Limited
+          </span>
+          {% else if row.status == "permanent" %}
+          <span data-status="permanent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-orange-500"></span>Permanent
+          </span>
           {% else %}
           <span data-status="skipped" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">
             <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Skipped
@@ -55,7 +63,9 @@
           {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400">
-          {% if row.expires_at_fmt == "" %}
+          {% if row.next_retry_rel != "" %}
+          <span class="text-purple-600 dark:text-purple-400" title="Next retry scheduled">{{ row.next_retry_rel }}</span>
+          {% else if row.expires_at_fmt == "" %}
           —
           {% else if row.expired %}
           <span class="text-red-600 dark:text-red-400">{{ row.expires_at_fmt }}</span>
@@ -98,8 +108,32 @@
       {% if let Some(err) = row.last_error %}
       <tr class="bg-red-50/50 dark:bg-red-900/10 border-t border-red-100 dark:border-red-900/30">
         <td colspan="5" class="px-4 py-2 text-xs text-red-700 dark:text-red-300">
-          <span class="font-medium">Last error:</span>
-          <code data-error="{{ row.domain }}" class="ml-1 break-all">{{ err }}</code>
+          <div class="flex flex-col gap-1">
+            <div>
+              <span class="font-medium">Last error:</span>
+              <code data-error="{{ row.domain }}" class="ml-1 break-all">{{ err }}</code>
+            </div>
+            {% if row.error_class_label != "" %}
+            <div>
+              <span class="font-medium">Classification:</span>
+              <span class="ml-1">
+                {% if row.error_class_label == "transient" %}
+                <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">
+                  Transient (will retry)
+                </span>
+                {% else if row.error_class_label == "rate-limited" %}
+                <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">
+                  Rate-limited (retry at {{ row.next_retry_rel }})
+                </span>
+                {% else if row.error_class_label == "permanent" %}
+                <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">
+                  Permanent (manual intervention required)
+                </span>
+                {% endif %}
+              </span>
+            </div>
+            {% endif %}
+          </div>
         </td>
       </tr>
       {% endif %}
@@ -128,6 +162,10 @@
         <span data-status="pending" class="text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">Pending</span>
         {% else if row.status == "issuing" %}
         <span data-status="issuing" class="text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">Issuing</span>
+        {% else if row.status == "rate_limited" %}
+        <span data-status="rate_limited" class="text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">Rate Limited</span>
+        {% else if row.status == "permanent" %}
+        <span data-status="permanent" class="text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">Permanent</span>
         {% else %}
         <span data-status="skipped" class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">Skipped</span>
         {% endif %}
@@ -136,10 +174,21 @@
         Started {% if row.started_rel == "" %}—{% else %}{{ row.started_rel }}{% endif %}
       </div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        {% if row.next_retry_rel != "" %}
+        Next retry {{ row.next_retry_rel }}
+        {% else %}
         Expires {% if row.expires_at_fmt == "" %}never{% else %}{{ row.expires_at_fmt }}{% endif %}
+        {% endif %}
       </div>
       {% if let Some(err) = row.last_error %}
-      <div class="text-xs text-red-600 dark:text-red-400 mb-2 break-all"><span class="font-medium">Last error:</span> {{ err }}</div>
+      <div class="text-xs text-red-600 dark:text-red-400 mb-2 break-all">
+        <span class="font-medium">Last error:</span> {{ err }}
+        {% if row.error_class_label != "" %}
+        <div class="mt-1">
+          <span class="font-medium">Class:</span> {{ row.error_class_label }}
+        </div>
+        {% endif %}
+      </div>
       {% endif %}
       <div class="flex gap-2">
         {% if row.retryable %}

@@ -33,7 +33,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
-use crate::types::{Cert, CertStatus, DnsProvider, Domain, Site, Tun};
+use crate::types::{Cert, CertErrorClass, CertStatus, DnsProvider, Domain, Site, Tun};
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
 /// Used as the on-disk form of `tun.token` (V3 migration); the WS
@@ -343,7 +343,8 @@ pub fn list_certs(conn: &Connection) -> rusqlite::Result<Vec<Cert>> {
     let mut stmt = conn.prepare(
         "SELECT domain, cert_file, key_file, expires_at, created_at,
                 sans, source, acme_dns_provider, acme_account_id, issued_at,
-                status, started_at, last_error
+                status, started_at, last_error,
+                next_retry_at, error_class, attempt_count, order_url
          FROM certs ORDER BY domain",
     )?;
     let rows = stmt.query_map([], row_to_cert)?;
@@ -370,7 +371,8 @@ pub fn list_certs_by_status(
     let sql = format!(
         "SELECT domain, cert_file, key_file, expires_at, created_at,
                 sans, source, acme_dns_provider, acme_account_id, issued_at,
-                status, started_at, last_error
+                status, started_at, last_error,
+                next_retry_at, error_class, attempt_count, order_url
          FROM certs
          WHERE status IN ({})
          ORDER BY COALESCE(started_at, created_at) DESC, domain",
@@ -423,6 +425,97 @@ pub fn set_cert_status_atomic(
     Ok(n > 0)
 }
 
+/// Atomically apply the V5 outcome of a failed ACME attempt: set the
+/// new status, the error class (so the UI can render it), the next
+/// retry timestamp (so the loop schedules itself), and bump the
+/// attempt counter (so backoff escalates). All in one UPDATE so
+/// concurrent readers never see a half-applied state.
+///
+/// `error_class` is `Some(class)` for the failing case, `None` when
+/// the row is being cleared (e.g. on transition to `Issued` or
+/// `Permanent` where the loop must not retry on its own).
+pub fn set_cert_failure(
+    conn: &Connection,
+    domain: &str,
+    status: CertStatus,
+    last_error: &str,
+    error_class: &CertErrorClass,
+    next_retry_at: DateTime<Utc>,
+    attempt_count: u32,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE certs
+            SET status = ?1,
+                last_error = ?2,
+                error_class = ?3,
+                next_retry_at = ?4,
+                attempt_count = ?5
+          WHERE domain = ?6",
+        params![
+            status.as_str(),
+            Some(last_error),
+            Some(error_class.as_str()),
+            next_retry_at.to_rfc3339(),
+            attempt_count as i64,
+            domain,
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// Clear the V5 failure fields on a successful issuance. The retry
+/// counter resets to 0 and `next_retry_at` / `error_class` go to NULL
+/// so the renewal loop will treat the row as healthy and the next
+/// expiry check will be the one to drive a renewal.
+pub fn clear_cert_failure(conn: &Connection, domain: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE certs
+            SET last_error = NULL,
+                error_class = NULL,
+                next_retry_at = NULL,
+                attempt_count = 0
+          WHERE domain = ?1",
+        params![domain],
+    )?;
+    Ok(n > 0)
+}
+
+/// Record the in-flight instant-acme order URL on the row, so the
+/// loop can resume polling it after a restart instead of opening a
+/// fresh order (and burning another rate-limit slot).
+pub fn set_cert_order_url(
+    conn: &Connection,
+    domain: &str,
+    order_url: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE certs
+            SET order_url = ?1,
+                status = CASE WHEN ?1 IS NULL THEN status ELSE 'issuing' END
+          WHERE domain = ?2",
+        params![order_url, domain],
+    )?;
+    Ok(n > 0)
+}
+
+/// Find the next `next_retry_at` across all rows in a retryable
+/// failure state. Used by `AcmeService::run` to pick the sleep
+/// duration for the per-row schedule: instead of a fixed 6h ticker,
+/// the loop sleeps until the earliest due row.
+///
+/// `None` means "no rows are due; the loop can sleep the full
+/// `idle_sleep` (default 6h) before re-checking".
+pub fn earliest_pending_retry(conn: &Connection) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    let mut stmt = conn.prepare(
+        "SELECT MIN(next_retry_at)
+         FROM certs
+         WHERE next_retry_at IS NOT NULL
+           AND status IN ('failed', 'rate_limited', 'skipped')",
+    )?;
+    let raw: Option<String> = stmt.query_row([], |row| row.get(0))?;
+    Ok(raw.as_deref().and_then(parse_dt_opt))
+}
+
 /// Aggregate count of rows per [`CertStatus`]. Every variant appears in
 /// the result (zero-valued when no rows match) so dashboard rendering
 /// doesn't have to special-case missing keys.
@@ -455,7 +548,8 @@ pub fn get_cert(conn: &Connection, domain: &str) -> rusqlite::Result<Option<Cert
     let mut stmt = conn.prepare(
         "SELECT domain, cert_file, key_file, expires_at, created_at,
                 sans, source, acme_dns_provider, acme_account_id, issued_at,
-                status, started_at, last_error
+                status, started_at, last_error,
+                next_retry_at, error_class, attempt_count, order_url
          FROM certs WHERE domain = ?1",
     )?;
     stmt.query_row(params![domain], row_to_cert).optional()
@@ -463,11 +557,13 @@ pub fn get_cert(conn: &Connection, domain: &str) -> rusqlite::Result<Option<Cert
 
 pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
     let sans_json = serde_json::to_string(&cert.sans).unwrap_or_else(|_| "[]".to_string());
+    let error_class_str = cert.error_class.as_ref().map(|c| c.as_str());
     conn.execute(
         "INSERT INTO certs (domain, cert_file, key_file, expires_at, created_at,
                              sans, source, acme_dns_provider, acme_account_id, issued_at,
-                             status, started_at, last_error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                             status, started_at, last_error,
+                             next_retry_at, error_class, attempt_count, order_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(domain) DO UPDATE SET
             cert_file = excluded.cert_file,
             key_file = excluded.key_file,
@@ -479,7 +575,11 @@ pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
             issued_at = excluded.issued_at,
             status = excluded.status,
             started_at = excluded.started_at,
-            last_error = excluded.last_error",
+            last_error = excluded.last_error,
+            next_retry_at = excluded.next_retry_at,
+            error_class = excluded.error_class,
+            attempt_count = excluded.attempt_count,
+            order_url = excluded.order_url",
         params![
             cert.domain,
             cert.cert_file,
@@ -494,6 +594,10 @@ pub fn upsert_cert(conn: &Connection, cert: &Cert) -> rusqlite::Result<()> {
             cert.status.as_str(),
             cert.started_at.map(|t| t.to_rfc3339()),
             cert.last_error,
+            cert.next_retry_at.map(|t| t.to_rfc3339()),
+            error_class_str,
+            cert.attempt_count,
+            cert.order_url,
         ],
     )?;
     Ok(())
@@ -789,6 +893,10 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
     let status_raw: String = row.get(10)?;
     let started_at: Option<String> = row.get(11)?;
     let last_error: Option<String> = row.get(12)?;
+    let next_retry_at: Option<String> = row.get(13)?;
+    let error_class: Option<String> = row.get(14)?;
+    let attempt_count: i64 = row.get(15)?;
+    let order_url: Option<String> = row.get(16)?;
     let sans: Vec<String> = serde_json::from_str(&sans_json).unwrap_or_default();
     // Unknown statuses (downgrade artefact, manual SQL edit) fall back to
     // the conservative `Issued` default — the cert is still on disk, so
@@ -810,6 +918,10 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
         status,
         started_at: started_at.as_deref().and_then(parse_dt_opt),
         last_error,
+        next_retry_at: next_retry_at.as_deref().and_then(parse_dt_opt),
+        error_class: error_class.as_deref().and_then(CertErrorClass::parse),
+        attempt_count: attempt_count.max(0) as u32,
+        order_url,
     })
 }
 
@@ -854,15 +966,17 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1 + V2 + V3 + V4 as applied. (V2 merges
+        // it's there and lists V1..V5 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
-        // ACME-lifecycle columns on `certs` for issue #45.)
+        // ACME-lifecycle columns on `certs` for issue #45; V5 adds
+        // next_retry_at / error_class / attempt_count / order_url for
+        // the per-row backoff schedule.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
-        assert_eq!(count, 4, "expected V1 + V2 + V3 + V4 to be applied");
+        assert_eq!(count, 5, "expected V1 + V2 + V3 + V4 + V5 to be applied");
 
         // Verify V2 is recorded.
         let v2_present: i64 = conn
@@ -1208,6 +1322,10 @@ mod tests {
             status: CertStatus::Issued,
             started_at: None,
             last_error: None,
+            next_retry_at: None,
+            error_class: None,
+            attempt_count: 0,
+            order_url: None,
         };
         upsert_cert(&conn, &c).unwrap();
         let list = list_certs(&conn).unwrap();
@@ -1216,6 +1334,9 @@ mod tests {
         assert_eq!(list[0].status, CertStatus::Issued);
         assert!(list[0].started_at.is_none());
         assert!(list[0].last_error.is_none());
+        assert!(list[0].next_retry_at.is_none());
+        assert!(list[0].error_class.is_none());
+        assert_eq!(list[0].attempt_count, 0);
         assert!(delete_cert(&conn, "example.com").unwrap());
     }
 
@@ -1238,6 +1359,10 @@ mod tests {
             status,
             started_at: None,
             last_error: last_error.map(String::from),
+            next_retry_at: None,
+            error_class: None,
+            attempt_count: 0,
+            order_url: None,
         }
     }
 
@@ -1367,12 +1492,16 @@ mod tests {
 
         let counts = count_certs_by_status(&conn).unwrap();
         // Every variant present, including the zero-valued ones.
-        assert_eq!(counts.len(), 5);
+        // (V5 added `RateLimited` and `Permanent` to the CertStatus
+        // enum, so the count goes from 5 to 7.)
+        assert_eq!(counts.len(), 7);
         assert_eq!(counts[&CertStatus::Pending], 1);
         assert_eq!(counts[&CertStatus::Issuing], 0);
         assert_eq!(counts[&CertStatus::Issued], 2);
         assert_eq!(counts[&CertStatus::Failed], 1);
         assert_eq!(counts[&CertStatus::Skipped], 0);
+        assert_eq!(counts[&CertStatus::RateLimited], 0);
+        assert_eq!(counts[&CertStatus::Permanent], 0);
     }
 
     #[test]

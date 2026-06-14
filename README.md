@@ -702,9 +702,8 @@ acme:
   email: "admin@yourdomain.com"   # ACME 注册邮箱
   cert_dir: "./certs"             # cert blob 落盘目录(autocert native 布局)
   acme_directory: "https://acme-v02.api.letsencrypt.org/directory"
-  renew_threshold_days: 30
+  renew_threshold_days: 14
   renew_check_interval_hours: 6
-  renew_max_retries: 3
   key_type: "ecdsa"               # ecdsa | rsa
 
 log:

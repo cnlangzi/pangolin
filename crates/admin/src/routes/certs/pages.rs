@@ -57,6 +57,8 @@ pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> 
         count_issued: counts.get(&CertStatus::Issued).copied().unwrap_or(0),
         count_failed: counts.get(&CertStatus::Failed).copied().unwrap_or(0),
         count_skipped: counts.get(&CertStatus::Skipped).copied().unwrap_or(0),
+        count_rate_limited: counts.get(&CertStatus::RateLimited).copied().unwrap_or(0),
+        count_permanent: counts.get(&CertStatus::Permanent).copied().unwrap_or(0),
     }
     .render()
     .unwrap();

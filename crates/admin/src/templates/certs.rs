@@ -2,7 +2,7 @@
 
 use askama::Template;
 use chrono::{DateTime, Utc};
-use pangolin_core::types::Cert;
+use pangolin_core::types::{Cert, CertErrorClass};
 
 /// Per-row view model for the certs table (issue #45).
 ///
@@ -28,6 +28,17 @@ pub struct CertRow {
     pub expired: bool,
     /// `last_error` from the cert row, when present.
     pub last_error: Option<String>,
+    /// V5: "next_retry_at" — when the renewal loop will next try this
+    /// row. Pre-formatted as a human-friendly countdown
+    /// ("in 1h 23m") so the template can render it without any
+    /// `chrono` calls. Empty when there's no scheduled retry (e.g.
+    /// fresh `Pending` row, or a successful `Issued` row).
+    pub next_retry_rel: String,
+    /// V5: short label for the error class (`"transient"`,
+    /// `"permanent"`, `"rate-limited"`). Drives the badge color in
+    /// the inline detail row. Empty when there's no failure to
+    /// classify.
+    pub error_class_label: &'static str,
 }
 
 impl CertRow {
@@ -43,6 +54,20 @@ impl CertRow {
             Some(e) => (e.format("%Y-%m-%d").to_string(), e < now),
             None => (String::new(), false),
         };
+        let next_retry_rel = match cert.next_retry_at {
+            Some(t) if t > now => super::relative_time(t, now),
+            // If `next_retry_at` is in the past, the loop is about to
+            // pick it up on the next iteration — show "any moment now"
+            // so the operator doesn't think the row is being ignored.
+            Some(_) => "any moment now".to_string(),
+            None => String::new(),
+        };
+        let error_class_label = match cert.error_class {
+            Some(CertErrorClass::Transient) => "transient",
+            Some(CertErrorClass::Permanent) => "permanent",
+            Some(CertErrorClass::RateLimited { .. }) => "rate-limited",
+            None => "",
+        };
         Self {
             domain: cert.domain.clone(),
             status: cert.status.to_string(),
@@ -51,6 +76,8 @@ impl CertRow {
             expires_at_fmt,
             expired,
             last_error: cert.last_error.clone(),
+            next_retry_rel,
+            error_class_label,
         }
     }
 }
@@ -71,6 +98,14 @@ pub struct CertsListTemplate<'a> {
     pub count_issued: usize,
     pub count_failed: usize,
     pub count_skipped: usize,
+    /// V5: count of `RateLimited` rows. Lets the chip-bar render a
+    /// distinct purple badge so the operator can spot throttled
+    /// certs at a glance.
+    pub count_rate_limited: usize,
+    /// V5: count of `Permanent` rows. The retry button is hidden for
+    /// these, but a chip still surfaces them so the operator can
+    /// investigate the "stuck on the same error forever" rows.
+    pub count_permanent: usize,
 }
 
 // ─── New page (GET /certs/new) ──────────────────────────────────────────────────
