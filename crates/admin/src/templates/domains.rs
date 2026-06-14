@@ -19,6 +19,17 @@ pub struct DomainsListTemplate<'a> {
     pub active_nav: &'a str,
 }
 
+impl<'a> DomainsListTemplate<'a> {
+    /// URL-encoded `domain` for use inside `href="..."` attributes in
+    /// the included `views/domains/_table.html` partial. Wildcard
+    /// domains (`*.example.com`) and any other name with URL-reserved
+    /// characters must be percent-encoded for the Edit link
+    /// (`/domains/{domain}/edit`).
+    pub fn domain_encoded(&self, domain: &str) -> String {
+        crate::templates::domains::domain_encoded(domain)
+    }
+}
+
 // ─── New page (GET /domains/new) ───────────────────────────────────────────────
 
 #[derive(Template)]
@@ -43,6 +54,11 @@ pub struct DomainsNewTemplate<'a> {
     /// `views/domains/_form_fields.html` compiles in the new context.
     pub edit_domain: Option<String>,
     pub current_auto_issue: bool,
+    /// Whether the `enabled` checkbox should render as checked.
+    /// Defaults to `true` for the "new" form (matches the historical
+    /// `handle_create` behaviour that always inserted with
+    /// `enabled = true`).
+    pub enabled_checked: bool,
 }
 
 impl<'a> DomainsNewTemplate<'a> {
@@ -84,6 +100,9 @@ impl<'a> DomainsNewTemplate<'a> {
     pub fn preselected_site_name_value(&self) -> &str {
         self.preselected_site_name.as_deref().unwrap_or("")
     }
+    pub fn enabled_checked(&self) -> bool {
+        self.enabled_checked
+    }
     pub fn next_redirect(&self) -> String {
         if let Some(site) = &self.preselected_site_name {
             return format!("/site/{}/domains", site);
@@ -107,6 +126,10 @@ pub struct DomainsEditTemplate<'a> {
     pub auto_issue_checked: bool,
     pub edit_domain: Option<String>,
     pub current_auto_issue: bool,
+    /// Whether the `enabled` checkbox should render as checked.
+    /// Populated from the existing row's `enabled` flag when
+    /// rendering the edit page.
+    pub enabled_checked: bool,
 }
 
 impl<'a> DomainsEditTemplate<'a> {
@@ -145,6 +168,9 @@ impl<'a> DomainsEditTemplate<'a> {
     pub fn preselected_site_name_value(&self) -> &str {
         self.preselected_site_name.as_deref().unwrap_or("")
     }
+    pub fn enabled_checked(&self) -> bool {
+        self.enabled_checked
+    }
     pub fn next_redirect(&self) -> String {
         if let Some(site) = &self.preselected_site_name {
             return format!("/site/{}/domains", site);
@@ -177,12 +203,33 @@ impl SiteDomainsTemplate {
 }
 
 // ─── Table view (HTMX partial) ────────────────────────────────────────────────
+//
+// `views/domains/_table.html` is only `{% include %}`-d by
+// `pages/domains/list.html`, so askama resolves `self.*` against the
+// `DomainsListTemplate` parent. The struct only exists to register the
+// template path with askama; the `domain_encoded` helper is provided by
+// `DomainsListTemplate`.
+
+/// Shared URL-encoder for `domain` names. Wildcard domains
+/// (`*.example.com`) and any other name with URL-reserved characters
+/// must be percent-encoded for the Edit link
+/// (`/domains/{domain}/edit`).
+fn domain_encoded(domain: &str) -> String {
+    urlencoding::encode(domain).into_owned()
+}
 
 #[derive(Template)]
 #[template(path = "views/domains/_table.html")]
 pub struct DomainsTableView<'a> {
     pub domains: Vec<Domain>,
     pub active_nav: &'a str,
+}
+
+impl<'a> DomainsTableView<'a> {
+    /// URL-encoded `domain.domain` for use inside `href="..."` attributes.
+    pub fn domain_encoded(&self, domain: &str) -> String {
+        crate::templates::domains::domain_encoded(domain)
+    }
 }
 
 // ─── Form fields view (shared by new + edit) ──────────────────────────────────
@@ -200,6 +247,7 @@ pub struct DomainsFormFieldsView<'a> {
     pub auto_issue_checked: bool,
     pub edit_domain: Option<String>,
     pub current_auto_issue: bool,
+    pub enabled_checked: bool,
 }
 
 impl<'a> DomainsFormFieldsView<'a> {
@@ -242,6 +290,9 @@ impl<'a> DomainsFormFieldsView<'a> {
     }
     pub fn preselected_site_name_value(&self) -> &str {
         self.preselected_site_name.as_deref().unwrap_or("")
+    }
+    pub fn enabled_checked(&self) -> bool {
+        self.enabled_checked
     }
     pub fn next_redirect(&self) -> String {
         if let Some(site) = &self.preselected_site_name {

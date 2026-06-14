@@ -19,7 +19,7 @@
     state: directory
     owner: pangolin
     group: pangolin
-    mode: 0750
+    mode: 0755
 
 - name: Create data directory
   become: true
@@ -28,7 +28,7 @@
     state: directory
     owner: pangolin
     group: pangolin
-    mode: 0750
+    mode: 0755
 
 - name: Create certs directory
   become: true
@@ -37,7 +37,7 @@
     state: directory
     owner: pangolin
     group: pangolin
-    mode: 0700
+    mode: 0755
 
 - name: Upload ngx binary
   become: true

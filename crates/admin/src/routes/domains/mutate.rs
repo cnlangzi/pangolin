@@ -10,7 +10,7 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::templates::DomainsNewTemplate;
+use crate::templates::{DomainsEditTemplate, DomainsNewTemplate};
 use crate::{redirect_response, App};
 
 type Resp = Response<Full<Bytes>>;
@@ -41,6 +41,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     let domain = params.get("domain").cloned().unwrap_or_default();
     let site_name = params.get("site_name").cloned().unwrap_or_default();
     let auto_issue = params.get("auto_issue").map(|_| true).unwrap_or(false);
+    // New form renders the `enabled` checkbox pre-checked (matches the
+    // historical `enabled: true` default for new domains). Operators
+    // can uncheck it at create time to insert a paused domain.
+    let enabled = params.get("enabled").map(|_| true).unwrap_or(true);
     let dns_provider = params
         .get("dns_provider")
         .cloned()
@@ -101,7 +105,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     let d = pangolin_core::types::Domain {
         domain,
         site_name,
-        enabled: true,
+        enabled,
         auto_issue,
         dns_provider,
         created_at: chrono::Utc::now(),
@@ -133,6 +137,197 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     }
 }
 
+/// POST /api/domains/{domain}/edit — update an existing domain's
+/// non-PK fields (site_name, enabled, auto_issue, dns_provider).
+///
+/// Issue #57 lifts the deliberate post-creation immutability of
+/// domains. The PK (`domain` itself) is preserved and the existing
+/// `created_at` is kept — only the operator-editable fields can change.
+/// Validation is copied from `handle_create` so the wildcard
+/// (DNS-01) and DNS-provider-exists invariants survive the edit path.
+///
+/// On success, `reload_indexes().await` fires `dns_change_notify`,
+/// waking the `AcmeState` background loop so the cert state machine
+/// (Pending/Issuing/Issued/Failed/Skipped) reacts immediately to
+/// changes in `enabled` / `auto_issue` / `dns_provider`.
+pub async fn handle_update(
+    app: &Arc<App>,
+    domain: Option<String>,
+    body: &[u8],
+    csrf: &str,
+) -> http::Result<Resp> {
+    let Some(domain_pk) = domain else {
+        return Ok(crate::not_found());
+    };
+    let params = parse_form(body);
+
+    // Look up the existing row — 404 if absent. The PK is immutable;
+    // we read everything else from the DB and overlay the form fields.
+    let existing = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None)
+    };
+    let Some(existing) = existing else {
+        return Ok(crate::not_found());
+    };
+
+    let site_name = params
+        .get("site_name")
+        .cloned()
+        .unwrap_or_else(|| existing.site_name.clone());
+    if site_name.is_empty() {
+        return render_edit_page_with_error(
+            app,
+            &domain_pk,
+            "Please select a site",
+            csrf,
+            &existing,
+        )
+        .await;
+    }
+    // Form fields:
+    //   site_name     — required, drops through to existing if missing
+    //   enabled       — checkbox: present => true, absent => false
+    //   auto_issue    — checkbox: present => true, absent => false
+    //   dns_provider  — text, empty => None
+    // The form always sends the current value of every field (the
+    // page is a fully-rendered form), so `params.get("enabled")`
+    // being absent only happens on a malformed client; we default to
+    // the existing value to be safe.
+    let enabled = params
+        .get("enabled")
+        .map(|_| true)
+        .unwrap_or(existing.enabled);
+    let auto_issue = params
+        .get("auto_issue")
+        .map(|_| true)
+        .unwrap_or(existing.auto_issue);
+    let dns_provider = params
+        .get("dns_provider")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let dns_provider = if dns_provider.is_empty() {
+        None
+    } else {
+        Some(dns_provider)
+    };
+
+    // Wildcard domains must have a DNS association (DNS-01 is the only
+    // way to validate `*.example.com`). Invariant copied from
+    // `handle_create`.
+    if domain_pk.starts_with("*.") && dns_provider.is_none() {
+        return render_edit_page_with_error(
+            app,
+            &domain_pk,
+            "Wildcard domains require a DNS provider for DNS-01 validation. \
+             Add one under DNS first, then assign it to this domain.",
+            csrf,
+            &existing,
+        )
+        .await;
+    }
+    // If a DNS provider is referenced, verify it exists. Invariant
+    // copied from `handle_create`.
+    if let Some(ref name) = dns_provider {
+        let db = app.db.lock().await;
+        let exists = pangolin_core::db::get_dns_provider(&db, name)
+            .unwrap_or(None)
+            .is_some();
+        drop(db);
+        if !exists {
+            return render_edit_page_with_error(
+                app,
+                &domain_pk,
+                &format!("DNS provider '{name}' does not exist; create it under DNS first"),
+                csrf,
+                &existing,
+            )
+            .await;
+        }
+    }
+
+    let updated = pangolin_core::types::Domain {
+        domain: existing.domain.clone(),
+        site_name,
+        enabled,
+        auto_issue,
+        dns_provider,
+        // PK and created_at are immutable; preserve them.
+        created_at: existing.created_at,
+    };
+
+    let db = app.db.lock().await;
+    let result = pangolin_core::db::upsert_domain(&db, &updated);
+    // Phase-1 lifecycle write (issue #45): if the operator turned
+    // auto-issue on (or left it on) and there's no cert row yet, plant
+    // a Pending placeholder so the dashboard reflects intent before
+    // the background ACME loop ticks. The helper is idempotent so
+    // pre-existing rows (Issued, Failed, …) are preserved.
+    if matches!(result, Ok(())) && updated.auto_issue {
+        let _ = pangolin_core::db::ensure_pending_cert_row(
+            &db,
+            &updated.domain,
+            &app.cert_manager.cert_dir,
+        );
+    }
+    drop(db);
+
+    match result {
+        Ok(()) => {
+            // Wake AcmeState so cert issuance / state transition
+            // follows the field change immediately rather than on the
+            // next tick.
+            app.reload_indexes().await;
+            Ok(redirect_response("/domains"))
+        }
+        Err(e) => {
+            render_edit_page_with_error(
+                app,
+                &domain_pk,
+                &format!("Database error: {}", e),
+                csrf,
+                &existing,
+            )
+            .await
+        }
+    }
+}
+
+/// Re-render the Edit-domain form with an inline error. Mirrors
+/// `render_create_page_with_error` but populates the form with the
+/// existing row's values (site_name, dns_provider, auto_issue) so the
+/// operator doesn't lose their in-flight edits.
+async fn render_edit_page_with_error(
+    app: &Arc<App>,
+    domain_pk: &str,
+    error: &str,
+    csrf: &str,
+    existing: &pangolin_core::types::Domain,
+) -> http::Result<Resp> {
+    let db = app.db.lock().await;
+    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
+    drop(db);
+    let html = DomainsEditTemplate {
+        sites,
+        dns_providers,
+        error: Some(error),
+        active_nav: "domains",
+        preselected_site: Some(existing.site_name.clone()),
+        preselected_site_name: Some(existing.site_name.clone()),
+        dns_provider_value: existing.dns_provider.clone().unwrap_or_default(),
+        auto_issue_checked: existing.auto_issue,
+        edit_domain: Some(domain_pk.to_string()),
+        current_auto_issue: existing.auto_issue,
+        enabled_checked: existing.enabled,
+    }
+    .render()
+    .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
 /// Re-render the New-domain form with an inline error. Uses the new
 /// `pages/domains/new.html` template via `DomainsNewTemplate` (rather
 /// than the legacy single-struct form). Behaviour matches the
@@ -159,6 +354,7 @@ async fn render_create_page_with_error(
         auto_issue_checked: false,
         edit_domain: None,
         current_auto_issue: false,
+        enabled_checked: true,
     }
     .render()
     .unwrap();
