@@ -374,7 +374,7 @@ pub struct TunnelMessage {
 /// orchestration lives in the `ngx` crate's `acme` module (PR-2 work).
 pub struct CertManager {
     pub cert_dir: PathBuf,
-    pub email: String,
+    pub email: Option<String>,
     pub acme_directory: String,
     pub renew_threshold_days: u32,
     pub renew_check_interval_hours: u32,
@@ -388,7 +388,7 @@ impl CertManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cert_dir: PathBuf,
-        email: String,
+        email: Option<String>,
         acme_directory: String,
         renew_threshold_days: u32,
         renew_check_interval_hours: u32,
@@ -459,7 +459,7 @@ impl Default for CertManager {
     fn default() -> Self {
         Self {
             cert_dir: PathBuf::from("./certs"),
-            email: String::new(),
+            email: None,
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
             renew_threshold_days: 30,
             renew_check_interval_hours: 6,

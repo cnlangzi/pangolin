@@ -4,7 +4,7 @@
 # so it only takes effect inside the container — local dev on macOS / Linux
 # is unaffected.
 #
-# Two performance wins, both standard Rust+Docker recipes:
+# Three performance wins, all standard Rust+Docker recipes:
 #
 #  1. sccache wraps rustc and caches the output of every `rustc` invocation
 #     keyed by its inputs.  The cache is mounted at /root/.cache/sccache
@@ -15,6 +15,20 @@
 #     links and dramatically faster on release LTO links.  We invoke it
 #     through clang's `-fuse-ld=mold` flag, which is the standard recipe
 #     in the Rust performance guide.
+#
+#  3. Registry mirror — primary is rsproxy.cn (Rust 中文社区镜像, fastest
+#     from CN networks).  This affects BOTH direct `crates-io` deps and
+#     transitive deps pulled in via git-source forks (e.g. our
+#     `cnlangzi/pingora` branch declares deps that re-resolve through
+#     crates-io).  Override on the command line with --config or
+#     CARGO_REGISTRIES_* env vars when building from outside China.
+#
+#     Mirror list (swap by editing `replace-with` + the registry name):
+#       rsproxy.cn   sparse+https://rsproxy.cn/index/
+#       ustc         sparse+https://mirrors.ustc.edu.cn/crates.io-index/
+#       tuna         sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/
+#       sjtu         sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/
+#       bytecode     https://mirrors.bytecode.cn/crates.io-index/
 
 [build]
 rustc-wrapper = "/usr/bin/sccache"
@@ -22,3 +36,25 @@ rustc-wrapper = "/usr/bin/sccache"
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+
+[net]
+# Faster git fetches for git-source dependencies (e.g. the forked
+# `pingora` declared in the workspace [patch.crates-io] section).
+git-fetch-with-cli = true
+
+[registries.crates-io]
+# Replace the default crates.io endpoint.  `replace-with` makes every
+# `crates-io` reference (including transitive dependencies, even those
+# pulled in via git-source forks like our `cnlangzi/pingora` branch)
+# go through the mirror configured below.
+replace-with = "rsproxy"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[registries.ustc]
+index = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[registries.tuna]
+index = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

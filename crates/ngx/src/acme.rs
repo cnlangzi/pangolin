@@ -182,7 +182,7 @@ fn format_challenge_error(id: &str, ch: &Challenge) -> Option<String> {
 pub struct AcmeClient {
     account: Account,
     cert_dir: PathBuf,
-    email: String,
+    email: Option<String>,
     renew_threshold_days: u32,
     renew_check_interval_hours: u32,
     key_type: KeyType,
@@ -233,7 +233,7 @@ impl AcmeClient {
     /// Create ACME client using native root CAs for TLS verification.
     pub async fn new(
         cert_dir: PathBuf,
-        email: String,
+        email: Option<String>,
         acme_directory: &str,
         renew_threshold_days: u32,
         renew_check_interval_hours: u32,
@@ -256,7 +256,10 @@ impl AcmeClient {
                 Account::builder()?.from_credentials(cred).await?
             }
             None => {
-                log::info!("ACME: registering new account for {}", email);
+                log::info!(
+                    "ACME: registering new account (contact: {})",
+                    email.as_deref().unwrap_or("<none>")
+                );
                 let new_account = instant_acme::NewAccount {
                     contact: &[],
                     terms_of_service_agreed: true,
@@ -289,7 +292,7 @@ impl AcmeClient {
     pub async fn with_http_client(
         http: Box<dyn instant_acme::HttpClient>,
         cert_dir: PathBuf,
-        email: String,
+        email: Option<String>,
         acme_directory: &str,
         renew_threshold_days: u32,
         renew_check_interval_hours: u32,
@@ -308,7 +311,10 @@ impl AcmeClient {
                     .await?
             }
             None => {
-                log::info!("ACME: registering new account for {}", email);
+                log::info!(
+                    "ACME: registering new account (contact: {})",
+                    email.as_deref().unwrap_or("<none>")
+                );
                 let new_account = instant_acme::NewAccount {
                     contact: &[],
                     terms_of_service_agreed: true,
@@ -1637,7 +1643,7 @@ mod tests {
         //
         // Path comes from `tempdir()` rather than a hardcoded string so
         // the test is independent of the operator's deploy layout
-        // (`/opt/pangolin/certs/...` is one possible layout, not the
+        // (`/usr/local/pangolin/certs/...` is one possible layout, not the
         // contract).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(ACCOUNT_KEY_FILE);

@@ -60,7 +60,7 @@ admin:
 
 acme:
   email: {{ ngx_acme_email | default('') }}
-  cert_dir: {{ ngx_acme_cert_dir | default('/opt/pangolin/certs') }}
+  cert_dir: {{ ngx_acme_cert_dir | default('/usr/local/pangolin/certs') }}
   acme_directory: {{ ngx_acme_directory | default('https://acme-v02.api.letsencrypt.org/directory') }}
   renew_threshold_days: {{ ngx_acme_renew_threshold_days | default(30) }}
   renew_check_interval_hours: {{ ngx_acme_renew_check_interval_hours | default(6) }}

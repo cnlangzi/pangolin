@@ -226,8 +226,8 @@ impl Default for CacheConfig {
 /// ACME directory to talk to, how often to scan for renewals, etc.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcmeConfig {
-    #[serde(default)]
-    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     #[serde(default = "default_cert_dir")]
     pub cert_dir: String,
     #[serde(default = "default_acme_directory")]
@@ -266,7 +266,10 @@ fn default_renew_max_retries() -> u32 {
 impl Default for AcmeConfig {
     fn default() -> Self {
         Self {
-            email: String::new(),
+            // None ⇒ no contact sent to the ACME server (it's optional).
+            // Operators who want expiration notices can set this in
+            // .env: NGX_ACME__EMAIL=ops@example.com
+            email: None,
             cert_dir: "./certs".into(),
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
             renew_threshold_days: 30,
