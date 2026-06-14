@@ -33,7 +33,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
-use crate::types::{Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, Site, Tun};
+use crate::types::{
+    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, Site, Tun,
+};
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
 /// Used as the on-disk form of `tun.token` (V3 migration); the WS
@@ -995,7 +997,10 @@ mod tests {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
-        assert_eq!(count, 6, "expected V1 + V2 + V3 + V4 + V5 + V6 to be applied");
+        assert_eq!(
+            count, 6,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 to be applied"
+        );
 
         // Verify V2 is recorded.
         let v2_present: i64 = conn
@@ -1248,6 +1253,129 @@ mod tests {
         upsert_domain(&conn, &d).unwrap();
         assert!(delete_domain(&conn, "app.example.com").unwrap());
         assert!(!delete_domain(&conn, "app.example.com").unwrap());
+    }
+
+    #[test]
+    fn domain_challenge_kind_db_roundtrip_each_variant() {
+        // Issue #55: V5 migration adds the `challenge_kind` column.
+        // Each variant must round-trip cleanly through upsert +
+        // get_domain + list_domains so the admin form value
+        // survives a refresh. NULL is also exercised (the auto
+        // default for pre-existing rows).
+        let conn = make_conn();
+        let s = Site {
+            name: "app".into(),
+            backend: "http://x:80".into(),
+            enabled: true,
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+            updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        };
+        upsert_site(&conn, &s).unwrap();
+
+        let cases: Vec<(&str, Option<ChallengeKind>)> = vec![
+            ("none.example.com", None),
+            ("http.example.com", Some(ChallengeKind::Http01)),
+            ("dns.example.com", Some(ChallengeKind::Dns01)),
+            ("persist.example.com", Some(ChallengeKind::DnsPersist01)),
+        ];
+        for (i, (name, kind)) in cases.iter().enumerate() {
+            let d = Domain {
+                domain: name.to_string(),
+                site_name: "app".into(),
+                enabled: true,
+                auto_issue: true,
+                dns_provider: if i == 0 { None } else { Some("main-cf".into()) },
+                challenge_kind: *kind,
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+            };
+            upsert_domain(&conn, &d).unwrap();
+        }
+
+        // list_domains path.
+        let listed = list_domains(&conn).unwrap();
+        assert_eq!(listed.len(), 4);
+        for (name, expected) in &cases {
+            let row = listed.iter().find(|d| d.domain == *name).expect("row");
+            assert_eq!(
+                &row.challenge_kind, expected,
+                "challenge_kind mismatch for {name}"
+            );
+        }
+
+        // get_domain path (separate code path that also parses the
+        // column).
+        for (name, expected) in &cases {
+            let row = get_domain(&conn, name).unwrap().expect("row");
+            assert_eq!(
+                &row.challenge_kind, expected,
+                "get_domain mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_challenge_kind_upsert_overwrites() {
+        // Switching a domain from auto to explicit http-01 (and back)
+        // must round-trip through ON CONFLICT(domain) DO UPDATE. The
+        // UPSERT path is the only one operators can change a domain
+        // after the initial save (there is no separate "update"
+        // endpoint), so any bug here would silently lock the kind.
+        let conn = make_conn();
+        let s = Site {
+            name: "app".into(),
+            backend: "http://x:80".into(),
+            enabled: true,
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+            updated_at: dt("2026-01-01T00:00:00+00:00"),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        };
+        upsert_site(&conn, &s).unwrap();
+
+        let mut d = Domain {
+            domain: "switch.example.com".into(),
+            site_name: "app".into(),
+            enabled: true,
+            auto_issue: true,
+            dns_provider: Some("main-cf".into()),
+            challenge_kind: None,
+            created_at: dt("2026-01-01T00:00:00+00:00"),
+        };
+        upsert_domain(&conn, &d).unwrap();
+        d.challenge_kind = Some(ChallengeKind::Dns01);
+        upsert_domain(&conn, &d).unwrap();
+        assert_eq!(
+            get_domain(&conn, "switch.example.com")
+                .unwrap()
+                .unwrap()
+                .challenge_kind,
+            Some(ChallengeKind::Dns01)
+        );
+
+        d.challenge_kind = Some(ChallengeKind::Http01);
+        upsert_domain(&conn, &d).unwrap();
+        assert_eq!(
+            get_domain(&conn, "switch.example.com")
+                .unwrap()
+                .unwrap()
+                .challenge_kind,
+            Some(ChallengeKind::Http01)
+        );
+
+        // Back to auto.
+        d.challenge_kind = None;
+        upsert_domain(&conn, &d).unwrap();
+        assert_eq!(
+            get_domain(&conn, "switch.example.com")
+                .unwrap()
+                .unwrap()
+                .challenge_kind,
+            None
+        );
     }
 
     #[test]

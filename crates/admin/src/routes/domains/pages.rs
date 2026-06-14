@@ -54,6 +54,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         edit_domain: None,
         current_auto_issue: false,
         enabled_checked: true,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();
@@ -101,6 +102,7 @@ pub async fn render_edit_page(
         edit_domain: Some(existing.domain.clone()),
         current_auto_issue: existing.auto_issue,
         enabled_checked: existing.enabled,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();
@@ -172,6 +174,7 @@ pub async fn api_render_form_new(
         edit_domain: None,
         current_auto_issue: false,
         enabled_checked: true,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();

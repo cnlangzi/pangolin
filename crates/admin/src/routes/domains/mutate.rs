@@ -56,6 +56,26 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     } else {
         Some(dns_provider)
     };
+    // Per-domain challenge kind (issue #55). Form value is one of
+    // `"auto"` (NULL — planner picks), `"http-01"`, `"dns-01"`,
+    // `"dns-persist-01"`. Anything else (empty, garbage) is treated
+    // as `"auto"` to preserve the legacy behaviour and keep the
+    // form forgiving when the dropdown is missing.
+    let challenge_kind_raw = params
+        .get("challenge_kind")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let challenge_kind = match challenge_kind_raw.as_str() {
+        "http-01" => Some(pangolin_core::types::ChallengeKind::Http01),
+        "dns-01" => Some(pangolin_core::types::ChallengeKind::Dns01),
+        "dns-persist-01" => Some(pangolin_core::types::ChallengeKind::DnsPersist01),
+        // "auto" or anything we don't recognise — leave the column NULL
+        // so the planner applies the auto default (dns-01 with a
+        // provider, http-01 without).
+        _ => None,
+    };
 
     if domain.is_empty() {
         return render_create_page_with_error(app, "Domain name is required", csrf, None).await;
@@ -79,6 +99,31 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             app,
             "Wildcard domains require a DNS provider for DNS-01 validation. \
              Add one under DNS first, then assign it to this domain.",
+            csrf,
+            None,
+        )
+        .await;
+    }
+    // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
+    // with http-01. Reject the combination at save time so the
+    // operator sees a clear error before the ACME server refuses.
+    // The error message MUST contain the literal "RFC 8555 §8.3" —
+    // the planner emits the same string and the admin UI test grep
+    // for it.
+    if domain.starts_with("*.")
+        && matches!(
+            challenge_kind,
+            Some(pangolin_core::types::ChallengeKind::Http01)
+        )
+    {
+        return render_create_page_with_error(
+            app,
+            "Wildcard domains cannot use the http-01 challenge (ACME \
+             servers do not offer an http-01 challenge for wildcard \
+             identifiers per RFC 8555 §8.3). Set the challenge kind \
+             to 'dns-01' or 'dns-persist-01', or pick 'auto' (the \
+             planner will resolve to dns-01 when a DNS provider is \
+             linked).",
             csrf,
             None,
         )
@@ -108,7 +153,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         enabled,
         auto_issue,
         dns_provider,
-        challenge_kind: None, // TODO(issue #55): replaced below with parsed form value
+        challenge_kind,
         created_at: chrono::Utc::now(),
     };
 
@@ -215,6 +260,26 @@ pub async fn handle_update(
         Some(dns_provider)
     };
 
+    // Per-domain challenge kind (issue #55). The edit form sends the
+    // current value of the dropdown. Same parsing rules as
+    // `handle_create`: `"http-01"` / `"dns-01"` / `"dns-persist-01"`
+    // map to the matching enum variant; `"auto"` or anything else
+    // (empty, missing field) maps to `None` so the planner applies
+    // the auto default. The field is dropped through to the existing
+    // value when the form is missing it (malformed client fallback).
+    let challenge_kind_raw = params
+        .get("challenge_kind")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let challenge_kind = match challenge_kind_raw.as_str() {
+        "http-01" => Some(pangolin_core::types::ChallengeKind::Http01),
+        "dns-01" => Some(pangolin_core::types::ChallengeKind::Dns01),
+        "dns-persist-01" => Some(pangolin_core::types::ChallengeKind::DnsPersist01),
+        _ => existing.challenge_kind,
+    };
+
     // Wildcard domains must have a DNS association (DNS-01 is the only
     // way to validate `*.example.com`). Invariant copied from
     // `handle_create`.
@@ -224,6 +289,29 @@ pub async fn handle_update(
             &domain_pk,
             "Wildcard domains require a DNS provider for DNS-01 validation. \
              Add one under DNS first, then assign it to this domain.",
+            csrf,
+            &existing,
+        )
+        .await;
+    }
+    // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
+    // with http-01. Mirror the save-time check from `handle_create`
+    // so the edit path refuses the same combination.
+    if domain_pk.starts_with("*.")
+        && matches!(
+            challenge_kind,
+            Some(pangolin_core::types::ChallengeKind::Http01)
+        )
+    {
+        return render_edit_page_with_error(
+            app,
+            &domain_pk,
+            "Wildcard domains cannot use the http-01 challenge (ACME \
+             servers do not offer an http-01 challenge for wildcard \
+             identifiers per RFC 8555 §8.3). Set the challenge kind \
+             to 'dns-01' or 'dns-persist-01', or pick 'auto' (the \
+             planner will resolve to dns-01 when a DNS provider is \
+             linked).",
             csrf,
             &existing,
         )
@@ -255,6 +343,7 @@ pub async fn handle_update(
         enabled,
         auto_issue,
         dns_provider,
+        challenge_kind,
         // PK and created_at are immutable; preserve them.
         created_at: existing.created_at,
     };
@@ -323,6 +412,10 @@ async fn render_edit_page_with_error(
         edit_domain: Some(domain_pk.to_string()),
         current_auto_issue: existing.auto_issue,
         enabled_checked: existing.enabled,
+        challenge_kind_value: existing
+            .challenge_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default(),
     }
     .render()
     .unwrap();
@@ -356,6 +449,7 @@ async fn render_create_page_with_error(
         edit_domain: None,
         current_auto_issue: false,
         enabled_checked: true,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();

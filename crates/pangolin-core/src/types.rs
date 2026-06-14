@@ -208,24 +208,31 @@ fn split_host_path(s: &str) -> &str {
 ///
 /// The kind is stored as a TEXT column on `domains.challenge_kind`,
 /// so the on-disk representation is one of the lowercase strings
-/// `"http-01"`, `"dns-01"`, `"dns-persist-01"`, or `NULL`.
+/// `"http-01"`, `"dns-01"`, `"dns-persist-01"`, or `NULL`. The
+/// `serde(rename = ...)` attributes on each variant pin the
+/// JSON form to those exact strings — `rename_all = "kebab-case"`
+/// would produce `"http01"` (no hyphen) for the two-letter
+/// `Http01` variant, which does not match the on-disk form or
+/// the admin form's `<option value="...">`, so we rename each
+/// variant explicitly and keep `http01` / `dns01` / `dns-persist01`
+/// as aliases for forward-compat with anyone who already
+/// serialised the kebab-case form.
 ///
 /// All SANs in a single certificate share one challenge kind (no
 /// per-SAN kind) — the planner enforces this by returning a single
 /// `ChallengeType` per order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ChallengeKind {
     /// HTTP-01: the ACME server fetches
     /// `http://<domain>/.well-known/acme-challenge/<token>` from the
     /// proxy. The proxy must serve the file from the on-disk
     /// challenge dir.
-    #[serde(alias = "http-01")]
+    #[serde(rename = "http-01", alias = "http01")]
     Http01,
     /// DNS-01: the ACME server checks a TXT record at
     /// `_acme-challenge.<domain>`. Requires a DNS provider linked
     /// to the domain (or its base).
-    #[serde(alias = "dns-01")]
+    #[serde(rename = "dns-01", alias = "dns01")]
     Dns01,
     /// dns-persist-01 (IETF draft-ietf-acme-dns-persist-01): the
     /// ACME server checks a persistent TXT at
@@ -239,7 +246,7 @@ pub enum ChallengeKind {
     /// issuance time will surface the directory URL and remediation
     /// steps — operators must switch to `dns-01` or `http-01` for
     /// production certs.
-    #[serde(alias = "dns-persist-01")]
+    #[serde(rename = "dns-persist-01", alias = "dns-persist01")]
     DnsPersist01,
 }
 
@@ -823,6 +830,50 @@ mod tests {
         assert_eq!(d, back);
         assert!(back.auto_issue);
         assert_eq!(back.dns_provider.as_deref(), Some("main-cf"));
+    }
+
+    #[test]
+    fn domain_challenge_kind_serde_kebab_case() {
+        // Issue #55: the on-disk form is kebab-case, not PascalCase.
+        // The serde rename_all = "kebab-case" attribute must produce
+        // exactly the strings the form submits (http-01 / dns-01 /
+        // dns-persist-01). Pinning the wire format here keeps the
+        // admin form in sync with the Rust struct.
+        for kind in [
+            ChallengeKind::Http01,
+            ChallengeKind::Dns01,
+            ChallengeKind::DnsPersist01,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let expected = format!("\"{}\"", kind.as_str());
+            assert_eq!(json, expected, "kebab-case repr broke for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn domain_challenge_kind_roundtrip_each_variant() {
+        // A Domain with each challenge_kind variant must round-trip
+        // through serde JSON without losing the field. Catches
+        // missing rename_all attributes and similar regressions.
+        for kind in [
+            None,
+            Some(ChallengeKind::Http01),
+            Some(ChallengeKind::Dns01),
+            Some(ChallengeKind::DnsPersist01),
+        ] {
+            let d = Domain {
+                domain: "example.com".into(),
+                site_name: "x".into(),
+                enabled: true,
+                auto_issue: true,
+                dns_provider: None,
+                challenge_kind: kind,
+                created_at: Utc::now(),
+            };
+            let json = serde_json::to_string(&d).unwrap();
+            let back: Domain = serde_json::from_str(&json).unwrap();
+            assert_eq!(d, back, "roundtrip broke for challenge_kind={kind:?}");
+        }
     }
 
     #[test]

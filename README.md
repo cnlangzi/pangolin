@@ -425,6 +425,21 @@ domains:
 - 某个域 `auto_issue = true`：公网域名，Let's Encrypt 可访问
 - 某个域 `auto_issue = false`：内网域名，ngx 无法被 Let's Encrypt 访问，需 admin 手动管 cert；或企业用自有 CA 签发 cert
 
+**per-domain `challenge_kind`**（issue #55，V5 migration）：每个域独立选择 ACME challenge 方式，存于 `domains` 表的 `challenge_kind` 列。
+
+| 值 | 含义 | 备注 |
+|----|------|------|
+| `NULL` (Auto) | 由 planner 决定：有 DNS provider → `dns-01`，否则 `http-01` | **默认值**，生产环境推荐 |
+| `http-01` | 文件型验证，ngx 直接服务 `.well-known/acme-challenge/<token>` | **wildcard 禁止** (RFC 8555 §8.3) |
+| `dns-01` | 在 `_acme-challenge.<domain>` 创建 TXT | 需要关联 DNS provider；推荐生产环境使用 |
+| `dns-persist-01` | IETF 草稿，在 `_validation-persist.<base>` 创建持久 TXT，跨续期复用 | **Let's Encrypt 生产环境不支持**（仅 staging），可能失败 |
+
+**关键约束**：
+
+- **Wildcard × http-01 禁止**：ACME 服务器根本不为通配符提供 http-01 challenge（[RFC 8555 §8.3](https://datatracker.ietf.org/doc/html/rfc8555#section-8.3)）。admin 表单在 wildcard 域禁用 http-01 选项，后端在保存时也再次拒绝。
+- **DNS 类 challenge 必须有 DNS provider**：选 `dns-01` / `dns-persist-01` 但没关联 provider → planner 返回错误指向 `/dns` admin 页。
+- **一张证书的所有 SAN 共享同一个 kind**：不分 per-SAN，wildcard 和裸 base 在同一个 order 里只能选同一种方式。
+
 
 ---
 

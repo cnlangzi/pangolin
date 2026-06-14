@@ -603,6 +603,26 @@ mod tests {
         }
     }
 
+    /// Issue #55: build a domain with a specific `challenge_kind` for
+    /// the new plan_issuance tests. The plain `make_domain` helper
+    /// leaves the field at `None` (auto); this one sets it explicitly.
+    fn make_domain_with_kind(
+        d: &str,
+        auto: bool,
+        dns: Option<&str>,
+        kind: Option<ChallengeKind>,
+    ) -> Domain {
+        Domain {
+            domain: d.into(),
+            site_name: "app".into(),
+            enabled: true,
+            auto_issue: auto,
+            dns_provider: dns.map(String::from),
+            challenge_kind: kind,
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn dns_index_lookup_fqdn_first() {
         let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
@@ -755,5 +775,211 @@ mod tests {
         let d = make_domain("example.com", true, Some("ghost"));
         let err = plan_issuance(&["example.com".into()], &d, &idx).unwrap_err();
         assert!(err.to_string().contains("unknown"), "{err}");
+    }
+
+    // ---- Issue #55: per-domain challenge_kind tests ----
+    //
+    // The pre-#55 behaviour was implicit (DNS-01 for any domain with a
+    // DNS provider, HTTP-01 otherwise, dns-persist-01 for wildcards).
+    // Post-#55 the domain row carries an explicit
+    // `challenge_kind: Option<ChallengeKind>` that the planner honours
+    // — the spec requires six scenarios below and a clear error
+    // message containing "RFC 8555 §8.3" for the wildcard × http-01
+    // case. These tests pin the behaviour so a future refactor
+    // cannot silently change it.
+
+    #[test]
+    fn plan_explicit_http01_non_wildcard() {
+        // Non-wildcard, no DNS provider, explicit http-01 — ok.
+        let idx = DnsIndex::default();
+        let d = make_domain_with_kind("example.com", true, None, Some(ChallengeKind::Http01));
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::Http01);
+        assert_eq!(
+            plan.challenges,
+            vec![("example.com".into(), ChallengeType::Http01)]
+        );
+        assert!(plan.dns_provider_name.is_none());
+    }
+
+    #[test]
+    fn plan_explicit_dns01_with_provider() {
+        // FQDN with linked DNS provider, explicit dns-01 — must use dns-01.
+        let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
+        let domains = vec![make_domain("example.com", true, Some("cf"))];
+        let idx = DnsIndex::build(&providers, &domains);
+        let d = make_domain_with_kind("example.com", true, Some("cf"), Some(ChallengeKind::Dns01));
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::Dns01);
+        assert_eq!(
+            plan.challenges,
+            vec![("example.com".into(), ChallengeType::Dns01)]
+        );
+        assert_eq!(plan.dns_provider_name.as_deref(), Some("cf"));
+    }
+
+    #[test]
+    fn plan_explicit_dns_persist01_with_provider() {
+        // FQDN with linked DNS provider, explicit dns-persist-01 — must
+        // use dns-persist-01 (the plan's effective_kind is the source
+        // of truth; the per-SAN ChallengeType stays Dns01 for
+        // backwards-compat with the legacy match arms in ngx::acme).
+        let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
+        let domains = vec![make_domain("example.com", true, Some("cf"))];
+        let idx = DnsIndex::build(&providers, &domains);
+        let d = make_domain_with_kind(
+            "example.com",
+            true,
+            Some("cf"),
+            Some(ChallengeKind::DnsPersist01),
+        );
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::DnsPersist01);
+        assert_eq!(plan.dns_provider_name.as_deref(), Some("cf"));
+    }
+
+    #[test]
+    fn plan_explicit_http01_with_wildcard_rejected() {
+        // Wildcard + explicit http-01 must be rejected with an error
+        // message containing "RFC 8555 §8.3" (issue #55 verification
+        // item + RFC 8555 §8.3 itself).
+        let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
+        let domains = vec![make_domain("example.com", true, Some("cf"))];
+        let idx = DnsIndex::build(&providers, &domains);
+        let d = make_domain_with_kind(
+            "*.example.com",
+            true,
+            Some("cf"),
+            Some(ChallengeKind::Http01),
+        );
+        let err = plan_issuance(&["*.example.com".into()], &d, &idx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RFC 8555 §8.3"),
+            "error must contain the RFC reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_null_with_dns_provider_resolves_to_dns01() {
+        // NULL challenge_kind + DNS provider linked — auto default is
+        // dns-01 (NOT dns-persist-01, NOT http-01).
+        let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
+        let domains = vec![make_domain("example.com", true, Some("cf"))];
+        let idx = DnsIndex::build(&providers, &domains);
+        let d = make_domain_with_kind("example.com", true, Some("cf"), None);
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::Dns01);
+        assert_eq!(
+            plan.challenges,
+            vec![("example.com".into(), ChallengeType::Dns01)]
+        );
+    }
+
+    #[test]
+    fn plan_null_no_dns_provider_resolves_to_http01() {
+        // NULL challenge_kind + no DNS provider — auto default is http-01.
+        let idx = DnsIndex::default();
+        let d = make_domain_with_kind("example.com", true, None, None);
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::Http01);
+        assert_eq!(
+            plan.challenges,
+            vec![("example.com".into(), ChallengeType::Http01)]
+        );
+    }
+
+    #[test]
+    fn plan_dns01_without_provider_errors_scenario_c() {
+        // DNS-01 explicitly chosen but no DNS provider linked — must
+        // error with a "scenario C" message telling the operator
+        // exactly what to do (the error mentions /dns admin page so
+        // they can fix it without reading the docs).
+        let idx = DnsIndex::default();
+        let d = make_domain_with_kind("example.com", true, None, Some(ChallengeKind::Dns01));
+        let err = plan_issuance(&["example.com".into()], &d, &idx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DNS provider"), "got: {msg}");
+        assert!(
+            msg.contains("/dns"),
+            "expected remediation hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_dns_persist01_without_provider_errors_scenario_c() {
+        // Same as above for dns-persist-01.
+        let idx = DnsIndex::default();
+        let d = make_domain_with_kind("example.com", true, None, Some(ChallengeKind::DnsPersist01));
+        let err = plan_issuance(&["example.com".into()], &d, &idx).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DNS provider"), "got: {msg}");
+    }
+
+    #[test]
+    fn plan_explicit_choice_overrides_dns_provider_link() {
+        // FQDN with linked DNS provider but explicit http-01 — the
+        // user's choice wins. No DNS provider is needed for the
+        // order (http-01 is the only challenge).
+        let providers = vec![make_provider("cf", DnsProviderKind::Cloudflare)];
+        let domains = vec![make_domain("example.com", true, Some("cf"))];
+        let idx = DnsIndex::build(&providers, &domains);
+        let d = make_domain_with_kind("example.com", true, Some("cf"), Some(ChallengeKind::Http01));
+        let plan = plan_issuance(&["example.com".into()], &d, &idx).unwrap();
+        assert_eq!(plan.effective_kind, ChallengeKind::Http01);
+        assert!(plan.dns_provider_name.is_none());
+    }
+
+    #[test]
+    fn plan_challenge_kind_roundtrip_string() {
+        // The on-disk form (lower-case, kebab-case) round-trips
+        // through the public API. This pins the wire format so a
+        // typo in `as_str` would break Pebble / admin tests.
+        for k in ChallengeKind::ALL {
+            let s = k.as_str();
+            let parsed: ChallengeKind = s.parse().unwrap();
+            assert_eq!(parsed, k, "roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn domain_effective_challenge_kind_explicit_wins() {
+        // `effective_challenge_kind` is a pure projection: explicit
+        // `Some(_)` wins over the auto default. The function does
+        // NOT enforce wildcard × http-01 (that lives in the planner
+        // and the admin form).
+        let d = make_domain_with_kind(
+            "*.example.com",
+            true,
+            Some("cf"),
+            Some(ChallengeKind::Http01),
+        );
+        // Even though this is a wildcard, the helper returns
+        // Http01 because the caller asked for it. The planner
+        // is the place that rejects this combination.
+        assert_eq!(d.effective_challenge_kind(true), ChallengeKind::Http01);
+    }
+
+    #[test]
+    fn domain_effective_challenge_kind_auto_with_dns() {
+        let d = make_domain("example.com", true, Some("cf"));
+        assert_eq!(d.effective_challenge_kind(true), ChallengeKind::Dns01);
+    }
+
+    #[test]
+    fn domain_effective_challenge_kind_auto_without_dns() {
+        let d = make_domain("example.com", true, None);
+        assert_eq!(d.effective_challenge_kind(false), ChallengeKind::Http01);
+    }
+
+    #[test]
+    fn domain_has_wildcard_san() {
+        assert!(Domain::has_wildcard_san(&["*.example.com".into()]));
+        assert!(Domain::has_wildcard_san(&[
+            "example.com".into(),
+            "*.example.com".into(),
+        ]));
+        assert!(!Domain::has_wildcard_san(&["example.com".into()]));
+        assert!(!Domain::has_wildcard_san(&[]));
     }
 }

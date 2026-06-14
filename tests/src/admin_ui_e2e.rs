@@ -642,6 +642,217 @@ async fn domains_create_and_list() {
     assert!(list.contains("example.com"), "domain should appear in list");
 }
 
+/// Issue #55 E2E: the admin form's `challenge_kind` dropdown must
+/// persist the operator's choice to the database. This pins the
+/// full form → backend → DB round-trip for one explicit kind.
+/// (The pre-#55 form had no dropdown, so this would have stored
+/// `None` regardless of what the user submitted — making the
+/// feature invisible end-to-end.)
+#[tokio::test]
+async fn domains_challenge_kind_form_persists() {
+    use rusqlite::Connection;
+
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site first.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "ck-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Submit the new-domain form with challenge_kind = dns-01.
+    let page2 = client.get("/domains").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&page2).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "ck.example.com"),
+                ("site_name", "ck-site"),
+                ("challenge_kind", "dns-01"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "domain create should redirect, got {}",
+        resp.status()
+    );
+
+    // Verify the row in SQLite has the explicit kind. The harness
+    // can open the same DB file (WAL) and read the column.
+    let db_path = ngx.db_path();
+    let conn = Connection::open(&db_path).expect("open db");
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT challenge_kind FROM domains WHERE domain = 'ck.example.com'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("row must exist");
+    assert_eq!(
+        kind.as_deref(),
+        Some("dns-01"),
+        "challenge_kind must be persisted as the kebab-case string"
+    );
+
+    // Re-render the form for the domain: the dropdown must show
+    // dns-01 as selected (not auto).
+    // The new form does not have an edit page (the codebase has a
+    // stub `DomainsEditTemplate` that's not wired into a route
+    // yet), so we verify the value is readable end-to-end via the
+    // DB; a future PR can add the edit page and assert
+    // `<option ... selected>` on it.
+}
+
+/// Issue #55 E2E: submitting a wildcard domain with
+/// challenge_kind=http-01 must be rejected at save time with a
+/// 200 + error message containing the literal "RFC 8555 §8.3".
+/// (Pre-#55 the form had no wildcard × http-01 check; the request
+/// would 302 to /domains and the bad combination would be saved,
+/// causing the next ACME issuance to fail with a generic server
+/// error.)
+#[tokio::test]
+async fn domains_wildcard_http01_rejected_at_save() {
+    use rusqlite::Connection;
+
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create a site + a DNS provider so the wildcard rule does
+    // not short-circuit on "no provider" (we want the *specific*
+    // http-01 check to fire).
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "w-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let page = client.get("/dns").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/dns/new",
+            &[
+                ("name", "cf"),
+                ("kind", "cloudflare"),
+                ("config", "{}"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await;
+    let _ = resp; // dns/new may or may not be wired into this build
+
+    // Submit a wildcard domain with challenge_kind=http-01.
+    let page2 = client.get("/domains").await.unwrap().text().await.unwrap();
+    let csrf2 = client.csrf_token(&page2).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "*.wildcard.example"),
+                ("site_name", "w-site"),
+                ("dns_provider", "cf"),
+                ("challenge_kind", "http-01"),
+                ("_csrf", &csrf2),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+
+    // The save-time rejection renders the form back with 200 + an
+    // error message; it does NOT 302 to /domains. The error
+    // message MUST contain "RFC 8555 §8.3" so operators and tests
+    // can grep for the spec reference.
+    assert_eq!(
+        status, 200,
+        "wildcard × http-01 must be rejected at save (got {status})"
+    );
+    assert!(
+        body.contains("RFC 8555 §8.3"),
+        "error body must reference the RFC; got: {}",
+        &body[..body.len().min(400)]
+    );
+
+    // Verify no row was inserted.
+    let db_path = ngx.db_path();
+    let conn = Connection::open(&db_path).expect("open db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM domains WHERE domain = '*.wildcard.example'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "wildcard × http-01 must not be saved");
+}
+
+/// Issue #55 E2E: the new form's HTML must contain the four
+/// challenge-kind options. This is the cheapest possible
+/// regression test for the dropdown UI — if a future refactor
+/// drops the `<option value="...">` rows, this fails.
+#[tokio::test]
+async fn domains_new_page_has_challenge_kind_dropdown() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client
+        .get("/domains/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("domain-challenge-kind"),
+        "form must include the challenge-kind select"
+    );
+    for opt in ["auto", "http-01", "dns-01", "dns-persist-01"] {
+        assert!(
+            page.contains(&format!("value=\"{opt}\"")),
+            "form must offer challenge_kind={opt} as an option"
+        );
+    }
+}
+
 #[tokio::test]
 async fn domains_create_no_csrf_forbidden() {
     let ngx = start_ngx().await;

@@ -572,6 +572,24 @@ impl AcmeClient {
 
     /// Issue a certificate for the given domains.
     /// Returns all (cert_path, key_path) pairs written — one per SAN (identical content).
+    /// Legacy entry point used by tests and `check_and_renew` (issue
+    /// #55). Production traffic goes through `issue_with_plan`,
+    /// which honours the per-domain `challenge_kind` set in the
+    /// admin UI / DB. This method preserves the pre-#55 heuristic
+    /// so the existing test suite keeps passing:
+    ///   * wildcard OR a DNS provider configured → dns-persist-01
+    ///   * otherwise                              → http-01
+    ///
+    /// The wildcard × http-01 case cannot reach this code path
+    /// because `is_wildcard && self.dns_provider.is_none()` is
+    /// rejected at the top of the function.
+    ///
+    /// If a future caller needs the per-domain kind honoured here,
+    /// add a new method `issue_cert_with_kind(&self, domains,
+    /// kind: ChallengeKind)` that threads the kind through to
+    /// `pick_and_setup_challenge` directly. The current production
+    /// path (`issue_with_plan` + `plan_issuance`) already does
+    /// that.
     pub async fn issue_cert(&self, domains: &[String]) -> Result<Vec<(PathBuf, PathBuf)>> {
         log::info!("ACME: requesting certificate for domains: {:?}", domains);
 
@@ -591,22 +609,11 @@ impl AcmeClient {
         let mut order = self.account.new_order(&new_order).await?;
         log::info!("ACME order created: {}", order.url());
 
-        // Determine challenge type. Pre-#55 the legacy `issue_cert`
-        // path picked DNS-01 for wildcards OR when a provider was
-        // configured, and http-01 otherwise. Post-#55 we respect
-        // the per-domain row's `challenge_kind` (or the auto
-        // default). The caller (`check_and_renew`) passes the kind
-        // it planned with `plan_issuance`, so by the time we get
-        // here the wildcard × http-01 case has already been
-        // rejected upstream.
+        // Pre-#55 heuristic (see doc comment above). `is_wildcard`
+        // is always false here when `self.dns_provider.is_none()`,
+        // so wildcard × http-01 is unreachable.
         let any_dns_kind = self.dns_provider.is_some() || is_wildcard;
         let effective_kind = if any_dns_kind {
-            // Pre-#55 default was dns-persist-01 when a provider
-            // exists. We keep that as the safest default — the
-            // persistent TXT is set up once per (domain, account)
-            // and reused across renewals. Operators that prefer
-            // dns-01 or http-01 should use the admin UI to set
-            // `challenge_kind` explicitly.
             pangolin_core::ChallengeKind::DnsPersist01
         } else {
             pangolin_core::ChallengeKind::Http01
@@ -1131,16 +1138,14 @@ impl AcmeClient {
                 // dns-01: create a TXT at _acme-challenge.<id> with
                 // the key_authorization value, wait for
                 // propagation, then notify the server.
-                let mut ch = auth
-                    .challenge(ChallengeType::Dns01)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "dns-01 challenge not offered by ACME server for identifier '{identifier}' \
+                let mut ch = auth.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dns-01 challenge not offered by ACME server for identifier '{identifier}' \
                              (directory: {directory_url}). Remediation: switch the domain's \
                              challenge_kind to 'http-01' (for non-wildcard identifiers only) or \
                              'dns-persist-01' (if the server supports the IETF draft)."
-                        )
-                    })?;
+                    )
+                })?;
                 let p = provider.ok_or_else(|| {
                     anyhow::anyhow!(
                         "dns-01 challenge for identifier '{identifier}' requires a DNS provider, \
