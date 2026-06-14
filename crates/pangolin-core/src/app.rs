@@ -15,7 +15,7 @@ use crate::{
     EventBuffer, EventType, Indexes,
     config::Config,
     db,
-    types::{ChallengeType, DnsProviderKind},
+    types::{ChallengeKind, ChallengeType, DnsProviderKind},
 };
 
 /// In-memory index of DNS-related state, rebuilt from DB on startup and
@@ -87,10 +87,22 @@ impl DnsIndex {
 /// challenge type (DNS-01 for wildcards, DNS-01 for FQDN with a DNS
 /// association, HTTP-01 otherwise). An empty `challenges` vec means
 /// "do nothing" (the domain has `auto_issue = false`).
+///
+/// `effective_kind` (issue #55) is the concrete challenge kind the
+/// order will use — `http-01` / `dns-01` / `dns-persist-01`. The
+/// per-SAN `challenges` list carries the legacy
+/// `pangolin_core::ChallengeType` (a 2-variant enum) for
+/// compatibility with the existing match arms in `ngx::acme`, and
+/// the `effective_kind` field is the source of truth for the
+/// wire-level choice. `effective_kind` is always equal for every
+/// SAN in the order — splitting the kind per SAN is not supported
+/// (the IETF draft puts the wildcard and the bare base in the
+/// same order and uses one TXT for both).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuancePlan {
     pub challenges: Vec<(String, ChallengeType)>,
     pub dns_provider_name: Option<String>,
+    pub effective_kind: ChallengeKind,
 }
 
 /// Decide how to issue/renew a cert for a domain.
@@ -98,12 +110,17 @@ pub struct IssuancePlan {
 /// Pure function: no I/O, no async, no DB. The caller supplies the
 /// current `DnsIndex` and the `Domain` row to make the decision.
 ///
-/// Rules (v2 design, locked 2026-06-10):
+/// Rules (issue #55 — supersedes the pre-#55 behaviour):
 ///   * `domain.auto_issue == false` → empty plan, no-op.
-///   * Wildcard identifier without an associated DNS provider → error.
-///   * FQDN identifier with an associated DNS provider → DNS-01.
-///   * FQDN identifier without an associated DNS provider → HTTP-01.
-///   * FQDN identifier whose association points to an unknown provider → error.
+///   * The effective challenge kind is `domain.effective_challenge_kind(...)`:
+///     explicit `challenge_kind` wins, otherwise the auto default is
+///     `dns-01` if a DNS provider is linked, else `http-01`.
+///   * All SANs in the order share the same kind (no per-SAN switching).
+///   * Wildcard × http-01 → error containing "RFC 8555 §8.3".
+///   * DNS-01 / dns-persist-01 with no DNS provider linked → error
+///     pointing at the /dns admin page (scenario C).
+///   * Wildcard × no-DNS-provider → error (no per-SAN workaround).
+///   * FQDN with an unknown provider → error.
 pub fn plan_issuance(
     sans: &[String],
     domain: &crate::types::Domain,
@@ -115,6 +132,7 @@ pub fn plan_issuance(
         return Ok(IssuancePlan {
             challenges: vec![],
             dns_provider_name: None,
+            effective_kind: ChallengeKind::Http01, // unused when challenges is empty
         });
     }
     if sans.is_empty() {
@@ -123,8 +141,7 @@ pub fn plan_issuance(
         ));
     }
 
-    let mut challenges = Vec::with_capacity(sans.len());
-    let mut required_provider: Option<String> = None;
+    let any_wildcard = sans.iter().any(|s| s.starts_with("*."));
 
     // First pass: pick the DNS provider the WHOLE order will use
     // (whichever one any of the SANs is associated with, since
@@ -144,7 +161,6 @@ pub fn plan_issuance(
             "order references unknown or disabled dns_provider '{p}'"
         )));
     }
-    let any_wildcard = sans.iter().any(|s| s.starts_with("*."));
     if any_wildcard && order_provider.is_none() {
         return Err(PangolinError::Config(
             "wildcard SAN in order requires a DNS provider (set dns_provider \
@@ -153,34 +169,83 @@ pub fn plan_issuance(
         ));
     }
 
-    for san in sans {
-        // If any SAN in this order is a wildcard, we MUST use
-        // Dns01 for ALL SANs in the order — the wildcard
-        // forces Dns01, and the bare base (e.g. `yaitoo.cn`
-        // alongside `*.yaitoo.cn`) shares the same persistent
-        // TXT record at `_validation-persist.<base>` so it
-        // can't be validated via http-01 without setting up a
-        // second challenge. (See the IETF
-        // draft-ietf-acme-dns-persist-01 §3.1 example which
-        // puts the wildcard and the bare FQDN in the same
-        // order and uses ONE TXT for both.) Even when no
-        // wildcard is present, the order's DNS provider (if
-        // any) is reused across SANs so all TXT records land
-        // in the same zone.
-        if any_wildcard || order_provider.is_some() {
-            let p = order_provider.as_ref().unwrap();
-            required_provider = Some(p.clone());
-            challenges.push((san.clone(), ChallengeType::Dns01));
-        } else {
-            // No DNS provider in the order AND no wildcard —
-            // fall back to http-01 for every SAN.
-            challenges.push((san.clone(), ChallengeType::Http01));
-        }
+    // Resolve the effective kind once for the whole order. The
+    // domain row's `challenge_kind` (or its auto default) is the
+    // single source of truth — there is no per-SAN kind switching.
+    let effective = domain.effective_challenge_kind(order_provider.is_some());
+
+    // Wildcard × http-01 — rejected here (plan time) so the operator
+    // sees a clear error before the ACME server refuses. The error
+    // message MUST contain the literal string "RFC 8555 §8.3" — the
+    // admin UI tests grep for it and operators can search the docs
+    // for it.
+    if any_wildcard && effective == ChallengeKind::Http01 {
+        let wildcard = sans
+            .iter()
+            .find(|s| s.starts_with("*."))
+            .cloned()
+            .unwrap_or_default();
+        return Err(PangolinError::Config(format!(
+            "wildcard SAN '{wildcard}' in order cannot be validated with http-01 \
+             (RFC 8555 §8.3 — ACME servers do not offer an http-01 \
+             challenge for wildcard identifiers). \
+             Set this domain's challenge_kind to 'dns-01' or \
+             'dns-persist-01', or link a DNS provider to the base \
+             domain so the auto-default resolves to dns-01."
+        )));
     }
+
+    // DNS-based challenge with no provider — scenario C. The error
+    // tells the operator exactly where to go to fix it.
+    let needs_dns_provider = matches!(
+        effective,
+        ChallengeKind::Dns01 | ChallengeKind::DnsPersist01
+    );
+    if needs_dns_provider && order_provider.is_none() {
+        return Err(PangolinError::Config(format!(
+            "domain '{domain}' is configured for {effective} but no DNS provider is linked \
+             (neither this domain nor its base has a dns_provider set). \
+             Add a DNS provider under the /dns admin page and link it to \
+             this domain, or switch the domain to challenge_kind = 'http-01' \
+             (http-01 is only valid for non-wildcard SANs per RFC 8555 §8.3).",
+            domain = domain.domain,
+            effective = effective,
+        )));
+    }
+
+    let required_provider = if needs_dns_provider {
+        // Unwrap is safe: we just checked `order_provider.is_none()`
+        // and returned the error above.
+        order_provider.clone()
+    } else {
+        None
+    };
+
+    // Build the per-SAN plan. All SANs use the same `effective` kind
+    // — wildcard × http-01 was rejected above, and the IETF draft
+    // uses one TXT for both the wildcard and the bare base in the
+    // same order, so splitting the kind per SAN is not supported.
+    //
+    // The plan still uses `ChallengeType::Dns01` for both `Dns01`
+    // and `DnsPersist01` — the wire-level distinction is made
+    // later in `pick_and_setup_challenge`, which decides which
+    // `instant_acme::ChallengeType` to request and which TXT
+    // helper to invoke. The plan carries the kind through
+    // `plan.dns_provider_name` + a separate `effective_kind` field
+    // would be cleaner, but keeping it on the domain row is the
+    // existing convention (issue #55 says: configuration lives on
+    // the domain row).
+    let ct = match effective {
+        ChallengeKind::Http01 => ChallengeType::Http01,
+        ChallengeKind::Dns01 | ChallengeKind::DnsPersist01 => ChallengeType::Dns01,
+    };
+    let challenges: Vec<(String, ChallengeType)> =
+        sans.iter().map(|san| (san.clone(), ct)).collect();
 
     Ok(IssuancePlan {
         challenges,
         dns_provider_name: required_provider,
+        effective_kind: effective,
     })
 }
 
@@ -533,6 +598,7 @@ mod tests {
             enabled: true,
             auto_issue: auto,
             dns_provider: dns.map(String::from),
+            challenge_kind: None,
             created_at: Utc::now(),
         }
     }

@@ -69,6 +69,7 @@ fn admin_delete_domain() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: Utc::now(),
     };
     db::upsert_domain(&conn, &domain).unwrap();

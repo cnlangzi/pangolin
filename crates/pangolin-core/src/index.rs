@@ -187,6 +187,7 @@ mod tests {
             enabled: true,
             auto_issue: false,
             dns_provider: None,
+            challenge_kind: None,
             created_at: Utc::now(),
         }
     }
@@ -295,6 +296,7 @@ mod tests {
             enabled: false,
             auto_issue: false,
             dns_provider: None,
+            challenge_kind: None,
             created_at: Utc::now(),
         }];
         let idx = Indexes::build(sites, domains);

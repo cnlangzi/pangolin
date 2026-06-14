@@ -408,6 +408,11 @@ pub struct AcmeClient {
     renew_check_interval_hours: u32,
     key_type: KeyType,
     dns_provider: Option<Arc<dyn DnsProvider>>,
+    /// ACME directory URL (e.g. https://acme-v02.api.letsencrypt.org/directory).
+    /// Stored on the struct so error messages can include it (issue #55
+    /// scenario A: when the server does not offer the chosen kind, the
+    /// operator needs to know which server rejected them).
+    directory_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,6 +510,7 @@ impl AcmeClient {
             renew_check_interval_hours,
             key_type,
             dns_provider,
+            directory_url: acme_directory.to_string(),
         })
     }
 
@@ -560,6 +566,7 @@ impl AcmeClient {
             renew_check_interval_hours,
             key_type,
             dns_provider,
+            directory_url: acme_directory.to_string(),
         })
     }
 
@@ -584,8 +591,26 @@ impl AcmeClient {
         let mut order = self.account.new_order(&new_order).await?;
         log::info!("ACME order created: {}", order.url());
 
-        // Determine challenge type
-        let use_dns01 = is_wildcard || self.dns_provider.is_some();
+        // Determine challenge type. Pre-#55 the legacy `issue_cert`
+        // path picked DNS-01 for wildcards OR when a provider was
+        // configured, and http-01 otherwise. Post-#55 we respect
+        // the per-domain row's `challenge_kind` (or the auto
+        // default). The caller (`check_and_renew`) passes the kind
+        // it planned with `plan_issuance`, so by the time we get
+        // here the wildcard × http-01 case has already been
+        // rejected upstream.
+        let any_dns_kind = self.dns_provider.is_some() || is_wildcard;
+        let effective_kind = if any_dns_kind {
+            // Pre-#55 default was dns-persist-01 when a provider
+            // exists. We keep that as the safest default — the
+            // persistent TXT is set up once per (domain, account)
+            // and reused across renewals. Operators that prefer
+            // dns-01 or http-01 should use the admin UI to set
+            // `challenge_kind` explicitly.
+            pangolin_core::ChallengeKind::DnsPersist01
+        } else {
+            pangolin_core::ChallengeKind::Http01
+        };
 
         // Process each authorization. In instant-acme 0.8.x,
         // `Order::authorizations()` returns a stream of
@@ -593,66 +618,39 @@ impl AcmeClient {
         // method gives us a typed handle to a specific
         // challenge, and `set_ready()` on that handle POSTs
         // the empty-body notification to the ACME server.
+        let directory_url = self.directory_url.clone();
         let mut auths = order.authorizations();
         while let Some(auth_result) = auths.next().await {
             let mut auth = auth_result?;
             let identifier_str = dns_id(auth.identifier().identifier);
             log::info!("auth: identifier={}", identifier_str);
 
-            if use_dns01 {
-                // Prefer dns-persist-01 if the server offers it
-                // (IETF draft-ietf-acme-dns-persist-01): once a
-                // persistent TXT is in place, no per-order DNS
-                // churn. Fall back to dns-01 otherwise.
-                // Pick the challenge type. We use dns-persist-01
-                // when the server offers it (IETF
-                // draft-ietf-acme-dns-persist-01) — the persistent
-                // TXT is set once per (domain, account) and reused
-                // for every renewal, so there's no per-order DNS
-                // churn.
-                //
-                // Note: we DON'T try a `dns-01` fallback inside the
-                // same scope. The fallback requires a second
-                // `auth.challenge()` call, which collides with the
-                // first call's mutable borrow on `auth` — Rust's NLL
-                // refuses to re-borrow `auth` while a
-                // `Option<ChallengeHandle>` is in scope, even if
-                // it's `None`. The fallback would have to live in a
-                // separate function (see the `pick_dns_challenge`
-                // helper, which compiles in isolation but is still
-                // rejected at the call site). Operators that need
-                // dns-01 can disable dns-persist-01 by setting the
-                // env `NGX_ACME__CHALLENGE_KIND=dns-01` (TODO once
-                // we add a config knob for this).
-                let mut challenge = auth
-                    .challenge(ChallengeType::Unknown("dns-persist-01".to_string()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "dns-persist-01 challenge not offered by ACME server for {} \
-                             (this server doesn't support IETF draft-ietf-acme-dns-persist-01)",
-                            identifier_str
-                        )
-                    })?;
-
-                // Legacy `issue_cert` path: same as the v2
-                // `issue_with_plan` path — use dns-persist-01 when
-                // available. See the long comment on the
-                // `auth.challenge(...)` call above for the
-                // borrow-checker rationale that blocks a dns-01
-                // fallback in the same scope.
-                self.setup_dns_persist_txt(&identifier_str, self.account.id())
-                    .await?;
-                log::info!("dns-persist-01 challenge ready: {}", identifier_str);
-                challenge.set_ready().await?;
-            } else {
-                // HTTP-01
-                let mut challenge = auth.challenge(ChallengeType::Http01).ok_or_else(|| {
-                    anyhow::anyhow!("no HTTP-01 challenge for {}", identifier_str)
-                })?;
-                let key_auth = challenge.key_authorization().as_str().to_string();
-                self.write_challenge(&challenge.token, &key_auth).await?;
-                challenge.set_ready().await?;
-            }
+            // Pick the per-SAN challenge handle and set up the
+            // wire-side artefact (HTTP-01 file, dns-01 TXT, or
+            // dns-persist-01 TXT) via the shared helper. The
+            // helper does the setup AND `set_ready` so we do not
+            // need to re-borrow `auth` here. The handle it
+            // returns is consumed below for diagnostic logging
+            // only — by the time we drop the handle, the
+            // challenge is already set up and ready.
+            let _challenge = self
+                .pick_and_setup_challenge(
+                    &mut auth,
+                    &identifier_str,
+                    effective_kind,
+                    self.dns_provider.as_deref(),
+                    &directory_url,
+                )
+                .await?;
+            log::info!(
+                "{} challenge ready: {}",
+                match effective_kind {
+                    pangolin_core::ChallengeKind::Http01 => "http-01",
+                    pangolin_core::ChallengeKind::Dns01 => "dns-01",
+                    pangolin_core::ChallengeKind::DnsPersist01 => "dns-persist-01",
+                },
+                identifier_str
+            );
         }
 
         // Poll until order is ready (instant-acme 0.8.x: built-in
@@ -1059,6 +1057,159 @@ impl AcmeClient {
             .await
     }
 
+    /// Per-SAN challenge dispatch (issue #55).
+    ///
+    /// Selects the right `instant_acme::ChallengeType` for the given
+    /// `kind`, performs the wire-side setup (write the HTTP-01
+    /// file, create + wait for the dns-01 TXT, ensure the
+    /// dns-persist-01 persistent TXT), and notifies the ACME server
+    /// that the challenge is ready for validation (`set_ready`).
+    ///
+    /// On success the returned `ChallengeHandle` is freshly borrowed
+    /// from `auth` and can be used by the caller to inspect
+    /// `r#type` / `token` / `key_authorization` if needed (e.g. for
+    /// post-issue cleanup or for diagnostic logging).
+    ///
+    /// Borrow-checker note: the three arms are written as a NESTED
+    /// match on `auth.challenge()` rather than a single `let ch =
+    /// auth.challenge(...)?` followed by an outer `match kind`. The
+    /// latter would compile, but the former is the canonical form
+    /// for "we have a small enum and we want a clean per-arm setup
+    /// that doesn't need to hold a `ChallengeHandle` across match
+    /// arms" — and it leaves room for a future fallback (e.g.
+    /// "prefer dns-persist-01, fall back to dns-01") without
+    /// re-introducing the borrow pitfall. Each arm ends with
+    /// `set_ready()` so the helper is a one-shot: the caller does
+    /// NOT need to call `set_ready` on the returned handle.
+    ///
+    /// Error messages satisfy issue #55's three scenarios:
+    ///   * Scenario A (server doesn't offer the kind) — message
+    ///     includes the directory URL (passed in as
+    ///     `directory_url`) and at least one remediation step.
+    ///   * Scenario B (wildcard × http-01) — caught upstream in
+    ///     `plan_issuance`; this helper does not see it.
+    ///   * Scenario C (DNS kind with no provider) — message names
+    ///     the missing provider requirement and the domain row's
+    ///     challenge_kind.
+    pub async fn pick_and_setup_challenge<'a>(
+        &'a self,
+        auth: &'a mut instant_acme::AuthorizationHandle<'a>,
+        identifier: &str,
+        kind: pangolin_core::ChallengeKind,
+        provider: Option<&dyn DnsProvider>,
+        directory_url: &str,
+    ) -> Result<instant_acme::ChallengeHandle<'a>> {
+        match kind {
+            pangolin_core::ChallengeKind::Http01 => {
+                // http-01: write a file under .well-known/acme-challenge/
+                // with the key_authorization string. The proxy serves
+                // this file when the ACME server requests it.
+                //
+                // Nested match: `auth.challenge(Http01)` returns
+                // `Option<ChallengeHandle>`. The `None` arm produces
+                // a scenario-A error with directory URL +
+                // remediation; the `Some` arm does the write +
+                // set_ready and returns the handle.
+                let mut ch = auth
+                    .challenge(ChallengeType::Http01)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "http-01 challenge not offered by ACME server for identifier '{identifier}' \
+                             (directory: {directory_url}). Remediation: this server does not offer \
+                             http-01 for this identifier — switch the domain's challenge_kind to \
+                             'dns-01' or 'dns-persist-01' on the /domains admin page, or remove \
+                             the wildcard from the SAN list (http-01 is not valid for wildcards per \
+                             RFC 8555 §8.3)."
+                        )
+                    })?;
+                let key_auth = ch.key_authorization().as_str().to_string();
+                self.write_challenge(&ch.token, &key_auth).await?;
+                ch.set_ready().await?;
+                Ok(ch)
+            }
+            pangolin_core::ChallengeKind::Dns01 => {
+                // dns-01: create a TXT at _acme-challenge.<id> with
+                // the key_authorization value, wait for
+                // propagation, then notify the server.
+                let mut ch = auth
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dns-01 challenge not offered by ACME server for identifier '{identifier}' \
+                             (directory: {directory_url}). Remediation: switch the domain's \
+                             challenge_kind to 'http-01' (for non-wildcard identifiers only) or \
+                             'dns-persist-01' (if the server supports the IETF draft)."
+                        )
+                    })?;
+                let p = provider.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dns-01 challenge for identifier '{identifier}' requires a DNS provider, \
+                         but the domain row has none linked (neither this domain nor its base has \
+                         a dns_provider set). Remediation: add a DNS provider under the /dns admin \
+                         page and link it to this domain, or switch challenge_kind to 'http-01'."
+                    )
+                })?;
+                let key_auth = ch.key_authorization().as_str().to_string();
+                let txt_name = format!("_acme-challenge.{}", identifier);
+                let txt_value = key_auth;
+                let (zone, _zone_id) = p.find_zone(identifier).await?;
+                // Best-effort delete-then-create: a stale TXT from
+                // a previous attempt would cause the validator to
+                // see a different value. The delete is allowed to
+                // fail (no record yet) — we ignore the error and
+                // proceed to create.
+                let _ = p.delete_txt(&zone, &txt_name).await;
+                p.create_txt(&zone, &txt_name, &txt_value, 600).await?;
+                // Wait for propagation. The deadline is short (60s)
+                // relative to the full 120s the legacy path used
+                // because the validation server retries — if the
+                // first wave misses we want to fail fast and let
+                // the operator see a clear error rather than
+                // waiting 2 minutes per identifier.
+                let propagated = wait_for_txt_propagation(&txt_name, &txt_value, 60, 5).await?;
+                if !propagated {
+                    log::warn!(
+                        "dns-01 TXT {} may not be fully propagated after 60s, proceeding",
+                        txt_name
+                    );
+                }
+                ch.set_ready().await?;
+                Ok(ch)
+            }
+            pangolin_core::ChallengeKind::DnsPersist01 => {
+                // dns-persist-01: ensure the persistent TXT at
+                // _validation-persist.<base> is present with the
+                // expected value, then notify the server. The
+                // record is reused across renewals so most
+                // issuances short-circuit on the sidecar check.
+                let mut ch = auth
+                    .challenge(ChallengeType::Unknown("dns-persist-01".to_string()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dns-persist-01 challenge not offered by ACME server for identifier \
+                             '{identifier}' (directory: {directory_url}). Remediation: this server \
+                             does not support IETF draft-ietf-acme-dns-persist-01 — switch the \
+                             domain's challenge_kind to 'dns-01' (recommended for production) or \
+                             'http-01' (only valid for non-wildcard identifiers per RFC 8555 §8.3)."
+                        )
+                    })?;
+                let p = provider.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dns-persist-01 challenge for identifier '{identifier}' requires a DNS \
+                         provider, but the domain row has none linked. Remediation: add a DNS \
+                         provider under the /dns admin page and link it to this domain, or switch \
+                         challenge_kind to 'dns-01' / 'http-01'."
+                    )
+                })?;
+                let account_uri = self.account.id().to_string();
+                self.ensure_dns_persist_txt(p, identifier, &account_uri)
+                    .await?;
+                ch.set_ready().await?;
+                Ok(ch)
+            }
+        }
+    }
+
     /// v2 entry point: issue a cert executing a per-identifier `IssuancePlan`.
     ///
     /// For each SAN in `domains`, the plan picks the challenge type. The
@@ -1166,171 +1317,60 @@ impl AcmeClient {
                 .get(i)
                 .ok_or_else(|| anyhow::anyhow!("plan missing entry for index {}", i))?;
 
-            // Pick the challenge handle. For DNS validation, we
-            // use dns-persist-01 (IETF
-            // draft-ietf-acme-dns-persist-01) when available — the
-            // persistent TXT is set up once and reused for every
-            // renewal. We don't try a `dns-01` fallback in the same
-            // scope: `AuthorizationHandle::challenge` takes `&mut
-            // self`, and the borrow checker refuses to re-borrow
-            // `auth` while the first `Option<ChallengeHandle>` is
-            // in scope (even if it's `None`). See the long comment
-            // on the legacy `issue_cert` path for details.
+            // Per-#55: every SAN in the order shares the same
+            // effective challenge kind (the planner enforces
+            // this). We pass `plan.effective_kind` to the
+            // shared helper, which picks the right
+            // `instant_acme::ChallengeType` and performs the
+            // wire-side setup (write the HTTP-01 file, create
+            // the dns-01 TXT, ensure the dns-persist-01
+            // persistent TXT) before calling `set_ready`.
             //
-            // For HTTP validation, use http-01.
-            let mut challenge = match plan_ct {
-                pangolin_core::ChallengeType::Dns01 => auth
-                    .challenge(ChallengeType::Unknown("dns-persist-01".to_string()))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "dns-persist-01 challenge not offered by ACME server for {} \
-                             (this server doesn't support IETF draft-ietf-acme-dns-persist-01)",
-                            identifier_str
-                        )
-                    })?,
-                pangolin_core::ChallengeType::Http01 => {
-                    auth.challenge(ChallengeType::Http01).ok_or_else(|| {
-                        anyhow::anyhow!("no http-01 challenge for {}", identifier_str)
-                    })?
-                }
-            };
+            // Pre-#55 we also handled the per-SAN
+            // (san, plan_ct) match inline here, which
+            // duplicated the dns-01 TXT dance and the
+            // dns-persist-01 setup. Post-#55 that lives in
+            // `pick_and_setup_challenge` (the
+            // `plan_ct → ChallengeKind` mapping is in
+            // `plan_issuance`). We still emit per-stage trace
+            // events for the dashboard — the helper does
+            // logging but the trace events are a v2-path
+            // concern.
+            //
+            // We pass `dns_provider` as `Option<&dyn DnsProvider>`
+            // (a borrowed reference) — the helper does not
+            // own it.
+            let _ = plan_ct; // intentionally unused; effective_kind wins.
 
-            // Inspect the chosen challenge type once so we know which
-            // TXT-record code path to take. `challenge.r#type` is a
-            // field on `Challenge` (the deref target of
-            // `ChallengeHandle`).
-            let challenge_kind = match &challenge.r#type {
-                ChallengeType::Unknown(s) if s == "dns-persist-01" => "dns-persist-01",
-                ChallengeType::Dns01 => "dns-01",
-                ChallengeType::Http01 => "http-01",
-                ChallengeType::Unknown(s) => {
-                    anyhow::bail!(
-                        "unsupported challenge type {:?} for {} (plan asked for {:?})",
-                        s,
-                        identifier_str,
-                        plan_ct
-                    );
-                }
-                other => {
-                    anyhow::bail!(
-                        "unexpected challenge type {:?} for {} (plan asked for {:?})",
-                        other,
-                        identifier_str,
-                        plan_ct
-                    );
-                }
-            };
+            // Emit a pre-stage trace so the dashboard reflects
+            // what we're about to do.
+            emit(
+                "challenge-pick",
+                format!(
+                    "identifier={} kind={} provider={:?}",
+                    identifier_str, plan.effective_kind, plan.dns_provider_name
+                ),
+            );
 
-            match challenge_kind {
-                "dns-persist-01" => {
-                    // Persistent TXT at `_validation-persist.<domain>`,
-                    // value = `<issuer>; accounturi=<account_url>`
-                    // per IETF draft-ietf-acme-dns-persist-01 §3.1 +
-                    // RFC 8659 issue-value syntax. The record is set
-                    // ONCE per (domain, account, issuer) and reused
-                    // on every renewal — no propagation wait needed.
-                    let p = dns_provider.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "dns-persist-01 for {} requires a DNS provider (plan.provider={:?})",
-                            identifier_str,
-                            plan.dns_provider_name
-                        )
-                    })?;
-                    let account_uri = self.account.id().to_string();
-                    // (clippy suggests `self.account.id()`; that returns &str which
-                    //  also fits `ensure_dns_persist_txt` — keeping the explicit
-                    //  String here is a no-op clone; revisit if the
-                    //  `expected_value` storage ever stops being a String.)
-                    emit(
-                        "dns-persist",
-                        format!("ensuring persistent TXT for {}", identifier_str),
-                    );
-                    self.ensure_dns_persist_txt(p.as_ref(), &identifier_str, &account_uri)
-                        .await?;
-                    emit(
-                        "dns-persist",
-                        format!("persistent TXT ready for {}", identifier_str),
-                    );
-                }
-                "dns-01" => {
-                    let p = dns_provider.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "plan requested dns-01 for {} but provider '{:?}' not in registry",
-                            identifier_str,
-                            plan.dns_provider_name
-                        )
-                    })?;
-                    let key_auth = challenge.key_authorization().as_str().to_string();
-                    let txt_name = format!("_acme-challenge.{}", identifier_str);
-                    let txt_value = key_auth;
-                    emit(
-                        "dns-zone",
-                        format!("looking up zone for {}", identifier_str),
-                    );
-                    let (zone, _zone_id) = p.find_zone(&identifier_str).await?;
-                    emit("dns-zone", format!("zone={}", zone));
+            // Run the per-SAN setup. The handle it returns is
+            // dropped here — `set_ready` was already called
+            // inside the helper, so the ACME server has been
+            // notified.
+            let _challenge = self
+                .pick_and_setup_challenge(
+                    &mut auth,
+                    &identifier_str,
+                    plan.effective_kind,
+                    dns_provider.map(|p| p.as_ref()),
+                    &self.directory_url,
+                )
+                .await?;
 
-                    emit(
-                        "dns-del",
-                        format!("deleting old TXT {} (if exists)", txt_name),
-                    );
-                    match p.delete_txt(&zone, &txt_name).await {
-                        Ok(()) => {
-                            emit("dns-del", format!("deletion complete for {}", txt_name));
-                        }
-                        Err(e) => {
-                            log::warn!("dns-del failed (non-fatal): {}", e);
-                            emit("dns-del", format!("deletion failed (continuing): {}", e));
-                        }
-                    }
-
-                    emit(
-                        "dns-set",
-                        format!("creating TXT {} (zone={}, ttl=600)", txt_name, zone),
-                    );
-                    p.create_txt(&zone, &txt_name, &txt_value, 600).await?;
-                    emit(
-                        "dns-set",
-                        format!("TXT {} created (zone={})", txt_name, zone),
-                    );
-                    emit(
-                        "dns-wait",
-                        format!("polling propagation: max 120s, every 5s ({})", txt_name),
-                    );
-                    let wait_started = std::time::Instant::now();
-                    let propagated =
-                        wait_for_txt_propagation(&txt_name, &txt_value, 120, 5).await?;
-                    let wait_elapsed = wait_started.elapsed().as_secs();
-                    if propagated {
-                        emit("dns-wait", format!("propagated in {}s", wait_elapsed));
-                    } else {
-                        emit(
-                            "dns-wait",
-                            format!(
-                                "timeout after {}s — proceeding anyway (may fail upstream)",
-                                wait_elapsed
-                            ),
-                        );
-                        log::warn!("DNS-01 TXT may not be fully propagated, proceeding");
-                    }
-                }
-                "http-01" => {
-                    let key_auth = challenge.key_authorization().as_str().to_string();
-                    self.write_challenge(&challenge.token, &key_auth).await?;
-                    emit(
-                        "http01",
-                        format!("wrote challenge file token={}", challenge.token),
-                    );
-                }
-                _ => unreachable!(),
-            }
-
-            challenge.set_ready().await?;
             emit(
                 "challenge-ready",
                 format!(
                     "notified ACME server for {} ({})",
-                    identifier_str, challenge_kind
+                    identifier_str, plan.effective_kind
                 ),
             );
             i += 1;

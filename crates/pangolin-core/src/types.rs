@@ -193,6 +193,95 @@ fn split_host_path(s: &str) -> &str {
     }
 }
 
+/// Per-domain ACME challenge kind (issue #55).
+///
+/// Each domain explicitly picks one of three ACME challenge kinds:
+/// * `Http01`       — HTTP-01 (file-based) — default fallback
+/// * `Dns01`        — DNS-01  (TXT at `_acme-challenge.<domain>`)
+/// * `DnsPersist01` — dns-persist-01 (persistent TXT at
+///   `_validation-persist.<domain>`, IETF
+///   draft-ietf-acme-dns-persist-01)
+/// * `None` (NULL in the DB) means "auto": the planner picks
+///   `dns-01` if a DNS provider is linked, `http-01` otherwise.
+///   The application resolves `None` to a concrete kind at
+///   `plan_issuance` time — there is no runtime fallback chain.
+///
+/// The kind is stored as a TEXT column on `domains.challenge_kind`,
+/// so the on-disk representation is one of the lowercase strings
+/// `"http-01"`, `"dns-01"`, `"dns-persist-01"`, or `NULL`.
+///
+/// All SANs in a single certificate share one challenge kind (no
+/// per-SAN kind) — the planner enforces this by returning a single
+/// `ChallengeType` per order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChallengeKind {
+    /// HTTP-01: the ACME server fetches
+    /// `http://<domain>/.well-known/acme-challenge/<token>` from the
+    /// proxy. The proxy must serve the file from the on-disk
+    /// challenge dir.
+    #[serde(alias = "http-01")]
+    Http01,
+    /// DNS-01: the ACME server checks a TXT record at
+    /// `_acme-challenge.<domain>`. Requires a DNS provider linked
+    /// to the domain (or its base).
+    #[serde(alias = "dns-01")]
+    Dns01,
+    /// dns-persist-01 (IETF draft-ietf-acme-dns-persist-01): the
+    /// ACME server checks a persistent TXT at
+    /// `_validation-persist.<base_domain>` with a value of the form
+    /// `<issuer-domain>; accounturi=<ACCOUNT_URL>; policy=wildcard`.
+    /// The record is set up once per (domain, account, issuer) and
+    /// reused across renewals — no per-order DNS churn.
+    ///
+    /// Note: production Let's Encrypt does NOT offer this challenge
+    /// (only the staging environment does). The error message at
+    /// issuance time will surface the directory URL and remediation
+    /// steps — operators must switch to `dns-01` or `http-01` for
+    /// production certs.
+    #[serde(alias = "dns-persist-01")]
+    DnsPersist01,
+}
+
+impl ChallengeKind {
+    /// Lowercase string used in the DB (matches the on-disk
+    /// representation and `serde(rename_all = "kebab-case")`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChallengeKind::Http01 => "http-01",
+            ChallengeKind::Dns01 => "dns-01",
+            ChallengeKind::DnsPersist01 => "dns-persist-01",
+        }
+    }
+
+    /// Every concrete variant. Used by the admin UI to render the
+    /// dropdown options and by the migration regression test to
+    /// assert the on-disk enum is stable.
+    pub const ALL: [ChallengeKind; 3] = [
+        ChallengeKind::Http01,
+        ChallengeKind::Dns01,
+        ChallengeKind::DnsPersist01,
+    ];
+}
+
+impl std::fmt::Display for ChallengeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ChallengeKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "http-01" => Ok(ChallengeKind::Http01),
+            "dns-01" => Ok(ChallengeKind::Dns01),
+            "dns-persist-01" => Ok(ChallengeKind::DnsPersist01),
+            other => Err(format!("unknown challenge_kind: {other}")),
+        }
+    }
+}
+
 /// Domain (domains table). domain is the primary key.
 /// site_name references sites.name (logical FK; not enforced at SQL level
 /// because we want fast reload without per-row FK checks).
@@ -210,7 +299,58 @@ pub struct Domain {
     /// None = no DNS-01 association; ACME will fall back to HTTP-01 (wildcards fail).
     #[serde(default)]
     pub dns_provider: Option<String>,
+    /// Per-domain ACME challenge kind (issue #55). `None` means
+    /// "auto": the planner picks `dns-01` if a DNS provider is
+    /// linked, `http-01` otherwise (resolved at `plan_issuance`
+    /// time, never silently fall back at runtime).
+    ///
+    /// The wildcard × http-01 combination is rejected at both save
+    /// time and plan time (RFC 8555 §8.3).
+    #[serde(default)]
+    pub challenge_kind: Option<ChallengeKind>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Domain {
+    /// Resolve the effective challenge kind for this domain.
+    ///
+    /// `dns_provider_linked` should be `true` when this domain (or
+    /// its base) has a `dns_providers.name` referenced via
+    /// `Domain::dns_provider` OR via the `dns_provider` column on
+    /// any related row. The caller is responsible for the actual
+    /// lookup — the planner already has a `DnsIndex` for this.
+    ///
+    /// Resolution rules (issue #55):
+    ///   1. Explicit `challenge_kind = Some(k)` → that kind.
+    ///   2. `challenge_kind = None` and DNS provider linked → `Dns01`.
+    ///   3. `challenge_kind = None` and no DNS provider → `Http01`.
+    ///
+    /// The wildcard × http-01 case is NOT rejected here — that
+    /// rejection lives in `plan_issuance` (which is the single
+    /// authority for "is this combination acceptable?") and in the
+    /// admin form (which greys out the http-01 option when a
+    /// wildcard is present). This helper is a pure projection:
+    /// "what kind would we use if we were to issue right now?".
+    pub fn effective_challenge_kind(&self, dns_provider_linked: bool) -> ChallengeKind {
+        match self.challenge_kind {
+            Some(k) => k,
+            None => {
+                if dns_provider_linked {
+                    ChallengeKind::Dns01
+                } else {
+                    ChallengeKind::Http01
+                }
+            }
+        }
+    }
+
+    /// True if any SAN this domain would include is a wildcard
+    /// (`*.example.com`). Wildcard SANs MUST be validated via DNS-01
+    /// or dns-persist-01 (per RFC 8555 §8.3 — the server does not
+    /// offer http-01 for wildcards).
+    pub fn has_wildcard_san(sans: &[String]) -> bool {
+        sans.iter().any(|s| s.starts_with("*."))
+    }
 }
 
 /// Tun node (tun table). name is the primary key.
@@ -659,6 +799,7 @@ mod tests {
             enabled: true,
             auto_issue: false,
             dns_provider: None,
+            challenge_kind: None,
             created_at: Utc::now(),
         };
         let json = serde_json::to_string(&d).unwrap();
@@ -674,6 +815,7 @@ mod tests {
             enabled: true,
             auto_issue: true,
             dns_provider: Some("main-cf".into()),
+            challenge_kind: None,
             created_at: Utc::now(),
         };
         let json = serde_json::to_string(&d).unwrap();

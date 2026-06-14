@@ -108,6 +108,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         enabled,
         auto_issue,
         dns_provider,
+        challenge_kind: None, // TODO(issue #55): replaced below with parsed form value
         created_at: chrono::Utc::now(),
     };
 
