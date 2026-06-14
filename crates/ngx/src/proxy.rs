@@ -55,6 +55,73 @@ impl ProxyHttp for AppProxy {
             is_ws_upgrade
         );
 
+        // ACME HTTP-01 short-circuit (issue #54).
+        //
+        // Must run BEFORE every other routing branch — is_ws_upgrade,
+        // lookup_site, the tunnel backend, the file:/// backend, the
+        // direct upstream_peer path. If the request falls through to
+        // site lookup, a domain configured with a non-ACME backend
+        // (e.g. a Go service that runs its own `autocert`) will see
+        // the challenge and return `acme/autocert: certificate cache
+        // miss` (or its proxied equivalent), which is exactly the bug
+        // reported in #54.
+        //
+        // The host header is irrelevant: ACME HTTP-01 specifies that
+        // the validator probes the *domain it is validating*, so a
+        // single cert_dir on the proxy is sufficient regardless of
+        // which site is configured for `Host:`.
+        if let Some(token) = crate::acme::parse_http01_path(&path) {
+            let cert_dir = self.app.cert_manager.cert_dir.clone();
+            match crate::acme::read_http01_challenge(&cert_dir, token).await {
+                Ok(Some(body)) => {
+                    debug!("ACME HTTP-01 served token={}", token);
+                    let mut hdr = match ResponseHeader::build(200, None) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            error!("failed to build ACME challenge response: {}", e);
+                            let _ = session.respond_error(500).await;
+                            return Ok(true);
+                        }
+                    };
+                    // ACME servers fetch this URL with a normal UA; no
+                    // special content type is required, but Pebble /
+                    // Boulder / Let's Encrypt all accept `text/plain`.
+                    hdr.insert_header("Content-Type", "text/plain; charset=utf-8")
+                        .ok();
+                    hdr.insert_header("Content-Length", body.len().to_string().as_bytes())
+                        .ok();
+                    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+                        error!("failed to write ACME challenge response header: {}", e);
+                        return Ok(true);
+                    }
+                    if let Err(e) = session
+                        .write_response_body(Some(Bytes::from(body)), true)
+                        .await
+                    {
+                        error!("failed to write ACME challenge response body: {}", e);
+                    }
+                    return Ok(true);
+                }
+                Ok(None) => {
+                    // Either the token was rejected by validation
+                    // (parse_http01_path should have caught that, but
+                    // read_http01_challenge re-validates defensively)
+                    // or no challenge file exists on disk. The ACME
+                    // server treats both as "challenge not ready",
+                    // i.e. 404. We must NOT fall through to site
+                    // routing — that's the original bug.
+                    debug!("ACME HTTP-01 not found: path={}", path);
+                    let _ = session.respond_error(404).await;
+                    return Ok(true);
+                }
+                Err(e) => {
+                    error!("ACME HTTP-01 read error for {}: {}", path, e);
+                    let _ = session.respond_error(500).await;
+                    return Ok(true);
+                }
+            }
+        }
+
         if is_ws_upgrade && path == self.app.ws_path {
             let host = session
                 .get_header("Host")

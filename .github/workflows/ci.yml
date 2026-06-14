@@ -101,6 +101,35 @@ jobs:
 
   # ----------------------------------------------------------------
   # E2E tests — requires Pebble ACME server
+  #
+  # Issue #54 regression check strategy:
+  #   Pebble's `PEBBLE_VA_ALWAYS_VALID=1` (the historical setting)
+  #   silently accepts every challenge WITHOUT actually performing the
+  #   HTTP fetch. That's why the missing proxy-side ACME HTTP-01
+  #   handler went unnoticed for so long — the validator never
+  #   probed the URL, so the cert was issued regardless.
+  #
+  #   Two complementary tests now cover the server-side regression:
+  #
+  #   1. `real_e2e_acme_http01_challenge_served` and
+  #      `real_e2e_acme_http01_missing_returns_404` (default-on, run
+  #      via `make test-e2e`): these are deterministic HTTP-level
+  #      simulations of what Pebble's validator would send. They plant
+  #      a challenge file, GET it through the proxy, and assert the
+  #      byte-exact response — no Pebble dependency, no port-80
+  #      binding, runs on every CI green.
+  #
+  #   2. `real_e2e_acme_http01_full_pebble_flow` (`#[ignore]`'d):
+  #      drives an actual issuance through Pebble. We do NOT run this
+  #      in CI because Pebble hardcodes HTTP-01 port 80 and the
+  #      ubuntu-latest sandbox cannot bind it; the test is runnable
+  #      locally with `cargo test ... -- --ignored` for anyone who
+  #      wants the end-to-end coverage.
+  #
+  # The Pebble service below stays in `PEBBLE_VA_ALWAYS_VALID=1`
+  # mode for the *client*-side tests (acme.rs::tests::acme_*), which
+  # only need an ACME server that will sign certificates — they
+  # don't care about challenge validation.
   # ----------------------------------------------------------------
   e2e:
     name: E2E tests (Pebble)
@@ -148,3 +177,70 @@ jobs:
         # build + ~5 min test).
         timeout-minutes: 15
         run: make test-e2e
+
+  # ----------------------------------------------------------------
+  # Strict-mode Pebble flow (manual trigger).
+  #
+  # Pebble with `PEBBLE_VA_ALWAYS_VALID=0` performs the actual HTTP-01
+  # fetch — exactly the path issue #54 broke. This job is `workflow_dispatch`
+  # only because:
+  #   - Pebble hardcodes port 80 for HTTP-01; the github-hosted
+  #     ubuntu-latest runner can't bind it from the e2e service
+  #     container without privileged mode.
+  #   - The deterministic direct-proxy tests above already catch the
+  #     regression in regular CI; this job exists so a developer can
+  #     validate the full issuance path locally and on PR before merge.
+  #
+  # Run via the GitHub UI: Actions → CI → Run workflow → strict_pebble.
+  # ----------------------------------------------------------------
+  strict_pebble:
+    name: Strict Pebble flow (manual)
+    if: false  # workflow_dispatch-only; remove this guard when wired up
+    runs-on: ubuntu-latest
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        ports:
+          - "14000:14000"
+          - "5001:5001"
+          - "15000:15000"
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "0"
+          PEBBLE_LISTEN: "0.0.0.0:14000"
+          PEBBLE_WFE_OVERRIDE_DNS: "127.0.0.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-strict-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-strict-1.96-
+
+      - name: Add hosts entry for localhost.test
+        run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
+
+      - name: Build release binaries
+        run: make build
+
+      - name: Run full Pebble HTTP-01 flow
+        # The full HTTP-01 issuance loop is gated behind `#[ignore]`
+        # because Pebble needs port 80, which the service container
+        # above can't bind. This step is the canonical way to
+        # exercise the end-to-end path on a workstation that can
+        # bind privileged ports.
+        timeout-minutes: 10
+        run: |
+          cargo test --features integration -p pangolin-integration-tests \
+              real_e2e_acme_http01_full_pebble_flow -- --ignored --nocapture

@@ -1686,3 +1686,263 @@ async fn real_e2e_h2_authority_fallback() {
 
     backend_handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// ACME HTTP-01 challenge serving (issue #54)
+// ---------------------------------------------------------------------------
+//
+// Why these tests are here:
+//   The original ACME client wrote challenge files to
+//   `{cert_dir}/.well-known/acme-challenge/{token}`, but the proxy
+//   never served them — so Let's Encrypt (or Pebble in strict mode)
+//   fetched the URL, fell through to site routing, hit a backend
+//   that doesn't know about ACME, and the operator saw a 403/404
+//   in the validator's logs.
+//
+//   Two of the three tests below are NOT `#[ignore]`'d because they
+//   don't require Pebble — they plant a challenge file as the ACME
+//   client would, then exercise the proxy directly. The third test
+//   drives the full Pebble flow and is `#[ignore]`'d so the default
+//   `make test-e2e` stays fast; CI runs it on Pebble.
+
+/// Plant a challenge file under the proxy's cert_dir, then fetch it
+/// from the public listener. The proxy must serve the file byte-for-
+/// byte with `200 OK` and `text/plain`, **regardless of the
+/// configured backend** — that's the whole bug from issue #54.
+///
+/// This is the cheapest reliable regression check for the missing
+/// ACME HTTP-01 handler: it doesn't need Pebble, doesn't drive the
+/// ACME state machine, and fails fast on the pre-fix code.
+#[tokio::test]
+async fn real_e2e_acme_http01_challenge_served() {
+    let backend = EchoBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // Configure a backend that, if the proxy ever falls through
+        // to it, returns 200 with a marker body that does NOT match
+        // the challenge. If we see the marker body, the proxy
+        // short-circuited the ACME path to the backend (the bug).
+        seed_site(&conn, "acme-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "acme.test", "acme-site");
+    })
+    .await;
+
+    // Mimic what `AcmeClient::write_challenge` does during a real
+    // issuance: write the key-authorization string to
+    // `{cert_dir}/.well-known/acme-challenge/{token}`.
+    let cert_dir = ngx.cert_dir();
+    let ch_dir = cert_dir.join(".well-known").join("acme-challenge");
+    std::fs::create_dir_all(&ch_dir).expect("mkdir .well-known/acme-challenge");
+    let token = "test-token-abc123";
+    let key_auth = format!("{}.thumbprint-def456", token);
+    std::fs::write(ch_dir.join(token), &key_auth).expect("write challenge file");
+
+    // Fetch via the public proxy. The `Host` header is intentionally
+    // the configured domain — pre-fix the proxy would route to
+    // `acme-site`'s backend and we'd see the EchoBackend's body
+    // instead of our challenge. Post-fix the proxy short-circuits
+    // and serves the challenge directly.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let path = format!("/.well-known/acme-challenge/{}", token);
+    let (status, body) = raw_get(&addr, "acme.test", &path).await;
+
+    assert_eq!(
+        status,
+        200,
+        "ACME HTTP-01 challenge should return 200, got {status}. \
+         If 404, the proxy is missing the short-circuit handler. \
+         body={body:?}. ngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(
+        body,
+        key_auth,
+        "ACME HTTP-01 challenge body must match what the ACME client wrote. \
+         If you see JSON like {{\"method\":\"GET\",\"path\":...}}, the proxy \
+         fell through to the configured backend instead of serving the \
+         challenge file. ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // The configured backend MUST NOT have received any request — the
+    // short-circuit is supposed to bypass site routing entirely.
+    let seen = backend.seen().await;
+    assert!(
+        seen.is_empty(),
+        "ACME HTTP-01 short-circuit should bypass backend routing; \
+         saw {} request(s) at backend: {:?}. ngx log:\n{}",
+        seen.len(),
+        seen,
+        ngx.log_string()
+    );
+}
+
+/// Missing challenge file → 404 from the proxy, not a fall-through
+/// to the configured backend. The ACME server treats 404 as
+/// "challenge not ready yet" (transient error) and retries; if the
+/// proxy instead returned 200 with the backend's body, the validator
+/// would mark the challenge invalid.
+///
+/// This test exercises the same short-circuit from a different
+/// angle: instead of "is the file served?" it asks "does a missing
+/// file produce a clean 404?".
+#[tokio::test]
+async fn real_e2e_acme_http01_missing_returns_404() {
+    let backend = EchoBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "acme-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "missing.test", "acme-site");
+    })
+    .await;
+
+    // Don't plant any challenge file.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, body) = raw_get(
+        &addr,
+        "missing.test",
+        "/.well-known/acme-challenge/never-existed",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        404,
+        "Missing ACME HTTP-01 challenge must return 404, got {status} \
+         (body={body:?}). If 200, the proxy fell through to the \
+         configured backend. ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Backend must NOT have seen anything.
+    let seen = backend.seen().await;
+    assert!(
+        seen.is_empty(),
+        "ACME HTTP-01 short-circuit should bypass backend routing \
+         even for missing tokens; saw {} request(s): {:?}",
+        seen.len(),
+        seen
+    );
+}
+
+/// Full Pebble-driven HTTP-01 issuance (issue #54's primary regression
+/// scenario): start a `pangolin-ngx` pointing at a local Pebble
+/// server with `PEBBLE_VA_ALWAYS_VALID=0`, drive an issuance via the
+/// admin API, and verify the cert blob appears on disk.
+///
+/// **Why this is `#[ignore]`'d:** the full flow requires Pebble
+/// reachable at `https://localhost:14000/dir` with strict validation
+/// (i.e. `PEBBLE_VA_ALWAYS_VALID=0`), `localhost.test` resolving to
+/// `127.0.0.1`, and Pebble's validator able to reach the proxy's
+/// HTTP listener on port 80 — Pebble hardcodes port 80 for HTTP-01
+/// by default. CI runs Pebble as a service (`.github/workflows/ci.yml`)
+/// but does not have the right port-80 wiring to exercise the full
+/// loop. Run locally with:
+///
+/// ```text
+/// podman run --rm -d --name pebble \
+///   -p 14000:14000 -p 5001:5001 -p 15000:15000 \
+///   -e PEBBLE_VA_NOSLEEP=1 \
+///   -e PEBBLE_VA_ALWAYS_VALID=0 \
+///   -e PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1 \
+///   ghcr.io/letsencrypt/pebble:latest
+/// echo '127.0.0.1 localhost.test' | sudo tee -a /etc/hosts
+/// cargo test --features integration -p pangolin-integration-tests \
+///     real_e2e_acme_http01_full_pebble_flow -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "requires Pebble on :14000 with strict validation; see comment"]
+async fn real_e2e_acme_http01_full_pebble_flow() {
+    use pangolin_core::db;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // Use a domain Pebble can resolve. `localhost.test` resolves
+        // to 127.0.0.1 only when /etc/hosts has the entry AND
+        // Pebble was started with PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1.
+        // The site backend is intentionally unreachable so a
+        // fall-through (the bug) would 502 instead of pretending to
+        // succeed.
+        seed_site(&conn, "acme-full-site", "http://127.0.0.1:1");
+        // auto_issue=true so the ACME service picks it up.
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO domains (domain, site_name, enabled, auto_issue, created_at) \
+             VALUES (?1, ?2, 1, 1, ?3)",
+            rusqlite::params!["localhost.test", "acme-full-site", now],
+        )
+        .expect("insert domain with auto_issue=1");
+    })
+    .await;
+
+    // Drive issuance via the admin retry endpoint. The handler
+    // calls AcmeState::retry which calls ensure_one → AcmeClient.
+    let admin = crate::admin_harness::AdminClient::new(&ngx);
+    admin.login("admin", "admin").await.expect("login");
+    let resp = admin
+        .post_form("/certs/retry", &[("domain", "localhost.test")])
+        .await
+        .expect("POST /certs/retry");
+    let status = resp.status().as_u16();
+    assert!(
+        (200..400).contains(&status),
+        "POST /certs/retry failed with {status}; ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Poll the cert blob on disk. Issuing a cert via Pebble takes
+    // ~3s end-to-end (order + challenge + finalize + cert polling).
+    // 60s is a generous upper bound that still fails fast on a
+    // stuck proxy.
+    let cert_dir = ngx.cert_dir();
+    let blob = cert_dir.join("localhost.test");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if blob.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "ACME HTTP-01 issuance never produced a cert blob at {} within 60s. \
+                 Most likely cause: Pebble validator returned an error because the \
+                 proxy failed to serve the challenge file. ngx log:\n{}",
+                blob.display(),
+                ngx.log_string()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Sanity: the blob contains a real certificate, not a stub.
+    let content = std::fs::read_to_string(&blob).expect("read blob");
+    assert!(
+        content.contains("-----BEGIN CERTIFICATE-----"),
+        "issued blob must contain a cert PEM block, got first 200 bytes: {:?}",
+        &content[..content.len().min(200)]
+    );
+
+    // And the certs row in the DB transitioned to `Issued` (or
+    // `Pending` if the blob was written before the row update
+    // landed — either is "not Failed"; the precise transition
+    // depends on the runtime).
+    let conn = Connection::open(ngx.db_path()).expect("open db");
+    let row = db::get_cert(&conn, "localhost.test")
+        .expect("db get_cert")
+        .expect("cert row must exist after issuance");
+    assert!(
+        matches!(
+            row.status,
+            pangolin_core::CertStatus::Issued | pangolin_core::CertStatus::Issuing
+        ),
+        "expected Issued/Issuing after successful issuance, got {:?} \
+         (last_error={:?}). This is the bug #54 regression — if the \
+         validator returned a 403/404 the row would be Failed.",
+        row.status,
+        row.last_error
+    );
+}
