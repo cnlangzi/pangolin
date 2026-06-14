@@ -326,12 +326,8 @@ pub async fn handle(
                         if domain.is_empty() {
                             not_found()
                         } else {
-                            routes::certs::api_handle_delete(
-                                &app,
-                                domain.to_string(),
-                                &csrf_token,
-                            )
-                            .await?
+                            routes::certs::api_handle_delete(&app, domain.to_string(), &csrf_token)
+                                .await?
                         }
                     } else {
                         not_found()

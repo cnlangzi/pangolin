@@ -2981,7 +2981,10 @@ async fn certs_hx_delete_no_csrf_forbidden() {
 
     // Send a non-empty body so the pingora body-read doesn't stall.
     let resp = client
-        .delete_form("/api/certs/any.example.com", &[("domain", "any.example.com")])
+        .delete_form(
+            "/api/certs/any.example.com",
+            &[("domain", "any.example.com")],
+        )
         .await
         .unwrap();
     assert_eq!(

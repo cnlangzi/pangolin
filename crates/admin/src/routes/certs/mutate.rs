@@ -92,11 +92,7 @@ pub async fn handle_delete(
 /// This is the unified delete endpoint for certs; the form-POST
 /// `/certs/delete` route above is kept for now as a fallback during the
 /// migration window (issue #48).
-pub async fn api_handle_delete(
-    app: &Arc<App>,
-    domain: String,
-    _csrf: &str,
-) -> http::Result<Resp> {
+pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> http::Result<Resp> {
     if domain.is_empty() {
         return Ok(crate::not_found());
     }
