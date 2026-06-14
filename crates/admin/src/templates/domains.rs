@@ -185,6 +185,16 @@ pub struct DomainsTableView<'a> {
     pub active_nav: &'a str,
 }
 
+// ─── Site-specific table view (HTMX partial for /api/site/{name}/domains) ────
+
+#[derive(Template)]
+#[template(path = "views/domains/_site_table.html")]
+pub struct SiteDomainsTableView<'a> {
+    pub domains: Vec<Domain>,
+    pub site_name: &'a str,
+    pub active_nav: &'a str,
+}
+
 // ─── Form fields view (shared by new + edit) ──────────────────────────────────
 
 #[derive(Template)]
