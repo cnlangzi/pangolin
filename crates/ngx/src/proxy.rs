@@ -35,12 +35,14 @@ use pingora_core::prelude::*;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
+use pangolin_core::decode_http_response;
 use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept, read_http_response};
 use pangolin_core::types::HostMode;
 use pangolin_core::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
+use tokio::io::AsyncReadExt;
 
 use crate::App;
 
@@ -128,20 +130,41 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
             .open_stream()
             .await
             .map_err(|e| ProxyError::Unavailable(format!("open_stream: {e}")))?;
+        // Write 4-byte big-endian length prefix followed by frame bytes.
+        // The tun side reads the length first, then reads exactly that many
+        // bytes — no need to wait for EOF (which is unreliable over yamux).
+        let len = bytes.len() as u32;
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| ProxyError::Backend(format!("write frame length: {e}")))?;
         stream
             .write_all(&bytes)
             .await
             .map_err(|e| ProxyError::Backend(format!("write frame: {e}")))?;
         stream
-            .shutdown()
+            .flush()
             .await
-            .map_err(|e| ProxyError::Backend(format!("shutdown: {e}")))?;
+            .map_err(|e| ProxyError::Backend(format!("flush: {e}")))?;
 
-        let response = read_http_response(&mut stream);
-        let response = timeout(Duration::from_secs(60), response)
+        // Read 4-byte big-endian length prefix, then read exactly that many
+        // bytes for the response. Mirrors the tun→ngx write protocol.
+        use tokio::io::AsyncReadExt as _;
+        let mut len_buf = [0u8; 4];
+        timeout(Duration::from_secs(60), stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| ProxyError::Backend(format!("read response: {e}")))?;
+            .map_err(|e| ProxyError::Backend(format!("read response length: {e}")))?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        timeout(Duration::from_secs(60), stream.read_exact(&mut resp_buf))
+            .await
+            .map_err(|_| ProxyError::Timeout)?
+            .map_err(|e| ProxyError::Backend(format!("read response body: {e}")))?;
+
+        let response = decode_http_response(&resp_buf)
+            .map_err(|e| ProxyError::Backend(format!("decode response: {e}")))?
+            .ok_or_else(|| ProxyError::Backend("empty response".into()))?;
 
         Ok(response)
     }

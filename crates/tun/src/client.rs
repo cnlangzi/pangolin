@@ -234,15 +234,19 @@ async fn handle_tunnel_frame<S>(mut stream: S, _config: &TunConfig, name: &str) 
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        match stream.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    // Read 4-byte big-endian length prefix, then read exactly that many bytes.
+    // This avoids waiting for EOF (unreliable over yamux half-close).
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame length: {}", e))?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; frame_len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame body: {}", e))?;
     let frame = decode_frame(&buf).map_err(|e| anyhow::anyhow!(e))?;
     if frame.is_upgrade {
         handle_ws_upgrade(stream, frame, name).await
@@ -296,11 +300,19 @@ where
     };
 
     let resp_bytes = encode_http_response(&response);
+    // Write 4-byte big-endian length prefix followed by response bytes.
+    // Mirrors the request direction (ngx→tun) so ngx can read an exact
+    // byte count without waiting for EOF or shutdown.
+    let len = resp_bytes.len() as u32;
+    if let Err(e) = stream.write_all(&len.to_be_bytes()).await {
+        warn!("tun {} write response length: {}", name, e);
+        return Err(e.into());
+    }
     if let Err(e) = stream.write_all(&resp_bytes).await {
         warn!("tun {} write response: {}", name, e);
         return Err(e.into());
     }
-    stream.shutdown().await?;
+    stream.flush().await?;
     Ok(())
 }
 

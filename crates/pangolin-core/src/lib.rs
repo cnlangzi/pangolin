@@ -43,7 +43,9 @@ pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
-pub use tunnel::{TunnelRole, YamuxTunnel, parse_http_request_bytes};
+pub use tunnel::{
+    TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,
+};
 pub use types::{
     BackendKind, Cert, CertErrorClass, CertStatus, ChallengeType, DnsProvider, DnsProviderKind,
     Domain, HostMode, Site, Tun, next_backoff,

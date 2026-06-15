@@ -524,6 +524,45 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
 
 /// Serialise an `HttpResponse` back into a wire-format HTTP/1.1
 /// response byte buffer.
+/// Decode an `HttpResponse` from a byte slice produced by `encode_http_response`.
+/// Returns `None` if the bytes are empty.
+pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let bytes_str = std::str::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Format: "HTTP/1.1 {status_line}\r\n{headers}\r\n\r\n{body}"
+    let split = bytes_str.find("\r\n\r\n").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+    })?;
+    let header_part = &bytes_str[..split];
+    let body_bytes = bytes[split + 4..].to_vec();
+
+    let mut lines = header_part.splitn(2, "\r\n");
+    let first_line = lines.next().unwrap_or("");
+    // first_line: "HTTP/1.1 200 OK"
+    let mut parts = first_line.splitn(2, ' ');
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let status_line = parts.next().unwrap_or("502 Bad Gateway").to_string();
+
+    let headers_part = lines.next().unwrap_or("");
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in headers_part.split("\r\n") {
+        if let Some(pos) = line.find(": ") {
+            headers.push((line[..pos].to_string(), line[pos + 2..].to_string()));
+        }
+    }
+
+    Ok(Some(HttpResponse {
+        version,
+        status_line,
+        headers,
+        body: body_bytes,
+    }))
+}
+
 pub fn encode_http_response(resp: &HttpResponse) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + resp.body.len());
     out.extend_from_slice(resp.version.as_bytes());
