@@ -36,13 +36,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 use pangolin_core::decode_http_response;
-use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept, read_http_response};
+use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept};
 use pangolin_core::types::HostMode;
+
 use pangolin_core::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
-use tokio::io::AsyncReadExt;
 
 use crate::App;
 
