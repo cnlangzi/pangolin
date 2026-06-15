@@ -526,21 +526,44 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
 /// response byte buffer.
 /// Decode an `HttpResponse` from a byte slice produced by `encode_http_response`.
 /// Returns `None` if the bytes are empty.
+///
+/// **Why we don't `from_utf8` the whole buffer**: the response body is
+/// arbitrary bytes (e.g. `Content-Encoding: deflate` returns a 5-byte
+/// deflate stream like `01 00 00 ff ff`, or any binary download).
+/// Validating the whole buffer as UTF-8 was a real bug — see the
+/// `decode_http_response_does_not_validate_body_as_utf8` test.
+///
+/// The **header** section is required to be ASCII (RFC 7230 §3.2.4:
+/// "field-value    = *( field-content / obs-fold )" where
+/// `field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]`
+/// and `field-vchar  = VCHAR / obs-text`, with VCHAR = `%x21-7E`).
+/// We still validate the header section as UTF-8 (a strict subset of
+/// ASCII in well-formed responses); the body is kept as `Vec<u8>`.
 pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let bytes_str = std::str::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Format: "HTTP/1.1 {status_line}\r\n{headers}\r\n\r\n{body}"
-    let split = bytes_str.find("\r\n\r\n").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+    let split = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+        })?;
+
+    // Validate **only the header section** as UTF-8. Body stays as
+    // `Vec<u8>` so binary content (deflate, gzip, images, downloads)
+    // passes through untouched.
+    let header_str = std::str::from_utf8(&bytes[..split]).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("response header is not valid UTF-8: {e}"),
+        )
     })?;
-    let header_part = &bytes_str[..split];
     let body_bytes = bytes[split + 4..].to_vec();
 
-    let mut lines = header_part.splitn(2, "\r\n");
+    let mut lines = header_str.splitn(2, "\r\n");
     let first_line = lines.next().unwrap_or("");
     // first_line: "HTTP/1.1 200 OK"
     let mut parts = first_line.splitn(2, ' ');
@@ -1237,4 +1260,97 @@ where
 #[allow(unused)]
 fn _silence_unused() {
     let _ = std::marker::PhantomData::<Context<'_>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Bug-fix regression (issue: tunnel 502 on deflate body).**
+    ///
+    /// The pre-fix `decode_http_response` validated the *whole* response
+    /// buffer (header + body) as UTF-8. That was wrong: a 302 with
+    /// `Content-Encoding: deflate` has a 5-byte deflate body
+    /// (`01 00 00 ff ff`), which is not valid UTF-8. The
+    /// `from_utf8` check failed at `index 126` (first body byte) and
+    /// ngx returned 502 to the browser.
+    ///
+    /// The fix splits the header/body at `\r\n\r\n` first and only
+    /// validates the **header** section as UTF-8. Body bytes are
+    /// preserved verbatim — exactly what an HTTP gateway must do for
+    /// compressed/binary responses.
+    #[test]
+    fn decode_http_response_does_not_validate_body_as_utf8() {
+        // Real bytes captured from the production 8888 backend
+        // (`curl -H 'Accept-Encoding: deflate'`), 5 bytes of raw
+        // deflate stream.
+        let body: Vec<u8> = vec![0x01, 0x00, 0x00, 0xff, 0xff];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 302 Found\r\n");
+        bytes.extend_from_slice(b"Content-Encoding: deflate\r\n");
+        bytes.extend_from_slice(b"Location: /login\r\n");
+        bytes.extend_from_slice(b"Date: Mon, 15 Jun 2026 09:06:25 GMT\r\n");
+        bytes.extend_from_slice(b"Content-Length: 5\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(&body);
+
+        let resp = decode_http_response(&bytes)
+            .expect("decode must succeed for binary body")
+            .expect("non-empty response");
+
+        assert_eq!(resp.status_line, "302 Found");
+        assert_eq!(resp.body, body, "body bytes must be preserved verbatim");
+        let loc = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .expect("Location header present");
+        assert_eq!(loc.1, "/login");
+        let ce = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            .expect("Content-Encoding header present");
+        assert_eq!(ce.1, "deflate");
+    }
+
+    /// Sanity: a well-formed 200 with a JSON body still decodes.
+    #[test]
+    fn decode_http_response_text_body_unchanged() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        bytes.extend_from_slice(b"Content-Type: application/json\r\n");
+        bytes.extend_from_slice(b"Content-Length: 2\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(b"{}");
+        let resp = decode_http_response(&bytes).unwrap().unwrap();
+        assert_eq!(resp.status_line, "200 OK");
+        assert_eq!(resp.body, b"{}");
+    }
+
+    /// A response with **no body** (the common 302 + Location case)
+    /// must still decode cleanly.
+    #[test]
+    fn decode_http_response_no_body() {
+        let bytes = b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\n\r\n";
+        let resp = decode_http_response(bytes).unwrap().unwrap();
+        assert_eq!(resp.status_line, "302 Found");
+        assert!(resp.body.is_empty());
+    }
+
+    /// Garbage bytes in the **header** section must still fail —
+    /// we only relaxed the body check, not the header check.
+    #[test]
+    fn decode_http_response_rejects_non_utf8_header() {
+        // Inject a non-UTF-8 byte (0x80) into a header value.
+        let bytes = b"HTTP/1.1 200 OK\r\nX-Bad: \x80\x81\r\n\r\n";
+        let err = decode_http_response(bytes).expect_err("non-utf8 header must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Empty buffer → None (preserves existing behaviour).
+    #[test]
+    fn decode_http_response_empty() {
+        assert!(decode_http_response(b"").unwrap().is_none());
+    }
 }

@@ -798,6 +798,27 @@ async fn build_request_from_session(
 /// Write an `HttpResponse` to a pingora `Session`. Translates
 /// our shared wire format into pingora's `ResponseHeader` +
 /// `write_response_body`.
+///
+/// **Why `append_header` (not `insert_header`)**: a backend may send
+/// multiple headers under the same name — the canonical example is
+/// `Set-Cookie` (RFC 6265 §3 / RFC 7230 §3.2.2 explicitly carves out
+/// `Set-Cookie` as the one header where multi-line wire format is
+/// meaningful). `insert_header` **replaces** all existing values
+/// under the same name, silently dropping every `Set-Cookie` after
+/// the first one. The user-visible symptom was a login flow where
+/// only the last `Set-Cookie` reached the browser, the session
+/// cookie got overwritten, and `/chat` immediately redirected back
+/// to `/login`.
+///
+/// `append_header` adds the new value without removing existing
+/// ones. For single-value headers like `Content-Length` it behaves
+/// identically to `insert_header` for the common case (one value
+/// in, one value out); if a misbehaving upstream sends duplicate
+/// `Content-Length`, surfacing both to the client matches the raw
+/// wire bytes the upstream sent — the right thing for a transparent
+/// proxy.
+///
+/// See `real_e2e_tunnel_preserves_multiple_set_cookie`.
 async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     let status = parse_status_from_line(&resp.status_line);
     let mut hdr = match ResponseHeader::build(status, None) {
@@ -810,7 +831,12 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     };
     for (k, v) in &resp.headers {
         if let Ok(value) = HeaderValue::from_str(v.as_str()) {
-            hdr.insert_header(k.to_string(), value).ok();
+            // `k` and `value` are owned; pass them by-value so
+            // `append_header`'s `IntoCaseHeaderName` / `TryInto`
+            // bounds are satisfied without escaping a borrow
+            // (E0521 — `resp` is `&`-aliased, the slice refs
+            // don't outlive this loop iteration).
+            hdr.append_header(k.clone(), value).ok();
         }
     }
     if resp
@@ -818,7 +844,7 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
         .iter()
         .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
     {
-        hdr.insert_header("Content-Length", resp.body.len().to_string())
+        hdr.append_header("Content-Length".to_string(), resp.body.len().to_string())
             .ok();
     }
     if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
