@@ -13,8 +13,8 @@ use http_body_util::Full;
 
 use askama::Template;
 
-use crate::templates::SiteDomainsTableView;
 use crate::App;
+use crate::templates::SiteDomainsTableView;
 
 type Resp = Response<Full<Bytes>>;
 
