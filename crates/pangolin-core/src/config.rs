@@ -62,6 +62,9 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// TLS listener tuning (HTTP/2 toggle, future knobs).
+    #[serde(default)]
+    pub tls: TlsConfig,
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -157,6 +160,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             cache: CacheConfig::default(),
             acme: AcmeConfig::default(),
+            tls: TlsConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -286,6 +290,46 @@ impl Default for AcmeConfig {
             pre_renew: None,
             post_renew: None,
             deploy: None,
+        }
+    }
+}
+
+/// TLS listener tuning.
+///
+/// Currently a single knob: whether to advertise HTTP/2 via ALPN on
+/// the TLS listener. The default is `true` (h2 is the modern
+/// browser default and offers multiplexing + header compression
+/// for direct-HTTP / file backends), but **set to `false` if you
+/// have a tunnel backend** (`site.backend = "<tun>:<url>"`) and
+/// see the browser receive `400 Bad Request: missing required
+/// Host header` on the first request to a h2 connection.
+///
+/// The h2 + tunnel combination hits an upstream pingora/h2 bug
+/// where the per-request yamux stream is torn down with
+/// `tokio_yamux::stream: this branch should be unreachable` before
+/// the request body reaches the kinnit backend, and pingora falls
+/// back to a 400 with that exact body. The same request works
+/// perfectly on HTTP/1.1. Once the upstream issue is fixed this
+/// knob can flip back to its default; for now it is the
+/// production-proven workaround.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Advertise HTTP/2 via ALPN. Default `true`. Set to `false`
+    /// to force h1 (browsers will fall back automatically; in our
+    /// testing modern Chrome works flawlessly on h1 with a tunnel
+    /// backend, and connection setup is still ~1 RTT).
+    #[serde(default = "default_tls_enable_h2")]
+    pub enable_h2: bool,
+}
+
+fn default_tls_enable_h2() -> bool {
+    true
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enable_h2: default_tls_enable_h2(),
         }
     }
 }
@@ -532,6 +576,34 @@ mod tests {
             let c = Config::from_str(s).unwrap();
             assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
             assert_eq!(c.tunnel.ws_path, "/tunnel");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tls_enable_h2_defaults_to_true() {
+        // Backwards compat: ships with h2 on, so the default
+        // `pangolin-ngx` config is unchanged for the 99% of installs
+        // that don't see the upstream h2+tunnel bug. See
+        // `TlsConfig` doc for the disable-h2 use case.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert!(c.tls.enable_h2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tls_enable_h2_explicit_false() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                tls:
+                  enable_h2: false
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert!(!c.tls.enable_h2);
             Ok(())
         });
     }

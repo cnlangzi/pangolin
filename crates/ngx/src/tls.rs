@@ -135,17 +135,29 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, String)> {
 
 /// Build a `TlsSettings` configured with the SNI callback.
 ///
-/// HTTP/2 is enabled on the TLS listener so modern clients (browsers,
-/// curl) get multiplexing, header compression, and the rest of the
-/// H2 wins. The H1↔H2 conversion between client and backend happens
-/// inside pingora's `HttpProxy`.
+/// HTTP/2 is enabled on the TLS listener by default so modern
+/// clients (browsers, curl) get multiplexing, header compression,
+/// and the rest of the h2 wins. The H1↔H2 conversion between
+/// client and backend happens inside pingora's `HttpProxy`.
+///
+/// **`enable_h2 = false`** is the production-proven workaround for
+/// a bug in the h2 + tunnel-backend path: pingora tears down the
+/// yamux stream mid-request (`tokio_yamux::stream: this branch
+/// should be unreachable`) and falls back to `400 Bad Request:
+/// missing required Host header` to the client. The same request
+/// works perfectly on h1, and modern browsers will fall back to
+/// h1 automatically when h2 is not advertised. Set this to `false`
+/// in `ngx.yml` for any deploy that fronts tunnel backends.
 pub fn build_sni_settings(
     cert_dir: std::path::PathBuf,
+    enable_h2: bool,
 ) -> anyhow::Result<pingora::listeners::tls::TlsSettings> {
     let cb: pingora::listeners::TlsAcceptCallbacks =
         Box::new(SniCertCallback::new(Arc::new(cert_dir)));
     let mut settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
-    settings.enable_h2();
+    if enable_h2 {
+        settings.enable_h2();
+    }
     Ok(settings)
 }
 
