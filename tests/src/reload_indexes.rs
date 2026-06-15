@@ -20,7 +20,6 @@ fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
         String::new(),
         30,
         24,
-        3,
         "ecdsa".into(),
     )
 }

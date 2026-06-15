@@ -173,9 +173,11 @@ fn admin_tun_auth() {
     assert!(db::auth_tun(&conn, "office", "wrong").unwrap().is_none());
 
     // Wrong name → no row
-    assert!(db::auth_tun(&conn, "nope", "secret-token-123")
-        .unwrap()
-        .is_none());
+    assert!(
+        db::auth_tun(&conn, "nope", "secret-token-123")
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// admin_certs_crud — create, list, delete a cert
@@ -197,6 +199,10 @@ fn admin_certs_crud() {
         status: pangolin_core::CertStatus::Issued,
         started_at: None,
         last_error: None,
+        next_retry_at: None,
+        error_class: None,
+        attempt_count: 0,
+        order_url: None,
     };
 
     // Create

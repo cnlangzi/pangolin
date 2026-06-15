@@ -23,7 +23,6 @@ fn make_cert_manager() -> CertManager {
         "https://acme.example.com/directory".into(),
         30,
         6,
-        3,
         "ecdsa".into(),
     )
 }

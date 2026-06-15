@@ -7,8 +7,8 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::templates::{ActivityRow, DashboardTemplate};
 use crate::App;
+use crate::templates::{ActivityRow, DashboardTemplate};
 
 /// How many of the most-recent EventBuffer entries to surface in the
 /// dashboard "Recent ACME activity" panel. The buffer is bounded at

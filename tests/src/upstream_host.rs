@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use pangolin_core::index::{lookup_site, Indexes};
+use pangolin_core::index::{Indexes, lookup_site};
 use pangolin_core::types::{Domain, Site};
 
 // Raw TCP HTTP request helper. Delegates to the shared

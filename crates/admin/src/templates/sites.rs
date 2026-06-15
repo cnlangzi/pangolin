@@ -56,11 +56,7 @@ impl<'a> SitesNewTemplate<'a> {
             .as_ref()
             .map(|s| {
                 let scheme = s.backend_scheme();
-                if scheme.is_empty() {
-                    "http"
-                } else {
-                    scheme
-                }
+                if scheme.is_empty() { "http" } else { scheme }
             })
             .unwrap_or("http")
     }
@@ -128,11 +124,7 @@ impl<'a> SitesEditTemplate<'a> {
             .as_ref()
             .map(|s| {
                 let scheme = s.backend_scheme();
-                if scheme.is_empty() {
-                    "http"
-                } else {
-                    scheme
-                }
+                if scheme.is_empty() { "http" } else { scheme }
             })
             .unwrap_or("http")
     }
@@ -209,11 +201,7 @@ impl<'a> SitesFormFieldsView<'a> {
             .as_ref()
             .map(|s| {
                 let scheme = s.backend_scheme();
-                if scheme.is_empty() {
-                    "http"
-                } else {
-                    scheme
-                }
+                if scheme.is_empty() { "http" } else { scheme }
             })
             .unwrap_or("http")
     }

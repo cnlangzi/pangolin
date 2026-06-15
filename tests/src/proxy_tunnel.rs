@@ -16,8 +16,8 @@
 use std::time::Duration;
 
 use pangolin_core::tunnel::{
-    bearer_token, compute_ws_accept, encode_http_request, generate_ws_key,
-    strip_hop_by_hop_headers, HttpRequest,
+    HttpRequest, bearer_token, compute_ws_accept, encode_http_request, generate_ws_key,
+    strip_hop_by_hop_headers,
 };
 
 use tokio::io::AsyncReadExt;
@@ -124,9 +124,10 @@ fn ws_accept_is_rfc6455_compliant() {
 fn ws_key_is_24_chars_base64() {
     let key = generate_ws_key();
     assert_eq!(key.len(), 24);
-    assert!(key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    assert!(
+        key.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    );
 }
 
 /// Hanging backend exercises the tun-side reqwest timeout.

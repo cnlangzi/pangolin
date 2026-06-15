@@ -7,8 +7,10 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::templates::{DomainsListTemplate, DomainsNewTemplate, SiteDomainsTemplate};
 use crate::App;
+use crate::templates::{
+    DomainsEditTemplate, DomainsListTemplate, DomainsNewTemplate, SiteDomainsTemplate,
+};
 
 type Resp = Response<Full<Bytes>>;
 
@@ -51,6 +53,54 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         auto_issue_checked: false,
         edit_domain: None,
         current_auto_issue: false,
+        enabled_checked: true,
+    }
+    .render()
+    .unwrap();
+    ok_html(crate::render_with_assets_and_csrf(html, csrf))
+}
+
+/// Render the Edit-domain page (`GET /domains/{domain}/edit`).
+///
+/// Issue #57: pre-fills the `DomainsEditTemplate` with the row's
+/// current values for all 4 editable fields (site_name, enabled,
+/// auto_issue, dns_provider). The PK (`domain`) is rendered read-only
+/// in the form via `lock_domain()`; the site dropdown is also locked
+/// (we still send the value in a hidden field). Returns 404 if the
+/// row doesn't exist.
+pub async fn render_edit_page(
+    app: &Arc<App>,
+    domain: Option<String>,
+    csrf: &str,
+) -> http::Result<Resp> {
+    let Some(domain_pk) = domain else {
+        return Ok(crate::not_found());
+    };
+    if domain_pk.is_empty() {
+        return Ok(crate::not_found());
+    }
+    let db = app.db.lock().await;
+    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
+    let existing = pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None);
+    drop(db);
+
+    let Some(existing) = existing else {
+        return Ok(crate::not_found());
+    };
+
+    let html = DomainsEditTemplate {
+        sites,
+        dns_providers,
+        error: None,
+        active_nav: "domains",
+        preselected_site: Some(existing.site_name.clone()),
+        preselected_site_name: Some(existing.site_name.clone()),
+        dns_provider_value: existing.dns_provider.clone().unwrap_or_default(),
+        auto_issue_checked: existing.auto_issue,
+        edit_domain: Some(existing.domain.clone()),
+        current_auto_issue: existing.auto_issue,
+        enabled_checked: existing.enabled,
     }
     .render()
     .unwrap();
@@ -121,6 +171,7 @@ pub async fn api_render_form_new(
         auto_issue_checked: false,
         edit_domain: None,
         current_auto_issue: false,
+        enabled_checked: true,
     }
     .render()
     .unwrap();

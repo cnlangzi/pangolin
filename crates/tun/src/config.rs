@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
-use figment::providers::{Env, Format, Yaml};
 use figment::Figment;
+use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
 use pangolin_core::config::LogConfig;

@@ -8,8 +8,8 @@ use http::Response;
 use http_body_util::Full;
 use pangolin_core::CertStatus;
 
-use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 use crate::App;
+use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 
 type Resp = Response<Full<Bytes>>;
 
@@ -57,6 +57,8 @@ pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> 
         count_issued: counts.get(&CertStatus::Issued).copied().unwrap_or(0),
         count_failed: counts.get(&CertStatus::Failed).copied().unwrap_or(0),
         count_skipped: counts.get(&CertStatus::Skipped).copied().unwrap_or(0),
+        count_rate_limited: counts.get(&CertStatus::RateLimited).copied().unwrap_or(0),
+        count_permanent: counts.get(&CertStatus::Permanent).copied().unwrap_or(0),
     }
     .render()
     .unwrap();
@@ -97,10 +99,10 @@ fn parse_status_filter(raw: Option<&str>) -> Vec<CertStatus> {
         if token.is_empty() {
             continue;
         }
-        if let Ok(s) = token.parse::<CertStatus>() {
-            if !out.contains(&s) {
-                out.push(s);
-            }
+        if let Ok(s) = token.parse::<CertStatus>()
+            && !out.contains(&s)
+        {
+            out.push(s);
         }
     }
     out

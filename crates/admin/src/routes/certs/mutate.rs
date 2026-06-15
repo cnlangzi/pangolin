@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::{redirect_response, App};
+use crate::{App, redirect_response};
 
 use super::helpers::parse_form;
 use super::pages::render_create_page_with_error;
@@ -54,6 +54,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         status: pangolin_core::types::CertStatus::Issued,
         started_at: None,
         last_error: None,
+        next_retry_at: None,
+        error_class: None,
+        attempt_count: 0,
+        order_url: None,
     };
 
     let db = app.db.lock().await;
@@ -75,13 +79,13 @@ pub async fn handle_delete(
     domain: Option<String>,
     _csrf: &str,
 ) -> http::Result<Resp> {
-    if let Some(d) = domain {
-        if !d.is_empty() {
-            let db = app.db.lock().await;
-            let _ = pangolin_core::db::delete_cert(&db, &d);
-            drop(db);
-            app.reload_indexes().await;
-        }
+    if let Some(d) = domain
+        && !d.is_empty()
+    {
+        let db = app.db.lock().await;
+        let _ = pangolin_core::db::delete_cert(&db, &d);
+        drop(db);
+        app.reload_indexes().await;
     }
     Ok(redirect_response("/certs"))
 }

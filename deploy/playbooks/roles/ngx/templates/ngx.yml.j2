@@ -62,13 +62,18 @@ acme:
   email: {{ ngx_acme_email | default('') }}
   cert_dir: {{ ngx_acme_cert_dir | default('/usr/local/pangolin/certs') }}
   acme_directory: {{ ngx_acme_directory | default('https://acme-v02.api.letsencrypt.org/directory') }}
-  renew_threshold_days: {{ ngx_acme_renew_threshold_days | default(30) }}
+  renew_threshold_days: {{ ngx_acme_renew_threshold_days | default(14) }}
   renew_check_interval_hours: {{ ngx_acme_renew_check_interval_hours | default(6) }}
-  renew_max_retries: {{ ngx_acme_renew_max_retries | default(3) }}
   key_type: {{ ngx_acme_key_type | default('ecdsa') }}
   # v2: no `autorenew` field. Per-domain `auto_issue` is managed via
   # the admin UI / `domains` table. The legacy `ngx_acme` host var
   # is preserved for inventory compatibility but no longer mapped.
+
+tls:
+  enable_h2: false      # advertise HTTP/2 via ALPN. Set to true if your deploy
+                        # fronts tunnel backends and you want HTTP/2 in
+                        # the browser. See TlsConfig docs in
+                        # crates/pangolin-core/src/config.rs.
 
 log:
   level: {{ ngx_log_level | default('info') }}

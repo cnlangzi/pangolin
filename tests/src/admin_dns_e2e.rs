@@ -10,7 +10,7 @@
 //! Prerequisites: `make build` (or `cargo build --release -p ngx -p tun`)
 
 use crate::admin_harness::AdminClient;
-use crate::harness::{init_pangolin_db, NgxProcess};
+use crate::harness::{NgxProcess, init_pangolin_db};
 use scraper::{Html, Selector};
 
 fn new_client_no_redirect() -> reqwest::Client {

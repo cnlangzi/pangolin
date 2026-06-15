@@ -12,8 +12,8 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 
-use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
 use crate::App;
+use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
 
 type Resp = Response<Full<Bytes>>;
 

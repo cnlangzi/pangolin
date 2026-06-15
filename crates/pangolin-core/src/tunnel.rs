@@ -72,8 +72,8 @@ pub use tokio_yamux as yamux;
 use yamux::{Config as YamuxConfig, Session, StreamHandle};
 
 // Re-exports for the manual WS handshake helpers below.
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use sha1::{Digest, Sha1};
 
 /// Marker for which side of a tunnel we are.
@@ -431,6 +431,72 @@ where
     }
 }
 
+/// Parse a complete HTTP/1.1 request from a byte slice (synchronous
+/// variant of [`read_http_request`]). Used by the tunnel frame
+/// decoder, which already has the entire request as a single
+/// `&[u8]` (no streaming reader).
+pub fn parse_http_request_bytes(bytes: &[u8]) -> IoResult<HttpRequest> {
+    let idx = find_header_end(bytes)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no CRLFCRLF in request bytes"))?;
+    let head_end = idx + 4;
+    let head_bytes = &bytes[..head_end];
+    let body_prefix = &bytes[head_end..];
+    let head = std::str::from_utf8(head_bytes)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+    let parsed = parse_request_head(head)?;
+    // Body: read from body_prefix (in-memory) instead of an
+    // AsyncRead. For Length(n) we copy n bytes; for Chunked we
+    // decode; for UntilEof we copy everything after the head.
+    let body = match parsed.body_kind {
+        BodyKind::Length(n) => {
+            if body_prefix.len() < n {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!("short body: expected {} got {}", n, body_prefix.len()),
+                ));
+            }
+            body_prefix[..n].to_vec()
+        }
+        BodyKind::Chunked => {
+            let mut out = Vec::new();
+            let mut cursor = 0usize;
+            loop {
+                let crlf = find_crlf(&body_prefix[cursor..])
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "chunked: no size CRLF"))?;
+                let size_line = std::str::from_utf8(&body_prefix[cursor..cursor + crlf])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+                let size_str = size_line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_str, 16)
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("chunk size: {e}")))?;
+                cursor += crlf + 2;
+                if size == 0 {
+                    // skip trailers + final CRLF
+                    let _ = find_crlf(&body_prefix[cursor..]);
+                    break;
+                }
+                if body_prefix.len() < cursor + size + 2 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "chunked: short body"));
+                }
+                out.extend_from_slice(&body_prefix[cursor..cursor + size]);
+                cursor += size + 2;
+            }
+            out
+        }
+        BodyKind::UntilEof => body_prefix.to_vec(),
+    };
+    Ok(HttpRequest {
+        method: parsed.method,
+        target: parsed.target,
+        version: parsed.version,
+        headers: parsed.headers,
+        body,
+    })
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|w| w == b"\r\n")
+}
+
 /// Serialise an `HttpRequest` back into a wire-format HTTP/1.1
 /// request byte buffer.
 pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
@@ -458,6 +524,115 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
 
 /// Serialise an `HttpResponse` back into a wire-format HTTP/1.1
 /// response byte buffer.
+/// Decode an `HttpResponse` from a byte slice produced by `encode_http_response`.
+/// Returns `None` if the bytes are empty.
+///
+/// **Why we don't `from_utf8` the whole buffer**: the response body is
+/// arbitrary bytes (e.g. `Content-Encoding: deflate` returns a 5-byte
+/// deflate stream like `01 00 00 ff ff`, or any binary download).
+/// Validating the whole buffer as UTF-8 was a real bug — see the
+/// `decode_http_response_does_not_validate_body_as_utf8` test.
+///
+/// **Why we don't `from_utf8` the header section either**: per
+/// RFC 7230 §3.2.6, header **values** may contain `obs-text` (any
+/// byte in 0x80–0xFF).  Such bytes are *not* valid UTF-8, but they
+/// are valid HTTP.  A legacy backend emitting an `X-Some-Thing: \x80`
+/// style header must round-trip through us untouched — the gateway
+/// is byte-transparent on the wire.
+///
+/// We therefore scan the header section byte-by-byte (splitting on
+/// `\r\n` and `: `), validate **only the start-line** as UTF-8 (the
+/// status line is required to be ASCII per RFC 7230 §3.1.1), and
+/// treat header names + values as opaque byte strings — converting
+/// each to a `String` only via `String::from_utf8_lossy` for storage
+/// in `HttpResponse`.  Non-UTF-8 bytes survive that conversion as
+/// U+FFFD replacement characters; the original bytes are kept on
+/// encode via `as_bytes()`.
+pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    // Format: "HTTP/1.1 {status_line}\r\n{headers}\r\n\r\n{body}"
+    let split = find_header_end(bytes).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+    })?;
+
+    let header_section = &bytes[..split];
+    let body_bytes = bytes[split + 4..].to_vec();
+
+    // Locate the end of the start-line (first "\r\n" inside the
+    // header section).  The start-line must be ASCII — RFC 7230
+    // §3.1.1: HTTP-version = HTTP-name "/" DIGIT "." DIGIT, status
+    // code/reason are ASCII.  We validate just this slice.
+    let first_line_end = header_section
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no start-line terminator",
+            )
+        })?;
+    let start_line_bytes = &header_section[..first_line_end];
+    let start_line_str = std::str::from_utf8(start_line_bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("response start-line is not valid ASCII/UTF-8: {e}"),
+        )
+    })?;
+
+    // "HTTP/1.1 200 OK" — split on the first space.  A missing or empty
+    // status-code half falls back to "502 Bad Gateway" so that
+    // `parse_status_from_line` downstream still produces a parseable status
+    // (the previous str-based parser had the same fallback).
+    let (version, status_line) = match start_line_str.split_once(' ') {
+        Some((v, s)) if !s.is_empty() => (v.to_string(), s.to_string()),
+        _ => ("HTTP/1.1".to_string(), "502 Bad Gateway".to_string()),
+    };
+
+    // Walk the remaining header lines byte-by-byte.  Each line ends
+    // at "\r\n" and the name/value separator is ": ".  We accept any
+    // byte sequence in the value (RFC 7230 §3.2.6 `obs-text`).
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut cursor = first_line_end + 2; // skip past first "\r\n"
+    let header_end = split; // headers run to (but not including) split
+    while cursor < header_end {
+        // Find end of this line.
+        let line_end = header_section[cursor..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| cursor + p)
+            .unwrap_or(header_end);
+        let line = &header_section[cursor..line_end];
+
+        if let Some(sep) = line.windows(2).position(|w| w == b": ") {
+            // Name MUST be ASCII (RFC 7230 §3.2.6: token = 1*tchar,
+            // tchar is a strict subset of VCHAR = 0x21–0x7E).  We
+            // still use lossy here so a malformed upstream doesn't
+            // take the gateway down — the value is what we need to
+            // be lenient about, and the name gets the same treatment
+            // for symmetry.
+            let name = String::from_utf8_lossy(&line[..sep]).into_owned();
+            let value = String::from_utf8_lossy(&line[sep + 2..]).into_owned();
+            headers.push((name, value));
+        }
+        // else: line without ": " — skip it (continuation/garbage)
+
+        if line_end == header_end {
+            break;
+        }
+        cursor = line_end + 2; // skip past "\r\n"
+    }
+
+    Ok(Some(HttpResponse {
+        version,
+        status_line,
+        headers,
+        body: body_bytes,
+    }))
+}
+
 pub fn encode_http_response(resp: &HttpResponse) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + resp.body.len());
     out.extend_from_slice(resp.version.as_bytes());
@@ -540,7 +715,7 @@ pub fn strip_hop_by_hop_headers(headers: &mut Vec<(String, String)>) {
 
 // ---- internal HTTP head/body types ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: String,
     pub target: String,
@@ -549,7 +724,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub version: String,
     pub status_line: String,
@@ -1132,4 +1307,123 @@ where
 #[allow(unused)]
 fn _silence_unused() {
     let _ = std::marker::PhantomData::<Context<'_>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Bug-fix regression (issue: tunnel 502 on deflate body).**
+    ///
+    /// The pre-fix `decode_http_response` validated the *whole* response
+    /// buffer (header + body) as UTF-8. That was wrong: a 302 with
+    /// `Content-Encoding: deflate` has a 5-byte deflate body
+    /// (`01 00 00 ff ff`), which is not valid UTF-8. The
+    /// `from_utf8` check failed at `index 126` (first body byte) and
+    /// ngx returned 502 to the browser.
+    ///
+    /// The fix splits the header/body at `\r\n\r\n` first and only
+    /// validates the **header** section as UTF-8. Body bytes are
+    /// preserved verbatim — exactly what an HTTP gateway must do for
+    /// compressed/binary responses.
+    #[test]
+    fn decode_http_response_does_not_validate_body_as_utf8() {
+        // Real bytes captured from the production 8888 backend
+        // (`curl -H 'Accept-Encoding: deflate'`), 5 bytes of raw
+        // deflate stream.
+        let body: Vec<u8> = vec![0x01, 0x00, 0x00, 0xff, 0xff];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 302 Found\r\n");
+        bytes.extend_from_slice(b"Content-Encoding: deflate\r\n");
+        bytes.extend_from_slice(b"Location: /login\r\n");
+        bytes.extend_from_slice(b"Date: Mon, 15 Jun 2026 09:06:25 GMT\r\n");
+        bytes.extend_from_slice(b"Content-Length: 5\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(&body);
+
+        let resp = decode_http_response(&bytes)
+            .expect("decode must succeed for binary body")
+            .expect("non-empty response");
+
+        assert_eq!(resp.status_line, "302 Found");
+        assert_eq!(resp.body, body, "body bytes must be preserved verbatim");
+        let loc = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+            .expect("Location header present");
+        assert_eq!(loc.1, "/login");
+        let ce = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            .expect("Content-Encoding header present");
+        assert_eq!(ce.1, "deflate");
+    }
+
+    /// Sanity: a well-formed 200 with a JSON body still decodes.
+    #[test]
+    fn decode_http_response_text_body_unchanged() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        bytes.extend_from_slice(b"Content-Type: application/json\r\n");
+        bytes.extend_from_slice(b"Content-Length: 2\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(b"{}");
+        let resp = decode_http_response(&bytes).unwrap().unwrap();
+        assert_eq!(resp.status_line, "200 OK");
+        assert_eq!(resp.body, b"{}");
+    }
+
+    /// A response with **no body** (the common 302 + Location case)
+    /// must still decode cleanly.
+    #[test]
+    fn decode_http_response_no_body() {
+        let bytes = b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\n\r\n";
+        let resp = decode_http_response(bytes).unwrap().unwrap();
+        assert_eq!(resp.status_line, "302 Found");
+        assert!(resp.body.is_empty());
+    }
+
+    /// `obs-text` bytes (0x80–0xFF) in a header value must round-trip
+    /// through the decoder — RFC 7230 §3.2.6 explicitly permits them
+    /// in field values, even though they're not valid UTF-8.  An
+    /// earlier strict-UTF-8 check rejected these, which would have
+    /// broken legacy backends.  See the review thread on PR #65.
+    #[test]
+    fn decode_http_response_preserves_obs_text_in_header_value() {
+        let bytes = b"HTTP/1.1 200 OK\r\nX-Legacy: foo\x80\x81bar\r\nContent-Length: 0\r\n\r\n";
+        let resp = decode_http_response(bytes)
+            .expect("obs-text in header value must decode")
+            .expect("non-empty response");
+        let val = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-legacy"))
+            .expect("X-Legacy header present")
+            .1
+            .clone();
+        // The non-UTF-8 bytes must survive as U+FFFD substitutions
+        // (lossy conversion).  Crucially, the response must NOT be
+        // rejected outright with `InvalidData`.
+        assert!(val.contains('\u{FFFD}'), "got: {val:?}");
+        assert!(val.starts_with("foo") && val.ends_with("bar"));
+    }
+
+    /// Non-UTF-8 bytes in the **start-line** are still a hard error:
+    /// the status line is required to be ASCII (RFC 7230 §3.1.1), so
+    /// this is genuinely malformed.
+    #[test]
+    fn decode_http_response_rejects_non_utf8_start_line() {
+        // 0x80 in "HTTP/1.1 200 OK" — the version/status portion.
+        let bytes = b"HTTP/1.\x80 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let err = decode_http_response(bytes).expect_err("non-ASCII start-line must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Empty buffer → None (preserves existing behaviour).
+    #[test]
+    fn decode_http_response_empty() {
+        assert!(decode_http_response(b"").unwrap().is_none());
+    }
 }

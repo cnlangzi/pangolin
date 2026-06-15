@@ -2,15 +2,47 @@
 # The .env → Ansible bridge lives in the parent playbook's `vars:`
 # block (`deploy/playbooks/tun.yml`), not here. `vars:` is a play-
 # level keyword and is not allowed inside a task file.
-- name: Create pangolin user
+- name: Snapshot tun service state
+  # On a re-deploy the existing `pangolin-tun` process is owned by
+  # the pangolin user, which makes `usermod` fail with
+  # "user pangolin is currently used by process N". Stop tun first;
+  # the final task re-enables and starts it. We deliberately do NOT
+  # touch `pangolin-ngx` — each role manages its own service.
+  become: true
+  ansible.builtin.systemd:
+    name: pangolin-tun
+  register: tun_service
+  failed_when: false
+
+- name: Stop tun service if active
+  become: true
+  ansible.builtin.systemd:
+    name: pangolin-tun
+    state: stopped
+  when: tun_service.status is defined and tun_service.status.ActiveState == 'active'
+
+- name: Check if pangolin user exists
+  # The pangolin user is shared with the ngx role. On a host that
+  # already runs ngx, that user is held by the `pangolin-ngx`
+  # process — calling `usermod` against it (e.g. to align home or
+  # shell) would fail. So we only create it if it's missing, and we
+  # do not try to align any attributes; the systemd unit's `User=`
+  # and `WorkingDirectory=` are what actually control service
+  # execution, the passwd fields are irrelevant.
+  ansible.builtin.getent:
+    database: passwd
+    key: pangolin
+  register: pangolin_user
+  failed_when: false
+  changed_when: false
+
+- name: Create pangolin user (only if absent)
   become: true
   user:
     name: pangolin
+    state: present
     system: yes
-    shell: /usr/sbin/nologin
-    home: /usr/local/pangolin
-    create_home: no
-    comment: "Pangolin Tunnel Service User"
+  when: pangolin_user is failed
 
 - name: Create workdir
   become: true
@@ -19,7 +51,7 @@
     state: directory
     owner: pangolin
     group: pangolin
-    mode: 0750
+    mode: 0755
 
 - name: Upload tun binary
   become: true
@@ -52,7 +84,7 @@
     - restart tun
 
 - name: Enable tun service
-  ansible.builtin.systemd_service:
+  ansible.builtin.systemd:
     name: pangolin-tun
     enabled: true
     masked: no

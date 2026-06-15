@@ -29,8 +29,8 @@ use log::{debug, error, info, warn};
 use tokio::net::TcpListener;
 
 use pangolin_core::tunnel::{
-    bearer_token, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
-    write_ws_accept_response, TunnelRole,
+    TunnelRole, bearer_token, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
+    write_ws_accept_response,
 };
 
 use crate::App;

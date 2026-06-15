@@ -18,6 +18,7 @@ New to Pangolin? Start here:
 ## Design
 
 - [Tunnel](design/tunnel.md) — WebSocket tunnel design choices, implementation map, known gaps
+- [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, `BackendExecutor` trait, pingora as the single HTTP client, `file://` parity, WS upgrade
 
 ## Admin UI (zh)
 

@@ -1487,7 +1487,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2235,18 +2234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pangolin-cli"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "pangolin-core",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "pangolin-core"
 version = "0.2.0"
 dependencies = [
@@ -2259,7 +2246,9 @@ dependencies = [
  "figment",
  "futures",
  "futures-util",
+ "httpdate",
  "log",
+ "mime_guess",
  "rand 0.8.6",
  "refinery",
  "rusqlite",
@@ -2288,6 +2277,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "httpdate",
+ "lazy_static",
  "log",
  "ngx",
  "pangolin-core",
@@ -3115,7 +3105,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -4146,6 +4135,8 @@ name = "tun"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "env_logger",
@@ -4155,17 +4146,14 @@ dependencies = [
  "futures-util",
  "http 1.4.1",
  "log",
- "mime_guess",
  "pangolin-core",
- "reqwest",
- "rustls",
+ "pingora-core",
+ "pingora-http",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-yamux",
- "url",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

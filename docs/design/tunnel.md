@@ -124,3 +124,76 @@ Tracked as backlog; no committed dates. Roughly in priority order:
 - Gateway-side handshake/auth: `crates/ngx/src/tunnel.rs` + `crates/pangolin-core/src/db.rs` (`auth_tun`)
 - Session registry: `crates/pangolin-core/src/app.rs` (`tun_sessions`, `register_tun`, `unregister_tun`)
 - External: [rathole](https://github.com/rapiz1/rathole) · [bore](https://github.com/ekzhang/bore) · [Noise Protocol](https://noiseprotocol.org/) · [Pingora](https://github.com/cloudflare/pingora)
+
+---
+
+## Wire protocol — length-prefix framing (v2, 2026-06-15)
+
+> **Background**: the original v1 protocol used `stream.shutdown()` on the
+> ngx side to signal end-of-request, and the tun side waited for `read() == 0`
+> (EOF) before processing the frame. This caused a deadlock:
+>
+> - `stream.shutdown()` over yamux triggers a half-close at the yamux layer,
+>   **but does not guarantee that the remote peer's `read()` will return 0
+>   immediately** — yamux may buffer or delay the FIN.
+> - tun blocked indefinitely in its `loop { read() }` waiting for EOF.
+> - ngx waited for a response that never came → 60 s timeout → 502.
+>
+> The symptom in e2e tests was: all `real_e2e_tunnel_*` tests failed with 502
+> locally **only when the release binary was rebuilt** (the pre-built
+> `bin/pangolin-ngx` was stale and didn't contain the broken code).  CI
+> always recompiles, so it caught the regression immediately.
+
+### Current framing (symmetric length-prefix)
+
+Both directions use the same wire format:
+
+```
+┌─────────────────────────────┐
+│  length  (4 bytes, BE u32)  │
+├─────────────────────────────┤
+│  payload (length bytes)     │
+└─────────────────────────────┘
+```
+
+**ngx → tun** (`crates/ngx/src/proxy.rs`, `YamuxTunnelExecutor::execute_http`):
+1. Serialise `TunnelHttpFrame` → `bytes` via `encode_tunnel_frame`
+2. Write `[len as u32 BE][bytes]`
+3. `flush()` — **no `shutdown()`**
+4. Read response length prefix (4 bytes), then `read_exact(resp_len)`
+5. `decode_http_response(&resp_buf)` → `HttpResponse`
+
+**tun → ngx** (`crates/tun/src/client.rs`, `handle_http_request`):
+1. `read_exact(4)` → frame length
+2. `read_exact(frame_len)` → frame bytes
+3. `decode_frame` → `TunnelHttpFrame`
+4. Execute request via `execute_via_pingora`
+5. Serialise response → `resp_bytes` via `encode_http_response`
+6. Write `[resp_len as u32 BE][resp_bytes]`
+7. `flush()` — **no `shutdown()`**
+
+### Why no `shutdown()`?
+
+Calling `shutdown()` on a yamux `StreamHandle` sends a FIN to the remote
+side, but yamux delivers it asynchronously. If ngx calls `shutdown()` and
+immediately starts reading the response, the remote `read()` may not see EOF
+until well after the response has been written and read. The length-prefix
+framing makes both sides independent of EOF — each side knows exactly how many
+bytes to read and returns as soon as it has them.
+
+### Debugging tip
+
+If you see `502` from tunnel tests in CI but not locally, the first thing to
+check is **binary staleness**: the e2e tests use `bin/pangolin-{ngx,tun}`,
+which are only updated by `make build`. CI runs `make build` before every
+test run; local development often skips it. Always run `make build` before
+running e2e tests locally after a code change.
+
+Key log patterns:
+- `[tokio_yamux::stream] connection reset` — ngx called `shutdown()` before
+  tun finished writing the response; remove the `shutdown()` call.
+- `[tokio_yamux::stream] this branch should be unreachable` — yamux debug
+  log triggered by half-close ordering; harmless noise but indicates the
+  shutdown/read race is active.
+- `backend error: read response: connection reset` — same root cause, seen
+  from the ngx side.

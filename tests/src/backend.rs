@@ -7,7 +7,7 @@
 //!   - tunnel prefix extraction (tun_name:url)
 //!   - error handling (invalid scheme, invalid tun_name)
 
-use pangolin_core::parse::{parse_backend, BackendScheme, ParseError};
+use pangolin_core::parse::{BackendScheme, ParseError, parse_backend};
 
 /// backend_http — `http://host:port` → direct path, correct addr:port
 #[test]

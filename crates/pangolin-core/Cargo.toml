@@ -34,6 +34,10 @@ sha1 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 
+# Static-file serving helpers used by file:// backends.
+mime_guess.workspace = true
+httpdate.workspace = true
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `figment::Jail` lives behind the `test` feature flag — used by the

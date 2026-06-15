@@ -6,7 +6,7 @@
 //! Prerequisites: `make build` (or `cargo build --release -p ngx -p tun`)
 
 use crate::admin_harness::AdminClient;
-use crate::harness::{init_pangolin_db, NgxProcess};
+use crate::harness::{NgxProcess, init_pangolin_db};
 use scraper::{Html, Selector};
 
 // ── helper ──────────────────────────────────────────────────────────────────
@@ -764,6 +764,405 @@ async fn domains_delete_verified_removed() {
         !list.contains("gone.com"),
         "deleted domain should not appear"
     );
+}
+
+// ── §19.x — Domain edit (issue #57) ──────────────────────────────────────────
+
+/// Setup helper: create a site + a domain, return the domain name.
+/// Used by the issue-#57 edit-flow tests below.
+async fn setup_domain_for_edit(client: &AdminClient, domain: &str, site_name: &str) {
+    // Site
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", site_name),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Domain
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&list).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", domain),
+                ("site_name", site_name),
+                ("enabled", "1"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302, "domain create should redirect");
+}
+
+/// `GET /domains/{domain}/edit` returns 200 and renders the edit page
+/// with the row's current values pre-filled.
+#[tokio::test]
+async fn domains_edit_page_renders_with_current_values() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    setup_domain_for_edit(&client, "edit-render.com", "site-edit-render").await;
+
+    let resp = client.get("/domains/edit-render.com/edit").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Edit domain"),
+        "page should have Edit heading"
+    );
+    assert!(
+        body.contains("edit-render.com"),
+        "page should show the domain name"
+    );
+    assert!(
+        body.contains("site-edit-render"),
+        "page should show the current site_name"
+    );
+}
+
+/// The Edit button appears on the domains list page and links to
+/// `/domains/{domain}/edit`.
+#[tokio::test]
+async fn domains_list_has_edit_button() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    setup_domain_for_edit(&client, "edit-link.com", "site-edit-link").await;
+
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
+    assert!(
+        list.contains("href=\"/domains/edit-link.com/edit\""),
+        "list page should contain Edit link to /domains/edit-link.com/edit, body was: {}",
+        list
+    );
+}
+
+/// `POST /api/domains/{domain}/edit` updates site_name + reloads.
+#[tokio::test]
+async fn domains_edit_updates_site_name() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Two sites so we can move the domain between them.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "site-a"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8081"),
+                ("name", "site-b"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // Create domain on site-a
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&list).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "mover.com"),
+                ("site_name", "site-a"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // Edit: move to site-b
+    let edit = client
+        .get("/domains/mover.com/edit")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&edit).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/api/domains/mover.com/edit",
+            &[
+                ("domain", "mover.com"),
+                ("site_name", "site-b"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "domain edit should redirect, got {}",
+        resp.status()
+    );
+
+    // Verify the new site is reflected in the list page (it shows site_name).
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
+    // The table row for mover.com should now show site-b.
+    assert!(
+        list.contains("mover.com"),
+        "domain should still appear in list"
+    );
+    // The per-site sub-page is the cleanest assertion: site-a/domains
+    // should no longer contain mover.com, site-b/domains should.
+    let site_a = client
+        .get("/site/site-a/domains")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !site_a.contains("mover.com"),
+        "mover.com should no longer be on site-a, got: {}",
+        site_a
+    );
+    let site_b = client
+        .get("/site/site-b/domains")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        site_b.contains("mover.com"),
+        "mover.com should be on site-b, got: {}",
+        site_b
+    );
+}
+
+/// Editing a domain to add dns_provider=null must succeed for
+/// non-wildcard domains (covers the `dns_provider` None path).
+#[tokio::test]
+async fn domains_edit_can_clear_dns_provider() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    setup_domain_for_edit(&client, "no-dns.com", "site-no-dns").await;
+
+    // Edit: clear dns_provider (empty string -> None)
+    let edit = client
+        .get("/domains/no-dns.com/edit")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&edit).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/api/domains/no-dns.com/edit",
+            &[
+                ("domain", "no-dns.com"),
+                ("site_name", "site-no-dns"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("dns_provider", ""),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+}
+
+/// POST with wildcard + missing dns_provider must be rejected
+/// (preserves the handle_create invariant).
+#[tokio::test]
+async fn domains_edit_wildcard_requires_dns_provider() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Setup a DNS provider so we can prove the wildcard is the rejection
+    // cause, not the provider being absent.
+    let page = client.get("/dns/new").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    client
+        .post_form(
+            "/dns/new",
+            &[
+                ("name", "cf-main"),
+                ("kind", "cloudflare"),
+                ("enabled", "1"),
+                ("api_token", "test-token-1234"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+
+    setup_domain_for_edit(&client, "site-w.com", "site-w").await;
+
+    // Now create a wildcard domain with the provider (so we have one to
+    // try to edit), then attempt to edit it with no provider.
+    let list = client.get("/domains").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&list).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "*.wildcard.com"),
+                ("site_name", "site-w"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("dns_provider", "cf-main"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "wildcard create should succeed"
+    );
+
+    // Now try to edit it with empty dns_provider — should be rejected
+    // (200 OK with inline error, NOT a 302). The wildcard `*` in
+    // the path is percent-encoded because reqwest preserves it
+    // literally. (The route handler decodes path params before
+    // looking up the row, so `%2A.wildcard.com` resolves to
+    // `*.wildcard.com` in the DB.)
+    let edit = client
+        .get("/domains/%2A.wildcard.com/edit")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&edit).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/api/domains/%2A.wildcard.com/edit",
+            &[
+                ("domain", "*.wildcard.com"),
+                ("site_name", "site-w"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("dns_provider", ""),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "wildcard-without-dns should be rejected (200 with inline error), got {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Wildcard domains require a DNS provider"),
+        "error message should explain the wildcard constraint, got: {}",
+        body
+    );
+}
+
+/// POST with non-existent dns_provider must be rejected.
+#[tokio::test]
+async fn domains_edit_nonexistent_dns_provider_rejected() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    setup_domain_for_edit(&client, "needs-dns.com", "site-needs-dns").await;
+
+    let edit = client
+        .get("/domains/needs-dns.com/edit")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&edit).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/api/domains/needs-dns.com/edit",
+            &[
+                ("domain", "needs-dns.com"),
+                ("site_name", "site-needs-dns"),
+                ("enabled", "1"),
+                ("auto_issue", "1"),
+                ("dns_provider", "does-not-exist"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "non-existent dns_provider should be rejected with 200 + inline error"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("does not exist"),
+        "error should mention missing provider, got: {}",
+        body
+    );
+}
+
+/// `GET /domains/{nonexistent}/edit` should 404.
+#[tokio::test]
+async fn domains_edit_404_for_missing_domain() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let resp = client.get("/domains/nope.com/edit").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
 }
 
 // ── §20-23 — Tokens full cycle ───────────────────────────────────────────────

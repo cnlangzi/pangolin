@@ -11,7 +11,7 @@
 //! integration test of the routing logic.
 
 use chrono::Utc;
-use pangolin_core::index::{lookup_site, Indexes};
+use pangolin_core::index::{Indexes, lookup_site};
 use pangolin_core::types::{Domain, HostMode, Site};
 
 // ---------------------------------------------------------------------------

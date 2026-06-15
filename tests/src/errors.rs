@@ -5,8 +5,8 @@
 //! Tests error paths: not found, invalid request, upstream error simulation.
 
 use chrono::Utc;
-use pangolin_core::index::{lookup_site, Indexes};
-use pangolin_core::parse::{parse_backend, ParseError};
+use pangolin_core::index::{Indexes, lookup_site};
+use pangolin_core::parse::{ParseError, parse_backend};
 use pangolin_core::types::{Domain, HostMode, Site};
 use std::collections::HashMap;
 
