@@ -451,10 +451,17 @@ async fn execute_via_pingora(
         .map_err(|e| format!("build header: {e}"))?;
 
     // Insert all non-Host, non-Content-Length headers.
-    for (k, v) in request.headers.iter().filter(|(k, _)| {
-        !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
-    }) {
-        let _ = header_builder.insert_header(k.clone(), v.as_bytes());
+    // Collect first to avoid borrow checker issues with the iterator.
+    let header_pairs: Vec<(String, String)> = request
+        .headers
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in header_pairs {
+        let _ = header_builder.insert_header(k, v.as_bytes());
     }
 
     // Apply host_mode Host override.
