@@ -1565,13 +1565,13 @@ fn decode_leaf_cert_from_blob(blob: &str) -> Result<Vec<u8>> {
         .and_then(|s| s.split("-----END CERTIFICATE-----").next())
         .ok_or_else(|| anyhow::anyhow!("no certificate block in blob"))?;
 
-    let cleaned: String = cert_block
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
+    let cleaned: String = cert_block.chars().filter(|c| !c.is_whitespace()).collect();
 
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cleaned.as_bytes())
-        .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))
+    base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        cleaned.as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))
 }
 
 /// Parse certificate expiry from a blob (key_pem + cert chain).
@@ -2559,10 +2559,7 @@ mod tests {
 
         builder.sign(&key, MessageDigest::sha256()).unwrap();
         let cert = builder.build();
-        (
-            String::from_utf8(cert.to_pem().unwrap()).unwrap(),
-            key_pem,
-        )
+        (String::from_utf8(cert.to_pem().unwrap()).unwrap(), key_pem)
     }
 
     /// Regression test for the sh-ali bug. Before the fix
@@ -2614,7 +2611,8 @@ mod tests {
         let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
 
         let blob = build_blob(&leaf_key, &chain);
-        let expiry = parse_blob_expiry(&blob).expect("must parse leaf despite longer-lived intermediate in chain");
+        let expiry = parse_blob_expiry(&blob)
+            .expect("must parse leaf despite longer-lived intermediate in chain");
 
         let now = Utc::now();
         let delta = (expiry - now).num_days();
@@ -2630,20 +2628,29 @@ mod tests {
     /// wildcard SANs are the v2 ACME feature flag case.
     #[test]
     fn parse_blob_metadata_extracts_leaf_sans_multi_and_wildcard() {
-        let (leaf_pem, leaf_key) =
-            build_test_cert(&["example.com", "www.example.com", "*.example.com"], 90, true);
+        let (leaf_pem, leaf_key) = build_test_cert(
+            &["example.com", "www.example.com", "*.example.com"],
+            90,
+            true,
+        );
         let (intermediate_pem, _) = build_test_cert(&["Example CA"], 3650, true);
         let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
         let blob = build_blob(&leaf_key, &chain);
 
-        let (_not_before, _not_after, sans) =
-            parse_blob_metadata(&blob).expect("must parse multi-SAN leaf with intermediate in chain");
+        let (_not_before, _not_after, sans) = parse_blob_metadata(&blob)
+            .expect("must parse multi-SAN leaf with intermediate in chain");
 
         assert!(sans.contains(&"example.com".to_string()), "sans={sans:?}");
-        assert!(sans.contains(&"www.example.com".to_string()), "sans={sans:?}");
+        assert!(
+            sans.contains(&"www.example.com".to_string()),
+            "sans={sans:?}"
+        );
         assert!(sans.contains(&"*.example.com".to_string()), "sans={sans:?}");
         // Intermediate CN must NOT leak into the leaf SAN list.
-        assert!(!sans.iter().any(|s| s.contains("CA")), "intermediate leaked: sans={sans:?}");
+        assert!(
+            !sans.iter().any(|s| s.contains("CA")),
+            "intermediate leaked: sans={sans:?}"
+        );
     }
 
     /// `parse_blob_metadata` reports `notBefore` from the leaf, not
@@ -2696,7 +2703,10 @@ mod tests {
         let blob = build_blob(&key_pem, &cert_pem).replace('\n', "\r\n");
         let expiry = parse_blob_expiry(&blob).expect("CRLF-wrapped PEM must parse");
         let now = Utc::now();
-        assert!((expiry - now).num_days() >= 89, "CRLF blob should yield ~90d expiry");
+        assert!(
+            (expiry - now).num_days() >= 89,
+            "CRLF blob should yield ~90d expiry"
+        );
     }
 
     /// MIME-style 76-char line wrapping (older / non-openssl tooling).
@@ -2723,7 +2733,10 @@ mod tests {
         let blob = build_blob(&key_pem, &rewrapped);
         let expiry = parse_blob_expiry(&blob).expect("76-char-wrapped PEM must parse");
         let now = Utc::now();
-        assert!((expiry - now).num_days() >= 89, "76-char wrapped blob should yield ~90d expiry");
+        assert!(
+            (expiry - now).num_days() >= 89,
+            "76-char wrapped blob should yield ~90d expiry"
+        );
     }
 
     /// Some operators / proxies inject trailing whitespace or tabs.
@@ -2739,7 +2752,7 @@ mod tests {
         let cert = cert_pem
             .replace("\n", "\t")     // tabs between base64 chunks
             .replace("\t\t\t", " ")  // a stray space
-            + " ";                   // trailing whitespace
+            + " "; // trailing whitespace
         let blob = build_blob(&key_pem, &cert);
         let expiry = parse_blob_expiry(&blob).expect("mixed-whitespace blob must parse");
         let now = Utc::now();
@@ -2800,8 +2813,7 @@ mod tests {
     #[test]
     fn parse_blob_expiry_handles_blob_with_only_marker_line() {
         // No actual cert content between the BEGIN/END markers.
-        let empty_cert =
-            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
+        let empty_cert = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
         let blob = build_blob(
             "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE\n-----END EC PRIVATE KEY-----",
             empty_cert,
@@ -2826,12 +2838,15 @@ mod tests {
         // Build a cert whose CN is "legacy.example.com" but with no
         // SAN extension — `include_san: false` skips the SAN extension
         // emit, exercising the runtime parser's CN fallback path.
-        let (cert_pem, key_pem) =
-            build_test_cert(&["legacy.example.com"], 90, false);
+        let (cert_pem, key_pem) = build_test_cert(&["legacy.example.com"], 90, false);
 
         let blob = build_blob(&key_pem, &cert_pem);
         let (_, _, sans) = parse_blob_metadata(&blob).expect("CN fallback must succeed");
-        assert_eq!(sans, vec!["legacy.example.com".to_string()], "got: {sans:?}");
+        assert_eq!(
+            sans,
+            vec!["legacy.example.com".to_string()],
+            "got: {sans:?}"
+        );
     }
 
     /// parse_blob_metadata and parse_blob_expiry must agree on which
