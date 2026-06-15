@@ -62,7 +62,8 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub acme: AcmeConfig,
-    /// TLS listener tuning (HTTP/2 toggle, future knobs).
+    /// TLS listener tuning. Currently a single knob (h2 ALPN on/off);
+    /// future TLS listener settings land here.
     #[serde(default)]
     pub tls: TlsConfig,
     #[serde(default)]
@@ -296,41 +297,37 @@ impl Default for AcmeConfig {
 
 /// TLS listener tuning.
 ///
-/// Currently a single knob: whether to advertise HTTP/2 via ALPN on
-/// the TLS listener. The default is `true` (h2 is the modern
-/// browser default and offers multiplexing + header compression
-/// for direct-HTTP / file backends), but **set to `false` if you
-/// have a tunnel backend** (`site.backend = "<tun>:<url>"`) and
-/// see the browser receive `400 Bad Request: missing required
-/// Host header` on the first request to a h2 connection.
+/// **Workaround knob**: the single `enable_h2` field exists to
+/// disable HTTP/2 ALPN on the TLS listener, sidestepping an
+/// upstream pingora/h2 bug that surfaces as
+/// `400 Bad Request: missing required Host header` when a request
+/// is proxied to a tunnel backend over h2 (pingora tears down the
+/// yamux stream with
+/// `tokio_yamux::stream: this branch should be unreachable`
+/// before the request body reaches the kinnit backend).
 ///
-/// The h2 + tunnel combination hits an upstream pingora/h2 bug
-/// where the per-request yamux stream is torn down with
-/// `tokio_yamux::stream: this branch should be unreachable` before
-/// the request body reaches the kinnit backend, and pingora falls
-/// back to a 400 with that exact body. The same request works
-/// perfectly on HTTP/1.1. Once the upstream issue is fixed this
-/// knob can flip back to its default; for now it is the
-/// production-proven workaround.
+/// Set `enable_h2: false` in `ngx.yml` for any deploy that fronts
+/// tunnel backends; modern browsers fall back to h1 automatically
+/// when h2 is not advertised. The same request works perfectly on
+/// h1. **TODO(upstream pingora h2+tunnel bug)**: flip the default
+/// back to `true` and remove this knob once the upstream issue is
+/// fixed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Advertise HTTP/2 via ALPN. Default `true`. Set to `false`
-    /// to force h1 (browsers will fall back automatically; in our
-    /// testing modern Chrome works flawlessly on h1 with a tunnel
-    /// backend, and connection setup is still ~1 RTT).
-    #[serde(default = "default_tls_enable_h2")]
+    /// to force h1 (see struct doc for the h2+tunnel workaround).
+    #[serde(default)]
     pub enable_h2: bool,
-}
-
-fn default_tls_enable_h2() -> bool {
-    true
 }
 
 impl Default for TlsConfig {
     fn default() -> Self {
-        Self {
-            enable_h2: default_tls_enable_h2(),
-        }
+        // `true` here is duplicated into the struct doc above and
+        // the field doc — there is no `#[serde(default = "…")]`
+        // function because a single bool literal is shorter than
+        // the helper, and the literal must stay in lock-step with
+        // the docs.
+        Self { enable_h2: true }
     }
 }
 

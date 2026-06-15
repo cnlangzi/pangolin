@@ -70,7 +70,10 @@ acme:
   # is preserved for inventory compatibility but no longer mapped.
 
 tls:
-  enable_h2: {{ lookup('env', 'NGX_TLS__ENABLE_H2') | default('true', true) }}  # set false for tunnel backends; see TlsConfig docs
+  enable_h2: false      # advertise HTTP/2 via ALPN. Set to true if your deploy
+                        # fronts tunnel backends and you want HTTP/2 in
+                        # the browser. See TlsConfig docs in
+                        # crates/pangolin-core/src/config.rs.
 
 log:
   level: {{ ngx_log_level | default('info') }}
