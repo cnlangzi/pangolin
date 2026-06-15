@@ -447,18 +447,13 @@ async fn execute_via_pingora(
     // slices / `String`; no `&'static` is required. The previous
     // code used `Box::leak` on every request, leaking the path
     // bytes and one allocation per header name per request.
-    let mut header_builder =
-        RequestHeader::build(&method, path_only.as_bytes(), None)
-            .map_err(|e| format!("build header: {e}"))?;
+    let mut header_builder = RequestHeader::build(&method, path_only.as_bytes(), None)
+        .map_err(|e| format!("build header: {e}"))?;
 
     // Insert all non-Host, non-Content-Length headers.
-    for (k, v) in request
-        .headers
-        .iter()
-        .filter(|(k, _)| {
-            !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
-        })
-    {
+    for (k, v) in request.headers.iter().filter(|(k, _)| {
+        !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
+    }) {
         let _ = header_builder.insert_header(k.clone(), v.as_bytes());
     }
 
