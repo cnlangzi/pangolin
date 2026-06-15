@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use crate::{redirect_response, App};
+use crate::{App, redirect_response};
 use pangolin_core::types::Tun;
 
 use super::helpers::{generate_token, parse_datetime, parse_form};
@@ -49,7 +49,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                 None,
                 &format!("Token generation error: {}", e),
                 csrf,
-            )
+            );
         }
     };
 
@@ -158,12 +158,12 @@ pub async fn handle_delete(
     name: Option<String>,
     _csrf: &str,
 ) -> http::Result<Resp> {
-    if let Some(n) = name {
-        if !n.is_empty() {
-            let db = app.db.lock().await;
-            let _ = pangolin_core::db::delete_tun(&db, &n);
-            drop(db);
-        }
+    if let Some(n) = name
+        && !n.is_empty()
+    {
+        let db = app.db.lock().await;
+        let _ = pangolin_core::db::delete_tun(&db, &n);
+        drop(db);
     }
     Ok(redirect_response("/tun"))
 }

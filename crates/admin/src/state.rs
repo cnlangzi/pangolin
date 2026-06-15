@@ -99,7 +99,7 @@ impl SessionStore {
 /// Generate a cryptographically random 32-byte hex-encoded token.
 fn generate_token() -> String {
     let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    let bytes: [u8; 32] = rng.r#gen();
     hex::encode(bytes)
 }
 
@@ -116,10 +116,10 @@ pub fn parse_csrf_cookie(cookie_header: &str) -> Option<String> {
 fn parse_cookie_named(cookie_header: &str, name: &str) -> Option<String> {
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=') {
-            if key.trim() == name {
-                return Some(value.trim().to_string());
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key.trim() == name
+        {
+            return Some(value.trim().to_string());
         }
     }
     None

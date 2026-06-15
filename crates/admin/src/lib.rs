@@ -30,7 +30,7 @@ pub mod templates;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{header, Response, StatusCode};
+use http::{Response, StatusCode, header};
 use http_body_util::Full;
 
 pub use app::App;

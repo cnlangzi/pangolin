@@ -72,8 +72,8 @@ pub use tokio_yamux as yamux;
 use yamux::{Config as YamuxConfig, Session, StreamHandle};
 
 // Re-exports for the manual WS handshake helpers below.
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use sha1::{Digest, Sha1};
 
 /// Marker for which side of a tunnel we are.
@@ -431,6 +431,72 @@ where
     }
 }
 
+/// Parse a complete HTTP/1.1 request from a byte slice (synchronous
+/// variant of [`read_http_request`]). Used by the tunnel frame
+/// decoder, which already has the entire request as a single
+/// `&[u8]` (no streaming reader).
+pub fn parse_http_request_bytes(bytes: &[u8]) -> IoResult<HttpRequest> {
+    let idx = find_header_end(bytes)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no CRLFCRLF in request bytes"))?;
+    let head_end = idx + 4;
+    let head_bytes = &bytes[..head_end];
+    let body_prefix = &bytes[head_end..];
+    let head = std::str::from_utf8(head_bytes)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+    let parsed = parse_request_head(head)?;
+    // Body: read from body_prefix (in-memory) instead of an
+    // AsyncRead. For Length(n) we copy n bytes; for Chunked we
+    // decode; for UntilEof we copy everything after the head.
+    let body = match parsed.body_kind {
+        BodyKind::Length(n) => {
+            if body_prefix.len() < n {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!("short body: expected {} got {}", n, body_prefix.len()),
+                ));
+            }
+            body_prefix[..n].to_vec()
+        }
+        BodyKind::Chunked => {
+            let mut out = Vec::new();
+            let mut cursor = 0usize;
+            loop {
+                let crlf = find_crlf(&body_prefix[cursor..])
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidData, "chunked: no size CRLF"))?;
+                let size_line = std::str::from_utf8(&body_prefix[cursor..cursor + crlf])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("utf-8: {e}")))?;
+                let size_str = size_line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_str, 16)
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("chunk size: {e}")))?;
+                cursor += crlf + 2;
+                if size == 0 {
+                    // skip trailers + final CRLF
+                    let _ = find_crlf(&body_prefix[cursor..]);
+                    break;
+                }
+                if body_prefix.len() < cursor + size + 2 {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "chunked: short body"));
+                }
+                out.extend_from_slice(&body_prefix[cursor..cursor + size]);
+                cursor += size + 2;
+            }
+            out
+        }
+        BodyKind::UntilEof => body_prefix.to_vec(),
+    };
+    Ok(HttpRequest {
+        method: parsed.method,
+        target: parsed.target,
+        version: parsed.version,
+        headers: parsed.headers,
+        body,
+    })
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|w| w == b"\r\n")
+}
+
 /// Serialise an `HttpRequest` back into a wire-format HTTP/1.1
 /// request byte buffer.
 pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
@@ -458,6 +524,45 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
 
 /// Serialise an `HttpResponse` back into a wire-format HTTP/1.1
 /// response byte buffer.
+/// Decode an `HttpResponse` from a byte slice produced by `encode_http_response`.
+/// Returns `None` if the bytes are empty.
+pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let bytes_str = std::str::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Format: "HTTP/1.1 {status_line}\r\n{headers}\r\n\r\n{body}"
+    let split = bytes_str.find("\r\n\r\n").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+    })?;
+    let header_part = &bytes_str[..split];
+    let body_bytes = bytes[split + 4..].to_vec();
+
+    let mut lines = header_part.splitn(2, "\r\n");
+    let first_line = lines.next().unwrap_or("");
+    // first_line: "HTTP/1.1 200 OK"
+    let mut parts = first_line.splitn(2, ' ');
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let status_line = parts.next().unwrap_or("502 Bad Gateway").to_string();
+
+    let headers_part = lines.next().unwrap_or("");
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in headers_part.split("\r\n") {
+        if let Some(pos) = line.find(": ") {
+            headers.push((line[..pos].to_string(), line[pos + 2..].to_string()));
+        }
+    }
+
+    Ok(Some(HttpResponse {
+        version,
+        status_line,
+        headers,
+        body: body_bytes,
+    }))
+}
+
 pub fn encode_http_response(resp: &HttpResponse) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + resp.body.len());
     out.extend_from_slice(resp.version.as_bytes());
@@ -540,7 +645,7 @@ pub fn strip_hop_by_hop_headers(headers: &mut Vec<(String, String)>) {
 
 // ---- internal HTTP head/body types ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: String,
     pub target: String,
@@ -549,7 +654,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub version: String,
     pub status_line: String,

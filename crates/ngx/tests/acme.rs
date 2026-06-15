@@ -15,7 +15,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use tempfile::TempDir;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // Force ring as the default crypto provider for tests.
 // rustls 0.23 auto-detects, but when both ring and aws-lc-rs are linked
@@ -48,28 +48,27 @@ fn build_acme_client(ca_pem: &[u8]) -> anyhow::Result<reqwest::Client> {
 
 /// Fix Pebble's authZ response by removing challenges without tokens.
 fn patch_authz_response(body: Vec<u8>) -> Vec<u8> {
-    if let Ok(text) = std::str::from_utf8(&body) {
-        if text.contains("\"challenges\"") && text.contains("\"dns-persist-01\"") {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                if let Some(challenges) = json.get("challenges").and_then(|c| c.as_array()) {
-                    let filtered: Vec<_> = challenges
-                        .iter()
-                        .filter(|c| {
-                            c.get("token")
-                                .and_then(|t| t.as_str())
-                                .map(|t| !t.is_empty())
-                                .unwrap_or(false)
-                        })
-                        .cloned()
-                        .collect();
-                    if filtered.len() != challenges.len() {
-                        let mut patched = json.clone();
-                        patched["challenges"] = serde_json::Value::Array(filtered);
-                        if let Ok(patched_str) = serde_json::to_string(&patched) {
-                            return patched_str.into_bytes();
-                        }
-                    }
-                }
+    if let Ok(text) = std::str::from_utf8(&body)
+        && text.contains("\"challenges\"")
+        && text.contains("\"dns-persist-01\"")
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(challenges) = json.get("challenges").and_then(|c| c.as_array())
+    {
+        let filtered: Vec<_> = challenges
+            .iter()
+            .filter(|c| {
+                c.get("token")
+                    .and_then(|t| t.as_str())
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if filtered.len() != challenges.len() {
+            let mut patched = json.clone();
+            patched["challenges"] = serde_json::Value::Array(filtered);
+            if let Ok(patched_str) = serde_json::to_string(&patched) {
+                return patched_str.into_bytes();
             }
         }
     }

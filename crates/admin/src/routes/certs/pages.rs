@@ -8,8 +8,8 @@ use http::Response;
 use http_body_util::Full;
 use pangolin_core::CertStatus;
 
-use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 use crate::App;
+use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 
 type Resp = Response<Full<Bytes>>;
 
@@ -99,10 +99,10 @@ fn parse_status_filter(raw: Option<&str>) -> Vec<CertStatus> {
         if token.is_empty() {
             continue;
         }
-        if let Ok(s) = token.parse::<CertStatus>() {
-            if !out.contains(&s) {
-                out.push(s);
-            }
+        if let Ok(s) = token.parse::<CertStatus>()
+            && !out.contains(&s)
+        {
+            out.push(s);
         }
     }
     out

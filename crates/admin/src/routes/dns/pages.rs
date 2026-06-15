@@ -10,10 +10,10 @@ use http_body_util::Full;
 
 use pangolin_core::DnsProviderKind;
 
+use crate::App;
 use crate::templates::{
     DnsProvidersEditTemplate, DnsProvidersListTemplate, DnsProvidersNewTemplate,
 };
-use crate::App;
 
 type Resp = Response<Full<Bytes>>;
 

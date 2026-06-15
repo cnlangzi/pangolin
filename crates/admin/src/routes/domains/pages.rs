@@ -7,10 +7,10 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
+use crate::App;
 use crate::templates::{
     DomainsEditTemplate, DomainsListTemplate, DomainsNewTemplate, SiteDomainsTemplate,
 };
-use crate::App;
 
 type Resp = Response<Full<Bytes>>;
 

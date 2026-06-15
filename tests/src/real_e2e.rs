@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::harness::{init_pangolin_db, NgxProcess, TunProcess};
+use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
 
 /// Issue a raw HTTP/1.1 GET to `addr` with the given `Host` header,
 /// returning the response body. Wrapper around the shared
@@ -102,12 +102,23 @@ impl Drop for MockBackend {
 // ---------------------------------------------------------------------------
 
 fn seed_site(conn: &Connection, name: &str, backend: &str) {
+    seed_site_with_host_mode(conn, name, backend, "passthrough", None);
+}
+
+fn seed_site_with_host_mode(
+    conn: &Connection,
+    name: &str,
+    backend: &str,
+    host_mode: &str,
+    host_custom: Option<&str>,
+) {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO sites (name, backend, enabled, created_at, updated_at) VALUES (?1, ?2, 1, ?3, ?3)",
-        rusqlite::params![name, backend, now],
+        "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?5)",
+        rusqlite::params![name, backend, host_mode, host_custom, now],
     )
-    .expect("insert site");
+    .expect("insert site with host_mode");
 }
 
 fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
@@ -273,6 +284,188 @@ async fn real_e2e_tunnel_http_request_through_tun() {
         host_header, "office.test",
         "Host header must pass through tunnel to backend as sent by client"
     );
+}
+
+/// **Issue #61 regression test — host_mode=Backend on the tunnel path.**
+///
+/// Before the v8 refactor, `host_mode` was applied on the
+/// *direct* path (ngx `upstream_request_filter`) but **not**
+/// on the tunnel path: the request was forwarded through
+/// the yamux stream with whatever Host header the client
+/// sent. For SPAs (like kinnit) that route by Host, this
+/// caused `/chat`, `/`, `/anything` to all collapse into
+/// the default page — they all saw an unknown Host.
+///
+/// This test seeds a site with `host_mode=Backend` and
+/// asserts the tun's reqwest-style executor (now
+/// `PingoraClientExecutor` in v8) **overwrites the Host
+/// header with the backend authority** before sending the
+/// request upstream. The InspectingBackend records the
+/// Host header it actually saw, and we compare.
+#[tokio::test]
+async fn real_e2e_tunnel_host_mode_backend_overrides_host() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+    let backend_addr_for_closure = backend_addr.clone();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site_with_host_mode(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr_for_closure}"),
+            "backend",
+            None,
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _body) = raw_request(&addr, "office.test", "GET", "/chat", b"").await;
+    assert_eq!(
+        status,
+        200,
+        "expected 200, got {status}. ngx log:\n{}\n-- tun log --\n{}",
+        ngx.log_string(),
+        _tun.log_string()
+    );
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1, "backend should have seen 1 request");
+    let req = &seen[0];
+    let host_header = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        host_header, backend_addr,
+        "host_mode=Backend must rewrite Host to backend authority. \
+         Got {host_header:?}, expected {backend_addr:?}"
+    );
+    // Path is preserved regardless of host_mode (the central
+    // invariant of v8).
+    assert_eq!(req.path, "/chat", "path must survive tunnel byte-exact");
+}
+
+/// **Issue #61 regression test — host_mode=Passthrough preserves Host.**
+///
+/// Companion to the above: when `host_mode=Passthrough`,
+/// the Host header must be the public host the client
+/// used, not the backend's authority. This is the default
+/// behaviour; we lock it in so future refactors can't
+/// silently flip it.
+#[tokio::test]
+async fn real_e2e_tunnel_host_mode_passthrough_preserves_host() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site_with_host_mode(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+            "passthrough",
+            None,
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _body) = raw_request(&addr, "office.test", "GET", "/api/v1/users?x=1", b"").await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1);
+    let req = &seen[0];
+    let host_header = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        host_header, "office.test",
+        "host_mode=Passthrough must leave Host as the public host"
+    );
+    assert_eq!(req.path, "/api/v1/users", "path must survive tunnel");
+    assert_eq!(req.query, "x=1", "query must survive tunnel");
+}
+
+/// **Path invariant across host_mode values — Issue #61 companion.**
+///
+/// For every host_mode, the URI path and query string must
+/// round-trip byte-exact. This is the v8 design's central
+/// invariant (`host_mode` only rewrites Host, never the
+/// path).
+#[tokio::test]
+async fn real_e2e_tunnel_path_invariant_across_host_modes() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("passthrough", "/", "/", ""),
+        ("passthrough", "/chat", "/chat", ""),
+        (
+            "passthrough",
+            "/api/v1/users?foo=bar&baz=qux",
+            "/api/v1/users",
+            "foo=bar&baz=qux",
+        ),
+        ("backend", "/", "/", ""),
+        ("backend", "/chat", "/chat", ""),
+        ("backend", "/api/v1/users?x=1", "/api/v1/users", "x=1"),
+        ("custom", "/chat", "/chat", ""),
+    ];
+    for (i, (mode, path, want_path, want_query)) in cases.iter().enumerate() {
+        let backend_addr_for_closure = backend_addr.clone();
+        let ngx = NgxProcess::start(move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site_with_host_mode(
+                &conn,
+                "office-site",
+                &format!("office:http://{backend_addr_for_closure}"),
+                mode,
+                Some("custom.example.com"),
+            );
+            seed_domain(&conn, "office.test", "office-site");
+        })
+        .await;
+
+        let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+        let addr = format!("127.0.0.1:{}", ngx.http_port);
+        let (status, _body) = raw_request(&addr, "office.test", "GET", path, b"").await;
+        assert_eq!(
+            status, 200,
+            "case {i} ({mode} {path}): expected 200, got {status}"
+        );
+        let seen = backend.seen().await;
+        assert_eq!(seen.len(), 1, "case {i}: backend saw wrong request count");
+        let req = &seen[0];
+        assert_eq!(
+            &req.path, want_path,
+            "case {i} ({mode} {path}): path mismatch"
+        );
+        assert_eq!(
+            &req.query, want_query,
+            "case {i} ({mode} {path}): query mismatch"
+        );
+        backend.reset().await; // (mock has no reset; this is a no-op but kept for symmetry)
+    }
 }
 
 /// **Regression test for the GET-without-Content-Length hang.**
@@ -824,6 +1017,14 @@ struct InspectingBackend {
 impl InspectingBackend {
     async fn start() -> Self {
         Self::start_with(200, "application/json", b"{}").await
+    }
+
+    /// Clear the recorded requests. Useful when reusing one
+    /// `InspectingBackend` across multiple assertions in a
+    /// single test (the `real_e2e_tunnel_path_invariant_*`
+    /// suite does this to amortise backend startup cost).
+    async fn reset(&self) {
+        self.requests.lock().await.clear();
     }
 
     async fn start_with(default_status: u16, default_ct: &str, default_body: &[u8]) -> Self {
@@ -1674,7 +1875,8 @@ async fn real_e2e_h2_authority_fallback() {
         .expect("parse http_code");
     let body = body.to_string();
     assert_eq!(
-        status, 200,
+        status,
+        200,
         "expected 200 OK from backend via H2, got {status}.\nbody: {stdout}\nstderr: {stderr}\nngx log:\n{}",
         ngx.log_string()
     );

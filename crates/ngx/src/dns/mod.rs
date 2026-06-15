@@ -6,7 +6,7 @@ use base64::Engine;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use hickory_resolver::TokioAsyncResolver;
 use pangolin_core::DnsProviderKind;
@@ -472,10 +472,10 @@ impl DnsProvider for AliyunDnsProvider {
             let candidate = parts[i..].join(".");
             let mut params = HashMap::new();
             params.insert("DomainName".to_string(), candidate.clone());
-            if let Ok(resp) = self.do_request("DescribeDomainRecords", params).await {
-                if resp.pointer("/DomainRecords/Record").is_some() {
-                    return Ok((candidate.clone(), candidate));
-                }
+            if let Ok(resp) = self.do_request("DescribeDomainRecords", params).await
+                && resp.pointer("/DomainRecords/Record").is_some()
+            {
+                return Ok((candidate.clone(), candidate));
             }
         }
         Err(anyhow::anyhow!("no Aliyun zone found for {}", fqdn))
@@ -867,14 +867,11 @@ pub async fn wait_for_txt_propagation(
             Ok(lookup) => {
                 for rdata in lookup.iter() {
                     for txt_slice in rdata.txt_data() {
-                        if let Ok(txt_str) = std::str::from_utf8(txt_slice) {
-                            if txt_str.contains(expected_value) {
-                                log::info!(
-                                    "DNS-01 TXT record found for {} after propagation",
-                                    fqdn
-                                );
-                                return Ok(true);
-                            }
+                        if let Ok(txt_str) = std::str::from_utf8(txt_slice)
+                            && txt_str.contains(expected_value)
+                        {
+                            log::info!("DNS-01 TXT record found for {} after propagation", fqdn);
+                            return Ok(true);
                         }
                     }
                 }

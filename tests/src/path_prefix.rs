@@ -15,7 +15,7 @@
 //! The actual path-rewriting happens in ngx proxy; we test the upstream logic.
 
 use chrono::Utc;
-use pangolin_core::index::{lookup_site, Indexes};
+use pangolin_core::index::{Indexes, lookup_site};
 use pangolin_core::parse::parse_backend;
 use pangolin_core::types::{Domain, HostMode, Site};
 

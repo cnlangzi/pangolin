@@ -96,7 +96,7 @@ pub fn install_signal_handlers(token: CancellationToken) {
     // SIGTERM (Unix only) — graceful terminate
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let token_for_sigterm = token.clone();
         tokio::spawn(async move {
             match signal(SignalKind::terminate()) {
