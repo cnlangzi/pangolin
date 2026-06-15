@@ -830,12 +830,17 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
         }
     };
     for (k, v) in &resp.headers {
-        if let Ok(value) = HeaderValue::from_str(v.as_str()) {
-            // `k` and `value` are owned; pass them by-value so
-            // `append_header`'s `IntoCaseHeaderName` / `TryInto`
-            // bounds are satisfied without escaping a borrow
-            // (E0521 — `resp` is `&`-aliased, the slice refs
-            // don't outlive this loop iteration).
+        if let Ok(value) = HeaderValue::from_str(v) {
+            // We can't pass `k.as_str()` here even though it's cheaper
+            // — pingora's `ResponseHeader::append_header` requires
+            // `'static` for the name (its internal `IntoCaseHeaderName`
+            // bound bottoms out in `bytes::Bytes`/`HeaderName`, which
+            // both need owned storage).  `k.clone()` is the cheapest
+            // path that satisfies the bound: a single short-string
+            // allocation per header.
+            //
+            // `value` is already an owned `HeaderValue` from
+            // `HeaderValue::from_str` above — no extra clone there.
             hdr.append_header(k.clone(), value).ok();
         }
     }
@@ -844,7 +849,8 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
         .iter()
         .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
     {
-        hdr.append_header("Content-Length".to_string(), resp.body.len().to_string())
+        // String literal — no `.to_string()` allocation needed.
+        hdr.append_header("Content-Length", resp.body.len().to_string())
             .ok();
     }
     if let Err(e) = session.write_response_header(Box::new(hdr), false).await {

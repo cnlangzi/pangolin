@@ -45,10 +45,21 @@ WORKDIR /pangolin
 # Override at build time with e.g. `--build-arg TW_MIRROR=` to fall
 # back to the direct URL when the proxy is down or unavailable in
 # your network.
+#
+# **Integrity**: the binary is verified against the SHA256 from the
+# upstream `sha256sums.txt` (fetched through the same proxy, since
+# that is the source of the bytes we're actually downloading — a
+# direct-GitHub hash is only useful if we're downloading directly
+# from GitHub).  `TW_SHA256` is the expected hex digest of the
+# linux-x64 binary at v3.4.17; bump it together with the URL when
+# upgrading the toolchain.
 ARG TW_MIRROR=https://gh-proxy.com/
+ARG TW_VERSION=3.4.17
+ARG TW_SHA256=7d24f7fa191d2193b78cd5f5a42a6093e14409521908529f42d80b11fde1f1d4
 RUN mkdir -p bin && \
     curl -fsSL -o bin/tailwindcss \
-        ${TW_MIRROR}https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
+        ${TW_MIRROR}https://github.com/tailwindlabs/tailwindcss/releases/download/v${TW_VERSION}/tailwindcss-linux-x64 && \
+    echo "${TW_SHA256}  bin/tailwindcss" | sha256sum -c - && \
     chmod +x bin/tailwindcss
 
 # Layer 2 — esbuild CLI.  Independent cache from layer 1.

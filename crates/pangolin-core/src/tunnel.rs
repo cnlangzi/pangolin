@@ -533,12 +533,21 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
 /// Validating the whole buffer as UTF-8 was a real bug — see the
 /// `decode_http_response_does_not_validate_body_as_utf8` test.
 ///
-/// The **header** section is required to be ASCII (RFC 7230 §3.2.4:
-/// "field-value    = *( field-content / obs-fold )" where
-/// `field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]`
-/// and `field-vchar  = VCHAR / obs-text`, with VCHAR = `%x21-7E`).
-/// We still validate the header section as UTF-8 (a strict subset of
-/// ASCII in well-formed responses); the body is kept as `Vec<u8>`.
+/// **Why we don't `from_utf8` the header section either**: per
+/// RFC 7230 §3.2.6, header **values** may contain `obs-text` (any
+/// byte in 0x80–0xFF).  Such bytes are *not* valid UTF-8, but they
+/// are valid HTTP.  A legacy backend emitting an `X-Some-Thing: \x80`
+/// style header must round-trip through us untouched — the gateway
+/// is byte-transparent on the wire.
+///
+/// We therefore scan the header section byte-by-byte (splitting on
+/// `\r\n` and `: `), validate **only the start-line** as UTF-8 (the
+/// status line is required to be ASCII per RFC 7230 §3.1.1), and
+/// treat header names + values as opaque byte strings — converting
+/// each to a `String` only via `String::from_utf8_lossy` for storage
+/// in `HttpResponse`.  Non-UTF-8 bytes survive that conversion as
+/// U+FFFD replacement characters; the original bytes are kept on
+/// encode via `as_bytes()`.
 pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
     if bytes.is_empty() {
         return Ok(None);
@@ -552,30 +561,77 @@ pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
         })?;
 
-    // Validate **only the header section** as UTF-8. Body stays as
-    // `Vec<u8>` so binary content (deflate, gzip, images, downloads)
-    // passes through untouched.
-    let header_str = std::str::from_utf8(&bytes[..split]).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("response header is not valid UTF-8: {e}"),
-        )
-    })?;
+    let header_section = &bytes[..split];
     let body_bytes = bytes[split + 4..].to_vec();
 
-    let mut lines = header_str.splitn(2, "\r\n");
-    let first_line = lines.next().unwrap_or("");
-    // first_line: "HTTP/1.1 200 OK"
-    let mut parts = first_line.splitn(2, ' ');
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
-    let status_line = parts.next().unwrap_or("502 Bad Gateway").to_string();
+    // Locate the end of the start-line (first "\r\n" inside the
+    // header section).  The start-line must be ASCII — RFC 7230
+    // §3.1.1: HTTP-version = HTTP-name "/" DIGIT "." DIGIT, status
+    // code/reason are ASCII.  We validate just this slice.
+    let first_line_end = header_section
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no start-line terminator",
+            )
+        })?;
+    let start_line_bytes = &header_section[..first_line_end];
+    let start_line_str = std::str::from_utf8(start_line_bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("response start-line is not valid ASCII/UTF-8: {e}"),
+        )
+    })?;
 
-    let headers_part = lines.next().unwrap_or("");
+    // "HTTP/1.1 200 OK" — split on the first space.
+    let (version, status_line) = match start_line_str.split_once(' ') {
+        Some((v, s)) => (v.to_string(), s.to_string()),
+        None => (
+            "HTTP/1.1".to_string(),
+            start_line_str.to_string(), // pathological: no space, treat whole line as status
+        ),
+    };
+    // Match the previous fallback semantics for a missing space.
+    let (version, status_line) = if status_line.is_empty() {
+        (version, "502 Bad Gateway".to_string())
+    } else {
+        (version, status_line)
+    };
+
+    // Walk the remaining header lines byte-by-byte.  Each line ends
+    // at "\r\n" and the name/value separator is ": ".  We accept any
+    // byte sequence in the value (RFC 7230 §3.2.6 `obs-text`).
     let mut headers: Vec<(String, String)> = Vec::new();
-    for line in headers_part.split("\r\n") {
-        if let Some(pos) = line.find(": ") {
-            headers.push((line[..pos].to_string(), line[pos + 2..].to_string()));
+    let mut cursor = first_line_end + 2; // skip past first "\r\n"
+    let header_end = split; // headers run to (but not including) split
+    while cursor < header_end {
+        // Find end of this line.
+        let line_end = header_section[cursor..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| cursor + p)
+            .unwrap_or(header_end);
+        let line = &header_section[cursor..line_end];
+
+        if let Some(sep) = line.windows(2).position(|w| w == b": ") {
+            // Name MUST be ASCII (RFC 7230 §3.2.6: token = 1*tchar,
+            // tchar is a strict subset of VCHAR = 0x21–0x7E).  We
+            // still use lossy here so a malformed upstream doesn't
+            // take the gateway down — the value is what we need to
+            // be lenient about, and the name gets the same treatment
+            // for symmetry.
+            let name = String::from_utf8_lossy(&line[..sep]).into_owned();
+            let value = String::from_utf8_lossy(&line[sep + 2..]).into_owned();
+            headers.push((name, value));
         }
+        // else: line without ": " — skip it (continuation/garbage)
+
+        if line_end == header_end {
+            break;
+        }
+        cursor = line_end + 2; // skip past "\r\n"
     }
 
     Ok(Some(HttpResponse {
@@ -1338,13 +1394,39 @@ mod tests {
         assert!(resp.body.is_empty());
     }
 
-    /// Garbage bytes in the **header** section must still fail —
-    /// we only relaxed the body check, not the header check.
+    /// `obs-text` bytes (0x80–0xFF) in a header value must round-trip
+    /// through the decoder — RFC 7230 §3.2.6 explicitly permits them
+    /// in field values, even though they're not valid UTF-8.  An
+    /// earlier strict-UTF-8 check rejected these, which would have
+    /// broken legacy backends.  See the review thread on PR #65.
     #[test]
-    fn decode_http_response_rejects_non_utf8_header() {
-        // Inject a non-UTF-8 byte (0x80) into a header value.
-        let bytes = b"HTTP/1.1 200 OK\r\nX-Bad: \x80\x81\r\n\r\n";
-        let err = decode_http_response(bytes).expect_err("non-utf8 header must fail");
+    fn decode_http_response_preserves_obs_text_in_header_value() {
+        let bytes = b"HTTP/1.1 200 OK\r\nX-Legacy: foo\x80\x81bar\r\nContent-Length: 0\r\n\r\n";
+        let resp = decode_http_response(bytes)
+            .expect("obs-text in header value must decode")
+            .expect("non-empty response");
+        let val = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-legacy"))
+            .expect("X-Legacy header present")
+            .1
+            .clone();
+        // The non-UTF-8 bytes must survive as U+FFFD substitutions
+        // (lossy conversion).  Crucially, the response must NOT be
+        // rejected outright with `InvalidData`.
+        assert!(val.contains('\u{FFFD}'), "got: {val:?}");
+        assert!(val.starts_with("foo") && val.ends_with("bar"));
+    }
+
+    /// Non-UTF-8 bytes in the **start-line** are still a hard error:
+    /// the status line is required to be ASCII (RFC 7230 §3.1.1), so
+    /// this is genuinely malformed.
+    #[test]
+    fn decode_http_response_rejects_non_utf8_start_line() {
+        // 0x80 in "HTTP/1.1 200 OK" — the version/status portion.
+        let bytes = b"HTTP/1.\x80 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let err = decode_http_response(bytes).expect_err("non-ASCII start-line must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
