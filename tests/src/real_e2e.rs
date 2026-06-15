@@ -553,6 +553,130 @@ async fn real_e2e_tunnel_get_without_content_length() {
     assert_eq!(seen[0].path, "/");
 }
 
+/// **Regression test — multiple `Set-Cookie` headers must reach the
+/// browser through the tunnel path.**
+///
+/// Symptom (from production): kinnit's login flow POSTs to `/login`
+/// and the backend replies `302` with two `Set-Cookie` headers
+/// (`uid=…` and `sid=…`). With the pre-fix `write_response_to_session`
+/// using `ResponseHeader::insert_header`, the second `Set-Cookie`
+/// silently overwrote the first — the browser only saw one cookie,
+/// the session lookup failed, and the follow-up `GET /chat` redirected
+/// straight back to `/login`. The user described it as "the cookie
+/// doesn't take effect."
+///
+/// Cause: `insert_header` replaces all values under the same name
+/// (pingora's `header_name_map` is a multi-map; `insert_header` does
+/// a `remove + append`, dropping every prior value). `Set-Cookie` is
+/// the one header where RFC 6265 §3 / RFC 7230 §3.2.2 explicitly
+/// permits — and backends regularly rely on — multiple values on the
+/// wire.
+///
+/// Fix: switch `write_response_to_session` to `append_header`, which
+/// adds the new value without removing existing ones. Every other
+/// header keeps the same behaviour (most are single-value; for
+/// multi-value-permitted headers like `Vary` / `Cache-Control` the
+/// append semantics are what a transparent proxy should provide).
+///
+/// Why this test catches it: the mock backend replies with two
+/// `Set-Cookie` lines. The assertion uses `raw_request_capture` (or
+/// its in-test equivalent) to read the **raw bytes** the client
+/// received — a TLS-free HTTP/1.1 dump — and fails immediately if
+/// only one `Set-Cookie` line is present. The pre-fix proxy would
+/// emit exactly one; the post-fix proxy emits both.
+#[tokio::test]
+async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
+    // Mock backend that replies with two Set-Cookie headers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                // Drain the request, we don't care about it.
+                let mut sink = vec![0u8; 8192];
+                let _ = stream.read(&mut sink).await;
+                // Empty body, so Content-Length is a literal 0 — no need to
+                // interpolate body.len().
+                let resp = "HTTP/1.1 302 Found\r\n\
+                     Location: /chat\r\n\
+                     Set-Cookie: uid=44; Path=/; Max-Age=2592000\r\n\
+                     Set-Cookie: sid=46; Path=/; Max-Age=2592000\r\n\
+                     Date: Mon, 15 Jun 2026 09:00:00 GMT\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site(
+                &conn,
+                "office-site",
+                &format!("office:http://{backend_addr}"),
+            );
+            seed_domain(&conn, "office.test", "office-site");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // Issue a raw HTTP/1.1 request and capture the full raw response
+    // bytes (we want to count *wire* Set-Cookie lines, not parse
+    // headers — headers can fold, but a Set-Cookie line is a
+    // Set-Cookie line).
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+        .await
+        .expect("connect to ngx (5s timeout)")
+        .expect("connect to ngx");
+    let req = b"GET / HTTP/1.1\r\nHost: office.test\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).await.expect("write request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let text = String::from_utf8_lossy(&buf);
+
+    let set_cookie_lines: Vec<&str> = text
+        .split("\r\n")
+        .filter(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .collect();
+
+    assert_eq!(
+        set_cookie_lines.len(),
+        2,
+        "exactly 2 Set-Cookie lines must reach the client, got {}: {:?}. \
+         raw response:\n{}",
+        set_cookie_lines.len(),
+        set_cookie_lines,
+        text
+    );
+    let joined = set_cookie_lines.join("|");
+    assert!(
+        joined.contains("uid=44"),
+        "uid cookie missing from forwarded Set-Cookie: {joined}"
+    );
+    assert!(
+        joined.contains("sid=46"),
+        "sid cookie missing from forwarded Set-Cookie: {joined}"
+    );
+}
+
 /// **Regression test for the HTTPS+H2 → tunnel path-construction bug.**
 ///
 /// Symptom (from production): `curl http://yaitoo.cn` works, but

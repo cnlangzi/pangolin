@@ -730,8 +730,15 @@ impl ProxyHttp for AppProxy {
                 .headers
                 .iter()
                 .any(|(hk, hv)| hk.as_str().eq_ignore_ascii_case(k) && hv == v.as_str());
+            // `append_header` (not `insert_header`) for the same reason as
+            // `write_response_to_session`: a client request may legitimately
+            // carry multiple headers with the same name (e.g. several
+            // `Forwarded` entries per RFC 7239 §4, or a `Via` chain), and
+            // `insert_header` would silently drop every value after the first.
+            // The `already` guard above suppresses *exact* (name, value)
+            // duplicates so we don't accidentally double an unchanged header.
             if !already && let Ok(value) = HeaderValue::from_str(v) {
-                upstream.insert_header(k.to_string(), value).ok();
+                upstream.append_header(k.to_string(), value).ok();
             }
         }
         Ok(())
@@ -798,6 +805,27 @@ async fn build_request_from_session(
 /// Write an `HttpResponse` to a pingora `Session`. Translates
 /// our shared wire format into pingora's `ResponseHeader` +
 /// `write_response_body`.
+///
+/// **Why `append_header` (not `insert_header`)**: a backend may send
+/// multiple headers under the same name — the canonical example is
+/// `Set-Cookie` (RFC 6265 §3 / RFC 7230 §3.2.2 explicitly carves out
+/// `Set-Cookie` as the one header where multi-line wire format is
+/// meaningful). `insert_header` **replaces** all existing values
+/// under the same name, silently dropping every `Set-Cookie` after
+/// the first one. The user-visible symptom was a login flow where
+/// only the last `Set-Cookie` reached the browser, the session
+/// cookie got overwritten, and `/chat` immediately redirected back
+/// to `/login`.
+///
+/// `append_header` adds the new value without removing existing
+/// ones. For single-value headers like `Content-Length` it behaves
+/// identically to `insert_header` for the common case (one value
+/// in, one value out); if a misbehaving upstream sends duplicate
+/// `Content-Length`, surfacing both to the client matches the raw
+/// wire bytes the upstream sent — the right thing for a transparent
+/// proxy.
+///
+/// See `real_e2e_tunnel_preserves_multiple_set_cookie`.
 async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     let status = parse_status_from_line(&resp.status_line);
     let mut hdr = match ResponseHeader::build(status, None) {
@@ -809,16 +837,36 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
         }
     };
     for (k, v) in &resp.headers {
-        if let Ok(value) = HeaderValue::from_str(v.as_str()) {
-            hdr.insert_header(k.to_string(), value).ok();
+        if let Ok(value) = HeaderValue::from_str(v) {
+            // We can't pass `k.as_str()` here even though it's cheaper
+            // — pingora's `ResponseHeader::append_header` requires
+            // `'static` for the name (its internal `IntoCaseHeaderName`
+            // bound bottoms out in `bytes::Bytes`/`HeaderName`, which
+            // both need owned storage).  `k.clone()` is the cheapest
+            // path that satisfies the bound: a single short-string
+            // allocation per header.
+            //
+            // `value` is already an owned `HeaderValue` from
+            // `HeaderValue::from_str` above — no extra clone there.
+            hdr.append_header(k.clone(), value).ok();
         }
     }
-    if resp
+    // Only synthesise `Content-Length` when neither a `Content-Length` nor a
+    // `Transfer-Encoding` header is already present.  RFC 7230 §3.3.3 forbids
+    // both being set on the same message — some clients treat the combination
+    // as a request-smuggling signal — and `encode_http_response` in
+    // `pangolin-core` makes the same dual check.  Mirroring that guard keeps
+    // the two code paths consistent for chunked upstream responses.
+    let has_content_length = resp
         .headers
         .iter()
-        .all(|(k, _)| !k.eq_ignore_ascii_case("content-length"))
-    {
-        hdr.insert_header("Content-Length", resp.body.len().to_string())
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    let has_transfer_encoding = resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    if !has_content_length && !has_transfer_encoding {
+        hdr.append_header("Content-Length", resp.body.len().to_string())
             .ok();
     }
     if let Err(e) = session.write_response_header(Box::new(hdr), false).await {

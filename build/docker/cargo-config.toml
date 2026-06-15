@@ -24,11 +24,11 @@
 #     CARGO_REGISTRIES_* env vars when building from outside China.
 #
 #     Mirror list (swap by editing `replace-with` + the registry name):
-#       rsproxy.cn   sparse+https://rsproxy.cn/index/
+#       sjtu         sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/
 #       ustc         sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 #       tuna         sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/
-#       sjtu         sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/
-#       bytecode     https://mirrors.bytecode.cn/crates.io-index/
+#       rsproxy.cn   sparse+https://rsproxy.cn/index/
+#       bytecode     https://mirrors.bytecode.cn/crates.io-index/  (often unreachable)
 
 [build]
 rustc-wrapper = "/usr/bin/sccache"
@@ -48,7 +48,19 @@ git-fetch-with-cli = true
 # `crates-io` reference (including transitive dependencies, even those
 # pulled in via git-source forks like our `cnlangzi/pingora` branch)
 # go through the mirror configured below.
-replace-with = "rsproxy"
+#
+# IMPORTANT: the registry named below MUST be defined in this file,
+# otherwise cargo silently falls back to the default crates.io and
+# the build may hit network timeouts in CN networks.  See the
+# "mirror selection" section at the top of this file.
+#
+# Verified reachable on 2026-06-15 (see docs on mirror selection):
+#   sjtu  ~1.7 MB/s  (fastest)
+#   ustc  ~900 KB/s
+#   tuna  ~150 KB/s
+#   rsproxy varies (sometimes drops to KB/s)
+#   bytecode DNS unresolvable from this network
+replace-with = "sjtu"
 
 [registries.rsproxy]
 index = "sparse+https://rsproxy.cn/index/"
@@ -58,3 +70,9 @@ index = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
 
 [registries.tuna]
 index = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+[registries.bytecode]
+index = "sparse+https://mirrors.bytecode.cn/crates.io-index/"
+
+[registries.sjtu]
+index = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
