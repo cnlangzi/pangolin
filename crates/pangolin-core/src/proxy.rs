@@ -206,10 +206,7 @@ pub fn apply_proxy_policy(request: &mut HttpRequest, ctx: &ProxyCtx) {
 /// Apply only Host rewrite and X-Forwarded-* headers, without
 /// stripping hop-by-hop headers. Used by ngx direct proxy path
 /// where pingora handles hop-by-hop headers automatically.
-pub fn apply_proxy_policy_without_hop_by_hop_stripping(
-    request: &mut HttpRequest,
-    ctx: &ProxyCtx,
-) {
+pub fn apply_proxy_policy_without_hop_by_hop_stripping(request: &mut HttpRequest, ctx: &ProxyCtx) {
     apply_host_and_forwarded_headers(request, ctx);
 }
 

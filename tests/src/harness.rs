@@ -92,7 +92,7 @@ fn resolve_binary(makefile_name: &str, cargo_name: &str) -> PathBuf {
 /// release_port() in Drop implementations.
 pub fn free_port() -> u16 {
     let mut allocated = PORT_ALLOCATOR.lock().unwrap();
-    
+
     // Try up to 100 times to find a free port
     for _ in 0..100 {
         // Bind to :0 to let the OS assign a free port
@@ -100,7 +100,7 @@ pub fn free_port() -> u16 {
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0 for free port");
         let port = listener.local_addr().expect("local_addr").port();
         drop(listener); // Release immediately
-        
+
         // Check if this port is already tracked as allocated
         if allocated.insert(port) {
             // Successfully reserved!
@@ -108,7 +108,7 @@ pub fn free_port() -> u16 {
         }
         // Port already allocated, try again
     }
-    
+
     panic!("Failed to allocate a free port after 100 attempts");
 }
 
