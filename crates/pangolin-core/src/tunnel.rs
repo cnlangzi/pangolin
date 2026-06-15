@@ -554,12 +554,9 @@ pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
     }
 
     // Format: "HTTP/1.1 {status_line}\r\n{headers}\r\n\r\n{body}"
-    let split = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
-        })?;
+    let split = find_header_end(bytes).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no header/body split")
+    })?;
 
     let header_section = &bytes[..split];
     let body_bytes = bytes[split + 4..].to_vec();
@@ -585,19 +582,13 @@ pub fn decode_http_response(bytes: &[u8]) -> IoResult<Option<HttpResponse>> {
         )
     })?;
 
-    // "HTTP/1.1 200 OK" — split on the first space.
+    // "HTTP/1.1 200 OK" — split on the first space.  A missing or empty
+    // status-code half falls back to "502 Bad Gateway" so that
+    // `parse_status_from_line` downstream still produces a parseable status
+    // (the previous str-based parser had the same fallback).
     let (version, status_line) = match start_line_str.split_once(' ') {
-        Some((v, s)) => (v.to_string(), s.to_string()),
-        None => (
-            "HTTP/1.1".to_string(),
-            start_line_str.to_string(), // pathological: no space, treat whole line as status
-        ),
-    };
-    // Match the previous fallback semantics for a missing space.
-    let (version, status_line) = if status_line.is_empty() {
-        (version, "502 Bad Gateway".to_string())
-    } else {
-        (version, status_line)
+        Some((v, s)) if !s.is_empty() => (v.to_string(), s.to_string()),
+        _ => ("HTTP/1.1".to_string(), "502 Bad Gateway".to_string()),
     };
 
     // Walk the remaining header lines byte-by-byte.  Each line ends

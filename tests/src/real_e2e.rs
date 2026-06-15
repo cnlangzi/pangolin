@@ -600,17 +600,15 @@ async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
                 // Drain the request, we don't care about it.
                 let mut sink = vec![0u8; 8192];
                 let _ = stream.read(&mut sink).await;
-                let body = b"";
-                let resp = format!(
-                    "HTTP/1.1 302 Found\r\n\
+                // Empty body, so Content-Length is a literal 0 — no need to
+                // interpolate body.len().
+                let resp = "HTTP/1.1 302 Found\r\n\
                      Location: /chat\r\n\
                      Set-Cookie: uid=44; Path=/; Max-Age=2592000\r\n\
                      Set-Cookie: sid=46; Path=/; Max-Age=2592000\r\n\
                      Date: Mon, 15 Jun 2026 09:00:00 GMT\r\n\
-                     Content-Length: {}\r\n\
-                     \r\n",
-                    body.len()
-                );
+                     Content-Length: 0\r\n\
+                     \r\n";
                 let _ = stream.write_all(resp.as_bytes()).await;
             });
         }
