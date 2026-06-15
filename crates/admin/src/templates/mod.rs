@@ -47,7 +47,7 @@ pub use dns::{
 };
 pub use domains::{
     DomainsEditTemplate, DomainsFormFieldsView, DomainsListTemplate, DomainsNewTemplate,
-    DomainsTableView, SiteDomainsTemplate,
+    DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
