@@ -34,9 +34,21 @@ FROM pangolin-debian AS pangolin-chef
 WORKDIR /pangolin
 
 # Layer 1 — tailwindcss CLI.  Cache survives until the version/URL changes.
+#
+# GitHub releases can be slow or unreachable from CN networks (40 MB
+# at ~30 KB/s = >20 min, often timing out).  `gh-proxy.com` is a
+# dedicated GitHub raw / releases proxy that we measured at ~9 MB/s
+# for the same asset (41 MB in ~5s on 2026-06-15).  Pass the original
+# GitHub URL after the proxy prefix; the proxy fetches and forwards
+# the bytes unchanged.
+#
+# Override at build time with e.g. `--build-arg TW_MIRROR=` to fall
+# back to the direct URL when the proxy is down or unavailable in
+# your network.
+ARG TW_MIRROR=https://gh-proxy.com/
 RUN mkdir -p bin && \
     curl -fsSL -o bin/tailwindcss \
-        https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
+        ${TW_MIRROR}https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-linux-x64 && \
     chmod +x bin/tailwindcss
 
 # Layer 2 — esbuild CLI.  Independent cache from layer 1.
