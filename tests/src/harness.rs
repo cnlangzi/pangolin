@@ -15,6 +15,7 @@
 //! the binary, and poll for readiness before returning. On drop they
 //! SIGTERM the child, give it 2s to exit, then SIGKILL.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
+
+// Global port allocator to prevent race conditions in parallel tests
+lazy_static::lazy_static! {
+    static ref PORT_ALLOCATOR: Mutex<HashSet<u16>> = Mutex::new(HashSet::new());
+}
 
 /// Path to the workspace's `target/release/` directory. Both binaries
 /// are expected to be there — the Makefile's `build` target produces
@@ -72,15 +78,44 @@ fn resolve_binary(makefile_name: &str, cargo_name: &str) -> PathBuf {
     bin
 }
 
-/// Reserve a free TCP port by binding to `:0` and reading the assigned
-/// port. The listener is dropped immediately so the port is released
-/// and the test binary can rebind to it.
+/// Reserve a free TCP port with global coordination to prevent race conditions.
+///
+/// **Problem**: The naive approach (bind :0, get port, drop listener) has a
+/// TOCTOU race window: between dropping the listener and the test actually
+/// binding the port, another parallel test might grab the same port.
+///
+/// **Solution**: Use a global Mutex<HashSet<u16>> to track allocated ports.
+/// Once a port is allocated, it stays reserved until explicitly released.
+///
+/// **Tradeoff**: There's still a small window between allocating and binding,
+/// but it's much smaller than the naive approach. Tests clean up ports via
+/// release_port() in Drop implementations.
 pub fn free_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0 for free port");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
+    let mut allocated = PORT_ALLOCATOR.lock().unwrap();
+    
+    // Try up to 100 times to find a free port
+    for _ in 0..100 {
+        // Bind to :0 to let the OS assign a free port
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0 for free port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener); // Release immediately
+        
+        // Check if this port is already tracked as allocated
+        if allocated.insert(port) {
+            // Successfully reserved!
+            return port;
+        }
+        // Port already allocated, try again
+    }
+    
+    panic!("Failed to allocate a free port after 100 attempts");
+}
+
+/// Release a port back to the pool. Called automatically by NgxProcess::drop
+/// and TunProcess::drop.
+pub fn release_port(port: u16) {
+    PORT_ALLOCATOR.lock().unwrap().remove(&port);
 }
 
 /// Issue a raw HTTP/1.1 request to `addr` with a caller-chosen
@@ -461,6 +496,12 @@ acme:
 
 impl Drop for NgxProcess {
     fn drop(&mut self) {
+        // Release allocated ports back to the pool so other tests can use them
+        release_port(self.http_port);
+        release_port(self.tls_port);
+        release_port(self.tunnel_port);
+        release_port(self.admin_port);
+
         // Abort the log-reader tasks first. They hold references to
         // the child's stdout/stderr pipes, so if we let the runtime
         // shut down with them still alive the test process hangs

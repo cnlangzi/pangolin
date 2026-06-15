@@ -38,8 +38,8 @@ use tokio::time::timeout;
 use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept, read_http_response};
 use pangolin_core::types::HostMode;
 use pangolin_core::{
-    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, parse_backend_to_target,
-    serve_file_target,
+    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
+    apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
 
 use crate::App;
@@ -674,7 +674,11 @@ impl ProxyHttp for AppProxy {
             headers: req_headers,
             body: Vec::new(),
         };
-        apply_proxy_policy(&mut req, &ctx);
+        // Use the variant without hop-by-hop stripping because
+        // Pingora handles those automatically in its HTTP/1.1
+        // serialization. Stripping them here would desync the
+        // header_name_map, causing assertion failures.
+        apply_proxy_policy_without_hop_by_hop_stripping(&mut req, &ctx);
 
         // host_mode=Backend: the executor (pingora upstream
         // peer) will dial the backend, so the Host header
@@ -691,25 +695,14 @@ impl ProxyHttp for AppProxy {
         }
 
         // Apply the mutations back to the pingora RequestHeader.
-        // `apply_proxy_policy` does two kinds of work:
+        // Since we're using apply_proxy_policy_without_hop_by_hop_stripping,
+        // we only need to handle:
+        //   - Host header rewrites (for Backend/Custom modes)
+        //   - X-Forwarded-* additions (for Backend/Custom modes)
         //
-        //   (a) strip hop-by-hop headers (Connection, etc.)
-        //   (b) rewrite Host / add X-Forwarded-Host /
-        //       add X-Forwarded-Proto
-        //
-        // For (a) we use `remove_header` on the live
-        // RequestHeader (which keeps the name/case map in
-        // sync). For (b) we compare the materialized view
-        // against the live headers and `insert_header` only
-        // for names that actually changed. Inserting a header
-        // that already exists with the same case would still
-        // be a no-op for `insert_header`, but we keep the diff
-        // loop explicit so we don't churn the name/case map
-        // on every request.
+        // Pingora handles hop-by-hop headers automatically, so we
+        // don't need to remove them here.
         for (k, v) in req.headers.iter() {
-            // Skip headers pingora manages or that we know are
-            // untouched — we still insert them so the upstream
-            // sees the same shape we computed.
             let already = upstream
                 .headers
                 .iter()
@@ -717,35 +710,6 @@ impl ProxyHttp for AppProxy {
             if !already && let Ok(value) = HeaderValue::from_str(v) {
                 upstream.insert_header(k.to_string(), value).ok();
             }
-        }
-        // Strip anything the policy removed (typically hop-by-hop).
-        // The live RequestHeader's `headers` is the source of
-        // truth for what stays; anything in `upstream.headers`
-        // that's not in the materialized `req.headers` was
-        // removed by the policy.
-        let kept: std::collections::HashSet<String> = req
-            .headers
-            .iter()
-            .map(|(k, _)| k.to_ascii_lowercase())
-            .collect();
-        let to_remove: Vec<String> = upstream
-            .headers
-            .iter()
-            .filter_map(|(k, _)| {
-                if kept.contains(&k.as_str().to_ascii_lowercase()) {
-                    None
-                } else {
-                    Some(k.as_str().to_string())
-                }
-            })
-            .collect();
-        for name in to_remove {
-            // Some headers pingora owns internally (Host, etc.)
-            // — skip them so we don't break framing.
-            if name.eq_ignore_ascii_case("host") {
-                continue;
-            }
-            upstream.remove_header(name.as_str());
         }
         Ok(())
     }

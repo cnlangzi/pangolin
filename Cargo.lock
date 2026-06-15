@@ -2277,6 +2277,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "httpdate",
+ "lazy_static",
  "log",
  "ngx",
  "pangolin-core",
