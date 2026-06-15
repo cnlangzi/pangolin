@@ -194,6 +194,16 @@ Shape of the `config` JSON per kind:
 | `level`  | `string` | `info`      | no       | `env_logger` filter: `trace` / `debug` / `info` / `warn` / `error`. |
 | `file`   | `string` | `""`        | no       | Log file path. Empty → stderr only. |
 
+### `[tls]` — TLS listener tuning
+
+Tuning knobs for the TLS listener (HTTPS port). Currently a single
+field; the section is reserved for future TLS settings so new
+knobs land in one place.
+
+| Field        | Type   | Default | Required | Notes |
+| ------------ | ------ | ------- | -------- | ----- |
+| `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN. Set to `false` to force h1 on every TLS connection — this is the **production-proven workaround for an upstream pingora/h2 bug** that surfaces as `400 Bad Request: missing required Host header` when a request is proxied to a tunnel backend (`site.backend = "<tun>:<url>"`). Modern browsers fall back to h1 automatically when h2 is not advertised; in practice the user-visible difference is one fewer multiplexed stream. Once the upstream pingora issue is fixed this knob can flip back to its default and be removed. |
+
 ## `tun.yml` — tunnel client configuration
 
 ### Top-level fields

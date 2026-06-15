@@ -232,12 +232,14 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // config.acme.cert_dir. The previous static-blob path with
         // "default" fallback was removed.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
-        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone())?;
+        let enable_h2 = config.tls.enable_h2;
+        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), enable_h2)?;
         proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
         log::info!(
-            "TLS enabled (SNI) with HTTP/2 ALPN on {} (cert_dir: {})",
+            "TLS enabled (SNI) on {} (cert_dir: {}, http2_alpn: {})",
             config.addr.https,
-            cert_dir.display()
+            cert_dir.display(),
+            enable_h2
         );
     }
     server.add_service(proxy_service);

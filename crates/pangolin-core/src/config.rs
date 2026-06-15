@@ -62,6 +62,10 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// TLS listener tuning. Currently a single knob (h2 ALPN on/off);
+    /// future TLS listener settings land here.
+    #[serde(default)]
+    pub tls: TlsConfig,
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -157,6 +161,7 @@ impl Default for Config {
             admin: AdminConfig::default(),
             cache: CacheConfig::default(),
             acme: AcmeConfig::default(),
+            tls: TlsConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -287,6 +292,42 @@ impl Default for AcmeConfig {
             post_renew: None,
             deploy: None,
         }
+    }
+}
+
+/// TLS listener tuning.
+///
+/// **Workaround knob**: the single `enable_h2` field exists to
+/// disable HTTP/2 ALPN on the TLS listener, sidestepping an
+/// upstream pingora/h2 bug that surfaces as
+/// `400 Bad Request: missing required Host header` when a request
+/// is proxied to a tunnel backend over h2 (pingora tears down the
+/// yamux stream with
+/// `tokio_yamux::stream: this branch should be unreachable`
+/// before the request body reaches the kinnit backend).
+///
+/// Set `enable_h2: false` in `ngx.yml` for any deploy that fronts
+/// tunnel backends; modern browsers fall back to h1 automatically
+/// when h2 is not advertised. The same request works perfectly on
+/// h1. **TODO(upstream pingora h2+tunnel bug)**: flip the default
+/// back to `true` and remove this knob once the upstream issue is
+/// fixed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Advertise HTTP/2 via ALPN. Default `true`. Set to `false`
+    /// to force h1 (see struct doc for the h2+tunnel workaround).
+    #[serde(default)]
+    pub enable_h2: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        // `true` here is duplicated into the struct doc above and
+        // the field doc — there is no `#[serde(default = "…")]`
+        // function because a single bool literal is shorter than
+        // the helper, and the literal must stay in lock-step with
+        // the docs.
+        Self { enable_h2: true }
     }
 }
 
@@ -532,6 +573,34 @@ mod tests {
             let c = Config::from_str(s).unwrap();
             assert_eq!(c.tunnel.addr, "127.0.0.1:9001");
             assert_eq!(c.tunnel.ws_path, "/tunnel");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tls_enable_h2_defaults_to_true() {
+        // Backwards compat: ships with h2 on, so the default
+        // `pangolin-ngx` config is unchanged for the 99% of installs
+        // that don't see the upstream h2+tunnel bug. See
+        // `TlsConfig` doc for the disable-h2 use case.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert!(c.tls.enable_h2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tls_enable_h2_explicit_false() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                tls:
+                  enable_h2: false
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert!(!c.tls.enable_h2);
             Ok(())
         });
     }
