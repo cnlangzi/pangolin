@@ -192,6 +192,7 @@ fn parse_authority(s: &str) -> Option<(&str, u16)> {
 ///      `X-Forwarded-*` are *not* added (preserves the historical
 ///      behaviour of the gateway, matches nginx defaults when no
 ///      `proxy_set_header` is set).
+///
 /// Caller is responsible for constructing `request.target` (the
 /// path-prefix concat happens before this is called) and for
 /// attaching the right `BackendTarget` to the chosen transport.
