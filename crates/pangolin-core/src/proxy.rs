@@ -152,13 +152,27 @@ pub fn parse_backend_to_target(backend: &str) -> Result<(String, BackendTarget),
 }
 
 fn parse_authority(s: &str) -> Option<(&str, u16)> {
+    // IPv6: bracketed form `[..]:port`. The closing `]` is
+    // guaranteed to appear before the port separator (RFC 3986).
+    if let Some(stripped) = s.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        let host = &stripped[..end];
+        let after = &stripped[end + 1..];
+        let port: u16 = after.strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+    // Try host:port format for IPv4/hostname
     if let Some(colon) = s.rfind(':') {
         let host = &s[..colon];
         let port = s[colon + 1..].parse::<u16>().ok()?;
+        // Reject bare IPv6 (no brackets) by checking if the host
+        // portion contains colons — ambiguous and unsupported.
+        if host.contains(':') {
+            return None;
+        }
         Some((host, port))
     } else {
-        let default = if s.contains(':') { 0 } else { 80 }; // never reached; rfind handles it
-        Some((s, default))
+        Some((s, 80))
     }
 }
 
@@ -721,6 +735,10 @@ fn serve_file(
     let mut headers = vec![
         ("Content-Type".to_string(), mime),
         ("Content-Length".to_string(), content_length),
+        // Match nginx's default for `location` blocks without an
+        // explicit `expires` directive — force revalidation per
+        // request, don't let downstream caches serve stale copies.
+        ("Cache-Control".to_string(), "no-cache".to_string()),
     ];
     if let Some(et) = &etag {
         headers.push(("ETag".to_string(), et.clone()));

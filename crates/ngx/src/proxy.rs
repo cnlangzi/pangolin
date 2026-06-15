@@ -401,7 +401,7 @@ impl ProxyHttp for AppProxy {
                 .path_and_query()
                 .map(|pq| pq.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            let req = match build_request_from_session(session, &path_and_query).await {
+            let mut req = match build_request_from_session(session, &path_and_query).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("file backend: build request: {}", e);
@@ -409,6 +409,23 @@ impl ProxyHttp for AppProxy {
                     return Ok(true);
                 }
             };
+            // Apply the same proxy policy (hop-by-hop stripping,
+            // X-Forwarded-*) the direct and tunnel paths do, so
+            // the file-serve path stays consistent with the
+            // v8 invariant of "all 18 combinations behave
+            // identically."
+            let original_host = host_from_session(session);
+            let scheme = match session.req_header().uri.scheme_str() {
+                Some("https") => Scheme::Https,
+                _ => Scheme::Http,
+            };
+            let ctx = ProxyCtx {
+                original_host,
+                original_scheme: scheme,
+                host_mode: site.host_mode,
+                host_custom: site.host_custom.clone(),
+            };
+            apply_proxy_policy(&mut req, &ctx);
             let resp = serve_file_target(&req, doc_root);
             write_response_to_session(session, &resp).await;
             return Ok(true);

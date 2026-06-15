@@ -124,7 +124,7 @@ Carries the inputs needed to apply the proxy policy. The
 `original_host` is preserved through the entire request lifecycle so
 that `X-Forwarded-Host` can echo it back.
 
-### 4.3 `apply_proxy_policy` — the only place Host gets rewritten
+### 4.3 `apply_proxy_policy` — the shared policy application layer
 
 ```rust
 // pangolin-core/src/proxy.rs
@@ -135,19 +135,28 @@ pub fn apply_proxy_policy(request: &mut HttpRequest, ctx: &ProxyCtx);
 
 Behavior:
 
-| `host_mode` | `Host` header after | Adds |
-|---|---|---|
-| `Passthrough` | `ctx.original_host` (unchanged) | — |
-| `Backend`     | backend URL's host:port | `X-Forwarded-Host: <ctx.original_host>`, `X-Forwarded-Proto: <scheme>` |
-| `Custom`      | `ctx.host_custom` | same as Backend |
+| `host_mode` | `Host` header after `apply_proxy_policy` | `X-Forwarded-*` added | Final `Host` (set by executor) |
+|---|---|---|---|
+| `Passthrough` | unchanged | — | (whatever the client sent) |
+| `Backend`     | unchanged | `X-Forwarded-Host: <original>`, `X-Forwarded-Proto: <scheme>` | backend URL's `host:port` |
+| `Custom`      | rewritten to `ctx.host_custom` | `X-Forwarded-Host: <original>`, `X-Forwarded-Proto: <scheme>` | `ctx.host_custom` |
 
 Plus RFC 7230 §6.1 hop-by-hop stripping (delegates to the
 existing `tunnel::strip_hop_by_hop_headers`).
 
-**This is the single source of truth for "how do we rewrite Host
-on the way out."** Both `ngx` and `tun` call it. The
-`upstream_request_filter` on `ngx` and the per-frame handler on
-`tun` both go through it.
+**Policy vs. Execution separation**: `apply_proxy_policy` handles
+the *policy layer* (X-Forwarded-* headers, hop-by-hop stripping,
+Custom mode Host rewrite). For `Backend` mode, the **executor**
+performs the final Host rewrite because only the executor has
+access to `BackendTarget` (which contains the actual backend
+host:port). This two-phase design keeps `ProxyCtx` lightweight
+and allows `apply_proxy_policy` to remain target-agnostic.
+
+Both `ngx` and `tun` call `apply_proxy_policy`, then their
+respective executors complete the Host rewrite for `Backend` mode:
+- `ngx`: `upstream_request_filter` (lines 683-691)
+- `tun`: `execute_via_pingora` (lines 476-481) and
+  `handle_ws_upgrade` (lines 365-377)
 
 ### 4.4 `BackendExecutor` — the transport trait
 
@@ -395,7 +404,7 @@ These are the testable contracts. Each row gets a unit test in
 | # | Invariant | Test |
 |---|---|---|
 | I-1  | `apply_proxy_policy` never mutates `request.target` | `apply_proxy_policy_never_touches_path` |
-| I-2  | `host_mode = Backend` rewrites Host to backend URL host:port | `apply_proxy_policy_backend_mode_rewrites_host` |
+| I-2  | `host_mode = Backend`: executor (not `apply_proxy_policy`) rewrites Host to backend URL host:port | `apply_proxy_policy_backend_mode_passthrough_xfh` (verifies policy adds X-Forwarded-* but leaves Host for executor) |
 | I-3  | `host_mode = Custom` rewrites Host to `host_custom` and adds `X-Forwarded-Host` | `apply_proxy_policy_custom_mode` |
 | I-4  | `host_mode = Passthrough` leaves Host unchanged | `apply_proxy_policy_passthrough_leaves_host` |
 | I-5  | All hop-by-hop headers are stripped | `apply_proxy_policy_strips_hop_by_hop` |

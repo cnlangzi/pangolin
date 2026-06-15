@@ -319,11 +319,13 @@ where
         .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    let host_mode = frame.host_mode;
+    let host_custom = frame.host_custom.clone();
     let ctx = ProxyCtx {
         original_host,
         original_scheme: Scheme::Http,
-        host_mode: frame.host_mode,
-        host_custom: frame.host_custom.clone(),
+        host_mode,
+        host_custom: host_custom.clone(),
     };
     let mut request = frame.request;
     apply_proxy_policy(&mut request, &ctx);
@@ -357,12 +359,26 @@ where
     info!("tun {} ws relay to {} path={}", name, backend_addr, path);
 
     let mut backend = TcpStream::connect(backend_addr).await?;
-    let host_hdr = request
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| authority.to_string());
+
+    // Mirror the HTTP path's Host header logic: apply_proxy_policy
+    // handles Passthrough and Custom modes. For Backend mode, we
+    // derive Host from the BackendTarget (frame.target) like
+    // execute_via_pingora does at lines 476-481.
+    let host_hdr = match host_mode {
+        HostMode::Passthrough | HostMode::Custom => request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| authority.to_string()),
+        HostMode::Backend => match &frame.target {
+            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
+                format!("{}:{}", host, port)
+            }
+            _ => authority.to_string(),
+        },
+    };
+
     let (req_bytes, key) = build_ws_upgrade_request(path, &host_hdr, "");
     backend.write_all(&req_bytes).await?;
     backend.flush().await?;
@@ -426,24 +442,24 @@ async fn execute_via_pingora(
     if path_only.is_empty() {
         return Err("empty path".into());
     }
-    let path_static: &'static [u8] =
-        Box::leak(path_only.to_string().into_bytes().into_boxed_slice());
 
-    let mut header_builder = RequestHeader::build(&method, path_static, None)
-        .map_err(|e| format!("build header: {e}"))?;
+    // `RequestHeader::build` and `insert_header` accept borrowed
+    // slices / `String`; no `&'static` is required. The previous
+    // code used `Box::leak` on every request, leaking the path
+    // bytes and one allocation per header name per request.
+    let mut header_builder =
+        RequestHeader::build(&method, path_only.as_bytes(), None)
+            .map_err(|e| format!("build header: {e}"))?;
 
     // Insert all non-Host, non-Content-Length headers.
-    let header_pairs: Vec<(String, String)> = request
+    for (k, v) in request
         .headers
         .iter()
         .filter(|(k, _)| {
             !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (k, v) in header_pairs {
-        let name_static: &'static str = Box::leak(k.into_boxed_str());
-        let _ = header_builder.insert_header(name_static, v.as_bytes());
+    {
+        let _ = header_builder.insert_header(k.clone(), v.as_bytes());
     }
 
     // Apply host_mode Host override.
