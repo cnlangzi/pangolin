@@ -1548,19 +1548,35 @@ impl AcmeClient {
     }
 }
 
-/// Parse certificate expiry from a blob (key_pem + cert chain).
-fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
+/// Decode the leaf cert out of a blob, returning the raw DER bytes.
+///
+/// PEM wraps base64 every 64 characters with `\n`; `.trim()` only
+/// removes leading/trailing whitespace, so the internal newlines
+/// survive and `base64::engine::general_purpose::STANDARD` rejects
+/// them with `Invalid symbol 10, offset N` (10 == `'\n'`). Stripping
+/// ALL whitespace before decoding fixes this without depending on the
+/// MIME engine's leniency. See the regression test
+/// `parse_blob_expiry_decodes_real_pem_with_line_wrapping` for the
+/// case that surfaced on sh-ali.
+fn decode_leaf_cert_from_blob(blob: &str) -> Result<Vec<u8>> {
     let cert_block = blob
         .split("-----BEGIN CERTIFICATE-----")
         .nth(1)
         .and_then(|s| s.split("-----END CERTIFICATE-----").next())
         .ok_or_else(|| anyhow::anyhow!("no certificate block in blob"))?;
 
-    let der = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        cert_block.trim(),
-    )
-    .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))?;
+    let cleaned: String = cert_block
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, cleaned.as_bytes())
+        .map_err(|e| anyhow::anyhow!("base64 decode error: {}", e))
+}
+
+/// Parse certificate expiry from a blob (key_pem + cert chain).
+fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
+    let der = decode_leaf_cert_from_blob(blob)?;
 
     let (_, cert) = x509_parser::parse_x509_certificate(&der)
         .map_err(|e| anyhow::anyhow!("X509 parse error: {}", e))?;
@@ -1580,16 +1596,7 @@ fn parse_blob_expiry(blob: &str) -> Result<DateTime<Utc>> {
 /// recorded only the filename's domain — operators couldn't tell the
 /// row covered `www.` too.
 fn parse_blob_metadata(blob: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, Vec<String>)> {
-    let cert_block = blob
-        .split("-----BEGIN CERTIFICATE-----")
-        .nth(1)
-        .and_then(|s| s.split("-----END CERTIFICATE-----").next())
-        .ok_or_else(|| anyhow::anyhow!("no certificate block in blob"))?;
-    let der = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        cert_block.trim(),
-    )
-    .map_err(|e| anyhow::anyhow!("base64 decode: {}", e))?;
+    let der = decode_leaf_cert_from_blob(blob)?;
     let (_, cert) = x509_parser::parse_x509_certificate(&der)
         .map_err(|e| anyhow::anyhow!("X509 parse: {}", e))?;
     let not_before =
@@ -2490,6 +2497,359 @@ mod tests {
             expected("https://example/acct/1"),
             expected("https://example/acct/1"),
             "value must be identical for bare and wildcard"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // parse_blob_expiry / parse_blob_metadata — regression coverage for
+    // the "Invalid symbol 10, offset 64" bug that hit sh-ali in June
+    // 2026 (issue: every renewal-loop tick decided the on-disk cert was
+    // "unreadable" because the base64 decoder rejected PEM's 64-char
+    // line-wrapping newlines, then drove the loop into Let's Encrypt's
+    // 5-per-168h rate limit). The fix strips all whitespace from the
+    // extracted cert block before passing it to the base64 decoder.
+    // ──────────────────────────────────────────────────────────────────
+
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use openssl::x509::{X509Builder, X509NameBuilder};
+
+    /// Build a self-signed cert with the given SAN list and `notAfter`
+    /// `days_from_now` days in the future, then return the cert PEM and
+    /// key PEM separately so each test can compose its own blob.
+    /// Pass `include_san = false` to test the CN-fallback path in
+    /// `parse_blob_metadata` (the runtime parser falls back to CN when
+    /// the leaf has no SubjectAltName extension).
+    fn build_test_cert(sans: &[&str], days_from_now: u32, include_san: bool) -> (String, String) {
+        let group = openssl::ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let ec_key = openssl::ec::EcKey::generate(&group).unwrap();
+        // Capture the PEM *before* moving `ec_key` into the PKey,
+        // matching the production pattern in `AcmeClient::generate_csr`.
+        let key_pem = String::from_utf8(ec_key.private_key_to_pem().unwrap()).unwrap();
+        let key = PKey::from_ec_key(ec_key).unwrap();
+
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", sans[0]).unwrap();
+        let name = name.build();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        let serial = openssl::bn::BigNum::from_u32(1).unwrap();
+        builder
+            .set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        let now = Asn1Time::days_from_now(0).unwrap();
+        let then = Asn1Time::days_from_now(days_from_now).unwrap();
+        builder.set_not_before(&now).unwrap();
+        builder.set_not_after(&then).unwrap();
+
+        if include_san {
+            let mut san = SubjectAlternativeName::new();
+            for d in sans {
+                san.dns(d);
+            }
+            let ctx = builder.x509v3_context(None, None);
+            builder.append_extension(san.build(&ctx).unwrap()).unwrap();
+        }
+
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+        (
+            String::from_utf8(cert.to_pem().unwrap()).unwrap(),
+            key_pem,
+        )
+    }
+
+    /// Regression test for the sh-ali bug. Before the fix
+    /// `parse_blob_expiry` failed with `Invalid symbol 10, offset 64`
+    /// because `base64::engine::general_purpose::STANDARD` rejects the
+    /// internal newlines that PEM uses for 64-char line wrapping.
+    /// After the fix it must return a valid expiry close to the cert's
+    /// configured `notAfter`.
+    #[test]
+    fn parse_blob_expiry_decodes_real_pem_with_line_wrapping() {
+        let (cert_pem, key_pem) = build_test_cert(&["example.com"], 90, true);
+        // Sanity: openssl writes 64-char wrapped PEM, so this blob
+        // has internal newlines between base64 lines — the exact
+        // shape that triggered the production bug. Pin that at
+        // least one base64 line is exactly 64 chars; that is the
+        // shape that the OLD parser rejected with "Invalid symbol
+        // 10, offset 64".
+        assert!(
+            cert_pem.lines().any(|l| l.len() == 64),
+            "openssl's PEM output must include 64-char base64 lines"
+        );
+
+        let blob = build_blob(&key_pem, &cert_pem);
+        let expiry = parse_blob_expiry(&blob).expect("must parse real PEM cert");
+
+        // Should be roughly 90 days from now (well clear of the 30d
+        // renewal threshold on sh-ali, which is what makes the bug
+        // harmful: every tick the loop saw "unreadable" and reissued).
+        let now = Utc::now();
+        let delta = (expiry - now).num_days();
+        assert!(
+            (89..=91).contains(&delta),
+            "expected ~90d expiry, got {delta}d"
+        );
+    }
+
+    /// The cert chain LE returns is leaf first, then intermediates,
+    /// then optionally the root. The parser must always pick the leaf
+    /// (first BEGIN CERTIFICATE block), never an intermediate whose
+    /// `notAfter` might be years further out and would make the
+    /// renewal loop falsely skip issuance.
+    #[test]
+    fn parse_blob_expiry_picks_leaf_not_intermediate() {
+        // Build a 90d leaf and a 3650d (10y) intermediate, then chain
+        // them. If the parser ever picked the intermediate the expiry
+        // would jump ~9 years instead of staying ~90 days.
+        let (leaf_pem, leaf_key) = build_test_cert(&["example.com"], 90, true);
+        let (intermediate_pem, _) = build_test_cert(&["Example Intermediate CA"], 3650, true);
+        let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
+
+        let blob = build_blob(&leaf_key, &chain);
+        let expiry = parse_blob_expiry(&blob).expect("must parse leaf despite longer-lived intermediate in chain");
+
+        let now = Utc::now();
+        let delta = (expiry - now).num_days();
+        assert!(
+            (89..=91).contains(&delta),
+            "parser picked the intermediate (delta={delta}d) instead of the leaf"
+        );
+    }
+
+    /// parse_blob_metadata must extract SANs from the leaf, not the
+    /// chain subject. Multi-SAN is the real-world case (LE returns a
+    /// single cert covering `example.com` + `www.example.com`), and
+    /// wildcard SANs are the v2 ACME feature flag case.
+    #[test]
+    fn parse_blob_metadata_extracts_leaf_sans_multi_and_wildcard() {
+        let (leaf_pem, leaf_key) =
+            build_test_cert(&["example.com", "www.example.com", "*.example.com"], 90, true);
+        let (intermediate_pem, _) = build_test_cert(&["Example CA"], 3650, true);
+        let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
+        let blob = build_blob(&leaf_key, &chain);
+
+        let (_not_before, _not_after, sans) =
+            parse_blob_metadata(&blob).expect("must parse multi-SAN leaf with intermediate in chain");
+
+        assert!(sans.contains(&"example.com".to_string()), "sans={sans:?}");
+        assert!(sans.contains(&"www.example.com".to_string()), "sans={sans:?}");
+        assert!(sans.contains(&"*.example.com".to_string()), "sans={sans:?}");
+        // Intermediate CN must NOT leak into the leaf SAN list.
+        assert!(!sans.iter().any(|s| s.contains("CA")), "intermediate leaked: sans={sans:?}");
+    }
+
+    /// `parse_blob_metadata` reports `notBefore` from the leaf, not
+    /// from some intermediate whose `notBefore` is in the distant past.
+    /// (Catches a class of bug where the parser drifts to the wrong
+    /// block in the chain.)
+    #[test]
+    fn parse_blob_metadata_not_before_comes_from_leaf() {
+        let (leaf_pem, leaf_key) = build_test_cert(&["example.com"], 90, true);
+        let (intermediate_pem, _) = build_test_cert(&["Example CA"], 3650, true);
+        let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
+        let blob = build_blob(&leaf_key, &chain);
+
+        let (not_before, _, _) = parse_blob_metadata(&blob).expect("must parse");
+        let now = Utc::now();
+        // Leaf `notBefore` is set to "now" via `days_from_now(0)`;
+        // intermediate's `notBefore` is also "now" but if the parser
+        // somehow picked the wrong block the assertion still holds
+        // (both are recent). The structural guarantee is covered by
+        // the SAN test above; here we only pin that notBefore is
+        // recent and not e.g. some hardcoded Unix epoch.
+        assert!(
+            (now - not_before).num_seconds().abs() < 60,
+            "leaf not_before should be ~now, got {} (delta={}s)",
+            not_before,
+            (now - not_before).num_seconds()
+        );
+    }
+
+    /// Cert blobs with no intermediate (single-cert, leaf only — what
+    /// some manual operators upload) must still parse. `nth(1)` over
+    /// `split("-----BEGIN CERTIFICATE-----")` must return `Some(…)`,
+    /// not `None`.
+    #[test]
+    fn parse_blob_expiry_handles_leaf_only_no_intermediate() {
+        let (cert_pem, key_pem) = build_test_cert(&["solo.example.com"], 30, true);
+        let blob = build_blob(&key_pem, &cert_pem);
+        let expiry = parse_blob_expiry(&blob).expect("leaf-only blob must parse");
+        let now = Utc::now();
+        assert!((expiry - now).num_days() >= 29, "expected ~30d expiry");
+    }
+
+    /// openssl writes `\n` line endings; some operators / Windows
+    /// tooling produces `\r\n`. The parser must accept both.
+    #[test]
+    fn parse_blob_expiry_accepts_crlf_line_endings() {
+        let (cert_pem, key_pem) = build_test_cert(&["example.com"], 90, true);
+        // Convert every \n to \r\n — openssl never emits \r in the
+        // first place, so this only exercises the parser's tolerance.
+        let blob = build_blob(&key_pem, &cert_pem).replace('\n', "\r\n");
+        let expiry = parse_blob_expiry(&blob).expect("CRLF-wrapped PEM must parse");
+        let now = Utc::now();
+        assert!((expiry - now).num_days() >= 89, "CRLF blob should yield ~90d expiry");
+    }
+
+    /// MIME-style 76-char line wrapping (older / non-openssl tooling).
+    /// The whitespace-strip fix is line-length agnostic so this must
+    /// also pass.
+    #[test]
+    fn parse_blob_expiry_accepts_76_char_line_wrap() {
+        let (cert_pem, key_pem) = build_test_cert(&["example.com"], 90, true);
+        // Re-wrap the base64 portion to 76-char lines (RFC 2045 MIME
+        // canonical), keeping the BEGIN/END markers intact.
+        let mut rewrapped = String::new();
+        for line in cert_pem.lines() {
+            if line.starts_with("-----") {
+                rewrapped.push_str(line);
+                rewrapped.push('\n');
+            } else {
+                // base64 line; chunk to 76 chars
+                for chunk in line.as_bytes().chunks(76) {
+                    rewrapped.push_str(std::str::from_utf8(chunk).unwrap());
+                    rewrapped.push('\n');
+                }
+            }
+        }
+        let blob = build_blob(&key_pem, &rewrapped);
+        let expiry = parse_blob_expiry(&blob).expect("76-char-wrapped PEM must parse");
+        let now = Utc::now();
+        assert!((expiry - now).num_days() >= 89, "76-char wrapped blob should yield ~90d expiry");
+    }
+
+    /// Some operators / proxies inject trailing whitespace or tabs.
+    /// The parser must be tolerant.
+    #[test]
+    fn parse_blob_expiry_accepts_mixed_internal_whitespace() {
+        let (cert_pem, key_pem) = build_test_cert(&["example.com"], 90, true);
+        // Replace a few of the internal newlines with a tab or space
+        // and add a stray trailing space on one line. If the parser
+        // is whitespace-tolerant (it should be after the fix) this
+        // decodes; if it isn't, this is the exact class of input
+        // that would surface in production from a hand-edited blob.
+        let cert = cert_pem
+            .replace("\n", "\t")     // tabs between base64 chunks
+            .replace("\t\t\t", " ")  // a stray space
+            + " ";                   // trailing whitespace
+        let blob = build_blob(&key_pem, &cert);
+        let expiry = parse_blob_expiry(&blob).expect("mixed-whitespace blob must parse");
+        let now = Utc::now();
+        assert!((expiry - now).num_days() >= 89);
+    }
+
+    // ── error-path coverage: the parser must fail loudly on inputs
+    //    the renewal loop / scan would otherwise feed to ACME. ──
+
+    #[test]
+    fn parse_blob_expiry_errors_on_empty_blob() {
+        let err = parse_blob_expiry("").unwrap_err().to_string();
+        assert!(err.contains("no certificate block"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_blob_expiry_errors_on_key_only_blob() {
+        let (_cert_pem, key_pem) = build_test_cert(&["example.com"], 90, true);
+        // Blob with a key but no CERTIFICATE block at all.
+        let blob = build_blob(&key_pem, "");
+        let err = parse_blob_expiry(&blob).unwrap_err().to_string();
+        assert!(err.contains("no certificate block"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_blob_expiry_errors_on_malformed_base64() {
+        // BEGIN/END markers present but the body isn't base64. Before
+        // the fix this would either crash or be misclassified as
+        // "cert unreadable" and reissued; after the fix it must
+        // return a base64 decode error.
+        let bad = "-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----";
+        let blob = build_blob(
+            "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE\n-----END EC PRIVATE KEY-----",
+            bad,
+        );
+        let err = parse_blob_expiry(&blob).unwrap_err().to_string();
+        assert!(
+            err.contains("base64"),
+            "expected base64 decode error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_blob_expiry_errors_on_valid_base64_but_not_a_cert() {
+        // Random base64 that decodes but isn't an X.509 cert.
+        let bogus = "-----BEGIN CERTIFICATE-----\naGVsbG8gd29ybGQ=\n-----END CERTIFICATE-----";
+        let blob = build_blob(
+            "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE\n-----END EC PRIVATE KEY-----",
+            bogus,
+        );
+        let err = parse_blob_expiry(&blob).unwrap_err().to_string();
+        assert!(
+            err.contains("X509 parse"),
+            "expected X509 parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_blob_expiry_handles_blob_with_only_marker_line() {
+        // No actual cert content between the BEGIN/END markers.
+        let empty_cert =
+            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
+        let blob = build_blob(
+            "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE\n-----END EC PRIVATE KEY-----",
+            empty_cert,
+        );
+        let err = parse_blob_expiry(&blob).unwrap_err().to_string();
+        // Must be either a base64 error or an X509 parse error —
+        // what it must NOT do is silently return Ok with garbage.
+        assert!(
+            err.contains("base64") || err.contains("X509 parse"),
+            "expected parse failure, got: {err}"
+        );
+    }
+
+    // ── parse_blob_metadata edge cases ───────────────────────────────
+
+    /// Legacy cert without a SAN extension. The parser falls back to
+    /// the CN (operator-policy choice; documented in the function).
+    /// Without this test the SAN→CN fallback could silently regress
+    /// to an empty Vec, breaking the scan_and_reconcile_blobs path.
+    #[test]
+    fn parse_blob_metadata_falls_back_to_cn_when_no_san() {
+        // Build a cert whose CN is "legacy.example.com" but with no
+        // SAN extension — `include_san: false` skips the SAN extension
+        // emit, exercising the runtime parser's CN fallback path.
+        let (cert_pem, key_pem) =
+            build_test_cert(&["legacy.example.com"], 90, false);
+
+        let blob = build_blob(&key_pem, &cert_pem);
+        let (_, _, sans) = parse_blob_metadata(&blob).expect("CN fallback must succeed");
+        assert_eq!(sans, vec!["legacy.example.com".to_string()], "got: {sans:?}");
+    }
+
+    /// parse_blob_metadata and parse_blob_expiry must agree on which
+    /// block is the leaf. If they ever diverge the renewal loop would
+    /// make decisions based on a different cert than the one shown
+    /// on the dashboard.
+    #[test]
+    fn parse_blob_metadata_and_expiry_agree_on_leaf() {
+        let (leaf_pem, leaf_key) = build_test_cert(&["example.com"], 90, true);
+        let (intermediate_pem, _) = build_test_cert(&["Example CA"], 3650, true);
+        let chain = format!("{}\n{}", leaf_pem.trim_end(), intermediate_pem.trim_end());
+        let blob = build_blob(&leaf_key, &chain);
+
+        let expiry_from_expiry_fn = parse_blob_expiry(&blob).expect("expiry");
+        let (_, expiry_from_meta_fn, _) = parse_blob_metadata(&blob).expect("metadata");
+        assert_eq!(
+            expiry_from_expiry_fn, expiry_from_meta_fn,
+            "the two parsers must agree on which cert block is the leaf"
         );
     }
 }
