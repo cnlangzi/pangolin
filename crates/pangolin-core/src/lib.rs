@@ -40,8 +40,8 @@ pub use parse::{
     is_valid_tun_name, matches_tun_name_charset, parse_backend,
 };
 pub use proxy::{
-    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, parse_backend_to_target,
-    serve_file_target,
+    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
+    apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
 pub use tunnel::{TunnelRole, YamuxTunnel, parse_http_request_bytes};
 pub use types::{

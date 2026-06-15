@@ -192,7 +192,6 @@ fn parse_authority(s: &str) -> Option<(&str, u16)> {
 ///      `X-Forwarded-*` are *not* added (preserves the historical
 ///      behaviour of the gateway, matches nginx defaults when no
 ///      `proxy_set_header` is set).
-///
 /// Caller is responsible for constructing `request.target` (the
 /// path-prefix concat happens before this is called) and for
 /// attaching the right `BackendTarget` to the chosen transport.
@@ -200,7 +199,22 @@ pub fn apply_proxy_policy(request: &mut HttpRequest, ctx: &ProxyCtx) {
     // 1. Hop-by-hop
     strip_hop_by_hop_headers(&mut request.headers);
 
-    // 2. Host rewrite per host_mode. `Passthrough` is a no-op for
+    // 2-3. Host rewrite and X-Forwarded-*
+    apply_host_and_forwarded_headers(request, ctx);
+}
+
+/// Apply only Host rewrite and X-Forwarded-* headers, without
+/// stripping hop-by-hop headers. Used by ngx direct proxy path
+/// where pingora handles hop-by-hop headers automatically.
+pub fn apply_proxy_policy_without_hop_by_hop_stripping(
+    request: &mut HttpRequest,
+    ctx: &ProxyCtx,
+) {
+    apply_host_and_forwarded_headers(request, ctx);
+}
+
+fn apply_host_and_forwarded_headers(request: &mut HttpRequest, ctx: &ProxyCtx) {
+    // 1. Host rewrite per host_mode. `Passthrough` is a no-op for
     // Host (we leave whatever the client sent — the executor
     // doesn't need to know about the rewrite in that case).
     // `Backend` and `Custom` set the Host to a deterministic
@@ -231,7 +245,7 @@ pub fn apply_proxy_policy(request: &mut HttpRequest, ctx: &ProxyCtx) {
         }
     }
 
-    // 3. X-Forwarded-* added whenever host_mode != Passthrough.
+    // 2. X-Forwarded-* added whenever host_mode != Passthrough.
     if ctx.host_mode != HostMode::Passthrough {
         if !ctx.original_host.is_empty() {
             upsert_header(&mut request.headers, "X-Forwarded-Host", &ctx.original_host);
