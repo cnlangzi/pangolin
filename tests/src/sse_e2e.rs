@@ -321,34 +321,46 @@ async fn real_e2e_tunnel_sse_streams_through() {
 /// **SSE through a tunnel where the backend URL contains a hostname**
 /// (not a bare IP address).
 ///
-/// ## Regression test for `SocketAddr::parse()` bug
+/// ## Regression test for two related DNS-resolution bugs
 ///
-/// Pre-fix, `handle_streaming_response` in `crates/tun/src/client.rs`
-/// used `SocketAddr::parse()` to convert the backend authority string
-/// to a `SocketAddr`.  `SocketAddr::parse()` is purely syntactic and
-/// only accepts numeric IP:PORT strings such as `127.0.0.1:9020`.
-/// When the backend URL contained a hostname (e.g. `localhost:PORT` or
-/// `myserver.internal:8080`) the parse returned an error and the
-/// function immediately sent a 502 back into the yamux stream,
-/// without ever connecting to the backend.
+/// `handle_streaming_response` (and its sibling `handle_ws_upgrade`)
+/// in `crates/tun/src/client.rs` need to dial the backend by
+/// authority string. The historical bugs and the corresponding
+/// fixes are:
 ///
-/// This caused a protocol de-synchronisation: ngx was trying to read
-/// an HTTP response head from the yamux stream, but the tun had already
-/// written the synth-502 body bytes into it, so ngx saw an
-/// `UnexpectedEof` / "connection reset" and surfaced a 502 Bad Gateway
-/// to the end client.
+/// 1. **`SocketAddr::parse()` (syntactic-only)** — the original
+///    code did `authority.parse::<SocketAddr>()`, which only
+///    accepts numeric `IP:PORT` strings. A hostname like
+///    `localhost:8888` or `xiajie.internal:8080` failed
+///    immediately, the tun sent a synth-502 into the yamux
+///    stream, and ngx surfaced a 502 Bad Gateway to the client.
+///    Fix: replace with `tokio::net::lookup_host(authority)`,
+///    which performs a real DNS lookup. The same fix is now in
+///    `handle_ws_upgrade`.
 ///
-/// The fix replaces `SocketAddr::parse()` with
-/// `tokio::net::lookup_host()`, which performs a real DNS lookup before
-/// connecting.  The same fix was applied to `handle_ws_upgrade`.
+/// 2. **First-result-only resolver (OS-dependent ordering)** —
+///    even after switching to `lookup_host`, the code took only
+///    the *first* address returned. `lookup_host` ordering is
+///    OS-dependent: macOS returns v4 first for `localhost`, but
+///    Linux `/etc/hosts` typically lists `::1 localhost` *before*
+///    `127.0.0.1 localhost`, so on Linux the first result is
+///    v6. A backend that only listens on v4 (the common case
+///    — our `SseBackend` binds to `127.0.0.1:0`) would refuse
+///    the v6 connect, the tun returned `Err` and dropped the
+///    yamux stream, and ngx saw a 502 with "connection reset"
+///    in the log. The CI Linux runner ("Pebble") caught this
+///    flakey behavior; macOS local runs were unaffected. Fix:
+///    iterate the full set of addresses returned by
+///    `lookup_host` and connect to the first one that succeeds.
 ///
-/// ## What this test does
+/// ## What this test exercises
 ///
-/// Seeds the site backend as `sse-hostname-tun:http://localhost:<port>`
-/// (hostname, not `127.0.0.1:<port>`).  The mock SSE backend listens
-/// on `127.0.0.1:<port>`.  On a post-fix binary, `tokio::net::lookup_host`
-/// resolves `localhost` → `127.0.0.1` and the SSE stream flows through.
-/// On a pre-fix binary, the parse would fail immediately with a 502.
+/// Seeds the site backend as `sse-hostname:http://localhost:<port>`
+/// (hostname, not `127.0.0.1:<port>`). On a post-fix binary
+/// the resolver finds `127.0.0.1` and the SSE stream flows
+/// through. The test passes on every platform because
+/// `handle_streaming_response` now falls through to whichever
+/// address family is reachable.
 #[tokio::test]
 async fn real_e2e_tunnel_sse_hostname_backend() {
     // Start a mock SSE backend on a random port.

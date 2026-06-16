@@ -365,8 +365,16 @@ where
         }
     };
 
-    let backend_addr: std::net::SocketAddr = match authority.parse() {
-        Ok(a) => a,
+    // Resolve the backend address. The authority may be a
+    // hostname (e.g. "xiajie:8888") rather than a bare IP:port;
+    // we use tokio's async DNS resolver. Try **every** address
+    // returned by the resolver — see the matching comment in
+    // `handle_streaming_response` for why (the first DNS result
+    // is often v6 on Linux, where the backend only listens on
+    // v4, and a single-address resolver turns that into a
+    // "connection refused → connection reset" path).
+    let addrs = match tokio::net::lookup_host(authority).await {
+        Ok(addrs) => addrs,
         Err(e) => {
             let resp_bytes = synth_502_bytes(&format!("bad backend addr: {e}"));
             stream.write_all(&resp_bytes).await?;
@@ -374,10 +382,42 @@ where
             return Ok(());
         }
     };
+    let mut backend = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                backend = Some(stream);
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    "tun {} ws relay connect to {} failed: {} — trying next address",
+                    name, addr, e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut backend = match backend {
+        Some(s) => s,
+        None => {
+            let resp_bytes = synth_502_bytes(&format!(
+                "no reachable address for {authority}: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no addresses".into())
+            ));
+            stream.write_all(&resp_bytes).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
 
+    let backend_addr = backend
+        .peer_addr()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     info!("tun {} ws relay to {} path={}", name, backend_addr, path);
-
-    let mut backend = TcpStream::connect(backend_addr).await?;
 
     // Mirror the HTTP path's Host header logic: apply_proxy_policy
     // handles Passthrough and Custom modes. For Backend mode, we
@@ -468,16 +508,20 @@ where
     // may be a hostname (e.g. "xiajie:8888") rather than a bare
     // IP:port, so we use tokio's async DNS resolver instead of
     // SocketAddr::parse(), which only handles numeric addresses.
-    let backend_addr = match tokio::net::lookup_host(authority).await {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => a,
-            None => {
-                let resp_bytes = synth_502_bytes(&format!("no DNS result for {authority}"));
-                stream.write_all(&resp_bytes).await?;
-                stream.flush().await?;
-                return Ok(());
-            }
-        },
+    //
+    // We try **every** address returned by the resolver, not just
+    // the first: `lookup_host` ordering is OS-dependent (Linux
+    // `/etc/hosts` typically lists `::1` before `127.0.0.1`, so
+    // `localhost` resolves to v6 first on Linux and v4 first on
+    // macOS), and a back-half of the connection failure modes are
+    // "wrong address family" — the backend only listens on v4, but
+    // the resolver hands us v6 first. Taking the first result
+    // gives a flakey "connection reset" path on the wrong-family
+    // case; iterating the full set and stopping at the first
+    // successful `TcpStream::connect` makes the lookup robust
+    // across OSes and dual-homed backends.
+    let addrs = match tokio::net::lookup_host(authority).await {
+        Ok(addrs) => addrs,
         Err(e) => {
             let resp_bytes = synth_502_bytes(&format!("DNS lookup failed for {authority}: {e}"));
             stream.write_all(&resp_bytes).await?;
@@ -485,10 +529,44 @@ where
             return Ok(());
         }
     };
+    let mut backend = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                backend = Some(stream);
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    "tun {} streaming connect to {} failed: {} — trying next address",
+                    name, addr, e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut backend = match backend {
+        Some(s) => s,
+        None => {
+            let resp_bytes = synth_502_bytes(&format!(
+                "no reachable address for {authority}: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no addresses".into())
+            ));
+            stream.write_all(&resp_bytes).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
 
+    let backend_addr = backend.peer_addr().unwrap_or_else(|_| {
+        // Fall back to a representative address for the log
+        // line; we don't need the exact one for diagnostics.
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+    });
     info!("tun {} streaming to {} path={}", name, backend_addr, path);
-
-    let mut backend = TcpStream::connect(backend_addr).await?;
 
     // Host header per host_mode (same logic as the HTTP and WS paths).
     let host_hdr = match host_mode {
