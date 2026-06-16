@@ -587,6 +587,145 @@ async fn sites_create_full_ui_flow_unique_names() {
     assert!(list.contains("flow-b"), "flow-b should be in list");
 }
 
+// ── §15.5 — Sites list mobile card structure (issue #72) ────────────────────
+//
+// Regression guard for the unbalanced `</div>` that lived inside the
+// `block md:hidden` mobile card template. With N>1 sites, the previous bug
+// caused the mobile block wrapper to close early, leaking sibling cards out
+// of the `overflow-x-auto` container and breaking the table layout below
+// 768px viewports.
+//
+// We assert structural invariants on the rendered HTML using scraper:
+//   - the mobile block wrapper exists and contains exactly N site cards
+//   - each card wraps all four sections (header, on/off badge, backend, actions)
+//   - per-card granularity catches a future refactor that moves the on/off
+//     badge out of the card wrapper (a body-wide card count would miss it)
+
+#[tokio::test]
+async fn sites_list_mobile_cards_well_formed() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create 3 sites so the regression (visible only with N>1) would manifest.
+    for site_name in &["mobile-a", "mobile-b", "mobile-c"] {
+        let form = client
+            .get("/sites/new")
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let csrf = client.csrf_token(&form).unwrap_or_default();
+        let resp = client
+            .post_form(
+                "/sites/new",
+                &[
+                    ("backend", "http://127.0.0.1:8080"),
+                    ("name", site_name),
+                    ("_csrf", &csrf),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "create '{}' should redirect, got {}",
+            site_name,
+            resp.status()
+        );
+    }
+
+    let body = client.get("/sites").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
+
+    // The mobile block wrapper is the only element on this page carrying
+    // `md:hidden` (desktop table uses `hidden md:table`, the inverse). A
+    // class-substring match avoids the CSS3 colon-escape ambiguity.
+    let mobile_sel = Selector::parse(r#"div[class*="md:hidden"]"#).unwrap();
+    let card_sel = Selector::parse("div.p-4").unwrap();
+    // The on/off badge: green when enabled, slate when disabled. We restrict
+    // to <span> so the backend <code> block (also bg-slate-100) is excluded.
+    let badge_sel = Selector::parse("span.bg-green-100, span.bg-slate-100").unwrap();
+    let code_sel = Selector::parse("code").unwrap();
+    let edit_sel = Selector::parse(r#"a[href^="/sites/edit"]"#).unwrap();
+    let delete_sel = Selector::parse(r#"button[hx-delete^="/api/sites/"]"#).unwrap();
+    // The outer scroll container wrapping both the desktop table and the
+    // mobile block. Asserted separately to catch a regression where the
+    // mobile wrapper leaks out of the overflow-x-auto container.
+    let overflow_sel = Selector::parse("div.overflow-x-auto").unwrap();
+
+    let mobile_block = doc
+        .select(&mobile_sel)
+        .next()
+        .expect("mobile block wrapper should be present");
+
+    let overflow = doc
+        .select(&overflow_sel)
+        .next()
+        .expect("overflow-x-auto container should be present");
+
+    // The mobile block must be nested inside the overflow-x-auto container —
+    // not a sibling. A sibling relationship would mean the wrapper leaked
+    // out of the scroll container (a higher-level regression of #72 where
+    // a stray </div> lifts the mobile block out of its parent).
+    assert!(
+        overflow
+            .select(&Selector::parse(r#"div[class*="md:hidden"]"#).unwrap())
+            .next()
+            .is_some(),
+        "mobile block should be nested inside the overflow-x-auto container, \
+         not a sibling — a regression of the #72 wrapper-leak bug"
+    );
+
+    let cards: Vec<_> = mobile_block.select(&card_sel).collect();
+    assert_eq!(
+        cards.len(),
+        3,
+        "expected 3 mobile cards inside the mobile block, found {} — \
+         this usually means a stray </div> closed the wrapper early",
+        cards.len()
+    );
+
+    // Per-card granularity catches a future refactor that accidentally moves
+    // the on/off badge out of the card wrapper — which a body-wide card
+    // count would not detect.
+    let names = ["mobile-a", "mobile-b", "mobile-c"];
+    for (i, card) in cards.iter().enumerate() {
+        let card_text: String = card.text().collect();
+        assert!(
+            card_text.contains(names[i]),
+            "card {} should contain site name '{}', got text: {:?}",
+            i,
+            names[i],
+            card_text
+        );
+        assert!(
+            card.select(&badge_sel).next().is_some(),
+            "card {} should contain the on/off badge inside it",
+            i
+        );
+        assert!(
+            card.select(&code_sel).next().is_some(),
+            "card {} should contain the backend <code> block",
+            i
+        );
+        assert_eq!(
+            card.select(&edit_sel).count(),
+            1,
+            "card {} should contain exactly one Edit link",
+            i
+        );
+        assert_eq!(
+            card.select(&delete_sel).count(),
+            1,
+            "card {} should contain exactly one Delete button",
+            i
+        );
+    }
+}
+
 // ── §16-19 — Domains full cycle ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -3672,3 +3811,5 @@ async fn dns_hx_delete_no_csrf_forbidden() {
         resp.status()
     );
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
