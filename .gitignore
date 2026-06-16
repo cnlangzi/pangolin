@@ -14,10 +14,16 @@ Cargo.lock.bak
 /assets/static/*.css
 /assets/static/*.js
 
-# Standalone Tailwind + esbuild binaries and generated bundles
+# Standalone Tailwind + esbuild binaries, and generated admin-UI bundles.
+# The bundle files are produced by `make build-ui` (or any release build,
+# since `build-ngx: build-ui` chains them) from `tailwindcss.css` and
+# `app.js` in the same directory. They MUST exist on disk at compile
+# time — `rust-embed` snapshots `crates/admin/templates/public/` into
+# the binary — but are regenerated deterministically from sources, so
+# we don't track the artifacts.
 /bin/
-/assets/app.css
-/assets/app.min.js
+/crates/admin/templates/public/app.css
+/crates/admin/templates/public/app.min.js
 
 # Generated certs (test or runtime)
 /certs
