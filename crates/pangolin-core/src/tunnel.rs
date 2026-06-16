@@ -309,7 +309,17 @@ async fn session_driver(
                     //
                     // Pending acceptors are drained with EOF below the
                     // loop, so they don't hang.
-                    Some(Err(_e)) => break,
+                    Some(Err(e)) => {
+                        // Surface the error at debug so operators can
+                        // distinguish a clean peer disconnect (the
+                        // `None` arm above) from a real session-level
+                        // fatal — keepalive timeout (the half-open
+                        // case the issue is fixing), transport I/O
+                        // error, or go-away. Without this, every
+                        // session end looks identical in the logs.
+                        debug!("tunnel: session ended with error: {e}");
+                        break;
+                    }
                     None => break,
                 }
             }
@@ -1464,6 +1474,48 @@ mod tests {
     // -------------------------------------------------------------------
     use tokio::io::DuplexStream;
 
+    /// Build a `YamuxTunnel` over an in-memory `tokio::io::duplex`
+    /// pair, spawn a peer task that just reads forever, and
+    /// block until the driver is plausibly in its `select!` loop.
+    ///
+    /// The returned `peer_handle` is the only thing keeping the
+    /// peer half of the duplex open. Aborting it (or letting it
+    /// drop) closes the peer's end of the pipe, which surfaces
+    /// to `ws_bridge` as an EOF and from there to `session_driver`
+    /// as `session.next() -> None` (clean disconnect path).
+    ///
+    /// The 50ms sleep is a soft synchronization point: with
+    /// tokio's current_thread test runtime the bridge task is
+    /// spawned and polled during the sleep, so by the time this
+    /// returns the driver has almost certainly entered its loop.
+    /// A future tightening could replace the sleep with an
+    /// explicit readiness signal from the driver, at the cost
+    /// of a new public test API on `YamuxTunnel`.
+    async fn make_test_tunnel() -> (YamuxTunnel, tokio::task::JoinHandle<()>) {
+        let (peer, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = fastwebsockets::WebSocket::after_handshake(server_io, WsRole::Server);
+        let tunnel = tunnel_over_websocket(server_ws, TunnelRole::Server);
+
+        let peer_handle = tokio::spawn(async move {
+            let mut peer: DuplexStream = peer;
+            let mut buf = [0u8; 1024];
+            while peer.read(&mut buf).await.is_ok() {}
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        (tunnel, peer_handle)
+    }
+
+    /// Simulate a clean peer-side disconnect: abort the peer
+    /// task (drops `peer` at the await point) and wait for the
+    /// JoinHandle to finalise. Mirrors what `kill -9` does to a
+    /// real tun process — the OS reaps the fd, no FIN/RST.
+    async fn drop_peer(peer_handle: tokio::task::JoinHandle<()>) {
+        peer_handle.abort();
+        let _ = peer_handle.await;
+    }
+
     /// A clean remote-side close (the peer drops its WS) must reach
     /// `session_end` on this side. Without the fix, the WS-bridge
     /// EOF path was already correct; this test guards against
@@ -1471,12 +1523,7 @@ mod tests {
     /// case.
     #[tokio::test]
     async fn session_end_fires_when_peer_closes_ws() {
-        // Two halves of one in-memory pipe. The server-side gets
-        // half B; the "peer" half (A) simulates the tun client.
-        let (peer, server_io) = tokio::io::duplex(64 * 1024);
-
-        let server_ws = fastwebsockets::WebSocket::after_handshake(server_io, WsRole::Server);
-        let tunnel = tunnel_over_websocket(server_ws, TunnelRole::Server);
+        let (tunnel, peer_handle) = make_test_tunnel().await;
 
         // Register a waiter on session_end **before** triggering
         // the disconnect. tokio::sync::Notify::notify_waiters
@@ -1490,30 +1537,8 @@ mod tests {
         let end = tunnel.session_end.clone();
         let waiter = tokio::spawn(async move { end.notified().await });
 
-        // Give the driver a moment to spawn and enter its loop.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop_peer(peer_handle).await;
 
-        // Spawn the peer in a task we can abort; JoinHandle::drop
-        // does NOT cancel the task, so we keep the handle alive.
-        let peer_handle = tokio::spawn(async move {
-            let mut peer: DuplexStream = peer;
-            let mut buf = [0u8; 1024];
-            loop {
-                match peer.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            }
-        });
-
-        // Simulate kill -9: abort the peer task so its future
-        // (which holds `peer`) is dropped at the await point.
-        peer_handle.abort();
-        let _ = peer_handle.await;
-
-        // The waiter must resolve. Bound the wait so a
-        // regression produces a real test failure rather than a
-        // hung test.
         match tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await {
             Ok(Ok(())) => {} // good — session_end fired
             Ok(Err(e)) => panic!("session_end waiter join errored: {e}"),
@@ -1532,19 +1557,9 @@ mod tests {
     /// returns.
     #[tokio::test]
     async fn open_stream_after_session_end_fails_cleanly() {
-        let (peer, server_io) = tokio::io::duplex(64 * 1024);
-        let server_ws = fastwebsockets::WebSocket::after_handshake(server_io, WsRole::Server);
-        let tunnel = tunnel_over_websocket(server_ws, TunnelRole::Server);
+        let (tunnel, peer_handle) = make_test_tunnel().await;
 
-        let peer_handle = tokio::spawn(async move {
-            let mut peer: DuplexStream = peer;
-            let mut buf = [0u8; 1024];
-            while peer.read(&mut buf).await.is_ok() {}
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        peer_handle.abort();
-        let _ = peer_handle.await;
+        drop_peer(peer_handle).await;
 
         let end = tunnel.session_end.clone();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), end.notified()).await;
@@ -1594,17 +1609,11 @@ mod tests {
     /// of scope for #68.
     #[tokio::test]
     async fn accept_stream_does_not_hang_on_peer_disconnect() {
-        let (peer, server_io) = tokio::io::duplex(64 * 1024);
-        let server_ws = fastwebsockets::WebSocket::after_handshake(server_io, WsRole::Server);
-        let tunnel = tunnel_over_websocket(server_ws, TunnelRole::Server);
+        let (tunnel, peer_handle) = make_test_tunnel().await;
 
         // --- Case (a): queue an accept BEFORE the disconnect. ---
         let tunnel_for_accept = tunnel.clone();
         let queued = tokio::spawn(async move { tunnel_for_accept.accept_stream().await });
-
-        // Give the driver time to enter its select! loop and
-        // move the accept_rx message into pending_accepts.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Register a session_end waiter BEFORE the peer drops.
         // tokio::sync::Notify::notify_waiters only wakes already-
@@ -1615,15 +1624,7 @@ mod tests {
         let end = tunnel.session_end.clone();
         let end_waiter = tokio::spawn(async move { end.notified().await });
 
-        // Drop the peer. ws_bridge EOFs; the bridge task's
-        // select! cancels the driver; session_end fires.
-        let peer_handle = tokio::spawn(async move {
-            let mut peer: DuplexStream = peer;
-            let mut buf = [0u8; 1024];
-            while peer.read(&mut buf).await.is_ok() {}
-        });
-        peer_handle.abort();
-        let _ = peer_handle.await;
+        drop_peer(peer_handle).await;
 
         // Sanity: session_end must fire within a few seconds.
         tokio::time::timeout(std::time::Duration::from_secs(5), end_waiter)
