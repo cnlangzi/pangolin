@@ -587,6 +587,109 @@ async fn sites_create_full_ui_flow_unique_names() {
     assert!(list.contains("flow-b"), "flow-b should be in list");
 }
 
+// ── §15.5 — Sites list mobile card structure (issue #72) ────────────────────
+//
+// Regression guard for the unbalanced `</div>` that lived inside the
+// `block md:hidden` mobile card template. With N>1 sites, the previous bug
+// caused the mobile block wrapper to close early, leaking sibling cards out
+// of the `overflow-x-auto` container and breaking the table layout below
+// 768px viewports.
+//
+// We assert structural invariants on the rendered HTML:
+//   - the mobile block wrapper exists and contains exactly N site cards
+//   - each card wraps all four sections (header, on/off badge, backend, actions)
+//   - the mobile block closes before the outer overflow container closes
+
+#[tokio::test]
+async fn sites_list_mobile_cards_well_formed() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create 3 sites so the regression (visible only with N>1) would manifest.
+    for site_name in &["mobile-a", "mobile-b", "mobile-c"] {
+        let form = client
+            .get("/sites/new")
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let csrf = client.csrf_token(&form).unwrap_or_default();
+        let resp = client
+            .post_form(
+                "/sites/new",
+                &[
+                    ("backend", "http://127.0.0.1:8080"),
+                    ("name", site_name),
+                    ("_csrf", &csrf),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "create '{}' should redirect, got {}",
+            site_name,
+            resp.status()
+        );
+    }
+
+    let body = client.get("/sites").await.unwrap().text().await.unwrap();
+
+    // Locate the mobile block wrapper.
+    let mobile_open = body
+        .find(r#"<div class="block md:hidden divide-y"#)
+        .expect("mobile block wrapper should be present");
+
+    // Walk forward from the mobile open, tracking <div / </div> depth, to
+    // find the matching `</div>` that closes the wrapper. A naive
+    // `body[mobile_open..].rfind("</div>")` would extend the slice all the
+    // way to the end of the document and hide the very bug we're guarding
+    // against (a stray `</div>` inside the for loop that closes the wrapper
+    // one iteration too early, leaving the rest of the cards as siblings of
+    // the overflow-x-auto container).
+    let mobile_close = find_matching_div_close(&body, mobile_open)
+        .expect("mobile block wrapper should have a matching </div>");
+    let mobile_block = &body[mobile_open..mobile_close + "</div>".len()];
+
+    // The mobile block must contain one `<div class="p-4">` per site — not
+    // zero (cards leaked out) and not double-counted (extra wrapper
+    // accidentally nesting).
+    let card_count = mobile_block.matches(r#"<div class="p-4">"#).count();
+    assert_eq!(
+        card_count, 3,
+        "expected 3 mobile cards inside the mobile block, found {} — this usually means a stray </div> closed the wrapper early",
+        card_count
+    );
+
+    // Each card name must appear inside the mobile block (not after it).
+    for site_name in &["mobile-a", "mobile-b", "mobile-c"] {
+        assert!(
+            mobile_block.contains(site_name),
+            "site '{}' should be rendered inside the mobile block",
+            site_name
+        );
+    }
+
+    // Each card should contain the action buttons (Edit / Delete) and a
+    // backend `<code>` block — proves the card structure stayed intact.
+    let edit_count = mobile_block.matches(">Edit</a>").count();
+    let delete_count = mobile_block.matches(">Delete</button>").count();
+    // Use the `max-w-full` class (unique to the mobile backend code element;
+    // the desktop table uses a different class) to count mobile backends only.
+    let backend_count = mobile_block
+        .matches(r#"<code class="block truncate max-w-full"#)
+        .count();
+    assert_eq!(edit_count, 3, "expected 3 Edit links in mobile block");
+    assert_eq!(delete_count, 3, "expected 3 Delete buttons in mobile block");
+    assert_eq!(
+        backend_count, 3,
+        "expected 3 backend <code> blocks in mobile block"
+    );
+}
+
 // ── §16-19 — Domains full cycle ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -3460,4 +3563,51 @@ async fn dns_hx_delete_no_csrf_forbidden() {
         "DELETE /api/dns/{{name}} without CSRF should be forbidden, got {}",
         resp.status()
     );
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Walk forward from `open_pos` (which must point at a `<div` token) and
+/// return the byte offset of the matching `</div>` (the close that brings
+/// the depth back to the level it was at before the open). Used by the
+/// mobile-card structural test to slice out exactly the mobile wrapper
+/// region even when the template contains stray `</div>` tokens.
+fn find_matching_div_close(body: &str, open_pos: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    if open_pos + 4 > bytes.len() || &body[open_pos..open_pos + 4] != "<div" {
+        return None;
+    }
+    // Ensure the tag continues with a non-identifier character (whitespace,
+    // `>`, or `/`) so we don't match `<divider>` or similar.
+    let next = bytes[open_pos + 4];
+    if next.is_ascii_alphanumeric() || next == b'_' {
+        return None;
+    }
+
+    let mut depth: i32 = 1;
+    let mut i = open_pos + 4;
+    while i < bytes.len() {
+        if i + 4 <= bytes.len() && &body[i..i + 4] == "<div" {
+            let after = if i + 4 < bytes.len() {
+                bytes[i + 4]
+            } else {
+                b' '
+            };
+            if !(after.is_ascii_alphanumeric() || after == b'_') {
+                depth += 1;
+                i += 4;
+                continue;
+            }
+        }
+        if i + 6 <= bytes.len() && &body[i..i + 6] == "</div>" {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
