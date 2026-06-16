@@ -651,11 +651,33 @@ async fn sites_list_mobile_cards_well_formed() {
     let code_sel = Selector::parse("code").unwrap();
     let edit_sel = Selector::parse(r#"a[href^="/sites/edit"]"#).unwrap();
     let delete_sel = Selector::parse(r#"button[hx-delete^="/api/sites/"]"#).unwrap();
+    // The outer scroll container wrapping both the desktop table and the
+    // mobile block. Asserted separately to catch a regression where the
+    // mobile wrapper leaks out of the overflow-x-auto container.
+    let overflow_sel = Selector::parse("div.overflow-x-auto").unwrap();
 
     let mobile_block = doc
         .select(&mobile_sel)
         .next()
         .expect("mobile block wrapper should be present");
+
+    let overflow = doc
+        .select(&overflow_sel)
+        .next()
+        .expect("overflow-x-auto container should be present");
+
+    // The mobile block must be nested inside the overflow-x-auto container —
+    // not a sibling. A sibling relationship would mean the wrapper leaked
+    // out of the scroll container (a higher-level regression of #72 where
+    // a stray </div> lifts the mobile block out of its parent).
+    assert!(
+        overflow
+            .select(&Selector::parse(r#"div[class*="md:hidden"]"#).unwrap())
+            .next()
+            .is_some(),
+        "mobile block should be nested inside the overflow-x-auto container, \
+         not a sibling — a regression of the #72 wrapper-leak bug"
+    );
 
     let cards: Vec<_> = mobile_block.select(&card_sel).collect();
     assert_eq!(
