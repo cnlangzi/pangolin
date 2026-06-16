@@ -48,8 +48,8 @@ pub use tunnel::{
     TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,
 };
 pub use types::{
-    BackendKind, Cert, CertErrorClass, CertStatus, ChallengeType, DnsProvider, DnsProviderKind,
-    Domain, HostMode, Site, Tun, next_backoff,
+    BackendKind, Cert, CertErrorClass, CertStatus, ChallengeKind, ChallengeType, DnsProvider,
+    DnsProviderKind, Domain, HostMode, Site, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

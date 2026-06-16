@@ -241,6 +241,7 @@ async fn upstream_host_header() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -312,6 +313,7 @@ async fn upstream_host_header_with_port() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));

@@ -502,6 +502,7 @@ async fn e2e_direct_http_get() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -562,6 +563,7 @@ async fn e2e_direct_http_404() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -610,6 +612,7 @@ async fn e2e_direct_http_post() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -670,6 +673,7 @@ async fn e2e_direct_static_file() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));
@@ -718,6 +722,7 @@ async fn e2e_direct_static_file_not_found() {
         enabled: true,
         auto_issue: false,
         dns_provider: None,
+        challenge_kind: None,
         created_at: chrono::Utc::now(),
     };
     let indexes = Arc::new(make_indexes(vec![site], vec![domain]));

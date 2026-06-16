@@ -54,6 +54,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         edit_domain: None,
         current_auto_issue: false,
         enabled_checked: true,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();
@@ -101,6 +102,13 @@ pub async fn render_edit_page(
         edit_domain: Some(existing.domain.clone()),
         current_auto_issue: existing.auto_issue,
         enabled_checked: existing.enabled,
+        // Pre-fill the dropdown from the row's stored kind (issue #55)
+        // so the operator sees the persisted value, not a hardcoded
+        // "Auto". Mirrors `render_edit_page_with_error` in mutate.rs.
+        challenge_kind_value: existing
+            .challenge_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default(),
     }
     .render()
     .unwrap();
@@ -172,6 +180,7 @@ pub async fn api_render_form_new(
         edit_domain: None,
         current_auto_issue: false,
         enabled_checked: true,
+        challenge_kind_value: String::new(),
     }
     .render()
     .unwrap();
