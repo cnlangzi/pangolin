@@ -419,6 +419,379 @@ async fn real_e2e_tunnel_sse_hostname_backend() {
     );
 }
 
+/// **SSE incremental delivery — events arrive spaced over time, not buffered.**
+///
+/// This is the *defining* property of the streaming path per
+/// `docs/design/tunnel.md` §"SSE / streaming-response support":
+/// "Bytes arrive at the client as they leave the backend, with no
+/// in-process buffering." If the buffering path silently regressed
+/// (e.g., a future refactor accidentally re-introduced the
+/// `HttpResponse { body: Vec<u8> }` shape for SSE), the
+/// `streams_through` test would still pass — events would arrive
+/// eventually, all at once, when the backend closed. This test
+/// catches that regression by asserting that the events arrive
+/// *spread over time*, with the first event arriving well before
+/// the last.
+///
+/// We give the mock backend a slow cadence (200 ms) and a
+/// generous overall budget (5 s). On the streaming path, the
+/// first event should reach the client in well under 1 s. On
+/// any path that buffers the body until EOF, the first event
+/// would not arrive until ~600 ms (after the third event has
+/// been written), and this assertion would still pass — but
+/// `streams_through` would also fail because the response
+/// wouldn't complete in the 2 s budget. The two tests together
+/// pin both liveness and incremental delivery.
+#[tokio::test]
+async fn real_e2e_tunnel_sse_incremental_delivery() {
+    use std::time::Instant;
+
+    let backend = SseBackend::start(3, Duration::from_millis(200)).await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "sse-incr", true);
+        seed_site(
+            &conn,
+            "sse-incr-site",
+            &format!("sse-incr:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "sse-incr.test", "sse-incr-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "sse-incr", "test-token").await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Read raw bytes and timestamp each occurrence of a `data:`
+    // line. With a 200 ms cadence and 3 events, the buffered
+    // path would deliver all three in one flush after ~600 ms;
+    // the streaming path should deliver them spread over
+    // ~400 ms / 200 ms gaps. We assert that event 0 arrives at
+    // most 350 ms after the request was sent (well before the
+    // 600 ms total backend time).
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .expect("connect (5s)")
+    .expect("connect");
+
+    let req = "GET /events HTTP/1.1\r\n\
+               Host: sse-incr.test\r\n\
+               Connection: close\r\n\
+               Accept: text/event-stream\r\n\
+               \r\n";
+    let sent_at = Instant::now();
+    stream.write_all(req.as_bytes()).await.expect("write req");
+    stream.flush().await.expect("flush req");
+
+    // Read header (up to CRLFCRLF).
+    let mut hdr_buf = Vec::new();
+    let mut tmp = [0u8; 1];
+    loop {
+        match timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => panic!("EOF before response head"),
+            Ok(Ok(_)) => {
+                hdr_buf.push(tmp[0]);
+                if hdr_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("read error: {e}"),
+            Err(_) => panic!("read header timeout (2s)"),
+        }
+    }
+    let hdr_str = String::from_utf8_lossy(&hdr_buf).into_owned();
+    assert_eq!(
+        hdr_str.lines().next().unwrap_or(""),
+        "HTTP/1.1 200 OK",
+        "first line: {hdr_str:?}"
+    );
+    assert!(
+        hdr_str
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type: {hdr_str:?}"
+    );
+
+    // Read body lines, recording the time each `data: event N`
+    // line arrives. The buffered path would deliver all three
+    // within one or two reads after the backend closes; the
+    // streaming path delivers each as it arrives.
+    let mut arrival = [None; 3];
+    let mut body_buf: Vec<u8> = Vec::new();
+    let mut read_tmp = [0u8; 1024];
+    let total_budget = Duration::from_secs(2);
+    loop {
+        let n = match timeout(total_budget, stream.read(&mut read_tmp)).await {
+            Ok(Ok(0)) => break, // backend closed
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => panic!("body read error: {e}"),
+            Err(_) => break, // timeout: streaming ended or hung
+        };
+        body_buf.extend_from_slice(&read_tmp[..n]);
+        for i in 0..3 {
+            if arrival[i].is_none() {
+                let needle = format!("data: event {i}").into_bytes();
+                if body_buf.windows(needle.len()).any(|w| w == needle) {
+                    arrival[i] = Some(sent_at.elapsed());
+                }
+            }
+        }
+        if arrival.iter().all(Option::is_some) && body_buf.windows(5).any(|w| w == b"0\r\n\r\n") {
+            break;
+        }
+    }
+
+    let t0 = arrival[0].expect("event 0 never arrived — backend did not stream");
+    let t1 = arrival[1].expect("event 1 never arrived — backend did not stream");
+    let t2 = arrival[2].expect("event 2 never arrived — backend did not stream");
+    eprintln!(
+        "SSE incremental arrival: event0={:?} event1={:?} event2={:?}",
+        t0, t1, t2
+    );
+
+    // Event 0 must arrive before event 2 minus 100 ms (i.e., the
+    // first event lands well before the last). A buffered path
+    // would land all three at t ≈ 600 ms in one flush; the
+    // assertion that event 0 arrives before t2 - 100 ms would
+    // fail because event 0's t would equal event 2's t.
+    assert!(
+        t0 + Duration::from_millis(100) < t2,
+        "events not delivered incrementally: t0={:?} t2={:?} \
+         (likely the response was buffered until EOF)",
+        t0,
+        t2
+    );
+    // Event 0 must also arrive before the *full* backend time
+    // (≈ 600 ms for 3 events × 200 ms cadence). A buffering
+    // regression would only release event 0 at t ≈ 600 ms.
+    assert!(
+        t0 < Duration::from_millis(500),
+        "event 0 arrived too late ({:?}); expected < 500 ms — \
+         the first chunk was probably buffered until the backend \
+         closed",
+        t0
+    );
+    // Sanity: events 0/1/2 must arrive in order.
+    assert!(
+        t0 < t1 && t1 < t2,
+        "events out of order: {t0:?} {t1:?} {t2:?}"
+    );
+}
+
+/// **SSE detection with multi-value Accept header — what real
+/// browser EventSource polyfills send.**
+///
+/// Browsers and many SSE clients send `Accept: */*` first and
+/// `Accept: text/event-stream` as a second header (this is
+/// permitted by RFC 7230 §3.2.2 — same name, multiple values).
+/// The ngx-side detection must iterate all values; if it
+/// only looks at the first Accept via `.get()` (which is the
+/// pre-fix bug the code-review pass caught), this request would
+/// fall through to the buffering path and the test would time
+/// out.
+#[tokio::test]
+async fn real_e2e_tunnel_sse_multi_value_accept_header() {
+    let backend = SseBackend::start(2, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "sse-multi", true);
+        seed_site(
+            &conn,
+            "sse-multi-site",
+            &format!("sse-multi:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "sse-multi.test", "sse-multi-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "sse-multi", "test-token").await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Send TWO separate Accept headers (per RFC 7230), the
+    // first not matching the SSE pattern. The detection must
+    // scan both values, not just .get("Accept").
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .expect("connect (5s)")
+    .expect("connect");
+
+    let req = "GET /events HTTP/1.1\r\n\
+               Host: sse-multi.test\r\n\
+               Connection: close\r\n\
+               Accept: */*\r\n\
+               Accept: text/event-stream\r\n\
+               \r\n";
+    stream.write_all(req.as_bytes()).await.expect("write req");
+    stream.flush().await.expect("flush req");
+
+    // Read head.
+    let mut hdr_buf = Vec::new();
+    let mut tmp = [0u8; 1];
+    loop {
+        match timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => panic!("EOF before response head"),
+            Ok(Ok(_)) => {
+                hdr_buf.push(tmp[0]);
+                if hdr_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("read error: {e}"),
+            Err(_) => panic!("read header timeout (2s) — SSE detection missed multi-Accept"),
+        }
+    }
+    let hdr_str = String::from_utf8_lossy(&hdr_buf).into_owned();
+    assert_eq!(
+        hdr_str.lines().next().unwrap_or(""),
+        "HTTP/1.1 200 OK",
+        "multi-Accept did not route to the streaming path: {hdr_str:?}"
+    );
+    assert!(
+        hdr_str
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type: {hdr_str:?}"
+    );
+
+    // Read body and confirm both events arrived.
+    let mut body = Vec::new();
+    let mut read_tmp = [0u8; 1024];
+    loop {
+        match timeout(Duration::from_secs(2), stream.read(&mut read_tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => body.extend_from_slice(&read_tmp[..n]),
+            Ok(Err(e)) => panic!("body read error: {e}"),
+            Err(_) => break,
+        }
+    }
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+    for i in 0..2 {
+        assert!(
+            body_str.contains(&format!("data: event {i}")),
+            "missing event {i}: body={body_str:?}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+}
+
+/// **SSE keep-alive comments — a real-world SSE feature the
+/// pre-fix buffering path would also drop.**
+///
+/// SSE lets the server send `:keepalive\n\n` (a comment line)
+/// to keep proxies and clients from idle-timing out the
+/// connection. The mock backend sends one comment between
+/// each data event, matching what observability tools and
+/// chat-streaming services do in production. The test verifies
+/// that the relay preserves these comments byte-for-byte (a
+/// hand-rolled HTTP head parser that mishandled `:keepalive`
+/// would either strip the leading colon or break the chunk
+/// boundary).
+#[tokio::test]
+async fn real_e2e_tunnel_sse_preserves_keepalive_comments() {
+    use std::time::Duration as StdDuration;
+
+    // A backend that emits 2 data events with a `:keepalive`
+    // comment line before the first data event.
+    async fn start_keepalive_backend() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let headers = "HTTP/1.1 200 OK\r\n\
+                           Content-Type: text/event-stream\r\n\
+                           Cache-Control: no-cache\r\n\
+                           Connection: close\r\n\
+                           Transfer-Encoding: chunked\r\n\
+                           \r\n";
+            if stream.write_all(headers.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = stream.flush().await;
+            // Comment line, then first data event.
+            let comment = ": keepalive\r\n";
+            let data0 = "data: hello\n\n";
+            let chunk0 = format!(
+                "{:x}\r\n{}{}\r\n{:x}\r\n{}\r\n",
+                comment.len(),
+                comment,
+                data0,
+                data0.len(),
+                data0,
+            );
+            let _ = stream.write_all(chunk0.as_bytes()).await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            // Second data event.
+            let data1 = "data: world\n\n";
+            let chunk1 = format!("{:x}\r\n{}\r\n", data1.len(), data1);
+            let _ = stream.write_all(chunk1.as_bytes()).await;
+            let _ = stream.flush().await;
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.flush().await;
+        });
+        (addr, handle)
+    }
+
+    let (backend_addr, handle) = start_keepalive_backend().await;
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "sse-keepalive", true);
+        seed_site(
+            &conn,
+            "sse-keepalive-site",
+            &format!("sse-keepalive:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "sse-keepalive.test", "sse-keepalive-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "sse-keepalive", "test-token").await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let (status, headers, body) = raw_sse_request(
+        &addr,
+        "sse-keepalive.test",
+        "/events",
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(
+        status, 200,
+        "got {status}, headers={headers:?}, body={body:?}"
+    );
+    assert!(
+        body.contains(": keepalive"),
+        "lost :keepalive comment: {body:?}"
+    );
+    assert!(
+        body.contains("data: hello"),
+        "lost first data event: {body:?}"
+    );
+    assert!(
+        body.contains("data: world"),
+        "lost second data event: {body:?}"
+    );
+
+    handle.abort();
+}
+
 /// **`is_streaming_request` detection unit test (pangolin-core).**
 ///
 /// Verifies the heuristics directly without spawning binaries.

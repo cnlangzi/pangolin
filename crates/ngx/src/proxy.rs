@@ -1007,6 +1007,14 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
         }
     };
 
+    // Preserve any body bytes that came along with the head
+    // read — yamux is a streaming transport, so a single `read`
+    // often returns the entire head plus the first body chunk
+    // in one go. Discarding those bytes silently drops the
+    // first SSE event (the test panic on CI showed exactly
+    // this: events 1 and 2 arrived but event 0 was missing).
+    let pre_buffered_body: Vec<u8> = header_buf[head_end..].to_vec();
+
     // Parse the status line + headers. We need a ResponseHeader
     // that pingora can write to the client.
     let head_str = match std::str::from_utf8(&header_buf[..head_end]) {
@@ -1057,6 +1065,17 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
     }
     if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
         error!("SSE: write response header: {}", e);
+        return Ok(true);
+    }
+
+    // Drain any body bytes that were already in the head-read
+    // buffer before we resume reading from the yamux stream.
+    if !pre_buffered_body.is_empty()
+        && let Err(e) = session
+            .write_response_body(Some(Bytes::copy_from_slice(&pre_buffered_body)), false)
+            .await
+    {
+        debug!("SSE: client closed early (prebuffer): {}", e);
         return Ok(true);
     }
 
