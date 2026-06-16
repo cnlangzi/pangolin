@@ -12,9 +12,15 @@
 //! additional CSRF is required (browsers can't send a custom
 //! `X-CSRF-Token` header from `EventSource` anyway).
 //!
-//! Asset / CSRF substitution is applied by the parent handler via
-//! `render_with_assets_and_csrf`, so we just produce a vanilla
-//! HTML body here.
+//! Asset / CSRF substitution is applied here via the shared
+//! `ok_html_with_csrf` helper, mirroring every other page route.
+//! Each route handler is responsible for this substitution (the
+//! parent `admin::handle()` does not post-process responses), so
+//! skipping it here would leave `__JS_FILE__` / `__JS_HASH__` /
+//! `__CSS_HASH__` / `__CSRF__` placeholders in the rendered HTML
+//! and the browser would 404 on `/assets/__JS_FILE__?v=__JS_HASH__`
+//! (observed symptom: the page renders but JS never loads and the
+//! SSE status pill stays on "disconnected").
 
 use std::sync::Arc;
 
@@ -24,6 +30,7 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::ok_html_with_csrf;
 use crate::templates::LogsTemplate;
 
 /// Build the `/logs` HTML page.
@@ -59,10 +66,5 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         }
     };
 
-    let resp = Response::builder()
-        .status(200)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(html)))
-        .expect("response builder for 200 OK should not fail");
-    Ok(resp)
+    ok_html_with_csrf(html, csrf)
 }
