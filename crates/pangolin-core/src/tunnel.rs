@@ -282,12 +282,43 @@ async fn session_driver(
                         // stream — the remote opener will
                         // see a RST.
                     }
-                    Some(Err(_e)) => {
-                        // Surface the error to the next
-                        // pending acceptor and continue.
-                        if let Some(reply) = pending_accepts.pop_front() {
-                            let _ = reply.send(Err(Error::other(format!("accept error: {_e}"))));
-                        }
+                    // `session.next()` yields Err only for **session-level**
+                    // fatals — today this is exclusively the yamux
+                    // keepalive timeout (ping outstanding longer than
+                    // `TIMEOUT` ≈ 30s; triggered by `kill -9`, OOM,
+                    // container restart, network partition, etc.) and
+                    // any transport-level I/O error on the underlying
+                    // duplex (yamux surfaces transport errors through
+                    // the same path). yamux's `Stream` impl does not
+                    // surface per-stream errors here — those are
+                    // observed by the `StreamHandle`'s own read/write
+                    // methods, not by `Session::poll_next`.
+                    //
+                    // This Err must therefore terminate the driver
+                    // loop. The pre-fix behaviour — forwarding it to a
+                    // single pending acceptor and continuing — left
+                    // `session.is_dead()` false, so the surrounding
+                    // bridge task never woke up `session_end` and the
+                    // `mark_tun_offline` call site never ran; the DB
+                    // row stayed `online=1` until the OS TCP timeout
+                    // (minutes to hours) finally caught the half-open
+                    // connection. Breaking out lets the surrounding
+                    // `tokio::select!` reach the
+                    // `session_end_for_task.notify_waiters()` line so
+                    // the existing call site fires.
+                    //
+                    // Pending acceptors are drained with EOF below the
+                    // loop, so they don't hang.
+                    Some(Err(e)) => {
+                        // Surface the error at debug so operators can
+                        // distinguish a clean peer disconnect (the
+                        // `None` arm above) from a real session-level
+                        // fatal — keepalive timeout (the half-open
+                        // case the issue is fixing), transport I/O
+                        // error, or go-away. Without this, every
+                        // session end looks identical in the logs.
+                        debug!("tunnel: session ended with error: {e}");
+                        break;
                     }
                     None => break,
                 }
@@ -1425,5 +1456,221 @@ mod tests {
     #[test]
     fn decode_http_response_empty() {
         assert!(decode_http_response(b"").unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // session_driver regression: session_end must fire when the
+    // underlying transport ends. Issue #68 fixes a bug where the
+    // pre-fix driver forwarded `session.next()` Err to a pending
+    // acceptor and continued, leaving `session_end` unfired (so
+    // `mark_tun_offline` was never called and the DB row stayed
+    // online). The test below exercises the **clean-disconnect EOF
+    // path** end-to-end to make sure the driver still surfaces a
+    // session-end notification after the fix. The half-open Err
+    // path (yamux keepalive timeout, ~30s) is covered by manual
+    // repro because yamux hardcodes the timeout (see
+    // `tokio-yamux-*/src/session.rs` const `TIMEOUT = 30s`) and
+    // would push the test into the minute-range.
+    // -------------------------------------------------------------------
+    use tokio::io::DuplexStream;
+
+    /// Build a `YamuxTunnel` over an in-memory `tokio::io::duplex`
+    /// pair, spawn a peer task that just reads forever, and
+    /// block until the driver is plausibly in its `select!` loop.
+    ///
+    /// The returned `peer_handle` is the only thing keeping the
+    /// peer half of the duplex open. Aborting it (or letting it
+    /// drop) closes the peer's end of the pipe, which surfaces
+    /// to `ws_bridge` as an EOF and from there to `session_driver`
+    /// as `session.next() -> None` (clean disconnect path).
+    ///
+    /// The 50ms sleep is a soft synchronization point: with
+    /// tokio's current_thread test runtime the bridge task is
+    /// spawned and polled during the sleep, so by the time this
+    /// returns the driver has almost certainly entered its loop.
+    /// A future tightening could replace the sleep with an
+    /// explicit readiness signal from the driver, at the cost
+    /// of a new public test API on `YamuxTunnel`.
+    async fn make_test_tunnel() -> (YamuxTunnel, tokio::task::JoinHandle<()>) {
+        let (peer, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = fastwebsockets::WebSocket::after_handshake(server_io, WsRole::Server);
+        let tunnel = tunnel_over_websocket(server_ws, TunnelRole::Server);
+
+        let peer_handle = tokio::spawn(async move {
+            let mut peer: DuplexStream = peer;
+            let mut buf = [0u8; 1024];
+            while peer.read(&mut buf).await.is_ok() {}
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        (tunnel, peer_handle)
+    }
+
+    /// Simulate a clean peer-side disconnect: abort the peer
+    /// task (drops `peer` at the await point) and wait for the
+    /// JoinHandle to finalise. Mirrors what `kill -9` does to a
+    /// real tun process — the OS reaps the fd, no FIN/RST.
+    async fn drop_peer(peer_handle: tokio::task::JoinHandle<()>) {
+        peer_handle.abort();
+        let _ = peer_handle.await;
+    }
+
+    /// A clean remote-side close (the peer drops its WS) must reach
+    /// `session_end` on this side. Without the fix, the WS-bridge
+    /// EOF path was already correct; this test guards against
+    /// regressing it while we add Err handling for the half-open
+    /// case.
+    #[tokio::test]
+    async fn session_end_fires_when_peer_closes_ws() {
+        let (tunnel, peer_handle) = make_test_tunnel().await;
+
+        // Register a waiter on session_end **before** triggering
+        // the disconnect. tokio::sync::Notify::notify_waiters
+        // only wakes currently-registered waiters, so a
+        // post-disconnect `notified().await` would race against
+        // the bridge finishing first and miss the signal. The
+        // production call site (crates/ngx/src/tunnel.rs) does
+        // the same thing — call .notified() before any chance
+        // of notification — so this is a faithful test of the
+        // real pattern.
+        let end = tunnel.session_end.clone();
+        let waiter = tokio::spawn(async move { end.notified().await });
+
+        drop_peer(peer_handle).await;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await {
+            Ok(Ok(())) => {} // good — session_end fired
+            Ok(Err(e)) => panic!("session_end waiter join errored: {e}"),
+            Err(_) => panic!(
+                "session_end did not fire within 5s after peer disconnect — \
+                 mark_tun_offline would never run and the DB row would stay online"
+            ),
+        }
+    }
+
+    /// An open_stream call issued AFTER session_end fired must
+    /// fail cleanly with BrokenPipe (not hang forever, not leak
+    /// the open_rx sender). The post-loop drain on
+    /// `pending_accepts` only covers acceptors; this guards the
+    /// `open_tx` path which is dropped when session_driver
+    /// returns.
+    #[tokio::test]
+    async fn open_stream_after_session_end_fails_cleanly() {
+        let (tunnel, peer_handle) = make_test_tunnel().await;
+
+        drop_peer(peer_handle).await;
+
+        let end = tunnel.session_end.clone();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), end.notified()).await;
+
+        // open_stream must now fail — the open_tx receiver has
+        // been dropped with session_driver.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), tunnel.open_stream()).await;
+        match result {
+            Ok(Err(e)) => assert_eq!(e.kind(), ErrorKind::BrokenPipe),
+            Ok(Ok(_)) => panic!("open_stream unexpectedly succeeded after session end"),
+            Err(_) => panic!("open_stream hung after session end"),
+        }
+    }
+
+    /// Issue #68 verification checklist step 7 — the
+    /// "concurrent open-accept test" — guards against two
+    /// leak risks in `accept_stream` after the session ends:
+    ///
+    /// (a) A caller that called `accept_stream()` *before* the
+    ///     peer disconnected must not hang forever. The driver
+    ///     must wake the pending acceptor either by running
+    ///     the post-loop drain (sending `UnexpectedEof("yamux
+    ///     session ended")`) or by dropping `pending_accepts`
+    ///     (which drops the oneshot sender, making the
+    ///     receiver return `Err` and `accept_stream` return
+    ///     `None`). Both outcomes are acceptable; a hang is not.
+    ///
+    /// (b) A caller that calls `accept_stream()` *after*
+    ///     session_end must observe `None` promptly (the driver
+    ///     has dropped `accept_rx`, so `accept_tx.send` fails
+    ///     and the impl short-circuits to `None` without
+    ///     awaiting the oneshot).
+    ///
+    /// Note on the current `tunnel_over_websocket` layout: the
+    /// driver and `ws_bridge` share a single `tokio::spawn`'d
+    /// task wrapped in `tokio::select!`. When the peer EOFs the
+    /// WS, `ws_bridge` finishes first and the driver future is
+    /// *cancelled*, so its post-loop drain never runs — case
+    /// (a) takes the second path (`None` via dropped
+    /// `pending_accepts`). This is a pre-existing structural
+    /// quirk, not a #68 regression. The #68 fix
+    /// (`Some(Err(_e)) => break`) only changes behaviour for
+    /// session-level fatals surfaced via `session.next()`; it
+    /// does not change the clean-EOF path. Restructuring the
+    /// bridge/driver tasks to let the drain always run is out
+    /// of scope for #68.
+    #[tokio::test]
+    async fn accept_stream_does_not_hang_on_peer_disconnect() {
+        let (tunnel, peer_handle) = make_test_tunnel().await;
+
+        // --- Case (a): queue an accept BEFORE the disconnect. ---
+        let tunnel_for_accept = tunnel.clone();
+        let queued = tokio::spawn(async move { tunnel_for_accept.accept_stream().await });
+
+        // Register a session_end waiter BEFORE the peer drops.
+        // tokio::sync::Notify::notify_waiters only wakes already-
+        // registered waiters; a post-disconnect `.notified().await`
+        // would race against the bridge finishing first and miss
+        // the signal. The production call site in
+        // crates/ngx/src/tunnel.rs does the same thing.
+        let end = tunnel.session_end.clone();
+        let end_waiter = tokio::spawn(async move { end.notified().await });
+
+        drop_peer(peer_handle).await;
+
+        // Sanity: session_end must fire within a few seconds.
+        tokio::time::timeout(std::time::Duration::from_secs(5), end_waiter)
+            .await
+            .expect("session_end_waiter timed out")
+            .expect("session_end_waiter task panicked");
+
+        // The queued accept must complete (no hang). The exact
+        // value is environment-dependent on the bridge-task
+        // layout — see the function-level comment — so accept
+        // either None (driver cancelled, pending_accepts
+        // dropped) or Some(Err(UnexpectedEof)) (post-loop drain
+        // ran). Some(Ok(_)) would be wrong (peer is gone).
+        match tokio::time::timeout(std::time::Duration::from_secs(5), queued).await {
+            // JoinHandle outer Ok, inner is Some(Ok(_)) — a live
+            // StreamHandle came back even though the peer is gone.
+            Ok(Ok(Some(Ok(_)))) => panic!(
+                "queued accept_stream returned a real StreamHandle after the peer \
+                 disconnected — accept should never resolve with a live stream once \
+                 the session is gone"
+            ),
+            // JoinHandle outer Ok, inner is Some(Err(_)) (post-loop
+            // drain fired) or None (driver cancelled, accept_rx
+            // dropped) — both are clean failures, accept either.
+            Ok(Ok(Some(Err(_)))) | Ok(Ok(None)) => {}
+            // JoinError: the task itself panicked.
+            Ok(Err(e)) => panic!("queued accept_stream task panicked: {e}"),
+            // Timeout: hung past 5s. This is the actual regression
+            // we are guarding against.
+            Err(_) => panic!(
+                "queued accept_stream hung past 5s after peer disconnect — \
+                 pending_accepts queue leaked (issue #68 verification step 7)"
+            ),
+        }
+
+        // --- Case (b): a new accept after session_end. ---
+        // The driver has dropped accept_rx, so accept_tx.send
+        // returns Err and accept_stream short-circuits to None.
+        match tokio::time::timeout(std::time::Duration::from_secs(2), tunnel.accept_stream()).await
+        {
+            Ok(None) => {} // good — fast-path None, no hang
+            Ok(Some(_)) => panic!(
+                "accept_stream after session_end returned Some(_) — driver should \
+                 have dropped accept_rx"
+            ),
+            Err(_) => panic!("accept_stream after session_end hung past 2s"),
+        }
     }
 }
