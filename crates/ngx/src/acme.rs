@@ -649,11 +649,7 @@ impl AcmeClient {
                     None,
                 )
                 .await?;
-            log::info!(
-                "{} challenge ready: {}",
-                effective_kind,
-                identifier_str
-            );
+            log::info!("{} challenge ready: {}", effective_kind, identifier_str);
         }
 
         // Poll until order is ready (instant-acme 0.8.x: built-in
@@ -1188,11 +1184,17 @@ impl AcmeClient {
                 // fail (no record yet) — we log a warning so a
                 // repeated silent failure that leaves stale TXT
                 // records in DNS can be diagnosed.
-                emit_stage("dns-del", format!("identifier={} name={}", dns_id, txt_name));
+                emit_stage(
+                    "dns-del",
+                    format!("identifier={} name={}", dns_id, txt_name),
+                );
                 if let Err(e) = p.delete_txt(&zone, &txt_name).await {
                     log::warn!("dns-del failed (non-fatal): {}", e);
                 }
-                emit_stage("dns-set", format!("identifier={} name={}", dns_id, txt_name));
+                emit_stage(
+                    "dns-set",
+                    format!("identifier={} name={}", dns_id, txt_name),
+                );
                 p.create_txt(&zone, &txt_name, &txt_value, 600).await?;
                 // Wait for propagation. The deadline matches the
                 // legacy `issue_with_plan` budget (120s) — slow DNS
