@@ -1,6 +1,7 @@
 [ngx]
-#ny-us ansible_host=ny-us ansible_user=yaitoo ansible_ssh_private_key_file=~/.ssh/id_rsa
-sh-ali ansible_host=sh-ali ansible_user=ecs-user ansible_ssh_private_key_file=~/.ssh/id_rsa
+ny-us ansible_host=ny-us ansible_user=yaitoo ansible_ssh_private_key_file=~/.ssh/id_rsa
+#sh-ali ansible_host=sh-ali ansible_user=ecs-user ansible_ssh_private_key_file=~/.ssh/id_rsa
+la-us ansible_host=la-us ansible_user=yaitoo ansible_ssh_private_key_file=~/.ssh/id_rsa
 
 
 [ngx:vars]
