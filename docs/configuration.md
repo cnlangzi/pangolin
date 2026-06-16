@@ -189,10 +189,21 @@ Shape of the `config` JSON per kind:
 
 ### `[log]`
 
-| Field    | Type     | Default     | Required | Notes |
-| -------- | -------- | ----------- | -------- | ----- |
-| `level`  | `string` | `info`      | no       | `env_logger` filter: `trace` / `debug` / `info` / `warn` / `error`. |
-| `file`   | `string` | `""`        | no       | Log file path. Empty → stderr only. |
+| Field                  | Type     | Default | Required | Notes |
+| ---------------------- | -------- | ------- | -------- | ----- |
+| `level`                | `string` | `info`  | no       | `env_logger` filter: `trace` / `debug` / `info` / `warn` / `error`. |
+| `file`                 | `string` | `""`    | no       | Log file path. Empty → stderr only. |
+| `access_log_recent`    | `usize`  | `100`   | no       | Capacity of the in-memory access-log ring buffer used to **replay** recent entries to a fresh SSE subscriber (`GET /api/logs/stream`). Each entry is ~150 B serialised, so the default costs ≈ 15 KB. Set to `0` to disable replay entirely (live SSE still works). Issue #73. |
+| `access_log_capacity`  | `usize`  | `1000`  | no       | Capacity of the `tokio::sync::broadcast` channel that fans live access-log entries out to every SSE subscriber. A subscriber that falls behind by more than this many entries sees a `: lagged N events` SSE comment and the stream keeps flowing — no crash. Default 1000 ≈ 150 KB. |
+
+> **In-memory access log + `/logs` admin page (issue #73).** Every
+> proxied request that lands on `ngx` is captured by
+> `response_filter` and pushed into both the ring buffer (above)
+> and a `broadcast` channel. The admin UI's `/logs` page opens an
+> `EventSource` against `/api/logs/stream`, which first replays
+> the ring buffer (oldest first) then tails the live channel. Zero
+> disk I/O; cleared on restart. See [design/access-log.md](design/access-log.md)
+> for the architecture, wire format, auth and failure modes.
 
 ### `[tls]` — TLS listener tuning
 
