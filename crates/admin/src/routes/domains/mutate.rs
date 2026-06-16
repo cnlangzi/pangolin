@@ -60,22 +60,18 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // `"auto"` (NULL — planner picks), `"http-01"`, `"dns-01"`,
     // `"dns-persist-01"`. Anything else (empty, garbage) is treated
     // as `"auto"` to preserve the legacy behaviour and keep the
-    // form forgiving when the dropdown is missing.
+    // form forgiving when the dropdown is missing. The mapping
+    // is delegated to the canonical `FromStr` impl on
+    // `ChallengeKind` so a fourth variant would only need to be
+    // added in one place.
     let challenge_kind_raw = params
         .get("challenge_kind")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let challenge_kind = match challenge_kind_raw.as_str() {
-        "http-01" => Some(pangolin_core::types::ChallengeKind::Http01),
-        "dns-01" => Some(pangolin_core::types::ChallengeKind::Dns01),
-        "dns-persist-01" => Some(pangolin_core::types::ChallengeKind::DnsPersist01),
-        // "auto" or anything we don't recognise — leave the column NULL
-        // so the planner applies the auto default (dns-01 with a
-        // provider, http-01 without).
-        _ => None,
-    };
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let challenge_kind = challenge_kind_raw
+        .parse::<pangolin_core::types::ChallengeKind>()
+        .ok();
 
     if domain.is_empty() {
         return render_create_page_with_error(app, "Domain name is required", csrf, None).await;
@@ -265,20 +261,18 @@ pub async fn handle_update(
     // `handle_create`: `"http-01"` / `"dns-01"` / `"dns-persist-01"`
     // map to the matching enum variant; `"auto"` or anything else
     // (empty, missing field) maps to `None` so the planner applies
-    // the auto default. The field is dropped through to the existing
-    // value when the form is missing it (malformed client fallback).
+    // the auto default — and crucially, an operator can revert an
+    // explicit kind back to the auto default by picking "Auto" in
+    // the dropdown. The mapping is delegated to the canonical
+    // `FromStr` impl on `ChallengeKind`.
     let challenge_kind_raw = params
         .get("challenge_kind")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let challenge_kind = match challenge_kind_raw.as_str() {
-        "http-01" => Some(pangolin_core::types::ChallengeKind::Http01),
-        "dns-01" => Some(pangolin_core::types::ChallengeKind::Dns01),
-        "dns-persist-01" => Some(pangolin_core::types::ChallengeKind::DnsPersist01),
-        _ => existing.challenge_kind,
-    };
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let challenge_kind = challenge_kind_raw
+        .parse::<pangolin_core::types::ChallengeKind>()
+        .ok();
 
     // Wildcard domains must have a DNS association (DNS-01 is the only
     // way to validate `*.example.com`). Invariant copied from

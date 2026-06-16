@@ -26,4 +26,5 @@
 -- and recovers automatically under the auto-default rule. No data
 -- backfill is required.
 
-ALTER TABLE domains ADD COLUMN challenge_kind TEXT;
+ALTER TABLE domains ADD COLUMN challenge_kind TEXT
+    CHECK (challenge_kind IS NULL OR challenge_kind IN ('http-01', 'dns-01', 'dns-persist-01'));

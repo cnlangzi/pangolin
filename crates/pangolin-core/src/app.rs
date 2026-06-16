@@ -172,6 +172,16 @@ pub fn plan_issuance(
     // Resolve the effective kind once for the whole order. The
     // domain row's `challenge_kind` (or its auto default) is the
     // single source of truth — there is no per-SAN kind switching.
+    //
+    // Auto-default: the order-level `order_provider` is consulted
+    // (which falls back to a base-domain association). A deeper
+    // subdomain that never had a provider set on its own row
+    // inherits the base's provider for the auto-default — this is
+    // the pre-#55 behaviour and is locked in by the
+    // `plan_base_uses_dns01_when_associated` and
+    // `plan_mixed_san_list_per_identifier` tests in this file.
+    // The wildcard × http-01 case is still rejected below when
+    // the wildcard forces Http01.
     let effective = domain.effective_challenge_kind(order_provider.is_some());
 
     // Wildcard × http-01 — rejected here (plan time) so the operator

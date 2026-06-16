@@ -9,6 +9,24 @@
 use askama::Template;
 use pangolin_core::types::{DnsProvider, Domain, Site};
 
+/// True if the form's `challenge_kind_value` matches the given kind.
+/// The empty string is treated as "auto" (the planner's NULL default)
+/// so the "Auto" dropdown option is selected by default on a fresh
+/// form. The 4-arm match is shared across the three template impls.
+pub(super) fn is_challenge_kind_selected(value: &str, kind: &str) -> bool {
+    let current = if value.is_empty() { "auto" } else { value };
+    current == kind
+}
+
+/// `http-01` must be disabled when the domain is a wildcard
+/// (issue #55 / RFC 8555 §8.3). The new form has no domain yet, so
+/// this returns `false` (`None` → not a wildcard). The edit form
+/// passes the PK through; if it starts with `*.`, http-01 is not
+/// allowed.
+pub(super) fn http01_disabled_for(edit_domain: Option<&str>) -> bool {
+    edit_domain.map(|d| d.starts_with("*.")).unwrap_or(false)
+}
+
 // ─── List page (GET /domains) ──────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -102,12 +120,7 @@ impl<'a> DomainsNewTemplate<'a> {
     /// True if the given challenge kind matches the form's current
     /// selection. The empty string is treated as "auto" (NULL).
     pub fn is_challenge_kind_selected(&self, kind: &str) -> bool {
-        let current = if self.challenge_kind_value.is_empty() {
-            "auto"
-        } else {
-            self.challenge_kind_value.as_str()
-        };
-        current == kind
+        is_challenge_kind_selected(&self.challenge_kind_value, kind)
     }
     /// `http-01` must be disabled when the domain is a wildcard
     /// (issue #55 / RFC 8555 §8.3). For the "new" form the
@@ -195,21 +208,13 @@ impl<'a> DomainsEditTemplate<'a> {
     /// True if the given challenge kind matches the form's current
     /// selection. The empty string is treated as "auto" (NULL).
     pub fn is_challenge_kind_selected(&self, kind: &str) -> bool {
-        let current = if self.challenge_kind_value.is_empty() {
-            "auto"
-        } else {
-            self.challenge_kind_value.as_str()
-        };
-        current == kind
+        is_challenge_kind_selected(&self.challenge_kind_value, kind)
     }
     /// `http-01` must be disabled when the domain is a wildcard
     /// (issue #55 / RFC 8555 §8.3). For the edit form the domain
     /// is fixed (primary key), so the disabled state is static.
     pub fn http01_disabled(&self) -> bool {
-        self.edit_domain
-            .as_deref()
-            .map(|d| d.starts_with("*."))
-            .unwrap_or(false)
+        http01_disabled_for(self.edit_domain.as_deref())
     }
     pub fn edit_domain_value(&self) -> &str {
         self.edit_domain.as_deref().unwrap_or("")
@@ -348,21 +353,13 @@ impl<'a> DomainsFormFieldsView<'a> {
     /// True if the given challenge kind matches the form's current
     /// selection. The empty string is treated as "auto" (NULL).
     pub fn is_challenge_kind_selected(&self, kind: &str) -> bool {
-        let current = if self.challenge_kind_value.is_empty() {
-            "auto"
-        } else {
-            self.challenge_kind_value.as_str()
-        };
-        current == kind
+        is_challenge_kind_selected(&self.challenge_kind_value, kind)
     }
     /// `http-01` must be disabled when the domain is a wildcard
     /// (issue #55 / RFC 8555 §8.3). Mirrors
     /// `DomainsEditTemplate::http01_disabled`.
     pub fn http01_disabled(&self) -> bool {
-        self.edit_domain
-            .as_deref()
-            .map(|d| d.starts_with("*."))
-            .unwrap_or(false)
+        http01_disabled_for(self.edit_domain.as_deref())
     }
     pub fn edit_domain_value(&self) -> &str {
         self.edit_domain.as_deref().unwrap_or("")

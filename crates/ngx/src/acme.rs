@@ -625,7 +625,6 @@ impl AcmeClient {
         // method gives us a typed handle to a specific
         // challenge, and `set_ready()` on that handle POSTs
         // the empty-body notification to the ACME server.
-        let directory_url = self.directory_url.clone();
         let mut auths = order.authorizations();
         while let Some(auth_result) = auths.next().await {
             let mut auth = auth_result?;
@@ -646,16 +645,13 @@ impl AcmeClient {
                     &identifier_str,
                     effective_kind,
                     self.dns_provider.as_deref(),
-                    &directory_url,
+                    &self.directory_url,
+                    None,
                 )
                 .await?;
             log::info!(
                 "{} challenge ready: {}",
-                match effective_kind {
-                    pangolin_core::ChallengeKind::Http01 => "http-01",
-                    pangolin_core::ChallengeKind::Dns01 => "dns-01",
-                    pangolin_core::ChallengeKind::DnsPersist01 => "dns-persist-01",
-                },
+                effective_kind,
                 identifier_str
             );
         }
@@ -1105,7 +1101,19 @@ impl AcmeClient {
         kind: pangolin_core::ChallengeKind,
         provider: Option<&dyn DnsProvider>,
         directory_url: &str,
+        // Optional dashboard trace callback. When `Some`, per-stage
+        // events (`dns-zone`, `dns-del`, `dns-set`, `dns-wait`,
+        // `dns-persist`, `http01`) are pushed so the activity panel
+        // shows granular progress. When `None` (test path, no UI
+        // surface) only `log::info!` runs — no behaviour change.
+        emit: Option<&IssueTrace>,
     ) -> Result<instant_acme::ChallengeHandle<'a>> {
+        let emit_stage = |stage: &str, detail: String| {
+            log::info!("ACME {} {}", stage, detail);
+            if let Some(t) = emit {
+                t(stage, detail);
+            }
+        };
         match kind {
             pangolin_core::ChallengeKind::Http01 => {
                 // http-01: write a file under .well-known/acme-challenge/
@@ -1130,6 +1138,10 @@ impl AcmeClient {
                         )
                     })?;
                 let key_auth = ch.key_authorization().as_str().to_string();
+                emit_stage(
+                    "http01",
+                    format!("identifier={} token={}", identifier, ch.token),
+                );
                 self.write_challenge(&ch.token, &key_auth).await?;
                 ch.set_ready().await?;
                 Ok(ch)
@@ -1155,26 +1167,46 @@ impl AcmeClient {
                     )
                 })?;
                 let key_auth = ch.key_authorization().as_str().to_string();
-                let txt_name = format!("_acme-challenge.{}", identifier);
+                // RFC 8555 §8.4: the TXT name is `_acme-challenge.<base>`
+                // — a wildcard identifier like `*.example.com` must use
+                // the *base* domain (`example.com`), not the raw
+                // identifier. Without stripping, the TXT name would be
+                // `_acme-challenge.*.example.com` (asterisks are not
+                // legal DNS labels) and the validator would never find
+                // it. `persist_base_domain` is the existing helper used
+                // by the dns-persist-01 arm; the same wildcard-strip
+                // applies here.
+                let dns_id = Self::persist_base_domain(identifier);
+                let txt_name = format!("_acme-challenge.{}", dns_id);
                 let txt_value = key_auth;
-                let (zone, _zone_id) = p.find_zone(identifier).await?;
+                emit_stage("dns-zone", format!("identifier={} looking up zone", dns_id));
+                let (zone, _zone_id) = p.find_zone(dns_id).await?;
+                emit_stage("dns-zone", format!("identifier={} zone={}", dns_id, zone));
                 // Best-effort delete-then-create: a stale TXT from
                 // a previous attempt would cause the validator to
                 // see a different value. The delete is allowed to
-                // fail (no record yet) — we ignore the error and
-                // proceed to create.
-                let _ = p.delete_txt(&zone, &txt_name).await;
+                // fail (no record yet) — we log a warning so a
+                // repeated silent failure that leaves stale TXT
+                // records in DNS can be diagnosed.
+                emit_stage("dns-del", format!("identifier={} name={}", dns_id, txt_name));
+                if let Err(e) = p.delete_txt(&zone, &txt_name).await {
+                    log::warn!("dns-del failed (non-fatal): {}", e);
+                }
+                emit_stage("dns-set", format!("identifier={} name={}", dns_id, txt_name));
                 p.create_txt(&zone, &txt_name, &txt_value, 600).await?;
-                // Wait for propagation. The deadline is short (60s)
-                // relative to the full 120s the legacy path used
-                // because the validation server retries — if the
-                // first wave misses we want to fail fast and let
-                // the operator see a clear error rather than
-                // waiting 2 minutes per identifier.
-                let propagated = wait_for_txt_propagation(&txt_name, &txt_value, 60, 5).await?;
+                // Wait for propagation. The deadline matches the
+                // legacy `issue_with_plan` budget (120s) — slow DNS
+                // providers (Route53, secondary authoritative
+                // servers with long TTLs) can take up to 2 minutes
+                // for a fresh TXT to become visible globally.
+                // Truncating to 60s introduced premature
+                // "may not be fully propagated" warnings and
+                // intermittent order validation failures.
+                emit_stage("dns-wait", format!("name={} deadline=120s", txt_name));
+                let propagated = wait_for_txt_propagation(&txt_name, &txt_value, 120, 5).await?;
                 if !propagated {
                     log::warn!(
-                        "dns-01 TXT {} may not be fully propagated after 60s, proceeding",
+                        "dns-01 TXT {} may not be fully propagated after 120s, proceeding",
                         txt_name
                     );
                 }
@@ -1207,6 +1239,10 @@ impl AcmeClient {
                     )
                 })?;
                 let account_uri = self.account.id().to_string();
+                emit_stage(
+                    "dns-persist",
+                    format!("identifier={} ensuring persistent TXT", identifier),
+                );
                 self.ensure_dns_persist_txt(p, identifier, &account_uri)
                     .await?;
                 ch.set_ready().await?;
@@ -1360,7 +1396,10 @@ impl AcmeClient {
             // Run the per-SAN setup. The handle it returns is
             // dropped here — `set_ready` was already called
             // inside the helper, so the ACME server has been
-            // notified.
+            // notified. Pass the trace through so the helper
+            // emits per-stage events (dns-zone, dns-del,
+            // dns-set, dns-wait, dns-persist, http01) for
+            // the dashboard activity panel.
             let _challenge = self
                 .pick_and_setup_challenge(
                     &mut auth,
@@ -1368,6 +1407,7 @@ impl AcmeClient {
                     plan.effective_kind,
                     dns_provider.map(|p| p.as_ref()),
                     &self.directory_url,
+                    trace,
                 )
                 .await?;
 

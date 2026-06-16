@@ -181,27 +181,13 @@ pub fn get_domain(conn: &Connection, domain: &str) -> rusqlite::Result<Option<Do
         "SELECT domain, site_name, enabled, auto_issue, dns_provider, challenge_kind, created_at
          FROM domains WHERE domain = ?1",
     )?;
-    let result = stmt.query_row(params![domain], |row| {
-        let enabled: i32 = row.get(2)?;
-        let auto_issue: i32 = row.get(3)?;
-        let challenge_kind_raw: Option<String> = row.get(5)?;
-        let created_at: String = row.get(6)?;
-        let challenge_kind: Option<ChallengeKind> = match challenge_kind_raw {
-            None => None,
-            Some(s) => Some(s.parse().map_err(|e: String| {
-                rusqlite::Error::InvalidParameterName(format!("invalid challenge_kind: {e}"))
-            })?),
-        };
-        Ok(Domain {
-            domain: row.get(0)?,
-            site_name: row.get(1)?,
-            enabled: enabled != 0,
-            auto_issue: auto_issue != 0,
-            dns_provider: row.get(4)?,
-            challenge_kind,
-            created_at: parse_dt(&created_at)?,
-        })
-    });
+    // Delegate to the shared `row_to_domain` so the column indices,
+    // types, and the `challenge_kind` parse are defined in exactly
+    // one place. (A previous hand-rolled version of this closure
+    // drifted on the `challenge_kind` parse, accepting malformed
+    // strings the `row_to_domain` path rejected — the two read
+    // paths now agree.)
+    let result = stmt.query_row(params![domain], row_to_domain);
     match result {
         Ok(d) => Ok(Some(d)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
