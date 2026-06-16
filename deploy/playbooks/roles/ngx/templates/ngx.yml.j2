@@ -70,10 +70,11 @@ acme:
   # is preserved for inventory compatibility but no longer mapped.
 
 tls:
-  enable_h2: false      # advertise HTTP/2 via ALPN. Set to true if your deploy
-                        # fronts tunnel backends and you want HTTP/2 in
-                        # the browser. See TlsConfig docs in
-                        # crates/pangolin-core/src/config.rs.
+  enable_h2: false      # advertise HTTP/2 via ALPN for non-tunnel sites.
+                        # Tunnel sites (backend with `tun_name:` prefix) always
+                        # negotiate h1 at runtime, regardless of this field —
+                        # see TlsConfig docs in crates/pangolin-core/src/config.rs
+                        # and the upstream tokio-yamux 0.3.18 issue it works around.
 
 log:
   level: {{ ngx_log_level | default('info') }}

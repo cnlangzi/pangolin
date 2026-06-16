@@ -20,6 +20,7 @@ sha2.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
+parking_lot.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 # Tunnel transport (issue #39): yamux over fastwebsockets, plus

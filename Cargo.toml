@@ -58,6 +58,11 @@ tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-ti
 futures = "0.3"
 futures-util = "0.3"
 
+# Sync RwLock for TLS hot-path (ALPN callback runs in a sync C context,
+# so the per-SNI tunnel-domain mirror must use a sync lock). See
+# `pangolin-core::App::tunnel_domains` and `ngx::tls::build_sni_settings`.
+parking_lot = "0.12"
+
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 

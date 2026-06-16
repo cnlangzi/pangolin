@@ -2249,6 +2249,7 @@ dependencies = [
  "httpdate",
  "log",
  "mime_guess",
+ "parking_lot",
  "rand 0.8.6",
  "refinery",
  "rusqlite",

@@ -677,7 +677,7 @@ async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
     );
 }
 
-/// **Regression test for the HTTPS+H2 → tunnel path-construction bug.**
+/// **Regression test for the HTTPS → tunnel path-construction bug.**
 ///
 /// Symptom (from production): `curl http://yaitoo.cn` works, but
 /// `curl https://yaitoo.cn` returns HTTP/2 404 with body
@@ -704,12 +704,16 @@ async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
 /// regardless of how the request arrived) when building the tunnel
 /// target.
 ///
-/// Why this test catches it: we drive a real HTTPS+H2 request through
-/// curl (`--http2 --http2-prior-knowledge`) against the proxy's TLS
-/// port. The mock backend records the path it actually received; the
-/// assertion `path == "/api/profile"` (not `path ==
-/// "/https://office.test/api/profile"`) fails immediately on the
-/// pre-fix proxy.
+/// Why this test catches it: we drive a real HTTPS request through
+/// curl (`--http2`, no `--http2-prior-knowledge`) against the
+/// proxy's TLS port. The dynamic ALPN callback in
+/// `ngx::tls::build_sni_settings` forces h1 for tunnel sites
+/// (issue #66 / commit `0c35ede`), so curl falls back to h1
+/// transparently. The mock backend records the path it actually
+/// received; the assertion `path == "/api/profile"` (not
+/// `path == "/https://office.test/api/profile"`) catches a
+/// regression in `path_and_query()` regardless of which protocol
+/// the request actually used.
 #[tokio::test]
 async fn real_e2e_tunnel_h2_path_preserved() {
     use std::process::Stdio;
@@ -768,15 +772,20 @@ async fn real_e2e_tunnel_h2_path_preserved() {
     )
     .expect("write cert blob");
 
-    // `--http2 --http2-prior-knowledge` skips the H1→H2 upgrade and
-    // ships native H2 framing from the first byte, exercising the
-    // pseudo-header → URI reconstruction path that hides the bug.
+    // `--http2` (no `--http2-prior-knowledge`): curl honours the
+    // server's ALPN advertisement. Since the dynamic ALPN callback
+    // in `ngx::tls::build_sni_settings` forces h1 for tunnel sites,
+    // curl will silently fall back to h1 — the request still
+    // exercises the path-construction path through `request_filter`
+    // (just over h1 instead of h2). This keeps the regression value
+    // of the test without requiring us to force h2 across the
+    // handshake.
+    //
     // `--resolve` so we don't touch /etc/hosts; `--insecure` because
     // the cert is self-signed.
     let url = format!("https://office.test:{}/api/profile?id=42", ngx.tls_port);
     let output = tokio::process::Command::new("curl")
         .arg("--http2")
-        .arg("--http2-prior-knowledge")
         .arg("--insecure")
         .arg("--max-time")
         .arg("5")
@@ -848,6 +857,320 @@ async fn real_e2e_tunnel_h2_path_preserved() {
         seen[0].query, "id=42",
         "H2 query string must reach the backend byte-exact"
     );
+}
+
+/// **Regression test for the per-SNI dynamic ALPN policy:**
+/// h2 client + tunnel site must transparently fall back to h1.
+///
+/// Pre-fix (PR #66 / commit `0c35ede`): the listener advertised h2
+/// for every connection. Browsers and `curl --http2` (without
+/// `--http2-prior-knowledge`) tried h2, the proxy accepted it, and
+/// the request then fell into the upstream `tokio-yamux 0.3.18`
+/// stream-state race (`debug!("this branch should be unreachable")`
+/// in `stream.rs:506`), which tore the yamux stream down and made
+/// pingora fall back to `400 Bad Request: missing required Host
+/// header`.
+///
+/// Post-fix: `ngx::tls::build_sni_settings` installs a per-SNI
+/// ALPN callback that does NOT offer h2 for tunnel sites — h1
+/// only. Curl's `--http2` mode (which respects the server's ALPN
+/// advertisement) silently falls back to h1 and the request goes
+/// through.
+///
+/// This test asserts two things together:
+///
+/// 1. The end-to-end request succeeds (200) when the client tries
+///    `--http2`. Pre-fix, this was a 400.
+/// 2. The server's ALPN did NOT offer h2 — confirmed by grepping
+///    `curl -v` stderr for the `ALPN: offers ` line. We assert the
+///    string `h2` does NOT appear in the ALPN offers for the
+///    tunnel site, so the h1 path is the only one that can run.
+#[tokio::test]
+async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
+    use std::process::Stdio;
+
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // Issue a self-signed cert for `office.test` and install it in
+    // the per-test cert dir.
+    let cert_dir = ngx.cert_dir();
+    let cert_path = cert_dir.join("office.test");
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "/tmp/office_tunnel_alpn.key",
+            "-out",
+            "/tmp/office_tunnel_alpn.crt",
+            "-days",
+            "36500",
+            "-subj",
+            "/CN=office.test",
+        ])
+        .status()
+        .expect("spawn openssl");
+    assert!(status.success(), "openssl cert generation failed");
+    let key = std::fs::read_to_string("/tmp/office_tunnel_alpn.key").expect("read key");
+    let crt = std::fs::read_to_string("/tmp/office_tunnel_alpn.crt").expect("read crt");
+    std::fs::write(
+        &cert_path,
+        format!("{}\n{}", key.trim_end(), crt.trim_end()),
+    )
+    .expect("write cert blob");
+
+    // `curl -v` writes the negotiated ALPN to stderr in the form
+    //   `* ALPN: offers <proto>`
+    // (libcurl with debug builds). We use this to assert h2 was
+    // NOT offered. The `http2` flag is present so curl tries h2
+    // first; the absence of h2 in the ALPN line forces the
+    // downgrade to h1.
+    let url = format!("https://office.test:{}/api/profile?id=42", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--http2")
+        .arg("-v")
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("10")
+        .arg("--silent")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("--resolve")
+        .arg(format!("office.test:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn curl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let (body, meta) = stdout.split_once("HTTP_CODE:").unwrap_or_else(|| {
+        panic!(
+            "curl did not emit HTTP_CODE marker. exit={:?}\nstdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+            output.status,
+            ngx.log_string()
+        )
+    });
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    assert_eq!(
+        status,
+        200,
+        "h2 + tunnel site must auto-fallback to h1 and return 200; got {status}. \
+         Pre-fix this was a 400 Bad Request from pingora. \
+         body: {body}\nstderr: {stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Look for curl's ALPN negotiation line. Curl prints three
+    // forms: `ALPN, offering <proto>` (client offer),
+    // `ALPN, server accepted to use <proto>` (the one we care
+    // about — what the server picked), and (older curl)
+    // `ALPN: offers <proto>`. We must grep the "server accepted"
+    // line, not the "offering" lines, otherwise we'd match the
+    // client's own h2 offer and wrongly conclude the server
+    // offered h2.
+    let server_alpn_line = stderr
+        .lines()
+        .find(|l| l.contains("ALPN") && l.contains("server accepted"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no `ALPN, server accepted` line in curl -v output. \
+                 full stderr:\n{stderr}\nngx log:\n{}",
+                ngx.log_string()
+            )
+        });
+    // The fix's contract: the server's ALPN for a tunnel site must
+    // be http/1.1 — h2 must NOT be selected.
+    assert!(
+        server_alpn_line.contains("http/1.1"),
+        "server did not accept http/1.1 for the tunnel site; \
+         ALPN override did not work. line: {server_alpn_line}\n\
+         stderr:\n{stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        !server_alpn_line.contains("h2"),
+        "server accepted h2 for a tunnel site; ALPN override did not work. \
+         line: {server_alpn_line}\nstderr:\n{stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // Backend should have seen exactly one request with the
+    // expected path (regression for `path_and_query()`).
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have seen exactly 1 request, saw {}. ngx log:\n{}",
+        seen.len(),
+        ngx.log_string()
+    );
+    assert_eq!(seen[0].path, "/api/profile");
+    assert_eq!(seen[0].query, "id=42");
+}
+
+/// **Regression test for h2 over a non-tunnel (direct) backend:**
+/// h2 must still be advertised so the client can use multiplexing.
+///
+/// This is the symmetric counterpart to
+/// `real_e2e_h2_tunnel_auto_fallback_to_h1`. The dynamic ALPN
+/// callback must:
+///   - Not affect non-tunnel sites (still offer h2).
+///   - Still successfully proxy over h2.
+#[tokio::test]
+async fn real_e2e_h2_direct_backend_keeps_h2() {
+    use std::process::Stdio;
+
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // No `tun` here — this site has a direct backend.
+        seed_site(&conn, "direct-site", &format!("http://{backend_addr}"));
+        seed_domain(&conn, "direct.test", "direct-site");
+    })
+    .await;
+
+    // Self-signed cert for direct.test.
+    let cert_dir = ngx.cert_dir();
+    let cert_path = cert_dir.join("direct.test");
+    let status = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            "/tmp/direct_h2.key",
+            "-out",
+            "/tmp/direct_h2.crt",
+            "-days",
+            "36500",
+            "-subj",
+            "/CN=direct.test",
+        ])
+        .status()
+        .expect("spawn openssl");
+    assert!(status.success(), "openssl cert generation failed");
+    let key = std::fs::read_to_string("/tmp/direct_h2.key").expect("read key");
+    let crt = std::fs::read_to_string("/tmp/direct_h2.crt").expect("read crt");
+    std::fs::write(
+        &cert_path,
+        format!("{}\n{}", key.trim_end(), crt.trim_end()),
+    )
+    .expect("write cert blob");
+
+    // For a non-tunnel site the server's ALPN must include h2 so
+    // the browser / curl can use HTTP/2 multiplexing. With
+    // `--http2-prior-knowledge` (no ALPN upgrade dance) we
+    // exercise the h2 hot path end-to-end: the request must
+    // succeed and the backend must have seen an h2-style request
+    // (path preserved byte-exact — see PR #43 regression).
+    let url = format!("https://direct.test:{}/api/profile?id=42", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--http2")
+        .arg("--http2-prior-knowledge")
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("10")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("--resolve")
+        .arg(format!("direct.test:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn curl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let (_body, meta) = stdout.split_once("HTTP_CODE:").unwrap_or_else(|| {
+        panic!(
+            "curl did not emit HTTP_CODE marker. exit={:?}\nstdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+            output.status,
+            ngx.log_string()
+        )
+    });
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    assert_eq!(
+        status,
+        200,
+        "h2 + http-direct site must return 200. got {status}. \
+         Pre-fix-style regressions (path mangling) would 404 here. \
+         stderr: {stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1, "backend should have seen 1 request");
+    assert_eq!(
+        seen[0].path, "/api/profile",
+        "H2 path must be byte-exact (no `https://host` prefix leak). \
+         This was the bug fixed in PR #43; we keep the regression."
+    );
+    assert_eq!(seen[0].query, "id=42");
 }
 
 ///

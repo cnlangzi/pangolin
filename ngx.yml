@@ -98,11 +98,10 @@ acme:
   # table). See the v2 design doc for details.
 
 tls:
-  enable_h2: true       # advertise HTTP/2 via ALPN. Set to false if
-                        # your deploy fronts tunnel backends and you
-                        # see "400 Bad Request: missing required
-                        # Host header" in the browser. See TlsConfig
-                        # docs in crates/pangolin-core/src/config.rs.
+  enable_h2: true       # advertise HTTP/2 via ALPN for non-tunnel sites.
+                        # Tunnel sites (backend with `tun_name:` prefix) always
+                        # negotiate h1 at runtime, regardless of this field.
+                        # See TlsConfig docs in crates/pangolin-core/src/config.rs.
 
 log:
   level: debug          # env_logger filter: trace|debug|info|warn|error
