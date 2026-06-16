@@ -151,12 +151,14 @@
       '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden lg:table-cell" title="' + escapeHtml(e.client_ip) + '">' + escapeHtml(e.client_ip) + '</td>';
     // Newest-first: insert at the top of tbody.
     tbody.insertBefore(tr, tbody.firstChild);
-    // Cap the visible rows to keep the DOM bounded. The server-side
-    // buffer cap is `access_log_recent`; we mirror it on the client
-    // so a long-lived tab does not eat RAM. 1000 is the absolute
-    // max anyone would want on a screen and matches the default
-    // server cap.
-    const MAX_ROWS = 1000;
+    // Cap the visible rows to keep the DOM bounded. Issue #73
+    // specifies a hard cap of 500 lines on the /logs page to bound
+    // browser memory — this is the *client-side* cap, independent
+    // of the server's `access_log_recent` ring buffer (which sets
+    // the initial replay depth). 500 is comfortably more than a
+    // user can scan in one viewport and well under what a modern
+    // browser handles without jank.
+    const MAX_ROWS = 500;
     while (tbody.children.length > MAX_ROWS) {
       tbody.removeChild(tbody.lastChild);
     }

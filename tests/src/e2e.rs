@@ -57,14 +57,9 @@ impl MockHttpBackend {
         let requests_for_spawn = requests.clone();
 
         let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let reqs = requests_for_spawn.clone();
-                        tokio::spawn(handle_http_stream(stream, reqs));
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let reqs = requests_for_spawn.clone();
+                tokio::spawn(handle_http_stream(stream, reqs));
             }
         });
 
@@ -110,7 +105,7 @@ async fn handle_http_stream(mut stream: TcpStream, requests: Arc<Mutex<Vec<HttpR
     let first = lines.first().copied().unwrap_or("");
 
     let parts: Vec<_> = first.split_whitespace().collect();
-    let method = parts.get(0).unwrap_or(&"GET");
+    let method = parts.first().unwrap_or(&"GET");
     let path = parts.get(1).unwrap_or(&"/");
 
     let mut host = "unknown".to_string();
@@ -248,12 +243,10 @@ async fn serve_static_file(client: &mut TcpStream, file_path: &str, apply_condit
     hdr.push_str("Cache-Control: no-cache\r\n");
     hdr.push_str("\r\n");
 
-    if let Err(_) = client.write_all(hdr.as_bytes()).await {
+    if client.write_all(hdr.as_bytes()).await.is_err() {
         return;
     }
-    if let Err(_) = client.write_all(&content).await {
-        return;
-    }
+    if client.write_all(&content).await.is_err() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +265,7 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
     let first = lines.first().copied().unwrap_or("");
 
     let parts: Vec<_> = first.split_whitespace().collect();
-    let method = parts.get(0).unwrap_or(&"GET");
+    let method = parts.first().unwrap_or(&"GET");
     let req_path_raw = parts.get(1).unwrap_or(&"/");
 
     let mut host = "".to_string();

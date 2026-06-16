@@ -122,7 +122,7 @@ plain-JSON 401 body.
 | --------- | ------- | ---------- | ------------ |
 | Ring buffer | 100 | `log.access_log_recent` | Late-join replay depth |
 | Broadcast channel | 1000 | `log.access_log_capacity` | Live fan-out to slow subscribers |
-| Browser DOM rows | 1000 | (client-side, mirrors default) | `tbody.children.length` after insert |
+| Browser DOM rows | 500 | (client-side, hard-coded in `pages/logs.html`) | `tbody.children.length` after insert |
 
 `AccessLogEntry` is ~150 bytes serialised; defaults cost ≈ 15 KB (ring) +
 ≈ 150 KB (channel). A noisy proxy with 10k req/s sees each subscriber
@@ -139,7 +139,7 @@ back to a no-op when the channel is full.
 | ------- | ----- | --------------- |
 | Page shows "disconnected" red pill | `EventSource` `onerror` fired (401, network, or service restart) | Reload the page after fixing the cause |
 | Page shows "replaying…" indefinitely | Replay frames stalled mid-stream | Server bug — check `pangolin-ngx` log for `SSE: ...` warnings |
-| Rows are dropped silently (no `: lagged N events` comment) | Subscriber slower than 1000 entries between polls | Raise `log.access_log_capacity`, or fix the slow consumer (the admin UI's `MAX_ROWS` cap in `pages/logs.html` should be >> 1 ms render time) |
+| Rows are dropped silently (no `: lagged N events` comment) | Subscriber slower than 1000 entries between polls | Raise `log.access_log_capacity`, or fix the slow consumer (the admin UI's `MAX_ROWS = 500` cap in `pages/logs.html` evicts oldest rows once exceeded — server-side replay/live stream still works) |
 | No entries at all | `log.access_log_recent: 0` *and* a request was just sent | Expected. Set the key > 0. |
 
 ## References

@@ -280,11 +280,11 @@ async fn serve_admin_ui_one_shot(
         warn!("admin: write_response_header failed: {e}");
         return None;
     }
-    if !body2.is_empty() {
-        if let Err(e) = session.write_response_body(Bytes::from(body2), true).await {
-            warn!("admin: write_response_body failed: {e}");
-            return None;
-        }
+    if !body2.is_empty()
+        && let Err(e) = session.write_response_body(Bytes::from(body2), true).await
+    {
+        warn!("admin: write_response_body failed: {e}");
+        return None;
     }
     let settings = pingora::apps::HttpPersistentSettings::for_session(&session);
     match session.finish().await {

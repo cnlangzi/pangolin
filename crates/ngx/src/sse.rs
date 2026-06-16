@@ -113,20 +113,18 @@ pub async fn handle_access_log_stream(
         // is exactly the right surface for an operator debugging a
         // missing-events report.
         let comment = frame_comment("replay: empty");
-        if write_chunk(&mut session, &comment).await.is_none() {
-            return None;
-        }
+        write_chunk(&mut session, &comment).await?;
     } else {
+        // Capture the length BEFORE the `for` loop consumes the
+        // Vec — moving `snapshot` into the iterator drops the
+        // value before we can read `.len()` again.
+        let snapshot_len = snapshot.len();
         for entry in snapshot {
             let frame = frame_data(&entry);
-            if write_chunk(&mut session, &frame).await.is_none() {
-                return None;
-            }
+            write_chunk(&mut session, &frame).await?;
         }
         let comment = frame_comment(&format!("replay: done ({})", snapshot_len));
-        if write_chunk(&mut session, &comment).await.is_none() {
-            return None;
-        }
+        write_chunk(&mut session, &comment).await?;
     }
 
     // 4) Live broadcast loop.
@@ -147,9 +145,7 @@ pub async fn handle_access_log_stream(
                 // The next successful recv() will deliver the
                 // newest message the channel still has.
                 let comment = frame_comment(&format!("lagged {} events", n));
-                if write_chunk(&mut session, &comment).await.is_none() {
-                    return None;
-                }
+                write_chunk(&mut session, &comment).await?;
                 warn!("SSE: subscriber lagged by {n} events");
             }
             Err(RecvError::Closed) => {

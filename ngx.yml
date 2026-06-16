@@ -121,7 +121,7 @@ log:
   #                             comment. Default 1000.
   # Each entry is ~150 bytes serialized, so the default ring uses
   # ≈ 15 KB and the default channel ≈ 150 KB. Scale up for noisy
-  # proxies; the admin UI tab caps the visible rows at 1000 to
+  # proxies; the admin UI tab caps the visible rows at 500 to
   # keep the DOM bounded.
   access_log_recent: 100
   access_log_capacity: 1000
