@@ -208,6 +208,30 @@ fn read_header_value(req: &HttpRequest, name: &str) -> Result<String, ()> {
 //  AppProxy (pingora)
 // ─────────────────────────────────────────────────────────────────
 
+/// Per-request state for access logging (Issue #73).
+/// Captures start time, method, path, host, and backend so
+/// response_filter can construct an AccessLogEntry.
+#[derive(Debug, Clone)]
+pub struct RequestState {
+    pub start: std::time::Instant,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub backend: String, // "tun:office" | "direct:1.2.3.4:8080" | "file://..."
+}
+
+impl Default for RequestState {
+    fn default() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            method: String::new(),
+            path: String::new(),
+            host: String::new(),
+            backend: String::new(),
+        }
+    }
+}
+
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
     pub app: Arc<App>,
@@ -215,11 +239,13 @@ pub struct AppProxy {
 
 #[async_trait]
 impl ProxyHttp for AppProxy {
-    type CTX = ();
+    type CTX = RequestState;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        RequestState::default()
+    }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
         let is_upgrade = session.is_upgrade_req();
         log::debug!(
@@ -227,6 +253,12 @@ impl ProxyHttp for AppProxy {
             path,
             is_upgrade
         );
+
+        // Issue #73: capture request start time + basics for access log
+        ctx.start = std::time::Instant::now();
+        ctx.method = session.req_header().method.as_str().to_string();
+        ctx.path = path.clone();
+        ctx.host = host_from_session(session);
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
@@ -452,6 +484,13 @@ impl ProxyHttp for AppProxy {
                 let _ = session.respond_error(502).await;
                 return Ok(true);
             }
+        };
+
+        // Issue #73: record backend string for access log
+        ctx.backend = if tun_name.is_empty() {
+            format!("direct:{}", target.authority())
+        } else {
+            format!("tun:{}", tun_name)
         };
 
         // ── file:// direct (no tun) ──────────────────────────
@@ -781,10 +820,30 @@ impl ProxyHttp for AppProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
-        _upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Issue #73: construct AccessLogEntry and push to App
+        let duration_ms = ctx.start.elapsed().as_millis() as u64;
+        let status = upstream_response.status.as_u16();
+        let client_ip = session
+            .client_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let entry = pangolin_core::AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: ctx.method.clone(),
+            path: ctx.path.clone(),
+            host: ctx.host.clone(),
+            status,
+            duration_ms,
+            backend: ctx.backend.clone(),
+            client_ip,
+        };
+
+        self.app.push_access_log(entry);
         Ok(())
     }
 }

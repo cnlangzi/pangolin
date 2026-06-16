@@ -33,6 +33,7 @@ pub mod certs;
 pub mod dashboard;
 pub mod dns;
 pub mod domains;
+pub mod logs;
 pub mod sites;
 pub mod tun;
 
@@ -49,6 +50,7 @@ pub use domains::{
     DomainsEditTemplate, DomainsFormFieldsView, DomainsListTemplate, DomainsNewTemplate,
     DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
+pub use logs::LogsTemplate;
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };

@@ -1,0 +1,224 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Access Logs — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Access Logs</h1>
+      <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
+        Live tail of every proxied request — in-memory, cleared on restart
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="logs-status"
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border
+                   bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700">
+        <span id="logs-status-dot" class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+        <span id="logs-status-text">connecting…</span>
+      </span>
+      <button id="logs-clear-btn" type="button"
+              class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/>
+        </svg>
+        Clear
+      </button>
+    </div>
+  </div>
+
+  {# Live access log table — populated client-side by the #}
+  {# EventSource consumer below. Server-rendered empty so a #}
+  {# browser without JS still gets a sane skeleton.          #}
+  <div id="logs-table" class="card overflow-hidden">
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+        <thead class="bg-slate-50 dark:bg-slate-800/50">
+          <tr>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-20">Method</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-16">Status</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Host</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-40 hidden md:table-cell">Backend</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden lg:table-cell">Client</th>
+          </tr>
+        </thead>
+        <tbody id="logs-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
+          <tr id="logs-empty-row">
+            <td colspan="8" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
+              Waiting for events…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+    Showing entries pushed by the proxy. Bounded buffer (configurable via <code>log.access_log_recent</code>); live channel (configurable via <code>log.access_log_capacity</code>). Restart of <code>pangolin-ngx</code> clears everything.
+  </p>
+</main>
+
+<script>
+(function() {
+  "use strict";
+  // ── Status pill ────────────────────────────────────────────────────────
+  const statusDot = document.getElementById("logs-status-dot");
+  const statusText = document.getElementById("logs-status-text");
+  const statusPill = document.getElementById("logs-status");
+  function setStatus(state, label) {
+    if (!statusPill) return;
+    statusText.textContent = label;
+    // strip existing colour classes, then apply the right ones for state
+    statusPill.className = "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border";
+    statusDot.className = "w-1.5 h-1.5 rounded-full";
+    if (state === "live") {
+      statusPill.classList.add("bg-green-50", "dark:bg-green-900/20", "text-green-800", "dark:text-green-200", "border-green-200", "dark:border-green-800");
+      statusDot.classList.add("bg-green-500", "animate-pulse");
+    } else if (state === "replay") {
+      statusPill.classList.add("bg-blue-50", "dark:bg-blue-900/20", "text-blue-800", "dark:text-blue-200", "border-blue-200", "dark:border-blue-800");
+      statusDot.classList.add("bg-blue-500", "animate-pulse");
+    } else if (state === "error") {
+      statusPill.classList.add("bg-red-50", "dark:bg-red-900/20", "text-red-800", "dark:text-red-200", "border-red-200", "dark:border-red-800");
+      statusDot.classList.add("bg-red-500");
+    } else if (state === "closed") {
+      statusPill.classList.add("bg-slate-100", "dark:bg-slate-800", "text-slate-700", "dark:text-slate-300", "border-slate-200", "dark:border-slate-700");
+      statusDot.classList.add("bg-slate-400");
+    } else {
+      statusPill.classList.add("bg-slate-100", "dark:bg-slate-800", "text-slate-700", "dark:text-slate-300", "border-slate-200", "dark:border-slate-700");
+      statusDot.classList.add("bg-slate-400");
+    }
+  }
+
+  // ── Table helpers ──────────────────────────────────────────────────────
+  const tbody = document.getElementById("logs-tbody");
+  const emptyRow = document.getElementById("logs-empty-row");
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function statusClass(code) {
+    if (code >= 500) return "text-red-600 dark:text-red-400";
+    if (code >= 400) return "text-yellow-700 dark:text-yellow-300";
+    if (code >= 300) return "text-blue-600 dark:text-blue-400";
+    if (code >= 200) return "text-green-600 dark:text-green-400";
+    return "text-slate-600 dark:text-slate-300";
+  }
+  function methodClass(m) {
+    const M = String(m || "").toUpperCase();
+    if (M === "GET") return "text-blue-600 dark:text-blue-400";
+    if (M === "POST") return "text-emerald-600 dark:text-emerald-400";
+    if (M === "PUT" || M === "PATCH") return "text-yellow-700 dark:text-yellow-300";
+    if (M === "DELETE") return "text-red-600 dark:text-red-400";
+    return "text-slate-600 dark:text-slate-300";
+  }
+  function formatTime(iso) {
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      // YYYY-MM-DD HH:MM:SS.mmm in local time
+      const pad = (n, w) => String(n).padStart(w, "0");
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1, 2) + "-" + pad(d.getDate(), 2)
+        + " " + pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2)
+        + "." + pad(d.getMilliseconds(), 3);
+    } catch (e) { return iso; }
+  }
+  function formatDuration(ms) {
+    const n = Number(ms) || 0;
+    if (n < 1000) return n + " ms";
+    return (n / 1000).toFixed(2) + " s";
+  }
+  function appendRow(e) {
+    if (!tbody) return;
+    if (emptyRow && emptyRow.parentNode) emptyRow.parentNode.removeChild(emptyRow);
+    const tr = document.createElement("tr");
+    tr.className = "hover:bg-slate-50/60 dark:hover:bg-slate-800/40";
+    tr.innerHTML =
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400">' + escapeHtml(formatTime(e.timestamp)) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap font-semibold ' + methodClass(e.method) + '">' + escapeHtml(e.method) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap font-semibold tabular-nums ' + statusClass(e.status) + '">' + escapeHtml(String(e.status)) + '</td>' +
+      '<td class="px-4 py-2 break-all text-slate-700 dark:text-slate-200" title="' + escapeHtml(e.path) + '">' + escapeHtml(e.path) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="' + escapeHtml(e.host) + '">' + escapeHtml(e.host) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600 dark:text-slate-300">' + escapeHtml(formatDuration(e.duration_ms)) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden md:table-cell" title="' + escapeHtml(e.backend) + '">' + escapeHtml(e.backend) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden lg:table-cell" title="' + escapeHtml(e.client_ip) + '">' + escapeHtml(e.client_ip) + '</td>';
+    // Newest-first: insert at the top of tbody.
+    tbody.insertBefore(tr, tbody.firstChild);
+    // Cap the visible rows to keep the DOM bounded. The server-side
+    // buffer cap is `access_log_recent`; we mirror it on the client
+    // so a long-lived tab does not eat RAM. 1000 is the absolute
+    // max anyone would want on a screen and matches the default
+    // server cap.
+    const MAX_ROWS = 1000;
+    while (tbody.children.length > MAX_ROWS) {
+      tbody.removeChild(tbody.lastChild);
+    }
+  }
+
+  // ── Clear button (client-side only) ────────────────────────────────────
+  const clearBtn = document.getElementById("logs-clear-btn");
+  if (clearBtn && tbody) {
+    clearBtn.addEventListener("click", function() {
+      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+      if (emptyRow) {
+        // re-attach the placeholder
+        tbody.appendChild(emptyRow);
+      }
+    });
+  }
+
+  // ── EventSource consumer ───────────────────────────────────────────────
+  // The browser will automatically send the session cookie on the GET
+  // to /api/logs/stream, so no extra headers are needed. If the user
+  // is not authenticated, the endpoint returns 401 and EventSource
+  // will keep retrying — we surface that as a red status pill.
+  let es = null;
+  function connect() {
+    setStatus("replay", "replaying…");
+    es = new EventSource("/api/logs/stream");
+    es.onopen = function() {
+      // "open" fires *before* any data, so the first frame(s) you see
+      // are the replay from the bounded ring buffer. Switch to "replay"
+      // first, then "live" once the server emits a "replay: done"
+      // comment (handled by onmessage on the "comment" pseudo-event).
+      // For simplicity we just call it "live" on open since the
+      // replay frames arrive immediately and the user can't tell the
+      // difference.
+      setStatus("live", "live");
+    };
+    es.onerror = function() {
+      // EventSource auto-retries; surface the problem so the operator
+      // knows the stream is broken. 401 keeps the page on a red
+      // "disconnected" state until the user re-logs in and reloads.
+      setStatus("error", "disconnected");
+    };
+    es.onmessage = function(ev) {
+      // Each `data:` frame is one JSON access log entry. The SSE
+      // comment frames (`: replay: done`, `: lagged N events`,
+      // `: closed`) are also delivered as `message` events with
+      // a non-JSON `data` field; we ignore those by trying to
+      // parse and falling through on failure.
+      let entry = null;
+      try { entry = JSON.parse(ev.data); } catch (e) { return; }
+      if (!entry || typeof entry !== "object") return;
+      if (typeof entry.method !== "string" || typeof entry.path !== "string") return;
+      appendRow(entry);
+    };
+    // Listen for explicit server-side "replay done" / "closed" hints
+    // (we emit them as JSON-shaped status frames so the message
+    // handler can also pick them up). Comments starting with `:` are
+    // not delivered to onmessage by default; the standard SSE spec
+    // treats them as ignored-by-EventSource. We don't have a custom
+    // event name, so we just rely on the JSON shape.
+  }
+  connect();
+})();
+</script>
+{% endblock %}
