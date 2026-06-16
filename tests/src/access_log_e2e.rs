@@ -48,6 +48,8 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use pangolin_core::db;
+use pangolin_core::types::{Domain, HostMode, Site};
 use reqwest::Client;
 use rusqlite::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,24 +60,44 @@ use crate::admin_harness::AdminClient;
 use crate::harness::{NgxProcess, init_pangolin_db, raw_request};
 
 // ─────────────────────────────────────────────────────────────────
-// DB seed helpers
+// DB seed helpers — thin wrappers over `pangolin_core::db::upsert_*`
+// so the test stays in lock-step with the canonical column set
+// (schema additions land in db.rs, not here).
 // ─────────────────────────────────────────────────────────────────
 
 fn seed_site(conn: &Connection, name: &str, backend: &str) {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
-         VALUES (?1, ?2, 1, 'passthrough', NULL, ?3, ?3)",
-        rusqlite::params![name, backend, now],
+    let now = Utc::now();
+    db::upsert_site(
+        conn,
+        &Site {
+            name: name.into(),
+            backend: backend.into(),
+            enabled: true,
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            created_at: now,
+            updated_at: now,
+            domain_count: 0,
+        },
     )
     .expect("insert site");
 }
 
 fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO domains (domain, site_name, enabled, created_at) VALUES (?1, ?2, 1, ?3)",
-        rusqlite::params![domain, site_name, now],
+    db::upsert_domain(
+        conn,
+        &Domain {
+            domain: domain.into(),
+            site_name: site_name.into(),
+            enabled: true,
+            auto_issue: false,
+            dns_provider: None,
+            // PR #71 added per-domain challenge_kind. Tests don't
+            // exercise ACME issuance, so `None` (auto-default) is
+            // the correct seed value.
+            challenge_kind: None,
+            created_at: Utc::now(),
+        },
     )
     .expect("insert domain");
 }

@@ -66,7 +66,7 @@ pub async fn handle_access_log_stream(
 
     // 2) SSE prelude.
     let status = http::StatusCode::OK;
-    let mut builder = http::Response::builder()
+    let builder = http::Response::builder()
         .status(status)
         // text/event-stream is the SSE content type per the WHATWG
         // server-sent events spec. charset=utf-8 is implicit but
@@ -83,13 +83,12 @@ pub async fn handle_access_log_stream(
         // we set it explicitly because some intermediaries drop the
         // connection otherwise.
         .header("Connection", "keep-alive");
-    // Use chunked transfer encoding so we can write frames over
-    // time. pingora sets this automatically when the body is
-    // streamed via write_response_body(.., false), but writing
-    // `Transfer-Encoding: chunked` here makes it explicit (and
-    // covers the HTTP/2 framing case where there's no chunked
-    // header but framing still happens via DATA frames).
-    builder = builder.header("Transfer-Encoding", "chunked");
+    // We deliberately do NOT set `Transfer-Encoding: chunked` here.
+    // Pingora sets it automatically when the body is streamed via
+    // `write_response_body(.., false)`. On HTTP/2 the header is
+    // forbidden entirely (HTTP/2 frames its own body), so setting
+    // it explicitly risks an "illegal connection-specific header"
+    // rejection from pingora's h2 layer.
 
     let resp: http::Response<()> = match builder.body(()) {
         Ok(r) => r,
@@ -105,35 +104,49 @@ pub async fn handle_access_log_stream(
         return None;
     }
 
-    // 3) Replay the ring buffer (oldest first).
+    // 3) Subscribe FIRST, then snapshot. Subscribing first guarantees
+    //    we capture every entry pushed from this moment forward; the
+    //    snapshot then covers everything pushed before. The window
+    //    between the two operations can produce at most one DUPLICATE
+    //    per entry (snapshot saw it AND the channel later delivers
+    //    it), never a gap — which is the correct trade-off for an
+    //    operator viewer ("show me everything, possibly with brief
+    //    duplicates" beats "show me almost everything").
+    //
+    //    The previous order (snapshot → subscribe) had a TOCTOU race:
+    //    entries pushed between the two calls were in neither the
+    //    snapshot nor the live stream and were silently lost.
+    let mut rx = app.access_log_tx.subscribe();
     let snapshot = app.recent_access_log();
     if snapshot.is_empty() {
         // Tell the client there is no replay. SSE comments are
         // ignored by `EventSource` but visible in devtools, which
         // is exactly the right surface for an operator debugging a
         // missing-events report.
-        let comment = frame_comment("replay: empty");
-        write_chunk(&mut session, &comment).await?;
+        write_chunk(&mut session, frame_comment("replay: empty")).await?;
     } else {
         // Capture the length BEFORE the `for` loop consumes the
         // Vec — moving `snapshot` into the iterator drops the
         // value before we can read `.len()` again.
         let snapshot_len = snapshot.len();
         for entry in snapshot {
-            let frame = frame_data(&entry);
-            write_chunk(&mut session, &frame).await?;
+            write_chunk(&mut session, frame_data(&entry)).await?;
         }
-        let comment = frame_comment(&format!("replay: done ({})", snapshot_len));
-        write_chunk(&mut session, &comment).await?;
+        write_chunk(
+            &mut session,
+            frame_comment(&format!("replay: done ({})", snapshot_len)),
+        )
+        .await?;
     }
 
     // 4) Live broadcast loop.
-    let mut rx = app.access_log_tx.subscribe();
     loop {
         match rx.recv().await {
             Ok(entry) => {
-                let frame = frame_data(&entry);
-                if write_chunk(&mut session, &frame).await.is_none() {
+                if write_chunk(&mut session, frame_data(&entry))
+                    .await
+                    .is_none()
+                {
                     // Client disconnected.
                     debug!("SSE: client disconnected, stopping live tail");
                     return None;
@@ -144,14 +157,13 @@ pub async fn handle_access_log_stream(
                 // (browsers ignore these, devtools shows them).
                 // The next successful recv() will deliver the
                 // newest message the channel still has.
-                let comment = frame_comment(&format!("lagged {} events", n));
-                write_chunk(&mut session, &comment).await?;
+                write_chunk(&mut session, frame_comment(&format!("lagged {} events", n))).await?;
                 warn!("SSE: subscriber lagged by {n} events");
             }
             Err(RecvError::Closed) => {
                 // Broadcast channel closed (app shutdown). Send a
                 // terminal comment and end the stream cleanly.
-                let _ = write_chunk(&mut session, &frame_comment("closed")).await;
+                let _ = write_chunk(&mut session, frame_comment("closed")).await;
                 break;
             }
         }
@@ -170,39 +182,51 @@ pub async fn handle_access_log_stream(
 
 /// Build an SSE `data:` frame for one access log entry.
 ///
+/// Returns owned `Bytes` (not `Vec<u8>`) so the caller can hand it
+/// straight to `session.write_response_body` without an extra copy.
 /// The JSON is serialised inline (no extra newline escapes needed
 /// because serde_json does not emit raw newlines inside a string
 /// — only escaped `\n` characters, which are valid in an SSE
 /// `data:` frame).
-fn frame_data(entry: &AccessLogEntry) -> Vec<u8> {
+fn frame_data(entry: &AccessLogEntry) -> Bytes {
     let json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
     let mut buf = Vec::with_capacity(json.len() + 8);
     buf.extend_from_slice(b"data: ");
     buf.extend_from_slice(json.as_bytes());
     buf.extend_from_slice(b"\n\n");
-    buf
+    // `Bytes::from(Vec)` transfers ownership of the heap allocation
+    // — no copy. The previous `Vec<u8>` + `Bytes::copy_from_slice`
+    // in `write_chunk` allocated twice per frame per subscriber.
+    Bytes::from(buf)
 }
 
 /// Build an SSE comment frame. Comments start with `:` and are
 /// ignored by the browser's `EventSource` handler. Useful for
 /// operator-visible diagnostics (replay size, lagged counts, etc.)
 /// without polluting the data stream.
-fn frame_comment(msg: &str) -> Vec<u8> {
+fn frame_comment(msg: &str) -> Bytes {
     let mut buf = Vec::with_capacity(msg.len() + 4);
     buf.extend_from_slice(b": ");
     buf.extend_from_slice(msg.as_bytes());
     buf.extend_from_slice(b"\n\n");
-    buf
+    Bytes::from(buf)
 }
 
 /// Write one SSE chunk to the wire. Returns `None` if the write
 /// failed (client disconnect / network error); the caller should
-/// treat that as "stream done".
-async fn write_chunk(session: &mut ServerSession, bytes: &[u8]) -> Option<()> {
-    session
-        .write_response_body(Bytes::copy_from_slice(bytes), false)
-        .await
-        .ok()
+/// treat that as "stream done". The underlying `io::Error` is
+/// logged at `debug!` level so a production debug session can see
+/// the actual cause (EPIPE / ECONNRESET / buffer full) — losing
+/// the error silently was a real maintenance hazard for SSE
+/// connection-drop investigations.
+async fn write_chunk(session: &mut ServerSession, bytes: Bytes) -> Option<()> {
+    match session.write_response_body(bytes, false).await {
+        Ok(()) => Some(()),
+        Err(e) => {
+            debug!("SSE: write_response_body failed: {e}");
+            None
+        }
+    }
 }
 
 /// Write a 401 HTML response for unauthenticated SSE requests.
