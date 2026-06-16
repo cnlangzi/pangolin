@@ -1,0 +1,451 @@
+//! Server-Sent Events (SSE) and streaming-response e2e tests
+//! through the tunnel.
+//!
+//! Background: the standard HTTP path in
+//! `crates/tun/src/client.rs::handle_http_request` buffers the
+//! entire response body in memory via
+//! `encode_http_response(HttpResponse { body: Vec<u8>, ... })`
+//! and reads `Content-Length` / `Transfer-Encoding: chunked` to
+//! completion before the ngx side can write a single byte to
+//! the client. For an SSE stream (`Content-Type:
+//! text/event-stream`, infinite chunked response), the body
+//! never ends, so the buffering path deadlocks.
+//!
+//! Fix: ngx detects SSE (via `is_streaming_request` in
+//! `pangolin-core::proxy`) and sets `is_streaming: true` on the
+//! `TunnelHttpFrame`. The tun side dispatches the request to
+//! `handle_streaming_response`, which connects to the backend
+//! over plain TCP, sends the request bytes, and uses
+//! `tokio::io::copy_bidirectional` to relay bytes as they
+//! arrive — the same pattern as `pump_ws_relay` for WebSocket.
+//!
+//! These tests exercise that path end-to-end: real `pangolin-ngx`
+//! + real `pangolin-tun` binaries + a mock SSE backend.
+
+use std::time::Duration;
+
+use chrono::Utc;
+use rusqlite::Connection;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::time::timeout;
+
+use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
+
+// ---------------------------------------------------------------------------
+// DB seed helpers (copied from real_e2e to keep sse_e2e self-contained;
+// cross-module access would require exposing them as `pub`).
+// ---------------------------------------------------------------------------
+
+fn seed_site(conn: &Connection, name: &str, backend: &str) {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+         VALUES (?1, ?2, 1, 'passthrough', NULL, ?3, ?3)",
+        rusqlite::params![name, backend, now],
+    )
+    .expect("insert site");
+}
+
+fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO domains (domain, site_name, enabled, created_at) VALUES (?1, ?2, 1, ?3)",
+        rusqlite::params![domain, site_name, now],
+    )
+    .expect("insert domain");
+}
+
+fn seed_tun(conn: &Connection, name: &str, enabled: bool) {
+    let now = Utc::now().to_rfc3339();
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"test-token");
+    let hash = format!("{:x}", h.finalize());
+    conn.execute(
+        "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
+         VALUES (?1, 'test-token', ?2, ?3, 0, ?4, ?4, NULL)",
+        rusqlite::params![name, hash, enabled as i32, now],
+    )
+    .expect("insert tun");
+}
+
+// ---------------------------------------------------------------------------
+// Mock SSE backend — sends a finite (but multi-event) SSE response.
+// ---------------------------------------------------------------------------
+
+/// Mock backend that replies with `text/event-stream` and emits
+/// `N` events before closing the connection. Records that it
+/// saw the request so the test can assert the request actually
+/// reached the backend (catches regressions where the request
+/// is dropped on the wire).
+struct SseBackend {
+    addr: String,
+    seen: std::sync::Arc<tokio::sync::Mutex<bool>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl SseBackend {
+    /// Start a backend that emits `n_events` SSE messages,
+    /// spaced `event_spacing` apart, then closes the response
+    /// cleanly (the last chunk is `0\r\n\r\n` for chunked).
+    async fn start(n_events: usize, event_spacing: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(false));
+        let seen_for_task = seen.clone();
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            // Mark that the backend received the request.
+            *seen_for_task.lock().await = true;
+
+            // Send SSE response headers (chunked transfer-encoding
+            // because we don't know the body length up front — this
+            // is the canonical SSE wire format).
+            let headers = "HTTP/1.1 200 OK\r\n\
+                           Content-Type: text/event-stream\r\n\
+                           Cache-Control: no-cache\r\n\
+                           Connection: close\r\n\
+                           Transfer-Encoding: chunked\r\n\
+                           \r\n";
+            if stream.write_all(headers.as_bytes()).await.is_err() {
+                return;
+            }
+            if stream.flush().await.is_err() {
+                return;
+            }
+
+            // Emit N events, each as its own chunk so we can verify
+            // that the **bytes arrive incrementally** through the
+            // tunnel (the buffering path would never reach the client
+            // because it would wait for the body to complete).
+            for i in 0..n_events {
+                let payload = format!("data: event {i}\n\n");
+                let chunk = format!("{:x}\r\n{}\r\n", payload.len(), payload);
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                if stream.flush().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(event_spacing).await;
+            }
+            // Terminate the chunked response cleanly.
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.flush().await;
+        });
+
+        Self { addr, seen, handle }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    async fn seen_request(&self) -> bool {
+        *self.seen.lock().await
+    }
+}
+
+impl Drop for SseBackend {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP/1.1 client that **does not** close the response on EOF —
+// reads incrementally and returns the bytes received within `within`.
+// ---------------------------------------------------------------------------
+
+/// Read raw bytes from `addr` after sending a request with
+/// `Accept: text/event-stream`. Returns the bytes received
+/// within `within` (must be > total time the backend takes to
+/// emit all events; for a real infinite stream we'd never
+/// reach EOF, but the mock backend closes the chunked
+/// response cleanly).
+async fn raw_sse_request(
+    addr: &str,
+    host: &str,
+    path: &str,
+    within: Duration,
+) -> (u16, String, String) {
+    let mut stream = timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("connect (5s)")
+        .expect("connect");
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Connection: close\r\n\
+         Accept: text/event-stream\r\n\
+         User-Agent: pangolin-e2e-sse\r\n\
+         \r\n"
+    );
+    stream.write_all(req.as_bytes()).await.expect("write req");
+    stream.flush().await.expect("flush req");
+
+    // Read header section (until \r\n\r\n).
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1];
+    loop {
+        match timeout(within, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break, // EOF
+            Ok(Ok(_)) => {
+                buf.push(tmp[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("read error: {e}"),
+            Err(_) => panic!("read header timeout (>{within:?})"),
+        }
+    }
+    let header_bytes = buf.clone();
+    let header_str = String::from_utf8_lossy(&header_bytes).into_owned();
+
+    // Parse status line.
+    let status_line = header_str.lines().next().unwrap_or("").to_string();
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Read body bytes until EOF or timeout. For SSE we expect
+    // the backend to close after the last event, so EOF is
+    // the natural terminator.
+    let mut body = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match timeout(within, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+            Ok(Err(e)) => panic!("body read error: {e}"),
+            Err(_) => break, // timeout: streaming ended or hung
+        }
+    }
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+    (status, header_str, body_str)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// **SSE through the tunnel path.**
+///
+/// Pre-fix behavior: the standard HTTP path would buffer the
+/// entire chunked body in `HttpResponse.body: Vec<u8>` and
+/// never return — the client would hang for 5 s and the test
+/// would fail with a read timeout. The mock backend emits
+/// events on a 50 ms cadence, so a working streaming path
+/// must see all events arrive well within the 2 s test
+/// budget.
+///
+/// Post-fix behavior: `is_streaming_request` matches the
+/// `Accept: text/event-stream` header, ngx sets
+/// `is_streaming = true` on the frame, the tun dispatches
+/// to `handle_streaming_response`, and bytes are relayed
+/// through `copy_bidirectional` as they arrive.
+#[tokio::test]
+async fn real_e2e_tunnel_sse_streams_through() {
+    let backend = SseBackend::start(3, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "sse", true);
+        seed_site(&conn, "sse-site", &format!("sse:http://{backend_addr}"));
+        seed_domain(&conn, "sse.test", "sse-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "sse", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // The whole interaction must complete in well under the
+    // pre-fix deadlock time (5 s read timeout in the raw
+    // helper). 2 s is generous: 3 events × 50 ms + 1 s
+    // safety margin.
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse.test", "/events", Duration::from_secs(2)).await;
+
+    assert_eq!(
+        status,
+        200,
+        "SSE request must return 200 through tunnel, got {status}. \
+         headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type must be text/event-stream, got headers: {headers:?}"
+    );
+
+    // The body must contain all three events in order.
+    // Pre-fix: empty body (buffered, never returned). Post-fix:
+    // all three events streamed through.
+    for i in 0..3 {
+        let expected = format!("data: event {i}");
+        assert!(
+            body.contains(&expected),
+            "SSE body missing event {i}, got: {body:?}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+
+    // Sanity: the backend actually received the request. A
+    // pre-fix deadlock on the **request** side (broken
+    // `is_streaming` flag, or routing the request through the
+    // standard HTTP path) would never reach the backend.
+    assert!(
+        backend.seen_request().await,
+        "SSE backend never received the request — the request \
+         was either dropped or routed through the wrong path. \
+         ngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// **SSE through a tunnel where the backend URL contains a hostname**
+/// (not a bare IP address).
+///
+/// ## Regression test for `SocketAddr::parse()` bug
+///
+/// Pre-fix, `handle_streaming_response` in `crates/tun/src/client.rs`
+/// used `SocketAddr::parse()` to convert the backend authority string
+/// to a `SocketAddr`.  `SocketAddr::parse()` is purely syntactic and
+/// only accepts numeric IP:PORT strings such as `127.0.0.1:9020`.
+/// When the backend URL contained a hostname (e.g. `localhost:PORT` or
+/// `myserver.internal:8080`) the parse returned an error and the
+/// function immediately sent a 502 back into the yamux stream,
+/// without ever connecting to the backend.
+///
+/// This caused a protocol de-synchronisation: ngx was trying to read
+/// an HTTP response head from the yamux stream, but the tun had already
+/// written the synth-502 body bytes into it, so ngx saw an
+/// `UnexpectedEof` / "connection reset" and surfaced a 502 Bad Gateway
+/// to the end client.
+///
+/// The fix replaces `SocketAddr::parse()` with
+/// `tokio::net::lookup_host()`, which performs a real DNS lookup before
+/// connecting.  The same fix was applied to `handle_ws_upgrade`.
+///
+/// ## What this test does
+///
+/// Seeds the site backend as `sse-hostname-tun:http://localhost:<port>`
+/// (hostname, not `127.0.0.1:<port>`).  The mock SSE backend listens
+/// on `127.0.0.1:<port>`.  On a post-fix binary, `tokio::net::lookup_host`
+/// resolves `localhost` → `127.0.0.1` and the SSE stream flows through.
+/// On a pre-fix binary, the parse would fail immediately with a 502.
+#[tokio::test]
+async fn real_e2e_tunnel_sse_hostname_backend() {
+    // Start a mock SSE backend on a random port.
+    let backend = SseBackend::start(3, Duration::from_millis(50)).await;
+    let backend_port = backend
+        .addr()
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("port from addr");
+
+    // Seed the site using "localhost" (hostname) instead of "127.0.0.1".
+    // This is the key difference that triggered the SocketAddr::parse bug.
+    let backend_url = format!("localhost:{}", backend_port);
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "sse-hostname", true);
+        seed_site(
+            &conn,
+            "sse-hostname-site",
+            &format!("sse-hostname:http://{backend_url}"),
+        );
+        seed_domain(&conn, "sse-hostname.test", "sse-hostname-site");
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "sse-hostname", "test-token").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Must complete well within pre-fix deadlock time.
+    let (status, headers, body) = raw_sse_request(
+        &addr,
+        "sse-hostname.test",
+        "/events",
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        200,
+        "SSE with hostname backend must return 200 (pre-fix would 502). \
+         headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type must be text/event-stream, got headers: {headers:?}"
+    );
+    for i in 0..3 {
+        let expected = format!("data: event {i}");
+        assert!(
+            body.contains(&expected),
+            "SSE body missing event {i}, got: {body:?}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+    assert!(
+        backend.seen_request().await,
+        "SSE backend never received a request through the hostname backend. \
+         ngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// **`is_streaming_request` detection unit test (pangolin-core).**
+///
+/// Verifies the heuristics directly without spawning binaries.
+#[test]
+fn is_streaming_request_detects_text_event_stream() {
+    use pangolin_core::is_streaming_request;
+    use pangolin_core::tunnel::HttpRequest;
+
+    let mk = |accept: &str| HttpRequest {
+        method: "GET".into(),
+        target: "/events".into(),
+        version: "HTTP/1.1".into(),
+        headers: vec![("Accept".into(), accept.into())],
+        body: vec![],
+    };
+
+    assert!(is_streaming_request(&mk("text/event-stream")));
+    assert!(is_streaming_request(&mk("*/*, text/event-stream")));
+    assert!(is_streaming_request(&mk("TEXT/EVENT-STREAM")));
+    assert!(!is_streaming_request(&mk("application/json")));
+
+    let no_accept = HttpRequest {
+        method: "GET".into(),
+        target: "/".into(),
+        version: "HTTP/1.1".into(),
+        headers: vec![("Host".into(), "x.test".into())],
+        body: vec![],
+    };
+    assert!(!is_streaming_request(&no_accept));
+}

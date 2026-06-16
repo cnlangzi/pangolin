@@ -101,7 +101,17 @@ pub trait BackendExecutor: Send + Sync {
 
 /// Send a request through a live `YamuxTunnel`. Encodes a
 /// `TunnelHttpFrame` (carrying host_mode, host_custom,
-/// is_upgrade) and waits for the matching response.
+/// is_upgrade, is_streaming) and waits for the matching
+/// response.
+///
+/// `is_streaming` is currently only used as a **routing flag**
+/// on the tun side: when set, the tun dispatches to
+/// `handle_streaming_response` (byte-relay path) instead of
+/// `handle_http_request` (buffered `HttpResponse` path). The
+/// executor still reads back a full `HttpResponse` from the
+/// yamux stream, because the byte-relay path on the tun side
+/// terminates the stream cleanly after the response — the
+/// protocol surface is unchanged.
 pub struct YamuxTunnelExecutor<'a> {
     pub tunnel: &'a pangolin_core::YamuxTunnel,
 }
@@ -116,12 +126,19 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
         host_custom: Option<String>,
     ) -> Result<HttpResponse, ProxyError> {
         let is_upgrade = is_ws_upgrade(&request);
+        // The buffered tunnel executor never carries a streaming
+        // request — the SSE / streaming path short-circuits in
+        // `request_filter` and constructs its own frame directly
+        // with `is_streaming = true`. Hardcoding `false` here
+        // avoids a per-request header scan for a value that is
+        // provably always false on this code path.
         let frame = TunnelHttpFrame {
             request,
             target: target.clone(),
             host_mode,
             host_custom,
             is_upgrade,
+            is_streaming: false,
         };
         let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
 
@@ -254,6 +271,31 @@ impl ProxyHttp for AppProxy {
             }
         }
 
+        // ── SSE / streaming response short-circuit ────────────
+        // Detected up-front (before site lookup) so we can pick
+        // the byte-relay path on both ends. The heuristic is
+        // intentionally conservative: only `text/event-stream`
+        // is matched today. Add new patterns to
+        // `pangolin_core::is_streaming_request` to extend.
+        //
+        // NOTE: this iterates over *all* request headers (not
+        // just the first Accept/Content-Type) so it matches
+        // multi-value Accept headers that HTTP/2 clients may
+        // send. Keep the semantics aligned with
+        // `pangolin_core::is_streaming_request` — see
+        // `is_streaming_request_detects_text_event_stream`.
+        let is_streaming = session.req_header().headers.iter().any(|(k, v)| {
+            let name = k.as_str();
+            (name.eq_ignore_ascii_case("Accept") || name.eq_ignore_ascii_case("Content-Type"))
+                && v.to_str()
+                    .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
+                    .unwrap_or(false)
+        });
+
+        if is_streaming {
+            return handle_streaming_request(&self.app, session).await;
+        }
+
         // ── WebSocket upgrade short-circuit ────────────────────
         if is_upgrade && path == self.app.ws_path {
             let host = host_from_session(session);
@@ -311,6 +353,7 @@ impl ProxyHttp for AppProxy {
                     host_mode: HostMode::Passthrough,
                     host_custom: None,
                     is_upgrade: true,
+                    is_streaming: false,
                 };
 
                 let tunnel = {
@@ -496,20 +539,13 @@ impl ProxyHttp for AppProxy {
             // — for file:// backends we use the **original**
             // path (so `serve_file_target` can extract it),
             // while for http/https we use the joined full URL.
-            let target_for_request = match &target {
-                BackendTarget::Http { .. } | BackendTarget::Https { .. } => None,
-                BackendTarget::File { .. } => Some(req_path.clone()),
-            };
-            let _ = target_for_request; // not used; we keep
-            // the construction below
-            // for clarity.
             let target_url = match &target {
                 BackendTarget::Http {
                     host,
                     port,
                     base_path,
                 } => format!(
-                    "http://{}:{}{}{}",
+                    "http://{}:{}{}",
                     host,
                     port,
                     if base_path.is_empty() {
@@ -517,14 +553,13 @@ impl ProxyHttp for AppProxy {
                     } else {
                         format!("{}{}", base_path.trim_end_matches('/'), req_path)
                     },
-                    ""
                 ),
                 BackendTarget::Https {
                     host,
                     port,
                     base_path,
                 } => format!(
-                    "https://{}:{}{}{}",
+                    "https://{}:{}{}",
                     host,
                     port,
                     if base_path.is_empty() {
@@ -532,7 +567,6 @@ impl ProxyHttp for AppProxy {
                     } else {
                         format!("{}{}", base_path.trim_end_matches('/'), req_path)
                     },
-                    ""
                 ),
                 BackendTarget::File { doc_root } => {
                     // For file:// the tun will parse
@@ -578,6 +612,7 @@ impl ProxyHttp for AppProxy {
                 host_mode: site.host_mode,
                 host_custom: site.host_custom.clone(),
                 is_upgrade: false,
+                is_streaming: false,
             };
             let exec = YamuxTunnelExecutor { tunnel: &tunnel };
             match exec
@@ -752,6 +787,308 @@ impl ProxyHttp for AppProxy {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Handle a streaming (SSE / long-lived chunked) request over
+/// the tunnel.
+///
+/// Mirrors the WebSocket relay at the top of `request_filter`:
+///   1. Site lookup → determine the tun name + backend URL.
+///   2. Open a yamux stream to the tun.
+///   3. Write the `TunnelHttpFrame` (with `is_streaming = true`).
+///   4. Read the response **header** off the yamux stream —
+///      just the HTTP head (status line + headers), no body
+///      length required because we are going to stream the
+///      body. The tun side writes the head, then the body
+///      bytes are relayed verbatim from the backend TCP
+///      socket by `handle_streaming_response` in the tun
+///      binary.
+///   5. Send the response head to the client, then
+///      `copy_bidirectional` between the yamux stream and
+///      the client session until either side closes.
+///
+/// This mirrors what `handle_ws_upgrade` does in the tun:
+/// both sides treat the yamux stream as a transparent byte
+/// pipe once the handshake is done.
+async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bool> {
+    let host = host_from_session(session);
+
+    let indexes = app.indexes.read().await;
+    let site = match pangolin_core::index::lookup_site(&indexes, &host) {
+        Some(s) => s.clone(),
+        None => {
+            debug!("SSE: no site for host {}", host);
+            let _ = session.respond_error(404).await;
+            return Ok(true);
+        }
+    };
+    drop(indexes);
+
+    let (tun_name, target) = match parse_backend_to_target(&site.backend) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("SSE: invalid backend for {}: {}", site.name, e);
+            let _ = session.respond_error(502).await;
+            return Ok(true);
+        }
+    };
+
+    if tun_name.is_empty() {
+        // Streaming is a tunnel-only feature for now — direct
+        // backends should still work, but the buffering path
+        // (which we explicitly bypassed up front) needs a
+        // non-tunnel implementation. We do not have one yet;
+        // return 501 to surface that the feature is
+        // tunnel-only.
+        warn!(
+            "SSE: no tun configured for {} (streaming is tunnel-only)",
+            host
+        );
+        let _ = session.respond_error(501).await;
+        return Ok(true);
+    }
+
+    if matches!(target, BackendTarget::File { .. }) {
+        // File:// backends over a tunnel are technically
+        // supported (the tun can serve files), but streaming
+        // makes no sense for a single-file response. Bail.
+        let _ = session.respond_error(400).await;
+        return Ok(true);
+    }
+
+    let tunnel = {
+        let sessions = app.tun_sessions.read().await;
+        sessions.get(&tun_name).cloned()
+    };
+    let Some(tunnel) = tunnel else {
+        warn!("SSE: tun {} not online", tun_name);
+        let _ = session.respond_error(503).await;
+        return Ok(true);
+    };
+
+    info!("Tunnel SSE relay: {} → tun {}", host, tun_name);
+
+    // Build the request — same URL construction as the buffered
+    // tunnel path, so path-prefix joining and host header rules
+    // are identical.
+    let path_and_query = session
+        .req_header()
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let req_path = if path_and_query.starts_with('/') {
+        path_and_query
+    } else {
+        format!("/{}", path_and_query)
+    };
+
+    // For the frame, the tun reads `request.target` to find
+    // the URL it must dial. We follow the same convention as
+    // the buffered tunnel path: full URL for http/https, the
+    // original path for file://.
+    let req_target = match &target {
+        BackendTarget::File { .. } => req_path.clone(),
+        BackendTarget::Http {
+            host,
+            port,
+            base_path,
+        } => format!(
+            "http://{}:{}{}",
+            host,
+            port,
+            if base_path.is_empty() {
+                req_path.clone()
+            } else {
+                format!("{}{}", base_path.trim_end_matches('/'), req_path)
+            }
+        ),
+        BackendTarget::Https {
+            host,
+            port,
+            base_path,
+        } => format!(
+            "https://{}:{}{}",
+            host,
+            port,
+            if base_path.is_empty() {
+                req_path.clone()
+            } else {
+                format!("{}{}", base_path.trim_end_matches('/'), req_path)
+            }
+        ),
+    };
+
+    let req = match build_request_from_session(session, &req_target).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("SSE: build request: {}", e);
+            let _ = session.respond_error(500).await;
+            return Ok(true);
+        }
+    };
+
+    let frame = TunnelHttpFrame {
+        request: req,
+        target: target.clone(),
+        host_mode: site.host_mode,
+        host_custom: site.host_custom.clone(),
+        is_upgrade: false,
+        is_streaming: true,
+    };
+
+    let mut yamux_stream = match tunnel.open_stream().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("SSE: open yamux stream: {}", e);
+            let _ = session.respond_error(502).await;
+            return Ok(true);
+        }
+    };
+
+    // Write the frame (length-prefixed). Same wire format as
+    // the buffered path.
+    let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
+    let len = bytes.len() as u32;
+    if let Err(e) = async {
+        use tokio::io::AsyncWriteExt;
+        yamux_stream.write_all(&len.to_be_bytes()).await?;
+        yamux_stream.write_all(&bytes).await?;
+        yamux_stream.flush().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await
+    {
+        warn!("SSE: write frame: {}", e);
+        let _ = session.respond_error(502).await;
+        return Ok(true);
+    }
+
+    // Read the response head off the yamux stream. The tun
+    // writes the head as soon as the backend has produced
+    // it, then relays body bytes. We do not require a length
+    // prefix here: we just scan for the CRLFCRLF delimiter.
+    use tokio::io::AsyncReadExt;
+    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 1024];
+    let header_read = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let n = yamux_stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err::<usize, std::io::Error>(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "tun closed before sending response head",
+                ));
+            }
+            header_buf.extend_from_slice(&tmp[..n]);
+            if let Some(idx) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(idx + 4);
+            }
+            if header_buf.len() > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "response head >64 KiB without CRLFCRLF",
+                ));
+            }
+        }
+    })
+    .await;
+    let head_end = match header_read {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            warn!("SSE: read response head: {}", e);
+            let _ = session.respond_error(502).await;
+            return Ok(true);
+        }
+        Err(_) => {
+            warn!("SSE: read response head timeout (60s)");
+            let _ = session.respond_error(504).await;
+            return Ok(true);
+        }
+    };
+
+    // Parse the status line + headers. We need a ResponseHeader
+    // that pingora can write to the client.
+    let head_str = match std::str::from_utf8(&header_buf[..head_end]) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("SSE: response head is not valid UTF-8: {}", e);
+            let _ = session.respond_error(502).await;
+            return Ok(true);
+        }
+    };
+    let mut status: u16 = 502;
+    let mut resp_headers: Vec<(String, String)> = Vec::new();
+    {
+        let mut lines = head_str.split("\r\n");
+        if let Some(status_line) = lines.next() {
+            // "HTTP/1.1 200 OK"
+            let mut parts = status_line.splitn(3, ' ');
+            let _ = parts.next();
+            if let Some(code) = parts.next() {
+                status = code.parse().unwrap_or(502);
+            }
+        }
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                resp_headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+    }
+
+    let mut hdr = match ResponseHeader::build(status, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("SSE: build response header: {}", e);
+            let _ = session.respond_error(502).await;
+            return Ok(true);
+        }
+    };
+    // `append_header` is the multi-value-safe variant (see
+    // `real_e2e_tunnel_preserves_multiple_set_cookie`). It takes
+    // owned `String` values, so we hand it clones of the (k, v)
+    // pairs directly — the borrow on `resp_headers` only needs
+    // to last for the iteration, not for the call.
+    for (k, v) in &resp_headers {
+        let _ = hdr.append_header(k.clone(), v.clone());
+    }
+    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+        error!("SSE: write response header: {}", e);
+        return Ok(true);
+    }
+
+    // Stream body bytes: yamux → client. We do not await
+    // EOF — the next "tun wrote nothing for a while" or
+    // client-close triggers a graceful return.
+    let mut buf = [0u8; 8192];
+    loop {
+        match yamux_stream.read(&mut buf).await {
+            Ok(0) => break, // tun closed the stream
+            Ok(n) => {
+                if let Err(e) = session
+                    .write_response_body(Some(Bytes::copy_from_slice(&buf[..n])), false)
+                    .await
+                {
+                    debug!("SSE: client closed early: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                debug!("SSE: read from yamux: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Finalise the response body so the client sees the
+    // body terminator / chunked-end / connection-close.
+    if let Err(e) = session.finish_body().await {
+        debug!("SSE: finish body: {}", e);
+    }
+    Ok(true)
 }
 
 fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {

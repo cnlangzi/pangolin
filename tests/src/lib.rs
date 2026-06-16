@@ -88,6 +88,9 @@ mod admin_harness;
 mod real_e2e;
 
 #[cfg(feature = "integration")]
+mod sse_e2e;
+
+#[cfg(feature = "integration")]
 mod admin_ui_e2e;
 
 #[cfg(feature = "integration")]

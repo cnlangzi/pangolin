@@ -41,7 +41,8 @@ pub use parse::{
 };
 pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
-    apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
+    apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_request, parse_backend_to_target,
+    serve_file_target,
 };
 pub use tunnel::{
     TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,

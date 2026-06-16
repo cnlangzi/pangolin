@@ -148,6 +148,11 @@ async fn handle_client(
             return Ok(());
         }
     };
+    info!(
+        "tunnel handshake: target={} token.len={}",
+        req.target,
+        token.len()
+    );
     // Pull the tun name from the path. The tun client
     // dials `ws://host/tunnel` (no name in the path any
     // more — name comes from the `Authorization: Bearer

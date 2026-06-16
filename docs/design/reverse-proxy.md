@@ -197,10 +197,16 @@ pub struct TunnelHttpFrame {
     pub host_mode:   HostMode,      // per-request (NOT a site cache)
     pub host_custom: Option<String>,
     pub is_upgrade:  bool,          // WebSocket upgrade flag
+    pub is_streaming: bool,         // SSE / chunked streaming response
 }
 
 pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8>;
 pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame>;
+
+/// Heuristic: returns true if the request expects a streaming
+/// response (matches `text/event-stream` in Accept or Content-Type).
+/// Used by ngx to flip `is_streaming = true` on the frame.
+pub fn is_streaming_request(request: &HttpRequest) -> bool;
 ```
 
 Wire layout:
@@ -282,18 +288,32 @@ the transports are different.
                   // rewrites Host, adds X-Forwarded-*, strips hop-by-hop
                             │
                             ▼
-                  dispatch on request.target's scheme:
+                  dispatch on frame flags + request.target's scheme:
                             │
-            ┌───────────────┼───────────────┐
-            │               │               │
-        http/https         file           ws upgrade
-            │               │               │
-            ▼               ▼               ▼
-  PingoraClientExecutor  serve_file_target  same executor
-  ::execute_http                            (pingora supports
-   (Connector +                              upgrade natively;
-    HttpPeer)                                 is_upgrade=true)
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   is_upgrade=true     is_streaming=true     http/https | file
+        │                   │                   │
+        ▼                   ▼                   ▼
+  handle_ws_upgrade   handle_streaming_     same executor
+  (TCP + manual WS     response             (pingora supports
+   handshake +         (TCP + plain HTTP    upgrade natively;
+   pump_ws_relay)       request +            is_upgrade=true)
+        │               copy_bidirectional)       │
+        │                   │                   │
+        ▼                   ▼                   ▼
+  bytes ↔ yamux       bytes ↔ yamux       HttpResponse
+  stream ↔ backend    stream ↔ backend    (buffered)
+  TCP socket          TCP socket          (in-memory)
 ```
+
+The **streaming path** (`is_streaming = true`) bypasses the
+`HttpResponse` buffering layer and uses the same
+`tokio::io::copy_bidirectional` pattern as WebSocket relay.
+This is what enables SSE (`Content-Type: text/event-stream`)
+and other long-lived chunked responses through the tunnel —
+the buffering path would deadlock waiting for an infinite
+chunked body to complete.
 
 `tun` holds **one piece of state** across the request lifecycle:
 an `Arc<HttpClientPool>` that wraps a `pingora_core::connectors::http::Connector`.

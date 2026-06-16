@@ -197,3 +197,186 @@ Key log patterns:
   shutdown/read race is active.
 - `backend error: read response: connection reset` — same root cause, seen
   from the ngx side.
+
+---
+
+## SSE / streaming-response support
+
+Long-lived HTTP responses (SSE: `Content-Type: text/event-stream`,
+and other `Transfer-Encoding: chunked` responses that never
+terminate) cannot be expressed through the standard
+`HttpResponse { body: Vec<u8> }` shape — the buffer would never
+finish filling. The tunnel handles this with a parallel
+**byte-relay** path that mirrors the WebSocket relay.
+
+### Wire format (`is_streaming` flag)
+
+`TunnelHttpFrame` carries an extra boolean after `is_upgrade`:
+
+```rust
+pub struct TunnelHttpFrame {
+    // ...existing fields...
+    pub is_upgrade:   bool,
+    pub is_streaming: bool,   // 1 byte on the wire
+}
+```
+
+`is_streaming` is set by `ngx` when the request matches
+`pangolin_core::is_streaming_request(&request)`, which currently
+looks for `text/event-stream` in `Accept` or `Content-Type`. The
+tun side uses it to dispatch to `handle_streaming_response`
+instead of the buffering `handle_http_request` path.
+
+### Streaming path (mirrors WebSocket relay)
+
+The streaming path reuses the same `copy_bidirectional` /
+`copy_bidirectional` pattern as the WS relay in
+[`handle_ws_upgrade`](../../crates/tun/src/client.rs). The only
+difference is the request handshake:
+
+| Path | Connect | Send | Then |
+|---|---|---|---|
+| `is_upgrade = true`  | TCP | WebSocket upgrade request | `pump_ws_relay` |
+| `is_streaming = true` | TCP | plain HTTP/1.1 request | `copy_bidirectional` |
+| neither              | pingora `Connector` | full HTTP/1.1 request | `HttpResponse { body: Vec<u8> }` (buffered) |
+
+The streaming path's contract is the same as the WS path's:
+yamux's `StreamHandle` is just an `AsyncRead + AsyncWrite`, so
+relay is the same regardless of what bytes are flowing. Bytes
+arrive at the client as they leave the backend, with no
+in-process buffering.
+
+### Why this works (yamux is not the bottleneck)
+
+yamux supports streaming natively — `StreamHandle` implements
+`AsyncRead + AsyncWrite` and has sliding-window flow control
+to prevent unbounded memory growth. The same primitives
+already power the WebSocket relay. The reason SSE did not work
+previously is **not** the multiplexer: it was the framing
+layer's choice to wait for a complete `HttpResponse` before
+sending any bytes. The streaming path bypasses that framing.
+
+### Detection rules
+
+```rust
+// pangolin-core/src/proxy.rs
+pub fn is_streaming_request(request: &HttpRequest) -> bool {
+    request.headers.iter().any(|(k, v)| {
+        (k.eq_ignore_ascii_case("Accept")
+            || k.eq_ignore_ascii_case("Content-Type"))
+            && v.to_ascii_lowercase().contains("text/event-stream")
+    })
+}
+```
+
+Conservative on purpose: only matches the canonical SSE
+marker. Future extensions (long-polling, custom response
+types) can be added to this helper without touching the
+transport or the wire format.
+
+### E2E test
+
+`tests/src/sse_e2e.rs::real_e2e_tunnel_sse_streams_through`
+spawns a real `pangolin-ngx` + `pangolin-tun` pair against a
+mock SSE backend that emits three chunked events on a 50 ms
+cadence and closes the response. Pre-fix this test would
+deadlock on the buffering path; post-fix all three events
+arrive at the client well within the 2 s test budget.
+
+`tests/src/sse_e2e.rs::real_e2e_tunnel_sse_hostname_backend`
+covers the second bug (see below): backend URL contains a
+hostname rather than a bare IP, verifying that DNS resolution
+works end-to-end through the tunnel.
+
+---
+
+## Bug: `handle_streaming_response` hostname resolution failure
+
+### Problem
+
+`handle_streaming_response` in `crates/tun/src/client.rs` used
+`SocketAddr::parse()` to convert the backend authority string to
+a `SocketAddr`. This only works for numeric IP:PORT strings such
+as `127.0.0.1:9020`. When the backend URL contains a hostname
+(e.g. `xiajie:8888` or `myserver.internal:8080`), `parse()`
+returns an error and the function immediately returns a 502 Bad
+Gateway without ever connecting to the backend:
+
+```rust
+// BUG — silent 502 when authority is a hostname
+let backend_addr: std::net::SocketAddr = match authority.parse() {
+    Ok(a)  => a,
+    Err(e) => {
+        let resp_bytes = synth_502_bytes(&format!("bad backend addr: {e}"));
+        stream.write_all(&resp_bytes).await?;
+        return Ok(());
+    }
+};
+```
+
+The standard `handle_http_request` / pingora path never hit this
+code — pingora resolves hostnames internally via `HttpPeer`. The
+streaming path bypasses pingora and opens a raw `TcpStream`, so
+DNS resolution had to be done explicitly.
+
+The same latent bug existed in `handle_ws_upgrade` (line 368),
+but WebSocket backends in production all used IP addresses so it
+had not been triggered.
+
+### Root cause
+
+`SocketAddr::parse()` is a purely syntactic, synchronous
+operation. It parses `"1.2.3.4:1234"` but rejects
+`"myhost:1234"` with `InvalidAddr`. No DNS lookup is ever
+attempted.
+
+### Fix
+
+Replace `SocketAddr::parse()` with `tokio::net::lookup_host()`
+in both `handle_streaming_response` and `handle_ws_upgrade`:
+
+```rust
+// FIXED — resolves hostnames via DNS before connecting
+let backend_addr = match tokio::net::lookup_host(authority).await {
+    Ok(mut addrs) => match addrs.next() {
+        Some(a) => a,
+        None => {
+            let resp_bytes = synth_502_bytes(
+                &format!("no DNS result for {authority}")
+            );
+            stream.write_all(&resp_bytes).await?;
+            return Ok(());
+        }
+    },
+    Err(e) => {
+        let resp_bytes = synth_502_bytes(
+            &format!("DNS lookup failed for {authority}: {e}")
+        );
+        stream.write_all(&resp_bytes).await?;
+        return Ok(());
+    }
+};
+```
+
+`tokio::net::lookup_host` accepts both `"hostname:port"` and
+`"ip:port"`, so the fix is backward-compatible. The same change
+was applied to `handle_ws_upgrade`.
+
+### Symptoms
+
+- Backend configured as `local:http://hostname:port` → **502 Bad
+  Gateway** immediately, no connection attempt to the backend.
+- Backend configured as `local:http://1.2.3.4:port` → works.
+- `ngx` log: `SSE: read response head: connection reset` (the
+  tun wrote the synth 502 body into the yamux stream before
+  ngx could read the response head, causing a protocol
+  desynchronisation that looked like a connection reset from the
+  ngx side).
+
+### Test coverage
+
+`tests/src/sse_e2e.rs::real_e2e_tunnel_sse_hostname_backend`
+seeds the site backend with `localhost:<port>` (a hostname, not
+`127.0.0.1:<port>`) and verifies that SSE streams through
+correctly. This test would have failed against the pre-fix
+binary.
