@@ -546,11 +546,11 @@ async fn real_e2e_tunnel_sse_incremental_delivery() {
             Err(_) => break, // timeout: streaming ended or hung
         };
         body_buf.extend_from_slice(&read_tmp[..n]);
-        for i in 0..3 {
-            if arrival[i].is_none() {
+        for (i, slot) in arrival.iter_mut().enumerate() {
+            if slot.is_none() {
                 let needle = format!("data: event {i}").into_bytes();
                 if body_buf.windows(needle.len()).any(|w| w == needle) {
-                    arrival[i] = Some(sent_at.elapsed());
+                    *slot = Some(sent_at.elapsed());
                 }
             }
         }

@@ -107,3 +107,21 @@ tls:
 log:
   level: debug          # env_logger filter: trace|debug|info|warn|error
   file: ""              # log file path; "" = stderr only
+  # ── Access log viewer (issue #73) ──────────────────────────────────
+  # Two related knobs; both can be 0 to disable their respective
+  # half of the feature:
+  #   * `access_log_recent`     ring buffer size for late-join replay
+  #                             (new subscribers get the most recent
+  #                             N entries on connect). 0 disables
+  #                             replay; the live SSE stream still
+  #                             works. Default 100.
+  #   * `access_log_capacity`  tokio broadcast channel capacity for
+  #                             the live fan-out. Lagged subscribers
+  #                             see a `: lagged N events` SSE
+  #                             comment. Default 1000.
+  # Each entry is ~150 bytes serialized, so the default ring uses
+  # ≈ 15 KB and the default channel ≈ 150 KB. Scale up for noisy
+  # proxies; the admin UI tab caps the visible rows at 500 to
+  # keep the DOM bounded.
+  access_log_recent: 100
+  access_log_capacity: 1000

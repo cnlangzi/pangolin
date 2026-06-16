@@ -16,7 +16,7 @@ fn new_client_no_redirect() -> reqwest::Client {
 }
 
 async fn start_ngx() -> NgxProcess {
-    NgxProcess::start(|path| init_pangolin_db(path)).await
+    NgxProcess::start(init_pangolin_db).await
 }
 
 // ── §1 — Unauthorized redirects ─────────────────────────────────────────────

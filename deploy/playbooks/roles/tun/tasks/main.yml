@@ -33,6 +33,11 @@
     database: passwd
     key: pangolin
   register: pangolin_user
+  # `getent` returns success even when the key is missing — the
+  # only signal is `ansible_facts.getent_passwd` not containing
+  # the user. `failed_when: false` is kept so a transport error
+  # doesn't mask the lookup; the `when:` below does the actual
+  # existence check.
   failed_when: false
   changed_when: false
 
@@ -42,7 +47,7 @@
     name: pangolin
     state: present
     system: yes
-  when: pangolin_user is failed
+  when: "'pangolin' not in (ansible_facts.getent_passwd | default({}))"
 
 - name: Create workdir
   become: true

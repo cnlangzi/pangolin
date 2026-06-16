@@ -105,6 +105,14 @@ base64 = "0.22"
 wiremock = "0.6"
 tempfile = "3"
 
+# parking_lot::Mutex is the sync primitive behind App's access-log
+# ring buffer. Chosen over std::sync::Mutex because the hot path
+# (response_filter on every proxied request) is short, contention
+# is bounded, and parking_lot's fast-path acquire + no poisoning
+# means we never have to .lock().unwrap() in a place where a
+# poisoned mutex would surface as a 500. Issue #73.
+parking_lot = "0.12"
+
 # Build profile
 [profile.release]
 opt-level = 3

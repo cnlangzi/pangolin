@@ -33,7 +33,7 @@ pub use app::{
 };
 pub use config::{Config, LogConfig, init_logger};
 pub use error::{PangolinError, Result};
-pub use events::{Event, EventBuffer, EventType, MAX_EVENTS};
+pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, lookup_site};
 pub use parse::{
     BackendScheme, ParseError, TUN_NAME_MAX, detect_scheme, file_url_to_path, is_valid_domain,

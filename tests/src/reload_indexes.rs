@@ -5,7 +5,7 @@
 
 use chrono::Utc;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -13,9 +13,9 @@ use pangolin_core::db;
 use pangolin_core::types::{Domain, HostMode, Site};
 use pangolin_core::{App, CertManager};
 
-fn make_cert_manager(cert_dir: &PathBuf) -> CertManager {
+fn make_cert_manager(cert_dir: &Path) -> CertManager {
     CertManager::new(
-        cert_dir.clone(),
+        cert_dir.to_path_buf(),
         None,
         String::new(),
         30,

@@ -7,6 +7,97 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Access log entry for real-time monitoring via SSE.
+///
+/// Constructed by `ngx`'s `response_filter` on every proxied request
+/// (issue #73). The struct is deliberately small + `Clone` — every
+/// push goes through a `tokio::sync::broadcast` channel, so we want
+/// to copy the bytes, not borrow them. The `backend` field is a
+/// pre-formatted string ("tun:office", "direct:1.2.3.4:8080",
+/// "file://…") derived from the existing `site.backend` so the
+/// dashboard renders a human-readable value without re-running the
+/// backend parser on every read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccessLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub status: u16,
+    pub duration_ms: u64,
+    pub backend: String,
+    pub client_ip: String,
+}
+
+/// Bounded ring buffer of recent access log entries.
+///
+/// Uses `parking_lot::Mutex` (not `std::sync::Mutex`) because:
+///   - The lock is held for microseconds (one `push_back` + one
+///     bound check); parking_lot's fast-path acquire is the right
+///     tool.
+///   - `parking_lot::Mutex` is not poisonable, so a panic inside
+///     the locked region never surfaces as a `.lock().unwrap()`
+///     abort on the next push — exactly the right semantics for a
+///     best-effort log buffer that must never crash a request.
+///
+/// Sized at construction time via `new(capacity)`. Capacity of 0
+/// is allowed and turns the buffer into a no-op (push is a
+/// single integer compare; no allocation). This matches the
+/// `ngx.yml` default for `log.access_log_recent: 100` but lets a
+/// user disable buffering entirely if they want to keep only the
+/// live broadcast.
+pub struct AccessLogBuffer {
+    entries: parking_lot::Mutex<VecDeque<AccessLogEntry>>,
+    capacity: usize,
+}
+
+impl AccessLogBuffer {
+    /// Create a new ring buffer with the given capacity. A capacity
+    /// of 0 means "drop every entry on push" — useful as a
+    /// disable-buffer knob without changing call sites.
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.min(MAX_EVENTS.saturating_mul(1024)); // sanity cap
+        Self {
+            entries: parking_lot::Mutex::new(VecDeque::with_capacity(cap)),
+            capacity: cap,
+        }
+    }
+
+    /// Push an entry to the back of the buffer, evicting the oldest
+    /// entry if capacity is exceeded. Never blocks (the buffer is
+    /// sync) and never panics on capacity=0 (the loop is a single
+    /// integer compare).
+    pub fn push(&self, entry: AccessLogEntry) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    /// Snapshot the buffer in chronological order (oldest first).
+    ///
+    /// Used by the SSE endpoint to replay the ring on connect. The
+    /// caller (an `async fn` serving a streaming response) takes
+    /// the lock once, clones the entries into a local `Vec`, and
+    /// drops the lock before the first `await` — so the lock is
+    /// never held across a network read.
+    pub fn snapshot(&self) -> Vec<AccessLogEntry> {
+        let entries = self.entries.lock();
+        entries.iter().cloned().collect()
+    }
+
+    /// Read the current capacity. Exposed so the SSE endpoint can
+    /// decide whether to send a `replay` hint without consulting
+    /// `App.config` separately.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 /// Maximum number of events to retain in the buffer.
 pub const MAX_EVENTS: usize = 100;
 
@@ -157,5 +248,80 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"TunConnected\""));
         assert!(json.contains("\"name\":\"office\""));
+    }
+
+    #[test]
+    fn access_log_entry_serialization() {
+        let entry = AccessLogEntry {
+            timestamp: Utc::now(),
+            method: "GET".into(),
+            path: "/test".into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 42,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "192.168.1.1".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: AccessLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.method, "GET");
+        assert_eq!(parsed.path, "/test");
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.duration_ms, 42);
+    }
+
+    fn make_entry(method: &str, path: &str) -> AccessLogEntry {
+        AccessLogEntry {
+            timestamp: Utc::now(),
+            method: method.into(),
+            path: path.into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 1,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "192.168.1.1".into(),
+        }
+    }
+
+    #[test]
+    fn access_log_buffer_capacity_zero_is_noop() {
+        // capacity=0 means "disable ring buffer entirely" — every
+        // push is silently dropped, snapshot is empty.
+        let buf = AccessLogBuffer::new(0);
+        buf.push(make_entry("GET", "/a"));
+        buf.push(make_entry("GET", "/b"));
+        assert!(buf.snapshot().is_empty());
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn access_log_buffer_evicts_oldest_on_overflow() {
+        let buf = AccessLogBuffer::new(3);
+        for i in 0..5 {
+            buf.push(make_entry("GET", &format!("/p{i}")));
+        }
+        let snap = buf.snapshot();
+        assert_eq!(snap.len(), 3);
+        // snapshot() returns in chronological (insertion) order.
+        // Entries /p0 and /p1 were evicted; the surviving entries
+        // are /p2, /p3, /p4 in that order.
+        assert_eq!(snap[0].path, "/p2");
+        assert_eq!(snap[1].path, "/p3");
+        assert_eq!(snap[2].path, "/p4");
+    }
+
+    #[test]
+    fn access_log_buffer_snapshot_chronological_order() {
+        // snapshot() returns oldest-first so an SSE endpoint can
+        // replay them as it received them.
+        let buf = AccessLogBuffer::new(10);
+        buf.push(make_entry("GET", "/a"));
+        buf.push(make_entry("GET", "/b"));
+        buf.push(make_entry("GET", "/c"));
+        let snap = buf.snapshot();
+        assert_eq!(
+            snap.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["/a", "/b", "/c"]
+        );
     }
 }

@@ -270,12 +270,18 @@ pub fn init_pangolin_db(path: &Path) {
     pangolin_core::db::migrate(&mut conn).expect("run migrations");
 }
 
+/// Shared, lock-protected log buffer (stdout+stderr) captured from
+/// a running child process. The `Arc<Mutex<Vec<u8>>>` is shared
+/// between the reader tasks and the test thread that wants to
+/// dump it on failure.
+type CapturedLog = Arc<Mutex<Vec<u8>>>;
+
 /// Capture child stdout+stderr into a shared `Vec<u8>` so failing tests
 /// can dump the binary's log output. Returns the `JoinHandle`s of the
 /// reader tasks so `NgxProcess::drop` can `abort()` them — otherwise
 /// they keep the tokio runtime alive after the test process tries to
 /// exit, and `cargo test` hangs indefinitely.
-fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>, Vec<JoinHandle<()>>) {
+fn spawn_with_log_capture(mut cmd: Command) -> (Child, CapturedLog, Vec<JoinHandle<()>>) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn child process");
     let log = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -530,8 +536,12 @@ impl Drop for NgxProcess {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // Drop runs on a sync stack — `child.kill().await` is not
+        // available here. `start_kill()` issues SIGKILL synchronously;
+        // the kernel reaps the child via the `try_wait` poll above on
+        // any future iteration, but on Drop we are at end-of-life so
+        // a brief unreaped zombie is acceptable.
+        let _ = child.start_kill();
     }
 }
 
@@ -667,7 +677,11 @@ impl Drop for TunProcess {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // Drop runs on a sync stack — `child.kill().await` is not
+        // available here. `start_kill()` issues SIGKILL synchronously;
+        // the kernel reaps the child via the `try_wait` poll above on
+        // any future iteration, but on Drop we are at end-of-life so
+        // a brief unreaped zombie is acceptable.
+        let _ = child.start_kill();
     }
 }
