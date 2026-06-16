@@ -595,10 +595,11 @@ async fn sites_create_full_ui_flow_unique_names() {
 // of the `overflow-x-auto` container and breaking the table layout below
 // 768px viewports.
 //
-// We assert structural invariants on the rendered HTML:
+// We assert structural invariants on the rendered HTML using scraper:
 //   - the mobile block wrapper exists and contains exactly N site cards
 //   - each card wraps all four sections (header, on/off badge, backend, actions)
-//   - the mobile block closes before the outer overflow container closes
+//   - per-card granularity catches a future refactor that moves the on/off
+//     badge out of the card wrapper (a body-wide card count would miss it)
 
 #[tokio::test]
 async fn sites_list_mobile_cards_well_formed() {
@@ -637,57 +638,70 @@ async fn sites_list_mobile_cards_well_formed() {
     }
 
     let body = client.get("/sites").await.unwrap().text().await.unwrap();
+    let doc = Html::parse_document(&body);
 
-    // Locate the mobile block wrapper.
-    let mobile_open = body
-        .find(r#"<div class="block md:hidden divide-y"#)
+    // The mobile block wrapper is the only element on this page carrying
+    // `md:hidden` (desktop table uses `hidden md:table`, the inverse). A
+    // class-substring match avoids the CSS3 colon-escape ambiguity.
+    let mobile_sel = Selector::parse(r#"div[class*="md:hidden"]"#).unwrap();
+    let card_sel = Selector::parse("div.p-4").unwrap();
+    // The on/off badge: green when enabled, slate when disabled. We restrict
+    // to <span> so the backend <code> block (also bg-slate-100) is excluded.
+    let badge_sel = Selector::parse("span.bg-green-100, span.bg-slate-100").unwrap();
+    let code_sel = Selector::parse("code").unwrap();
+    let edit_sel = Selector::parse(r#"a[href^="/sites/edit"]"#).unwrap();
+    let delete_sel = Selector::parse(r#"button[hx-delete^="/api/sites/"]"#).unwrap();
+
+    let mobile_block = doc
+        .select(&mobile_sel)
+        .next()
         .expect("mobile block wrapper should be present");
 
-    // Walk forward from the mobile open, tracking <div / </div> depth, to
-    // find the matching `</div>` that closes the wrapper. A naive
-    // `body[mobile_open..].rfind("</div>")` would extend the slice all the
-    // way to the end of the document and hide the very bug we're guarding
-    // against (a stray `</div>` inside the for loop that closes the wrapper
-    // one iteration too early, leaving the rest of the cards as siblings of
-    // the overflow-x-auto container).
-    let mobile_close = find_matching_div_close(&body, mobile_open)
-        .expect("mobile block wrapper should have a matching </div>");
-    let mobile_block = &body[mobile_open..mobile_close + "</div>".len()];
-
-    // The mobile block must contain one `<div class="p-4">` per site — not
-    // zero (cards leaked out) and not double-counted (extra wrapper
-    // accidentally nesting).
-    let card_count = mobile_block.matches(r#"<div class="p-4">"#).count();
+    let cards: Vec<_> = mobile_block.select(&card_sel).collect();
     assert_eq!(
-        card_count, 3,
-        "expected 3 mobile cards inside the mobile block, found {} — this usually means a stray </div> closed the wrapper early",
-        card_count
+        cards.len(),
+        3,
+        "expected 3 mobile cards inside the mobile block, found {} — \
+         this usually means a stray </div> closed the wrapper early",
+        cards.len()
     );
 
-    // Each card name must appear inside the mobile block (not after it).
-    for site_name in &["mobile-a", "mobile-b", "mobile-c"] {
+    // Per-card granularity catches a future refactor that accidentally moves
+    // the on/off badge out of the card wrapper — which a body-wide card
+    // count would not detect.
+    let names = ["mobile-a", "mobile-b", "mobile-c"];
+    for (i, card) in cards.iter().enumerate() {
+        let card_text: String = card.text().collect();
         assert!(
-            mobile_block.contains(site_name),
-            "site '{}' should be rendered inside the mobile block",
-            site_name
+            card_text.contains(names[i]),
+            "card {} should contain site name '{}', got text: {:?}",
+            i,
+            names[i],
+            card_text
+        );
+        assert!(
+            card.select(&badge_sel).next().is_some(),
+            "card {} should contain the on/off badge inside it",
+            i
+        );
+        assert!(
+            card.select(&code_sel).next().is_some(),
+            "card {} should contain the backend <code> block",
+            i
+        );
+        assert_eq!(
+            card.select(&edit_sel).count(),
+            1,
+            "card {} should contain exactly one Edit link",
+            i
+        );
+        assert_eq!(
+            card.select(&delete_sel).count(),
+            1,
+            "card {} should contain exactly one Delete button",
+            i
         );
     }
-
-    // Each card should contain the action buttons (Edit / Delete) and a
-    // backend `<code>` block — proves the card structure stayed intact.
-    let edit_count = mobile_block.matches(">Edit</a>").count();
-    let delete_count = mobile_block.matches(">Delete</button>").count();
-    // Use the `max-w-full` class (unique to the mobile backend code element;
-    // the desktop table uses a different class) to count mobile backends only.
-    let backend_count = mobile_block
-        .matches(r#"<code class="block truncate max-w-full"#)
-        .count();
-    assert_eq!(edit_count, 3, "expected 3 Edit links in mobile block");
-    assert_eq!(delete_count, 3, "expected 3 Delete buttons in mobile block");
-    assert_eq!(
-        backend_count, 3,
-        "expected 3 backend <code> blocks in mobile block"
-    );
 }
 
 // ── §16-19 — Domains full cycle ──────────────────────────────────────────────
@@ -3566,48 +3580,3 @@ async fn dns_hx_delete_no_csrf_forbidden() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Walk forward from `open_pos` (which must point at a `<div` token) and
-/// return the byte offset of the matching `</div>` (the close that brings
-/// the depth back to the level it was at before the open). Used by the
-/// mobile-card structural test to slice out exactly the mobile wrapper
-/// region even when the template contains stray `</div>` tokens.
-fn find_matching_div_close(body: &str, open_pos: usize) -> Option<usize> {
-    let bytes = body.as_bytes();
-    if open_pos + 4 > bytes.len() || &body[open_pos..open_pos + 4] != "<div" {
-        return None;
-    }
-    // Ensure the tag continues with a non-identifier character (whitespace,
-    // `>`, or `/`) so we don't match `<divider>` or similar.
-    let next = bytes[open_pos + 4];
-    if next.is_ascii_alphanumeric() || next == b'_' {
-        return None;
-    }
-
-    let mut depth: i32 = 1;
-    let mut i = open_pos + 4;
-    while i < bytes.len() {
-        if i + 4 <= bytes.len() && &body[i..i + 4] == "<div" {
-            let after = if i + 4 < bytes.len() {
-                bytes[i + 4]
-            } else {
-                b' '
-            };
-            if !(after.is_ascii_alphanumeric() || after == b'_') {
-                depth += 1;
-                i += 4;
-                continue;
-            }
-        }
-        if i + 6 <= bytes.len() && &body[i..i + 6] == "</div>" {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-            i += 6;
-            continue;
-        }
-        i += 1;
-    }
-    None
-}
