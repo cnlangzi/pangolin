@@ -285,6 +285,10 @@ pub struct TunnelHttpFrame {
     pub host_mode: HostMode,
     pub host_custom: Option<String>,
     pub is_upgrade: bool,
+    /// True for streaming responses (SSE, long-lived chunked responses).
+    /// When set, the tun side bypasses HttpResponse buffering and
+    /// relays bytes directly from backend TCP to the yamux stream.
+    pub is_streaming: bool,
 }
 
 const FRAME_HOST_PASSTHROUGH: u8 = 0;
@@ -329,6 +333,8 @@ pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8> {
     }
     // is_upgrade
     out.push(if frame.is_upgrade { 1 } else { 0 });
+    // is_streaming (feature flag: 0 = not streaming, 1 = streaming)
+    out.push(if frame.is_streaming { 1 } else { 0 });
     // target
     let (kind, host, port, base_path, doc_root) = match &frame.target {
         BackendTarget::Http {
@@ -436,6 +442,15 @@ pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame> {
     }
     let is_upgrade = bytes[cursor] != 0;
     cursor += 1;
+    // is_streaming
+    if bytes.len() < cursor + 1 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "tunnel frame: missing is_streaming byte",
+        ));
+    }
+    let is_streaming = bytes[cursor] != 0;
+    cursor += 1;
     // target
     if bytes.len() < cursor + 1 {
         return Err(Error::new(
@@ -538,6 +553,7 @@ pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame> {
         host_mode,
         host_custom,
         is_upgrade,
+        is_streaming,
     })
 }
 
@@ -547,6 +563,28 @@ fn host_mode_byte(mode: HostMode) -> u8 {
         HostMode::Backend => FRAME_HOST_BACKEND,
         HostMode::Custom => FRAME_HOST_CUSTOM,
     }
+}
+
+// ── is_streaming_request ──────────────────────────────────────
+
+/// Detect if `request` expects a streaming response that should
+/// bypass the standard HttpResponse buffering path.
+///
+/// Heuristics (conservative — only matches things we can be
+/// confident are streaming):
+///   1. `Accept: text/event-stream` — the canonical SSE marker.
+///   2. `Content-Type: text/event-stream` — some backends echo
+///      this on the request side (less common, but harmless).
+///
+/// Future extensions (chunked responses, custom headers, path
+/// patterns) can be added here without touching the transport
+/// layer. The `is_streaming` flag in `TunnelHttpFrame` is what
+/// ultimately decides the dispatch; this helper just sets it.
+pub fn is_streaming_request(request: &HttpRequest) -> bool {
+    request.headers.iter().any(|(k, v)| {
+        (k.eq_ignore_ascii_case("Accept") || k.eq_ignore_ascii_case("Content-Type"))
+            && v.to_ascii_lowercase().contains("text/event-stream")
+    })
 }
 
 // ── serve_file_target ─────────────────────────────────────────
@@ -1053,6 +1091,7 @@ mod tests {
                 host_mode: mode,
                 host_custom: custom.clone(),
                 is_upgrade: true,
+                is_streaming: false,
             };
             let bytes = encode_tunnel_frame(&frame);
             let decoded = decode_tunnel_frame(&bytes).unwrap();
@@ -1076,10 +1115,43 @@ mod tests {
             host_mode: HostMode::Passthrough,
             host_custom: None,
             is_upgrade: false,
+            is_streaming: false,
         };
         let bytes = encode_tunnel_frame(&frame);
         let decoded = decode_tunnel_frame(&bytes).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    // is_streaming_request: heuristics for SSE / streaming responses.
+    // Used by ngx to flip `TunnelHttpFrame::is_streaming = true`,
+    // which routes the request to the byte-relay path instead of
+    // the buffering HttpResponse path.
+    #[test]
+    fn is_streaming_request_detects_text_event_stream() {
+        // Accept header matches → streaming
+        let req = mk("GET", "/events", &[("Accept", "text/event-stream")], &[]);
+        assert!(is_streaming_request(&req));
+
+        // Mixed-case value still matches
+        let req = mk("GET", "/events", &[("Accept", "TEXT/EVENT-STREAM")], &[]);
+        assert!(is_streaming_request(&req));
+
+        // Accept with extra params (the browser default form)
+        let req = mk(
+            "GET",
+            "/events",
+            &[("Accept", "*/*, text/event-stream")],
+            &[],
+        );
+        assert!(is_streaming_request(&req));
+
+        // application/json is NOT streaming
+        let req = mk("GET", "/api", &[("Accept", "application/json")], &[]);
+        assert!(!is_streaming_request(&req));
+
+        // No Accept header at all
+        let req = mk("GET", "/", &[("Host", "x.test")], &[]);
+        assert!(!is_streaming_request(&req));
     }
 
     // I-8

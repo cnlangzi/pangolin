@@ -7,13 +7,18 @@
 //!   - the raw `HttpRequest`
 //!   - per-request `host_mode` and `host_custom`
 //!   - `is_upgrade` flag (WebSocket upgrade)
+//!   - `is_streaming` flag (SSE / chunked streaming response)
 //!
 //! The tun applies `apply_proxy_policy` (pangolin-core) and
-//! dispatches to one of three executors:
+//! dispatches based on the frame flags + backend scheme:
 //!   - `file://` → `serve_file_target` (pangolin-core)
 //!   - `http/https` → `PingoraClientExecutor` (this file)
-//!   - WS upgrade → also via `PingoraClientExecutor`, which
-//!     uses pingora's built-in upgrade path.
+//!   - WS upgrade → `handle_ws_upgrade` (TCP + manual WS handshake + `pump_ws_relay`)
+//!   - streaming → `handle_streaming_response` (TCP + plain HTTP request + `copy_bidirectional`)
+//!
+//! See `docs/design/tunnel.md` "SSE / streaming-response support"
+//! for why this mirrors the WS relay instead of using the
+//! buffered `HttpResponse` path.
 //!
 //! There is **no reqwest** on this side: the v8 design uses
 //! pingora-core for the HTTP client so behavior matches the
@@ -23,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use pangolin_core::tunnel::{
     HttpRequest, HttpResponse, TunnelRole, WsRole, YamuxTunnel, build_ws_upgrade_request,
@@ -250,6 +255,8 @@ where
     let frame = decode_frame(&buf).map_err(|e| anyhow::anyhow!(e))?;
     if frame.is_upgrade {
         handle_ws_upgrade(stream, frame, name).await
+    } else if frame.is_streaming {
+        handle_streaming_response(stream, frame, name).await
     } else {
         handle_http_request(stream, frame, name).await
     }
@@ -358,8 +365,16 @@ where
         }
     };
 
-    let backend_addr: std::net::SocketAddr = match authority.parse() {
-        Ok(a) => a,
+    // Resolve the backend address. The authority may be a
+    // hostname (e.g. "xiajie:8888") rather than a bare IP:port;
+    // we use tokio's async DNS resolver. Try **every** address
+    // returned by the resolver — see the matching comment in
+    // `handle_streaming_response` for why (the first DNS result
+    // is often v6 on Linux, where the backend only listens on
+    // v4, and a single-address resolver turns that into a
+    // "connection refused → connection reset" path).
+    let addrs = match tokio::net::lookup_host(authority).await {
+        Ok(addrs) => addrs,
         Err(e) => {
             let resp_bytes = synth_502_bytes(&format!("bad backend addr: {e}"));
             stream.write_all(&resp_bytes).await?;
@@ -367,10 +382,42 @@ where
             return Ok(());
         }
     };
+    let mut backend = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                backend = Some(stream);
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    "tun {} ws relay connect to {} failed: {} — trying next address",
+                    name, addr, e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut backend = match backend {
+        Some(s) => s,
+        None => {
+            let resp_bytes = synth_502_bytes(&format!(
+                "no reachable address for {authority}: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no addresses".into())
+            ));
+            stream.write_all(&resp_bytes).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
 
+    let backend_addr = backend
+        .peer_addr()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
     info!("tun {} ws relay to {} path={}", name, backend_addr, path);
-
-    let mut backend = TcpStream::connect(backend_addr).await?;
 
     // Mirror the HTTP path's Host header logic: apply_proxy_policy
     // handles Passthrough and Custom modes. For Backend mode, we
@@ -397,6 +444,230 @@ where
     read_ws_accept_response(&mut backend, &key).await?;
     pump_ws_relay(stream, backend, "ngx", "backend").await?;
     Ok(())
+}
+
+/// Handle a streaming response (SSE, long-lived chunked) from a
+/// parsed `TunnelHttpFrame`.
+///
+/// Mirrors [`handle_ws_upgrade`] but for plain HTTP/1.1 streaming
+/// instead of WebSocket upgrade:
+///   1. Connect to the backend over plain TCP.
+///   2. Send the original HTTP request bytes (no WS handshake).
+///   3. Use [`tokio::io::copy_bidirectional`] to relay bytes
+///      between the yamux stream and the backend TCP socket.
+///
+/// This is the path that supports `Content-Type: text/event-stream`
+/// (SSE) and other long-lived HTTP responses. The standard
+/// HTTP path in [`handle_http_request`] would buffer the entire
+/// body in memory and never complete for an infinite stream —
+/// this path forwards bytes as they arrive, the same way
+/// [`pump_ws_relay`] does for WebSocket frames.
+async fn handle_streaming_response<S>(
+    mut stream: S,
+    frame: TunnelHttpFrame,
+    name: &str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let original_host = frame
+        .request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let host_mode = frame.host_mode;
+    let host_custom = frame.host_custom.clone();
+    let ctx = ProxyCtx {
+        original_host,
+        original_scheme: Scheme::Http,
+        host_mode,
+        host_custom: host_custom.clone(),
+    };
+    let mut request = frame.request;
+    apply_proxy_policy(&mut request, &ctx);
+
+    let (authority, path) = match request.target.find("://") {
+        Some(idx) => {
+            let rest = &request.target[idx + 3..];
+            match rest.find('/') {
+                Some(p) => (&rest[..p], &rest[p..]),
+                None => (rest, "/"),
+            }
+        }
+        None => {
+            let resp_bytes = synth_502_bytes("streaming target has no scheme");
+            stream.write_all(&resp_bytes).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
+
+    // Resolve the backend address. The authority from the URL
+    // may be a hostname (e.g. "xiajie:8888") rather than a bare
+    // IP:port, so we use tokio's async DNS resolver instead of
+    // SocketAddr::parse(), which only handles numeric addresses.
+    //
+    // We try **every** address returned by the resolver, not just
+    // the first: `lookup_host` ordering is OS-dependent (Linux
+    // `/etc/hosts` typically lists `::1` before `127.0.0.1`, so
+    // `localhost` resolves to v6 first on Linux and v4 first on
+    // macOS), and a back-half of the connection failure modes are
+    // "wrong address family" — the backend only listens on v4, but
+    // the resolver hands us v6 first. Taking the first result
+    // gives a flakey "connection reset" path on the wrong-family
+    // case; iterating the full set and stopping at the first
+    // successful `TcpStream::connect` makes the lookup robust
+    // across OSes and dual-homed backends.
+    let addrs = match tokio::net::lookup_host(authority).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            let resp_bytes = synth_502_bytes(&format!("DNS lookup failed for {authority}: {e}"));
+            stream.write_all(&resp_bytes).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
+    let mut backend = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                backend = Some(stream);
+                break;
+            }
+            Err(e) => {
+                debug!(
+                    "tun {} streaming connect to {} failed: {} — trying next address",
+                    name, addr, e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut backend = match backend {
+        Some(s) => s,
+        None => {
+            let resp_bytes = synth_502_bytes(&format!(
+                "no reachable address for {authority}: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no addresses".into())
+            ));
+            stream.write_all(&resp_bytes).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+    };
+
+    let backend_addr = backend.peer_addr().unwrap_or_else(|_| {
+        // Fall back to a representative address for the log
+        // line; we don't need the exact one for diagnostics.
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+    });
+    info!("tun {} streaming to {} path={}", name, backend_addr, path);
+
+    // Host header per host_mode (same logic as the HTTP and WS paths).
+    let host_hdr = match host_mode {
+        HostMode::Passthrough | HostMode::Custom => request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| authority.to_string()),
+        HostMode::Backend => match &frame.target {
+            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
+                format!("{}:{}", host, port)
+            }
+            _ => authority.to_string(),
+        },
+    };
+
+    // Build a plain HTTP/1.1 request (no WS upgrade, no key).
+    // Mirrors the request line + headers produced by the WS
+    // path but stops there — the backend replies with a normal
+    // HTTP response, which we then byte-relay.
+    let req_bytes = build_plain_http_request(&request, path, &host_hdr);
+    // Debug: log the headers being sent to the backend (excluding body)
+    {
+        let header_part = std::str::from_utf8(&req_bytes).unwrap_or("(invalid utf8)");
+        let header_end = header_part.find("\r\n\r\n").unwrap_or(header_part.len());
+        debug!(
+            "tun {} streaming headers→backend:\n{}",
+            name,
+            &header_part[..header_end]
+        );
+    }
+    backend.write_all(&req_bytes).await?;
+    backend.flush().await?;
+
+    // Unidirectional relay: backend → stream only.
+    //
+    // SSE / long-lived chunked responses are server-push: the
+    // client sends the GET request and then sits idle. We must
+    // **not** use `copy_bidirectional` here, because its
+    // `copy` loop reads from both sides; the moment the client
+    // direction is idle / EOF, it shuts down the backend
+    // direction, killing the stream. We need the stream
+    // direction to stay open until the backend closes it.
+    //
+    // We ignore the stream direction entirely (it carries no
+    // SSE traffic anyway) and copy backend → stream until the
+    // backend closes. If the tun's yamux stream errors or
+    // closes first (the client disconnected from ngx), we
+    // return so the per-frame task ends and the yamux stream
+    // can be released.
+    if let Err(e) = tokio::io::copy(&mut backend, &mut stream).await {
+        debug!("tun {} streaming backend→stream copy: {}", name, e);
+    }
+    // Best-effort: close our write side so the client sees
+    // EOF promptly. Ignore errors — the connection may already
+    // be gone.
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Build a plain HTTP/1.1 request byte stream (no WebSocket
+/// upgrade). Used by the streaming path: SSE / chunked / long-lived
+/// responses that the standard HttpResponse buffering path cannot
+/// handle.
+fn build_plain_http_request(request: &HttpRequest, path: &str, host_hdr: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + request.body.len());
+    out.extend_from_slice(request.method.as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(path.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(host_hdr.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    // Content-Length must be set whenever the request carries a
+    // body — otherwise the backend has no way to know when the
+    // body ends (no Transfer-Encoding: chunked is implied here)
+    // and will hang waiting for more bytes. Mirrors the
+    // Content-Length injection in `execute_via_pingora`.
+    let mut has_content_length = false;
+    for (k, v) in &request.headers {
+        if k.eq_ignore_ascii_case("Host") {
+            // Already written above; skip to avoid duplicates.
+            continue;
+        }
+        if k.eq_ignore_ascii_case("Content-Length") {
+            has_content_length = true;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if !request.body.is_empty() && !has_content_length {
+        out.extend_from_slice(b"Content-Length: ");
+        out.extend_from_slice(request.body.len().to_string().as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&request.body);
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────
