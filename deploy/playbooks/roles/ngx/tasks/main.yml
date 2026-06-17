@@ -2,24 +2,19 @@
 # The .env → Ansible bridge lives in the parent playbook's `vars:`
 # block (`deploy/playbooks/ngx.yml`), not here. `vars:` is a play-
 # level keyword and is not allowed inside a task file.
-- name: Snapshot ngx service state
-  # On a re-deploy the existing `pangolin-ngx` process is owned by
-  # the pangolin user, which makes `usermod` fail with
-  # "user pangolin is currently used by process N". Stop ngx first;
-  # the final task re-enables and starts it. We deliberately do NOT
-  # touch `pangolin-tun` — each role manages its own service.
-  become: true
-  ansible.builtin.systemd:
-    name: pangolin-ngx
-  register: ngx_service
-  failed_when: false
-
-- name: Stop ngx service if active
-  become: true
-  ansible.builtin.systemd:
-    name: pangolin-ngx
-    state: stopped
-  when: ngx_service.status is defined and ngx_service.status.ActiveState == 'active'
+#
+# Deploy order: upload first, restart last. Old code stopped the
+# service up front and re-started it after the upload, so downtime
+# was "stop + upload (tens of MB) + start". Linux lets you
+# overwrite an executable that a running process has mmap'd, so
+# the new order leaves the old binary running through the upload
+# and the trailing `restart` handler is the only thing that flips
+# to it — downtime collapses to a single sub-second restart.
+#
+# Backup: single rolling `.bak` (overwriting any prior one)
+# instead of `copy: backup: yes`'s timestamped stack. The `stat`
+# + `copy` pair backs up only when the binary already exists —
+# first deploy is a clean copy with no backup.
 
 - name: Check if pangolin user exists
   # The pangolin user is shared with the tun role. On a host that
@@ -32,7 +27,6 @@
   ansible.builtin.getent:
     database: passwd
     key: pangolin
-  register: pangolin_user
   # `getent` returns success even when the key is missing — the
   # only signal is `ansible_facts.getent_passwd` not containing
   # the user. `failed_when: false` is kept so a transport error
@@ -76,6 +70,30 @@
     group: pangolin
     mode: 0755
 
+- name: Stat existing ngx binary
+  # Used to skip the backup step on a fresh install — the binary
+  # may not exist yet on the very first deploy, in which case
+  # there is nothing to back up.
+  become: true
+  ansible.builtin.stat:
+    path: /usr/local/pangolin/pangolin-ngx
+  register: ngx_binary_stat
+
+- name: Backup existing ngx binary to pangolin-ngx.bak
+  # `remote_src: yes` reads from the managed host, and `force` is
+  # on by default, so any prior `.bak` is overwritten — disk
+  # holds exactly one previous version. Roll back by hand with
+  # `cp pangolin-ngx.bak pangolin-ngx && systemctl restart pangolin-ngx`.
+  become: true
+  ansible.builtin.copy:
+    src: /usr/local/pangolin/pangolin-ngx
+    dest: /usr/local/pangolin/pangolin-ngx.bak
+    remote_src: yes
+    owner: pangolin
+    group: pangolin
+    mode: 0755
+  when: ngx_binary_stat.stat.exists
+
 - name: Upload ngx binary
   become: true
   copy:
@@ -84,7 +102,6 @@
     owner: pangolin
     group: pangolin
     mode: 0755
-    backup: yes
   notify: restart ngx
 
 - name: Upload ngx config
@@ -107,8 +124,12 @@
     - restart ngx
 
 - name: Enable ngx service
+  # Boot-time enable only; the trailing `restart ngx` handler is
+  # the single source of truth for "start the service" — both
+  # fresh install and binary refresh route through it. This task
+  # intentionally has no `state:` so an idempotent no-op deploy
+  # doesn't silently start a service the operator left down.
   ansible.builtin.systemd:
     name: pangolin-ngx
     enabled: true
     masked: no
-    state: started
