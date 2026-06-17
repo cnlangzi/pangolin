@@ -623,31 +623,31 @@ log:
         // `app.tun_sessions[name]`. Earlier we waited for
         // "connected to ngx", which fires after the TCP/WS
         // handshake but before the yamux open-stream exchange —
-// on cold CI runners that gap is enough for the test's first
-// request to race ahead and hit "Tun <name> not online" (503).
-//
-// The "yamux session live" marker is emitted by the tun client
-// after the control-stream handshake completes; see
-// `crates/tun/src/client.rs::run_session`.
-//
-// 5s → 15s deadline: cold-cache CI runners routinely take 6-8s
-// to reach this state (DNS + cert verify + dynamic loader +
-// page cache warm-up for both binaries). 15s is well under the
-// e2e job's 15-minute overall budget and well above the
-// observed warm-cache local finish of <1s.
-let deadline = Instant::now() + Duration::from_secs(15);
-loop {
-    let log_s = String::from_utf8_lossy(&log.lock().unwrap()).into_owned();
-    if log_s.contains("yamux session live") {
-        break;
-    }
-    // Legacy fallback for older tun builds that don't log the
-    // "yamux session live" marker. Keep this so a freshly-built
-    // test crate running against an old `bin/pangolin-tun` still
-    // finds the tun ready.
-    if log_s.contains("connected to ngx") && log_s.contains("WS upgrade ok") {
-        break;
-    }
+        // on cold CI runners that gap is enough for the test's first
+        // request to race ahead and hit "Tun <name> not online" (503).
+        //
+        // The "yamux session live" marker is emitted by the tun client
+        // after the control-stream handshake completes; see
+        // `crates/tun/src/client.rs::run_session`.
+        //
+        // 5s → 15s deadline: cold-cache CI runners routinely take 6-8s
+        // to reach this state (DNS + cert verify + dynamic loader +
+        // page cache warm-up for both binaries). 15s is well under the
+        // e2e job's 15-minute overall budget and well above the
+        // observed warm-cache local finish of <1s.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let log_s = String::from_utf8_lossy(&log.lock().unwrap()).into_owned();
+            if log_s.contains("yamux session live") {
+                break;
+            }
+            // Legacy fallback for older tun builds that don't log the
+            // "yamux session live" marker. Keep this so a freshly-built
+            // test crate running against an old `bin/pangolin-tun` still
+            // finds the tun ready.
+            if log_s.contains("connected to ngx") && log_s.contains("WS upgrade ok") {
+                break;
+            }
             // Detect early failure (e.g. auth rejection) by looking
             // for the "disconnected" / "error" markers.
             if log_s.contains("disconnected") || log_s.contains("error") {

@@ -640,8 +640,7 @@ async fn access_log_all_backend_types_emit_entries() {
     // 3) File backend — point at a tempdir with a known file.
     let doc_root = TempDir::new().expect("tempdir");
     let doc_root_path = doc_root.path().to_path_buf();
-    std::fs::write(doc_root_path.join("hello.txt"), "hi from file\n")
-        .expect("write hello.txt");
+    std::fs::write(doc_root_path.join("hello.txt"), "hi from file\n").expect("write hello.txt");
     let doc_root_uri = format!("file://{}", doc_root_path.display());
 
     let ngx = NgxProcess::start({
@@ -652,11 +651,7 @@ async fn access_log_all_backend_types_emit_entries() {
             init_pangolin_db(db_path);
             let conn = Connection::open(db_path).expect("open db");
             // Direct site (pingora path → response_filter).
-            seed_site(
-                &conn,
-                "direct-site",
-                &format!("http://{direct_addr}"),
-            );
+            seed_site(&conn, "direct-site", &format!("http://{direct_addr}"));
             seed_domain(&conn, "direct.test", "direct-site");
 
             // Tunnel site (YamuxTunnelExecutor short-circuit).
@@ -739,10 +734,7 @@ async fn access_log_all_backend_types_emit_entries() {
     let (s_file, _) = raw_request(&http_addr, "file.test", "GET", "/hello.txt", b"").await;
     assert_eq!(s_file, 200, "file backend must return 200");
 
-    let frames = sse_task
-        .await
-        .expect("sse task join")
-        .expect("sse frames");
+    let frames = sse_task.await.expect("sse task join").expect("sse frames");
 
     // Build a small index keyed by path so we can assert each
     // backend type contributed exactly one entry.
@@ -769,10 +761,7 @@ async fn access_log_all_backend_types_emit_entries() {
                 ngx.log_string()
             )
         });
-        let backend = entry
-            .get("backend")
-            .and_then(|b| b.as_str())
-            .unwrap_or("");
+        let backend = entry.get("backend").and_then(|b| b.as_str()).unwrap_or("");
         assert!(
             backend.starts_with(expected_backend_prefix),
             "path={path}: expected backend starting with {:?}, got {backend:?}",
