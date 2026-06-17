@@ -524,14 +524,25 @@ impl ProxyHttp for AppProxy {
                 Some("https") => Scheme::Https,
                 _ => Scheme::Http,
             };
-            let ctx = ProxyCtx {
+            let proxy_ctx = ProxyCtx {
                 original_host,
                 original_scheme: scheme,
                 host_mode: site.host_mode,
                 host_custom: site.host_custom.clone(),
             };
-            apply_proxy_policy(&mut req, &ctx);
+            apply_proxy_policy(&mut req, &proxy_ctx);
             let resp = serve_file_target(&req, doc_root);
+            // Issue #73: file:// requests also short-circuit pingora
+            // — record the access log here for parity with the
+            // tunnel + direct paths. `ctx` (the trait's
+            // `RequestState`) is unaffected because the proxy
+            // policy `ProxyCtx` was renamed to `proxy_ctx` above.
+            record_access_log(
+                &self.app,
+                ctx,
+                session,
+                parse_status_from_line(&resp.status_line),
+            );
             write_response_to_session(session, &resp).await;
             return Ok(true);
         }
@@ -659,6 +670,16 @@ impl ProxyHttp for AppProxy {
                 .await
             {
                 Ok(resp) => {
+                    // Issue #73: tunnel-path requests short-circuit
+                    // pingora so the proxy `response_filter` never
+                    // runs — record the access log here so the entry
+                    // shows up on /logs.
+                    record_access_log(
+                        &self.app,
+                        ctx,
+                        session,
+                        parse_status_from_line(&resp.status_line),
+                    );
                     write_response_to_session(session, &resp).await;
                     return Ok(true);
                 }
@@ -825,25 +846,8 @@ impl ProxyHttp for AppProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Issue #73: construct AccessLogEntry and push to App
-        let duration_ms = ctx.start.elapsed().as_millis() as u64;
         let status = upstream_response.status.as_u16();
-        let client_ip = session
-            .client_addr()
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let entry = pangolin_core::AccessLogEntry {
-            timestamp: chrono::Utc::now(),
-            method: ctx.method.clone(),
-            path: ctx.path.clone(),
-            host: ctx.host.clone(),
-            status,
-            duration_ms,
-            backend: ctx.backend.clone(),
-            client_ip,
-        };
-
-        self.app.push_access_log(entry);
+        record_access_log(&self.app, ctx, session, status);
         Ok(())
     }
 }
@@ -1294,6 +1298,36 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     {
         error!("failed to write response body: {}", e);
     }
+}
+
+/// Build an [`AccessLogEntry`](pangolin_core::AccessLogEntry) from the
+/// per-request [`RequestState`] and the client address from
+/// `session`, and push it to [`App::push_access_log`]. Shared by
+/// `response_filter` (direct / pingora path) and the tunnel +
+/// file:// short-circuits in `request_filter` so every response
+/// that the user actually sees is logged exactly once.
+///
+/// Tunnel and file paths in `request_filter` return `Ok(true)` to
+/// short-circuit pingora, which means the proxy's `response_filter`
+/// is never called for them — without this helper those requests
+/// would silently disappear from the `/logs` page.
+fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
+    let duration_ms = ctx.start.elapsed().as_millis() as u64;
+    let client_ip = session
+        .client_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let entry = pangolin_core::AccessLogEntry {
+        timestamp: chrono::Utc::now(),
+        method: ctx.method.clone(),
+        path: ctx.path.clone(),
+        host: ctx.host.clone(),
+        status,
+        duration_ms,
+        backend: ctx.backend.clone(),
+        client_ip,
+    };
+    app.push_access_log(entry);
 }
 
 /// Parse the status code from an `HttpResponse::status_line`
