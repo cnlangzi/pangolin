@@ -423,6 +423,13 @@ impl App {
     /// Reload indexes from DB. Called after every admin write operation.
     /// Also fires `dns_change_notify` so the `AcmeState` background loop
     /// picks up new DNS providers / domain associations.
+    ///
+    /// fix/cert_www: also rebuilds the `cert_links` cache so an
+    /// out-of-band `INSERT INTO certs` (e.g. SQL console, a test
+    /// writing a cert blob post-startup) becomes visible to the
+    /// SNI callback without requiring a process restart. CRUD hooks
+    /// keep the cache warm in the normal case; this method is the
+    /// recovery path.
     pub async fn reload_indexes(&self) {
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
@@ -432,6 +439,13 @@ impl App {
         let dns_index = DnsIndex::build(&providers, &domains);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
+        // Rebuild cert_links (fix/cert_www). Best-effort: if the
+        // rebuild fails (e.g. a transient DB error), log and keep
+        // the existing cache. The cache is a derived view and will
+        // catch up on the next reload.
+        if let Err(e) = self.cert_links.reload_from_db(&conn) {
+            log::warn!("cert_links: reload from DB failed: {}", e);
+        }
         drop(conn);
         // Wake the AcmeState loop (if any) so it re-reads dns_providers.
         self.dns_change_notify.notify_one();

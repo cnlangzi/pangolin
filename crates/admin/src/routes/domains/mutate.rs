@@ -171,14 +171,14 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // gained a cert, or the cert it points to may have changed).
     // Failures are logged and ignored — a stale cache entry is
     // recoverable via `load_from_db` at next startup.
-    if result.is_ok() {
-        if let Err(e) = app.cert_links.relink_for_domain(&db, &d.domain) {
-            log::warn!(
-                "cert_links: relink for {} after create failed: {}",
-                d.domain,
-                e
-            );
-        }
+    if result.is_ok()
+        && let Err(e) = app.cert_links.relink_for_domain(&db, &d.domain)
+    {
+        log::warn!(
+            "cert_links: relink for {} after create failed: {}",
+            d.domain,
+            e
+        );
     }
     drop(db);
 
@@ -372,14 +372,14 @@ pub async fn handle_update(
     }
     // fix/cert_www: refresh the cert link. See handle_create for
     // the rationale; same warning-on-failure pattern.
-    if result.is_ok() {
-        if let Err(e) = app.cert_links.relink_for_domain(&db, &updated.domain) {
-            log::warn!(
-                "cert_links: relink for {} after update failed: {}",
-                updated.domain,
-                e
-            );
-        }
+    if result.is_ok()
+        && let Err(e) = app.cert_links.relink_for_domain(&db, &updated.domain)
+    {
+        log::warn!(
+            "cert_links: relink for {} after update failed: {}",
+            updated.domain,
+            e
+        );
     }
     drop(db);
 

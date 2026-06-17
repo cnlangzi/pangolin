@@ -1928,7 +1928,11 @@ pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
             // that were previously linked to nothing (or to a different
             // cert). Refresh the link cache for this cert's row.
             if let Err(e) = app.cert_links.relink_for_cert(&conn, &cert.domain) {
-                log::warn!("cert_links: relink for {} after scan failed: {}", cert.domain, e);
+                log::warn!(
+                    "cert_links: relink for {} after scan failed: {}",
+                    cert.domain,
+                    e
+                );
             }
         }
         synced += 1;

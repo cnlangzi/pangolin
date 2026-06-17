@@ -238,11 +238,8 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // time. See docs/design/cert-link.md.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
         let enable_h2 = config.tls.enable_h2;
-        let tls_settings = crate::tls::build_sni_settings(
-            cert_dir.clone(),
-            app.cert_links.clone(),
-            enable_h2,
-        )?;
+        let tls_settings =
+            crate::tls::build_sni_settings(cert_dir.clone(), app.cert_links.clone(), enable_h2)?;
         proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
         log::info!(
             "TLS enabled (SNI) on {} (cert_dir: {}, http2_alpn: {})",

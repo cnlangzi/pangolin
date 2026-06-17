@@ -130,6 +130,26 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
     .expect("insert domain");
 }
 
+/// Insert a `certs` row for a domain. Required by tests that
+/// bypass the ACME issuance flow and write a cert blob directly to
+/// `cert_dir/{domain}` (autocert DirCache format) — they must also
+/// seed the matching `certs` row so the in-memory `CertLinkCache`
+/// (fix/cert_www) builds the link at startup. The `cert_file` /
+/// `key_file` columns are placeholders; the cache only consults
+/// `certs.domain` and `certs.sans`. The actual blob on disk is
+/// written separately by the test, post-startup, so the SNI callback
+/// can find it via `cert_dir/{domain}`.
+fn seed_cert(conn: &Connection, domain: &str) {
+    let now = Utc::now().to_rfc3339();
+    let sans_json = serde_json::to_string(&vec![domain.to_string()]).expect("serialize sans");
+    conn.execute(
+        "INSERT INTO certs (domain, cert_file, key_file, created_at, sans, source, status)
+         VALUES (?1, '/dev/null', '/dev/null', ?2, ?3, 'manual', 'issued')",
+        rusqlite::params![domain, now, sans_json],
+    )
+    .expect("insert cert");
+}
+
 fn seed_tun(conn: &Connection, name: &str, enabled: bool) {
     // Convenience wrapper: insert a tun with token "test-token"
     // (matches the harness's `TunProcess::start(..., "test-token")`
@@ -1891,6 +1911,11 @@ async fn real_e2e_h2_authority_fallback() {
             seed_site(&conn, "h2-site", &format!("http://{backend_addr}"));
             // Domain matches the SNI we'll use in the curl request.
             seed_domain(&conn, "h2test.local", "h2-site");
+            // fix/cert_www: seed the cert row so the in-memory
+            // `CertLinkCache` (built at startup) has a link for
+            // `h2test.local`. The actual cert blob lands on disk
+            // below, after start.
+            seed_cert(&conn, "h2test.local");
         }
     })
     .await;

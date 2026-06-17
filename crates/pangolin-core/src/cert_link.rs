@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::types::CertStatus;
 
@@ -53,15 +53,27 @@ impl CertLinkCache {
     /// which is the right answer.
     pub fn load_from_db(conn: &Connection) -> crate::Result<Self> {
         let cache = Self::new();
+        cache.reload_from_db(conn)?;
+        Ok(cache)
+    }
+
+    /// Drop every entry and rebuild from the DB. Used by
+    /// `App::reload_indexes` to make the cache consistent after an
+    /// out-of-band edit (e.g. `INSERT INTO certs` by hand, or a
+    /// test that writes a cert blob and inserts the matching row
+    /// after the process has already started). Cheap — O(domains ×
+    /// certs), see `relink_for_cert` for the perf note.
+    pub fn reload_from_db(&self, conn: &Connection) -> crate::Result<()> {
+        self.map.clear();
         let mut stmt = conn.prepare("SELECT domain FROM domains")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for row in rows {
             let domain = row?;
             if let Some(cert_domain) = find_best_cert_for(conn, &domain)? {
-                cache.map.insert(domain, cert_domain);
+                self.map.insert(domain, cert_domain);
             }
         }
-        Ok(cache)
+        Ok(())
     }
 
     /// SNI hot path: exact match, then walk up the domain looking for
@@ -212,11 +224,7 @@ fn find_best_cert_for(conn: &Connection, domain: &str) -> crate::Result<Option<S
 /// Single-level wildcard only: `*.example.com` covers
 /// `api.example.com` but NOT `api.v2.example.com`. This matches
 /// Let's Encrypt's issuance rules and RFC 6125.
-fn cert_covers_domain(
-    cert_domain: &str,
-    sans: &[String],
-    domain: &str,
-) -> Option<Priority> {
+fn cert_covers_domain(cert_domain: &str, sans: &[String], domain: &str) -> Option<Priority> {
     if cert_domain == domain {
         return Some(Priority::Exact);
     }
@@ -283,10 +291,7 @@ mod tests {
         // cache's job is just to find the best link, not to police
         // what the user registered.
         let c = cache_with(&[("*.example.com", "example.com")]);
-        assert_eq!(
-            c.lookup("a.b.example.com").as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(c.lookup("a.b.example.com").as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -299,10 +304,7 @@ mod tests {
     #[test]
     fn lookup_strips_trailing_dot() {
         let c = cache_with(&[("example.com", "example.com")]);
-        assert_eq!(
-            c.lookup("example.com.").as_deref(),
-            Some("example.com")
-        );
+        assert_eq!(c.lookup("example.com.").as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -338,7 +340,11 @@ mod tests {
             Some(Priority::Exact)
         );
         assert_eq!(
-            cert_covers_domain("example.com", &["www.example.com".into()], "www.example.com"),
+            cert_covers_domain(
+                "example.com",
+                &["www.example.com".into()],
+                "www.example.com"
+            ),
             Some(Priority::Exact)
         );
     }
@@ -479,7 +485,10 @@ mod tests {
         let cache = CertLinkCache::load_from_db(&conn).unwrap();
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
-        assert_eq!(cache.lookup("api.example.com").as_deref(), Some("example.com"));
+        assert_eq!(
+            cache.lookup("api.example.com").as_deref(),
+            Some("example.com")
+        );
     }
 
     #[test]

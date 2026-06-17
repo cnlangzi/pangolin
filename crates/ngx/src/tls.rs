@@ -33,7 +33,10 @@ pub struct SniCertCallback {
 
 impl SniCertCallback {
     pub fn new(cert_dir: Arc<std::path::PathBuf>, cert_links: CertLinkCache) -> Self {
-        Self { cert_dir, cert_links }
+        Self {
+            cert_dir,
+            cert_links,
+        }
     }
 }
 

@@ -146,19 +146,9 @@ fn load_from_db_ignores_pending_and_failed_certs() {
     let conn = setup_db();
     insert_domain(&conn, "example.com");
     // A Pending cert must NOT be picked up — it's not yet usable.
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Pending,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Pending);
     // Same for Failed.
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Failed,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Failed);
     let cache = CertLinkCache::load_from_db(&conn).expect("load");
     assert!(
         cache.is_empty(),
@@ -173,18 +163,8 @@ fn load_from_db_uses_final_status_after_upsert() {
     // lands as Issued; the cache picks it up.
     let conn = setup_db();
     insert_domain(&conn, "example.com");
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Failed,
-    );
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Issued,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Failed);
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Issued);
     let cache = CertLinkCache::load_from_db(&conn).expect("load");
     assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
 }
@@ -278,12 +258,7 @@ fn relink_for_domain_picks_exact_over_wildcard() {
     let conn = setup_db();
     insert_domain(&conn, "api.example.com");
     // Wildcard cert first (lower priority), specific cert second.
-    insert_cert(
-        &conn,
-        "example.com",
-        &["*.example.com"],
-        CertStatus::Issued,
-    );
+    insert_cert(&conn, "example.com", &["*.example.com"], CertStatus::Issued);
     insert_cert(
         &conn,
         "api.example.com",
@@ -306,12 +281,7 @@ fn relink_for_domain_picks_exact_over_wildcard() {
 fn relink_for_domain_drops_entry_when_no_cert_covers() {
     let conn = setup_db();
     insert_domain(&conn, "example.com");
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Issued,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Issued);
     let cache = CertLinkCache::load_from_db(&conn).expect("load");
     assert!(!cache.is_empty());
 
@@ -363,12 +333,7 @@ fn relink_for_cert_refreshes_all_affected_domains() {
 fn remove_domain_clears_entry() {
     let conn = setup_db();
     insert_domain(&conn, "example.com");
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Issued,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Issued);
     let cache = CertLinkCache::load_from_db(&conn).expect("load");
     assert_eq!(cache.len(), 1);
 
@@ -409,24 +374,13 @@ fn cache_is_cheap_to_clone() {
     // SNI callback and admin handlers each hold their own clone.
     let conn = setup_db();
     insert_domain(&conn, "example.com");
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Issued,
-    );
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Issued);
     let cache = CertLinkCache::load_from_db(&conn).expect("load");
     let cache2 = cache.clone();
 
     // Both clones see the same data.
-    assert_eq!(
-        cache.lookup("example.com").as_deref(),
-        Some("example.com")
-    );
-    assert_eq!(
-        cache2.lookup("example.com").as_deref(),
-        Some("example.com")
-    );
+    assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
+    assert_eq!(cache2.lookup("example.com").as_deref(), Some("example.com"));
 
     // A write through one clone is visible to the other.
     cache.remove_domain("example.com");
@@ -440,17 +394,8 @@ fn cache_works_with_arc_wrapper() {
     // This test just exercises the same code path through `Arc`.
     let conn = setup_db();
     insert_domain(&conn, "example.com");
-    insert_cert(
-        &conn,
-        "example.com",
-        &["example.com"],
-        CertStatus::Issued,
-    );
-    let cache: Arc<CertLinkCache> =
-        Arc::new(CertLinkCache::load_from_db(&conn).expect("load"));
+    insert_cert(&conn, "example.com", &["example.com"], CertStatus::Issued);
+    let cache: Arc<CertLinkCache> = Arc::new(CertLinkCache::load_from_db(&conn).expect("load"));
     let cache2 = Arc::clone(&cache);
-    assert_eq!(
-        cache2.lookup("example.com").as_deref(),
-        Some("example.com")
-    );
+    assert_eq!(cache2.lookup("example.com").as_deref(), Some("example.com"));
 }
