@@ -3,20 +3,9 @@
 # block (`deploy/playbooks/tun.yml`), not here. `vars:` is a play-
 # level keyword and is not allowed inside a task file.
 #
-# Deploy order: upload first, restart last. Old code stopped the
-# service up front and re-started it after the upload, so downtime
-# was "stop + upload (tens of MB) + start". Linux lets you
-# overwrite an executable that a running process has mmap'd, so
-# the new order leaves the old binary running through the upload
-# and the trailing `restart` handler is the only thing that flips
-# to it — downtime collapses to a single sub-second restart. The
-# WebSocket reconnect to ngx is fast enough that callers don't
-# notice.
-#
-# Backup: single rolling `.bak` (overwriting any prior one)
-# instead of `copy: backup: yes`'s timestamped stack. The `stat`
-# + `copy` pair backs up only when the binary already exists —
-# first deploy is a clean copy with no backup.
+# Upload first, restart last — old binary keeps serving through
+# the upload, downtime is a single restart. Binary gets a single
+# rolling `.bak`, not a timestamped stack.
 
 - name: Check if pangolin user exists
   # The pangolin user is shared with the ngx role. On a host that
@@ -54,29 +43,10 @@
     group: pangolin
     mode: 0755
 
-- name: Stat existing tun binary
-  # Used to skip the backup step on a fresh install — the binary
-  # may not exist yet on the very first deploy, in which case
-  # there is nothing to back up.
-  become: true
-  ansible.builtin.stat:
-    path: /usr/local/pangolin/pangolin-tun
-  register: tun_binary_stat
-
-- name: Backup existing tun binary to pangolin-tun.bak
-  # `remote_src: yes` reads from the managed host, and `force` is
-  # on by default, so any prior `.bak` is overwritten — disk
-  # holds exactly one previous version. Roll back by hand with
-  # `cp pangolin-tun.bak pangolin-tun && systemctl restart pangolin-tun`.
-  become: true
-  ansible.builtin.copy:
-    src: /usr/local/pangolin/pangolin-tun
-    dest: /usr/local/pangolin/pangolin-tun.bak
-    remote_src: yes
-    owner: pangolin
-    group: pangolin
-    mode: 0755
-  when: tun_binary_stat.stat.exists
+- name: Backup existing tun binary to .bak
+  ansible.builtin.include_tasks: ../../common/tasks/backup-rolling-binary.yml
+  vars:
+    binary_name: pangolin-tun
 
 - name: Upload tun binary
   become: true
