@@ -62,6 +62,18 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_cert(&db, &c);
+    // fix/cert_www: a manually-uploaded cert may be the best match
+    // for any number of registered domains. Refresh the link cache
+    // so the SNI callback picks it up immediately.
+    if result.is_ok() {
+        if let Err(e) = app.cert_links.relink_for_cert(&db, &c.domain) {
+            log::warn!(
+                "cert_links: relink for {} after manual upload failed: {}",
+                c.domain,
+                e
+            );
+        }
+    }
     drop(db);
 
     match result {
@@ -84,6 +96,12 @@ pub async fn handle_delete(
     {
         let db = app.db.lock().await;
         let _ = pangolin_core::db::delete_cert(&db, &d);
+        // fix/cert_www: the cert row is gone — drop any domain link
+        // that pointed at it. `relink_for_cert` re-derives from the
+        // current certs table, so any surviving cert will replace it.
+        if let Err(e) = app.cert_links.relink_for_cert(&db, &d) {
+            log::warn!("cert_links: relink for {} after delete failed: {}", d, e);
+        }
         drop(db);
         app.reload_indexes().await;
     }
@@ -102,6 +120,10 @@ pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> h
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_cert(&db, &domain);
+    // fix/cert_www: see handle_delete above.
+    if let Err(e) = app.cert_links.relink_for_cert(&db, &domain) {
+        log::warn!("cert_links: relink for {} after delete failed: {}", domain, e);
+    }
     drop(db);
     app.reload_indexes().await;
     Ok(Response::builder()

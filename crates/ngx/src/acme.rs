@@ -1924,6 +1924,12 @@ pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
                 log::warn!("scan: upsert {} failed: {}", domain, e);
                 continue;
             }
+            // fix/cert_www: a cert we just imported may cover domains
+            // that were previously linked to nothing (or to a different
+            // cert). Refresh the link cache for this cert's row.
+            if let Err(e) = app.cert_links.relink_for_cert(&conn, &cert.domain) {
+                log::warn!("cert_links: relink for {} after scan failed: {}", cert.domain, e);
+            }
         }
         synced += 1;
         app.add_event(pangolin_core::EventType::Info {
@@ -3461,6 +3467,18 @@ impl AcmeState {
                     order_url: None,
                 };
                 let _ = pangolin_core::db::upsert_cert(&conn, &cert_row);
+                // fix/cert_www: a freshly-issued cert may be the best
+                // match for any number of registered domains (e.g. a
+                // wildcard cert covers all matching subdomains). Refresh
+                // the link cache so the SNI callback picks it up
+                // immediately.
+                if let Err(e) = app.cert_links.relink_for_cert(&conn, &cert_row.domain) {
+                    log::warn!(
+                        "cert_links: relink for {} after issue failed: {}",
+                        cert_row.domain,
+                        e
+                    );
+                }
                 drop(conn);
                 trace(
                     "issued",

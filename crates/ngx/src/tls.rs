@@ -17,6 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
+use pangolin_core::CertLinkCache;
 use pingora::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingora_core::tls::ssl::NameType;
@@ -27,11 +28,12 @@ use pingora_core::tls::ssl::NameType;
 /// the listener.
 pub struct SniCertCallback {
     pub cert_dir: Arc<std::path::PathBuf>,
+    pub cert_links: CertLinkCache,
 }
 
 impl SniCertCallback {
-    pub fn new(cert_dir: Arc<std::path::PathBuf>) -> Self {
-        Self { cert_dir }
+    pub fn new(cert_dir: Arc<std::path::PathBuf>, cert_links: CertLinkCache) -> Self {
+        Self { cert_dir, cert_links }
     }
 }
 
@@ -44,15 +46,32 @@ impl TlsAccept for SniCertCallback {
             None => return, // no SNI → no cert → handshake fails
         };
 
-        // Try ECDSA blob first, then +rsa variant.
-        let ecdsa = self.cert_dir.join(&sni);
-        let rsa = self.cert_dir.join(format!("{}+rsa", &sni));
+        // Resolve the link: domain → cert primary. The cache does the
+        // single-level wildcard walk (api.example.com → *.example.com
+        // etc.) so the file system only sees an exact cert primary.
+        let cert_domain = match self.cert_links.lookup(&sni) {
+            Some(c) => c,
+            None => {
+                log::debug!("TLS: no cert link for SNI '{}', handshake will fail", sni);
+                return;
+            }
+        };
+
+        // Try ECDSA blob first, then +rsa variant. The link points to the
+        // cert primary (e.g. "example.com" for a *.example.com wildcard
+        // cert); both filenames are written with identical content.
+        let ecdsa = self.cert_dir.join(&cert_domain);
+        let rsa = self.cert_dir.join(format!("{}+rsa", &cert_domain));
         let blob_path = if ecdsa.is_file() {
             ecdsa
         } else if rsa.is_file() {
             rsa
         } else {
-            log::debug!("TLS: no cert for SNI '{}', handshake will fail", sni);
+            log::debug!(
+                "TLS: link stale for SNI '{}' → cert '{}' not on disk",
+                sni,
+                cert_domain
+            );
             return;
         };
 
@@ -141,10 +160,11 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, String)> {
 /// reference).
 pub fn build_sni_settings(
     cert_dir: std::path::PathBuf,
+    cert_links: CertLinkCache,
     enable_h2: bool,
 ) -> anyhow::Result<pingora::listeners::tls::TlsSettings> {
     let cb: pingora::listeners::TlsAcceptCallbacks =
-        Box::new(SniCertCallback::new(Arc::new(cert_dir)));
+        Box::new(SniCertCallback::new(Arc::new(cert_dir), cert_links));
     let mut settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
     if enable_h2 {
         settings.enable_h2();

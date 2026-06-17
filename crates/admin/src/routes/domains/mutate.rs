@@ -166,6 +166,20 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         let _ =
             pangolin_core::db::ensure_pending_cert_row(&db, &d.domain, &app.cert_manager.cert_dir);
     }
+    // fix/cert_www: refresh the domain → cert link cache. If the
+    // upsert succeeded, recompute this domain's link (it may have
+    // gained a cert, or the cert it points to may have changed).
+    // Failures are logged and ignored — a stale cache entry is
+    // recoverable via `load_from_db` at next startup.
+    if result.is_ok() {
+        if let Err(e) = app.cert_links.relink_for_domain(&db, &d.domain) {
+            log::warn!(
+                "cert_links: relink for {} after create failed: {}",
+                d.domain,
+                e
+            );
+        }
+    }
     drop(db);
 
     match result {
@@ -356,6 +370,17 @@ pub async fn handle_update(
             &app.cert_manager.cert_dir,
         );
     }
+    // fix/cert_www: refresh the cert link. See handle_create for
+    // the rationale; same warning-on-failure pattern.
+    if result.is_ok() {
+        if let Err(e) = app.cert_links.relink_for_domain(&db, &updated.domain) {
+            log::warn!(
+                "cert_links: relink for {} after update failed: {}",
+                updated.domain,
+                e
+            );
+        }
+    }
     drop(db);
 
     match result {
@@ -465,6 +490,11 @@ pub async fn handle_delete(
         let db = app.db.lock().await;
         let _ = pangolin_core::db::delete_domain(&db, &d);
         drop(db);
+        // fix/cert_www: drop this domain's link from the cache. Any
+        // cert row that previously covered it is left in place — the
+        // cert may still be serving other domains — but this one
+        // should no longer claim it.
+        app.cert_links.remove_domain(&d);
         app.reload_indexes().await;
     }
     Ok(redirect_response("/domains"))
@@ -479,6 +509,8 @@ pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> h
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_domain(&db, &domain);
     drop(db);
+    // fix/cert_www: see handle_delete above.
+    app.cert_links.remove_domain(&domain);
     app.reload_indexes().await;
     Ok(Response::builder()
         .status(200)

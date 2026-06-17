@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::tunnel::YamuxTunnel;
 use crate::{
-    AccessLogBuffer, AccessLogEntry, EventBuffer, EventType, Indexes,
+    AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
     db,
     types::{ChallengeKind, ChallengeType, DnsProviderKind},
@@ -330,6 +330,12 @@ pub struct App {
     /// broadcasts. Sized by `config.log.access_log_recent`
     /// (default 100).
     pub access_log_recent: Arc<AccessLogBuffer>,
+    /// Domain → cert pre-computed link (fix/cert_www). Built once
+    /// at startup from the `domains` × `certs` tables, then
+    /// maintained by the domain/cert CRUD hooks. Read on every
+    /// TLS handshake by the SNI callback in `ngx::tls`. See
+    /// `docs/design/cert-link.md` for the full design.
+    pub cert_links: CertLinkCache,
 }
 
 impl App {
@@ -370,6 +376,12 @@ impl App {
         let indexes = Indexes::build(sites, domains.clone());
         let dns_index = DnsIndex::build(&providers, &domains);
 
+        // fix/cert_www: build the domain → cert pre-computed link
+        // cache. Pure derived view over `domains` and `certs`; the
+        // SNI callback reads it on every TLS handshake. Built once
+        // here and maintained by the CRUD hooks (`relink_for_*`).
+        let cert_links = CertLinkCache::load_from_db(&conn)?;
+
         // Access log live channel (issue #73). tokio::sync::broadcast
         // already deduplicates per-subscriber but we still need to
         // set a real capacity here so the channel has somewhere to
@@ -395,6 +407,7 @@ impl App {
             cert_retrier: RwLock::new(None),
             access_log_tx,
             access_log_recent: Arc::new(AccessLogBuffer::new(access_log_recent_capacity)),
+            cert_links,
         })
     }
 
