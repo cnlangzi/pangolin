@@ -57,7 +57,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::admin_harness::AdminClient;
-use crate::harness::{NgxProcess, init_pangolin_db, raw_request};
+use crate::harness::{NgxProcess, TunProcess, init_pangolin_db, raw_request};
 
 // ─────────────────────────────────────────────────────────────────
 // DB seed helpers — thin wrappers over `pangolin_core::db::upsert_*`
@@ -100,6 +100,30 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
         },
     )
     .expect("insert domain");
+}
+
+/// Insert a tun row with a known token. Mirrors `seed_tun` in
+/// `real_e2e.rs` but kept inline so this module doesn't have to
+/// depend on the tunnel test's seeders. The token is `sha256`'d
+/// at insert time — that matches what `tun::auth_tun` expects
+/// (v3 hash-based lookup).
+fn seed_tun(conn: &Connection, name: &str) {
+    use pangolin_core::db::upsert_tun;
+    use pangolin_core::types::Tun;
+    upsert_tun(
+        conn,
+        &Tun {
+            name: name.into(),
+            token: Some("test-token".into()),
+            token_hash: None,
+            enabled: true,
+            online: false,
+            registered_at: None,
+            last_seen_at: None,
+            expires_at: None,
+        },
+    )
+    .expect("insert tun");
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -584,4 +608,183 @@ async fn access_log_admin_page_requires_auth() {
         loc.contains("/login"),
         "redirect target must be /login, got: {loc}"
     );
+}
+
+/// access_log_all_backend_types_emit_entries — regression for the
+/// `d5f232e` fix that made `record_access_log` fire on the tunnel
+/// and file:// short-circuits in `request_filter`. Before the fix,
+/// only the direct / pingora path logged anything; tunnel and
+/// file:// requests went through `write_response_to_session`
+/// followed by `return Ok(true)` and never reached
+/// `response_filter`, so the `/logs` page stayed silent for
+/// half the production traffic.
+///
+/// The test stands up three sites covering the three backend
+/// types and asserts each one's entry shows up on the SSE stream
+/// with the matching `backend` label.
+#[tokio::test]
+async fn access_log_all_backend_types_emit_entries() {
+    use tempfile::TempDir;
+
+    // 1) Direct backend — mock HTTP server. 200 OK is enough; the
+    //    proxy logs the request regardless of body.
+    let direct_backend = MockHttpBackend::start().await;
+    let direct_addr = direct_backend.addr().to_string();
+
+    // 2) Tunnel backend — uses the same mock upstream as the
+    //    direct site, but routed through a `local:tun_name`
+    //    tunnel. Requires a real `pangolin-tun` binary.
+    let tunnel_backend = MockHttpBackend::start().await;
+    let tunnel_backend_addr = tunnel_backend.addr().to_string();
+
+    // 3) File backend — point at a tempdir with a known file.
+    let doc_root = TempDir::new().expect("tempdir");
+    let doc_root_path = doc_root.path().to_path_buf();
+    std::fs::write(doc_root_path.join("hello.txt"), "hi from file\n")
+        .expect("write hello.txt");
+    let doc_root_uri = format!("file://{}", doc_root_path.display());
+
+    let ngx = NgxProcess::start({
+        let direct_addr = direct_addr.clone();
+        let tunnel_backend_addr = tunnel_backend_addr.clone();
+        let doc_root_uri = doc_root_uri.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            // Direct site (pingora path → response_filter).
+            seed_site(
+                &conn,
+                "direct-site",
+                &format!("http://{direct_addr}"),
+            );
+            seed_domain(&conn, "direct.test", "direct-site");
+
+            // Tunnel site (YamuxTunnelExecutor short-circuit).
+            seed_tun(&conn, "office");
+            seed_site(
+                &conn,
+                "tunnel-site",
+                &format!("office:http://{tunnel_backend_addr}"),
+            );
+            seed_domain(&conn, "tunnel.test", "tunnel-site");
+
+            // File site (serve_file_target short-circuit).
+            seed_site(&conn, "file-site", &doc_root_uri);
+            seed_domain(&conn, "file.test", "file-site");
+        }
+    })
+    .await;
+
+    // Spin up the tun binary — without it the tunnel request
+    // returns 503 and the test fails on the wrong symptom.
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // Authenticate so the SSE endpoint will accept our stream.
+    // We login via a low-level reqwest client (no auto-redirect)
+    // and pull the raw `pangolin_session=...` cookie out of the
+    // Set-Cookie header — same dance as
+    // `access_log_sse_replays_then_streams_live`.
+    let admin_base = format!("http://127.0.0.1:{}", ngx.admin_port);
+    let raw_login = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build raw login client");
+    let login_resp = raw_login
+        .post(&format!("{admin_base}/login"))
+        .form(&[("username", "admin"), ("password", "admin")])
+        .send()
+        .await
+        .expect("POST /login");
+    assert_eq!(login_resp.status().as_u16(), 302, "login must redirect");
+    let sse_cookie: String = login_resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| {
+            v.split(';').next().and_then(|kv| {
+                let kv = kv.trim();
+                if kv.starts_with("pangolin_session=") {
+                    Some(kv.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("login must Set-Cookie pangolin_session=");
+
+    // Open SSE in the background; it will receive both the
+    // pre-stream replay (empty — we haven't fired yet) and the
+    // live entries pushed by the three requests below.
+    let sse_addr = format!("127.0.0.1:{}", ngx.admin_port);
+    let sse_task = tokio::spawn(async move {
+        read_sse_data_frames(&sse_addr, Duration::from_secs(5), Some(&sse_cookie)).await
+    });
+
+    // Give the SSE handshake + replay-drain time to settle before
+    // we start firing requests; otherwise our entries might land
+    // before the subscription is live and be lost.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Fire one request per backend. Each must succeed (the
+    // tunnel + file responses prove the request actually reached
+    // the matching code path) — otherwise a regression in the
+    // unrelated proxy plumbing would mask the access-log bug
+    // we're trying to catch.
+    let http_addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (s_direct, _) = raw_request(&http_addr, "direct.test", "GET", "/d", b"").await;
+    assert_eq!(s_direct, 200, "direct backend must return 200");
+    let (s_tunnel, _) = raw_request(&http_addr, "tunnel.test", "GET", "/t", b"").await;
+    assert_eq!(s_tunnel, 200, "tunnel backend must return 200");
+    let (s_file, _) = raw_request(&http_addr, "file.test", "GET", "/hello.txt", b"").await;
+    assert_eq!(s_file, 200, "file backend must return 200");
+
+    let frames = sse_task
+        .await
+        .expect("sse task join")
+        .expect("sse frames");
+
+    // Build a small index keyed by path so we can assert each
+    // backend type contributed exactly one entry.
+    let mut by_path: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for frame in &frames {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else {
+            continue;
+        };
+        let Some(path) = v.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        by_path.insert(path.to_string(), v);
+    }
+
+    for (path, expected_backend_prefix) in [
+        ("/d", "direct:"),
+        ("/t", "tun:"),
+        ("/hello.txt", "direct:"), // file:// path is logged as `direct:<doc_root>`
+    ] {
+        let entry = by_path.get(path).unwrap_or_else(|| {
+            panic!(
+                "no SSE frame for path={path}. frames={frames:?}\nngx log:\n{}",
+                ngx.log_string()
+            )
+        });
+        let backend = entry
+            .get("backend")
+            .and_then(|b| b.as_str())
+            .unwrap_or("");
+        assert!(
+            backend.starts_with(expected_backend_prefix),
+            "path={path}: expected backend starting with {:?}, got {backend:?}",
+            expected_backend_prefix
+        );
+        assert_eq!(
+            entry.get("host").and_then(|h| h.as_str()),
+            Some(match path {
+                "/d" => "direct.test",
+                "/t" => "tunnel.test",
+                _ => "file.test",
+            })
+        );
+    }
 }

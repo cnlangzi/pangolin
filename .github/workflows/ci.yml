@@ -92,7 +92,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-unit-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # See the e2e job's comment — including **/*.rs in the key
+          # busts the cache when source changes, avoiding the
+          # "stale incremental state from a previous run" flake.
+          key: ${{ runner.os }}-cargo-unit-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/*.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-unit-1.96-
 
@@ -163,7 +166,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-e2e-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # hashFiles includes every .rs file so source-only changes
+          # (which cargo's incremental rebuild would otherwise pick
+          # up correctly, but GHA's `target/` cache snapshot can mask
+          # by feeding cargo a stale incremental state) bust the
+          # cache. Cargo.lock / Cargo.toml alone are NOT enough —
+          # they don't change when `src/proxy.rs` does, and we've
+          # seen that lead to flakes where the running binary was
+          # older than the source the test was written against.
+          key: ${{ runner.os }}-cargo-e2e-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '**/*.rs') }}
           restore-keys: |
             ${{ runner.os }}-cargo-e2e-1.96-
 
