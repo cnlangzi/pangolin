@@ -747,6 +747,10 @@ async fn real_e2e_tunnel_h2_path_preserved() {
             &format!("office:http://{backend_addr}"),
         );
         seed_domain(&conn, "office.test", "office-site");
+        // fix/cert_www: seed the cert row so the in-memory
+        // `CertLinkCache` (built at startup) has a link for
+        // `office.test`. The actual cert blob lands on disk below.
+        seed_cert(&conn, "office.test");
     })
     .await;
 
