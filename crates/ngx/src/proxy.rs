@@ -303,11 +303,17 @@ impl ProxyHttp for AppProxy {
             }
         }
 
-        // ── SSE / streaming response short-circuit ────────────
-        // Detected up-front (before site lookup) so we can pick
-        // the byte-relay path on both ends. The heuristic is
-        // intentionally conservative: only `text/event-stream`
-        // is matched today. Add new patterns to
+        // ── SSE / streaming response detection ────────────────
+        // The streaming path is a byte-relay that exists for the
+        // **tunnel** transport: the tun-side relay uses
+        // `copy_bidirectional` because the buffering HttpResponse
+        // path would deadlock on an infinite chunked body. For
+        // **direct** backends, pingora's H1/H2 client streams the
+        // response natively — we just let it through to
+        // `upstream_peer` and nothing buffers.
+        //
+        // The detection is intentionally conservative (only
+        // `text/event-stream` today). Add new patterns to
         // `pangolin_core::is_streaming_request` to extend.
         //
         // NOTE: this iterates over *all* request headers (not
@@ -316,6 +322,12 @@ impl ProxyHttp for AppProxy {
         // send. Keep the semantics aligned with
         // `pangolin_core::is_streaming_request` — see
         // `is_streaming_request_detects_text_event_stream`.
+        //
+        // The short-circuit itself runs *after* the site lookup
+        // below so we can branch on `tun_name.is_empty()`:
+        //   - tunnel    → call `handle_streaming_request` (byte-relay)
+        //   - direct    → fall through, pingora streams natively
+        //   - file://   → 400 (no streaming concept for a single file)
         let is_streaming = session.req_header().headers.iter().any(|(k, v)| {
             let name = k.as_str();
             (name.eq_ignore_ascii_case("Accept") || name.eq_ignore_ascii_case("Content-Type"))
@@ -323,10 +335,6 @@ impl ProxyHttp for AppProxy {
                     .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
                     .unwrap_or(false)
         });
-
-        if is_streaming {
-            return handle_streaming_request(&self.app, session).await;
-        }
 
         // ── WebSocket upgrade short-circuit ────────────────────
         if is_upgrade && path == self.app.ws_path {
@@ -492,6 +500,45 @@ impl ProxyHttp for AppProxy {
         } else {
             format!("tun:{}", tun_name)
         };
+
+        // ── SSE / streaming response short-circuit (tunnel only) ──
+        // Branch on the routing decision we just made:
+        //   - tunnel:    the tun-side `handle_streaming_response`
+        //                byte-relay is required (the tun's buffered
+        //                HttpResponse path deadlocks on infinite
+        //                chunked bodies). Take the short-circuit.
+        //   - direct +   file:// is not a streaming transport —
+        //     file://    refuse with 400.
+        //   - direct +   pingora's H1/H2 client streams the
+        //     Http/Https response natively, no buffering on the
+        //                ngx side. Fall through to the standard
+        //                direct path (the `Ok(false)` branch at
+        //                the bottom of `request_filter`).
+        if is_streaming {
+            if !tun_name.is_empty() {
+                return handle_streaming_request(&self.app, session).await;
+            }
+            if matches!(target, BackendTarget::File { .. }) {
+                warn!(
+                    "SSE: refused on file:// backend for {} \
+                     (file:// has no streaming concept)",
+                    host
+                );
+                let _ = session.respond_error(400).await;
+                return Ok(true);
+            }
+            // Direct Http/Https + SSE: fall through to the
+            // pingora direct path. The access-log entry is
+            // already populated above (`ctx.backend`), and
+            // `response_filter` will record the final status
+            // when pingora finishes the stream.
+            debug!(
+                "SSE: direct path (pingora-native streaming) \
+                 {} → {}",
+                host,
+                target.authority()
+            );
+        }
 
         // ── file:// direct (no tun) ──────────────────────────
         // Only when tun_name is empty — otherwise the file

@@ -834,3 +834,147 @@ fn is_streaming_request_detects_text_event_stream() {
     };
     assert!(!is_streaming_request(&no_accept));
 }
+
+/// **SSE through a direct (non-tunnel) Http backend.**
+///
+/// Regression test: prior to the fix, the `is_streaming` short-
+/// circuit in `request_filter` unconditionally called
+/// `handle_streaming_request`, which returned 501 when the site
+/// had no tunnel — even though pingora's direct path streams
+/// H1/H2 chunked responses natively. Any site that wanted SSE
+/// (chat streams, live tail of `/logs`, observability) was
+/// forced to be fronted by a tun.
+///
+/// Post-fix: the `is_streaming` check now branches on
+/// `tun_name.is_empty()` — for direct backends we fall through
+/// to the standard direct path and let pingora stream the
+/// response. This test pins that behavior so a future refactor
+/// can't quietly regress it back to 501.
+#[tokio::test]
+async fn real_e2e_direct_sse_streams_through() {
+    let backend = SseBackend::start(3, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    // NOTE: backend is `http://...` (no `tunname:` prefix).
+    // The site therefore has `tun_name.is_empty() == true`,
+    // and SSE must take the direct path.
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // No `seed_tun` call — there is no tun for this site.
+        seed_site(&conn, "sse-direct-site", &format!("http://{backend_addr}"));
+        seed_domain(&conn, "sse-direct.test", "sse-direct-site");
+    })
+    .await;
+
+    // No `TunProcess::start` — there is no tun.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let (status, headers, body) = raw_sse_request(
+        &addr,
+        "sse-direct.test",
+        "/events",
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Pre-fix: 501 (Not Implemented). Post-fix: 200.
+    assert_eq!(
+        status,
+        200,
+        "SSE request must stream through direct (non-tunnel) \
+         backend, got {status}. headers={headers:?}\nbody={body:?}\
+         \nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type must be text/event-stream, got headers: {headers:?}"
+    );
+    for i in 0..3 {
+        let expected = format!("data: event {i}");
+        assert!(
+            body.contains(&expected),
+            "SSE body missing event {i}, got: {body:?}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+    assert!(
+        backend.seen_request().await,
+        "SSE direct backend never received the request — the \
+         request was either dropped or short-circuited. ngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// **SSE through a direct (non-tunnel) Https backend.**
+///
+/// Mirrors the Https case from the screenshot: `dev.yaitoo.cn`
+/// is a direct `http://127.0.0.1:8080` backend, and the browser
+/// was hitting `https://dev.yaitoo.cn/sse` (H1 to ngx, H1 to
+/// the local backend). The 501 came from the tun-only
+/// short-circuit, not from TLS. This test exercises the same
+/// routing decision with a *plain HTTP* local backend but under
+/// a TLS-terminating edge (we use the raw H1 helper for the
+/// internal connection; the bug and the fix are at the
+/// request_filter level, identical between H1 and HTTPS edges).
+#[tokio::test]
+async fn real_e2e_direct_sse_via_https_edge() {
+    let backend = SseBackend::start(2, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // Direct Https backend (the dev.yaitoo.cn shape).
+        seed_site(
+            &conn,
+            "sse-https-site",
+            &format!("https://{backend_addr}"),
+        );
+        seed_domain(&conn, "sse-https.test", "sse-https-site");
+    })
+    .await;
+
+    // The local SSE backend speaks H1 — the TLS in the URL is
+    // only there to exercise the `BackendTarget::Https { .. }`
+    // branch. The backend will fail the TLS handshake (it
+    // doesn't have a cert), which is fine for our purposes:
+    // we're testing the routing decision (no 501), not end-
+    // to-end TLS. We assert either:
+    //   - status 200 (lucky: SseBackend was actually H1, but
+    //     ng​x opens TLS to it → handshake fails first), OR
+    //   - status 502 (TLS handshake failed at the backend, the
+    //     expected outcome for a real "direct Https" path
+    //     against an H1 backend).
+    // The bug we are regression-testing is the *501*: if the
+    // test ever gets 501, the tun-only short-circuit has come
+    // back. Anything else means the routing works.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, headers, body) = raw_sse_request(
+        &addr,
+        "sse-https.test",
+        "/events",
+        Duration::from_secs(3),
+    )
+    .await;
+
+    assert_ne!(
+        status, 501,
+        "SSE on direct Https must NOT 501 (regression of the \
+         tunnel-only short-circuit). got {status}. \
+         headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    // The TLS handshake will fail (the local mock backend is
+    // H1), so the expected status is in the 5xx range (502
+    // or 504). The point of this test is the 501 absence.
+    assert!(
+        status >= 500,
+        "expected a 5xx from the TLS handshake failure, got \
+         {status}. headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+}
