@@ -2294,6 +2294,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "lazy_static",
+ "libc",
  "log",
  "ngx",
  "pangolin-core",
