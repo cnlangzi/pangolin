@@ -100,7 +100,20 @@ impl HttpServerApp for AdminApp {
 
         // 4) SSE access log stream — issue #73. This is the ONLY
         //    path that streams; everything else goes through the
-        //    admin::handle() one-shot path.
+        //    admin::handle() one-shot path. We hand the SSE
+        //    handler an **owned** clone of the `ShutdownWatch`
+        //    so a Ctrl-C during a long-lived stream connection
+        //    can interrupt the broadcast loop promptly — without
+        //    it, the loop's `rx.recv().await` would block the
+        //    runtime drain for the full
+        //    `graceful_shutdown_timeout_seconds` window.
+        //
+        // The trait's `shutdown` parameter is `&ShutdownWatch`
+        // (not `&mut` — see HttpServerApp's TODO); we need an
+        // owned receiver to call `.changed().await` (which
+        // requires `&mut self`). `ShutdownWatch` is a
+        // `tokio::sync::watch::Receiver<bool>`, so a clone is
+        // just an `Arc` increment.
         if method == "GET" && path == "/api/logs/stream" {
             let cookie = req
                 .headers
@@ -112,6 +125,7 @@ impl HttpServerApp for AdminApp {
                 self.app.clone(),
                 self.sessions.clone(),
                 cookie.as_deref(),
+                shutdown.clone(),
             )
             .await;
         }

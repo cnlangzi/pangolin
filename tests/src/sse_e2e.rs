@@ -870,13 +870,8 @@ async fn real_e2e_direct_sse_streams_through() {
     // No `TunProcess::start` — there is no tun.
     let addr = format!("127.0.0.1:{}", ngx.http_port);
 
-    let (status, headers, body) = raw_sse_request(
-        &addr,
-        "sse-direct.test",
-        "/events",
-        Duration::from_secs(2),
-    )
-    .await;
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse-direct.test", "/events", Duration::from_secs(2)).await;
 
     // Pre-fix: 501 (Not Implemented). Post-fix: 200.
     assert_eq!(
@@ -929,11 +924,7 @@ async fn real_e2e_direct_sse_via_https_edge() {
         init_pangolin_db(db_path);
         let conn = Connection::open(db_path).expect("open db");
         // Direct Https backend (the dev.yaitoo.cn shape).
-        seed_site(
-            &conn,
-            "sse-https-site",
-            &format!("https://{backend_addr}"),
-        );
+        seed_site(&conn, "sse-https-site", &format!("https://{backend_addr}"));
         seed_domain(&conn, "sse-https.test", "sse-https-site");
     })
     .await;
@@ -941,28 +932,23 @@ async fn real_e2e_direct_sse_via_https_edge() {
     // The local SSE backend speaks H1 — the TLS in the URL is
     // only there to exercise the `BackendTarget::Https { .. }`
     // branch. The backend will fail the TLS handshake (it
-    // doesn't have a cert), which is fine for our purposes:
-    // we're testing the routing decision (no 501), not end-
-    // to-end TLS. We assert either:
-    //   - status 200 (lucky: SseBackend was actually H1, but
-    //     ng​x opens TLS to it → handshake fails first), OR
-    //   - status 502 (TLS handshake failed at the backend, the
-    //     expected outcome for a real "direct Https" path
-    //     against an H1 backend).
-    // The bug we are regression-testing is the *501*: if the
-    // test ever gets 501, the tun-only short-circuit has come
-    // back. Anything else means the routing works.
+    // doesn't have a cert), so we expect a 5xx (502 from the
+    // Https upstream peer). The bug we are regression-testing
+    // is the *501*: if the test ever gets 501, the tun-only
+    // short-circuit has come back. The strict `status >= 500`
+    // assertion below is deliberate — it documents that
+    // direct-Https-against-an-H1-backend is a server-side
+    // failure (handshake error), not a "lucky 200" success.
+    // 200 would mean we accidentally hit the mock backend
+    // without doing TLS, which would be a test fixture
+    // problem, not a real production outcome.
     let addr = format!("127.0.0.1:{}", ngx.http_port);
-    let (status, headers, body) = raw_sse_request(
-        &addr,
-        "sse-https.test",
-        "/events",
-        Duration::from_secs(3),
-    )
-    .await;
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse-https.test", "/events", Duration::from_secs(3)).await;
 
     assert_ne!(
-        status, 501,
+        status,
+        501,
         "SSE on direct Https must NOT 501 (regression of the \
          tunnel-only short-circuit). got {status}. \
          headers={headers:?}\nbody={body:?}\nngx log:\n{}",
