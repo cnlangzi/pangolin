@@ -303,30 +303,48 @@ impl ProxyHttp for AppProxy {
             }
         }
 
-        // ── SSE / streaming response short-circuit ────────────
-        // Detected up-front (before site lookup) so we can pick
-        // the byte-relay path on both ends. The heuristic is
-        // intentionally conservative: only `text/event-stream`
-        // is matched today. Add new patterns to
-        // `pangolin_core::is_streaming_request` to extend.
+        // ── SSE / streaming response detection ────────────────
+        // The streaming path is a byte-relay that exists for the
+        // **tunnel** transport: the tun-side relay uses
+        // `copy_bidirectional` because the buffering HttpResponse
+        // path would deadlock on an infinite chunked body. For
+        // **direct** backends, pingora's H1/H2 client streams the
+        // response natively — we just let it through to
+        // `upstream_peer` and nothing buffers.
         //
-        // NOTE: this iterates over *all* request headers (not
-        // just the first Accept/Content-Type) so it matches
-        // multi-value Accept headers that HTTP/2 clients may
-        // send. Keep the semantics aligned with
-        // `pangolin_core::is_streaming_request` — see
-        // `is_streaming_request_detects_text_event_stream`.
-        let is_streaming = session.req_header().headers.iter().any(|(k, v)| {
-            let name = k.as_str();
-            (name.eq_ignore_ascii_case("Accept") || name.eq_ignore_ascii_case("Content-Type"))
-                && v.to_str()
-                    .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
-                    .unwrap_or(false)
-        });
-
-        if is_streaming {
-            return handle_streaming_request(&self.app, session).await;
-        }
+        // The detection is delegated to the shared
+        // `pangolin_core::is_streaming_request` so the heuristic
+        // has exactly one home — extending it (chunked
+        // responses, custom headers, path patterns) touches
+        // pangolin-core and reaches both transports at once.
+        // See `is_streaming_request_detects_text_event_stream`
+        // for the unit-test contract.
+        //
+        // The short-circuit itself runs *after* the site lookup
+        // below so we can branch on `tun_name.is_empty()`:
+        //   - tunnel    → call `handle_streaming_request` (byte-relay)
+        //   - direct    → fall through, pingora streams natively
+        //   - file://   → 415 (no streaming concept for a single file)
+        let is_streaming = {
+            // Build a minimal `HttpRequest` (no body — the helper
+            // only reads `headers`) from the session so we can
+            // delegate to the shared detector. The body is empty
+            // because the helper does not consult it.
+            let req_header = session.req_header();
+            let headers: Vec<(String, String)> = req_header
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            let req = HttpRequest {
+                method: req_header.method.as_str().to_string(),
+                target: req_header.uri.to_string(),
+                version: format!("{:?}", req_header.version),
+                headers,
+                body: Vec::new(),
+            };
+            pangolin_core::is_streaming_request(&req)
+        };
 
         // ── WebSocket upgrade short-circuit ────────────────────
         if is_upgrade && path == self.app.ws_path {
@@ -492,6 +510,48 @@ impl ProxyHttp for AppProxy {
         } else {
             format!("tun:{}", tun_name)
         };
+
+        // ── SSE / streaming response short-circuit (tunnel only) ──
+        // Branch on the routing decision we just made:
+        //   - tunnel:    the tun-side `handle_streaming_response`
+        //                byte-relay is required (the tun's buffered
+        //                HttpResponse path deadlocks on infinite
+        //                chunked bodies). Take the short-circuit.
+        //   - direct +   file:// is not a streaming transport —
+        //     file://    refuse with 415 Unsupported Media Type
+        //                (and a small JSON body explaining why,
+        //                so callers can distinguish this from a
+        //                generic 400).
+        //   - direct +   pingora's H1/H2 client streams the
+        //     Http/Https response natively, no buffering on the
+        //                ngx side. Fall through to the standard
+        //                direct path (the `Ok(false)` branch at
+        //                the bottom of `request_filter`).
+        if is_streaming {
+            if !tun_name.is_empty() {
+                return handle_streaming_request(&self.app, session).await;
+            }
+            if matches!(target, BackendTarget::File { .. }) {
+                warn!(
+                    "SSE: refused on file:// backend for {} \
+                     (file:// has no streaming concept)",
+                    host
+                );
+                respond_streaming_unsupported_on_file(session).await;
+                return Ok(true);
+            }
+            // Direct Http/Https + SSE: fall through to the
+            // pingora direct path. The access-log entry is
+            // already populated above (`ctx.backend`), and
+            // `response_filter` will record the final status
+            // when pingora finishes the stream.
+            debug!(
+                "SSE: direct path (pingora-native streaming) \
+                 {} → {}",
+                host,
+                target.authority()
+            );
+        }
 
         // ── file:// direct (no tun) ──────────────────────────
         // Only when tun_name is empty — otherwise the file
@@ -1311,6 +1371,53 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
 /// short-circuit pingora, which means the proxy's `response_filter`
 /// is never called for them — without this helper those requests
 /// would silently disappear from the `/logs` page.
+/// Respond with `415 Unsupported Media Type` and a small JSON
+/// body explaining why a streaming request is not valid on a
+/// `file://` backend.
+///
+/// 415 (not 400) is the right code per RFC 7231 §6.5.13: the
+/// server *understands* the request and the `text/event-stream`
+/// media type, but refuses to process it on this particular
+/// resource. A bare 400 would lump "no streaming concept" in
+/// with every other "this is malformed" failure and force the
+/// caller to read the log to tell them apart. The body is
+/// JSON so a programmatic client can branch on the
+/// `error` field; the `message` is human-readable for anyone
+/// reading the response in a browser devtools panel.
+async fn respond_streaming_unsupported_on_file(session: &mut Session) {
+    use serde_json::json;
+    let body = json!({
+        "error": "streaming_unsupported",
+        "message": "Server-Sent Events (text/event-stream) are not \
+                    supported on file:// backends. file:// serves a \
+                    single on-disk file and has no concept of an \
+                    infinite, chunked stream. Configure a tunnel or \
+                    an HTTP(S) backend to stream responses.",
+    })
+    .to_string();
+    let mut hdr = match ResponseHeader::build(415, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("failed to build 415 response: {e}");
+            let _ = session.respond_error(500).await;
+            return;
+        }
+    };
+    hdr.insert_header("Content-Type", "application/json").ok();
+    hdr.insert_header("Content-Length", body.len().to_string().as_bytes())
+        .ok();
+    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+        warn!("failed to write 415 response header: {e}");
+        return;
+    }
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(body)), true)
+        .await
+    {
+        warn!("failed to write 415 response body: {e}");
+    }
+}
+
 fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
     let client_ip = session

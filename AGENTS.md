@@ -17,6 +17,42 @@ If `make lint` complains, fix the code and re-run — do **not** ship a
 commit just because `cargo build` works. `cargo build` does not run
 clippy or fmt-check.
 
+## Every new feature and bug fix must ship with a regression test
+
+Code without a test is a code path that will silently rot. Every
+non-trivial change — a new feature, a bug fix, a refactor that
+touches observable behaviour — ships with at least one test that
+would have failed before the change and passes after it. Pick the
+right tier for the change:
+
+- **Unit test** (`#[cfg(test)] mod tests` in the same file, or a
+  sibling test file): pure-logic functions, parsers, helpers, the
+  shared `pangolin_core::is_streaming_request`-style heuristics.
+  Cheapest to run; ideal for any change that doesn't need a real
+  process or network.
+- **Integration test** (`tests/src/<topic>.rs`, harness-style):
+  multi-component behaviour that still runs entirely in-process —
+  e.g. a request-filter branch that needs the proxy machinery but
+  not a real subprocess. Uses the `harness.rs` helpers
+  (`init_pangolin_db`, `seed_site`, …) without spawning the binary.
+- **E2E test** (`real_e2e_*` in `tests/src/`): anything that needs
+  the real `pangolin-ngx` / `pangolin-tun` binaries, real TCP,
+  real ACME, real filesystem, or a real signal. Gate behind
+  `--features integration` so day-to-day `cargo test --lib` skips
+  them.
+
+The test should be named so the regression it pins is obvious from
+the function name — `real_e2e_direct_sse_streams_through` is better
+than `sse_test_3`. When you find a bug, the fix commit and the
+regression test go in the same PR; the test description explains
+*what* the bug was and *why* the test would have caught it, so the
+next person reading the diff knows what the test is for without
+running it.
+
+If a fix is genuinely untestable (e.g. it depends on a kernel
+quirk you can't reproduce in CI), say so in the PR description —
+don't silently ship an unverified change.
+
 ## Local development: targeted tests, not the full e2e suite
 
 `make test-e2e` builds release binaries and runs the **entire**

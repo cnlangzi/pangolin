@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use pangolin_core::AccessLogEntry;
 use pingora::apps::ReusedHttpStream;
 use pingora::http::ResponseHeader;
@@ -47,11 +47,26 @@ use crate::App;
 ///
 /// Returns `Some(ReusedHttpStream)` on a clean shutdown (the
 /// connection may be reused); `None` on error (the caller logs).
+///
+/// `shutdown` is an owned clone of pingora's
+/// `ShutdownWatch` — a `tokio::sync::watch::Receiver<bool>`
+/// the runtime flips on SIGINT/SIGTERM. We `select!` on it
+/// inside the live broadcast loop so a Ctrl-C doesn't have to
+/// wait for `graceful_shutdown_timeout_seconds` to expire
+/// before the SSE handler yields. Without this, an idle SSE
+/// client (no new access-log entries) would hold the runtime
+/// open for the full 5 s pingora-configured drain window —
+/// visible in the log as
+/// `Waiting for service runtime pangolin-http to exit` — and
+/// the operator-facing shutdown latency would be `grace_period
+/// + graceful_shutdown_timeout` instead of `grace_period`
+///   alone.
 pub async fn handle_access_log_stream(
     mut session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
+    mut shutdown: pingora::server::ShutdownWatch,
 ) -> Option<ReusedHttpStream> {
     // 1) Auth — admin-only. Non-admin attempts get a normal 401
     //    HTML response, not an SSE frame.
@@ -139,32 +154,63 @@ pub async fn handle_access_log_stream(
         .await?;
     }
 
-    // 4) Live broadcast loop.
+    // 4) Live broadcast loop. Race the broadcast receiver
+    //    against pingora's ShutdownWatch so a Ctrl-C during
+    //    a long-lived SSE connection drops the connection
+    //    promptly instead of waiting for the full
+    //    `graceful_shutdown_timeout_seconds` window.
+    //
+    // `ShutdownWatch` is a `tokio::sync::watch::Receiver<bool>`
+    // (pingora-core/src/server/mod.rs) — its `changed()` future
+    // resolves the moment the server flips its shutdown flag.
+    // Calling `borrow()` first is the cheap fast path: if the
+    // flag is *already* set (e.g. the loop is entered after a
+    // shutdown that arrived between subscribe() and the first
+    // poll), we break without consuming a broadcast slot. The
+    // `select!` below would catch it too, but the early
+    // check keeps the log line ("shutdown observed") distinct
+    // from a poll that races on shutdown mid-loop.
     loop {
-        match rx.recv().await {
-            Ok(entry) => {
-                if write_chunk(&mut session, frame_data(&entry))
-                    .await
-                    .is_none()
-                {
-                    // Client disconnected.
-                    debug!("SSE: client disconnected, stopping live tail");
-                    return None;
-                }
-            }
-            Err(RecvError::Lagged(n)) => {
-                // Subscriber fell behind. Surface as an SSE comment
-                // (browsers ignore these, devtools shows them).
-                // The next successful recv() will deliver the
-                // newest message the channel still has.
-                write_chunk(&mut session, frame_comment(&format!("lagged {} events", n))).await?;
-                warn!("SSE: subscriber lagged by {n} events");
-            }
-            Err(RecvError::Closed) => {
-                // Broadcast channel closed (app shutdown). Send a
-                // terminal comment and end the stream cleanly.
-                let _ = write_chunk(&mut session, frame_comment("closed")).await;
+        if *shutdown.borrow() {
+            info!("SSE: shutdown already signalled, ending live tail");
+            let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
+            break;
+        }
+        tokio::select! {
+            // Bias toward shutdown so a Ctrl-C during a long
+            // broadcast gap doesn't have to wait for the next
+            // entry to arrive.
+            biased;
+            _ = shutdown.changed() => {
+                info!("SSE: shutdown observed, ending live tail");
+                let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
                 break;
+            }
+            recv = rx.recv() => match recv {
+                Ok(entry) => {
+                    if write_chunk(&mut session, frame_data(&entry))
+                        .await
+                        .is_none()
+                    {
+                        // Client disconnected.
+                        debug!("SSE: client disconnected, stopping live tail");
+                        return None;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    // Subscriber fell behind. Surface as an SSE comment
+                    // (browsers ignore these, devtools shows them).
+                    // The next successful recv() will deliver the
+                    // newest message the channel still has.
+                    write_chunk(&mut session, frame_comment(&format!("lagged {} events", n))).await?;
+                    warn!("SSE: subscriber lagged by {n} events");
+                }
+                Err(RecvError::Closed) => {
+                    // Broadcast channel closed (app shutdown). Send a
+                    // terminal comment and end the stream cleanly.
+                    let _ = write_chunk(&mut session, frame_comment("closed")).await;
+                    break;
+                }
             }
         }
     }
