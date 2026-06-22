@@ -926,6 +926,10 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
             &format!("office:http://{backend_addr}"),
         );
         seed_domain(&conn, "office.test", "office-site");
+        // fix/cert_www: seed the cert row so the in-memory
+        // `CertLinkCache` (built at startup) has a link for
+        // `office.test`. The actual cert blob lands on disk below.
+        seed_cert(&conn, "office.test");
     })
     .await;
 
@@ -1108,6 +1112,10 @@ async fn real_e2e_h2_direct_backend_keeps_h2() {
         // No `tun` here — this site has a direct backend.
         seed_site(&conn, "direct-site", &format!("http://{backend_addr}"));
         seed_domain(&conn, "direct.test", "direct-site");
+        // fix/cert_www: seed the cert row so the in-memory
+        // `CertLinkCache` (built at startup) has a link for
+        // `direct.test`. The actual cert blob lands on disk below.
+        seed_cert(&conn, "direct.test");
     })
     .await;
 
