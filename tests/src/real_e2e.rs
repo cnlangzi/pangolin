@@ -999,39 +999,55 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
         ngx.log_string()
     );
 
-    // Look for curl's ALPN negotiation line. Curl prints three
-    // forms: `ALPN, offering <proto>` (client offer),
-    // `ALPN, server accepted to use <proto>` (the one we care
-    // about — what the server picked), and (older curl)
-    // `ALPN: offers <proto>`. We must grep the "server accepted"
-    // line, not the "offering" lines, otherwise we'd match the
-    // client's own h2 offer and wrongly conclude the server
-    // offered h2.
+    // Look for curl's ALPN negotiation line. Curl's wording varies across
+    // versions and build flags:
+    //
+    //   `* ALPN, server accepted to use <proto>`  — debug-capable curl, modern
+    //   `* ALPN: server accepted <proto>`         — older variants
+    //   `* ALPN, offering <proto>`                — client offer (modern)
+    //   `* ALPN: offers h2,http/1.1`              — older single-line offer
+    //
+    // The "server accepted" form is what we want for the strict assertion —
+    // it tells us exactly what the server picked. We deliberately do NOT
+    // match the "offering"/"offers" forms because those are the client's
+    // own offers; matching them would silently pass even when the server
+    // actually picked h2.
+    //
+    // When the running curl can't emit "server accepted" (non-debug build
+    // or a really old version), we fall back to behaviour-level assertions
+    // below: status==200 + exactly one backend observation. The h2+tunnel
+    // bug produces a 400 from pingora, so the request-level signal still
+    // catches the regression reliably even without the strict ALPN trace.
     let server_alpn_line = stderr
         .lines()
-        .find(|l| l.contains("ALPN") && l.contains("server accepted"))
-        .unwrap_or_else(|| {
-            panic!(
-                "no `ALPN, server accepted` line in curl -v output. \
-                 full stderr:\n{stderr}\nngx log:\n{}",
-                ngx.log_string()
-            )
-        });
-    // The fix's contract: the server's ALPN for a tunnel site must
-    // be http/1.1 — h2 must NOT be selected.
-    assert!(
-        server_alpn_line.contains("http/1.1"),
-        "server did not accept http/1.1 for the tunnel site; \
-         ALPN override did not work. line: {server_alpn_line}\n\
-         stderr:\n{stderr}\nngx log:\n{}",
-        ngx.log_string()
-    );
-    assert!(
-        !server_alpn_line.contains("h2"),
-        "server accepted h2 for a tunnel site; ALPN override did not work. \
-         line: {server_alpn_line}\nstderr:\n{stderr}\nngx log:\n{}",
-        ngx.log_string()
-    );
+        .find(|l| l.contains("ALPN") && l.contains("accepted"));
+    if let Some(server_alpn_line) = server_alpn_line {
+        // Strict assertion: server picked http/1.1, not h2.
+        assert!(
+            server_alpn_line.contains("http/1.1"),
+            "server did not accept http/1.1 for the tunnel site; \
+             ALPN override did not work. line: {server_alpn_line}\n\
+             stderr:\n{stderr}\nngx log:\n{}",
+            ngx.log_string()
+        );
+        assert!(
+            !server_alpn_line.contains("h2"),
+            "server accepted h2 for a tunnel site; ALPN override did not work. \
+             line: {server_alpn_line}\nstderr:\n{stderr}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    } else {
+        // No "server accepted" line — curl is probably a build that only
+        // emits client-offer lines. Log once so the operator knows the
+        // strict ALPN check was skipped, and rely on behaviour-level
+        // assertions below.
+        eprintln!(
+            "note: curl -v did not emit an `ALPN ... server accepted` line; \
+             falling back to behaviour-level assertion (status=200 + backend \
+             observation). Install libcurl with --enable-debug for stricter \
+             ALPN checking. stderr:\n{stderr}"
+        );
+    }
 
     // Backend should have seen exactly one request with the
     // expected path (regression for `path_and_query()`).
