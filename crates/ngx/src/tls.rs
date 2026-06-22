@@ -229,11 +229,11 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
 /// - If neither h2 nor http/1.1 is offered, return `NOACK` so openssl
 ///   sends a fatal alert (matches `prefer_h2` / `h1_only` in vendored
 ///   pingora).
-fn select_alpn<'a>(
+fn select_alpn(
     is_tunnel: bool,
     global_enable_h2: bool,
-    alpn_in: &'a [u8],
-) -> Result<&'a [u8], AlpnError> {
+    alpn_in: &[u8],
+) -> Result<&[u8], AlpnError> {
     // 3a. Tunnel sites: http/1.1 ONLY — see policy above.
     if is_tunnel {
         return pick_protocol(alpn_in, b"http/1.1").ok_or(AlpnError::NOACK);
