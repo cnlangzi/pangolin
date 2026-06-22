@@ -231,15 +231,20 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // v2: SNI callback that loads per-host cert blobs on demand from
         // config.acme.cert_dir. The previous static-blob path with
         // "default" fallback was removed.
+        //
+        // ALPN is decided per-SNI inside `build_sni_settings` — the
+        // listener runs a dynamic callback that picks h1 for tunnel
+        // sites and follows `config.tls.enable_h2` for everything else.
+        // See `tls::install_dynamic_alpn` for the policy and
+        // `pangolin_core::App::tunnel_domains` for the data it consults.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
-        let enable_h2 = config.tls.enable_h2;
-        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), enable_h2)?;
+        let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), app.clone())?;
         proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
         log::info!(
-            "TLS enabled (SNI) on {} (cert_dir: {}, http2_alpn: {})",
+            "TLS enabled (SNI, dynamic ALPN) on {} (cert_dir: {}, non_tunnel_h2: {})",
             config.addr.https,
             cert_dir.display(),
-            enable_h2
+            config.tls.enable_h2
         );
     }
     server.add_service(proxy_service);

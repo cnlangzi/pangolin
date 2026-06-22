@@ -58,6 +58,15 @@ tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-ti
 futures = "0.3"
 futures-util = "0.3"
 
+# parking_lot::Mutex / RwLock are used in two places:
+#   - TLS hot-path (ALPN callback runs in a sync C context, so the
+#     per-SNI tunnel-domain mirror must use a sync lock). See
+#     `pangolin-core::App::tunnel_domains` and `ngx::tls::build_sni_settings`.
+#   - App's in-memory access-log ring buffer (issue #73). Sync,
+#     non-poisoning, fast-path acquire — the response_filter hot path
+#     holds it for a single VecDeque bound check + push_back.
+parking_lot = "0.12"
+
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
@@ -104,14 +113,6 @@ base64 = "0.22"
 # Test (ACME test server pebble)
 wiremock = "0.6"
 tempfile = "3"
-
-# parking_lot::Mutex is the sync primitive behind App's access-log
-# ring buffer. Chosen over std::sync::Mutex because the hot path
-# (response_filter on every proxied request) is short, contention
-# is bounded, and parking_lot's fast-path acquire + no poisoning
-# means we never have to .lock().unwrap() in a place where a
-# poisoned mutex would surface as a 500. Issue #73.
-parking_lot = "0.12"
 
 # Build profile
 [profile.release]

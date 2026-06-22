@@ -10,13 +10,32 @@
 //! The previous v1 listener used `TlsSettings::intermediate(path, path)`
 //! with a single fixed host (config-driven). The v2 listener is SNI-based
 //! to support multi-tenant wildcard + per-domain certs in one listener.
+//!
+//! ## Per-SNI dynamic ALPN
+//!
+//! [`build_sni_settings`] installs an ALPN selection callback that
+//! decides HTTP/2 vs HTTP/1.1 per connection based on the SNI:
+//!
+//! - If the SNI resolves to a site with a `tun_name:` backend prefix
+//!   (i.e. the request will be proxied through a yamux tunnel
+//!   session), the listener offers **HTTP/1.1 only** — this avoids
+//!   the `tokio-yamux 0.3.18` stream-state race that breaks the
+//!   h2 + tunnel path (issue #66 / commit `0c35ede`).
+//! - Otherwise the listener follows `config.tls.enable_h2`.
+//!
+//! The decision is per-connection, so the operator-facing `tls.enable_h2`
+//! flag still controls the non-tunnel default; the runtime override
+//! for tunnel sites is transparent to clients — no 4xx, no 421, no
+//! manual retry, just a fallback to h1 inside the handshake.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use openssl::pkey::PKey;
+use openssl::ssl::AlpnError;
 use openssl::x509::X509;
+use pangolin_core::App;
 use pingora::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingora_core::tls::ssl::NameType;
@@ -133,25 +152,250 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, String)> {
     Ok((key_part, cert_part))
 }
 
-/// Build a `TlsSettings` configured with the SNI callback.
+/// Build a `TlsSettings` configured with the SNI cert callback AND a
+/// per-SNI dynamic ALPN selection callback.
 ///
-/// h2 is advertised via ALPN by default; pass `enable_h2 = false` to
-/// force h1 (workaround for the h2 + tunnel-backend bug — see
-/// `pangolin_core::config::TlsConfig` for the rationale and tracking
-/// reference).
+/// The ALPN callback is installed via `SslAcceptorBuilder::set_alpn_select_callback`
+/// (reachable through `TlsSettings`'s `Deref<Target = SslAcceptorBuilder>`).
+/// It is called by openssl/boringssl during the TLS handshake, in a sync
+/// C context, on a pingora tokio worker thread. The callback:
+///
+/// 1. Reads the SNI from the in-progress `SslRef`.
+/// 2. Looks up the SNI in `app.tunnel_domains` (sync `parking_lot` mirror
+///    of the in-memory `Indexes`; the mirror is rebuilt atomically on
+///    every admin-triggered `App::reload_indexes`).
+/// 3. Picks the target protocol: `http/1.1` for tunnel sites, `h2` for
+///    non-tunnel sites if `config.tls.enable_h2`, otherwise `http/1.1`.
+/// 4. Walks the client-offered ALPN list and returns the first match;
+///    falls back to the other protocol if the target is not offered.
+///
+/// We do NOT call `TlsSettings::enable_h2()` here — that would install
+/// a static h2-preferring ALPN callback that ignores SNI. Dynamic
+/// per-SNI selection is the whole point of this function.
 pub fn build_sni_settings(
     cert_dir: std::path::PathBuf,
-    enable_h2: bool,
+    app: Arc<App>,
 ) -> anyhow::Result<pingora::listeners::tls::TlsSettings> {
     let cb: pingora::listeners::TlsAcceptCallbacks =
         Box::new(SniCertCallback::new(Arc::new(cert_dir)));
     let mut settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
-    if enable_h2 {
-        settings.enable_h2();
-    }
+
+    // Install per-SNI dynamic ALPN selection.
+    install_dynamic_alpn(&mut settings, app);
+
     Ok(settings)
+}
+
+/// Install the per-SNI ALPN selection callback. See module-level docs
+/// and [`build_sni_settings`].
+fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app: Arc<App>) {
+    // Capture the config snapshot once. `app.config` is set at startup
+    // and never mutated, so this is safe; if it ever changes, the listener
+    // would need to be rebuilt anyway (cert dir, SNI map, etc.).
+    let global_enable_h2 = app.config.tls.enable_h2;
+
+    settings.set_alpn_select_callback(move |ssl_ref, alpn_in| {
+        // 1. Pull SNI. If the client didn't send SNI, we have no way to
+        //    route; return NOACK so openssl closes the handshake. The cert
+        //    callback will also fail because it can't find a cert blob.
+        let sni = match ssl_ref.servername(NameType::HOST_NAME) {
+            Some(s) => s.to_lowercase(),
+            None => return Err(AlpnError::NOACK),
+        };
+
+        // 2. Sync lookup: is this SNI a tunnel site?
+        let is_tunnel = {
+            let guard = app.tunnel_domains.read();
+            pangolin_core::index::host_matches_set(&guard, &sni)
+        };
+
+        select_alpn(is_tunnel, global_enable_h2, alpn_in)
+    });
+}
+
+/// Pure ALPN-selection helper. Extracted from the openssl callback so the
+/// per-SNI policy is unit-testable without a real `SslRef` / handshake.
+///
+/// Policy:
+/// - Tunnel sites: `http/1.1` ONLY. If the client doesn't offer it, return
+///   `NOACK`. Never fall back to `h2` — h2 + yamux tunnel trips
+///   tokio-yamux 0.3.18's stream-state race (issue #66 / commit
+///   `0c35ede`), and pingora then emits `400 Bad Request: missing
+///   required Host header`. Modern browsers automatically retry with h1
+///   when h2 isn't advertised, so NOACK is transparent in practice.
+/// - Non-tunnel sites: target follows `tls.enable_h2`; if the target is
+///   not offered, fall back to the other protocol so h1-only clients
+///   (curl --http1.1) still work.
+/// - If neither h2 nor http/1.1 is offered, return `NOACK` so openssl
+///   sends a fatal alert (matches `prefer_h2` / `h1_only` in vendored
+///   pingora).
+fn select_alpn(
+    is_tunnel: bool,
+    global_enable_h2: bool,
+    alpn_in: &[u8],
+) -> Result<&[u8], AlpnError> {
+    // 3a. Tunnel sites: http/1.1 ONLY — see policy above.
+    if is_tunnel {
+        return pick_protocol(alpn_in, b"http/1.1").ok_or(AlpnError::NOACK);
+    }
+
+    // 3b. Non-tunnel sites.
+    let target: &[u8] = if global_enable_h2 { b"h2" } else { b"http/1.1" };
+    if let Some(p) = pick_protocol(alpn_in, target) {
+        return Ok(p);
+    }
+    let fallback: &[u8] = if target == b"h2" { b"http/1.1" } else { b"h2" };
+    if let Some(p) = pick_protocol(alpn_in, fallback) {
+        return Ok(p);
+    }
+
+    // Client offered neither h2 nor http/1.1 — return NOACK.
+    Err(AlpnError::NOACK)
+}
+
+/// Walk an ALPN wire-format list (`len || proto || len || proto …`)
+/// and return the first protocol matching `target`. The returned slice
+/// has the same lifetime as `alpn_in`, so it satisfies the
+/// `set_alpn_select_callback` lifetime contract.
+fn pick_protocol<'a>(alpn_in: &'a [u8], target: &[u8]) -> Option<&'a [u8]> {
+    let mut bytes = alpn_in;
+    while !bytes.is_empty() {
+        let len = bytes[0] as usize;
+        // Defensive: malformed input. The ALPN spec requires
+        // `0 < len <= 255` and that the rest of the buffer can hold
+        // the protocol bytes. Bail out on any violation.
+        if len == 0 || 1 + len > bytes.len() {
+            return None;
+        }
+        let proto = &bytes[1..1 + len];
+        if proto == target {
+            return Some(proto);
+        }
+        bytes = &bytes[1 + len..];
+    }
+    None
 }
 
 // Suppress unused import on non-openssl builds.
 #[allow(dead_code)]
 fn _force_use_path(_p: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_protocol;
+
+    /// Build a wire-format ALPN list from a slice of protocol names.
+    fn alpn(items: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in items {
+            assert!(
+                !p.is_empty() && p.len() <= 255,
+                "alpn proto len out of range"
+            );
+            out.push(p.len() as u8);
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    #[test]
+    fn pick_protocol_first_match() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        assert_eq!(pick_protocol(&wire, b"h2"), Some(&b"h2"[..]));
+        assert_eq!(pick_protocol(&wire, b"http/1.1"), Some(&b"http/1.1"[..]));
+    }
+
+    #[test]
+    fn pick_protocol_reverse_order() {
+        // Client prefers h1 first; the callback should still return h2
+        // if h2 is the target.
+        let wire = alpn(&[b"http/1.1", b"h2"]);
+        assert_eq!(pick_protocol(&wire, b"h2"), Some(&b"h2"[..]));
+    }
+
+    #[test]
+    fn pick_protocol_miss_returns_none() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        assert_eq!(pick_protocol(&wire, b"spdy/3"), None);
+    }
+
+    #[test]
+    fn pick_protocol_empty_input() {
+        assert_eq!(pick_protocol(&[], b"h2"), None);
+    }
+
+    #[test]
+    fn pick_protocol_ignores_malformed_entries() {
+        // len=0 is malformed; the walker should bail out and return None
+        // rather than panic or walk past the end of the buffer.
+        let wire = vec![0u8];
+        assert_eq!(pick_protocol(&wire, b"h2"), None);
+
+        // len=5 but only 1 byte left is also malformed.
+        let wire = vec![5u8, b'h'];
+        assert_eq!(pick_protocol(&wire, b"h2"), None);
+    }
+
+    #[test]
+    fn pick_protocol_h2_05d8_aka_h2c() {
+        // h2c (HTTP/2 over cleartext) is sometimes offered; we treat it
+        // as a non-match (we only do TLS h2). The fallback path in
+        // `install_dynamic_alpn` then falls back to http/1.1.
+        let wire = alpn(&[b"h2c", b"http/1.1"]);
+        assert_eq!(pick_protocol(&wire, b"h2"), None);
+        assert_eq!(pick_protocol(&wire, b"http/1.1"), Some(&b"http/1.1"[..]));
+    }
+
+    // ---- select_alpn policy tests ----
+    //
+    // These cover the per-SNI policy from `install_dynamic_alpn`. The key
+    // invariant is "tunnel sites always negotiate h1" — see the
+    // `TlsConfig` doc and `docs/configuration.md`.
+
+    use super::select_alpn;
+    use openssl::ssl::AlpnError;
+
+    #[test]
+    fn select_alpn_tunnel_prefers_http11() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        // Tunnel + h2 + http/1.1 offered → must pick http/1.1, never h2.
+        assert_eq!(select_alpn(true, true, &wire), Ok(&b"http/1.1"[..]));
+        // Same wire, non-tunnel + enable_h2 → h2 picked.
+        assert_eq!(select_alpn(false, true, &wire), Ok(&b"h2"[..]));
+    }
+
+    #[test]
+    fn select_alpn_tunnel_rejects_h2_only_client() {
+        // Client offers ONLY h2 (no http/1.1) — a tunnel SNI must NOACK
+        // rather than negotiate h2. This is the regression test for the
+        // h2+tunnel bug (issue #66). Pre-fix, the callback would fall
+        // back to h2 here and trip tokio-yamux 0.3.18's stream-state
+        // race.
+        let wire = alpn(&[b"h2"]);
+        assert_eq!(select_alpn(true, true, &wire), Err(AlpnError::NOACK));
+        // Same wire on non-tunnel + enable_h2 → h2 is fine.
+        assert_eq!(select_alpn(false, true, &wire), Ok(&b"h2"[..]));
+    }
+
+    #[test]
+    fn select_alpn_non_tunnel_falls_back_to_other_protocol() {
+        // Non-tunnel + enable_h2: client offers only http/1.1 → must
+        // fall back to http/1.1 (so curl --http1.1 still works).
+        let wire = alpn(&[b"http/1.1"]);
+        assert_eq!(select_alpn(false, true, &wire), Ok(&b"http/1.1"[..]));
+
+        // Non-tunnel + enable_h2=false: client offers only h2 → must
+        // fall back to h2 (mirrors the http1.1-only-client case).
+        let wire = alpn(&[b"h2"]);
+        assert_eq!(select_alpn(false, false, &wire), Ok(&b"h2"[..]));
+    }
+
+    #[test]
+    fn select_alpn_no_noack_when_neither_protocol_offered() {
+        // Client offers only an unrelated protocol — NOACK in both paths.
+        let wire = alpn(&[b"spdy/3"]);
+        assert_eq!(select_alpn(true, true, &wire), Err(AlpnError::NOACK));
+        assert_eq!(select_alpn(false, true, &wire), Err(AlpnError::NOACK));
+        assert_eq!(select_alpn(false, false, &wire), Err(AlpnError::NOACK));
+    }
+}

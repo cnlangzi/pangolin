@@ -20,6 +20,7 @@ sha2.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 futures-util.workspace = true
+parking_lot.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 # Tunnel transport (issue #39): yamux over fastwebsockets, plus
@@ -42,7 +43,6 @@ httpdate.workspace = true
 # ring buffer (issue #73). Sync, non-poisoning, fast-path acquire —
 # the response_filter hot path holds it for a single VecDeque bound
 # check + push_back.
-parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
