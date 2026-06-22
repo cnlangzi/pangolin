@@ -236,16 +236,33 @@ state to invalidate.
 ```
                      ngx::request_filter
                             │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-   direct                tunnel               file://
-   pingora               yamux               local fs
-   server                (frame)             (serve_file)
-        │                   │                   │
-        ▼                   ▼                   ▼
-  upstream_peer       YamuxTunnelExecutor   serve_file_target
-  + upstream_         ::execute_http        (no trait, just
-  request_filter                            a function call)
+                  ┌─────────┴─────────┐
+              streaming?            (no)
+              (Accept: text/         │
+               event-stream)         │
+                  │                   │
+            ┌─────┴─────┐             │
+            │           │             │
+        has tunnel    no tunnel       │
+            │           │             │
+            ▼           ▼             │
+       YamuxTunnel  fall through     │
+       Executor     to pingora       │
+       (frame w/    direct path      │
+       is_streaming)  (pingora       │
+                  │  streams H1/    │
+                  │  H2 natively)    │
+                  │                  │
+        ┌─────────┼─────────────┐    │
+        │         │             │    │
+   direct      tunnel       file://    │
+   pingora     yamux       local fs    │
+   server      (frame)     (serve_file)│
+        │         │             │      │
+        ▼         ▼             ▼      ▼
+  upstream_peer YamuxTunnelExecutor  serve_file_target
+  + upstream_   ::execute_http       (no trait, just
+  request_filter                      a function call)
 ```
 
 The `request_filter` does the routing; it does **not** call
@@ -314,6 +331,26 @@ This is what enables SSE (`Content-Type: text/event-stream`)
 and other long-lived chunked responses through the tunnel —
 the buffering path would deadlock waiting for an infinite
 chunked body to complete.
+
+### Streaming requests on **direct** backends
+
+When `is_streaming` matches and the site has **no tunnel**,
+`request_filter` **does not** take a 501 short-circuit.
+Instead it falls through to pingora's direct path, which
+streams chunked H1/H2 responses natively — no `HttpResponse
+{ body: Vec<u8> }` buffering is involved on the pingora
+direct path (the buffering only existed on the tun side,
+because the tun used to materialise the whole body before
+forwarding). The direct path's `upstream_peer` /
+`upstream_request_filter` are reused unchanged; the
+detection up-front is only to suppress any code that
+assumes a finite response body.
+
+This was previously tunnel-only and returned 501 for any
+SSE request on a direct backend. That forced every site
+that wanted SSE (chat streams, live tail of `/logs`, etc.)
+to be fronted by a tun. Direct backends with `Accept:
+text/event-stream` now work without an extra hop.
 
 `tun` holds **one piece of state** across the request lifecycle:
 an `Arc<HttpClientPool>` that wraps a `pingora_core::connectors::http::Connector`.

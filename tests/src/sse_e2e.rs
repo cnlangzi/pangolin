@@ -22,9 +22,10 @@
 //! These tests exercise that path end-to-end: real `pangolin-ngx`
 //! + real `pangolin-tun` binaries + a mock SSE backend.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use reqwest::Client;
 use rusqlite::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -546,11 +547,11 @@ async fn real_e2e_tunnel_sse_incremental_delivery() {
             Err(_) => break, // timeout: streaming ended or hung
         };
         body_buf.extend_from_slice(&read_tmp[..n]);
-        for i in 0..3 {
-            if arrival[i].is_none() {
+        for (i, slot) in arrival.iter_mut().enumerate() {
+            if slot.is_none() {
                 let needle = format!("data: event {i}").into_bytes();
                 if body_buf.windows(needle.len()).any(|w| w == needle) {
-                    arrival[i] = Some(sent_at.elapsed());
+                    *slot = Some(sent_at.elapsed());
                 }
             }
         }
@@ -833,4 +834,403 @@ fn is_streaming_request_detects_text_event_stream() {
         body: vec![],
     };
     assert!(!is_streaming_request(&no_accept));
+}
+
+/// **SSE through a direct (non-tunnel) Http backend.**
+///
+/// Regression test: prior to the fix, the `is_streaming` short-
+/// circuit in `request_filter` unconditionally called
+/// `handle_streaming_request`, which returned 501 when the site
+/// had no tunnel — even though pingora's direct path streams
+/// H1/H2 chunked responses natively. Any site that wanted SSE
+/// (chat streams, live tail of `/logs`, observability) was
+/// forced to be fronted by a tun.
+///
+/// Post-fix: the `is_streaming` check now branches on
+/// `tun_name.is_empty()` — for direct backends we fall through
+/// to the standard direct path and let pingora stream the
+/// response. This test pins that behavior so a future refactor
+/// can't quietly regress it back to 501.
+#[tokio::test]
+async fn real_e2e_direct_sse_streams_through() {
+    let backend = SseBackend::start(3, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    // NOTE: backend is `http://...` (no `tunname:` prefix).
+    // The site therefore has `tun_name.is_empty() == true`,
+    // and SSE must take the direct path.
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // No `seed_tun` call — there is no tun for this site.
+        seed_site(&conn, "sse-direct-site", &format!("http://{backend_addr}"));
+        seed_domain(&conn, "sse-direct.test", "sse-direct-site");
+    })
+    .await;
+
+    // No `TunProcess::start` — there is no tun.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse-direct.test", "/events", Duration::from_secs(2)).await;
+
+    // Pre-fix: 501 (Not Implemented). Post-fix: 200.
+    assert_eq!(
+        status,
+        200,
+        "SSE request must stream through direct (non-tunnel) \
+         backend, got {status}. headers={headers:?}\nbody={body:?}\
+         \nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "Content-Type must be text/event-stream, got headers: {headers:?}"
+    );
+    for i in 0..3 {
+        let expected = format!("data: event {i}");
+        assert!(
+            body.contains(&expected),
+            "SSE body missing event {i}, got: {body:?}\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+    assert!(
+        backend.seen_request().await,
+        "SSE direct backend never received the request — the \
+         request was either dropped or short-circuited. ngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// **SSE through a direct (non-tunnel) Https backend.**
+///
+/// Mirrors the Https case from the screenshot: `dev.yaitoo.cn`
+/// is a direct `http://127.0.0.1:8080` backend, and the browser
+/// was hitting `https://dev.yaitoo.cn/sse` (H1 to ngx, H1 to
+/// the local backend). The 501 came from the tun-only
+/// short-circuit, not from TLS. This test exercises the same
+/// routing decision with a *plain HTTP* local backend but under
+/// a TLS-terminating edge (we use the raw H1 helper for the
+/// internal connection; the bug and the fix are at the
+/// request_filter level, identical between H1 and HTTPS edges).
+#[tokio::test]
+async fn real_e2e_direct_sse_via_https_edge() {
+    let backend = SseBackend::start(2, Duration::from_millis(50)).await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // Direct Https backend (the dev.yaitoo.cn shape).
+        seed_site(&conn, "sse-https-site", &format!("https://{backend_addr}"));
+        seed_domain(&conn, "sse-https.test", "sse-https-site");
+    })
+    .await;
+
+    // The local SSE backend speaks H1 — the TLS in the URL is
+    // only there to exercise the `BackendTarget::Https { .. }`
+    // branch. The backend will fail the TLS handshake (it
+    // doesn't have a cert), so we expect a 5xx (502 from the
+    // Https upstream peer). The bug we are regression-testing
+    // is the *501*: if the test ever gets 501, the tun-only
+    // short-circuit has come back. The strict `status >= 500`
+    // assertion below is deliberate — it documents that
+    // direct-Https-against-an-H1-backend is a server-side
+    // failure (handshake error), not a "lucky 200" success.
+    // 200 would mean we accidentally hit the mock backend
+    // without doing TLS, which would be a test fixture
+    // problem, not a real production outcome.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse-https.test", "/events", Duration::from_secs(3)).await;
+
+    assert_ne!(
+        status,
+        501,
+        "SSE on direct Https must NOT 501 (regression of the \
+         tunnel-only short-circuit). got {status}. \
+         headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    // The TLS handshake will fail (the local mock backend is
+    // H1), so the expected status is in the 5xx range (502
+    // or 504). The point of this test is the 501 absence.
+    assert!(
+        status >= 500,
+        "expected a 5xx from the TLS handshake failure, got \
+         {status}. headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// **SSE on a `file://` backend returns `415 Unsupported Media Type`**.
+///
+/// Locks in the contract from the code review: when a streaming
+/// request (Accept: text/event-stream) hits a site whose backend
+/// is `file://`, the proxy refuses with 415 + a JSON body that
+/// names the exact error (`streaming_unsupported`) so a
+/// programmatic client can distinguish it from a generic 400
+/// and surface a helpful message. Regression test: if anyone
+/// refactors `respond_streaming_unsupported_on_file` and
+/// accidentally flips it back to a bare 400 (or to 200 with
+/// the file contents), this test fails.
+///
+/// We do **not** need a real file on disk — `415` is decided
+/// at `request_filter` time, before `serve_file_target` ever
+/// opens the file.
+#[tokio::test]
+async fn real_e2e_file_sse_returns_415_with_json_body() {
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        // `file://` backend (no tun).
+        seed_site(&conn, "sse-file-site", "file:///tmp/pangolin-test-docroot");
+        seed_domain(&conn, "sse-file.test", "sse-file-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, headers, body) =
+        raw_sse_request(&addr, "sse-file.test", "/anything", Duration::from_secs(2)).await;
+
+    // Must be 415 (not 400, not 200, not 501).
+    assert_eq!(
+        status,
+        415,
+        "SSE on file:// must be 415 Unsupported Media Type, \
+         got {status}. headers={headers:?}\nbody={body:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    let lower_headers = headers.to_ascii_lowercase();
+    assert!(
+        lower_headers.contains("content-type: application/json"),
+        "415 body must be JSON for programmatic clients to branch \
+         on the `error` field, got headers: {headers:?}"
+    );
+    // JSON body must name the exact error so callers don't have
+    // to string-match the human message.
+    assert!(
+        body.contains("\"error\":\"streaming_unsupported\""),
+        "415 JSON body must include \
+         `error: streaming_unsupported`, got body: {body:?}"
+    );
+}
+
+/// **SSE handler is shutdown-aware — a long-lived `/api/logs/stream`
+/// connection drops within 1.5 s of SIGINT, not 5–10 s.**
+///
+/// Regression test for the Ctrl-C latency report from the
+/// user. Pre-fix, the SSE access-log handler's broadcast loop
+/// awaited `rx.recv()` indefinitely; an idle SSE client
+/// connected during a SIGINT would keep the `pangolin-http`
+/// runtime pinned for pingora's full
+/// `graceful_shutdown_timeout_seconds` (5 s) before the runtime
+/// could be torn down — the operator-facing shutdown latency
+/// jumped to `grace_period + graceful_shutdown_timeout` (≈10 s)
+/// instead of `grace_period` alone (≈5 s). Visible in the log
+/// as `Waiting for service runtime pangolin-http to exit`.
+///
+/// Post-fix the handler `select!`s on
+/// `pingora::server::ShutdownWatch::changed()` inside the
+/// broadcast loop and breaks with a `: shutdown\n\n` SSE
+/// comment the moment the runtime's flag flips. The TCP
+/// connection drops almost immediately — the assertion below
+/// is `1.5 s` (generous: 500 ms handler exit + 500 ms OS /
+/// pingora dance + 500 ms scheduler slack). The pre-fix
+/// behaviour would be `5+ s` and would fail this test.
+///
+/// ## Why we take `ngx.child` out of the harness
+///
+/// `NgxProcess::drop` sends `SIGTERM` then `SIGKILL` if the
+/// child is still alive. We want this test to observe the
+/// **SIGINT** shutdown path end-to-end (the child needs to be
+/// allowed to drain gracefully, not yanked out of the
+/// runtime). Taking the child out of the `Option<Child>` moves
+/// the Drop-skip into our hands, where we wait the full
+/// graceful-drain time. If the test fails and the child is
+/// still alive, the harness's `SIGTERM` + `SIGKILL` will
+/// eventually clean it up.
+#[tokio::test]
+async fn real_e2e_sse_drops_connection_promptly_on_sigint() {
+    let mut ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+    })
+    .await;
+
+    // 0) Authenticate against the admin port to get a session
+    //    cookie. `/api/logs/stream` is admin-only.
+    let admin_base = format!("http://127.0.0.1:{}", ngx.admin_port);
+    let raw_client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build raw client");
+    let login_resp = raw_client
+        .post(&format!("{admin_base}/login"))
+        .form(&[("username", "admin"), ("password", "admin")])
+        .send()
+        .await
+        .expect("POST /login");
+    assert_eq!(login_resp.status().as_u16(), 302, "login must redirect");
+    let session_cookie: String = login_resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| {
+            v.split(';').next().and_then(|kv| {
+                let kv = kv.trim();
+                if kv.starts_with("pangolin_session=") {
+                    Some(kv.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("login response must Set-Cookie pangolin_session=");
+
+    // 1) Open the SSE connection and confirm the handshake
+    //    (200 OK + text/event-stream). We deliberately do NOT
+    //    trigger any access-log entries before SIGINT — an idle
+    //    SSE client is the worst case for the pre-fix bug,
+    //    because the broadcast loop has no entry to wake on.
+    let sse_addr = format!("127.0.0.1:{}", ngx.admin_port);
+    let mut sse_stream = tokio::net::TcpStream::connect(&sse_addr)
+        .await
+        .expect("connect admin port");
+    let req = format!(
+        "GET /api/logs/stream HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Accept: text/event-stream\r\n\
+         Connection: close\r\n\
+         User-Agent: pangolin-sse-shutdown-e2e\r\n\
+         Cookie: {session_cookie}\r\n\
+         \r\n"
+    );
+    sse_stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write sse req");
+    sse_stream.flush().await.expect("flush sse req");
+
+    // Read until we see \r\n\r\n. The handler should respond
+    // with `200 OK` and `Content-Type: text/event-stream`
+    // before entering the broadcast loop.
+    let mut hdr_buf = Vec::new();
+    let mut tmp = [0u8; 1];
+    loop {
+        match timeout(Duration::from_secs(2), sse_stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => panic!("EOF before SSE handshake complete"),
+            Ok(Ok(_)) => {
+                hdr_buf.push(tmp[0]);
+                if hdr_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("SSE handshake read error: {e}"),
+            Err(_) => panic!("SSE handshake timeout (2s)"),
+        }
+    }
+    let hdr_str = String::from_utf8_lossy(&hdr_buf).into_owned();
+    assert_eq!(
+        hdr_str.lines().next().unwrap_or(""),
+        "HTTP/1.1 200 OK",
+        "SSE handshake first line: {hdr_str:?}"
+    );
+    assert!(
+        hdr_str
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "SSE handshake missing text/event-stream: {hdr_str:?}"
+    );
+
+    // 2) Take the child out of the harness so the harness Drop
+    //    does not race our SIGINT with its own SIGTERM+SIGKILL.
+    let mut child = ngx.child.take().expect("child process handle");
+    let pid = child.id().expect("child pid") as i32;
+
+    // 3) Send SIGINT and time the response. We expect the
+    //    connection to drop within 1.5 s. The pre-fix
+    //    behaviour was 5–10 s, so the assertion margin is
+    //    large enough to be robust on a slow CI box but
+    //    small enough to catch the regression.
+    let t_sigint = Instant::now();
+    // SAFETY: libc::kill with a valid pid and a standard
+    // signal number has no memory-safety implications for
+    // the caller.
+    let rc = unsafe { libc::kill(pid, libc::SIGINT) };
+    assert_eq!(
+        rc,
+        0,
+        "kill(SIGINT) returned {rc} (errno: {})",
+        std::io::Error::last_os_error()
+    );
+
+    // 4) Read from the SSE socket. With the fix, the handler
+    //    emits `: shutdown\n\n` and finishes the response
+    //    within ~100 ms; the kernel-side close arrives a bit
+    //    later. We bound the wait at 1.5 s.
+    let mut body_buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let conn_dropped = loop {
+        match timeout(Duration::from_millis(1500), sse_stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break true, // EOF — server closed cleanly
+            Ok(Ok(n)) => {
+                body_buf.extend_from_slice(&tmp[..n]);
+                // Keep reading until EOF or we see the
+                // : shutdown comment (a non-essential early
+                // signal that the fix is in place).
+                continue;
+            }
+            Ok(Err(_)) => break true, // read error counts as drop
+            Err(_) => break false,    // 1.5 s elapsed — still alive
+        }
+    };
+    let elapsed = t_sigint.elapsed();
+    assert!(
+        conn_dropped,
+        "SSE connection was NOT closed within 1.5 s of SIGINT \
+         (took >{elapsed:?}). This is the pre-fix behaviour: the \
+         broadcast loop is not racing the ShutdownWatch and the \
+         runtime is pinned until graceful_shutdown_timeout expires. \
+         The fix lives in crates/ngx/src/sse.rs::handle_access_log_stream \
+         (the `select!` on `shutdown.changed()`). \
+         body so far: {body_buf:?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "SSE connection did drop, but only after {elapsed:?} — \
+         the 1.5 s budget is the pre-fix baseline; anything close \
+         to 5 s is a regression. body={body_buf:?}"
+    );
+
+    // 5) Wait for the child to exit cleanly. We give it the
+    //    full graceful-drain budget (12 s — covers pingora's
+    //    5 s grace + 5 s runtime drain + 2 s scheduler slack)
+    //    so the test does not race the harness Drop.
+    let drain_deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= drain_deadline {
+                    let _ = child.start_kill();
+                    panic!(
+                        "ngx child did not exit within 12 s of SIGINT; \
+                         killing it. ng x log:\n{}",
+                        ngx.log_string()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("try_wait error: {e}"),
+        }
+    }
+    // The child should have exited via the SIGINT graceful
+    // path — a 0 exit code would mean the test environment
+    // somehow had no shutdown signalled; we don't assert on
+    // the specific code, just that the child is gone.
 }

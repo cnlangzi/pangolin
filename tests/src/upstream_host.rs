@@ -43,14 +43,9 @@ impl HostCheckBackend {
         let headers_for_spawn = received_headers.clone();
 
         let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let hdrs = headers_for_spawn.clone();
-                        tokio::spawn(handle_http_with_headers(stream, hdrs));
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let hdrs = headers_for_spawn.clone();
+                tokio::spawn(handle_http_with_headers(stream, hdrs));
             }
         });
 
@@ -185,7 +180,7 @@ async fn handle_proxy_connection(mut client: TcpStream, indexes: Arc<Indexes>) {
         .collect::<Vec<_>>()
         .join("\n");
 
-    if let Err(_) = backend.write_all(forwarded.as_bytes()).await {
+    if backend.write_all(forwarded.as_bytes()).await.is_err() {
         return;
     }
 

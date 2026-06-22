@@ -338,10 +338,35 @@ pub struct LogConfig {
     pub level: String,
     #[serde(default)]
     pub file: String,
+    /// Capacity of the in-memory access log ring buffer (issue #73).
+    /// Default 100 — matches the existing dashboard activity-feed
+    /// buffer so a default install has consistent "recent N" depth.
+    /// Set to 0 to disable the ring buffer entirely (live SSE
+    /// subscribers still receive entries; late-join replay is off).
+    /// Each entry is ~150 bytes serialized, so 100 ≈ 15 KB.
+    #[serde(default = "default_access_log_recent")]
+    pub access_log_recent: usize,
+    /// Capacity of the `tokio::sync::broadcast` channel that fans
+    /// out live access log entries to SSE subscribers (issue #73).
+    /// Default 1000 — enough that a single idle dashboard can fall
+    /// a few minutes behind without losing entries. Lagged
+    /// subscribers see a `: lagged N events` SSE comment and the
+    /// stream continues — see `routes::logs::stream` in the admin
+    /// crate.
+    #[serde(default = "default_access_log_capacity")]
+    pub access_log_capacity: usize,
 }
 
 fn default_log_level() -> String {
     "info".into()
+}
+
+fn default_access_log_recent() -> usize {
+    100
+}
+
+fn default_access_log_capacity() -> usize {
+    1000
 }
 
 impl Default for LogConfig {
@@ -349,6 +374,8 @@ impl Default for LogConfig {
         Self {
             level: "info".into(),
             file: String::new(),
+            access_log_recent: default_access_log_recent(),
+            access_log_capacity: default_access_log_capacity(),
         }
     }
 }
@@ -467,6 +494,41 @@ mod tests {
         assert_eq!(c.addr.https, "0.0.0.0:443");
         // v2: cert.autorenew removed; no global ACME toggle to assert
         assert_eq!(c.acme.key_type, "ecdsa");
+        // v3 (issue #73): access log knobs default to 100 / 1000
+        // so a YAML without `[log]` keys still parses.
+        assert_eq!(c.log.access_log_recent, 100);
+        assert_eq!(c.log.access_log_capacity, 1000);
+    }
+
+    #[test]
+    fn log_access_log_keys_parse_and_default() {
+        // Operators who pre-date issue #73 (no access_log_* keys in
+        // their ngx.yml) must not see a parse error. This is the
+        // hard constraint from the issue: serde defaults make the
+        // new fields backwards-compatible.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.log.access_log_recent, 100);
+            assert_eq!(c.log.access_log_capacity, 1000);
+            Ok(())
+        });
+
+        // And operators who set them explicitly get the values they
+        // asked for.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                log:
+                  level: info
+                  access_log_recent: 250
+                  access_log_capacity: 4000
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert_eq!(c.log.access_log_recent, 250);
+            assert_eq!(c.log.access_log_capacity, 4000);
+            Ok(())
+        });
     }
 
     #[test]

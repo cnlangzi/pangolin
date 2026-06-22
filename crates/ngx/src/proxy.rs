@@ -208,6 +208,30 @@ fn read_header_value(req: &HttpRequest, name: &str) -> Result<String, ()> {
 //  AppProxy (pingora)
 // ─────────────────────────────────────────────────────────────────
 
+/// Per-request state for access logging (Issue #73).
+/// Captures start time, method, path, host, and backend so
+/// response_filter can construct an AccessLogEntry.
+#[derive(Debug, Clone)]
+pub struct RequestState {
+    pub start: std::time::Instant,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub backend: String, // "tun:office" | "direct:1.2.3.4:8080" | "file://..."
+}
+
+impl Default for RequestState {
+    fn default() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            method: String::new(),
+            path: String::new(),
+            host: String::new(),
+            backend: String::new(),
+        }
+    }
+}
+
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
     pub app: Arc<App>,
@@ -215,11 +239,13 @@ pub struct AppProxy {
 
 #[async_trait]
 impl ProxyHttp for AppProxy {
-    type CTX = ();
+    type CTX = RequestState;
 
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self) -> Self::CTX {
+        RequestState::default()
+    }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let path = session.req_header().uri.path().to_string();
         let is_upgrade = session.is_upgrade_req();
         log::debug!(
@@ -227,6 +253,12 @@ impl ProxyHttp for AppProxy {
             path,
             is_upgrade
         );
+
+        // Issue #73: capture request start time + basics for access log
+        ctx.start = std::time::Instant::now();
+        ctx.method = session.req_header().method.as_str().to_string();
+        ctx.path = path.clone();
+        ctx.host = host_from_session(session);
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
@@ -271,30 +303,48 @@ impl ProxyHttp for AppProxy {
             }
         }
 
-        // ── SSE / streaming response short-circuit ────────────
-        // Detected up-front (before site lookup) so we can pick
-        // the byte-relay path on both ends. The heuristic is
-        // intentionally conservative: only `text/event-stream`
-        // is matched today. Add new patterns to
-        // `pangolin_core::is_streaming_request` to extend.
+        // ── SSE / streaming response detection ────────────────
+        // The streaming path is a byte-relay that exists for the
+        // **tunnel** transport: the tun-side relay uses
+        // `copy_bidirectional` because the buffering HttpResponse
+        // path would deadlock on an infinite chunked body. For
+        // **direct** backends, pingora's H1/H2 client streams the
+        // response natively — we just let it through to
+        // `upstream_peer` and nothing buffers.
         //
-        // NOTE: this iterates over *all* request headers (not
-        // just the first Accept/Content-Type) so it matches
-        // multi-value Accept headers that HTTP/2 clients may
-        // send. Keep the semantics aligned with
-        // `pangolin_core::is_streaming_request` — see
-        // `is_streaming_request_detects_text_event_stream`.
-        let is_streaming = session.req_header().headers.iter().any(|(k, v)| {
-            let name = k.as_str();
-            (name.eq_ignore_ascii_case("Accept") || name.eq_ignore_ascii_case("Content-Type"))
-                && v.to_str()
-                    .map(|s| s.to_ascii_lowercase().contains("text/event-stream"))
-                    .unwrap_or(false)
-        });
-
-        if is_streaming {
-            return handle_streaming_request(&self.app, session).await;
-        }
+        // The detection is delegated to the shared
+        // `pangolin_core::is_streaming_request` so the heuristic
+        // has exactly one home — extending it (chunked
+        // responses, custom headers, path patterns) touches
+        // pangolin-core and reaches both transports at once.
+        // See `is_streaming_request_detects_text_event_stream`
+        // for the unit-test contract.
+        //
+        // The short-circuit itself runs *after* the site lookup
+        // below so we can branch on `tun_name.is_empty()`:
+        //   - tunnel    → call `handle_streaming_request` (byte-relay)
+        //   - direct    → fall through, pingora streams natively
+        //   - file://   → 415 (no streaming concept for a single file)
+        let is_streaming = {
+            // Build a minimal `HttpRequest` (no body — the helper
+            // only reads `headers`) from the session so we can
+            // delegate to the shared detector. The body is empty
+            // because the helper does not consult it.
+            let req_header = session.req_header();
+            let headers: Vec<(String, String)> = req_header
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            let req = HttpRequest {
+                method: req_header.method.as_str().to_string(),
+                target: req_header.uri.to_string(),
+                version: format!("{:?}", req_header.version),
+                headers,
+                body: Vec::new(),
+            };
+            pangolin_core::is_streaming_request(&req)
+        };
 
         // ── WebSocket upgrade short-circuit ────────────────────
         if is_upgrade && path == self.app.ws_path {
@@ -454,6 +504,55 @@ impl ProxyHttp for AppProxy {
             }
         };
 
+        // Issue #73: record backend string for access log
+        ctx.backend = if tun_name.is_empty() {
+            format!("direct:{}", target.authority())
+        } else {
+            format!("tun:{}", tun_name)
+        };
+
+        // ── SSE / streaming response short-circuit (tunnel only) ──
+        // Branch on the routing decision we just made:
+        //   - tunnel:    the tun-side `handle_streaming_response`
+        //                byte-relay is required (the tun's buffered
+        //                HttpResponse path deadlocks on infinite
+        //                chunked bodies). Take the short-circuit.
+        //   - direct +   file:// is not a streaming transport —
+        //     file://    refuse with 415 Unsupported Media Type
+        //                (and a small JSON body explaining why,
+        //                so callers can distinguish this from a
+        //                generic 400).
+        //   - direct +   pingora's H1/H2 client streams the
+        //     Http/Https response natively, no buffering on the
+        //                ngx side. Fall through to the standard
+        //                direct path (the `Ok(false)` branch at
+        //                the bottom of `request_filter`).
+        if is_streaming {
+            if !tun_name.is_empty() {
+                return handle_streaming_request(&self.app, session).await;
+            }
+            if matches!(target, BackendTarget::File { .. }) {
+                warn!(
+                    "SSE: refused on file:// backend for {} \
+                     (file:// has no streaming concept)",
+                    host
+                );
+                respond_streaming_unsupported_on_file(session).await;
+                return Ok(true);
+            }
+            // Direct Http/Https + SSE: fall through to the
+            // pingora direct path. The access-log entry is
+            // already populated above (`ctx.backend`), and
+            // `response_filter` will record the final status
+            // when pingora finishes the stream.
+            debug!(
+                "SSE: direct path (pingora-native streaming) \
+                 {} → {}",
+                host,
+                target.authority()
+            );
+        }
+
         // ── file:// direct (no tun) ──────────────────────────
         // Only when tun_name is empty — otherwise the file
         // lives on the tun's machine and must be served
@@ -485,14 +584,25 @@ impl ProxyHttp for AppProxy {
                 Some("https") => Scheme::Https,
                 _ => Scheme::Http,
             };
-            let ctx = ProxyCtx {
+            let proxy_ctx = ProxyCtx {
                 original_host,
                 original_scheme: scheme,
                 host_mode: site.host_mode,
                 host_custom: site.host_custom.clone(),
             };
-            apply_proxy_policy(&mut req, &ctx);
+            apply_proxy_policy(&mut req, &proxy_ctx);
             let resp = serve_file_target(&req, doc_root);
+            // Issue #73: file:// requests also short-circuit pingora
+            // — record the access log here for parity with the
+            // tunnel + direct paths. `ctx` (the trait's
+            // `RequestState`) is unaffected because the proxy
+            // policy `ProxyCtx` was renamed to `proxy_ctx` above.
+            record_access_log(
+                &self.app,
+                ctx,
+                session,
+                parse_status_from_line(&resp.status_line),
+            );
             write_response_to_session(session, &resp).await;
             return Ok(true);
         }
@@ -620,6 +730,16 @@ impl ProxyHttp for AppProxy {
                 .await
             {
                 Ok(resp) => {
+                    // Issue #73: tunnel-path requests short-circuit
+                    // pingora so the proxy `response_filter` never
+                    // runs — record the access log here so the entry
+                    // shows up on /logs.
+                    record_access_log(
+                        &self.app,
+                        ctx,
+                        session,
+                        parse_status_from_line(&resp.status_line),
+                    );
                     write_response_to_session(session, &resp).await;
                     return Ok(true);
                 }
@@ -781,10 +901,13 @@ impl ProxyHttp for AppProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
-        _upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Issue #73: construct AccessLogEntry and push to App
+        let status = upstream_response.status.as_u16();
+        record_access_log(&self.app, ctx, session, status);
         Ok(())
     }
 }
@@ -1235,6 +1358,83 @@ async fn write_response_to_session(session: &mut Session, resp: &HttpResponse) {
     {
         error!("failed to write response body: {}", e);
     }
+}
+
+/// Build an [`AccessLogEntry`](pangolin_core::AccessLogEntry) from the
+/// per-request [`RequestState`] and the client address from
+/// `session`, and push it to [`App::push_access_log`]. Shared by
+/// `response_filter` (direct / pingora path) and the tunnel +
+/// file:// short-circuits in `request_filter` so every response
+/// that the user actually sees is logged exactly once.
+///
+/// Tunnel and file paths in `request_filter` return `Ok(true)` to
+/// short-circuit pingora, which means the proxy's `response_filter`
+/// is never called for them — without this helper those requests
+/// would silently disappear from the `/logs` page.
+/// Respond with `415 Unsupported Media Type` and a small JSON
+/// body explaining why a streaming request is not valid on a
+/// `file://` backend.
+///
+/// 415 (not 400) is the right code per RFC 7231 §6.5.13: the
+/// server *understands* the request and the `text/event-stream`
+/// media type, but refuses to process it on this particular
+/// resource. A bare 400 would lump "no streaming concept" in
+/// with every other "this is malformed" failure and force the
+/// caller to read the log to tell them apart. The body is
+/// JSON so a programmatic client can branch on the
+/// `error` field; the `message` is human-readable for anyone
+/// reading the response in a browser devtools panel.
+async fn respond_streaming_unsupported_on_file(session: &mut Session) {
+    use serde_json::json;
+    let body = json!({
+        "error": "streaming_unsupported",
+        "message": "Server-Sent Events (text/event-stream) are not \
+                    supported on file:// backends. file:// serves a \
+                    single on-disk file and has no concept of an \
+                    infinite, chunked stream. Configure a tunnel or \
+                    an HTTP(S) backend to stream responses.",
+    })
+    .to_string();
+    let mut hdr = match ResponseHeader::build(415, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("failed to build 415 response: {e}");
+            let _ = session.respond_error(500).await;
+            return;
+        }
+    };
+    hdr.insert_header("Content-Type", "application/json").ok();
+    hdr.insert_header("Content-Length", body.len().to_string().as_bytes())
+        .ok();
+    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+        warn!("failed to write 415 response header: {e}");
+        return;
+    }
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(body)), true)
+        .await
+    {
+        warn!("failed to write 415 response body: {e}");
+    }
+}
+
+fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
+    let duration_ms = ctx.start.elapsed().as_millis() as u64;
+    let client_ip = session
+        .client_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let entry = pangolin_core::AccessLogEntry {
+        timestamp: chrono::Utc::now(),
+        method: ctx.method.clone(),
+        path: ctx.path.clone(),
+        host: ctx.host.clone(),
+        status,
+        duration_ms,
+        backend: ctx.backend.clone(),
+        client_ip,
+    };
+    app.push_access_log(entry);
 }
 
 /// Parse the status code from an `HttpResponse::status_line`

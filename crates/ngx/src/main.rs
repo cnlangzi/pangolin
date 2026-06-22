@@ -22,6 +22,7 @@ mod dns;
 mod proxy;
 mod runtime;
 mod serve;
+mod sse;
 mod tls;
 mod tunnel;
 
@@ -41,7 +42,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use pingora::apps::http_app::HttpServer;
 use pingora::proxy::http_proxy_service;
 use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
@@ -250,7 +250,11 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     server.add_service(proxy_service);
 
     // Admin HTTP server (admin API + static files).
-    let mut http_server = Service::new("pangolin-http".to_string(), HttpServer::new_app(app_http));
+    // Issue #73: `AppHttp` now implements `HttpServerApp` directly
+    // so the `/api/logs/stream` SSE endpoint can chunk its writes
+    // over a long-lived connection (ServeHttp materialises the
+    // whole body before returning, which would defeat SSE).
+    let mut http_server = Service::new("pangolin-http".to_string(), app_http);
     http_server.add_tcp(&config.admin.addr);
     server.add_service(http_server);
 

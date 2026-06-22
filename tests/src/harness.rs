@@ -270,12 +270,18 @@ pub fn init_pangolin_db(path: &Path) {
     pangolin_core::db::migrate(&mut conn).expect("run migrations");
 }
 
+/// Shared, lock-protected log buffer (stdout+stderr) captured from
+/// a running child process. The `Arc<Mutex<Vec<u8>>>` is shared
+/// between the reader tasks and the test thread that wants to
+/// dump it on failure.
+type CapturedLog = Arc<Mutex<Vec<u8>>>;
+
 /// Capture child stdout+stderr into a shared `Vec<u8>` so failing tests
 /// can dump the binary's log output. Returns the `JoinHandle`s of the
 /// reader tasks so `NgxProcess::drop` can `abort()` them — otherwise
 /// they keep the tokio runtime alive after the test process tries to
 /// exit, and `cargo test` hangs indefinitely.
-fn spawn_with_log_capture(mut cmd: Command) -> (Child, Arc<Mutex<Vec<u8>>>, Vec<JoinHandle<()>>) {
+fn spawn_with_log_capture(mut cmd: Command) -> (Child, CapturedLog, Vec<JoinHandle<()>>) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn child process");
     let log = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -530,8 +536,12 @@ impl Drop for NgxProcess {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // Drop runs on a sync stack — `child.kill().await` is not
+        // available here. `start_kill()` issues SIGKILL synchronously;
+        // the kernel reaps the child via the `try_wait` poll above on
+        // any future iteration, but on Drop we are at end-of-life so
+        // a brief unreaped zombie is acceptable.
+        let _ = child.start_kill();
     }
 }
 
@@ -606,13 +616,36 @@ log:
         cmd.env_remove("no_proxy");
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
-        // Tun's own "connected to ngx" log is the cleanest readiness
-        // signal. We poll the log buffer for up to 5s rather than
-        // sleeping a fixed duration.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Tun's own "yamux session live" log is the cleanest readiness
+        // signal — it fires AFTER the WS upgrade succeeded AND the
+        // yamux control session is open, which is exactly the
+        // moment the proxy side will start honouring
+        // `app.tun_sessions[name]`. Earlier we waited for
+        // "connected to ngx", which fires after the TCP/WS
+        // handshake but before the yamux open-stream exchange —
+        // on cold CI runners that gap is enough for the test's first
+        // request to race ahead and hit "Tun <name> not online" (503).
+        //
+        // The "yamux session live" marker is emitted by the tun client
+        // after the control-stream handshake completes; see
+        // `crates/tun/src/client.rs::run_session`.
+        //
+        // 5s → 15s deadline: cold-cache CI runners routinely take 6-8s
+        // to reach this state (DNS + cert verify + dynamic loader +
+        // page cache warm-up for both binaries). 15s is well under the
+        // e2e job's 15-minute overall budget and well above the
+        // observed warm-cache local finish of <1s.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let log_s = String::from_utf8_lossy(&log.lock().unwrap()).into_owned();
-            if log_s.contains("connected to ngx") {
+            if log_s.contains("yamux session live") {
+                break;
+            }
+            // Legacy fallback for older tun builds that don't log the
+            // "yamux session live" marker. Keep this so a freshly-built
+            // test crate running against an old `bin/pangolin-tun` still
+            // finds the tun ready.
+            if log_s.contains("connected to ngx") && log_s.contains("WS upgrade ok") {
                 break;
             }
             // Detect early failure (e.g. auth rejection) by looking
@@ -667,7 +700,11 @@ impl Drop for TunProcess {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // Drop runs on a sync stack — `child.kill().await` is not
+        // available here. `start_kill()` issues SIGKILL synchronously;
+        // the kernel reaps the child via the `try_wait` poll above on
+        // any future iteration, but on Drop we are at end-of-life so
+        // a brief unreaped zombie is acceptable.
+        let _ = child.start_kill();
     }
 }
