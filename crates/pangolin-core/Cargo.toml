@@ -44,6 +44,12 @@ httpdate.workspace = true
 # the response_filter hot path holds it for a single VecDeque bound
 # check + push_back.
 
+# DashMap is the concurrent hashmap behind CertLinkCache
+# (fix/cert_www). The SNI callback reads under contention from
+# concurrent handshake tasks; DashMap's per-shard locking gives
+# us lock-free reads in the common case.
+dashmap.workspace = true
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `figment::Jail` lives behind the `test` feature flag — used by the

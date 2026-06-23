@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::tunnel::YamuxTunnel;
 use crate::{
-    AccessLogBuffer, AccessLogEntry, EventBuffer, EventType, Indexes,
+    AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
     db,
     types::{ChallengeKind, ChallengeType, DnsProviderKind},
@@ -341,6 +341,12 @@ pub struct App {
     /// broadcasts. Sized by `config.log.access_log_recent`
     /// (default 100).
     pub access_log_recent: Arc<AccessLogBuffer>,
+    /// Domain → cert pre-computed link (fix/cert_www). Built once
+    /// at startup from the `domains` × `certs` tables, then
+    /// maintained by the domain/cert CRUD hooks. Read on every
+    /// TLS handshake by the SNI callback in `ngx::tls`. See
+    /// `docs/design/cert-link.md` for the full design.
+    pub cert_links: CertLinkCache,
 }
 
 impl App {
@@ -382,6 +388,12 @@ impl App {
         let dns_index = DnsIndex::build(&providers, &domains);
         let tunnel_set = build_tunnel_domain_set(&indexes);
 
+        // fix/cert_www: build the domain → cert pre-computed link
+        // cache. Pure derived view over `domains` and `certs`; the
+        // SNI callback reads it on every TLS handshake. Built once
+        // here and maintained by the CRUD hooks (`relink_for_*`).
+        let cert_links = CertLinkCache::load_from_db(&conn)?;
+
         // Access log live channel (issue #73). tokio::sync::broadcast
         // already deduplicates per-subscriber but we still need to
         // set a real capacity here so the channel has somewhere to
@@ -408,6 +420,7 @@ impl App {
             cert_retrier: RwLock::new(None),
             access_log_tx,
             access_log_recent: Arc::new(AccessLogBuffer::new(access_log_recent_capacity)),
+            cert_links,
         })
     }
 
@@ -423,6 +436,13 @@ impl App {
     /// Reload indexes from DB. Called after every admin write operation.
     /// Also fires `dns_change_notify` so the `AcmeState` background loop
     /// picks up new DNS providers / domain associations.
+    ///
+    /// fix/cert_www: also rebuilds the `cert_links` cache so an
+    /// out-of-band `INSERT INTO certs` (e.g. SQL console, a test
+    /// writing a cert blob post-startup) becomes visible to the
+    /// SNI callback without requiring a process restart. CRUD hooks
+    /// keep the cache warm in the normal case; this method is the
+    /// recovery path.
     pub async fn reload_indexes(&self) {
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
@@ -437,6 +457,13 @@ impl App {
         let tunnel_set = build_tunnel_domain_set(&indexes);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
+        // Rebuild cert_links (fix/cert_www). Best-effort: if the
+        // rebuild fails (e.g. a transient DB error), log and keep
+        // the existing cache. The cache is a derived view and will
+        // catch up on the next reload.
+        if let Err(e) = self.cert_links.reload_from_db(&conn) {
+            log::warn!("cert_links: reload from DB failed: {}", e);
+        }
         *self.tunnel_domains.write() = Arc::new(tunnel_set);
         drop(conn);
         // Wake the AcmeState loop (if any) so it re-reads dns_providers.

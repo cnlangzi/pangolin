@@ -394,6 +394,21 @@ pub fn list_certs_by_status(
 /// `started_at` semantics: set to `Some(now)` whenever a new ACME attempt
 /// begins (Pending → Issuing transition, manual retry). Pass `None` to
 /// keep the existing value (e.g. on the Issuing → Issued/Failed transition).
+///
+/// **`CertLinkCache` interaction (fix/cert_www):** this helper does NOT
+/// touch the in-memory cert link cache. The status flow that matters for
+/// serving is `Pending → Issuing → Issued`, and the cache only needs to
+/// reflect the `Issued` state (the only one considered "linkable" by
+/// `find_best_cert_for`). In the current code, the transition to
+/// `Issued` happens via `upsert_cert`, not this helper, and the
+/// `upsert_cert` callers in `acme.rs` and `admin/certs/mutate.rs` are
+/// the ones that invoke `relink_for_cert`.
+///
+/// If a future caller transitions a cert to `Issued` *only* via this
+/// helper (without a follow-up `upsert_cert`), the cache will not see
+/// the change. Either route through `upsert_cert`, or add a
+/// `relink_for_cert` call at the new call site. See
+/// `docs/design/cert-link.md` §6.
 pub fn set_cert_status_atomic(
     conn: &Connection,
     domain: &str,

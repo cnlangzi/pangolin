@@ -232,6 +232,11 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // config.acme.cert_dir. The previous static-blob path with
         // "default" fallback was removed.
         //
+        // fix/cert_www: SNI resolution is now driven by a pre-computed
+        // domain → cert link (`app.cert_links`), so wildcard certs
+        // (e.g. *.example.com) cover their subdomains at handshake
+        // time. See docs/design/cert-link.md.
+        //
         // ALPN is decided per-SNI inside `build_sni_settings` — the
         // listener runs a dynamic callback that picks h1 for tunnel
         // sites and follows `config.tls.enable_h2` for everything else.
