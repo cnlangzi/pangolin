@@ -95,7 +95,7 @@ product or implement `Last-Event-ID` in their own backend.
 |---|---|---|
 | `crates/tun/src/client.rs:621-628` | Match on `copy` result. On `Err`, call `backend.shutdown().await` before returning. | Close backend TCP promptly when yamux peer disappears. Mirrors `pump_ws_relay`'s "read failure → peer shutdown" pattern. |
 | `crates/ngx/src/proxy.rs:1205` | Comment block above the body loop. **No code change.** | Lock the contract that `StreamHandle::drop` sends RST (not FIN), and that calling `shutdown().await` explicitly here would be *worse*, not better. |
-| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend TCP closes within 2 s of client disconnect on both tunnel and direct paths. |
+| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend TCP closes within 2 s of client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — direct path skips the tun/yamux hops, so it should propagate faster). |
 | `docs/design/sse-reconnect.md` | This document | Record the contract. |
 
 ### yamux Drop sends RST, not FIN — verified

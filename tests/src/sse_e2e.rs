@@ -185,12 +185,17 @@ struct ObservableSseBackend {
     peer_closed_at: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
     /// Outer main-task handle (write loop). Aborted on Drop.
     handle: tokio::task::JoinHandle<()>,
-    /// Inner watchdog-task handle (read loop). Sent from the
-    /// outer task via this oneshot after the watchdog is
-    /// spawned, so `Drop` can abort it too. Without this, a
-    /// test panic before the main loop ends would leak the
-    /// watchdog task and its `reader` half indefinitely.
-    watchdog: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Watchdog-task `AbortHandle` (read loop), parked in a
+    /// `std::sync::Mutex` so `Drop` can take it without a
+    /// `try_lock` race. The outer task writes the handle
+    /// exactly once (right after spawning the watchdog) and
+    /// `Drop` takes it exactly once; the guard is never held
+    /// across an `.await`, so contention is negligible. The
+    /// blocking `lock()` in `Drop` is correct: it cannot
+    /// fail spuriously the way `try_lock` did, so the
+    /// watchdog (and its `reader` half) cannot be leaked
+    /// because the slot was momentarily contended.
+    watchdog: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl ObservableSseBackend {
@@ -199,8 +204,8 @@ impl ObservableSseBackend {
         let addr = listener.local_addr().unwrap().to_string();
         let seen = std::sync::Arc::new(tokio::sync::Mutex::new(false));
         let peer_closed_at = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-        let watchdog_slot: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let watchdog_slot: std::sync::Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen_for_task = seen.clone();
         let peer_closed_for_task = peer_closed_at.clone();
         let watchdog_slot_for_task = watchdog_slot.clone();
@@ -236,19 +241,24 @@ impl ObservableSseBackend {
 
             // Watchdog task: blocks on a one-byte read. When the
             // peer closes (FIN/RST), the read returns Ok(0) or
-            // Err and we stamp `peer_closed_at`. We register
-            // its `JoinHandle` in the shared slot so `Drop`
-            // can abort it (otherwise a test panic before this
-            // outer task reaches the post-loop `watchdog.abort()`
-            // call would leak the watchdog task and its
-            // `reader` half until the kernel TCP closes).
+            // Err and we stamp `peer_closed_at`. We store its
+            // `AbortHandle` in the shared slot so `Drop` can
+            // abort it deterministically (the previous design
+            // stored the `JoinHandle` and `try_lock`-ed the
+            // slot in `Drop`, which could lose the race and
+            // leak the watchdog — and its `reader` half —
+            // until the kernel closed the socket).
             let peer_closed_watchdog = peer_closed_for_task.clone();
             let watchdog = tokio::spawn(async move {
                 let mut probe = [0u8; 1];
                 let _ = reader.read(&mut probe).await;
                 *peer_closed_watchdog.lock().await = Some(Instant::now());
             });
-            *watchdog_slot_for_task.lock().await = Some(watchdog);
+            // Sync, very-brief lock — the guard is never held
+            // across an `.await`. If `Drop` is mid-`lock()` at
+            // the same instant, it'll wait nanoseconds and
+            // then get the handle.
+            *watchdog_slot_for_task.lock().unwrap() = Some(watchdog.abort_handle());
 
             // Main task: emit events forever. Stops when its own
             // write fails (peer gone) or the test ends (Drop).
@@ -265,37 +275,52 @@ impl ObservableSseBackend {
                 i += 1;
                 tokio::time::sleep(event_spacing).await;
             }
-            // Abort the watchdog now that the write loop ended
-            // — the reader half is already past EOF at this
-            // point, but the kernel may take an extra RTT to
-            // surface FIN to it; explicit abort keeps the test
-            // runtime bounded.
-            if let Some(h) = watchdog_slot_for_task.lock().await.take() {
-                h.abort();
-            }
+            // The watchdog's `JoinHandle` (`watchdog`) drops
+            // here when this outer task ends. Dropping a
+            // `JoinHandle` does NOT abort the task — only
+            // `AbortHandle::abort` does. The `watchdog_abort`
+            // we kept in the shared slot is what guarantees
+            // the watchdog is aborted at test end, regardless
+            // of whether we reach this line, the outer task
+            // panics, or `Drop` runs first.
         });
 
-        Self { addr, seen, peer_closed_at, handle, watchdog: watchdog_slot }
+        Self {
+            addr,
+            seen,
+            peer_closed_at,
+            handle,
+            watchdog: watchdog_slot,
+        }
     }
 
-    fn addr(&self) -> &str { &self.addr }
+    fn addr(&self) -> &str {
+        &self.addr
+    }
 
-    async fn seen_request(&self) -> bool { *self.seen.lock().await }
+    async fn seen_request(&self) -> bool {
+        *self.seen.lock().await
+    }
 
-    async fn peer_closed_at(&self) -> Option<Instant> { *self.peer_closed_at.lock().await }
+    async fn peer_closed_at(&self) -> Option<Instant> {
+        *self.peer_closed_at.lock().await
+    }
 }
 
 impl Drop for ObservableSseBackend {
     fn drop(&mut self) {
-        // Abort the outer task first, then take the watchdog
-        // handle out of the shared slot and abort it too. If
-        // a panic happened before the outer task got to
-        // register the watchdog, the slot is `None` — that's
-        // fine, the outer task is already aborted.
+        // Abort the outer task, then take the watchdog's
+        // `AbortHandle` out of the slot and abort it too.
+        // `lock()` (blocking) replaces the previous
+        // `try_lock` — it cannot fail spuriously, so the
+        // watchdog (and its `reader` half) cannot be leaked
+        // because the slot was momentarily contended.
+        // Best-effort: if the outer task hadn't yet stored
+        // the handle when `Drop` ran, the slot is `None`
+        // and the watchdog exits naturally when its
+        // `reader` half is dropped with the outer task.
         self.handle.abort();
-        if let Ok(mut guard) = self.watchdog.try_lock()
-            && let Some(h) = guard.take()
-        {
+        if let Some(h) = self.watchdog.lock().unwrap().take() {
             h.abort();
         }
     }
@@ -1288,7 +1313,7 @@ async fn real_e2e_direct_sse_client_disconnect_propagates_to_backend() {
     assert!(
         elapsed < Duration::from_secs(1),
         "direct-path backend TCP took {elapsed:?} to close after client drop \
-         (expected < 2s). Pre-#85 this scenario was untestable (501 short-circuit). \
+         (expected < 1s). Pre-#85 this scenario was untestable (501 short-circuit). \
          ngx log:\n{}",
         ngx.log_string()
     );
