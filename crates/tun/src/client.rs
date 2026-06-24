@@ -614,28 +614,33 @@ where
     //
     // We ignore the stream direction entirely (it carries no
     // SSE traffic anyway) and copy backend → stream until the
-    // backend closes. If the tun's yamux stream errors or
-    // closes first (the client disconnected from ngx), we
-    // return so the per-frame task ends and the yamux stream
-    // can be released.
+    // backend closes. The teardown contract is:
     //
-    // Two teardown paths:
-    //   - `Ok(_)`: backend closed cleanly. Propagate EOF to
-    //     the client so it sees the end of the stream.
-    //   - `Err(_)`: the yamux stream broke. The most common
-    //     cause is that ngx dropped its end on client
-    //     disconnect; `StreamHandle::drop` sends RST (not
-    //     FIN — see `docs/design/sse-reconnect.md`). Without
-    //     an explicit `backend.shutdown()` here, the backend
-    //     TCP would linger until OS-level FIN timeout
-    //     (60–120 s on Linux) and keep producing events that
-    //     go nowhere. Mirror `pump_ws_relay`'s "read failure →
-    //     peer shutdown" pattern
-    //     (`crates/pangolin-core/src/tunnel.rs`).
+    //   - `Ok(_)`: backend closed cleanly. We must propagate
+    //     EOF to the client by calling `stream.shutdown()` —
+    //     yamux's `Drop` only sends RST, not FIN, and a
+    //     successful end-of-stream is the one case where we
+    //     want a clean FIN so the client sees the end of the
+    //     body.
+    //
+    //   - `Err(_)`: the yamux stream broke (most commonly
+    //     because ngx dropped it on client disconnect).
+    //     Without an explicit `backend.shutdown()` here, the
+    //     backend TCP would linger until OS-level FIN
+    //     timeout (60–120 s on Linux) and keep producing
+    //     events that go nowhere. We must NOT call
+    //     `stream.shutdown()` on this path: that would
+    //     transition the yamux state to `LocalClosing`, and
+    //     `Drop for StreamHandle` skips the RST frame when
+    //     state is `LocalClosing` (see
+    //     `docs/design/sse-reconnect.md`). Instead, let
+    //     `stream` fall out of scope at function return —
+    //     `Drop` then sees `Established` and sends RST,
+    //     which propagates faster than FIN.
     match tokio::io::copy(&mut backend, &mut stream).await {
         Ok(_) => {
             // Backend closed cleanly: propagate EOF to the
-            // client so it sees the end of the stream.
+            // client (see contract above).
             let _ = stream.shutdown().await;
         }
         Err(e) => {
@@ -643,8 +648,11 @@ where
                 "tun {} streaming backend→stream copy: {} → closing backend TCP",
                 name, e
             );
+            // Close the backend TCP so it stops producing
+            // events that go nowhere. Do NOT call
+            // `stream.shutdown()` — let it drop at function
+            // return so Drop emits RST (faster than FIN).
             let _ = backend.shutdown().await;
-            let _ = stream.shutdown().await;
         }
     }
     Ok(())

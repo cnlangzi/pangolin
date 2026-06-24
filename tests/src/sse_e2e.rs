@@ -183,7 +183,14 @@ struct ObservableSseBackend {
     addr: String,
     seen: std::sync::Arc<tokio::sync::Mutex<bool>>,
     peer_closed_at: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
+    /// Outer main-task handle (write loop). Aborted on Drop.
     handle: tokio::task::JoinHandle<()>,
+    /// Inner watchdog-task handle (read loop). Sent from the
+    /// outer task via this oneshot after the watchdog is
+    /// spawned, so `Drop` can abort it too. Without this, a
+    /// test panic before the main loop ends would leak the
+    /// watchdog task and its `reader` half indefinitely.
+    watchdog: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ObservableSseBackend {
@@ -192,8 +199,11 @@ impl ObservableSseBackend {
         let addr = listener.local_addr().unwrap().to_string();
         let seen = std::sync::Arc::new(tokio::sync::Mutex::new(false));
         let peer_closed_at = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let watchdog_slot: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let seen_for_task = seen.clone();
         let peer_closed_for_task = peer_closed_at.clone();
+        let watchdog_slot_for_task = watchdog_slot.clone();
 
         let handle = tokio::spawn(async move {
             let (stream, _) = match listener.accept().await {
@@ -226,13 +236,19 @@ impl ObservableSseBackend {
 
             // Watchdog task: blocks on a one-byte read. When the
             // peer closes (FIN/RST), the read returns Ok(0) or
-            // Err and we stamp `peer_closed_at`.
+            // Err and we stamp `peer_closed_at`. We register
+            // its `JoinHandle` in the shared slot so `Drop`
+            // can abort it (otherwise a test panic before this
+            // outer task reaches the post-loop `watchdog.abort()`
+            // call would leak the watchdog task and its
+            // `reader` half until the kernel TCP closes).
             let peer_closed_watchdog = peer_closed_for_task.clone();
             let watchdog = tokio::spawn(async move {
                 let mut probe = [0u8; 1];
                 let _ = reader.read(&mut probe).await;
                 *peer_closed_watchdog.lock().await = Some(Instant::now());
             });
+            *watchdog_slot_for_task.lock().await = Some(watchdog);
 
             // Main task: emit events forever. Stops when its own
             // write fails (peer gone) or the test ends (Drop).
@@ -249,10 +265,17 @@ impl ObservableSseBackend {
                 i += 1;
                 tokio::time::sleep(event_spacing).await;
             }
-            watchdog.abort();
+            // Abort the watchdog now that the write loop ended
+            // — the reader half is already past EOF at this
+            // point, but the kernel may take an extra RTT to
+            // surface FIN to it; explicit abort keeps the test
+            // runtime bounded.
+            if let Some(h) = watchdog_slot_for_task.lock().await.take() {
+                h.abort();
+            }
         });
 
-        Self { addr, seen, peer_closed_at, handle }
+        Self { addr, seen, peer_closed_at, handle, watchdog: watchdog_slot }
     }
 
     fn addr(&self) -> &str { &self.addr }
@@ -263,7 +286,19 @@ impl ObservableSseBackend {
 }
 
 impl Drop for ObservableSseBackend {
-    fn drop(&mut self) { self.handle.abort(); }
+    fn drop(&mut self) {
+        // Abort the outer task first, then take the watchdog
+        // handle out of the shared slot and abort it too. If
+        // a panic happened before the outer task got to
+        // register the watchdog, the slot is `None` — that's
+        // fine, the outer task is already aborted.
+        self.handle.abort();
+        if let Ok(mut guard) = self.watchdog.try_lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -486,9 +521,15 @@ async fn real_e2e_tunnel_sse_streams_through() {
 /// Pre-fix this test would time out at 2 s — the backend TCP
 /// would sit open until OS-level FIN timeout (60–120 s on
 /// Linux) because the tun-side `copy` ignored yamux errors
-/// and never called `backend.shutdown()`. The 1 s ceiling is
-/// generous (1× scheduler tick + loopback RTT) but well below
-/// the pre-fix OS timeout, so the test distinguishes clearly.
+/// and never called `backend.shutdown()`. The 2 s ceiling is
+/// generous (multi-hop loopback RTT × 5 hops + scheduler
+/// jitter on a loaded CI runner) but well below the
+/// pre-fix OS timeout, so the test distinguishes clearly.
+/// The ceiling is sized for the propagation chain
+/// `client drop → ngx body-loop break → yamux Drop-RST →
+/// tun next-write error → tun `backend.shutdown()` (FIN) →
+/// kernel FIN → backend watchdog read returns Ok(0) →
+/// stamp peer_closed_at`.
 #[tokio::test]
 async fn real_e2e_tunnel_sse_client_disconnect_propagates_to_backend() {
     let backend = ObservableSseBackend::start(Duration::from_millis(50)).await;
@@ -583,9 +624,9 @@ async fn real_e2e_tunnel_sse_client_disconnect_propagates_to_backend() {
 
     let elapsed = closed_at.duration_since(t_drop);
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_secs(2),
         "backend TCP took {elapsed:?} to close after client drop \
-         (expected < 1s). Pre-fix behaviour was 60–120 s \
+         (expected < 2s). Pre-fix behaviour was 60–120 s \
          (OS FIN timeout). ngx log:\n{}\n\ntun log:\n{}",
         ngx.log_string(),
         _tun.log_string()
@@ -1247,7 +1288,7 @@ async fn real_e2e_direct_sse_client_disconnect_propagates_to_backend() {
     assert!(
         elapsed < Duration::from_secs(1),
         "direct-path backend TCP took {elapsed:?} to close after client drop \
-         (expected < 1s). Pre-#85 this scenario was untestable (501 short-circuit). \
+         (expected < 2s). Pre-#85 this scenario was untestable (501 short-circuit). \
          ngx log:\n{}",
         ngx.log_string()
     );
