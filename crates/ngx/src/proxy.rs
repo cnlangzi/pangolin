@@ -1205,6 +1205,22 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
     // Stream body bytes: yamux → client. We do not await
     // EOF — the next "tun wrote nothing for a while" or
     // client-close triggers a graceful return.
+    //
+    // **Do not** add an explicit `yamux_stream.shutdown().await`
+    // here. When the client disconnects we `break` out of the
+    // loop and let `yamux_stream` drop out of scope at the
+    // bottom of this function. That Drop sends **RST** (not
+    // FIN) on the yamux stream
+    // (`tokio-yamux-0.3.18/src/stream.rs:597-622`, state
+    // `Established` → `Flag::Rst`). The tun-side
+    // `tokio::io::copy(&mut backend, &mut stream)` then errors
+    // out on its next write with `ECONNRESET`, which lets the
+    // tun promptly shut down the backend TCP. By contrast an
+    // explicit `shutdown().await` would set state to
+    // `LocalClosing` and send FIN — a half-close handshake —
+    // which is *slower* to propagate through the back-half of
+    // the tun's copy loop. See
+    // `docs/design/sse-reconnect.md` for the full rationale.
     let mut buf = [0u8; 8192];
     loop {
         match yamux_stream.read(&mut buf).await {
