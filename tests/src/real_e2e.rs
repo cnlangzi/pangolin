@@ -2270,26 +2270,26 @@ async fn real_e2e_proxy_propagates_backend_error_codes() {
     }
 }
 
-/// A reverse proxy should add `X-Forwarded-For` (and ideally
-/// `X-Forwarded-Proto`) so the upstream can log the real client
-/// IP.  If pangolin fails to add this, the upstream only sees
-/// 127.0.0.1 (its local proxy peer) — log analysis becomes
-/// useless.
+/// A reverse proxy must surface the real client IP / scheme /
+/// host to the upstream so log analysis and per-IP policy can
+/// run.  The contract: on every delivery path (direct + tun,
+/// every host_mode), the proxy must inject
+///   - `X-Forwarded-For: <client_ip>`  (or append to existing chain)
+///   - `X-Real-IP: <client_ip>`
+///   - `X-Forwarded-Proto: <http|https>`
+///   - `X-Forwarded-Host: <original_public_host>`
 ///
-/// **STATUS: known unimplemented feature.**  Grep finds zero
-/// references to X-Forwarded-For / X-Real-IP / X-Forwarded-Proto
-/// anywhere in `crates/`.  This test is `#[ignore]`'d so the rest
-/// of the suite stays green, but the body stays runnable so the
-/// future contributor who implements this can simply remove the
-/// `#[ignore]` attribute and get a real regression check.
+/// These are the four headers every well-behaved upstream
+/// (frtpilot, kinnit, standard nginx) inspects.
 ///
-/// When implementing: the natural place is
-/// `AppProxy::upstream_peer` in `crates/ngx/src/proxy.rs` —
-/// modify the `HttpPeer` builder (or use pingora's
-/// `proxy_set_header`-equivalent) to inject
-/// `X-Forwarded-For: <client_ip>` before forwarding.
+/// Implementation note: injection lives in
+/// `pangolin_core::apply_proxy_policy` so the direct path
+/// (ngx → upstream TCP) and the tunnel path (ngx → tun →
+///
+/// upstream) are both covered. The client IP is detected
+/// from `session.client_addr()` on the ngx side and shipped
+/// to the tun inside the `TunnelHttpFrame`.
 #[tokio::test]
-#[ignore = "known unimplemented feature — see comment for implementation guidance"]
 async fn real_e2e_proxy_adds_x_forwarded_for() {
     let backend = InspectingBackend::start().await;
 
@@ -2326,6 +2326,231 @@ async fn real_e2e_proxy_adds_x_forwarded_for() {
         xff.split(',')
             .any(|tok| tok.trim().parse::<std::net::IpAddr>().is_ok()),
         "X-Forwarded-For value must contain at least one parseable IP, got: {xff:?}"
+    );
+}
+
+/// The X-Forwarded-* family must be injected on every path
+/// variant.  This matrix test seeds four sites (one per
+/// host_mode × transport pair) and verifies all four headers
+/// (X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
+/// X-Forwarded-Host) appear on every backend request.
+#[tokio::test]
+async fn real_e2e_proxy_injects_x_forwarded_headers_all_paths() {
+    // 4 sites: 1 direct, 1 tun; 1 Passthrough, 1 Backend.
+    let direct_pt = InspectingBackend::start().await;
+    let direct_bk = InspectingBackend::start().await;
+    let tun_pt = InspectingBackend::start().await;
+    let tun_bk = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let direct_pt_addr = direct_pt.addr().to_string();
+        let direct_bk_addr = direct_bk.addr().to_string();
+        let tun_pt_addr = tun_pt.addr().to_string();
+        let tun_bk_addr = tun_bk.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site(&conn, "site-direct-pt", &format!("http://{direct_pt_addr}"));
+            seed_domain(&conn, "direct-pt.test", "site-direct-pt");
+            seed_site(&conn, "site-direct-bk", &format!("http://{direct_bk_addr}"));
+            seed_domain(&conn, "direct-bk.test", "site-direct-bk");
+            seed_site_with_host_mode(
+                &conn,
+                "site-tun-pt",
+                &format!("office:http://{tun_pt_addr}"),
+                "passthrough",
+                None,
+            );
+            seed_domain(&conn, "tun-pt.test", "site-tun-pt");
+            seed_site_with_host_mode(
+                &conn,
+                "site-tun-bk",
+                &format!("office:http://{tun_bk_addr}"),
+                "backend",
+                None,
+            );
+            seed_domain(&conn, "tun-bk.test", "site-tun-bk");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Each case: (host, expected_backend, expected_xfp, expect_xfh)
+    // We pass the InspectingBackend ref directly so the test
+    // never has to second-guess which backend saw the request
+    // based on host header text. (Tun+passthrough: Host stays
+    // as public host; tun+backend: Host rewritten to backend
+    // authority. Direct mirrors the same.)
+    let cases: &[(&str, &InspectingBackend, &str, &str)] = &[
+        ("direct-pt.test", &direct_pt, "http", "direct-pt.test"),
+        ("direct-bk.test", &direct_bk, "http", "direct-bk.test"),
+        ("tun-pt.test", &tun_pt, "http", "tun-pt.test"),
+        ("tun-bk.test", &tun_bk, "http", "tun-bk.test"),
+    ];
+
+    for (host, backend, expected_xfp, expected_xfh) in cases {
+        let (status, _) = raw_request(&addr, host, "GET", "/api/x", b"").await;
+        assert_eq!(status, 200, "{host}: expected 200, got {status}");
+
+        let seen = backend.seen().await;
+        let last = seen.last().expect("backend saw request");
+        let h = |name: &str| -> String {
+            last.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+
+        assert!(
+            h("X-Forwarded-For").contains("127.0.0.1"),
+            "{host}: X-Forwarded-For must contain 127.0.0.1, got {:?}",
+            h("X-Forwarded-For")
+        );
+        assert_eq!(
+            h("X-Real-IP"),
+            "127.0.0.1",
+            "{host}: X-Real-IP must be 127.0.0.1"
+        );
+        assert_eq!(
+            h("X-Forwarded-Proto"),
+            expected_xfp.to_string(),
+            "{host}: X-Forwarded-Proto must be {expected_xfp}"
+        );
+        assert_eq!(
+            h("X-Forwarded-Host"),
+            expected_xfh.to_string(),
+            "{host}: X-Forwarded-Host must be {expected_xfh}"
+        );
+    }
+}
+
+/// X-Forwarded-For must be appended, not replaced, when an
+/// upstream proxy has already added one.  This preserves the
+/// chain so a multi-hop setup (CDN → pangolin → origin) still
+/// shows the full path.
+#[tokio::test]
+async fn real_e2e_proxy_appends_to_existing_x_forwarded_for() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(
+            &conn,
+            "xff-chain-site",
+            &format!("http://{}", backend.addr()),
+        );
+        seed_domain(&conn, "xffchain.test", "xff-chain-site");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // Build a raw request that includes an existing X-Forwarded-For.
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
+    let req = b"GET /api/x HTTP/1.1\r\n\
+                Host: xffchain.test\r\n\
+                X-Forwarded-For: 1.2.3.4, 5.6.7.8\r\n\
+                Connection: close\r\n\r\n";
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(req).await.expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    assert!(
+        String::from_utf8_lossy(&buf).contains("200 OK"),
+        "expected 200, got: {}",
+        String::from_utf8_lossy(&buf)
+    );
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1);
+    let xff = seen[0]
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Forwarded-For"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    // The chain should preserve 1.2.3.4 and 5.6.7.8, then
+    // append 127.0.0.1 (our client).
+    let parts: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
+    assert!(
+        parts.contains(&"1.2.3.4") && parts.contains(&"5.6.7.8") && parts.contains(&"127.0.0.1"),
+        "X-Forwarded-For chain must preserve 1.2.3.4 and 5.6.7.8 and append 127.0.0.1, got: {xff:?}"
+    );
+    // Order: original chain first, our IP last.
+    assert_eq!(parts.last(), Some(&"127.0.0.1"));
+}
+
+/// `X-Forwarded-Proto: https` is set when the request arrived
+/// on the TLS listener.  Drives the WSS / h2 path so the
+/// proxy sees the scheme as https, not http.
+#[tokio::test]
+async fn real_e2e_proxy_injects_x_forwarded_proto_https_for_tls() {
+    let backend = InspectingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "xfp-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "xfp.test", "xfp-site");
+            seed_cert(&conn, "xfp.test");
+        }
+    })
+    .await;
+    let _ = install_test_cert(&ngx.cert_dir(), "xfp.test");
+
+    let url = format!("https://xfp.test:{}/api/x", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("5")
+        .arg("--silent")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("--resolve")
+        .arg(format!("xfp.test:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .output()
+        .await
+        .expect("spawn curl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (_body, meta) = stdout
+        .split_once("HTTP_CODE:")
+        .expect("curl should emit HTTP_CODE marker");
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    assert_eq!(status, 200, "TLS request should be 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    let xfp = last
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Forwarded-Proto"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        xfp, "https",
+        "X-Forwarded-Proto over TLS must be https, got {xfp:?}"
     );
 }
 

@@ -86,12 +86,22 @@ impl std::error::Error for ProxyError {}
 /// `PingoraClientExecutor` lives in the `tun` crate.
 #[async_trait]
 pub trait BackendExecutor: Send + Sync {
+    /// Send `request` to the backend described by `target` and
+    /// return the response.
+    ///
+    /// `client_ip` is the source IP of the original client
+    /// (from `session.client_addr()`); it is forwarded to the
+    /// backend so the tun's `apply_proxy_policy` can inject
+    /// `X-Forwarded-For` / `X-Real-IP`. `None` for sessions
+    /// where the peer address is unknown (e.g. a test that
+    /// doesn't bind a real client).
     async fn execute_http(
         &self,
         request: HttpRequest,
         target: &BackendTarget,
         host_mode: HostMode,
         host_custom: Option<String>,
+        client_ip: Option<String>,
     ) -> Result<HttpResponse, ProxyError>;
 }
 
@@ -124,6 +134,7 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
         target: &BackendTarget,
         host_mode: HostMode,
         host_custom: Option<String>,
+        client_ip: Option<String>,
     ) -> Result<HttpResponse, ProxyError> {
         let is_upgrade = is_ws_upgrade(&request);
         // The buffered tunnel executor never carries a streaming
@@ -139,6 +150,7 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
             host_custom,
             is_upgrade,
             is_streaming: false,
+            client_ip,
         };
         let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
 
@@ -515,6 +527,9 @@ impl ProxyHttp for AppProxy {
                 original_scheme: scheme,
                 host_mode: site.host_mode,
                 host_custom: site.host_custom.clone(),
+                client_ip: session
+                    .client_addr()
+                    .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
             };
             apply_proxy_policy(&mut req, &proxy_ctx);
             let resp = serve_file_target(&req, doc_root);
@@ -692,10 +707,19 @@ impl ProxyHttp for AppProxy {
                 host_custom: site.host_custom.clone(),
                 is_upgrade: false,
                 is_streaming: false,
+                client_ip: session
+                    .client_addr()
+                    .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
             };
             let exec = YamuxTunnelExecutor { tunnel: &tunnel };
             match exec
-                .execute_http(frame.request, &target, frame.host_mode, frame.host_custom)
+                .execute_http(
+                    frame.request,
+                    &target,
+                    frame.host_mode,
+                    frame.host_custom,
+                    frame.client_ip,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -797,6 +821,16 @@ impl ProxyHttp for AppProxy {
             original_scheme: scheme,
             host_mode: site.host_mode,
             host_custom: site.host_custom.clone(),
+            // Detected from the client's TCP peer. `SocketAddr::ip()`
+            // returns the bare `IpAddr` (no `:port`); we want the
+            // bare IP for `X-Forwarded-For` / `X-Real-IP` (the
+            // upstream already knows its own port via the Host
+            // header or the listening socket). `None` only happens
+            // in tests that fabricate a session without a peer
+            // address, in which case we degrade gracefully.
+            client_ip: session
+                .client_addr()
+                .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
         };
 
         // Collect current headers as Vec<(String, String)>.
@@ -845,24 +879,47 @@ impl ProxyHttp for AppProxy {
         // Since we're using apply_proxy_policy_without_hop_by_hop_stripping,
         // we only need to handle:
         //   - Host header rewrites (for Backend/Custom modes)
-        //   - X-Forwarded-* additions (for Backend/Custom modes)
+        //   - X-Forwarded-* additions on every mode (issue: we
+        //     now inject X-Forwarded-For / X-Real-IP / etc on
+        //     Passthrough too, so upstreams always see the real
+        //     client)
         //
         // Pingora handles hop-by-hop headers automatically, so we
         // don't need to remove them here.
+        //
+        // For headers the policy may have MODIFIED (X-Forwarded-*
+        // chain appends, X-Real-IP overwrite, Host rewrite), we
+        // must use `insert_header` (replace) — otherwise the
+        // original client-sent value would survive alongside the
+        // policy-injected one, producing duplicate X-Forwarded-For
+        // entries on the wire. For headers the policy did NOT
+        // touch, `append_header` is the right call so we preserve
+        // legitimate multi-value headers like `Via` or RFC 7239
+        // `Forwarded` chains.
+        //
+        // Concretely: walk `req.headers` in order. The first
+        // occurrence of each name uses `insert_header` (replace);
+        // subsequent occurrences (the policy is NOT multi-value)
+        // use `append_header` so anything the client sent that
+        // the policy didn't touch (e.g. a `Cookie2:` line) still
+        // goes through. The "already" guard on identical
+        // (name, value) pairs avoids redundant rewrites.
+        let mut inserted: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (k, v) in req.headers.iter() {
-            let already = upstream
+            let already_same = upstream
                 .headers
                 .iter()
                 .any(|(hk, hv)| hk.as_str().eq_ignore_ascii_case(k) && hv == v.as_str());
-            // `append_header` (not `insert_header`) for the same reason as
-            // `write_response_to_session`: a client request may legitimately
-            // carry multiple headers with the same name (e.g. several
-            // `Forwarded` entries per RFC 7239 §4, or a `Via` chain), and
-            // `insert_header` would silently drop every value after the first.
-            // The `already` guard above suppresses *exact* (name, value)
-            // duplicates so we don't accidentally double an unchanged header.
-            if !already && let Ok(value) = HeaderValue::from_str(v) {
-                upstream.append_header(k.to_string(), value).ok();
+            if already_same {
+                continue;
+            }
+            let Ok(value) = HeaderValue::from_str(v) else {
+                continue;
+            };
+            if inserted.insert(k.to_ascii_lowercase()) {
+                upstream.insert_header(k.clone(), value).ok();
+            } else {
+                upstream.append_header(k.clone(), value).ok();
             }
         }
         Ok(())
@@ -986,6 +1043,7 @@ async fn ws_relay_to_tun(
         host_custom,
         is_upgrade: true,
         is_streaming: false,
+        client_ip: session.client_addr().map(|a| a.to_string()),
     };
 
     // 101 Switching Protocols — replicate the WS handshake on
@@ -1251,6 +1309,7 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
         host_custom: site.host_custom.clone(),
         is_upgrade: false,
         is_streaming: true,
+        client_ip: session.client_addr().map(|a| a.to_string()),
     };
 
     let mut yamux_stream = match tunnel.open_stream().await {
