@@ -1072,13 +1072,117 @@ mod tests {
             client_ip: None,
         };
         apply_proxy_policy(&mut req, &ctx);
+        // The I-4 invariant: Passthrough leaves Host alone.
         assert_eq!(
             req.headers.iter().find(|(k, _)| k == "Host").unwrap().1,
             "dev.yaitoo.cn"
         );
-        // No X-Forwarded-* added in passthrough mode
-        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-Host"));
-        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-Proto"));
+        // Even in Passthrough, the policy injects
+        // X-Forwarded-Host + X-Forwarded-Proto so the upstream
+        // always knows the public host + scheme. This is the
+        // behavior post-#XFF work; the previous assertion
+        // ("no X-Forwarded-* in Passthrough") is the old
+        // artifact we deliberately removed because nginx-style
+        // backends inspect these headers regardless of host_mode.
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Host" && v == "dev.yaitoo.cn"),
+            "X-Forwarded-Host must be set even in Passthrough"
+        );
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Proto" && v == "http"),
+            "X-Forwarded-Proto must be set even in Passthrough"
+        );
+        // No client_ip → no X-Forwarded-For / X-Real-IP (we
+        // can't make up an IP that isn't there).
+        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-For"));
+        assert!(!req.headers.iter().any(|(k, _)| k == "X-Real-IP"));
+    }
+
+    /// `client_ip = Some(...)` triggers the X-Forwarded-For +
+    /// X-Real-IP injection. The XFF chain is APPENDED (not
+    /// replaced) so multi-hop setups preserve upstream proxy
+    /// entries. This is the I-21 / I-22 behavior at the
+    /// `apply_proxy_policy` level; the e2e layer (`tests/`)
+    /// covers the wire-level flow.
+    #[test]
+    fn apply_proxy_policy_appends_client_ip_to_xff_chain() {
+        // 1. Fresh request (no XFF yet) → policy starts the chain.
+        let mut req = mk("GET", "/", &[("Host", "dev.yaitoo.cn")], &[]);
+        let ctx = ProxyCtx {
+            original_host: "dev.yaitoo.cn".into(),
+            original_scheme: Scheme::Http,
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            client_ip: Some("203.0.113.42".into()),
+        };
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "203.0.113.42",
+            "fresh request: chain starts with the client IP"
+        );
+        let xri = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Real-IP")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(xri, "203.0.113.42", "X-Real-IP is the bare client IP");
+
+        // 2. Existing chain (upstream proxy already added an
+        //    entry) → policy appends.
+        let mut req = mk(
+            "GET",
+            "/",
+            &[
+                ("Host", "dev.yaitoo.cn"),
+                ("X-Forwarded-For", "198.51.100.1"),
+            ],
+            &[],
+        );
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "198.51.100.1, 203.0.113.42",
+            "existing chain: append, not replace"
+        );
+
+        // 3. Duplicate (client_ip already at the chain tail) →
+        //    policy does NOT add a second occurrence.
+        let mut req = mk(
+            "GET",
+            "/",
+            &[
+                ("Host", "dev.yaitoo.cn"),
+                ("X-Forwarded-For", "198.51.100.1, 203.0.113.42"),
+            ],
+            &[],
+        );
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "198.51.100.1, 203.0.113.42",
+            "duplicate tail: no double-append"
+        );
     }
 
     // I-5
