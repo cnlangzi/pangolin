@@ -375,16 +375,6 @@ impl ProxyHttp for AppProxy {
             if !tun_name.is_empty() {
                 info!("Tunnel WS relay: {} → tun {}", host, tun_name);
 
-                // Build the HttpRequest from the session and
-                // encode as a TunnelHttpFrame with is_upgrade=true.
-                let req = match build_request_from_session(session, "/").await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("ws relay: build request: {}", e);
-                        let _ = session.respond_error(500).await;
-                        return Ok(true);
-                    }
-                };
                 // For WS, if the target is File, there's no
                 // host:port to dial — bail out (file://
                 // doesn't make sense for a WS upgrade).
@@ -397,15 +387,6 @@ impl ProxyHttp for AppProxy {
                     let _ = session.respond_error(400).await;
                     return Ok(true);
                 }
-                let frame = TunnelHttpFrame {
-                    request: req,
-                    target: ws_target,
-                    host_mode: HostMode::Passthrough,
-                    host_custom: None,
-                    is_upgrade: true,
-                    is_streaming: false,
-                };
-
                 let tunnel = {
                     let sessions = self.app.tun_sessions.read().await;
                     sessions.get(&tun_name).cloned()
@@ -414,66 +395,9 @@ impl ProxyHttp for AppProxy {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
-
-                // 101 Switching Protocols
-                let mut hdr = ResponseHeader::build(101, None).unwrap();
-                hdr.insert_header("Upgrade", "websocket").ok();
-                hdr.insert_header("Connection", "Upgrade").ok();
-                if let Some(sec_key) = session.get_header("Sec-WebSocket-Key")
-                    && let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes())
-                {
-                    let accept = compute_ws_accept(key_str);
-                    hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
-                }
-                if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol")
-                    && let Ok(v) = std::str::from_utf8(protocols.as_bytes())
-                {
-                    hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
-                }
-                if let Some(version) = session.get_header("Sec-WebSocket-Version")
-                    && let Ok(v) = std::str::from_utf8(version.as_bytes())
-                {
-                    hdr.insert_header("Sec-WebSocket-Version", v).ok();
-                }
-                session.write_response_header(Box::new(hdr), false).await?;
-
-                // Open a yamux stream and write the frame.
-                let mut yamux_stream = match tunnel.open_stream().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("open yamux stream for WS relay: {}", e);
-                        return Ok(true);
-                    }
-                };
-                let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
-                if let Err(e) = async {
-                    use tokio::io::AsyncWriteExt;
-                    yamux_stream.write_all(&bytes).await?;
-                    yamux_stream.flush().await?;
-                    Ok::<(), std::io::Error>(())
-                }
-                .await
-                {
-                    warn!("failed to write WS relay frame: {}", e);
+                if !ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None).await? {
                     return Ok(true);
                 }
-
-                // WS upgrade: server-side 101 is sent. The
-                // tun will read the frame, perform the WS
-                // upgrade against the backend, and pump
-                // bytes between the yamux stream and the
-                // backend. From the ngx side we just keep
-                // the stream alive; WS frames flow
-                // tun<->backend through the yamux pipe.
-                // The HTTP-level 101 is sent here; client
-                // sees the upgrade as complete.
-                let stream = {
-                    let h1 = session.as_http1_mut().expect("not HTTP/1 session");
-                    h1.take_stream()
-                };
-                drop(stream); // Stream not used; tun handles WS via yamux.
-                drop(yamux_stream);
-
                 return Ok(true);
             }
             // Direct WS: let pingora handle the 101 upgrade.
@@ -604,6 +528,49 @@ impl ProxyHttp for AppProxy {
                 parse_status_from_line(&resp.status_line),
             );
             write_response_to_session(session, &resp).await;
+            return Ok(true);
+        }
+
+        // ── WS upgrade through a tun (any path, not just `ws_path`) ──
+        // The ws_path short-circuit above only fires for the tun
+        // control channel endpoint (default `/tunnel`). For WS
+        // upgrades on any other path that route to a tun backend
+        // we must also forward the upgrade over the yamux stream
+        // — otherwise the request falls into the plain tunnel
+        // HTTP path with `is_upgrade: false`, the tun replays a
+        // plain GET to the backend, and the WS upgrade is lost.
+        // See `real_e2e_tunnel_ws_upgrade_path_preserved` and
+        // `real_e2e_tunnel_ws_upgrade_host_mode` in
+        // `tests/src/real_e2e.rs` (doc invariants I-21 and I-22).
+        if is_upgrade && !tun_name.is_empty() {
+            if matches!(target, BackendTarget::File { .. }) {
+                // WS upgrade against a file:// backend makes no
+                // sense (single file response, no host:port to
+                // dial). Mirror the ws_path short-circuit's 400.
+                let _ = session.respond_error(400).await;
+                return Ok(true);
+            }
+            let tunnel = {
+                let sessions = self.app.tun_sessions.read().await;
+                sessions.get(&tun_name).cloned()
+            };
+            let Some(tunnel) = tunnel else {
+                warn!("Tun {} not online for WS upgrade relay", tun_name);
+                let _ = session.respond_error(503).await;
+                return Ok(true);
+            };
+            info!(
+                "Tunnel WS upgrade relay: {} path={} → tun {}",
+                host, path, tun_name
+            );
+            ws_relay_to_tun(
+                session,
+                &target,
+                &tunnel,
+                site.host_mode,
+                site.host_custom.clone(),
+            )
+            .await?;
             return Ok(true);
         }
 
@@ -911,6 +878,231 @@ impl ProxyHttp for AppProxy {
         Ok(())
     }
 }
+
+/// WebSocket upgrade relay to a tun backend. Used by two callers in
+/// `request_filter`:
+///   1. The historical short-circuit for `path == ws_path` (the
+///      tun control channel endpoint, default `/tunnel`) — kept
+///      for defense-in-depth.
+///   2. The new general branch for any WS upgrade that routes
+///      to a tun backend on a non-`ws_path` path (issue: WS
+///      upgrades through a tun were silently broken because
+///      the tunnel path set `is_upgrade: false`).
+///
+/// Steps:
+///   1. Build a `TunnelHttpFrame` with `is_upgrade: true`,
+///      `host_mode` and `host_custom` from the site.
+///   2. Send `HTTP/1.1 101 Switching Protocols` to the client,
+///      forwarding `Upgrade`, `Connection`, `Sec-WebSocket-Key`
+///      → `Sec-WebSocket-Accept`, `Sec-WebSocket-Protocol`, and
+///      `Sec-WebSocket-Version`.
+///   3. Open a yamux stream to the tun and write the encoded
+///      frame so the tun knows to perform the WS upgrade
+///      against the backend.
+///   4. **Pump** raw bytes between the client's HTTP/1 stream
+///      and the yamux stream. Once the 101 is sent the
+///      connection is in WebSocket mode; the proxy's job from
+///      here on is the same opaque byte-relay the SSE
+///      streaming path uses (see `handle_streaming_request`).
+///      The tun's `handle_ws_upgrade` performs the matching
+///      relay between yamux and the backend, so the byte path
+///      is client ↔ proxy ↔ yamux ↔ tun ↔ backend.
+async fn ws_relay_to_tun(
+    session: &mut Session,
+    target: &BackendTarget,
+    tunnel: &pangolin_core::YamuxTunnel,
+    host_mode: HostMode,
+    host_custom: Option<String>,
+) -> Result<bool> {
+    info!("ws_relay_to_tun: helper entered");
+    // Build the HttpRequest from the session and encode as a
+    // TunnelHttpFrame with is_upgrade=true. The path used in
+    // `request.target` is the full URL of the backend (e.g.
+    // `http://1.2.3.4:8080/chat?x=1`) — the tun's
+    // `handle_ws_upgrade` parses it to derive the
+    // authority:port it needs to dial and the path to send on
+    // the upgrade request.
+    let path_and_query = session
+        .req_header()
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let req_path = if path_and_query.starts_with('/') {
+        path_and_query
+    } else {
+        format!("/{}", path_and_query)
+    };
+    let target_url = match target {
+        BackendTarget::Http {
+            host,
+            port,
+            base_path,
+        } => format!(
+            "http://{}:{}{}",
+            host,
+            port,
+            if base_path.is_empty() {
+                req_path.clone()
+            } else {
+                format!("{}{}", base_path.trim_end_matches('/'), req_path)
+            }
+        ),
+        BackendTarget::Https {
+            host,
+            port,
+            base_path,
+        } => format!(
+            "https://{}:{}{}",
+            host,
+            port,
+            if base_path.is_empty() {
+                req_path.clone()
+            } else {
+                format!("{}{}", base_path.trim_end_matches('/'), req_path)
+            }
+        ),
+        BackendTarget::File { .. } => {
+            // ws_relay_to_tun's callers gate on
+            // `!matches!(target, File)` already; this branch is
+            // unreachable but the match must be total.
+            return Ok(false);
+        }
+    };
+    let req = match build_request_from_session(session, &target_url).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("ws relay: build request: {}", e);
+            let _ = session.respond_error(500).await;
+            return Ok(false);
+        }
+    };
+    let frame = TunnelHttpFrame {
+        request: req,
+        target: target.clone(),
+        host_mode,
+        host_custom,
+        is_upgrade: true,
+        is_streaming: false,
+    };
+
+    // 101 Switching Protocols — replicate the WS handshake on
+    // the proxy's side so the client sees the upgrade succeed
+    // before we hand the rest of the connection off to yamux.
+    let mut hdr = ResponseHeader::build(101, None).unwrap();
+    hdr.insert_header("Upgrade", "websocket").ok();
+    hdr.insert_header("Connection", "Upgrade").ok();
+    if let Some(sec_key) = session.get_header("Sec-WebSocket-Key")
+        && let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes())
+    {
+        let accept = compute_ws_accept(key_str);
+        hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
+    }
+    if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol")
+        && let Ok(v) = std::str::from_utf8(protocols.as_bytes())
+    {
+        hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
+    }
+    if let Some(version) = session.get_header("Sec-WebSocket-Version")
+        && let Ok(v) = std::str::from_utf8(version.as_bytes())
+    {
+        hdr.insert_header("Sec-WebSocket-Version", v).ok();
+    }
+    session.write_response_header(Box::new(hdr), false).await?;
+
+    // Take the client's stream out of the session. `take_stream`
+    // uses `std::ptr::read` which copies the `Stream` (a
+    // `Box<dyn IO>`) out but does NOT zero the original
+    // location — when pingora's `request_filter` returns
+    // `Ok(true)` and the runtime calls
+    // `session.downstream_session.finish().await`, the
+    // `Http1Session::reuse` path invokes
+    // `self.underlying_stream.shutdown()` on the moved-from
+    // field, closing the underlying TcpStream and RST'ing the
+    // client. We work around this by overwriting the original
+    // location with a no-op Stream (an in-memory `DuplexStream`
+    // whose Drop does nothing) BEFORE returning Ok(true). The
+    // pingora contract is a footgun; the patch is required
+    // until upstream fixes `take_stream` properly (e.g. via
+    // `Option<Stream>` + `take()`).
+    let mut stream = {
+        let h1 = session.as_http1_mut().expect("not HTTP/1 session");
+        // SAFETY: `take_stream` returns the moved-out Stream.
+        // The original field is still a valid `Stream` (a
+        // `Box<dyn IO>`) pointing to the same TcpStream, but
+        // the bytes have been bitwise-copied out via
+        // `std::ptr::read`. We immediately overwrite the
+        // original field with a no-op DuplexStream so the
+        // later `finish()` shutdown is a no-op (Drop on a
+        // DuplexStream just frees the in-memory buffer; no
+        // socket close).
+        //
+        // We rely on the in-practice-stable layout that
+        // `HttpSession`'s first field is `underlying_stream:
+        // Stream`; the cast `h1 as *mut _ as *mut Stream`
+        // aliases the field's address. `repr(Rust)` doesn't
+        // guarantee this, but every pingora release has
+        // kept the field at offset 0.
+        let (a, _b) = tokio::io::duplex(64);
+        let noop: pingora_core::protocols::Stream = Box::new(a);
+        let field_ptr: *mut pingora_core::protocols::Stream =
+            h1 as *mut _ as *mut pingora_core::protocols::Stream;
+        let taken = h1.take_stream();
+        unsafe {
+            std::ptr::write(field_ptr, noop);
+        }
+        taken
+    };
+
+    // Open a yamux stream and write the frame.
+    let mut yamux_stream = match tunnel.open_stream().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("open yamux stream for WS relay: {}", e);
+            return Ok(true);
+        }
+    };
+    let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
+    let len = bytes.len() as u32;
+    if let Err(e) = async {
+        use tokio::io::AsyncWriteExt;
+        // The tun's `handle_tunnel_frame` reads a 4-byte BE
+        // length prefix then that many bytes of frame body
+        // (see `tun/src/client.rs:242-254`). Without the
+        // prefix the tun's first read of `len_buf` consumes
+        // the start of the encoded frame and the whole
+        // pipeline desyncs — the WS upgrade silently never
+        // reaches the tun. The historical ws_path
+        // short-circuit was missing this prefix too; the
+        // path was untested, so the bug never surfaced.
+        yamux_stream.write_all(&len.to_be_bytes()).await?;
+        yamux_stream.write_all(&bytes).await?;
+        yamux_stream.flush().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await
+    {
+        warn!("failed to write WS relay frame: {}", e);
+        return Ok(true);
+    }
+
+    // Run the byte-pump synchronously in the request_filter
+    // future. The pingora worker is tied up until both sides
+    // close — that's fine for a WS connection (it's the
+    // lifetime of the upgrade). A future enhancement can
+    // hand the pump to a dedicated long-lived task via a
+    // channel; for now, keeping it inline avoids a class of
+    // issues where a `tokio::spawn`'d task is starved or
+    // aborted by pingora's task-queue lifecycle (request_filter
+    // runs in a per-request future, and detached tasks
+    // spawned inside it are not always polled promptly
+    // before pingora's finish path tears the connection
+    // down). The relay is the same `copy_bidirectional`
+    // pattern the SSE streaming path uses.
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut yamux_stream).await;
+    Ok(true)
+}
+
 
 /// Handle a streaming (SSE / long-lived chunked) request over
 /// the tunnel.

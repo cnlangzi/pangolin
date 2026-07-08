@@ -12,6 +12,7 @@
 //! so the binaries exist at `target/release/{ngx,tun}`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use pangolin_core::db;
@@ -1655,6 +1656,316 @@ impl Drop for InspectingBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mock WebSocket backend: performs a server-side WS handshake (101 Switching
+// Protocols) and echoes text/binary frames bidirectionally. Records the WS
+// upgrade HTTP request and every received WS frame for assertion.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct RecordedWsHandshake {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedWsFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Close,
+    Ping,
+    Pong,
+}
+
+#[derive(Default)]
+struct WsBackendRecord {
+    handshake: Option<RecordedWsHandshake>,
+    frames_in: Vec<RecordedWsFrame>,
+}
+
+struct MockWsBackend {
+    addr: String,
+    record: Arc<Mutex<WsBackendRecord>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MockWsBackend {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let record: Arc<Mutex<WsBackendRecord>> = Arc::new(Mutex::new(WsBackendRecord::default()));
+        let record_for_task = record.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let rec = record_for_task.clone();
+                tokio::spawn(async move {
+                    let _ = serve_ws_connection(stream, rec).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            record,
+            handle,
+        }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    async fn handshake(&self) -> Option<RecordedWsHandshake> {
+        self.record.lock().await.handshake.clone()
+    }
+
+    async fn frames_in(&self) -> Vec<RecordedWsFrame> {
+        self.record.lock().await.frames_in.clone()
+    }
+}
+
+impl Drop for MockWsBackend {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Drives a single WebSocket connection: reads the upgrade request, writes
+/// the 101 response, then echoes frames. Returns when the peer closes or
+/// the stream errors. Hand-rolled RFC 6455 frame codec (no tungstenite on
+/// the server side so the test exercises the wire bytes the proxy actually
+/// produces, byte for byte).
+async fn serve_ws_connection(
+    mut stream: TcpStream,
+    rec: Arc<Mutex<WsBackendRecord>>,
+) -> std::io::Result<()> {
+    // 1. Read until end-of-headers.
+    let mut buf = Vec::with_capacity(4096);
+    let header_end = loop {
+        let mut tmp = [0u8; 1024];
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF before WS upgrade headers",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_double_crlf(&buf) {
+            break pos;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WS upgrade headers exceeded 64 KiB",
+            ));
+        }
+    };
+    let head_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut lines = head_str.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut sec_key: Option<String> = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("Sec-WebSocket-Key") {
+                sec_key = Some(v.clone());
+            }
+            headers.push((k, v));
+        }
+    }
+    let key = sec_key.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Sec-WebSocket-Key")
+    })?;
+    let accept = pangolin_core::tunnel::compute_ws_accept(&key);
+
+    // 2. Write 101 Switching Protocols.
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        accept
+    );
+    stream.write_all(resp.as_bytes()).await?;
+
+    // 3. Record the handshake.
+    {
+        let mut r = rec.lock().await;
+        r.handshake = Some(RecordedWsHandshake {
+            method,
+            path,
+            headers,
+        });
+    }
+
+    // 4. Frame loop. Any bytes past the header go into `leftover` so we
+    //    don't lose a half-received frame across read() boundaries.
+    let mut leftover: Vec<u8> = buf.split_off(header_end + 4);
+
+    loop {
+        let frame = match read_ws_frame(&mut stream, &mut leftover).await {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        };
+        match &frame {
+            RecordedWsFrame::Text(_) | RecordedWsFrame::Binary(_) => {
+                rec.lock().await.frames_in.push(frame.clone());
+                write_ws_frame(&mut stream, &frame).await?;
+            }
+            RecordedWsFrame::Ping => {
+                write_ws_frame(&mut stream, &RecordedWsFrame::Pong).await?;
+            }
+            RecordedWsFrame::Close => {
+                let _ = write_ws_frame(&mut stream, &RecordedWsFrame::Close).await;
+                return Ok(());
+            }
+            RecordedWsFrame::Pong => {
+                // unsolicited — just record and move on
+                rec.lock().await.frames_in.push(frame);
+            }
+        }
+    }
+}
+
+/// Read one RFC 6455 frame from `stream` (using `leftover` as a buffer for
+/// bytes that arrived past the header). Supports opcodes 0x1 (text),
+/// 0x2 (binary), 0x8 (close), 0x9 (ping), 0xA (pong). Decodes the
+/// client→server mask.
+async fn read_ws_frame(
+    stream: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+) -> std::io::Result<RecordedWsFrame> {
+    // Ensure we have at least 2 bytes for the basic header.
+    while leftover.len() < 2 {
+        let mut tmp = [0u8; 256];
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF in WS frame header",
+            ));
+        }
+        leftover.extend_from_slice(&tmp[..n]);
+    }
+    let b0 = leftover[0];
+    let b1 = leftover[1];
+    let _fin = (b0 & 0x80) != 0;
+    let opcode = b0 & 0x0F;
+    let masked = (b1 & 0x80) != 0;
+    let mut payload_len = (b1 & 0x7F) as usize;
+    let mut header_len = 2usize;
+    if payload_len == 126 {
+        while leftover.len() < 4 {
+            let mut tmp = [0u8; 16];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF in WS ext len (u16)",
+                ));
+            }
+            leftover.extend_from_slice(&tmp[..n]);
+        }
+        payload_len = u16::from_be_bytes([leftover[2], leftover[3]]) as usize;
+        header_len = 4;
+    } else if payload_len == 127 {
+        while leftover.len() < 10 {
+            let mut tmp = [0u8; 32];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF in WS ext len (u64)",
+                ));
+            }
+            leftover.extend_from_slice(&tmp[..n]);
+        }
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&leftover[2..10]);
+        payload_len = u64::from_be_bytes(len_bytes) as usize;
+        header_len = 10;
+    }
+    let mask_len = if masked { 4 } else { 0 };
+    let payload_offset = header_len + mask_len;
+    let total = payload_offset + payload_len;
+    while leftover.len() < total {
+        let need = total - leftover.len();
+        let mut tmp = vec![0u8; need.max(256)];
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF in WS payload",
+            ));
+        }
+        leftover.extend_from_slice(&tmp[..n]);
+    }
+    let payload_slice = &leftover[payload_offset..total];
+    let payload: Vec<u8> = if masked {
+        let mut unmasked = vec![0u8; payload_len];
+        for i in 0..payload_len {
+            unmasked[i] = payload_slice[i] ^ leftover[header_len + (i % 4)];
+        }
+        unmasked
+    } else {
+        payload_slice.to_vec()
+    };
+    leftover.drain(..total);
+    Ok(match opcode {
+        0x1 => RecordedWsFrame::Text(String::from_utf8_lossy(&payload).into_owned()),
+        0x2 => RecordedWsFrame::Binary(payload),
+        0x8 => RecordedWsFrame::Close,
+        0x9 => RecordedWsFrame::Ping,
+        0xA => RecordedWsFrame::Pong,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported WS opcode: 0x{other:x}"),
+            ));
+        }
+    })
+}
+
+/// Write one RFC 6455 frame to `stream`. Server → client frames are NOT
+/// masked (RFC 6455 §5.3: "A server MUST NOT mask any frames that it
+/// sends to the client.").
+async fn write_ws_frame(stream: &mut TcpStream, frame: &RecordedWsFrame) -> std::io::Result<()> {
+    let (opcode, payload): (u8, Vec<u8>) = match frame {
+        RecordedWsFrame::Text(s) => (0x1, s.as_bytes().to_vec()),
+        RecordedWsFrame::Binary(b) => (0x2, b.clone()),
+        RecordedWsFrame::Close => (0x8, Vec::new()),
+        RecordedWsFrame::Ping => (0x9, Vec::new()),
+        RecordedWsFrame::Pong => (0xA, Vec::new()),
+    };
+    let mut out = Vec::with_capacity(payload.len() + 4);
+    out.push(0x80 | opcode); // FIN=1, opcode
+    let len = payload.len();
+    if len < 126 {
+        out.push(len as u8);
+    } else if len < 65536 {
+        out.push(126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(&payload);
+    stream.write_all(&out).await
+}
+
 /// Regression: the proxy must forward arbitrary HTTP methods to the
 /// configured upstream without filtering.  The `/api/*` prefix is
 /// reserved on the *admin* port (9081); on the *proxy* port (80) the
@@ -2647,4 +2958,512 @@ async fn real_e2e_acme_http01_full_pebble_flow() {
         row.status,
         row.last_error
     );
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket reverse-proxy e2e tests (ws:// + wss://, direct + tun).
+//
+// As of issue #39 the WS upgrade is split between two paths in
+// `AppProxy::request_filter`:
+//   1. path == self.app.ws_path → yamux relay to the tun (the tun
+//      control channel endpoint)
+//   2. any other path → falls through to pingora (direct backends)
+//      or to the tunnel path with `is_upgrade: false` (tun backends
+//      — which is the bug the new branch at the top of the tunnel
+//      path will fix)
+//
+// Coverage added by this file:
+//   - real_e2e_proxy_ws_upgrade_to_direct_backend     (ws + direct, was untested)
+//   - real_e2e_proxy_wss_upgrade_to_direct_backend    (wss + direct, was untested)
+//   - real_e2e_tunnel_ws_upgrade_path_preserved       (doc I-21, was untested)
+//   - real_e2e_tunnel_ws_upgrade_host_mode            (doc I-22, was untested)
+// ---------------------------------------------------------------------------
+
+/// Generate a self-signed cert for `domain` and write it to the harness's
+/// `cert_dir/{domain}` in autocert DirCache blob layout (key PEM first,
+/// then cert chain — same convention `real_e2e_h2_authority_fallback`
+/// uses). Returns the DER-encoded leaf certificate bytes for use in a
+/// per-test rustls root store.
+fn install_test_cert(cert_dir: &std::path::Path, domain: &str) -> Vec<u8> {
+    let cert = rcgen::generate_simple_self_signed(vec![domain.to_string()])
+        .expect("rcgen self-signed cert");
+    let cert_der = cert.cert.der().clone();
+    let blob_path = cert_dir.join(domain);
+    let body = format!(
+        "{}\n{}",
+        cert.signing_key.serialize_pem(),
+        cert.cert.pem()
+    );
+    std::fs::write(&blob_path, body).expect("write cert blob");
+    cert_der.to_vec()
+}
+
+/// Build a rustls ClientConfig that trusts exactly one root cert (the one
+/// we just generated). Used by the wss:// client to verify the
+/// `pangolin-ngx` TLS listener without falling back to webpki-roots.
+fn client_config_with_root(cert_der: Vec<u8>) -> std::sync::Arc<rustls::ClientConfig> {
+    use rustls::pki_types::CertificateDer;
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store
+        .add(CertificateDer::from(cert_der))
+        .expect("add test root");
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+}
+
+/// Open a `ws://` connection against the proxy's HTTP listener using
+/// tokio-tungstenite, with a custom Host header so the proxy routes by
+/// domain instead of by DNS-resolved IP.
+async fn open_ws_client(
+    port: u16,
+    public_host: &str,
+    path: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+) {
+    use tokio_tungstenite::client_async;
+    use tokio_tungstenite::tungstenite::handshake::client::Request;
+    let url = format!("ws://127.0.0.1:{}{}", port, path);
+    let req = Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("Host", public_host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") // matches RFC 6455 vector
+        .body(())
+        .expect("build WS request");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    client_async(req, tcp).await.expect("WS handshake")
+}
+
+/// Open a `wss://` connection against the proxy's TLS listener. Uses a
+/// custom rustls ClientConfig that trusts the per-test self-signed root
+/// (so the SNI/cert presented by `pangolin-ngx` validates).
+async fn open_wss_client(
+    port: u16,
+    public_host: &str,
+    path: &str,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+) {
+    use tokio_tungstenite::client_async;
+    use tokio_tungstenite::tungstenite::handshake::client::Request;
+    let url = format!("wss://127.0.0.1:{}{}", port, path);
+    let req = Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("Host", public_host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .expect("build WSS request");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let server_name = rustls::pki_types::ServerName::try_from(public_host.to_string())
+        .expect("server name");
+    let tls = connector.connect(server_name, tcp).await.expect("TLS handshake");
+    client_async(req, tls).await.expect("WSS handshake")
+}
+
+// ---------------------------------------------------------------------------
+// Test 1: ws://host/ws → direct HTTP backend (pingora native path)
+// ---------------------------------------------------------------------------
+
+/// **Issue #39 + new coverage — public `ws://` reverse-proxy to a direct
+/// backend.**
+///
+/// Before this test, the public `ws://` → direct-backend code path in
+/// `AppProxy::request_filter` (line 479-480: "Direct WS: let pingora
+/// handle the 101 upgrade") was completely untested — every `real_e2e_*`
+/// test in this file drove HTTP requests, never a WebSocket upgrade.
+///
+/// This test seeds a site with a direct HTTP backend (a `MockWsBackend`),
+/// opens a `ws://` connection through the proxy's HTTP listener, and
+/// verifies that:
+///   1. The handshake succeeds (proxy returns 101, not 502/400).
+///   2. The backend saw the upgrade headers (`Upgrade: websocket`,
+///      `Sec-WebSocket-Key`, `Sec-WebSocket-Version`).
+///   3. The path on the backend side matches the public path byte-exact.
+///   4. Text frames flow client → backend → client via the proxy
+///      (the proxy's job is to be transparent for direct backends).
+#[tokio::test]
+async fn real_e2e_proxy_ws_upgrade_to_direct_backend() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "ws-direct-site", &format!("http://{backend_addr}"));
+        seed_domain(&conn, "wsdirect.test", "ws-direct-site");
+    })
+    .await;
+
+    let (mut ws, response) = open_ws_client(ngx.http_port, "wsdirect.test", "/chat").await;
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "proxy must answer 101 Switching Protocols for ws://, got {}",
+        response.status()
+    );
+
+    // Send 2 text frames, expect 2 echoes.
+    ws.send(Message::Text("hello-1".into())).await.unwrap();
+    ws.send(Message::Text("hello-2".into())).await.unwrap();
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("frame timeout")
+            .expect("ws stream end")
+            .expect("ws error");
+        if let Message::Text(t) = msg {
+            received.push(t.to_string());
+        }
+    }
+    received.sort();
+    assert_eq!(
+        received,
+        vec!["hello-1".to_string(), "hello-2".to_string()],
+        "backend must echo both frames; got {received:?}"
+    );
+
+    // Backend must have seen the upgrade with the right headers.
+    let h = backend.handshake().await.expect("backend saw handshake");
+    assert_eq!(h.method, "GET");
+    assert_eq!(h.path, "/chat", "path preserved byte-exact");
+    let header_lookup = |name: &str| -> Option<String> {
+        h.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        header_lookup("Upgrade").as_deref(),
+        Some("websocket"),
+        "backend must see Upgrade: websocket"
+    );
+    assert!(
+        header_lookup("Connection").is_some(),
+        "backend must see Connection header"
+    );
+    assert!(
+        header_lookup("Sec-WebSocket-Key").is_some(),
+        "backend must see Sec-WebSocket-Key"
+    );
+    assert_eq!(
+        header_lookup("Sec-WebSocket-Version").as_deref(),
+        Some("13"),
+        "backend must see Sec-WebSocket-Version: 13"
+    );
+
+    // Backend should have recorded the 2 text frames.
+    let frames_in = backend.frames_in().await;
+    let text_count = frames_in
+        .iter()
+        .filter(|f| matches!(f, RecordedWsFrame::Text(_)))
+        .count();
+    assert_eq!(
+        text_count, 2,
+        "backend must have received 2 text frames, got {text_count}"
+    );
+
+    ws.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: wss://host/ws → direct HTTP backend (TLS termination + pingora)
+// ---------------------------------------------------------------------------
+
+/// **Issue #39 + new coverage — public `wss://` reverse-proxy to a direct
+/// backend.**
+///
+/// Same as test 1 but over TLS: the connection lands on the proxy's TLS
+/// listener, terminates, and then runs through the same pingora-native
+/// 101 path as the `ws://` case. We use `rcgen` to mint a per-test
+/// self-signed cert for `wssdirect.test`, drop it in the harness's
+/// `cert_dir`, and configure the test WS client with a `rustls::ClientConfig`
+/// that trusts exactly that cert.
+///
+/// On success the test locks in:
+///   1. TLS termination at the SNI callback for `wssdirect.test`.
+///   2. ALPN allows h1 (so WS over TLS works; see issue #66 / commit
+///      `0c35ede` which forces h1 for tun sites — but `wssdirect.test`
+///      is a direct site, not tun, so h2 is also fine).
+///   3. The 101 handshake + frame echo round-trip through the proxy.
+#[tokio::test]
+async fn real_e2e_proxy_wss_upgrade_to_direct_backend() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "wss-direct-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "wssdirect.test", "wss-direct-site");
+            // fix/cert_www: seed the cert row so the in-memory
+            // CertLinkCache (built at startup) has a link for
+            // wssdirect.test. The cert blob lands on disk below.
+            seed_cert(&conn, "wssdirect.test");
+        }
+    })
+    .await;
+
+    let cert_der = install_test_cert(&ngx.cert_dir(), "wssdirect.test");
+    let client_config = client_config_with_root(cert_der);
+
+    let (mut ws, response) =
+        open_wss_client(ngx.tls_port, "wssdirect.test", "/secure", client_config).await;
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "proxy must answer 101 Switching Protocols for wss://, got {}",
+        response.status()
+    );
+
+    ws.send(Message::Text("tls-frame".into())).await.unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .expect("ws error");
+    let payload = match msg {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text echo, got {other:?}"),
+    };
+    assert_eq!(payload, "tls-frame");
+
+    let h = backend.handshake().await.expect("backend saw handshake");
+    assert_eq!(h.path, "/secure");
+    let frames_in = backend.frames_in().await;
+    let text_count = frames_in
+        .iter()
+        .filter(|f| matches!(f, RecordedWsFrame::Text(t) if t == "tls-frame"))
+        .count();
+    assert_eq!(
+        text_count, 1,
+        "backend must have received the wss text frame, got frames_in: {frames_in:?}"
+    );
+
+    ws.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: ws://host/<non-ws_path> → tun → direct HTTP backend (doc I-21)
+// ---------------------------------------------------------------------------
+
+/// **Doc invariant I-21 — `real_e2e_tunnel_ws_upgrade_path_preserved`.**
+///
+/// A public client opens `ws://office.test/chat` (a non-`/tunnel` path)
+/// against a site whose backend is `office:http://<mock-backend>`. The
+/// request must reach the backend over the yamux relay with the WS
+/// upgrade intact: full headers (`Upgrade`, `Connection`,
+/// `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) and the path
+/// `/chat` byte-exact.
+///
+/// Pre-fix, `AppProxy::request_filter` would only relay the WS upgrade
+/// to the tun when `path == self.app.ws_path` (i.e. `/tunnel`); for any
+/// other path the request fell into the tunnel path with
+/// `is_upgrade: false`, the tun's `handle_http_request` would replay it
+/// as a plain HTTP request, and the backend would reply 400 / 404. This
+/// test asserts the post-fix behaviour: the WS upgrade reaches the
+/// backend, the path is preserved, frames round-trip.
+#[tokio::test]
+async fn real_e2e_tunnel_ws_upgrade_path_preserved() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            // The path `/chat` is intentionally NOT equal to the
+            // configured ws_path (`/tunnel`) — this is the regression
+            // path the new branch in proxy.rs handles.
+            seed_site(
+                &conn,
+                "office-ws-site",
+                &format!("office:http://{backend_addr}"),
+            );
+            seed_domain(&conn, "office.test", "office-ws-site");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let (mut ws, response) = open_ws_client(ngx.http_port, "office.test", "/chat").await;
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "tun WS relay must answer 101, got {} (body of failure below)\n\
+         ngx log:\n{}\n-- tun log --\n{}",
+        response.status(),
+        ngx.log_string(),
+        _tun.log_string()
+    );
+
+    if let Err(e) = ws.send(Message::Text("over-tun".into())).await {
+        panic!(
+            "ws.send failed: {e}\nngx log:\n{}\n-- tun log --\n{}",
+            ngx.log_string(),
+            _tun.log_string()
+        );
+    }
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .unwrap_or_else(|e| {
+            panic!(
+                "ws error: {e}\nngx log:\n{}\n-- tun log --\n{}",
+                ngx.log_string(),
+                _tun.log_string()
+            )
+        });
+    let payload = match msg {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text echo, got {other:?}"),
+    };
+    assert_eq!(payload, "over-tun", "echoed frame must round-trip");
+
+    let h = backend.handshake().await.expect("backend saw WS upgrade");
+    assert_eq!(h.method, "GET");
+    assert_eq!(
+        h.path, "/chat",
+        "path preserved byte-exact through the tun (was the I-21 invariant)"
+    );
+    let header_lookup = |name: &str| -> Option<String> {
+        h.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        header_lookup("Upgrade").as_deref(),
+        Some("websocket"),
+        "backend must see Upgrade: websocket over the tun"
+    );
+    assert!(
+        header_lookup("Sec-WebSocket-Key").is_some(),
+        "Sec-WebSocket-Key must survive the tun relay"
+    );
+    assert_eq!(
+        header_lookup("Sec-WebSocket-Version").as_deref(),
+        Some("13"),
+        "Sec-WebSocket-Version must survive the tun relay"
+    );
+    // Passthrough: the Host header should be the public host.
+    assert_eq!(
+        header_lookup("Host").as_deref(),
+        Some("office.test"),
+        "Passthrough host_mode must leave Host as the public host"
+    );
+
+    ws.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: ws://host/<non-ws_path> → tun + host_mode=Backend (doc I-22)
+// ---------------------------------------------------------------------------
+
+/// **Doc invariant I-22 — `real_e2e_tunnel_ws_upgrade_host_mode`.**
+///
+/// Companion to test 3, with `host_mode = Backend`. The WS upgrade's
+/// `Host` header must be rewritten to the backend's authority
+/// (`host:port`) before the tun performs the upgrade against the backend.
+/// This mirrors `real_e2e_tunnel_host_mode_backend_overrides_host` for
+/// the HTTP path.
+#[tokio::test]
+async fn real_e2e_tunnel_ws_upgrade_host_mode() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site_with_host_mode(
+                &conn,
+                "office-ws-hm-site",
+                &format!("office:http://{backend_addr}"),
+                "backend",
+                None,
+            );
+            seed_domain(&conn, "officehm.test", "office-ws-hm-site");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let (mut ws, response) = open_ws_client(ngx.http_port, "officehm.test", "/chat").await;
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "tun WS relay + host_mode=Backend must answer 101, got {}\n\
+         ngx log:\n{}\n-- tun log --\n{}",
+        response.status(),
+        ngx.log_string(),
+        _tun.log_string()
+    );
+
+    ws.send(Message::Text("hm-frame".into())).await.unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .expect("ws error");
+    let payload = match msg {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text echo, got {other:?}"),
+    };
+    assert_eq!(payload, "hm-frame");
+
+    let h = backend.handshake().await.expect("backend saw WS upgrade");
+    let host_hdr = h
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        host_hdr, backend_addr,
+        "host_mode=Backend must rewrite the WS Host header to backend authority. \
+         got {host_hdr:?}, expected {backend_addr:?}"
+    );
+
+    ws.close(None).await.ok();
 }
