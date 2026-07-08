@@ -395,7 +395,9 @@ impl ProxyHttp for AppProxy {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
-                if !ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None).await? {
+                if !ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None)
+                    .await?
+                {
                     return Ok(true);
                 }
                 return Ok(true);
@@ -1102,7 +1104,6 @@ async fn ws_relay_to_tun(
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut yamux_stream).await;
     Ok(true)
 }
-
 
 /// Handle a streaming (SSE / long-lived chunked) request over
 /// the tunnel.

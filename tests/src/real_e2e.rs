@@ -2989,11 +2989,7 @@ fn install_test_cert(cert_dir: &std::path::Path, domain: &str) -> Vec<u8> {
         .expect("rcgen self-signed cert");
     let cert_der = cert.cert.der().clone();
     let blob_path = cert_dir.join(domain);
-    let body = format!(
-        "{}\n{}",
-        cert.signing_key.serialize_pem(),
-        cert.cert.pem()
-    );
+    let body = format!("{}\n{}", cert.signing_key.serialize_pem(), cert.cert.pem());
     std::fs::write(&blob_path, body).expect("write cert blob");
     cert_der.to_vec()
 }
@@ -3073,9 +3069,12 @@ async fn open_wss_client(
         .await
         .expect("tcp connect");
     let connector = tokio_rustls::TlsConnector::from(client_config);
-    let server_name = rustls::pki_types::ServerName::try_from(public_host.to_string())
-        .expect("server name");
-    let tls = connector.connect(server_name, tcp).await.expect("TLS handshake");
+    let server_name =
+        rustls::pki_types::ServerName::try_from(public_host.to_string()).expect("server name");
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS handshake");
     client_async(req, tls).await.expect("WSS handshake")
 }
 
