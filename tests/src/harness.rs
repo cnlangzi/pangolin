@@ -428,6 +428,22 @@ acme:
         // failures surface useful proxy/lookup debug logs.
         cmd.env("RUST_LOG", "debug");
         cmd.kill_on_drop(true);
+        // Strip HTTP_PROXY/HTTPS_PROXY/all_proxy/NO_PROXY: ngx uses
+        // reqwest for ACME HTTP-01 validation; a shell-configured
+        // SOCKS/HTTP proxy would otherwise route those checks
+        // through the user's proxy and fail with ECONNREFUSED
+        // against 127.0.0.1:1087-style local proxies. The proxy is
+        // supposed to make DIRECT outbound connections; the test
+        // matches that. (TunProcess does the same strip — see the
+        // comment there for the full rationale.)
+        cmd.env_remove("HTTP_PROXY");
+        cmd.env_remove("HTTPS_PROXY");
+        cmd.env_remove("http_proxy");
+        cmd.env_remove("https_proxy");
+        cmd.env_remove("ALL_PROXY");
+        cmd.env_remove("all_proxy");
+        cmd.env_remove("NO_PROXY");
+        cmd.env_remove("no_proxy");
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
         // Wait for all four listeners to bind before returning. The

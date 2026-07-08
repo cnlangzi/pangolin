@@ -23,8 +23,9 @@ use crate::{ParseError, parse_backend};
 
 /// The scheme the client used to reach the gateway. Forwarded as
 /// `X-Forwarded-Proto` when `apply_proxy_policy` rewrites the Host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Scheme {
+    #[default]
     Http,
     Https,
 }
@@ -35,12 +36,20 @@ pub enum Scheme {
 ///
 /// `original_host` is preserved across the whole pipeline so that
 /// `X-Forwarded-Host` can echo it back to the backend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProxyCtx {
     pub original_host: String,
     pub original_scheme: Scheme,
     pub host_mode: HostMode,
     pub host_custom: Option<String>,
+    /// Client source IP (e.g. `203.0.113.42`). When set, the
+    /// proxy policy appends it to `X-Forwarded-For` (or starts
+    /// the chain if absent) and sets `X-Real-IP`. Both direct
+    /// and tunnel paths populate this from
+    /// `session.client_addr()` on the ngx side; the tunnel
+    /// path also ships it inside the `TunnelHttpFrame` so the
+    /// tun's `apply_proxy_policy` call sees it.
+    pub client_ip: Option<String>,
 }
 
 // ── BackendTarget ──────────────────────────────────────────────
@@ -186,12 +195,20 @@ fn parse_authority(s: &str) -> Option<(&str, u16)> {
 /// What it does, in order:
 ///   1. Strip RFC 7230 §6.1 hop-by-hop headers.
 ///   2. Rewrite `Host` per `ctx.host_mode`.
-///   3. When rewriting `Host` (modes `Backend` and `Custom`),
-///      also add `X-Forwarded-Host: <original>` and
-///      `X-Forwarded-Proto: <scheme>`. In `Passthrough` mode,
-///      `X-Forwarded-*` are *not* added (preserves the historical
-///      behaviour of the gateway, matches nginx defaults when no
-///      `proxy_set_header` is set).
+///   3. Inject the `X-Forwarded-*` family on **every** path
+///      variant (direct + tun, all host_modes) so the
+///      upstream always sees the real client:
+///        - `X-Forwarded-For`: append `ctx.client_ip` to any
+///          existing chain (RFC 7239); if absent, just the
+///          client IP.
+///        - `X-Forwarded-Proto`: `http` or `https` per
+///          `ctx.original_scheme`.
+///        - `X-Forwarded-Host`: the public `Host` the client
+///          used.
+///        - `X-Real-IP`: same as `X-Forwarded-For`'s last
+///          token (no chain), the bare client IP. The
+///          single-value variant is what most nginx-style
+///          upstreams inspect.
 ///
 /// Caller is responsible for constructing `request.target` (the
 /// path-prefix concat happens before this is called) and for
@@ -243,17 +260,48 @@ fn apply_host_and_forwarded_headers(request: &mut HttpRequest, ctx: &ProxyCtx) {
         }
     }
 
-    // 2. X-Forwarded-* added whenever host_mode != Passthrough.
-    if ctx.host_mode != HostMode::Passthrough {
-        if !ctx.original_host.is_empty() {
-            upsert_header(&mut request.headers, "X-Forwarded-Host", &ctx.original_host);
-        }
-        let proto = match ctx.original_scheme {
-            Scheme::Http => "http",
-            Scheme::Https => "https",
-        };
-        upsert_header(&mut request.headers, "X-Forwarded-Proto", proto);
+    // 2. X-Forwarded-* — apply on EVERY host_mode (including
+    // Passthrough) so upstreams can always see the real client.
+    // The headers are only meaningful when the client actually
+    // went through this proxy; for direct internal traffic
+    // (test fixtures), `ctx.client_ip` is None and the loop
+    // degrades to "no X-Forwarded-For, no X-Real-IP" — the
+    // other two (X-Forwarded-Proto, X-Forwarded-Host) are
+    // still set because they're cheap and useful.
+    if let Some(ip) = ctx.client_ip.as_deref().filter(|s| !s.is_empty()) {
+        append_xff_chain(&mut request.headers, ip);
+        upsert_header(&mut request.headers, "X-Real-IP", ip);
     }
+    if !ctx.original_host.is_empty() {
+        upsert_header(&mut request.headers, "X-Forwarded-Host", &ctx.original_host);
+    }
+    let proto = match ctx.original_scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    upsert_header(&mut request.headers, "X-Forwarded-Proto", proto);
+}
+
+/// Append `ip` to the existing `X-Forwarded-For` chain. If the
+/// header is absent, sets it to `ip` outright. Uses
+/// comma-separated values per RFC 7239 §5.2 / the de-facto
+/// `X-Forwarded-For` convention.
+fn append_xff_chain(headers: &mut Vec<(String, String)>, ip: &str) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case("X-Forwarded-For"))
+    {
+        // Append only if the chain doesn't already end with
+        // this IP (avoid duplicates if a buggy upstream added
+        // us to the chain and re-emitted).
+        let existing = slot.1.clone();
+        let last = existing.rsplit(',').next().map(|s| s.trim()).unwrap_or("");
+        if last != ip {
+            slot.1 = format!("{}, {}", existing, ip);
+        }
+        return;
+    }
+    headers.push(("X-Forwarded-For".to_string(), ip.to_string()));
 }
 
 /// Set or replace a header (case-insensitive name match).
@@ -289,6 +337,13 @@ pub struct TunnelHttpFrame {
     /// When set, the tun side bypasses HttpResponse buffering and
     /// relays bytes directly from backend TCP to the yamux stream.
     pub is_streaming: bool,
+    /// Client source IP, detected by ngx from `session.client_addr()`.
+    /// Shipped to the tun so `apply_proxy_policy` on the tun side
+    /// can inject `X-Forwarded-For` + `X-Real-IP` even when the
+    /// request goes through a tunnel. `None` for frames that pre-date
+    /// the field's introduction; those frames are decoded back as
+    /// `None` so old tun versions stay wire-compatible.
+    pub client_ip: Option<String>,
 }
 
 const FRAME_HOST_PASSTHROUGH: u8 = 0;
@@ -307,6 +362,7 @@ const FRAME_TARGET_FILE: u8 = 2;
 /// │ 1 byte   │ 1 byte   │ 2-byte BE length + UTF-8            │
 /// ├──────────┴──────────┴─────────────────────────────────────┤
 /// │ is_upgrade (1 byte, 0/1)                                  │
+/// │ is_streaming (1 byte, 0/1)                                │
 /// ├────────────────────────────────────────────────────────────┤
 /// │ target_kind (1 byte: 0=http, 1=https, 2=file)            │
 /// │ target_host_len (2 bytes BE) | UTF-8 ("" for file)        │
@@ -314,9 +370,18 @@ const FRAME_TARGET_FILE: u8 = 2;
 /// │ target_base_path_len (2 bytes BE) | UTF-8 (base_path)      │
 /// │ target_doc_root_len (2 bytes BE) | UTF-8 (only for file)  │
 /// ├────────────────────────────────────────────────────────────┤
+/// │ client_ip_present (1 byte, 0/1)                            │
+/// │ client_ip_len (2 bytes BE) | UTF-8 (when present)         │
+/// ├────────────────────────────────────────────────────────────┤
 /// │ encode_http_request(&request) — full HTTP/1.1 byte stream  │
 /// └────────────────────────────────────────────────────────────┘
 /// ```
+///
+/// `client_ip` was added after the initial wire format. The
+/// decoder accepts the **old** layout (no `client_ip` block) and
+/// decodes back `client_ip = None`, so a new ngx talking to an
+/// old tun (and vice-versa) still works on the bytes they each
+/// understand.
 pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + 16 + frame.request.body.len());
     // host_mode
@@ -378,6 +443,16 @@ pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8> {
     let doc_bytes = doc_root.as_bytes();
     out.extend_from_slice(&(doc_bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(doc_bytes);
+    // client_ip (optional; see wire-format doc above)
+    match &frame.client_ip {
+        None => out.push(0),
+        Some(s) => {
+            out.push(1);
+            let bytes = s.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
     // request bytes
     out.extend_from_slice(&encode_http_request(&frame.request));
     out
@@ -545,7 +620,53 @@ pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame> {
         }
     };
 
-    let request = crate::tunnel::parse_http_request_bytes(&bytes[cursor..])?;
+    // `client_ip` was added after the initial wire format; the
+    // old layout (no `client_ip` block) is still in the wild.
+    // The new layout inserts a 1-byte flag (0/1) right before
+    // the request bytes. We can detect which layout we got by
+    // peeking at `bytes[cursor]`: the new flag is always 0 or 1,
+    // while the first byte of an HTTP request method is always
+    // an ASCII letter (G/P/C/H/D/L/...) which is all > 1. So
+    // 0/1 is unambiguously the new flag; anything else is the
+    // start of the request.
+    let (client_ip, request) = match bytes.get(cursor).copied() {
+        Some(0) | Some(1) => {
+            // New format.
+            cursor += 1;
+            let ip = if bytes[cursor - 1] == 1 {
+                if bytes.len() < cursor + 2 {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "tunnel frame: missing client_ip length",
+                    ));
+                }
+                let ip_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+                cursor += 2;
+                if bytes.len() < cursor + ip_len {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "tunnel frame: client_ip truncated",
+                    ));
+                }
+                let s = std::str::from_utf8(&bytes[cursor..cursor + ip_len])
+                    .map_err(|e| {
+                        Error::new(ErrorKind::InvalidData, format!("client_ip utf-8: {e}"))
+                    })?
+                    .to_string();
+                cursor += ip_len;
+                Some(s)
+            } else {
+                None
+            };
+            let req = crate::tunnel::parse_http_request_bytes(&bytes[cursor..])?;
+            (ip, req)
+        }
+        _ => {
+            // Old format: no client_ip block.
+            let req = crate::tunnel::parse_http_request_bytes(&bytes[cursor..])?;
+            (None, req)
+        }
+    };
 
     Ok(TunnelHttpFrame {
         request,
@@ -554,6 +675,7 @@ pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame> {
         host_custom,
         is_upgrade,
         is_streaming,
+        client_ip,
     })
 }
 
@@ -870,6 +992,7 @@ mod tests {
                 original_scheme: Scheme::Http,
                 host_mode: mode,
                 host_custom: Some("custom.example.com".into()),
+                client_ip: None,
             };
             apply_proxy_policy(&mut req, &ctx);
             assert_eq!(req.target, original, "path touched under {:?}", mode);
@@ -889,6 +1012,7 @@ mod tests {
             original_scheme: Scheme::Http,
             host_mode: HostMode::Backend,
             host_custom: None,
+            client_ip: None,
         };
         apply_proxy_policy(&mut req, &ctx);
         assert!(
@@ -917,6 +1041,7 @@ mod tests {
             original_scheme: Scheme::Https,
             host_mode: HostMode::Custom,
             host_custom: Some("custom.example.com".into()),
+            client_ip: None,
         };
         apply_proxy_policy(&mut req, &ctx);
         assert_eq!(
@@ -944,15 +1069,120 @@ mod tests {
             original_scheme: Scheme::Http,
             host_mode: HostMode::Passthrough,
             host_custom: None,
+            client_ip: None,
         };
         apply_proxy_policy(&mut req, &ctx);
+        // The I-4 invariant: Passthrough leaves Host alone.
         assert_eq!(
             req.headers.iter().find(|(k, _)| k == "Host").unwrap().1,
             "dev.yaitoo.cn"
         );
-        // No X-Forwarded-* added in passthrough mode
-        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-Host"));
-        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-Proto"));
+        // Even in Passthrough, the policy injects
+        // X-Forwarded-Host + X-Forwarded-Proto so the upstream
+        // always knows the public host + scheme. This is the
+        // behavior post-#XFF work; the previous assertion
+        // ("no X-Forwarded-* in Passthrough") is the old
+        // artifact we deliberately removed because nginx-style
+        // backends inspect these headers regardless of host_mode.
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Host" && v == "dev.yaitoo.cn"),
+            "X-Forwarded-Host must be set even in Passthrough"
+        );
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "X-Forwarded-Proto" && v == "http"),
+            "X-Forwarded-Proto must be set even in Passthrough"
+        );
+        // No client_ip → no X-Forwarded-For / X-Real-IP (we
+        // can't make up an IP that isn't there).
+        assert!(!req.headers.iter().any(|(k, _)| k == "X-Forwarded-For"));
+        assert!(!req.headers.iter().any(|(k, _)| k == "X-Real-IP"));
+    }
+
+    /// `client_ip = Some(...)` triggers the X-Forwarded-For +
+    /// X-Real-IP injection. The XFF chain is APPENDED (not
+    /// replaced) so multi-hop setups preserve upstream proxy
+    /// entries. This is the I-21 / I-22 behavior at the
+    /// `apply_proxy_policy` level; the e2e layer (`tests/`)
+    /// covers the wire-level flow.
+    #[test]
+    fn apply_proxy_policy_appends_client_ip_to_xff_chain() {
+        // 1. Fresh request (no XFF yet) → policy starts the chain.
+        let mut req = mk("GET", "/", &[("Host", "dev.yaitoo.cn")], &[]);
+        let ctx = ProxyCtx {
+            original_host: "dev.yaitoo.cn".into(),
+            original_scheme: Scheme::Http,
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            client_ip: Some("203.0.113.42".into()),
+        };
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "203.0.113.42",
+            "fresh request: chain starts with the client IP"
+        );
+        let xri = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Real-IP")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(xri, "203.0.113.42", "X-Real-IP is the bare client IP");
+
+        // 2. Existing chain (upstream proxy already added an
+        //    entry) → policy appends.
+        let mut req = mk(
+            "GET",
+            "/",
+            &[
+                ("Host", "dev.yaitoo.cn"),
+                ("X-Forwarded-For", "198.51.100.1"),
+            ],
+            &[],
+        );
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "198.51.100.1, 203.0.113.42",
+            "existing chain: append, not replace"
+        );
+
+        // 3. Duplicate (client_ip already at the chain tail) →
+        //    policy does NOT add a second occurrence.
+        let mut req = mk(
+            "GET",
+            "/",
+            &[
+                ("Host", "dev.yaitoo.cn"),
+                ("X-Forwarded-For", "198.51.100.1, 203.0.113.42"),
+            ],
+            &[],
+        );
+        apply_proxy_policy(&mut req, &ctx);
+        let xff = req
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Forwarded-For")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            xff, "198.51.100.1, 203.0.113.42",
+            "duplicate tail: no double-append"
+        );
     }
 
     // I-5
@@ -978,6 +1208,7 @@ mod tests {
             original_scheme: Scheme::Http,
             host_mode: HostMode::Passthrough,
             host_custom: None,
+            client_ip: None,
         };
         apply_proxy_policy(&mut req, &ctx);
         let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
@@ -1092,6 +1323,7 @@ mod tests {
                 host_custom: custom.clone(),
                 is_upgrade: true,
                 is_streaming: false,
+                client_ip: None,
             };
             let bytes = encode_tunnel_frame(&frame);
             let decoded = decode_tunnel_frame(&bytes).unwrap();
@@ -1116,6 +1348,7 @@ mod tests {
             host_custom: None,
             is_upgrade: false,
             is_streaming: false,
+            client_ip: None,
         };
         let bytes = encode_tunnel_frame(&frame);
         let decoded = decode_tunnel_frame(&bytes).unwrap();

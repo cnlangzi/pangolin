@@ -46,9 +46,13 @@ sha2 = "0.10"
 # graceful-shutdown path.
 libc = "0.2"
 
-# WebSocket (for Sec-WebSocket-Accept in tests)
+# WebSocket (for Sec-WebSocket-Accept in tests + client side of ws/wss e2e)
 sha1 = "0.10"
 base64 = "0.22"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Manual TLS connector for wss:// tests where we drive a custom
+# rustls ClientConfig (trusting a per-test self-signed cert).
+tokio-rustls = "0.26"
 
 # Real-binary e2e harness: self-signed cert generation
 rcgen = "0.14"

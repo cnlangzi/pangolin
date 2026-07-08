@@ -285,6 +285,11 @@ where
         original_scheme: Scheme::Http,
         host_mode: frame.host_mode,
         host_custom: frame.host_custom.clone(),
+        // Client IP was detected by ngx from `session.client_addr()`
+        // and shipped to us inside the frame. When the frame
+        // predates the field, `client_ip` is `None` and we
+        // degrade gracefully (no X-Forwarded-For / X-Real-IP).
+        client_ip: frame.client_ip.clone(),
     };
 
     info!(
@@ -345,6 +350,7 @@ where
         original_scheme: Scheme::Http,
         host_mode,
         host_custom: host_custom.clone(),
+        client_ip: frame.client_ip.clone(),
     };
     let mut request = frame.request;
     apply_proxy_policy(&mut request, &ctx);
@@ -484,6 +490,7 @@ where
         original_scheme: Scheme::Http,
         host_mode,
         host_custom: host_custom.clone(),
+        client_ip: frame.client_ip.clone(),
     };
     let mut request = frame.request;
     apply_proxy_policy(&mut request, &ctx);
