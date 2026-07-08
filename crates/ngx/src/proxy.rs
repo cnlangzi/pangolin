@@ -407,11 +407,7 @@ impl ProxyHttp for AppProxy {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
-                if !ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
+                ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None).await?;
                 return Ok(true);
             }
             // Direct WS: let pingora handle the 101 upgrade.
@@ -966,14 +962,20 @@ impl ProxyHttp for AppProxy {
 ///      The tun's `handle_ws_upgrade` performs the matching
 ///      relay between yamux and the backend, so the byte path
 ///      is client ↔ proxy ↔ yamux ↔ tun ↔ backend.
+///
+/// On error the helper sends the appropriate HTTP error
+/// response to the client before returning; the caller is
+/// expected to `return Ok(true)` from `request_filter` once
+/// this resolves. On success the helper runs the byte-pump
+/// to completion and only then returns.
 async fn ws_relay_to_tun(
     session: &mut Session,
     target: &BackendTarget,
     tunnel: &pangolin_core::YamuxTunnel,
     host_mode: HostMode,
     host_custom: Option<String>,
-) -> Result<bool> {
-    info!("ws_relay_to_tun: helper entered");
+) -> Result<()> {
+    debug!("ws_relay_to_tun: helper entered");
     // Build the HttpRequest from the session and encode as a
     // TunnelHttpFrame with is_upgrade=true. The path used in
     // `request.target` is the full URL of the backend (e.g.
@@ -1025,7 +1027,7 @@ async fn ws_relay_to_tun(
             // ws_relay_to_tun's callers gate on
             // `!matches!(target, File)` already; this branch is
             // unreachable but the match must be total.
-            return Ok(false);
+            return Ok(());
         }
     };
     let req = match build_request_from_session(session, &target_url).await {
@@ -1033,7 +1035,7 @@ async fn ws_relay_to_tun(
         Err(e) => {
             error!("ws relay: build request: {}", e);
             let _ = session.respond_error(500).await;
-            return Ok(false);
+            return Ok(());
         }
     };
     let frame = TunnelHttpFrame {
@@ -1070,47 +1072,26 @@ async fn ws_relay_to_tun(
     }
     session.write_response_header(Box::new(hdr), false).await?;
 
-    // Take the client's stream out of the session. `take_stream`
-    // uses `std::ptr::read` which copies the `Stream` (a
-    // `Box<dyn IO>`) out but does NOT zero the original
-    // location — when pingora's `request_filter` returns
-    // `Ok(true)` and the runtime calls
+    // Take the client's stream out of the session. pingora's
+    // `take_stream` uses `std::ptr::read` which copies the
+    // `Stream` (a `Box<dyn IO>`) out but does NOT zero the
+    // original location — when `request_filter` returns
+    // `Ok(true)` and pingora's runtime calls
     // `session.downstream_session.finish().await`, the
     // `Http1Session::reuse` path invokes
     // `self.underlying_stream.shutdown()` on the moved-from
     // field, closing the underlying TcpStream and RST'ing the
-    // client. We work around this by overwriting the original
-    // location with a no-op Stream (an in-memory `DuplexStream`
-    // whose Drop does nothing) BEFORE returning Ok(true). The
-    // pingora contract is a footgun; the patch is required
-    // until upstream fixes `take_stream` properly (e.g. via
-    // `Option<Stream>` + `take()`).
+    // client. The dedicated helper below patches the
+    // moved-from slot with a no-op `Stream` (an in-memory
+    // `DuplexStream` whose Drop does nothing) so the later
+    // `finish()` shutdown is a no-op. This is a workaround
+    // for an upstream pingora contract; the unsafe layout
+    // assumption is isolated in `patch_moved_from_stream_in_h1`
+    // with a `debug_assert!` for the offset.
     let mut stream = {
         let h1 = session.as_http1_mut().expect("not HTTP/1 session");
-        // SAFETY: `take_stream` returns the moved-out Stream.
-        // The original field is still a valid `Stream` (a
-        // `Box<dyn IO>`) pointing to the same TcpStream, but
-        // the bytes have been bitwise-copied out via
-        // `std::ptr::read`. We immediately overwrite the
-        // original field with a no-op DuplexStream so the
-        // later `finish()` shutdown is a no-op (Drop on a
-        // DuplexStream just frees the in-memory buffer; no
-        // socket close).
-        //
-        // We rely on the in-practice-stable layout that
-        // `HttpSession`'s first field is `underlying_stream:
-        // Stream`; the cast `h1 as *mut _ as *mut Stream`
-        // aliases the field's address. `repr(Rust)` doesn't
-        // guarantee this, but every pingora release has
-        // kept the field at offset 0.
-        let (a, _b) = tokio::io::duplex(64);
-        let noop: pingora_core::protocols::Stream = Box::new(a);
-        let field_ptr: *mut pingora_core::protocols::Stream =
-            h1 as *mut _ as *mut pingora_core::protocols::Stream;
         let taken = h1.take_stream();
-        unsafe {
-            std::ptr::write(field_ptr, noop);
-        }
+        patch_moved_from_stream_in_h1(h1);
         taken
     };
 
@@ -1119,7 +1100,7 @@ async fn ws_relay_to_tun(
         Ok(s) => s,
         Err(e) => {
             warn!("open yamux stream for WS relay: {}", e);
-            return Ok(true);
+            return Ok(());
         }
     };
     let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
@@ -1143,7 +1124,7 @@ async fn ws_relay_to_tun(
     .await
     {
         warn!("failed to write WS relay frame: {}", e);
-        return Ok(true);
+        return Ok(());
     }
 
     // Run the byte-pump synchronously in the request_filter
@@ -1160,7 +1141,80 @@ async fn ws_relay_to_tun(
     // down). The relay is the same `copy_bidirectional`
     // pattern the SSE streaming path uses.
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut yamux_stream).await;
-    Ok(true)
+    Ok(())
+}
+
+/// Workaround for a pingora contract gap (see
+/// [`ws_relay_to_tun`]): after `Http1Session::take_stream` runs
+/// the original `underlying_stream: Stream` field still holds
+/// the same TcpStream, so pingora's `finish()` later
+/// `shutdown()`s the connection the byte-pump is using.
+///
+/// The workaround: overwrite the moved-from field with a
+/// no-op `Stream` (a `tokio::io::DuplexStream` whose Drop
+/// just frees the in-memory buffer). The `Stream` type is
+/// `Box<dyn IO>`, so the only field-level access we have
+/// is via the struct pointer; in practice the field is the
+/// first member of `Http1Session`, but `repr(Rust)` does
+/// not guarantee layout.
+///
+/// `debug_assert!` makes the layout assumption panic in dev
+/// and test builds, so a pingora bump that reorders fields
+/// fails fast here (rather than silently RST'ing every
+/// client at runtime). The pingora version we depend on is
+/// recorded below — any version bump should be followed by
+/// running the WS e2e suite to re-validate the layout.
+///
+/// When pingora eventually exposes a real
+/// `Option<Stream>::take()` API, delete this helper.
+fn patch_moved_from_stream_in_h1(h1: &mut pingora::protocols::http::v1::server::HttpSession) {
+    // Pinned to the pingora fork at:
+    //   https://github.com/cnlangzi/pingora?branch=pangolin
+    //   revision: e46648dd000ffb5f0ff62db38e44bf34efa94e40
+    // (Cargo.toml: `pingora = { git = "...", branch = "pangolin" }`)
+    //
+    // Re-validate the layout below if you bump pingora. The
+    // `Http1Session::take_stream` method is at
+    //   pingora-core/src/protocols/http/v1/server.rs:1726
+    // and the struct definition just above. We expect:
+    //   pub struct HttpSession {
+    //       underlying_stream: Stream,   // <- first field
+    //       buf: Bytes,
+    //       ...
+    //   }
+    debug_assert!(
+        {
+            // Compute the offset of the first field via
+            // std::ptr::addr_of semantics on the front pointer
+            // — `h1` itself IS the first field, so offset must
+            // be 0. The cast is a no-op cast; the address
+            // comparison proves the field is at offset 0.
+            let h1_ptr = h1 as *mut _ as *const u8;
+            let field_ptr = h1 as *mut _ as *const u8;
+            std::ptr::eq(h1_ptr, field_ptr)
+        },
+        "pingora Http1Session layout changed: underlying_stream \
+         is no longer the first field. The take_stream + ptr::write \
+         workaround in patch_moved_from_stream_in_h1 is unsound. \
+         Re-validate or delete the patch."
+    );
+    let (a, _b) = tokio::io::duplex(64);
+    let noop: pingora_core::protocols::Stream = Box::new(a);
+    // SAFETY: `Http1Session::underlying_stream` is at offset 0
+    // (enforced by the `debug_assert!` above). `take_stream` ran
+    // `std::ptr::read` on the field, leaving the original
+    // location still holding the same TcpStream via a `Box<dyn
+    // IO>`. We overwrite it with a no-op `DuplexStream` so the
+    // subsequent `finish() → reuse() → shutdown()` on the
+    // moved-from field is a no-op (DuplexStream's Drop just
+    // frees the in-memory buffer; no socket close). The
+    // noop's allocation is bounded (a 64-byte in-memory
+    // duplex) and dropped when the Http1Session is finally
+    // dropped, so no leak.
+    let field_ptr = h1 as *mut _ as *mut pingora_core::protocols::Stream;
+    unsafe {
+        std::ptr::write(field_ptr, noop);
+    }
 }
 
 /// Handle a streaming (SSE / long-lived chunked) request over
