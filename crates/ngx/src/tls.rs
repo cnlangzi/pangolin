@@ -282,10 +282,21 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
             None => return Err(AlpnError::NOACK),
         };
 
+        // 1a. **Normalization must match the SNI cert callback.**
+        // Both callbacks see the same SNI and have to classify it
+        // identically — otherwise a host can find a cert (so the
+        // handshake reaches ALPN) yet be classified as non-tunnel
+        // here, and we'd offer h2 to a site that's about to run the
+        // yamux tunnel path. That's the h2+yamux race (issue #66).
+        // The SNI cert callback's `cert_link::lookup` strips a
+        // trailing dot; we do the same here so `host_matches_set`
+        // sees the same string.
+        let sni = sni.trim_end_matches('.');
+
         // 2. Sync lookup: is this SNI a tunnel site?
         let is_tunnel = {
             let guard = app.tunnel_domains.read();
-            pangolin_core::index::host_matches_set(&guard, &sni)
+            pangolin_core::index::host_matches_set(&guard, sni)
         };
 
         select_alpn(is_tunnel, global_enable_h2, alpn_in)
@@ -422,7 +433,10 @@ mod tests {
         assert_eq!(key, key_pem(), "key is the trimmed key block");
         assert_eq!(certs.len(), 3, "leaf + intermediate + root");
         assert!(certs[0].contains(LEAF_BODY), "first is leaf");
-        assert!(certs[1].contains(INTERMEDIATE_BODY), "second is intermediate");
+        assert!(
+            certs[1].contains(INTERMEDIATE_BODY),
+            "second is intermediate"
+        );
         assert!(certs[2].contains(ROOT_BODY), "third is root");
     }
 
@@ -482,7 +496,10 @@ mod tests {
     #[test]
     fn split_blob_rejects_blob_without_key() {
         let blob = format!("{}\n", leaf_pem());
-        assert!(split_blob(&blob).is_err(), "missing PRIVATE KEY is rejected");
+        assert!(
+            split_blob(&blob).is_err(),
+            "missing PRIVATE KEY is rejected"
+        );
     }
 
     /// Truncated trailing block (BEGIN without END) must surface as a
@@ -496,7 +513,10 @@ mod tests {
             leaf_pem(),
             INTERMEDIATE_BODY,
         );
-        assert!(split_blob(&blob).is_err(), "truncated chain tail is rejected");
+        assert!(
+            split_blob(&blob).is_err(),
+            "truncated chain tail is rejected"
+        );
     }
 
     // ---- pick_protocol tests (per-SNI dynamic ALPN, origin/main) ----
