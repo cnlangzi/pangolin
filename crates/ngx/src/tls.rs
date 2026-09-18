@@ -473,9 +473,9 @@ mod tests {
         assert!(certs[1].contains(INTERMEDIATE_BODY));
     }
 
-    /// Multiple intermediates — real Let's Encrypt chains are leaf
-    /// + 1 intermediate + root. `split_blob` must hand them all back
-    /// in order so `ssl_add_chain_cert` installs each one.
+    /// Multiple intermediates — real Let's Encrypt chains are leaf,
+    /// 1 intermediate, then root. `split_blob` must hand them all
+    /// back in order so `ssl_add_chain_cert` installs each one.
     #[test]
     fn split_blob_handles_multiple_intermediates() {
         let blob = format!(
