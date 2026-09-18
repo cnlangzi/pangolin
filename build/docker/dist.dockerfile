@@ -2,86 +2,94 @@
 # ────────────────────────────────────────────────────────────────────────────
 # Rust Docker build pipeline
 #
-#   pangolin-debian  → rust + build tools
-#   pangolin-chef    → cargo-chef + tailwindcss + esbuild
-#   planner          → recipe.json
-#   cooker           → compile dependencies
-#   builder          → build UI + compile project
-#   export-stage     → export binaries
+# Base:        `docker.io/imlangzi/yaitoo:rust-npm`
+#   - Debian 12 (bookworm, glibc 2.36) — required for binary
+#     compatibility with production hosts (don't let the build image
+#     upgrade to trixie; cgo/cargo binaries record GLIBC_2.38 symbols
+#     and refuse to start on the targets).
+#   - Rust toolchain (version-pinned in the base image)
+#   - Node.js + pnpm via corepack (ready for `pnpm run build`-style
+#     UIs; not currently used by this project but kept available so the
+#     base image stays a single shared dependency across Rust projects)
+#   - esbuild + tailwindcss standalone CLIs (already baked into the
+#     base — they're Go-compiled binaries, not npm packages, so no
+#     Node.js is needed to run them).
+#
+#   pangolin-chef  → + project-specific build tools (cmake, libssl-dev,
+#                    pkg-config, sccache, clang, mold) + cargo-chef
+#                    + cargo config (registry mirrors, linker)
+#   planner        → recipe.json
+#   cooker         → compile third-party dependencies
+#   builder        → build UI + compile project
+#   export-stage   → export binaries
 # ────────────────────────────────────────────────────────────────────────────
 
-# ── Stage A: download UI build CLIs first + install cargo-chef ────────────
+# Two-step FROM so a previously-pulled / locally-tagged `yaitoo:rust-npm`
+# is reused without going back to docker.io.  Same aliasing trick used by
+# `starter/build/docker/{npm,dist}.dockerfile`:
 #
-# Why this ordering:
+#   * `docker.io/imlangzi/yaitoo:rust-npm` is the canonical published ref
+#     (used by external Dockerfiles, ansible deploys, anyone outside this
+#     repo).
+#   * `yaitoo:rust-npm` is the local short alias used inside this repo.
 #
-#  1. The two CLI tools (tailwindcss, esbuild) are downloaded as separate
-#     RUN steps so each one has its own Docker cache layer.  Bumping the
-#     tailwindcss version invalidates ONLY its layer — the esbuild layer
-#     (and everything below it) survives the bump.
-#
-#  2. Both CLI layers come BEFORE the cargo + cargo-config layers so that
-#     the very frequent edits to build/docker/cargo-config.toml (e.g.
-#     switching registry mirrors) don't invalidate the CLI download cache.
-#     CLIs are essentially immutable across builds — bumping them is a
-#     deliberate, rare action, so they're the perfect candidates for the
-#     outermost cache layers.
-#
-#  3. WORKDIR is moved to a dedicated layer right before cargo install so
-#     that the cargo step has a deterministic working directory without
-#     having to recreate it inside the RUN command.
-FROM pangolin-debian AS pangolin-chef
+# The first FROM pulls (or reuses the cached pull of) the canonical ref
+# and exposes it under the in-build alias `yaitoo-rust-npm`.  The second
+# FROM re-references the same image through its local alias, so once the
+# alias exists in the local image store (e.g. via `docker pull … && docker
+# tag … yaitoo:rust-npm`) every subsequent build skips the docker.io
+# roundtrip without any change to this file.
+ARG REGISTRY_OWNER=imlangzi
+FROM docker.io/${REGISTRY_OWNER}/yaitoo:rust-npm AS yaitoo-rust-npm
+FROM yaitoo:rust-npm AS pangolin-chef
 
 WORKDIR /pangolin
 
-# Layer 1 — tailwindcss CLI.  Cache survives until the version/URL changes.
+# Project-specific build tools.  Not in the base image because they are
+# tied to Rust-specific linking / native-deps requirements:
 #
-# GitHub releases can be slow or unreachable from CN networks (40 MB
-# at ~30 KB/s = >20 min, often timing out).  `gh-proxy.com` is a
-# dedicated GitHub raw / releases proxy that we measured at ~9 MB/s
-# for the same asset (41 MB in ~5s on 2026-06-15).  Pass the original
-# GitHub URL after the proxy prefix; the proxy fetches and forwards
-# the bytes unchanged.
+#   - cmake / libssl-dev / pkg-config: native deps pulled in transitively
+#     by `libz-ng-sys`, `openssl-sys`, etc.  Without them `cargo build`
+#     dies at the `build script` step of any dep that links C code.
+#   - clang + mold:  mold is a drop-in `ld` replacement; `cargo-config.toml`
+#     invokes it via clang's `-fuse-ld=mold` so release linking drops
+#     from ~30s to ~3s on a cold cache.
+#   - sccache: shared compiler cache mounted at /root/.cache/sccache
+#     below so artefacts survive across `docker build` runs AND across
+#     CI jobs.
 #
-# Override at build time with e.g. `--build-arg TW_MIRROR=` to fall
-# back to the direct URL when the proxy is down or unavailable in
-# your network.
-#
-# **Integrity**: the binary is verified against the SHA256 from the
-# upstream `sha256sums.txt` (fetched through the same proxy, since
-# that is the source of the bytes we're actually downloading — a
-# direct-GitHub hash is only useful if we're downloading directly
-# from GitHub).  `TW_SHA256` is the expected hex digest of the
-# linux-x64 binary at v3.4.17; bump it together with the URL when
-# upgrading the toolchain.
-ARG TW_MIRROR=https://gh-proxy.com/
-ARG TW_VERSION=3.4.17
-ARG TW_SHA256=7d24f7fa191d2193b78cd5f5a42a6093e14409521908529f42d80b11fde1f1d4
-RUN mkdir -p bin && \
-    curl -fsSL -o bin/tailwindcss \
-        ${TW_MIRROR}https://github.com/tailwindlabs/tailwindcss/releases/download/v${TW_VERSION}/tailwindcss-linux-x64 && \
-    echo "${TW_SHA256}  bin/tailwindcss" | sha256sum -c - && \
-    chmod +x bin/tailwindcss
+# Apt runs before any Rust-related layer so changing only the apt list
+# invalidates only this layer, not cargo-chef or the cargo-config layer
+# below.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        clang \
+        mold \
+        pkg-config \
+        libssl-dev \
+        sccache && \
+    rm -rf /var/lib/apt/lists/*
 
-# Layer 2 — esbuild CLI.  Independent cache from layer 1.
-RUN curl -fsSL -o bin/esbuild \
-        https://cdn.jsdelivr.net/npm/@esbuild/linux-x64@0.28.0/bin/esbuild && \
-    chmod +x bin/esbuild
+# cargo config — registry mirrors + clang/mold linker + sccache wrapper.
+# Placed AFTER the apt layer so editing `cargo-config.toml` invalidates
+# only this layer; the heavier apt-install layer above is preserved.
+COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
 
-# Layer 3 — cargo-chef (installed binary, versioned so cache survives).
+# cargo-chef — installed binary, versioned so the layer survives until
+# someone deliberately bumps the version.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo install cargo-chef --locked --version 0.1.71
 
-# Layer 4 — cargo config.  Most frequently edited layer (registry
-# mirrors, build flags, etc.); placing it last in this stage means
-# changes here invalidate only cargo's behavior, not the CLI layers.
-COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
-
 # ── Stage B: produce recipe.json ───────────────────────────────────────────
 FROM pangolin-chef AS planner
 
-# Copy ONLY the manifest + lockfile.  `cargo chef prepare` resolves the
-# full dependency graph and emits recipe.json.
+# Copy ONLY the manifest + lockfile + workspace crate dirs.
+# `cargo chef prepare` resolves the full dependency graph and emits
+# recipe.json; copying the whole tree here would invalidate the recipe
+# layer on every source edit.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
@@ -108,11 +116,15 @@ FROM cooker AS builder
 
 COPY . .
 
-# Build UI assets using the downloaded tools from bin/.
-RUN bin/tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
-    bin/esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js
+# Build UI assets using the standalone CLIs baked into the base image
+# (`tailwindcss` and `esbuild` are on PATH — same approach as
+# `starter/build/docker/dist.dockerfile`, which also calls them bare).
+RUN tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
+    esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js
 
-# Build ngx + tun binaries.
+# Build ngx + tun binaries.  Single cargo invocation so shared crates
+# (pangolin-core, admin, pingora, …) are compiled and linked exactly
+# once.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \

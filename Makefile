@@ -48,7 +48,7 @@ require-env:
 		exit 1; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full debian dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
@@ -60,7 +60,7 @@ help:
 	@echo "  make build-tun     # Local build tun only"
 	@echo "  make build-ui      # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
 	@echo "  make build-dist    # Docker build, export to build/output/"
-	@echo "  make debian        # Build base Docker image"
+	@echo "  make dist          # Same as build-dist"
 	@echo ""
 	@echo "=== Local Run ==="
 	@echo "  make start-ngx     # Build + run ./bin/pangolin-ngx (foreground, no sudo)"
@@ -202,10 +202,12 @@ build-ui: download-ui-tools
 	bin/esbuild ./crates/admin/templates/public/app.js --bundle --minify --format=esm --target=es2020 --outfile=./crates/admin/templates/public/app.min.js
 	@echo "  build-ui done"
 
-build-dist: debian dist
-
-debian:
-	./build/debian.sh
+# Base image (`docker.io/imlangzi/yaitoo:rust-npm`) is a pre-built shared
+# dependency — Debian 12 + Rust toolchain + Node + pnpm + standalone
+# tailwindcss/esbuild CLIs.  It lives on docker.io, not in this repo.
+# `dist` just layers cargo-chef + cargo-config + project crates on top
+# (see build/docker/dist.dockerfile for the full pipeline).
+build-dist: dist
 
 dist:
 	./build/dist.sh
