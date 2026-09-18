@@ -170,6 +170,14 @@ pub fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
 /// Used by the TLS ALPN callback to decide, per connection, whether
 /// the SNI resolves to a tunnel-backed site. The lookup is sync
 /// because the callback runs in a C context inside the handshake.
+///
+/// **Wildcard guard.** The walk must NOT consult `*.X` where `X`
+/// has no further dot — i.e. a bare TLD like `*.com`. RFC 6125
+/// (and Let's Encrypt's issuance rules) only allow wildcards over a
+/// full suffix; `*.com` is meaningless and would, if present in
+/// the set, cause every `*.com` host to be mis-classified as
+/// tunnel. `cert_link::lookup` enforces the same rule (see the
+/// `!rest.contains('.')` break in its walk) — keep them in sync.
 pub fn host_matches_set(set: &std::collections::HashSet<String>, host: &str) -> bool {
     let domain = normalize_host(host);
 
@@ -180,6 +188,14 @@ pub fn host_matches_set(set: &std::collections::HashSet<String>, host: &str) -> 
     let mut rest: &str = &domain;
     while let Some(dot) = rest.find('.') {
         rest = &rest[dot + 1..];
+        // rest must contain a dot to be a valid wildcard suffix
+        // (*.com is meaningless — wildcard certs don't cover TLDs).
+        // Without this break, a set entry "*.com" would match
+        // "foo.com" and silently flip it to tunnel classification,
+        // tripping the h2+yamux bug (issue #66).
+        if !rest.contains('.') {
+            break;
+        }
         let candidate = format!("*.{}", rest);
         if set.contains(&candidate) {
             return true;
@@ -400,6 +416,22 @@ mod tests {
         let s = set(&["*.example.com", "*.foo.example.com"]);
         assert!(host_matches_set(&s, "a.foo.example.com"));
         assert!(host_matches_set(&s, "b.example.com"));
+    }
+
+    /// Without the `!rest.contains('.')` guard in the wildcard
+    /// walk, a `*.com` entry would match every `foo.com` host and
+    /// silently classify it as tunnel. The fix-cert-valid review
+    /// caught this asymmetry with `cert_link::lookup`, which has
+    /// had the guard since the cache was introduced.
+    #[test]
+    fn host_matches_set_rejects_bare_tld_wildcard() {
+        // The hypothetical bad case: set has "*.com".
+        let s = set(&["*.com"]);
+        // foo.com must NOT match — *.com is meaningless and would
+        // mis-classify every .com host as tunnel.
+        assert!(!host_matches_set(&s, "foo.com"));
+        // example.com likewise.
+        assert!(!host_matches_set(&s, "example.com"));
     }
 
     #[test]

@@ -60,3 +60,4 @@ Cargo.lock.bak
 # OS
 .DS_Store
 Thumbs.db
+.nightme/

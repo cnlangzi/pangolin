@@ -1158,12 +1158,16 @@ async fn ws_relay_to_tun(
 /// first member of `Http1Session`, but `repr(Rust)` does
 /// not guarantee layout.
 ///
-/// `debug_assert!` makes the layout assumption panic in dev
-/// and test builds, so a pingora bump that reorders fields
-/// fails fast here (rather than silently RST'ing every
-/// client at runtime). The pingora version we depend on is
-/// recorded below — any version bump should be followed by
-/// running the WS e2e suite to re-validate the layout.
+/// **Layout assumption — re-validate on every pingora bump.**
+/// The pingora fork + commit is pinned below; the
+/// `Http1Session::take_stream` body in
+/// `pingora-core/src/protocols/http/v1/server.rs` must
+/// leave the moved-from slot uninitialized enough that an
+/// immediate `ptr::write` (inside the helper) doesn't first
+/// run the previous `Drop`. The actual runtime guard is
+/// the WS e2e test
+/// `real_e2e_proxy_wss_upgrade_to_direct_backend` —
+/// re-run it (and a fresh `make build`) on any pingora bump.
 ///
 /// When pingora eventually exposes a real
 /// `Option<Stream>::take()` API, delete this helper.
@@ -1182,35 +1186,42 @@ fn patch_moved_from_stream_in_h1(h1: &mut pingora::protocols::http::v1::server::
     //       buf: Bytes,
     //       ...
     //   }
-    debug_assert!(
-        {
-            // Compute the offset of the first field via
-            // std::ptr::addr_of semantics on the front pointer
-            // — `h1` itself IS the first field, so offset must
-            // be 0. The cast is a no-op cast; the address
-            // comparison proves the field is at offset 0.
-            let h1_ptr = h1 as *mut _ as *const u8;
-            let field_ptr = h1 as *mut _ as *const u8;
-            std::ptr::eq(h1_ptr, field_ptr)
-        },
-        "pingora Http1Session layout changed: underlying_stream \
-         is no longer the first field. The take_stream + ptr::write \
-         workaround in patch_moved_from_stream_in_h1 is unsound. \
-         Re-validate or delete the patch."
-    );
+    // No runtime layout check — the earlier `debug_assert!`
+    // compared `h1` to itself and so was vacuous. The real
+    // guard is the WS e2e test
+    // (`real_e2e_proxy_wss_upgrade_to_direct_backend`) plus
+    // manual review on any pingora bump. The pinned commit
+    // hash in this file's doc comment is the authoritative
+    // version this `unsafe` is sound against.
     let (a, _b) = tokio::io::duplex(64);
     let noop: pingora_core::protocols::Stream = Box::new(a);
     // SAFETY: `Http1Session::underlying_stream` is at offset 0
-    // (enforced by the `debug_assert!` above). `take_stream` ran
-    // `std::ptr::read` on the field, leaving the original
-    // location still holding the same TcpStream via a `Box<dyn
-    // IO>`. We overwrite it with a no-op `DuplexStream` so the
-    // subsequent `finish() → reuse() → shutdown()` on the
-    // moved-from field is a no-op (DuplexStream's Drop just
-    // frees the in-memory buffer; no socket close). The
-    // noop's allocation is bounded (a 64-byte in-memory
-    // duplex) and dropped when the Http1Session is finally
-    // dropped, so no leak.
+    // (see doc comment for the pinned revision). `take_stream`
+    // ran `std::ptr::read` on the field, leaving the original
+    // location still holding the same TcpStream via a
+    // `Box<dyn IO>`. We overwrite it with a no-op
+    // `DuplexStream` so the subsequent `finish() → reuse() →
+    // shutdown()` on the moved-from field is a no-op
+    // (DuplexStream's Drop just frees the in-memory buffer; no
+    // socket close). The noop's allocation is bounded (a
+    // 64-byte in-memory duplex) and dropped when the
+    // Http1Session is finally dropped, so no leak.
+    //
+    // **Re-validate this whole block if pingora is bumped.**
+    // Two distinct layout assumptions to recheck:
+    // 1. The first field of `Http1Session` is still
+    //    `underlying_stream: Stream`. `repr(Rust)` permits
+    //    reordering on field add/remove, so a bump that
+    //    inserts a new field at the front would silently
+    //    corrupt a different field here.
+    // 2. `take_stream`'s implementation still uses `ptr::read`
+    //    and leaves the moved-from slot in a state where an
+    //    immediate `ptr::write` (this call) is safe — i.e.,
+    //    the previous `Drop` has NOT been queued to run on the
+    //    moved-from `Box<dyn IO>`. If a future pingora starts
+    //    running `Drop` on the moved-from slot, the
+    //    subsequent `ptr::write` would overwrite a live
+    //    `Box` and leak its inner heap allocation.
     let field_ptr = h1 as *mut _ as *mut pingora_core::protocols::Stream;
     unsafe {
         std::ptr::write(field_ptr, noop);
