@@ -735,6 +735,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2241,6 +2255,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "dashmap 6.2.1",
  "env_logger",
  "fastwebsockets",
  "figment",
@@ -2279,6 +2294,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "lazy_static",
+ "libc",
  "log",
  "ngx",
  "pangolin-core",
@@ -2293,6 +2309,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tun",
 ]
 
@@ -2683,7 +2701,7 @@ version = "0.8.0"
 source = "git+https://github.com/cnlangzi/pingora?branch=pangolin#e46648dd000ffb5f0ff62db38e44bf34efa94e40"
 dependencies = [
  "crossbeam-queue",
- "dashmap",
+ "dashmap 5.5.3",
  "futures",
  "log",
  "lru",
@@ -3980,6 +3998,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4155,6 +4189,26 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-yamux",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http 1.4.1",
+ "httparse",
+ "log",
+ "rand 0.8.6",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
 ]
 
 [[package]]

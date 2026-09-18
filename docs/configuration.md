@@ -213,7 +213,7 @@ knobs land in one place.
 
 | Field        | Type   | Default | Required | Notes |
 | ------------ | ------ | ------- | -------- | ----- |
-| `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN. Set to `false` to force h1 on every TLS connection — this is the **production-proven workaround for an upstream pingora/h2 bug** that surfaces as `400 Bad Request: missing required Host header` when a request is proxied to a tunnel backend (`site.backend = "<tun>:<url>"`). Modern browsers fall back to h1 automatically when h2 is not advertised; in practice the user-visible difference is one fewer multiplexed stream. Once the upstream pingora issue is fixed this knob can flip back to its default and be removed. |
+| `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN for **non-tunnel sites**. Tunnel sites (`site.backend = "<tun>:<url>"`) always negotiate h1 at runtime — this is the per-SNI dynamic ALPN policy in `ngx::tls::build_sni_settings` that works around the upstream `tokio-yamux 0.3.18` stream-state race (issue #66 / commit `0c35ede`). Modern browsers fall back to h1 automatically when h2 is not advertised; the per-SNI override is transparent to clients — no 4xx, no 421, no manual retry. |
 
 ## `tun.yml` — tunnel client configuration
 

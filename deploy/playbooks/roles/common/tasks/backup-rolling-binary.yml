@@ -1,0 +1,25 @@
+---
+# Shared by both `ngx` and `tun` roles. Keeps a single rolling
+# `.bak` of the on-host binary at
+# `/usr/local/pangolin/<binary_name>.bak`. Skipped on the first
+# deploy (when the binary doesn't exist yet).
+#
+# Caller passes `binary_name` via `vars:` on the `include_tasks`
+# call.
+
+- name: Stat existing {{ binary_name }} binary
+  become: true
+  ansible.builtin.stat:
+    path: /usr/local/pangolin/{{ binary_name }}
+  register: binary_stat
+
+- name: Backup {{ binary_name }} binary to {{ binary_name }}.bak
+  become: true
+  ansible.builtin.copy:
+    src: /usr/local/pangolin/{{ binary_name }}
+    dest: /usr/local/pangolin/{{ binary_name }}.bak
+    remote_src: yes
+    owner: pangolin
+    group: pangolin
+    mode: 0755
+  when: binary_stat.stat.exists

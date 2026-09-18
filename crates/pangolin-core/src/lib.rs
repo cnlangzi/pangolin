@@ -16,6 +16,7 @@
 //! See `README.md` for the design rationale.
 
 pub mod app;
+pub mod cert_link;
 pub mod config;
 pub mod db;
 pub(crate) mod embedded_migrations;
@@ -31,6 +32,7 @@ pub mod types;
 pub use app::{
     App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage, plan_issuance,
 };
+pub use cert_link::CertLinkCache;
 pub use config::{Config, LogConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};

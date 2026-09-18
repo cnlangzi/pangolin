@@ -160,6 +160,35 @@ pub fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
     None
 }
 
+/// Check whether a host matches any entry in `set`, with the same
+/// wildcard semantics as [`lookup_site`].
+///
+/// `set` is expected to contain domain strings in the same form
+/// `Indexes.domain` does — exact FQDNs (`foo.example.com`) and
+/// wildcard literals (`*.example.com`).
+///
+/// Used by the TLS ALPN callback to decide, per connection, whether
+/// the SNI resolves to a tunnel-backed site. The lookup is sync
+/// because the callback runs in a C context inside the handshake.
+pub fn host_matches_set(set: &std::collections::HashSet<String>, host: &str) -> bool {
+    let domain = normalize_host(host);
+
+    if set.contains(&domain) {
+        return true;
+    }
+
+    let mut rest: &str = &domain;
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        let candidate = format!("*.{}", rest);
+        if set.contains(&candidate) {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +374,46 @@ mod tests {
         assert!(lookup_site(&idx, "a.example.com").is_some());
         // but tunIndex is empty
         assert!(idx.tun.is_empty());
+    }
+
+    // ── host_matches_set tests (used by TLS ALPN callback) ──
+
+    fn set(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn host_matches_set_exact() {
+        let s = set(&["foo.example.com", "bar.example.com"]);
+        assert!(host_matches_set(&s, "foo.example.com"));
+        assert!(host_matches_set(&s, "bar.example.com"));
+        assert!(!host_matches_set(&s, "baz.example.com"));
+    }
+
+    #[test]
+    fn host_matches_set_wildcard_literal() {
+        // `*.example.com` literal in the set matches any sub.
+        let s = set(&["*.example.com"]);
+        assert!(host_matches_set(&s, "foo.example.com"));
+        assert!(host_matches_set(&s, "x.y.example.com"));
+        // Multi-level wildcard: `*.foo.example.com` literal wins first.
+        let s = set(&["*.example.com", "*.foo.example.com"]);
+        assert!(host_matches_set(&s, "a.foo.example.com"));
+        assert!(host_matches_set(&s, "b.example.com"));
+    }
+
+    #[test]
+    fn host_matches_set_normalizes_case_and_port() {
+        let s = set(&["foo.example.com"]);
+        assert!(host_matches_set(&s, "FOO.example.com:8443"));
+        assert!(host_matches_set(&s, "Foo.Example.COM"));
+    }
+
+    #[test]
+    fn host_matches_set_misses_apex_for_wildcard() {
+        // `*.example.com` should NOT match the apex `example.com`
+        // (the wildcard deformation only strips labels).
+        let s = set(&["*.example.com"]);
+        assert!(!host_matches_set(&s, "example.com"));
     }
 }

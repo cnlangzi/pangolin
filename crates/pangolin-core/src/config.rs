@@ -297,25 +297,26 @@ impl Default for AcmeConfig {
 
 /// TLS listener tuning.
 ///
-/// **Workaround knob**: the single `enable_h2` field exists to
-/// disable HTTP/2 ALPN on the TLS listener, sidestepping an
-/// upstream pingora/h2 bug that surfaces as
-/// `400 Bad Request: missing required Host header` when a request
-/// is proxied to a tunnel backend over h2 (pingora tears down the
-/// yamux stream with
-/// `tokio_yamux::stream: this branch should be unreachable`
-/// before the request body reaches the kinnit backend).
+/// ALPN selection is decided **per connection, per SNI** in
+/// `ngx::tls::build_sni_settings`. The runtime rule is:
 ///
-/// Set `enable_h2: false` in `ngx.yml` for any deploy that fronts
-/// tunnel backends; modern browsers fall back to h1 automatically
-/// when h2 is not advertised. The same request works perfectly on
-/// h1. **TODO(upstream pingora h2+tunnel bug)**: flip the default
-/// back to `true` and remove this knob once the upstream issue is
-/// fixed.
+/// - If the SNI resolves to a site with a `tun_name:` backend
+///   prefix, the listener offers **HTTP/1.1 only** — this
+///   sidesteps an upstream `tokio-yamux 0.3.18` stream-state race
+///   that tears down the yamux stream mid-request and makes
+///   pingora fall back to `400 Bad Request: missing required Host
+///   header`. Tracked upstream; the runtime override stays even
+///   after the upstream fix so that operators can keep tunnel
+///   sites on h1 if they choose to.
+/// - Otherwise the listener follows the `enable_h2` field
+///   below.
+///
+/// `enable_h2` therefore controls the **non-tunnel default**.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TlsConfig {
-    /// Advertise HTTP/2 via ALPN. Default `true`. Set to `false`
-    /// to force h1 (see struct doc for the h2+tunnel workaround).
+    /// Advertise HTTP/2 via ALPN for **non-tunnel** sites. Default
+    /// `true`. Tunnel sites always negotiate h1 regardless of this
+    /// field (see struct doc).
     #[serde(default)]
     pub enable_h2: bool,
 }

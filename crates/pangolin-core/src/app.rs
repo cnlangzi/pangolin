@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::tunnel::YamuxTunnel;
 use crate::{
-    AccessLogBuffer, AccessLogEntry, EventBuffer, EventType, Indexes,
+    AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
     db,
     types::{ChallengeKind, ChallengeType, DnsProviderKind},
@@ -286,6 +286,17 @@ pub struct App {
     pub db: Arc<Mutex<Connection>>,
     /// In-memory indexes rebuilt from DB on startup and after each admin write
     pub indexes: Arc<RwLock<Indexes>>,
+    /// Sync mirror of the subset of `indexes.domain` whose site has a
+    /// `tun_name:` backend prefix. Lives behind a **sync** lock because
+    /// the TLS ALPN callback (which runs in a sync C context inside the
+    /// handshake) needs to ask "is this SNI on a tunnel site?" without
+    /// blocking on the async `indexes` lock. Rebuilt atomically with
+    /// `indexes` inside [`App::reload_indexes`].
+    ///
+    /// See `ngx::tls::build_sni_settings` for the per-SNI ALPN logic
+    /// that consumes this set; see issue #66 / commit `0c35ede` for
+    /// the upstream tokio-yamux h2+tunnel bug that motivates it.
+    pub tunnel_domains: Arc<parking_lot::RwLock<Arc<std::collections::HashSet<String>>>>,
     /// DNS provider + per-domain association index, rebuilt alongside `indexes`
     pub dns_index: Arc<RwLock<DnsIndex>>,
     /// Global configuration
@@ -330,6 +341,12 @@ pub struct App {
     /// broadcasts. Sized by `config.log.access_log_recent`
     /// (default 100).
     pub access_log_recent: Arc<AccessLogBuffer>,
+    /// Domain → cert pre-computed link (fix/cert_www). Built once
+    /// at startup from the `domains` × `certs` tables, then
+    /// maintained by the domain/cert CRUD hooks. Read on every
+    /// TLS handshake by the SNI callback in `ngx::tls`. See
+    /// `docs/design/cert-link.md` for the full design.
+    pub cert_links: CertLinkCache,
 }
 
 impl App {
@@ -369,6 +386,13 @@ impl App {
         let providers = db::list_dns_providers(&conn)?;
         let indexes = Indexes::build(sites, domains.clone());
         let dns_index = DnsIndex::build(&providers, &domains);
+        let tunnel_set = build_tunnel_domain_set(&indexes);
+
+        // fix/cert_www: build the domain → cert pre-computed link
+        // cache. Pure derived view over `domains` and `certs`; the
+        // SNI callback reads it on every TLS handshake. Built once
+        // here and maintained by the CRUD hooks (`relink_for_*`).
+        let cert_links = CertLinkCache::load_from_db(&conn)?;
 
         // Access log live channel (issue #73). tokio::sync::broadcast
         // already deduplicates per-subscriber but we still need to
@@ -384,6 +408,7 @@ impl App {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             indexes: Arc::new(RwLock::new(indexes)),
+            tunnel_domains: Arc::new(parking_lot::RwLock::new(Arc::new(tunnel_set))),
             ws_path: config.tunnel.ws_path.clone(),
             dns_index: Arc::new(RwLock::new(dns_index)),
             config,
@@ -395,6 +420,7 @@ impl App {
             cert_retrier: RwLock::new(None),
             access_log_tx,
             access_log_recent: Arc::new(AccessLogBuffer::new(access_log_recent_capacity)),
+            cert_links,
         })
     }
 
@@ -410,6 +436,13 @@ impl App {
     /// Reload indexes from DB. Called after every admin write operation.
     /// Also fires `dns_change_notify` so the `AcmeState` background loop
     /// picks up new DNS providers / domain associations.
+    ///
+    /// fix/cert_www: also rebuilds the `cert_links` cache so an
+    /// out-of-band `INSERT INTO certs` (e.g. SQL console, a test
+    /// writing a cert blob post-startup) becomes visible to the
+    /// SNI callback without requiring a process restart. CRUD hooks
+    /// keep the cache warm in the normal case; this method is the
+    /// recovery path.
     pub async fn reload_indexes(&self) {
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
@@ -417,8 +450,21 @@ impl App {
         let providers = db::list_dns_providers(&conn).unwrap_or_default();
         let indexes = Indexes::build(sites, domains.clone());
         let dns_index = DnsIndex::build(&providers, &domains);
+        // Sync mirror: every domain that resolves to a tunnel-backed
+        // site. The TLS ALPN callback consults this set on the
+        // handshake hot path. We derive it from the freshly-built
+        // `indexes` (single source of truth) so the two never drift.
+        let tunnel_set = build_tunnel_domain_set(&indexes);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
+        // Rebuild cert_links (fix/cert_www). Best-effort: if the
+        // rebuild fails (e.g. a transient DB error), log and keep
+        // the existing cache. The cache is a derived view and will
+        // catch up on the next reload.
+        if let Err(e) = self.cert_links.reload_from_db(&conn) {
+            log::warn!("cert_links: reload from DB failed: {}", e);
+        }
+        *self.tunnel_domains.write() = Arc::new(tunnel_set);
         drop(conn);
         // Wake the AcmeState loop (if any) so it re-reads dns_providers.
         self.dns_change_notify.notify_one();
@@ -604,6 +650,34 @@ impl Default for CertManager {
     }
 }
 
+/// Build the set of all domain strings (exact + wildcard literals)
+/// whose matching site has a `tun_name:` backend prefix.
+///
+/// Single source of truth for [`App::tunnel_domains`]. The output
+/// contains the exact strings stored in `Indexes.domain`; wildcard
+/// suffix matching is done at lookup time by
+/// [`crate::index::host_matches_set`].
+///
+/// Sites whose `backend` cannot be parsed are skipped silently —
+/// the same policy used in `Indexes::build`'s tun index pass. Any
+/// startup-time parse errors have already failed-fast at boot, so
+/// a per-reload silent skip is safe.
+fn build_tunnel_domain_set(indexes: &crate::Indexes) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (domain, site) in &indexes.domain {
+        match crate::parse::parse_backend(&site.backend) {
+            Ok((tun_name, _url)) if !tun_name.is_empty() => {
+                out.insert(domain.clone());
+            }
+            _ => {
+                // Direct backend, or unparseable (skipped). Either way
+                // this domain does not route through a tunnel.
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +725,92 @@ mod tests {
             ..CertManager::default()
         };
         assert!(cm.resolve_cert("nope.example.com").is_err());
+    }
+
+    // ---- tunnel_domains mirror (per-SNI ALPN) tests ----
+
+    use crate::index::Indexes;
+
+    fn site_with_backend(name: &str, backend: &str) -> crate::types::Site {
+        let now = Utc::now();
+        crate::types::Site {
+            name: name.into(),
+            backend: backend.into(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            host_mode: crate::types::HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        }
+    }
+
+    fn domain_for_site(domain: &str, site_name: &str) -> Domain {
+        let now = Utc::now();
+        Domain {
+            domain: domain.into(),
+            site_name: site_name.into(),
+            enabled: true,
+            auto_issue: false,
+            dns_provider: None,
+            challenge_kind: None,
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_collects_only_tunnel_sites() {
+        let sites = vec![
+            site_with_backend("direct", "http://127.0.0.1:8080"),
+            site_with_backend("tun", "office:http://10.0.0.1:8080"),
+            site_with_backend("file", "file:///srv/static"),
+        ];
+        let domains = vec![
+            domain_for_site("direct.example.com", "direct"),
+            domain_for_site("tun.example.com", "tun"),
+            domain_for_site("file.example.com", "file"),
+        ];
+        let idx = Indexes::build(sites, domains);
+        let set = build_tunnel_domain_set(&idx);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("tun.example.com"));
+        assert!(!set.contains("direct.example.com"));
+        assert!(!set.contains("file.example.com"));
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_includes_wildcard_literals() {
+        let sites = vec![site_with_backend("tun", "office:http://10.0.0.1:8080")];
+        let domains = vec![domain_for_site("*.example.com", "tun")];
+        let idx = Indexes::build(sites, domains);
+        let set = build_tunnel_domain_set(&idx);
+        // The literal `*.example.com` is stored as-is so the TLS callback
+        // can match SNI `foo.example.com` via the wildcard deformation.
+        assert!(set.contains("*.example.com"));
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_skips_disabled_sites() {
+        // Indexes::build already excludes disabled sites from `domain`,
+        // so the mirror follows the same filter.
+        let mut disabled = site_with_backend("tun", "office:http://10.0.0.1:8080");
+        disabled.enabled = false;
+        let sites = vec![disabled];
+        let domains = vec![domain_for_site("tun.example.com", "tun")];
+        let idx = Indexes::build(sites, domains);
+        let set = build_tunnel_domain_set(&idx);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_skips_invalid_backends() {
+        // Bad backend → parse fails → domain excluded from mirror.
+        // Same policy as the tun index pass in `Indexes::build`.
+        let sites = vec![site_with_backend("bad", "ftp://x:21")];
+        let domains = vec![domain_for_site("bad.example.com", "bad")];
+        let idx = Indexes::build(sites, domains);
+        let set = build_tunnel_domain_set(&idx);
+        assert!(set.is_empty());
     }
 
     // ---- DnsIndex / plan_issuance tests ----
