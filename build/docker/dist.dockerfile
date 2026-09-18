@@ -2,7 +2,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # Rust Docker build pipeline
 #
-# Base:        `docker.io/imlangzi/yaitoo:rust-npm`
+# Base:        `imlangzi/yaitoo:rust-npm`
 #   - Debian 12 (bookworm, glibc 2.36) — required for binary
 #     compatibility with production hosts (don't let the build image
 #     upgrade to trixie; cgo/cargo binaries record GLIBC_2.38 symbols
@@ -24,14 +24,16 @@
 #   export-stage   → export binaries
 # ────────────────────────────────────────────────────────────────────────────
 
-# `docker.io/imlangzi/yaitoo:rust-npm` is the canonical published ref.
-# Docker uses content-addressable storage: once the image has been
-# pulled (or pulled-and-tagged under any other name, e.g.
+# `imlangzi/yaitoo:rust-npm` is the canonical published ref on
+# Docker Hub (the registry is implicit — `docker.io/` is the default
+# when no hostname is present in the ref).  Docker uses
+# content-addressable storage: once the image has been pulled (or
+# pulled-and-tagged under any other name, e.g.
 # `docker pull imlangzi/yaitoo:rust-npm && docker tag … yaitoo:rust-npm`),
 # subsequent builds reuse the local copy without a docker.io roundtrip —
 # no two-step FROM aliasing needed because we don't publish a local
 # rebuild of the base image from this repo.
-FROM docker.io/imlangzi/yaitoo:rust-npm AS pangolin-chef
+FROM imlangzi/yaitoo:rust-npm AS pangolin-chef
 
 WORKDIR /pangolin
 
