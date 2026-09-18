@@ -3235,6 +3235,247 @@ fn client_config_with_root(cert_der: Vec<u8>) -> std::sync::Arc<rustls::ClientCo
     )
 }
 
+/// Generate a 3-level cert chain (root → intermediate → leaf) using
+/// the system `openssl` CLI, and write the leaf+intermediate to
+/// `cert_dir/{domain}` in the autocert DirCache blob layout (key PEM
+/// first, then leaf, then intermediate — root is **not** included,
+/// matching the production layout: ACME certs come with leaf +
+/// intermediates, the root is in the client trust store).
+///
+/// Returns `(leaf_der, root_der)` so the test can:
+///
+/// - drop `root_der` into a `rustls::RootCertStore` (so the chain
+///   verifies), and
+/// - keep `leaf_der` for an exact byte-level check against the cert
+///   the server actually presented (so the test can't be fooled by a
+///   flipped leaf/intermediate ordering).
+fn install_test_cert_chain(cert_dir: &std::path::Path, domain: &str) -> (Vec<u8>, Vec<u8>) {
+    use std::process::Command;
+
+    let prefix = format!("/tmp/chain-{domain}");
+
+    // Root (self-signed, CA:true, long-lived). Plain `openssl req
+    // -x509` produces a v1 cert without extensions — webpki
+    // requires v3, so we feed it a full config file (the bare
+    // `-extfile + -extensions` combo errors with "Use -help for
+    // summary" because `req` needs a `[req]` section + a
+    // distinguished-name source — the config bundle below covers
+    // all three: prompt=no + DN + v3 extensions).
+    let root_extfile = format!("{prefix}-root.cnf");
+    std::fs::write(
+        &root_extfile,
+        "\
+[req]
+distinguished_name = req_dn
+prompt = no
+[req_dn]
+CN = pangolin-test-chain-root
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+",
+    )
+    .expect("write root extfile");
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            &format!("{prefix}-root.key"),
+            "-out",
+            &format!("{prefix}-root.crt"),
+            "-days",
+            "36500",
+            "-config",
+            &root_extfile,
+            "-extensions",
+            "v3_ca",
+        ])
+        .status()
+        .expect("spawn openssl root");
+    assert!(status.success(), "openssl root generation failed");
+
+    // Intermediate CSR + signed-by-root, CA:true. The CA extension
+    // is stamped via `-extfile <file> -extensions <section>`, which
+    // requires the file to have a section header — bare
+    // `key=value` lines silently produce a v1 cert with no
+    // extensions (the gotcha that motivated this comment).
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            &format!("{prefix}-inter.key"),
+            "-out",
+            &format!("{prefix}-inter.csr"),
+            "-subj",
+            "/CN=pangolin-test-chain-intermediate",
+        ])
+        .status()
+        .expect("spawn openssl intermediate csr");
+    assert!(status.success(), "openssl intermediate CSR failed");
+    let extfile = format!("{prefix}-inter.cnf");
+    std::fs::write(
+        &extfile,
+        "\
+[v3_inter]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+",
+    )
+    .expect("write intermediate extfile");
+    let status = Command::new("openssl")
+        .args([
+            "x509",
+            "-req",
+            "-in",
+            &format!("{prefix}-inter.csr"),
+            "-CA",
+            &format!("{prefix}-root.crt"),
+            "-CAkey",
+            &format!("{prefix}-root.key"),
+            "-CAcreateserial",
+            "-out",
+            &format!("{prefix}-inter.crt"),
+            "-days",
+            "36500",
+            "-extfile",
+            &extfile,
+            "-extensions",
+            "v3_inter",
+        ])
+        .status()
+        .expect("spawn openssl intermediate sign");
+    assert!(status.success(), "openssl intermediate sign failed");
+
+    // Leaf CSR + signed-by-intermediate, SAN=domain (so the SNI check
+    // matches).
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            &format!("{prefix}-leaf.key"),
+            "-out",
+            &format!("{prefix}-leaf.csr"),
+            "-subj",
+            &format!("/CN={domain}"),
+            "-addext",
+            &format!("subjectAltName=DNS:{domain}"),
+        ])
+        .status()
+        .expect("spawn openssl leaf CSR");
+    assert!(status.success(), "openssl leaf CSR failed");
+    // webpki needs a v3 leaf with `subjectAltName` for hostname
+    // matching — CN-only matching was deprecated years ago. The
+    // CSR's `-addext` only stamps the request, not the issued
+    // cert, so we re-stamp via `-extfile` at sign time.
+    let leaf_extfile = format!("{prefix}-leaf.cnf");
+    std::fs::write(
+        &leaf_extfile,
+        format!(
+            "\
+[v3_leaf]
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:{domain}
+subjectKeyIdentifier = hash
+"
+        ),
+    )
+    .expect("write leaf extfile");
+    let output = Command::new("openssl")
+        .args([
+            "x509",
+            "-req",
+            "-in",
+            &format!("{prefix}-leaf.csr"),
+            "-CA",
+            &format!("{prefix}-inter.crt"),
+            "-CAkey",
+            &format!("{prefix}-inter.key"),
+            "-CAcreateserial",
+            "-out",
+            &format!("{prefix}-leaf.crt"),
+            "-days",
+            "90",
+            "-extfile",
+            &leaf_extfile,
+            "-extensions",
+            "v3_leaf",
+        ])
+        .output()
+        .expect("spawn openssl leaf sign");
+    assert!(
+        output.status.success(),
+        "openssl leaf sign failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Write the blob in the autocert DirCache layout: leaf key, then
+    // leaf, then intermediate. The root is intentionally absent —
+    // matches what Let's Encrypt returns (root lives in the client
+    // trust store, never sent on the wire).
+    let key = std::fs::read_to_string(format!("{prefix}-leaf.key")).expect("read leaf key");
+    let leaf_pem = std::fs::read_to_string(format!("{prefix}-leaf.crt")).expect("read leaf cert");
+    let inter_pem =
+        std::fs::read_to_string(format!("{prefix}-inter.crt")).expect("read intermediate");
+    let blob_path = cert_dir.join(domain);
+    std::fs::write(
+        &blob_path,
+        format!(
+            "{}\n{}\n{}",
+            key.trim_end(),
+            leaf_pem.trim_end(),
+            inter_pem.trim_end(),
+        ),
+    )
+    .expect("write chain blob");
+
+    // DER for the rustls trust store + the byte-level equality check.
+    let root_der = Command::new("openssl")
+        .args([
+            "x509",
+            "-in",
+            &format!("{prefix}-root.crt"),
+            "-outform",
+            "DER",
+        ])
+        .output()
+        .expect("openssl root -> DER")
+        .stdout;
+    let leaf_der = Command::new("openssl")
+        .args([
+            "x509",
+            "-in",
+            &format!("{prefix}-leaf.crt"),
+            "-outform",
+            "DER",
+        ])
+        .output()
+        .expect("openssl leaf -> DER")
+        .stdout;
+    (leaf_der, root_der)
+}
+
 /// Open a `ws://` connection against the proxy's HTTP listener using
 /// tokio-tungstenite, with a custom Host header so the proxy routes by
 /// domain instead of by DNS-resolved IP.
@@ -3612,6 +3853,103 @@ async fn real_e2e_tunnel_ws_upgrade_path_preserved() {
     );
 
     ws.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test: TLS handshake serves the full cert chain (leaf + intermediate)
+// ---------------------------------------------------------------------------
+
+/// **Regression test for the "Your connection is not secure" bug.**
+///
+/// The SNI cert callback (`SniCertCallback::certificate_callback`)
+/// must install **every** `-----BEGIN CERTIFICATE-----` block from
+/// the on-disk blob onto the SSL handshake — not just the leaf.
+/// Without intermediates in the TLS `Certificate` message, browsers
+/// (Chrome especially, which has disabled AIA fetching) cannot
+/// build the chain and report the site as untrusted even though the
+/// leaf itself is valid.
+///
+/// Test plan:
+/// 1. Build a 3-level chain (root → intermediate → leaf) via the
+///    system `openssl` CLI.
+/// 2. Write the autocert DirCache blob `key + leaf + intermediate`
+///    under `cert_dir/{domain}` (root intentionally omitted, matching
+///    what Let's Encrypt delivers — the root lives in the client
+///    trust store, never on the wire).
+/// 3. Start `pangolin-ngx` against a trivial HTTP backend.
+/// 4. Connect with `rustls`, putting **only** the test root into the
+///    trust store (no intermediate, no leaf). If the handshake
+///    succeeds, the server MUST have sent the intermediate as part
+///    of the TLS `Certificate` message — otherwise rustls/webpki
+///    reports `UnknownIssuer`.
+/// 5. Assert the chain the server actually sent has length 2 and
+///    that the first cert matches the leaf we wrote byte-for-byte
+///    (guards against a flipped leaf/intermediate ordering).
+#[tokio::test]
+async fn real_e2e_tls_handshake_serves_intermediate_certificate() {
+    use rustls::pki_types::CertificateDer;
+
+    let backend = MockBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let domain = "chain-test.example";
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "chain-test-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, domain, "chain-test-site");
+            // The in-memory CertLinkCache is built at startup from the
+            // certs table; without the seed the SNI callback wouldn't
+            // even know to look at the on-disk blob.
+            seed_cert(&conn, domain);
+        }
+    })
+    .await;
+
+    let (leaf_der, root_der) = install_test_cert_chain(&ngx.cert_dir(), domain);
+
+    // rustls ClientConfig trusts ONLY the test root. If the server
+    // sends just the leaf (the pre-fix bug), webpki fails with
+    // `UnknownIssuer` and the handshake errors out below — exactly
+    // what we want a regression here to look like.
+    let client_config = client_config_with_root(root_der);
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let server_name =
+        rustls::pki_types::ServerName::try_from(domain.to_string()).expect("server name");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ngx.tls_port))
+        .await
+        .expect("tcp connect");
+    let tls = connector.connect(server_name, tcp).await.expect(
+        "TLS handshake must succeed — chain has leaf + intermediate, \
+             so webpki can verify against the trusted root. If this errors \
+             with `UnknownIssuer`, the SNI callback dropped the \
+             intermediate (see tls.rs `split_blob` / \
+             `ssl_add_chain_cert`).",
+    );
+
+    // Belt-and-braces: pull the chain the server actually sent and
+    // assert its shape. This catches a future bug where the
+    // handshake still happens to succeed (e.g. the client cache
+    // happens to have the intermediate from another test) but the
+    // server isn't actually sending it.
+    let peer_certs: &[CertificateDer<'_>] = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .expect("server sent at least the leaf cert");
+    assert_eq!(
+        peer_certs.len(),
+        2,
+        "server must send leaf + intermediate (got {} cert(s))",
+        peer_certs.len()
+    );
+    assert_eq!(
+        peer_certs[0].as_ref(),
+        leaf_der.as_slice(),
+        "first cert the server sent must be the leaf (not the intermediate)"
+    );
 }
 
 // ---------------------------------------------------------------------------
