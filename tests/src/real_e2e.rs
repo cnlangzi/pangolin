@@ -3435,8 +3435,7 @@ subjectKeyIdentifier = hash
     // matches what Let's Encrypt returns (root lives in the client
     // trust store, never sent on the wire).
     let key = std::fs::read_to_string(format!("{prefix}-leaf.key")).expect("read leaf key");
-    let leaf_pem =
-        std::fs::read_to_string(format!("{prefix}-leaf.crt")).expect("read leaf cert");
+    let leaf_pem = std::fs::read_to_string(format!("{prefix}-leaf.crt")).expect("read leaf cert");
     let inter_pem =
         std::fs::read_to_string(format!("{prefix}-inter.crt")).expect("read intermediate");
     let blob_path = cert_dir.join(domain);
@@ -3453,12 +3452,24 @@ subjectKeyIdentifier = hash
 
     // DER for the rustls trust store + the byte-level equality check.
     let root_der = Command::new("openssl")
-        .args(["x509", "-in", &format!("{prefix}-root.crt"), "-outform", "DER"])
+        .args([
+            "x509",
+            "-in",
+            &format!("{prefix}-root.crt"),
+            "-outform",
+            "DER",
+        ])
         .output()
         .expect("openssl root -> DER")
         .stdout;
     let leaf_der = Command::new("openssl")
-        .args(["x509", "-in", &format!("{prefix}-leaf.crt"), "-outform", "DER"])
+        .args([
+            "x509",
+            "-in",
+            &format!("{prefix}-leaf.crt"),
+            "-outform",
+            "DER",
+        ])
         .output()
         .expect("openssl leaf -> DER")
         .stdout;
@@ -3910,16 +3921,13 @@ async fn real_e2e_tls_handshake_serves_intermediate_certificate() {
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ngx.tls_port))
         .await
         .expect("tcp connect");
-    let tls = connector
-        .connect(server_name, tcp)
-        .await
-        .expect(
-            "TLS handshake must succeed — chain has leaf + intermediate, \
+    let tls = connector.connect(server_name, tcp).await.expect(
+        "TLS handshake must succeed — chain has leaf + intermediate, \
              so webpki can verify against the trusted root. If this errors \
              with `UnknownIssuer`, the SNI callback dropped the \
              intermediate (see tls.rs `split_blob` / \
              `ssl_add_chain_cert`).",
-        );
+    );
 
     // Belt-and-braces: pull the chain the server actually sent and
     // assert its shape. This catches a future bug where the
