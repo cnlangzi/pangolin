@@ -24,24 +24,14 @@
 #   export-stage   → export binaries
 # ────────────────────────────────────────────────────────────────────────────
 
-# Two-step FROM so a previously-pulled / locally-tagged `yaitoo:rust-npm`
-# is reused without going back to docker.io.  Same aliasing trick used by
-# `starter/build/docker/{npm,dist}.dockerfile`:
-#
-#   * `docker.io/imlangzi/yaitoo:rust-npm` is the canonical published ref
-#     (used by external Dockerfiles, ansible deploys, anyone outside this
-#     repo).
-#   * `yaitoo:rust-npm` is the local short alias used inside this repo.
-#
-# The first FROM pulls (or reuses the cached pull of) the canonical ref
-# and exposes it under the in-build alias `yaitoo-rust-npm`.  The second
-# FROM re-references the same image through its local alias, so once the
-# alias exists in the local image store (e.g. via `docker pull … && docker
-# tag … yaitoo:rust-npm`) every subsequent build skips the docker.io
-# roundtrip without any change to this file.
-ARG REGISTRY_OWNER=imlangzi
-FROM docker.io/${REGISTRY_OWNER}/yaitoo:rust-npm AS yaitoo-rust-npm
-FROM yaitoo:rust-npm AS pangolin-chef
+# `docker.io/imlangzi/yaitoo:rust-npm` is the canonical published ref.
+# Docker uses content-addressable storage: once the image has been
+# pulled (or pulled-and-tagged under any other name, e.g.
+# `docker pull imlangzi/yaitoo:rust-npm && docker tag … yaitoo:rust-npm`),
+# subsequent builds reuse the local copy without a docker.io roundtrip —
+# no two-step FROM aliasing needed because we don't publish a local
+# rebuild of the base image from this repo.
+FROM docker.io/imlangzi/yaitoo:rust-npm AS pangolin-chef
 
 WORKDIR /pangolin
 
