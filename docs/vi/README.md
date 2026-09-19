@@ -30,7 +30,7 @@ crates/admin/templates/
 ## 2. 硬性约束(对**新代码/新页面**)
 
 - ✅ 用 Tailwind utility,**禁止新增** `.btn-*` `.card` `.input` `.alert` `.table` 等 `@apply` 类
-- ✅ JS 全部写进 `crates/admin/templates/public/app.js`,用 `data-*` 钩子
+- ✅ JS 全部写进 `assets/app.js`,用 `data-*` 钩子
 - ❌ **禁止** per-page 内联 `<script>`(`base.html` 已经引入 `app.js` 和 htmx)
 - ✅ 颜色必须用 token (见 §3);**禁止**直接 HEX,确保 dark mode 自动适配
 - ✅ 暗色模式跟随系统,统一 `dark:` 前缀
@@ -257,7 +257,7 @@ crates/admin/templates/
 
 | Legacy | 位置 | 处置 |
 | ------ | ---- | ---- |
-| `@apply` 组件类(`.btn-*` `.card` `.input` `.alert` `.table` `.badge-*` `.nav-link*` `.spinner`) | `crates/admin/templates/public/tailwindcss.css`(顶部已标 `@deprecated`) | 只删,不加;新增组件直接 utility |
+| `@apply` 组件类(`.btn-*` `.card` `.input` `.alert` `.table` `.badge-*` `.nav-link*` `.spinner`) | `assets/tailwindcss.css`(顶部已标 `@deprecated`) | 只删,不加;新增组件直接 utility |
 | `text-gray-*` | `pages/dashboard.html` | 替换为 `text-slate-*` |
 | `text-orange-500` | `views/dns/_form_fields.html`("阿"字头像) | 替换为 `text-amber-500` |
 | 重复加载 `app.js` | `pages/domains/site_domains.html` 末尾 | 删除 — `base.html` 已加载 |

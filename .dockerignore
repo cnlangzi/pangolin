@@ -11,8 +11,6 @@ Cargo.lock.bak
 # Node.js (admin UI is built on the host, not inside the image)
 node_modules/
 dist/
-assets/static/*.css
-assets/static/*.js
 package-lock.json
 
 # Generated / runtime artifacts

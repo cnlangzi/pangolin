@@ -1,8 +1,23 @@
 //! Admin UI asset pipeline.
 //!
-//! Assets in the workspace `assets/` directory are snapshotted by
+//! Assets in the repo-root `assets/` directory are snapshotted by
 //! [`rust-embed`] at compile time (release) or read from the filesystem at
 //! runtime (`debug-embed` feature, dev builds).
+//!
+//! ## Build pipeline
+//!
+//! Single source of truth lives in [`assets/`] at the repo root:
+//!
+//! - `tailwindcss.css` (tracked) — Tailwind CLI input with `@tailwind` directives
+//! - `app.js`           (tracked) — hand-written JS source, no imports
+//! - `app.css`          (gitignored) — Tailwind CLI output (unminified in dev, minified when produced by `make build-ui-prod` / the Docker `builder` stage)
+//! - `app.min.js`       (gitignored) — esbuild output, only produced by `make build-ui-prod` / the Docker `builder` stage
+//!
+//! Dev (`make build-ui`) runs Tailwind without `--minify` and skips esbuild
+//! entirely — `app.js` has no imports so the raw source is browser-ready.
+//! Production (`make build-dist`) re-runs both with `--minify`.
+//!
+//! [`assets/`]: https://github.com/yaitoo/pangolin/tree/main/assets
 //!
 //! ## Hashing
 //!
@@ -13,20 +28,27 @@
 //! ## `PANGOLIN_ADMIN_JS`
 //!
 //! `raw` → `app.js`, anything else → `app.min.js`. The choice is captured
-//! once at startup in [`JS_FILE`].
+//! once at startup in [`JS_FILE`]. If the chosen file is missing,
+//! [`js_bytes`] falls back to `app.js` (with a warning) so dev builds that
+//! haven't run `make build-ui-prod` still serve the source bundle.
 
 use std::sync::LazyLock;
 
 use rust_embed::Embed;
 use sha2::{Digest, Sha256};
 
-/// Snapshot of every file in the `crates/admin/templates/public/` directory.
+/// Snapshot of every file in the repo-root `assets/` directory.
+///
+/// `#[folder]` is resolved relative to `CARGO_MANIFEST_DIR`
+/// (`crates/admin/`), so `../../assets/` lands at the repo root — the single
+/// source of truth shared by `make build-ui`, `make build-ui-prod`, and the
+/// Docker `builder` stage.
 ///
 /// - **Release**: bytes are embedded into the binary.
 /// - **Debug** (`debug-embed`): `Asset::get()` reads from the filesystem at
 ///   runtime, so `make build-ui` takes effect on the next process restart.
 #[derive(Embed)]
-#[folder = "templates/public/"]
+#[folder = "../../assets/"]
 pub struct Asset;
 
 /// Active JS bundle filename, selected from `PANGOLIN_ADMIN_JS` at startup.
@@ -65,10 +87,30 @@ pub fn css_bytes() -> Vec<u8> {
 }
 
 /// Bytes of the active JS bundle (`app.js` or `app.min.js`, per [`JS_FILE`]).
+///
+/// If [`JS_FILE`] is `app.min.js` but that file is missing (typical for dev
+/// builds that haven't run `make build-ui-prod`), transparently fall back to
+/// the unminified `app.js` source. This means dev works out-of-the-box even
+/// without setting `PANGOLIN_ADMIN_JS=raw`; the warning log line makes the
+/// fallback visible so it doesn't silently mask a broken build-dist.
 pub fn js_bytes() -> Vec<u8> {
-    <Asset as rust_embed::RustEmbed>::get(&JS_FILE)
-        .map(|f| f.data.into_owned())
-        .unwrap_or_default()
+    if let Some(f) = <Asset as rust_embed::RustEmbed>::get(&JS_FILE) {
+        return f.data.into_owned();
+    }
+    if *JS_FILE != "app.js"
+        && let Some(f) = <Asset as rust_embed::RustEmbed>::get("app.js")
+    {
+        log::warn!(
+            "admin assets: {} missing, falling back to unminified app.js",
+            *JS_FILE
+        );
+        return f.data.into_owned();
+    }
+    log::warn!(
+        "admin assets: no JS bundle found (tried {}, app.js)",
+        *JS_FILE
+    );
+    Vec::new()
 }
 
 pub const CSS_MIME: &str = "text/css; charset=utf-8";

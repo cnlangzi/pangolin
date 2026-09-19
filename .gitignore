@@ -15,15 +15,22 @@ Cargo.lock.bak
 /assets/static/*.js
 
 # Standalone Tailwind + esbuild binaries, and generated admin-UI bundles.
-# The bundle files are produced by `make build-ui` (or any release build,
-# since `build-ngx: build-ui` chains them) from `tailwindcss.css` and
-# `app.js` in the same directory. They MUST exist on disk at compile
-# time — `rust-embed` snapshots `crates/admin/templates/public/` into
-# the binary — but are regenerated deterministically from sources, so
-# we don't track the artifacts.
+# The bundle files are produced by `make build-ui` (dev, unminified) or
+# `make build-ui-prod` / the Docker `builder` stage (minified) from
+# `tailwindcss.css` and `app.js` in `assets/`. They MUST exist on disk at
+# compile time — `rust-embed` snapshots `assets/` into the binary via
+# `crates/admin/src/assets.rs` — but are regenerated deterministically
+# from the tracked sources, so we don't track the artifacts.
 /bin/
-/crates/admin/templates/public/app.css
-/crates/admin/templates/public/app.min.js
+/assets/app.css
+/assets/app.min.js
+
+# Intentionally absent: there is no `assets/vendor/` directory. JS deps
+# (htmx today, anything else we add later) load from a public CDN pinned
+# in the askama templates — see `layouts/base.html` and
+# `pages/auth/login.html`. Don't vendor them; adding files here bloats the
+# rust-embed binary and creates version-drift risk (templates already pin
+# a different version than what would sit in `vendor/`).
 
 # Generated certs (test or runtime)
 /certs

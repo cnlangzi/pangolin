@@ -69,12 +69,8 @@ pub async fn handle_login(
         return Ok(resp);
     }
 
-    let error_html =
-        r#"<p class="text-red-400 text-sm mb-4 font-medium">Invalid username or password</p>"#;
-    let tmpl = LoginTemplate {
-        next: "",
-        error: error_html,
-    };
+    let error = "Invalid username or password";
+    let tmpl = LoginTemplate { next: "", error };
     let html = tmpl
         .render()
         .unwrap_or_else(|e| format!("Template error: {}", e));
