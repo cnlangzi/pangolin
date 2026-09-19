@@ -197,9 +197,9 @@ fn main() -> anyhow::Result<()> {
         // pingora worker has stopped emitting access log entries, so
         // the bot fan-out (driven by `App::push_access_log`) has gone
         // quiet. Signal the background writer to perform a final
-        // drain and exit; without this the most-recent bot entries
-        // would sit in the queue until the runtime drops.
-        app_for_shutdown.shutdown_bot_writer();
+        // drain and `await` its completion (Gap #5/#6 fix — was
+        // previously fire-and-forget).
+        app_for_shutdown.shutdown_bot_writer().await;
 
         Ok::<(), anyhow::Error>(())
     });

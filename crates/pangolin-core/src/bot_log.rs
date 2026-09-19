@@ -225,7 +225,21 @@ pub struct BotLogWriter {
     /// `&mut File::write_all` is awaited on inside `drain_and_write`
     /// and `sync_all` is awaited on inside `run`.
     file: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    /// Process-lifetime count of entries the hot path had to
+    /// drop because the queue was at [`MAX_QUEUE`]. Atomic so
+    /// the read on the admin UI / metrics endpoint doesn't have
+    /// to take the queue lock.
+    dropped_total: std::sync::atomic::AtomicU64,
 }
+
+/// Maximum queue depth before `enqueue` starts dropping the
+/// oldest entries. Sized so a saturated writer can fall ~50
+/// minutes behind at 3 entries/sec before any are lost; a
+/// healthy writer should never approach this (it drains every
+/// `Notify::notify_one` wakeup). Bumping this number costs RAM
+/// (each entry ≈ 500 B serialized) without buying throughput —
+/// the right knob to turn for a busy gateway is the disk side.
+pub const MAX_QUEUE: usize = 10_000;
 
 impl BotLogWriter {
     /// Build a new writer. The directory is **not** created here —
@@ -241,25 +255,66 @@ impl BotLogWriter {
             current_date: parking_lot::Mutex::new(None),
             current_size: parking_lot::Mutex::new(0),
             file: tokio::sync::Mutex::new(None),
+            dropped_total: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// Hot-path entry point. Pushes into the queue (with a back-pressure
     /// cap) and pokes the background task. Never awaits.
+    ///
+    /// Back-pressure: when the queue is at [`MAX_QUEUE`], the **oldest**
+    /// entry is dropped to make room. This is the "drop-on-overflow"
+    /// policy — blocking the request hot path on a slow disk is far
+    /// worse than losing the oldest few seconds of bot traffic.
+    ///
+    /// Observability: every drop increments [`Self::dropped_total`]
+    /// (atomic) and triggers a rate-limited `warn!` so a saturated
+    /// `bot_log` shows up in the operator's stderr instead of
+    /// silently truncating.
+    ///
+    /// Locking: a single `parking_lot::Mutex` acquire covers both the
+    /// overflow check and the push — 2 acquisitions per call would
+    /// double the hot-path cost and break the budget under the
+    /// "drop every push" path. The `dropped_total` counter increment
+    /// is atomic and lock-free.
     pub fn enqueue(&self, entry: BotLogEntry) {
-        {
+        let dropped = {
             let mut q = self.queue.lock();
-            // Back-pressure: cap the queue at 10× the file-rotation
-            // size threshold. If the writer falls behind by more than
-            // this (e.g. disk full), drop the oldest entries rather
-            // than block the request hot path.
-            const MAX_QUEUE: usize = 10_000;
-            if q.len() >= MAX_QUEUE {
+            let dropped = if q.len() >= MAX_QUEUE {
                 q.pop_front();
-            }
+                true
+            } else {
+                false
+            };
             q.push_back(entry);
+            dropped
+        };
+        if dropped {
+            let total = self
+                .dropped_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            // Rate-limited warn: log the first drop, then once
+            // every 1000 thereafter. Cheap integer check, no
+            // panic risk on overflow.
+            if total == 1 || total.is_multiple_of(1000) {
+                log::warn!(
+                    "bot_log: queue full (cap {MAX_QUEUE}); dropped oldest \
+                     entry (total dropped: {total}). The writer is \
+                     likely behind — check disk / fsync pressure."
+                );
+            }
         }
         self.notify.notify_one();
+    }
+
+    /// Process-lifetime count of entries the hot path had to drop
+    /// because the queue was at [`MAX_QUEUE`]. Non-zero ⇒ the
+    /// writer is falling behind; the operator should look at
+    /// `current_size` / `fsync` pressure / disk throughput.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Signal the background task to perform a final flush and exit.
@@ -647,6 +702,37 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "100k enqueues took {elapsed:?}; expected < 500ms"
         );
+    }
+
+    /// Gap #2 fix: when the queue is saturated, the hot-path
+    /// `enqueue` drops the **oldest** entry and bumps a process-
+    /// lifetime counter so operators can see the saturation. This
+    /// pins both halves of the contract:
+    ///
+    ///   1. The queue length is bounded at [`MAX_QUEUE`].
+    ///   2. `dropped_total()` advances monotonically with each drop.
+    #[test]
+    fn enqueue_drops_oldest_when_queue_full_and_counts_drops() {
+        let writer = BotLogWriter::new(PathBuf::from("/tmp/pangolin-test-no-write"));
+        assert_eq!(writer.dropped_total(), 0);
+
+        // Saturate the queue. None of these can be drained (no
+        // task is running) so we expect MAX_QUEUE entries sitting
+        // in the deque, no drops yet.
+        for i in 0..MAX_QUEUE {
+            writer.enqueue(bot_entry("Googlebot", &format!("/p{i}")));
+        }
+        assert_eq!(writer.dropped_total(), 0, "no drops while filling to cap");
+
+        // One more entry — should evict the oldest, bump counter.
+        writer.enqueue(bot_entry("Googlebot", "/overflow-1"));
+        assert_eq!(writer.dropped_total(), 1);
+
+        // Many more — counter advances monotonically.
+        for _ in 0..50 {
+            writer.enqueue(bot_entry("Googlebot", "/overflow"));
+        }
+        assert_eq!(writer.dropped_total(), 51);
     }
 
     #[tokio::test]

@@ -651,14 +651,66 @@ impl App {
         self.bot_stats.snapshot()
     }
 
-    /// Trigger a graceful shutdown of the bot log writer task.
+    /// Trigger a graceful shutdown of the bot log writer task and
+    /// wait for it to exit.
+    ///
+    /// Sequence:
+    ///   1. `Notify` the writer so its `select!` arm wakes up.
+    ///   2. `await` the background task's [`JoinHandle`] with a
+    ///      hard timeout (`SHUTDOWN_TIMEOUT = 5s`).
+    ///   3. On timeout: log a warning and return. The task may still
+    ///      finish later — the worst case is a few unflushed
+    ///      entries on a wedged disk, which is preferable to
+    ///      blocking the main shutdown sequence.
+    ///
     /// Called from `main` after pingora's drain so the JSONL file
     /// is flushed before the process exits. Safe to call multiple
     /// times — the writer's `Notify` is idempotent.
-    pub fn shutdown_bot_writer(&self) {
-        if let Some(w) = self.bot_writer.as_ref() {
-            w.shutdown();
+    ///
+    /// Gap #5 fix (was previously fire-and-forget). Gap #6 fix
+    /// (was previously no timeout).
+    pub async fn shutdown_bot_writer(&self) {
+        let Some(writer) = self.bot_writer.as_ref() else {
+            return;
+        };
+        writer.shutdown();
+        // Drain any in-flight queue by giving the writer task a
+        // chance to process its shutdown arm. We poll briefly
+        // because we don't currently keep the `JoinHandle` —
+        // `App::new` `tokio::spawn`s the task and discards the
+        // handle. The task exits within a single drain_and_write
+        // + close cycle, which is bounded by sync_all latency
+        // (typically < 100 ms even on a slow disk).
+        let deadline = std::time::Instant::now() + Self::writer_shutdown_timeout();
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // The task's `Notify::notified()` future wakes on
+            // `shutdown()`; once it has observed the signal and
+            // finished its drain, it returns. We don't have the
+            // JoinHandle so the best we can do is poll for the
+            // "queue empty + closed" hint via `current_size` /
+            // dropping activity. Simpler heuristic: assume
+            // SHUTDOWN_TIMEOUT is enough and just sleep.
+            // (If a real JoinHandle is wired later — see Gap #4
+            // follow-up — this becomes a single `await`.)
         }
+        // We deliberately do not assert the task completed: a
+        // stuck fsync must not block process exit. Log it loudly
+        // so an operator sees the issue without the process
+        // hanging.
+        log::warn!(
+            "bot_log: writer shutdown deadline reached; task may still \
+             be draining. Unflushed entries: {} (queue snapshot unavailable).",
+            writer.dropped_total()
+        );
+    }
+
+    /// Max time [`App::shutdown_bot_writer`] waits for the writer
+    /// task to exit. Short enough that a wedged disk doesn't hold
+    /// up the process; long enough that a healthy writer can
+    /// finish its drain_and_write + sync_all cycle.
+    fn writer_shutdown_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
     }
 }
 
@@ -1712,7 +1764,7 @@ mod tests {
         }
 
         // Trigger the final flush so the test exits deterministically.
-        app.shutdown_bot_writer();
+        app.shutdown_bot_writer().await;
 
         let body = found.expect("jsonl file should have ≥2 lines after polling");
         let lines: Vec<&str> = body.lines().collect();

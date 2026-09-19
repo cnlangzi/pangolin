@@ -56,6 +56,11 @@ pub struct BotStatsSummary {
     /// `total_records`, kept separate for forward-compat
     /// (if we ever record only a sample, this stays accurate).
     pub total_hits: u64,
+    /// Records dropped because the unique-pair map hit
+    /// [`MAX_UNIQUE_PAIRS`]. Non-zero ⇒ operators should pivot
+    /// to the JSONL stream (`log.bot.dir/bot-*.jsonl`) for full
+    /// per-host visibility.
+    pub dropped_unique_pairs: u64,
 }
 
 /// Thread-safe bot stats store.
@@ -69,7 +74,23 @@ pub struct BotStats {
 struct BotStatsInner {
     rows: HashMap<RowKey, RowData>,
     total_records: u64,
+    /// Number of records dropped because the `(bot, host)` map was
+    /// already at [`MAX_UNIQUE_PAIRS`]. Pinned here (not just
+    /// logged) so the admin UI can surface "stats are saturated;
+    /// switch to JSONL for full coverage" rather than silently
+    /// showing undercounts.
+    dropped_unique_cap: u64,
 }
+
+/// Hard upper bound on distinct `(bot_name, host)` pairs kept in
+/// memory. A bot scanning millions of random subdomains would
+/// otherwise OOM the process — the per-row footprint is ~120 B
+/// (RowKey + RowData) so `MAX_UNIQUE_PAIRS = 50_000` caps memory
+/// at ≈ 6 MB. Once the cap is reached, further `(bot, host)`
+/// combinations still increment `total_records` but the row is
+/// dropped; operators can pivot to the JSONL stream (`jq`
+/// aggregation) for full visibility.
+pub const MAX_UNIQUE_PAIRS: usize = 50_000;
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 struct RowKey {
@@ -92,6 +113,7 @@ impl BotStats {
             inner: parking_lot::RwLock::new(BotStatsInner {
                 rows: HashMap::new(),
                 total_records: 0,
+                dropped_unique_cap: 0,
             }),
         })
     }
@@ -100,21 +122,61 @@ impl BotStats {
     /// a single hashmap lookup + insert/update. The lock is held
     /// for sub-microsecond on a small map — well under the 5 µs
     /// budget.
+    ///
+    /// Capacity safeguard: when the row map is already at
+    /// [`MAX_UNIQUE_PAIRS`], a *new* `(bot, host)` pair is
+    /// dropped — `total_records` and `dropped_unique_cap` still
+    /// tick so operators see the saturation in the dashboard.
+    /// Hits on already-known pairs continue to update normally
+    /// (the common case where one bot hammers a few hosts).
     pub fn record(&self, entry: &BotLogEntry) {
         let mut g = self.inner.write();
         let key = RowKey {
             bot_name: entry.bot_name,
             host: entry.host.clone(),
         };
-        let row = g.rows.entry(key).or_insert_with(|| RowData {
-            bot_vendor: entry.bot_vendor,
-            bot_category: entry.bot_category,
-            hits: 0,
-            last_seen: entry.timestamp,
-        });
-        row.hits += 1;
-        row.last_seen = entry.timestamp;
+        if let Some(row) = g.rows.get_mut(&key) {
+            // Hot path: known (bot, host) — just bump counters.
+            row.hits += 1;
+            row.last_seen = entry.timestamp;
+            g.total_records += 1;
+            return;
+        }
+        // Cold path: new pair. Respect the cap.
+        if g.rows.len() >= MAX_UNIQUE_PAIRS {
+            g.total_records += 1;
+            g.dropped_unique_cap += 1;
+            // Log every Nth drop so a saturated `bot_log` doesn't
+            // drown the stderr in noise — once per 1000 events is
+            // enough for an operator to see the trend.
+            if g.dropped_unique_cap % 1000 == 1 {
+                log::warn!(
+                    "bot_stats: dropped {} (bot, host) rows since startup; \
+                     unique-pair cap = {MAX_UNIQUE_PAIRS}. Use the JSONL \
+                     stream (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) for full \
+                     visibility.",
+                    g.dropped_unique_cap
+                );
+            }
+            return;
+        }
+        g.rows.insert(
+            key,
+            RowData {
+                bot_vendor: entry.bot_vendor,
+                bot_category: entry.bot_category,
+                hits: 1,
+                last_seen: entry.timestamp,
+            },
+        );
         g.total_records += 1;
+    }
+
+    /// Number of records dropped because the unique-pair cap was
+    /// reached. Process-lifetime counter; expose in the admin UI
+    /// so a saturated map is visible.
+    pub fn dropped_unique_pairs(&self) -> u64 {
+        self.inner.read().dropped_unique_cap
     }
 
     /// Snapshot the full per-(bot, host) table plus a summary.
@@ -138,6 +200,7 @@ impl BotStats {
             unique_pairs: rows.len(),
             total_records: g.total_records,
             total_hits: rows.iter().map(|r| r.hits).sum(),
+            dropped_unique_pairs: g.dropped_unique_cap,
         };
         (rows, summary)
     }
@@ -288,5 +351,51 @@ mod tests {
         // last_seen must be the later entry's timestamp.
         assert!(rows[0].last_seen >= e1.timestamp);
         assert!(rows[0].last_seen >= e2.timestamp - chrono::Duration::milliseconds(1));
+    }
+
+    // ---- Cap behaviour (Gap #1 fix) -------------------------------------
+
+    /// Build `MAX_UNIQUE_PAIRS + N` distinct `(bot, host)` rows
+    /// and assert the cap holds + the dropped counter advances.
+    /// Uses the public constant so a future bump propagates
+    /// automatically.
+    #[test]
+    fn record_caps_unique_pairs_and_counts_drops() {
+        let stats = BotStats::new();
+        // Fill the map to capacity with `(Googlebot, host-i)` pairs.
+        for i in 0..MAX_UNIQUE_PAIRS {
+            stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
+        }
+        let (rows, summary) = stats.snapshot();
+        assert_eq!(rows.len(), MAX_UNIQUE_PAIRS);
+        assert_eq!(summary.total_records, MAX_UNIQUE_PAIRS as u64);
+        assert_eq!(summary.dropped_unique_pairs, 0);
+
+        // One more distinct host → dropped, but total_records ticks.
+        stats.record(&entry("Googlebot", "host-extra.example.com", "/"));
+        let (rows, summary) = stats.snapshot();
+        assert_eq!(rows.len(), MAX_UNIQUE_PAIRS); // unchanged
+        assert_eq!(summary.total_records, (MAX_UNIQUE_PAIRS + 1) as u64);
+        assert_eq!(summary.dropped_unique_pairs, 1);
+
+        // A repeat hit on a known pair still increments normally
+        // (the cap is on *unique* pairs, not total records).
+        stats.record(&entry("Googlebot", "host-0.example.com", "/"));
+        let (_, summary) = stats.snapshot();
+        assert_eq!(summary.total_records, (MAX_UNIQUE_PAIRS + 2) as u64);
+        assert_eq!(summary.dropped_unique_pairs, 1);
+    }
+
+    /// The dropped counter is exposed via the public getter so
+    /// `/logs/bots` (and any future `/api/logs/bots/stats`) can
+    /// surface saturation without going through the full snapshot.
+    #[test]
+    fn dropped_unique_pairs_getter() {
+        let stats = BotStats::new();
+        assert_eq!(stats.dropped_unique_pairs(), 0);
+        for i in 0..(MAX_UNIQUE_PAIRS + 5) {
+            stats.record(&entry("Googlebot", &format!("h-{i}.ex"), "/"));
+        }
+        assert_eq!(stats.dropped_unique_pairs(), 5);
     }
 }
