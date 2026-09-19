@@ -31,24 +31,50 @@
   {# Live access log table — populated client-side by the #}
   {# EventSource consumer below. Server-rendered empty so a #}
   {# browser without JS still gets a sane skeleton.          #}
+  {#
+    # Layout decision (searchenginebots follow-up):
+    #
+    # The pre-stage-1 column set was
+    #   TIME | METHOD | STATUS | PATH | HOST | DURATION | BACKEND | CLIENT
+    # which forced PATH into a narrow column where long REST
+    # URLs wrapped to 4-5 lines (see screenshot in PR
+    # description). With the bot side-channel now also feeding
+    # user-agent into the access log stream, two things had to
+    # give:
+    #
+    #   1. METHOD + STATUS + PATH collapse into one `Request`
+    #      column. Status is left-most (small badge, easy to
+    #      scan), then method, then path. The path has the
+    #      full remaining width of the column — no more
+    #      wrap-induced 5-line cells.
+    #   2. Backend drops out of the default view. It stays
+    #      in the row data (title attribute) for hover,
+    #      and the same column will appear in the bot
+    #      page where it's less critical. We trade backend
+    #      visibility for User-Agent.
+    #
+    # User-Agent itself is long and almost never useful in
+    # full on first scan, so each cell is a button that
+    # toggles between a truncated preview and the full
+    # string. The toggle is JS-driven (one class on the
+    # button) and works on touch via tap.
+    #}
   <div id="logs-table" class="card overflow-hidden">
     <div class="overflow-x-auto scrollbar-thin">
       <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
         <thead class="bg-slate-50 dark:bg-slate-800/50">
           <tr>
             <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-20">Method</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-16">Status</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Host</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Request</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
             <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-40 hidden md:table-cell">Backend</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden lg:table-cell">Client</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-72">User-Agent</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
           </tr>
         </thead>
         <tbody id="logs-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
           <tr id="logs-empty-row">
-            <td colspan="8" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
+            <td colspan="6" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
               Waiting for events…
             </td>
           </tr>
@@ -58,9 +84,56 @@
   </div>
 
   <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
-    Showing entries pushed by the proxy. Bounded buffer (configurable via <code>log.access_log_recent</code>); live channel (configurable via <code>log.access_log_capacity</code>). Restart of <code>pangolin-ngx</code> clears everything.
+    Showing entries pushed by the proxy. Bounded buffer (configurable via <code>log.access_log_recent</code>); live channel (configurable via <code>log.access_log_capacity</code>). Restart of <code>pangolin-ngx</code> clears everything. Click a User-Agent cell to expand the full string; the backend is on hover (title attribute).
   </p>
 </main>
+
+<style>
+  /* User-Agent cell: button toggles between truncated preview
+     (`.ua-preview`) and full word-broken text (`.ua-full`).
+     The class is toggled by the inline click handler; no JS
+     module needed. The accent color is hardcoded because this
+     is an inline `<style>` (Tailwind's `theme()` only resolves
+     through the PostCSS pipeline, not in SSR-served HTML). */
+  .ua-toggle {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    border-radius: 0.25rem;
+    transition: background-color 0.1s;
+  }
+  .ua-toggle:hover { background-color: rgba(15, 23, 42, 0.04); }
+  .dark .ua-toggle:hover { background-color: rgba(255, 255, 255, 0.04); }
+  .ua-toggle:focus-visible {
+    outline: 2px solid #F59E0B;
+    outline-offset: 1px;
+  }
+  .ua-toggle .ua-preview {
+    display: block;
+    max-width: 18rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ua-toggle .ua-full {
+    display: none;
+    word-break: break-all;
+    white-space: pre-wrap;
+    line-height: 1.4;
+    max-height: 8rem;
+    overflow-y: auto;
+  }
+  .ua-toggle.expanded .ua-preview { display: none; }
+  .ua-toggle.expanded .ua-full { display: block; }
+  /* When expanded, the cell needs a bit of vertical room. */
+  td:has(.ua-toggle.expanded) { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+</style>
 
 <script>
 (function() {
@@ -72,7 +145,6 @@
   function setStatus(state, label) {
     if (!statusPill) return;
     statusText.textContent = label;
-    // strip existing colour classes, then apply the right ones for state
     statusPill.className = "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border";
     statusDot.className = "w-1.5 h-1.5 rounded-full";
     if (state === "live") {
@@ -96,6 +168,23 @@
   // ── Table helpers ──────────────────────────────────────────────────────
   const tbody = document.getElementById("logs-tbody");
   const emptyRow = document.getElementById("logs-empty-row");
+
+  // UA truncation: keep first ~50 chars, break at the next space
+  // so we don't cut mid-token. Pure cosmetic — the full string is
+  // always one click away.
+  const UA_PREVIEW_CHARS = 50;
+  function uaPreview(s) {
+    if (!s) return "";
+    if (s.length <= UA_PREVIEW_CHARS) return s;
+    const slice = s.slice(0, UA_PREVIEW_CHARS);
+    const lastSpace = slice.lastIndexOf(" ");
+    // If there's no space in the first 50 chars (a single very-long
+    // token), truncate at the boundary with an ellipsis appended at
+    // the end of the long token.
+    if (lastSpace <= 0) return slice + "…";
+    return slice.slice(0, lastSpace) + "…";
+  }
+
   function escapeHtml(s) {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -123,7 +212,6 @@
     try {
       const d = new Date(iso);
       if (isNaN(d.getTime())) return iso;
-      // YYYY-MM-DD HH:MM:SS.mmm in local time
       const pad = (n, w) => String(n).padStart(w, "0");
       return d.getFullYear() + "-" + pad(d.getMonth() + 1, 2) + "-" + pad(d.getDate(), 2)
         + " " + pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2)
@@ -135,21 +223,72 @@
     if (n < 1000) return n + " ms";
     return (n / 1000).toFixed(2) + " s";
   }
+
+  // Build the User-Agent cell. Default = truncated preview;
+  // clicking the button toggles `.expanded` which swaps the
+  // two inner spans via CSS. The full UA is always in the
+  // DOM (so the toggle is instant and there's no extra
+  // network round-trip). `title` attribute on the button
+  // also surfaces the full UA on hover for non-touch users.
+  function uaCellHtml(ua) {
+    if (!ua) {
+      return '<td class="px-4 py-2 text-slate-400 dark:text-slate-500 font-sans">—</td>';
+    }
+    const full = escapeHtml(ua);
+    const preview = escapeHtml(uaPreview(ua));
+    return '<td class="px-4 py-2 align-top">' +
+      '<button class="ua-toggle" type="button" title="' + full + '" aria-expanded="false">' +
+        '<span class="ua-preview">' + preview + '</span>' +
+        '<span class="ua-full">' + full + '</span>' +
+      '</button>' +
+    '</td>';
+  }
+
   function appendRow(e) {
     if (!tbody) return;
     if (emptyRow && emptyRow.parentNode) emptyRow.parentNode.removeChild(emptyRow);
     const tr = document.createElement("tr");
     tr.className = "hover:bg-slate-50/60 dark:hover:bg-slate-800/40";
+
+    // Request column: status badge + method + path, all on one line.
+    // Status is the smallest element so the eye scans left-to-right
+    // by severity (200 first), then action (GET/POST), then
+    // resource. The path uses min-w-0 + truncate so long URLs get
+    // ellipsised at the column edge instead of wrapping.
+    const statusHtml = '<span class="font-semibold tabular-nums ' + statusClass(e.status) + '">' + escapeHtml(String(e.status)) + '</span>';
+    const methodHtml = '<span class="font-semibold ' + methodClass(e.method) + '">' + escapeHtml(e.method) + '</span>';
+    const pathHtml = '<span class="truncate font-mono text-slate-700 dark:text-slate-200" title="' + escapeHtml(e.path) + '">' + escapeHtml(e.path) + '</span>';
+    const requestHtml = '<td class="px-4 py-2 align-top">' +
+      '<div class="flex items-center gap-3 min-w-0">' +
+        statusHtml + methodHtml + pathHtml +
+      '</div>' +
+    '</td>';
+
+    // Backend is no longer in the default view; surface it as a
+    // tooltip on the host cell instead.
+    const hostTitle = e.backend ? 'Backend: ' + escapeHtml(e.backend) : '';
+    const hostHtml = '<td class="px-4 py-2 whitespace-nowrap align-top" title="' + hostTitle + '">' +
+      '<span class="text-slate-600 dark:text-slate-300" title="' + hostTitle + '">' + escapeHtml(e.host) + '</span>' +
+    '</td>';
+
     tr.innerHTML =
-      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400">' + escapeHtml(formatTime(e.timestamp)) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap font-semibold ' + methodClass(e.method) + '">' + escapeHtml(e.method) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap font-semibold tabular-nums ' + statusClass(e.status) + '">' + escapeHtml(String(e.status)) + '</td>' +
-      '<td class="px-4 py-2 break-all text-slate-700 dark:text-slate-200" title="' + escapeHtml(e.path) + '">' + escapeHtml(e.path) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="' + escapeHtml(e.host) + '">' + escapeHtml(e.host) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600 dark:text-slate-300">' + escapeHtml(formatDuration(e.duration_ms)) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden md:table-cell" title="' + escapeHtml(e.backend) + '">' + escapeHtml(e.backend) + '</td>' +
-      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden lg:table-cell" title="' + escapeHtml(e.client_ip) + '">' + escapeHtml(e.client_ip) + '</td>';
-    // Newest-first: insert at the top of tbody.
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 align-top">' + escapeHtml(formatTime(e.timestamp)) + '</td>' +
+      requestHtml +
+      hostHtml +
+      '<td class="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600 dark:text-slate-300 align-top">' + escapeHtml(formatDuration(e.duration_ms)) + '</td>' +
+      uaCellHtml(e.user_agent) +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 align-top hidden xl:table-cell" title="' + escapeHtml(e.client_ip) + '">' + escapeHtml(e.client_ip) + '</td>';
+
+    // Wire the User-Agent toggle. Inline onclick also works, but
+    // a delegated listener is cleaner and survives row re-creation.
+    const uaBtn = tr.querySelector(".ua-toggle");
+    if (uaBtn) {
+      uaBtn.addEventListener("click", function() {
+        const expanded = uaBtn.classList.toggle("expanded");
+        uaBtn.setAttribute("aria-expanded", expanded ? "true" : "false");
+      });
+    }
+
     tbody.insertBefore(tr, tbody.firstChild);
     // Cap the visible rows to keep the DOM bounded. Issue #73
     // specifies a hard cap of 500 lines on the /logs page to bound
@@ -211,14 +350,10 @@
       try { entry = JSON.parse(ev.data); } catch (e) { return; }
       if (!entry || typeof entry !== "object") return;
       if (typeof entry.method !== "string" || typeof entry.path !== "string") return;
+      // user_agent is optional (older JSON without it, or requests
+      // that didn't send a UA header). appendRow handles undefined.
       appendRow(entry);
     };
-    // Listen for explicit server-side "replay done" / "closed" hints
-    // (we emit them as JSON-shaped status frames so the message
-    // handler can also pick them up). Comments starting with `:` are
-    // not delivered to onmessage by default; the standard SSE spec
-    // treats them as ignored-by-EventSource. We don't have a custom
-    // event name, so we just rely on the JSON shape.
   }
   connect();
 })();

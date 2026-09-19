@@ -28,7 +28,7 @@
 use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{PangolinError, Result};
 
@@ -355,6 +355,75 @@ pub struct LogConfig {
     /// crate.
     #[serde(default = "default_access_log_capacity")]
     pub access_log_capacity: usize,
+    /// Bot log side-channel (searchenginebots). Writes
+    /// `bot-YYYY-MM-DD.jsonl` per UTC day, with an in-memory ring
+    /// buffer + a dedicated SSE stream for the admin UI's
+    /// `/logs/bots` page.
+    #[serde(default)]
+    pub bot: BotLogConfig,
+}
+
+/// Per-day JSONL side-channel for crawler / AI / social / monitoring
+/// bot traffic.
+///
+/// All fields have safe defaults — a missing `log.bot:` block in
+/// `ngx.yml` (or no `ngx.yml` at all) produces a working bot log.
+///
+/// The two "growth-cap" fields (`max_file_size_bytes`,
+/// `max_age_days`) are kept in the struct but marked
+/// `#[serde(skip)]` so v1 doesn't expose them to operators. Daily
+/// rotation only, no auto-cleanup. A future commit can flip the
+/// `skip` annotations to re-enable size-based rotation / retention
+/// without touching call sites.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BotLogConfig {
+    /// Master switch. When `false`, [`App::push_access_log`](crate::app::App::push_access_log)
+    /// returns before invoking the bot detector so the feature has
+    /// effectively zero cost.
+    #[serde(default = "default_bot_enabled")]
+    pub enabled: bool,
+    /// Capacity of the in-memory ring buffer used by `/logs/bots`
+    /// late-join replay. Default 200 — bot traffic is sparse so a
+    /// smaller buffer than the main access log is fine. Set to 0
+    /// to disable replay (the live SSE stream still works).
+    #[serde(default = "default_bot_recent")]
+    pub recent: usize,
+    /// Capacity of the dedicated `tokio::sync::broadcast` channel
+    /// for bot entries. Default 1000 — same rationale as
+    /// `access_log_capacity`.
+    #[serde(default = "default_bot_capacity")]
+    pub capacity: usize,
+    /// Output directory for `bot-YYYY-MM-DD.jsonl`. Created lazily
+    /// on first write. Default `./logs/bots`.
+    #[serde(default = "default_bot_dir")]
+    pub dir: PathBuf,
+
+    /// Size-based rotation threshold in bytes. Currently skipped
+    /// from `ngx.yml` (v1 is daily-rotation-only). Default
+    /// `u64::MAX` means "never rotate by size".
+    #[serde(skip)]
+    pub max_file_size_bytes: u64,
+    /// Self-cleanup age in days. Currently skipped from `ngx.yml`
+    /// (operators handle retention externally via logrotate). Default
+    /// `0` means "never auto-delete".
+    #[serde(skip)]
+    pub max_age_days: u32,
+}
+
+fn default_bot_enabled() -> bool {
+    true
+}
+
+fn default_bot_recent() -> usize {
+    200
+}
+
+fn default_bot_capacity() -> usize {
+    1000
+}
+
+fn default_bot_dir() -> PathBuf {
+    PathBuf::from("./logs/bots")
 }
 
 fn default_log_level() -> String {
@@ -376,6 +445,23 @@ impl Default for LogConfig {
             file: String::new(),
             access_log_recent: default_access_log_recent(),
             access_log_capacity: default_access_log_capacity(),
+            bot: BotLogConfig::default(),
+        }
+    }
+}
+
+impl Default for BotLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_bot_enabled(),
+            recent: default_bot_recent(),
+            capacity: default_bot_capacity(),
+            dir: default_bot_dir(),
+            // Skipped from YAML today — picked conservatively so a
+            // accidental operator mutation can't silently disable
+            // something v1 relies on.
+            max_file_size_bytes: u64::MAX,
+            max_age_days: 0,
         }
     }
 }

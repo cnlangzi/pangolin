@@ -221,6 +221,7 @@ pub async fn handle(
             .await?
         }
         ("logs", "GET") => routes::logs::render(&app, &csrf_token).await?,
+        ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token).await?,
         ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
         ("certs/new", "POST") => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?

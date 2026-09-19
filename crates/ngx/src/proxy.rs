@@ -221,8 +221,12 @@ fn read_header_value(req: &HttpRequest, name: &str) -> Result<String, ()> {
 // ─────────────────────────────────────────────────────────────────
 
 /// Per-request state for access logging (Issue #73).
-/// Captures start time, method, path, host, and backend so
-/// response_filter can construct an AccessLogEntry.
+/// Captures start time, method, path, host, backend, and the
+/// `User-Agent` header so [`record_access_log`] can build a fully
+/// populated [`AccessLogEntry`](pangolin_core::AccessLogEntry) —
+/// the `user_agent` field is consumed by the bot side-channel
+/// in [`App::push_access_log`](pangolin_core::App::push_access_log)
+/// (searchenginebots stage-1).
 #[derive(Debug, Clone)]
 pub struct RequestState {
     pub start: std::time::Instant,
@@ -230,6 +234,10 @@ pub struct RequestState {
     pub path: String,
     pub host: String,
     pub backend: String, // "tun:office" | "direct:1.2.3.4:8080" | "file://..."
+    /// `User-Agent` header value, captured once per request in
+    /// `request_filter`. `None` if the client didn't send one or
+    /// the header wasn't valid UTF-8.
+    pub user_agent: Option<String>,
 }
 
 impl Default for RequestState {
@@ -240,6 +248,7 @@ impl Default for RequestState {
             path: String::new(),
             host: String::new(),
             backend: String::new(),
+            user_agent: None,
         }
     }
 }
@@ -271,6 +280,26 @@ impl ProxyHttp for AppProxy {
         ctx.method = session.req_header().method.as_str().to_string();
         ctx.path = path.clone();
         ctx.host = host_from_session(session);
+        // Stage-1 (searchenginebots): capture the User-Agent so
+        // `record_access_log` can populate the entry's
+        // `user_agent` field, which feeds `App::push_access_log`'s
+        // bot side-channel. We do it once here (the hot path) so
+        // the four call sites of `record_access_log` don't need
+        // to re-iterate the request headers.
+        //
+        // `HeaderMap::get` does the case-insensitive lookup in
+        // O(1) (vs. an O(n) `.iter().find(...)` linear scan)
+        // and returns the first matching value, which matches
+        // the previous behaviour exactly.
+        //
+        // Non-ASCII / non-UTF-8 UA values are coerced to `None` —
+        // bot detection is substring-based and the rules are
+        // ASCII, so a non-UTF-8 UA can't match anyway.
+        ctx.user_agent = session
+            .req_header()
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok().map(String::from));
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
@@ -1766,6 +1795,10 @@ fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, stat
         duration_ms,
         backend: ctx.backend.clone(),
         client_ip,
+        // Captured once in `request_filter` (searchenginebots
+        // stage-1). Consumed by `App::push_access_log`'s bot
+        // side-channel; a missing UA simply skips the bot path.
+        user_agent: ctx.user_agent.clone(),
     };
     app.push_access_log(entry);
 }

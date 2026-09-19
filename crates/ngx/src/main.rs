@@ -176,7 +176,22 @@ fn main() -> anyhow::Result<()> {
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
         ];
 
+        // `ServiceContext` takes ownership of the `App`; keep a
+        // clone so we can still drive the bot-log writer's graceful
+        // shutdown after `drain_services` returns.
+        let app_for_shutdown = app.clone();
         let ctx = runtime::ServiceContext::new(app, shutdown.clone());
+
+        // Spawn the bot-log JSONL writer task. Must happen
+        // **inside** the tokio runtime — `App::new` runs from
+        // synchronous `main()` before the runtime exists, so
+        // it can't spawn the task itself. Without this call, the
+        // bot-side-channel `bot-YYYY-MM-DD.jsonl` file is never
+        // written in production (a bug fixed in the post-merge
+        // review). Returns `true` on success; we ignore the bool
+        // and let `shutdown_bot_writer` be a silent no-op when
+        // disabled (so the call is always safe).
+        app_for_shutdown.start_bot_writer();
 
         let mut handles = Vec::with_capacity(services.len());
         for svc in services.into_iter() {
@@ -188,6 +203,15 @@ fn main() -> anyhow::Result<()> {
         log::info!("shutdown signalled, draining host services");
 
         runtime::drain_services(handles).await;
+
+        // Bot log JSONL writer flush. After `drain_services` the
+        // pingora worker has stopped emitting access log entries, so
+        // the bot fan-out (driven by `App::push_access_log`) has gone
+        // quiet. Signal the background writer to perform a final
+        // drain and `await` its completion (Gap #5/#6 fix — was
+        // previously fire-and-forget).
+        app_for_shutdown.shutdown_bot_writer().await;
+
         Ok::<(), anyhow::Error>(())
     });
 

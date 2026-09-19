@@ -31,3 +31,6 @@ log.workspace = true
 anyhow.workspace = true
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }

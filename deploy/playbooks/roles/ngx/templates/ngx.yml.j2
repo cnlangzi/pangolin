@@ -42,6 +42,20 @@
 #   log.access_log_capacity broadcast channel cap for live SSE fan-out
 #                           (default 1000; lagged subscribers see
 #                           `: lagged N events` and keep flowing).
+#   log.bot.enabled         master switch for the searchenginebots
+#                           side-channel (search-engine / AI / social /
+#                           monitoring bot detection). When false,
+#                           App::push_access_log short-circuits before
+#                           invoking the detector — zero overhead.
+#                           Default true.
+#   log.bot.recent          ring-buffer depth for /logs/bots late-join
+#                           replay (default 200; 0 disables replay,
+#                           live SSE + JSONL still work).
+#   log.bot.capacity        broadcast channel cap for the bot-only
+#                           SSE fan-out (default 1000).
+#   log.bot.dir             output directory for `bot-YYYY-MM-DD.jsonl`
+#                           (UTC daily rotation). Created lazily on
+#                           first write. Default `./logs/bots`.
 
 # ── Proxy listen (top level) ────────────────────────────────────────────
 addr:
@@ -96,3 +110,22 @@ log:
   # docs/design/access-log.md for the full design.
   access_log_recent: {{ ngx_log_access_log_recent | default(100) }}
   access_log_capacity: {{ ngx_log_access_log_capacity | default(1000) }}
+  # searchenginebots stage-1: bot side-channel.
+  # Filters every request's User-Agent against a built-in rule
+  # table (~50 entries: Googlebot / Bingbot / Baiduspider /
+  # GPTBot / ClaudeBot / facebookexternalhit / UptimeRobot /
+  # AdsBot-Google / …). Detected bots are fanned out to:
+  #   - bot_log_recent (in-memory ring buffer, replay-on-connect)
+  #   - bot_log_tx     (dedicated SSE channel /api/logs/bots/stream)
+  #   - bot_stats      (per-(bot, host) counters for /logs/bots)
+  #   - BotLogWriter   (async JSONL writer → <dir>/bot-YYYY-MM-DD.jsonl,
+  #                     daily UTC rotation, jq/DuckDB-friendly)
+  # Non-bot traffic (real browsers, curl, …) is unaffected —
+  # the detector only runs on the already-built AccessLogEntry.
+  # v1 fully trusts the client-supplied UA. See
+  # docs/configuration.md §"log.bot" for the full schema.
+  bot:
+    enabled: {{ ngx_log_bot_enabled | default(true) }}
+    recent: {{ ngx_log_bot_recent | default(200) }}
+    capacity: {{ ngx_log_bot_capacity | default(1000) }}
+    dir: {{ ngx_log_bot_dir | default('/usr/local/pangolin/logs/bots') }}
