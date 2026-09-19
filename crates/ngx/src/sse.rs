@@ -77,7 +77,7 @@ pub async fn handle_access_log_stream(
         None => false,
     };
     if !authed {
-        return write_sse_unauth(session).await;
+        return write_sse_unauth(session, "access logs").await;
     }
 
     // 2) SSE prelude.
@@ -284,10 +284,17 @@ async fn write_chunk(session: &mut ServerSession, bytes: Bytes) -> Option<()> {
 /// (which then tries to parse our 401 HTML as `data:` frames and
 /// errors out). A plain HTML 401 is the cleanest "you must log in"
 /// signal.
-async fn write_sse_unauth(mut session: ServerSession) -> Option<ReusedHttpStream> {
+/// Write a 401 response for an unauthenticated SSE request.
+///
+/// Used by both [`handle_access_log_stream`] and
+/// [`handle_bot_log_stream`]. The `topic` argument lets each
+/// caller pass a stream-specific label so the error message
+/// doesn't lie to the operator (e.g. "view access logs" when
+/// they hit the bot stream).
+async fn write_sse_unauth(mut session: ServerSession, topic: &str) -> Option<ReusedHttpStream> {
     let body = json!({
         "error": "unauthenticated",
-        "message": "Admin login required to view access logs.",
+        "message": format!("Admin login required to view {topic}."),
     })
     .to_string();
     let resp: http::Response<()> = http::Response::builder()
@@ -339,7 +346,7 @@ pub async fn handle_bot_log_stream(
         None => false,
     };
     if !authed {
-        return write_sse_unauth(session).await;
+        return write_sse_unauth(session, "bot logs").await;
     }
 
     // 2) SSE prelude (identical headers to the access-log stream).
