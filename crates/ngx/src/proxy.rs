@@ -287,15 +287,19 @@ impl ProxyHttp for AppProxy {
         // the four call sites of `record_access_log` don't need
         // to re-iterate the request headers.
         //
+        // `HeaderMap::get` does the case-insensitive lookup in
+        // O(1) (vs. an O(n) `.iter().find(...)` linear scan)
+        // and returns the first matching value, which matches
+        // the previous behaviour exactly.
+        //
         // Non-ASCII / non-UTF-8 UA values are coerced to `None` —
         // bot detection is substring-based and the rules are
         // ASCII, so a non-UTF-8 UA can't match anyway.
         ctx.user_agent = session
             .req_header()
             .headers
-            .iter()
-            .find(|(k, _)| k.as_str().eq_ignore_ascii_case("user-agent"))
-            .and_then(|(_, v)| v.to_str().ok().map(String::from));
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok().map(String::from));
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
