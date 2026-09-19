@@ -10,11 +10,8 @@
 //!
 //! - `tailwindcss.css` (tracked) — Tailwind CLI input with `@tailwind` directives
 //! - `app.js`           (tracked) — hand-written JS source, no imports
-//! - `app.css`          (gitignored) — Tailwind CLI output (unminified in dev,
-//!                      minified when produced by `make build-ui-prod` /
-//!                      the Docker `builder` stage)
-//! - `app.min.js`       (gitignored) — esbuild output, only produced by
-//!                      `make build-ui-prod` / the Docker `builder` stage
+//! - `app.css`          (gitignored) — Tailwind CLI output (unminified in dev, minified when produced by `make build-ui-prod` / the Docker `builder` stage)
+//! - `app.min.js`       (gitignored) — esbuild output, only produced by `make build-ui-prod` / the Docker `builder` stage
 //!
 //! Dev (`make build-ui`) runs Tailwind without `--minify` and skips esbuild
 //! entirely — `app.js` has no imports so the raw source is browser-ready.
@@ -100,14 +97,14 @@ pub fn js_bytes() -> Vec<u8> {
     if let Some(f) = <Asset as rust_embed::RustEmbed>::get(&JS_FILE) {
         return f.data.into_owned();
     }
-    if *JS_FILE != "app.js" {
-        if let Some(f) = <Asset as rust_embed::RustEmbed>::get("app.js") {
-            log::warn!(
-                "admin assets: {} missing, falling back to unminified app.js",
-                *JS_FILE
-            );
-            return f.data.into_owned();
-        }
+    if *JS_FILE != "app.js"
+        && let Some(f) = <Asset as rust_embed::RustEmbed>::get("app.js")
+    {
+        log::warn!(
+            "admin assets: {} missing, falling back to unminified app.js",
+            *JS_FILE
+        );
+        return f.data.into_owned();
     }
     log::warn!(
         "admin assets: no JS bundle found (tried {}, app.js)",
