@@ -53,6 +53,50 @@ If a fix is genuinely untestable (e.g. it depends on a kernel
 quirk you can't reproduce in CI), say so in the PR description —
 don't silently ship an unverified change.
 
+## Migrations are append-only — never rename or edit an applied .sql
+
+[`refinery`] records every applied migration as a
+`(version, name, checksum)` row in `refinery_schema_history`. Once a
+migration has shipped — i.e. is in any DB, dev box or production —
+the file is immutable for the lifetime of that DB:
+
+- **Never rename** `V{N}__foo.sql` → `V{M}__bar.sql`. Every DB that
+  already ran the old name stores a row keyed to `(N, foo)`, and on
+  next startup the binary fails with
+  `applied migration V{N}__foo is different than filesystem one
+  V{M}__bar` and refuses to launch. Production included.
+- **Never edit** the SQL body of an applied migration. Even an
+  added comment changes the SipHasher-13 checksum that refinery
+  baked into the history table, and the same checksum-mismatch
+  failure fires on every existing DB.
+- To change the schema, **add a new migration** at the next version
+  number — `V{N+1}__fix_foo.sql` doing a forward-only `ALTER TABLE` —
+  not a rewrite of the old file.
+
+To insert a new feature *between* two existing migrations in the
+narrative sense, give it a number **higher than anything already
+shipped** (`V{N+1}`, `V{N+2}` …). The history must be append-only
+from the first commit that introduced migrations. Renumbering old
+files to "make room" is what caused the `V5__add_domain_challenge_kind`
+vs `V5__cert_error_class` collision that bricked a dev DB on
+2026-09-19 and would have bricked all four production hosts the
+next time they pulled.
+
+If you ever hit the mismatch error on a dev box, the local DB has
+drifted from canonical history. The fix is local-only — production
+DBs at the correct version are unaffected:
+
+```bash
+rm -f pangolin.db pangolin.db-shm pangolin.db-wal   # local dev only
+make start-ngx                                    # re-applies V1..V{N}
+```
+
+Never `UPDATE refinery_schema_history` or hand-run an `ALTER TABLE`
+to silence the checksum mismatch — that hides the real bug and
+breaks the next fresh DB that tries to apply the canonical history.
+
+[`refinery`]: https://docs.rs/refinery
+
 ## Local development: targeted tests, not the full e2e suite
 
 `make test-e2e` builds release binaries and runs the **entire**
