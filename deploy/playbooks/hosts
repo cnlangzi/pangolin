@@ -1,8 +1,8 @@
 [ngx]
-ny-us ansible_host=ny-us ansible_user=yaitoo 
+#ny-us ansible_host=ny-us ansible_user=yaitoo 
 sh-ali ansible_host=sh-ali ansible_user=ecs-user 
-la-us ansible_host=la-us ansible_user=yaitoo 
-sv-us ansible_host=sv-us ansible_user=yaitoo
+#la-us ansible_host=la-us ansible_user=yaitoo 
+#sv-us ansible_host=sv-us ansible_user=yaitoo
 
 
 [ngx:vars]
