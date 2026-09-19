@@ -35,7 +35,7 @@ use pingora::protocols::http::ServerSession;
 use pingora::server::ShutdownWatch;
 
 use crate::App;
-use crate::sse::handle_access_log_stream;
+use crate::sse::{handle_access_log_stream, handle_bot_log_stream};
 
 /// Thin pingora-app wrapper for the admin UI.
 ///
@@ -121,6 +121,27 @@ impl HttpServerApp for AdminApp {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             return handle_access_log_stream(
+                session,
+                self.app.clone(),
+                self.sessions.clone(),
+                cookie.as_deref(),
+                shutdown.clone(),
+            )
+            .await;
+        }
+
+        // 4b) SSE bot log stream — searchenginebots stage-2.
+        //     Mirrors the access-log stream but subscribes to
+        //     `App::bot_log_tx`. Auth + replay + live broadcast
+        //     shape are identical; see `handle_bot_log_stream`
+        //     for details.
+        if method == "GET" && path == "/api/logs/bots/stream" {
+            let cookie = req
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            return handle_bot_log_stream(
                 session,
                 self.app.clone(),
                 self.sessions.clone(),

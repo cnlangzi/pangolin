@@ -124,3 +124,29 @@ log:
   # keep the DOM bounded.
   access_log_recent: 100
   access_log_capacity: 1000
+  # ── Bot log side-channel (searchenginebots stage-1) ────────────────
+  # Filters each request's User-Agent against a built-in rule
+  # table (~40 entries: Googlebot/Bingbot/Baiduspider/GPTBot/
+  # ClaudeBot/…). Detected bots are written to
+  # `<dir>/bot-YYYY-MM-DD.jsonl` (UTC daily rotation), fed to a
+  # dedicated `/api/logs/bots/stream` SSE channel, and counted
+  # per (bot, host) pair for the `/logs/bots` dashboard card.
+  #
+  # Non-bot traffic (real browsers, curl, …) is unaffected —
+  # the detector runs only on the hot path's already-built
+  # AccessLogEntry.
+  #
+  #   * `enabled`     master switch. When false, the entire
+  #                   side-channel is bypassed at zero cost.
+  #   * `recent`      in-memory ring buffer for `/logs/bots`
+  #                   late-join replay. 0 disables replay; the
+  #                   live SSE + JSONL still work. Default 200.
+  #   * `capacity`    tokio broadcast channel capacity for the
+  #                   bot-only SSE fan-out. Default 1000.
+  #   * `dir`         output directory for `bot-YYYY-MM-DD.jsonl`.
+  #                   Created lazily on first write.
+  bot:
+    enabled: true
+    recent: 200
+    capacity: 1000
+    dir: ./logs/bots

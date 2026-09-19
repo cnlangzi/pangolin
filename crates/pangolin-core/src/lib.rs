@@ -16,6 +16,9 @@
 //! See `README.md` for the design rationale.
 
 pub mod app;
+pub mod bot;
+pub mod bot_log;
+pub mod bot_stats;
 pub mod cert_link;
 pub mod config;
 pub mod db;
@@ -32,8 +35,11 @@ pub mod types;
 pub use app::{
     App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage, plan_issuance,
 };
+pub use bot::{BotCategory, BotIdentity, detect_bot};
+pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
+pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
-pub use config::{Config, LogConfig, init_logger};
+pub use config::{BotLogConfig, Config, LogConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, lookup_site};

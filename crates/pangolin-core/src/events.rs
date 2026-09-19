@@ -27,6 +27,18 @@ pub struct AccessLogEntry {
     pub duration_ms: u64,
     pub backend: String,
     pub client_ip: String,
+    /// `User-Agent` header value, captured by the proxy on the
+    /// request hot path. `None` if the client didn't send one.
+    ///
+    /// Added in stage-1 of the searchenginebots feature so the
+    /// bot side-channel in [`App::push_access_log`](crate::app::App::push_access_log)
+    /// can identify crawlers without re-reading the request
+    /// headers. `skip_serializing_if = "Option::is_none"` keeps
+    /// the wire format unchanged for the common (no-UA-rewrite
+    /// needed) case, and `#[serde(default)]` lets old JSONL
+    /// rows deserialise cleanly into `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
 }
 
 /// Bounded ring buffer of recent access log entries.
@@ -261,6 +273,7 @@ mod tests {
             duration_ms: 42,
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "192.168.1.1".into(),
+            user_agent: Some("curl/8.0".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: AccessLogEntry = serde_json::from_str(&json).unwrap();
@@ -280,6 +293,7 @@ mod tests {
             duration_ms: 1,
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "192.168.1.1".into(),
+            user_agent: None,
         }
     }
 

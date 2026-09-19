@@ -50,7 +50,7 @@ pub use domains::{
     DomainsEditTemplate, DomainsFormFieldsView, DomainsListTemplate, DomainsNewTemplate,
     DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
-pub use logs::LogsTemplate;
+pub use logs::{BotLogsTemplate, LogsTemplate};
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };

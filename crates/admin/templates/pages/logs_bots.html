@@ -1,0 +1,263 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Bot Logs — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Bot Logs</h1>
+      <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
+        Crawler, AI, social-link-preview, and monitoring-bot traffic only — in-memory + per-day JSONL
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="bots-status"
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border
+                   bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700">
+        <span id="bots-status-dot" class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
+        <span id="bots-status-text">connecting…</span>
+      </span>
+    </div>
+  </div>
+
+  {# ── Summary card (server-rendered) ─────────────────────────────────── #}
+  {# On first paint the dashboard should show useful state, not a #}
+  {# "no bots detected yet" skeleton. The top-N table + summary #}
+  {# counters come from `BotStats::snapshot()` and are rendered #}
+  {# server-side; the SSE feed below appends new rows in real time. #}
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+    <div class="card p-4">
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Total bot requests</div>
+      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Distinct (bot × host) pairs</div>
+      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.unique_pairs }}</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Top bot</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900 dark:text-white">
+        {% if top_rows.is_empty() %}
+          <span class="text-slate-400 dark:text-slate-500 text-base font-normal">none yet</span>
+        {% else %}
+          {{ top_rows[0].bot_name }}
+          <span class="text-sm text-slate-500 dark:text-slate-400 font-normal ml-1">({{ top_rows[0].hits }} hits)</span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
+  {% if !top_rows.is_empty() %}
+  <div class="card overflow-hidden mb-6">
+    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Top bots by hit count</h2>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+        <thead class="bg-slate-50 dark:bg-slate-800/50">
+          <tr>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Bot</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Category</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+            <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Last seen</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
+          {% for row in top_rows %}
+          <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+            <td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100">{{ row.bot_name }}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ row.bot_vendor }}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ row.bot_category }}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="{{ row.host }}">{{ row.host }}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ row.hits }}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400" data-last-seen="{{ row.last_seen }}"></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Live tail table (client-side SSE) ───────────────────────────────── #}
+  <div id="bots-table" class="card overflow-hidden">
+    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Live tail</h2>
+      <span class="text-xs text-slate-500 dark:text-slate-400">Bounded ring buffer; live SSE channel</span>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+        <thead class="bg-slate-50 dark:bg-slate-800/50">
+          <tr>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Bot</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Category</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-20">Status</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Host</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden lg:table-cell">Client</th>
+          </tr>
+        </thead>
+        <tbody id="bots-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
+          <tr id="bots-empty-row">
+            <td colspan="8" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
+              Waiting for bot traffic…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+    In-memory ring buffer (configurable via <code>log.bot.recent</code>); live channel (<code>log.bot.capacity</code>).
+    Persistent per-day JSONL under <code>log.bot.dir</code> as <code>bot-YYYY-MM-DD.jsonl</code> — operators tail / inspect
+    directly with <code>jq</code> / <code>DuckDB</code>. Restart of <code>pangolin-ngx</code> clears the in-memory ring but
+    the JSONL files persist (daily rotation, no auto-cleanup in v1).
+  </p>
+</main>
+
+<script>
+(function() {
+  "use strict";
+  // ── Status pill (status: connecting → replay → live → error/closed) ─
+  const statusDot = document.getElementById("bots-status-dot");
+  const statusText = document.getElementById("bots-status-text");
+  const statusPill = document.getElementById("bots-status");
+  function setStatus(state, label) {
+    if (!statusPill) return;
+    statusText.textContent = label;
+    statusPill.className = "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border";
+    statusDot.className = "w-1.5 h-1.5 rounded-full";
+    if (state === "live") {
+      statusPill.classList.add("bg-green-50", "dark:bg-green-900/20", "text-green-800", "dark:text-green-200", "border-green-200", "dark:border-green-800");
+      statusDot.classList.add("bg-green-500", "animate-pulse");
+    } else if (state === "replay") {
+      statusPill.classList.add("bg-blue-50", "dark:bg-blue-900/20", "text-blue-800", "dark:text-blue-200", "border-blue-200", "dark:border-blue-800");
+      statusDot.classList.add("bg-blue-500", "animate-pulse");
+    } else if (state === "error") {
+      statusPill.classList.add("bg-red-50", "dark:bg-red-900/20", "text-red-800", "dark:text-red-200", "border-red-200", "dark:border-red-800");
+      statusDot.classList.add("bg-red-500");
+    } else {
+      statusPill.classList.add("bg-slate-100", "dark:bg-slate-800", "text-slate-700", "dark:text-slate-300", "border-slate-200", "dark:border-slate-700");
+      statusDot.classList.add("bg-slate-400");
+    }
+  }
+
+  // ── Format helpers (mirrors /logs page) ─────────────────────────────
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function statusClass(code) {
+    if (code >= 500) return "text-red-600 dark:text-red-400";
+    if (code >= 400) return "text-yellow-700 dark:text-yellow-300";
+    if (code >= 300) return "text-blue-600 dark:text-blue-400";
+    if (code >= 200) return "text-green-600 dark:text-green-400";
+    return "text-slate-600 dark:text-slate-300";
+  }
+  // Map BotCategory (snake_case from serde) to a small set of CSS
+  // colour tokens. Centralised so the colour scheme is one-edit.
+  function categoryClass(c) {
+    switch (c) {
+      case "search_engine": return "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200";
+      case "ai_bot":         return "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200";
+      case "social":         return "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200";
+      case "monitoring":     return "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200";
+      case "ads_bot":        return "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200";
+      default:               return "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300";
+    }
+  }
+  function formatTime(iso) {
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      const pad = (n, w) => String(n).padStart(w, "0");
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1, 2) + "-" + pad(d.getDate(), 2)
+        + " " + pad(d.getHours(), 2) + ":" + pad(d.getMinutes(), 2) + ":" + pad(d.getSeconds(), 2)
+        + "." + pad(d.getMilliseconds(), 3);
+    } catch (e) { return iso; }
+  }
+  function formatDuration(ms) {
+    const n = Number(ms) || 0;
+    if (n < 1000) return n + " ms";
+    return (n / 1000).toFixed(2) + " s";
+  }
+  // Render the relative "last seen" tag in the top-N table. Cheap
+  // version: show the same local-time string as the live tail.
+  function paintLastSeen() {
+    document.querySelectorAll("[data-last-seen]").forEach(function(el) {
+      const iso = el.getAttribute("data-last-seen");
+      if (iso) el.textContent = formatTime(iso);
+    });
+  }
+
+  // ── Live-tail row builder ────────────────────────────────────────────
+  const tbody = document.getElementById("bots-tbody");
+  const emptyRow = document.getElementById("bots-empty-row");
+  function appendRow(e) {
+    if (!tbody) return;
+    if (emptyRow && emptyRow.parentNode) emptyRow.parentNode.removeChild(emptyRow);
+    const tr = document.createElement("tr");
+    tr.className = "hover:bg-slate-50/60 dark:hover:bg-slate-800/40";
+    tr.innerHTML =
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400">' + escapeHtml(formatTime(e.timestamp)) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100">' + escapeHtml(e.bot_name) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap"><span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ' + categoryClass(e.bot_category) + '">' + escapeHtml(e.bot_category) + '</span></td>' +
+      '<td class="px-4 py-2 whitespace-nowrap font-semibold tabular-nums ' + statusClass(e.status) + '">' + escapeHtml(String(e.status)) + '</td>' +
+      '<td class="px-4 py-2 break-all text-slate-700 dark:text-slate-200" title="' + escapeHtml(e.path) + '">' + escapeHtml(e.path) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="' + escapeHtml(e.host) + '">' + escapeHtml(e.host) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600 dark:text-slate-300">' + escapeHtml(formatDuration(e.duration_ms)) + '</td>' +
+      '<td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden lg:table-cell" title="' + escapeHtml(e.client_ip) + '">' + escapeHtml(e.client_ip) + '</td>';
+    tbody.insertBefore(tr, tbody.firstChild);
+    // Cap visible rows. Same 500-line ceiling as /logs; bot traffic
+    // is sparse so this rarely fires, but the hard cap keeps the
+    // DOM bounded against a sudden burst.
+    const MAX_ROWS = 500;
+    while (tbody.children.length > MAX_ROWS) {
+      tbody.removeChild(tbody.lastChild);
+    }
+  }
+
+  paintLastSeen();
+
+  // ── SSE connection (mirror of /logs but pointing at the bot stream) ─
+  let es = null;
+  function connect() {
+    setStatus("replay", "replaying…");
+    es = new EventSource("/api/logs/bots/stream");
+    es.onopen = function() {
+      // Replay frames arrive synchronously with open; flip to "live"
+      // immediately — the operator can tell the difference only via
+      // the devtools log, and the replay→live transition is rare in
+      // practice.
+      setStatus("live", "live");
+    };
+    es.onerror = function() {
+      // EventSource auto-retries; surface so the operator knows.
+      setStatus("error", "disconnected");
+    };
+    es.onmessage = function(ev) {
+      // Same shape handling as the access-log stream: ignore
+      // non-JSON comment frames (`: replay: done`, `: lagged N events`,
+      // `: closed`) by failing the parse.
+      let entry = null;
+      try { entry = JSON.parse(ev.data); } catch (e) { return; }
+      if (!entry || typeof entry !== "object") return;
+      if (typeof entry.bot_name !== "string" || typeof entry.path !== "string") return;
+      appendRow(entry);
+    };
+  }
+  connect();
+})();
+</script>
+{% endblock %}

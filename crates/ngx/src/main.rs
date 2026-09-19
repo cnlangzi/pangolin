@@ -176,6 +176,10 @@ fn main() -> anyhow::Result<()> {
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
         ];
 
+        // `ServiceContext` takes ownership of the `App`; keep a
+        // clone so we can still drive the bot-log writer's graceful
+        // shutdown after `drain_services` returns.
+        let app_for_shutdown = app.clone();
         let ctx = runtime::ServiceContext::new(app, shutdown.clone());
 
         let mut handles = Vec::with_capacity(services.len());
@@ -188,6 +192,15 @@ fn main() -> anyhow::Result<()> {
         log::info!("shutdown signalled, draining host services");
 
         runtime::drain_services(handles).await;
+
+        // Bot log JSONL writer flush. After `drain_services` the
+        // pingora worker has stopped emitting access log entries, so
+        // the bot fan-out (driven by `App::push_access_log`) has gone
+        // quiet. Signal the background writer to perform a final
+        // drain and exit; without this the most-recent bot entries
+        // would sit in the queue until the runtime drops.
+        app_for_shutdown.shutdown_bot_writer();
+
         Ok::<(), anyhow::Error>(())
     });
 

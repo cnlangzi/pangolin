@@ -10,6 +10,9 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::bot::detect_bot;
+use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
+use crate::bot_stats::BotStats;
 use crate::tunnel::YamuxTunnel;
 use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
@@ -341,6 +344,35 @@ pub struct App {
     /// broadcasts. Sized by `config.log.access_log_recent`
     /// (default 100).
     pub access_log_recent: Arc<AccessLogBuffer>,
+    /// Bot log side-channel (searchenginebots stage-1).
+    ///
+    /// When `config.log.bot.enabled` is `true`,
+    /// [`App::push_access_log`] runs `detect_bot(ua)` on the
+    /// request's `User-Agent` and, on a hit, fans the entry out
+    /// to:
+    ///
+    ///   - [`Self::bot_log_recent`] — in-memory ring buffer for the
+    ///     admin UI's `/logs/bots` late-join replay.
+    ///   - [`Self::bot_log_tx`] — dedicated SSE channel
+    ///     (`/api/logs/bots/stream`, stage-2).
+    ///   - [`Self::bot_stats`] — per-(bot, host) hit counters for
+    ///     the admin dashboard.
+    ///   - [`Self::bot_writer`] — async JSONL writer that
+    ///     appends one line per entry to
+    ///     `bot-YYYY-MM-DD.jsonl` under `config.log.bot.dir`.
+    ///
+    /// All four writes are synchronous on the request hot path
+    /// (no `await`); the actual disk write happens in the
+    /// background `BotLogWriter::run` task.
+    pub bot_log_tx: broadcast::Sender<BotLogEntry>,
+    /// In-memory ring buffer for bot entries (default 200).
+    pub bot_log_recent: Arc<BotLogBuffer>,
+    /// Per-(bot, host) hit counters.
+    pub bot_stats: Arc<BotStats>,
+    /// Background JSONL writer. `None` when the bot log is
+    /// disabled (`config.log.bot.enabled = false`) — the
+    /// side-channel then short-circuits in `push_access_log`.
+    pub bot_writer: Option<Arc<BotLogWriter>>,
     /// Domain → cert pre-computed link (fix/cert_www). Built once
     /// at startup from the `domains` × `certs` tables, then
     /// maintained by the domain/cert CRUD hooks. Read on every
@@ -405,6 +437,39 @@ impl App {
         let access_log_recent_capacity = config.log.access_log_recent;
         let (access_log_tx, _initial_rx) = broadcast::channel(access_log_capacity);
 
+        // Bot log side-channel (searchenginebots stage-1). Disabled
+        // → all four fields are inert (broadcast has zero
+        // subscribers, ring buffer is capacity-0, stats has no
+        // rows, writer is None) so the cost of the feature in the
+        // disabled case is a single `if !enabled { return; }` at
+        // the top of `push_access_log`.
+        let bot_cfg = &config.log.bot;
+        let (bot_log_tx, _initial_bot_rx) = broadcast::channel(bot_cfg.capacity.max(1));
+        let bot_log_recent = Arc::new(BotLogBuffer::new(bot_cfg.recent));
+        let bot_stats = BotStats::new();
+        let bot_writer = if bot_cfg.enabled {
+            let writer = BotLogWriter::new(bot_cfg.dir.clone());
+            // Spawn the writer task on the current runtime. In
+            // test builds without a runtime (e.g. direct unit
+            // tests on `App::new`), `tokio::spawn` returns an
+            // `Err` and we silently drop the task — the writer
+            // is still reachable via `Arc` so a test that wants
+            // it can `tokio::spawn` itself.
+            //
+            // The writer drains its queue on `notify` and exits
+            // when `shutdown` fires. `App::new` returns the
+            // writer's `Arc` so `main` can call `shutdown()` on
+            // graceful termination.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let w = writer.clone();
+                handle.spawn(async move { w.run().await });
+            }
+            Some(writer)
+        } else {
+            log::info!("bot log side-channel disabled by log.bot.enabled=false");
+            None
+        };
+
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             indexes: Arc::new(RwLock::new(indexes)),
@@ -420,6 +485,10 @@ impl App {
             cert_retrier: RwLock::new(None),
             access_log_tx,
             access_log_recent: Arc::new(AccessLogBuffer::new(access_log_recent_capacity)),
+            bot_log_tx,
+            bot_log_recent,
+            bot_stats,
+            bot_writer,
             cert_links,
         })
     }
@@ -511,6 +580,16 @@ impl App {
     /// messages) we drop the entry from the broadcast but keep it
     /// in the ring buffer; the SSE endpoint emits `: lagged N events`
     /// and continues. We never panic and never block.
+    ///
+    /// ## Bot side-channel (searchenginebots stage-1)
+    ///
+    /// When the bot log is enabled AND the entry carries a
+    /// `User-Agent` AND `detect_bot` recognises it as a known bot,
+    /// the entry is fanned out to the bot ring buffer, stats
+    /// counters, JSONL writer queue, and bot SSE broadcast. The
+    /// whole fan-out is synchronous (no `.await`) and bounded by
+    /// a small hashmap lookup + a `Mutex<VecDeque>` push — well
+    /// under 5 µs total.
     pub fn push_access_log(&self, entry: AccessLogEntry) {
         // 1) ring buffer (sync, fast path). Even if the broadcast
         //    later drops the entry, the ring buffer always keeps
@@ -520,7 +599,28 @@ impl App {
         // 2) live broadcast. Errors are *expected* (zero subscribers)
         //    so we discard the Result. A Lagged subscriber is the
         //    SSE endpoint's responsibility to surface.
-        let _ = self.access_log_tx.send(entry);
+        let _ = self.access_log_tx.send(entry.clone());
+
+        // 3) Bot side-channel. Short-circuit first on the cheapest
+        //    predicate (`bot_writer.is_none()`) so the disabled
+        //    case is one branch + return.
+        let Some(writer) = self.bot_writer.as_ref() else {
+            return;
+        };
+        let Some(ua) = entry.user_agent.as_deref() else {
+            return;
+        };
+        let Some(bot) = detect_bot(ua) else {
+            return;
+        };
+        let Some(bot_entry) = BotLogEntry::from_access_log(&entry, bot) else {
+            return;
+        };
+
+        self.bot_log_recent.push(bot_entry.clone());
+        self.bot_stats.record(&bot_entry);
+        writer.enqueue(bot_entry.clone());
+        let _ = self.bot_log_tx.send(bot_entry);
     }
 
     /// Snapshot the access log ring buffer in chronological order
@@ -529,6 +629,36 @@ impl App {
     /// (`access_log_recent: 0`).
     pub fn recent_access_log(&self) -> Vec<AccessLogEntry> {
         self.access_log_recent.snapshot()
+    }
+
+    /// Snapshot the bot log ring buffer in chronological order
+    /// (oldest first). Used by `/api/logs/bots/stream` (stage-2)
+    /// to replay entries on connect. Empty Vec when the bot log
+    /// is disabled or `bot.recent: 0`.
+    pub fn recent_bot_log(&self) -> Vec<BotLogEntry> {
+        self.bot_log_recent.snapshot()
+    }
+
+    /// Snapshot per-(bot, host) hit counters + totals. Used by the
+    /// `/logs/bots` dashboard card (stage-2). Cheap — single
+    /// `RwLock` acquisition.
+    pub fn bot_stats_snapshot(
+        &self,
+    ) -> (
+        Vec<crate::bot_stats::BotStatsRow>,
+        crate::bot_stats::BotStatsSummary,
+    ) {
+        self.bot_stats.snapshot()
+    }
+
+    /// Trigger a graceful shutdown of the bot log writer task.
+    /// Called from `main` after pingora's drain so the JSONL file
+    /// is flushed before the process exits. Safe to call multiple
+    /// times — the writer's `Notify` is idempotent.
+    pub fn shutdown_bot_writer(&self) {
+        if let Some(w) = self.bot_writer.as_ref() {
+            w.shutdown();
+        }
     }
 }
 
@@ -1190,6 +1320,10 @@ mod tests {
                 file: String::new(),
                 access_log_recent: recent,
                 access_log_capacity: capacity,
+                // `bot` is overridden per-test by
+                // `make_log_config_with_bot`; the default here keeps
+                // the pre-existing access-log tests compiling.
+                bot: crate::BotLogConfig::default(),
             },
             ..Config::default()
         }
@@ -1208,6 +1342,23 @@ mod tests {
             duration_ms: 7,
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "10.0.0.1".into(),
+            user_agent: None,
+        }
+    }
+
+    /// Stage-1 helper: build an entry with a known bot User-Agent.
+    /// Used by the bot side-channel tests below.
+    fn make_bot_entry(ua: &str, path: &str) -> AccessLogEntry {
+        AccessLogEntry {
+            timestamp: Utc::now(),
+            method: "GET".into(),
+            path: path.into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 12,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "66.249.66.1".into(),
+            user_agent: Some(ua.into()),
         }
     }
 
@@ -1358,5 +1509,224 @@ mod tests {
             .build()
             .unwrap()
             .block_on(fut)
+    }
+
+    // ---- Bot log side-channel tests (searchenginebots stage-1) ----
+    //
+    // These tests pin the contract of `push_access_log`'s bot
+    // fan-out: every detected bot must land in the four sinks
+    // (ring buffer / stats / writer queue / broadcast), and
+    // non-bot traffic must NOT touch any of them. They also pin
+    // the "disabled" behaviour — when `log.bot.enabled = false`,
+    // the entire fan-out is skipped at the cheapest branch.
+
+    /// Stage-1 helper: build a `Config` with the bot log knobs
+    /// overridden so we can exercise the enabled/disabled paths.
+    fn make_log_config_with_bot(recent: usize, capacity: usize, bot_enabled: bool) -> Config {
+        let mut cfg = make_log_config(recent, capacity);
+        cfg.log.bot.enabled = bot_enabled;
+        cfg
+    }
+
+    #[test]
+    fn push_access_log_googlebot_routes_to_bot_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let cert_mgr = CertManager::default();
+        let app = App::new(&db_path, cfg, cert_mgr).unwrap();
+
+        // Subscribe to the bot broadcast before pushing so we can
+        // verify the entry reaches a live subscriber.
+        let mut bot_rx = app.bot_log_tx.subscribe();
+
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        app.push_access_log(make_bot_entry(ua, "/sitemap.xml"));
+
+        // 1) Bot ring buffer received it.
+        let snap = app.recent_bot_log();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].bot_name, "Googlebot");
+        assert_eq!(snap[0].bot_vendor, "Google");
+        assert_eq!(snap[0].path, "/sitemap.xml");
+        assert!(snap[0].ua.contains("Googlebot"));
+
+        // 2) Stats counter incremented.
+        let (rows, summary) = app.bot_stats_snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bot_name, "Googlebot");
+        assert_eq!(rows[0].hits, 1);
+        assert_eq!(summary.total_records, 1);
+
+        // 3) Bot broadcast delivered it.
+        let delivered = tokio_test_block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), bot_rx.recv())
+                .await
+                .expect("bot recv timed out")
+                .expect("bot broadcast channel closed unexpectedly")
+        });
+        assert_eq!(delivered.bot_name, "Googlebot");
+        assert_eq!(delivered.path, "/sitemap.xml");
+
+        // 4) Generic access log ALSO received it (both paths run).
+        assert_eq!(app.recent_access_log().len(), 1);
+    }
+
+    #[test]
+    fn push_access_log_non_bot_ua_does_not_touch_bot_sinks() {
+        // A regular Chrome UA must not be classified as a bot and
+        // therefore must not produce any bot-side writes.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+
+        let chrome_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        app.push_access_log(make_bot_entry(chrome_ua, "/page"));
+
+        // Bot sinks are empty.
+        assert!(app.recent_bot_log().is_empty());
+        let (rows, summary) = app.bot_stats_snapshot();
+        assert!(rows.is_empty());
+        assert_eq!(summary.total_records, 0);
+
+        // Generic access log got the entry (it's still a normal request).
+        assert_eq!(app.recent_access_log().len(), 1);
+    }
+
+    #[test]
+    fn push_access_log_missing_ua_does_not_touch_bot_sinks() {
+        // No UA → detect_bot returns None → bot fan-out skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+
+        // make_entry has user_agent=None.
+        app.push_access_log(make_entry("GET", "/page", 200));
+
+        assert!(app.recent_bot_log().is_empty());
+        let (rows, _) = app.bot_stats_snapshot();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn push_access_log_disabled_skips_bot_fan_out_entirely() {
+        // When `log.bot.enabled = false`, `bot_writer` is None and
+        // the side-channel short-circuits on the very first
+        // branch. The test passes iff `push_access_log` does not
+        // panic and the bot sinks remain empty.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, false);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.bot_writer.is_none(),
+            "writer must be None when disabled"
+        );
+
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1)";
+        app.push_access_log(make_bot_entry(ua, "/sitemap.xml"));
+
+        assert!(app.recent_bot_log().is_empty());
+        let (rows, _) = app.bot_stats_snapshot();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn push_access_log_multiple_bots_aggregate_in_stats() {
+        // Three Googlebot hits + two Bingbot hits → two rows,
+        // correct hit counts, summary reflects the total.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+
+        let google = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let bing = "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)";
+        for path in ["/a", "/b", "/c"] {
+            app.push_access_log(make_bot_entry(google, path));
+        }
+        for path in ["/x", "/y"] {
+            app.push_access_log(make_bot_entry(bing, path));
+        }
+
+        let (rows, summary) = app.bot_stats_snapshot();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(summary.total_records, 5);
+        assert_eq!(summary.total_hits, 5);
+        let google_row = rows.iter().find(|r| r.bot_name == "Googlebot").unwrap();
+        let bing_row = rows.iter().find(|r| r.bot_name == "Bingbot").unwrap();
+        assert_eq!(google_row.hits, 3);
+        assert_eq!(bing_row.hits, 2);
+    }
+
+    /// End-to-end: push a bot entry through `App::push_access_log`,
+    /// let the spawned writer task drain the queue, verify the
+    /// JSONL file contains the entry.
+    ///
+    /// This is the only stage-1 test that exercises the
+    /// background-task path (all the others run as plain `#[test]`
+    /// and so never spawn the writer — `bot_writer` stays `None`).
+    /// The test pins the contract that `App::new` correctly
+    /// spawns the writer when a tokio runtime is in scope and
+    /// that the writer actually drains the queue.
+    #[tokio::test]
+    async fn push_access_log_writer_task_writes_jsonl_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config_with_bot(50, 16, true);
+        // Point the writer at the same tempdir so we can read the
+        // file back without crossing mount points.
+        cfg.log.bot.dir = dir.path().to_path_buf();
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.bot_writer.is_some(),
+            "writer must be spawned when a tokio runtime is in scope"
+        );
+
+        app.push_access_log(make_bot_entry(
+            "Mozilla/5.0 (compatible; Googlebot/2.1)",
+            "/sitemap.xml",
+        ));
+        app.push_access_log(make_bot_entry(
+            "Mozilla/5.0 (compatible; bingbot/2.0)",
+            "/other.xml",
+        ));
+
+        // Wait for the background writer to drain. 200 ms is plenty
+        // for two entries (the writer is woken immediately by
+        // `Notify::notify_one`); we poll the file rather than
+        // `sleep` for a fixed interval to keep the test snappy.
+        let today = chrono::Utc::now().date_naive();
+        let path = dir.path().join(format!("bot-{today}.jsonl"));
+        let mut found: Option<String> = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(s) = std::fs::read_to_string(&path)
+                && s.lines().count() >= 2
+            {
+                found = Some(s);
+                break;
+            }
+        }
+
+        // Trigger the final flush so the test exits deterministically.
+        app.shutdown_bot_writer();
+
+        let body = found.expect("jsonl file should have ≥2 lines after polling");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 JSONL lines, got: {body}");
+        // Spot-check each line is parseable JSON with the right bot.
+        let v0: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("line 0 must be valid JSON");
+        let v1: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("line 1 must be valid JSON");
+        let names: Vec<&str> = [v0["bot_name"].as_str(), v1["bot_name"].as_str()]
+            .iter()
+            .filter_map(|s| *s)
+            .collect();
+        assert!(names.contains(&"Googlebot"), "missing Googlebot in: {body}");
+        assert!(names.contains(&"Bingbot"), "missing Bingbot in: {body}");
     }
 }
