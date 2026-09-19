@@ -495,11 +495,12 @@ pub static BOT_RULES: &[(&str, BotIdentity)] = &[
 /// Returns `Some(BotIdentity)` if `ua` (case-insensitively) contains
 /// any of the substrings in [`BOT_RULES`]; `None` otherwise.
 ///
-/// The check is allocation-cheap: at most one `to_ascii_lowercase`
-/// allocation per call (for UAs > 12 bytes; shorter UAs are scanned
-/// in-place via `eq_ignore_ascii_case`). v1 fully trusts the
-/// client-supplied UA — a future iteration may add an optional
-/// reverse-DNS verification for `SearchEngine` bots.
+/// Implementation: a length pre-check (UAs < 12 bytes can't be a
+/// real bot), one `to_ascii_lowercase` allocation per call (~1 µs
+/// for a typical 100-byte UA), then a linear scan over the
+/// ~50-entry rule table. v1 fully trusts the client-supplied UA —
+/// a future iteration may add an optional reverse-DNS verification
+/// for `SearchEngine` bots.
 pub fn detect_bot(ua: &str) -> Option<BotIdentity> {
     // Fast reject: empty or unusually short UA can't be a real bot.
     // Real bot UAs are at least ~20 bytes (`Mozilla/5.0 ... bot ...`).
