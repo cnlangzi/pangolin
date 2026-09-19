@@ -129,47 +129,60 @@ impl BotStats {
     /// tick so operators see the saturation in the dashboard.
     /// Hits on already-known pairs continue to update normally
     /// (the common case where one bot hammers a few hosts).
+    ///
+    /// Lock discipline: the warn-log on cap-saturation runs
+    /// **after** releasing the write guard so a slow stderr
+    /// (file-backed logger, journald socket, etc.) can't stall
+    /// every other `record()` writer or `snapshot()` reader.
     pub fn record(&self, entry: &BotLogEntry) {
-        let mut g = self.inner.write();
-        let key = RowKey {
-            bot_name: entry.bot_name,
-            host: entry.host.clone(),
-        };
-        if let Some(row) = g.rows.get_mut(&key) {
-            // Hot path: known (bot, host) — just bump counters.
-            row.hits += 1;
-            row.last_seen = entry.timestamp;
-            g.total_records += 1;
-            return;
-        }
-        // Cold path: new pair. Respect the cap.
-        if g.rows.len() >= MAX_UNIQUE_PAIRS {
-            g.total_records += 1;
-            g.dropped_unique_cap += 1;
-            // Log every Nth drop so a saturated `bot_log` doesn't
-            // drown the stderr in noise — once per 1000 events is
-            // enough for an operator to see the trend.
-            if g.dropped_unique_cap % 1000 == 1 {
-                log::warn!(
-                    "bot_stats: dropped {} (bot, host) rows since startup; \
-                     unique-pair cap = {MAX_UNIQUE_PAIRS}. Use the JSONL \
-                     stream (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) for full \
-                     visibility.",
-                    g.dropped_unique_cap
+        // Cold-path outcome (saturated cap) needs a separate
+        // signal because we can't log under the lock.
+        let mut should_warn = false;
+
+        {
+            let mut g = self.inner.write();
+            let key = RowKey {
+                bot_name: entry.bot_name,
+                host: entry.host.clone(),
+            };
+            if let Some(row) = g.rows.get_mut(&key) {
+                // Hot path: known (bot, host) — just bump counters.
+                row.hits += 1;
+                row.last_seen = entry.timestamp;
+                g.total_records += 1;
+            } else if g.rows.len() >= MAX_UNIQUE_PAIRS {
+                // Cold path, saturated cap.
+                g.total_records += 1;
+                g.dropped_unique_cap += 1;
+                // Capture the rate-limit trigger under the lock;
+                // the actual log fires after the guard drops so
+                // a slow stderr doesn't stall concurrent readers.
+                if g.dropped_unique_cap % 1000 == 1 {
+                    should_warn = true;
+                }
+            } else {
+                // Cold path, new pair.
+                g.rows.insert(
+                    key,
+                    RowData {
+                        bot_vendor: entry.bot_vendor,
+                        bot_category: entry.bot_category,
+                        hits: 1,
+                        last_seen: entry.timestamp,
+                    },
                 );
+                g.total_records += 1;
             }
-            return;
         }
-        g.rows.insert(
-            key,
-            RowData {
-                bot_vendor: entry.bot_vendor,
-                bot_category: entry.bot_category,
-                hits: 1,
-                last_seen: entry.timestamp,
-            },
-        );
-        g.total_records += 1;
+
+        if should_warn {
+            log::warn!(
+                "bot_stats: (bot, host) cap {MAX_UNIQUE_PAIRS} reached; \
+                 further unique pairs will be counted but not stored. \
+                 Use the JSONL stream (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) \
+                 for full visibility."
+            );
+        }
     }
 
     /// Number of records dropped because the unique-pair cap was
