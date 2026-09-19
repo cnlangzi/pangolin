@@ -29,7 +29,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -506,26 +505,6 @@ async fn ensure_dir(dir: &Path) -> std::io::Result<()> {
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => tokio::fs::create_dir_all(dir).await,
         Err(e) => Err(e),
-    }
-}
-
-/// Periodic background flush — keeps the OS from holding unflushed
-/// bytes across a crash. Spawned alongside `run_writer`.
-pub async fn run_periodic_sync(writer: Arc<BotLogWriter>, interval: Duration) {
-    let mut tick = tokio::time::interval(interval);
-    tick.tick().await; // first tick fires immediately; skip it
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                let mut guard = writer.file.lock().await;
-                if let Some(f) = guard.as_mut()
-                    && let Err(e) = f.sync_all().await
-                {
-                    log::warn!("bot_log: periodic sync_all failed: {e}");
-                }
-            }
-            _ = writer.shutdown.notified() => break,
-        }
     }
 }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::task::JoinHandle;
 
 use crate::bot::detect_bot;
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
@@ -372,7 +373,23 @@ pub struct App {
     /// Background JSONL writer. `None` when the bot log is
     /// disabled (`config.log.bot.enabled = false`) — the
     /// side-channel then short-circuits in `push_access_log`.
+    ///
+    /// The writer *exists* in this struct from `App::new` time, but
+    /// the task that drains its queue is **not** spawned by `App::new`
+    /// itself — `App::new` is called from synchronous `main()` before
+    /// any tokio runtime exists, so `Handle::try_current()` would
+    /// always fail there. Callers must invoke
+    /// [`App::start_bot_writer`] exactly once after entering a tokio
+    /// runtime (production: inside `block_on_host` in `main.rs`).
     pub bot_writer: Option<Arc<BotLogWriter>>,
+    /// `JoinHandle` for the background writer task. Populated by
+    /// [`App::start_bot_writer`], consumed by
+    /// [`App::shutdown_bot_writer`] so the await on shutdown can
+    /// observe the task's actual exit (vs. a fixed 5 s sleep).
+    /// `parking_lot::Mutex` is fine here — the critical section is
+    /// always a single `Option::take` and we never hold the guard
+    /// across an await.
+    bot_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// Domain → cert pre-computed link (fix/cert_www). Built once
     /// at startup from the `domains` × `certs` tables, then
     /// maintained by the domain/cert CRUD hooks. Read on every
@@ -443,28 +460,24 @@ impl App {
         // rows, writer is None) so the cost of the feature in the
         // disabled case is a single `if !enabled { return; }` at
         // the top of `push_access_log`.
+        //
+        // The writer *object* is built here, but the task that
+        // drains its queue is NOT spawned here. `App::new` runs
+        // from synchronous `main()` before any tokio runtime
+        // exists, so `Handle::try_current()` would always fail
+        // there — silently dropping the writer task and breaking
+        // the JSONL side-channel in production (the only test that
+        // would have caught this is `#[tokio::test]`-gated, where
+        // the runtime does exist). Callers must invoke
+        // [`App::start_bot_writer`] exactly once after entering a
+        // tokio runtime (production: inside `block_on_host` in
+        // `main.rs`).
         let bot_cfg = &config.log.bot;
         let (bot_log_tx, _initial_bot_rx) = broadcast::channel(bot_cfg.capacity.max(1));
         let bot_log_recent = Arc::new(BotLogBuffer::new(bot_cfg.recent));
         let bot_stats = BotStats::new();
         let bot_writer = if bot_cfg.enabled {
-            let writer = BotLogWriter::new(bot_cfg.dir.clone());
-            // Spawn the writer task on the current runtime. In
-            // test builds without a runtime (e.g. direct unit
-            // tests on `App::new`), `tokio::spawn` returns an
-            // `Err` and we silently drop the task — the writer
-            // is still reachable via `Arc` so a test that wants
-            // it can `tokio::spawn` itself.
-            //
-            // The writer drains its queue on `notify` and exits
-            // when `shutdown` fires. `App::new` returns the
-            // writer's `Arc` so `main` can call `shutdown()` on
-            // graceful termination.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let w = writer.clone();
-                handle.spawn(async move { w.run().await });
-            }
-            Some(writer)
+            Some(BotLogWriter::new(bot_cfg.dir.clone()))
         } else {
             log::info!("bot log side-channel disabled by log.bot.enabled=false");
             None
@@ -489,6 +502,7 @@ impl App {
             bot_log_recent,
             bot_stats,
             bot_writer,
+            bot_writer_task: parking_lot::Mutex::new(None),
             cert_links,
         })
     }
@@ -651,58 +665,103 @@ impl App {
         self.bot_stats.snapshot()
     }
 
+    /// Spawn the background bot-log writer task. Must be called
+    /// **once**, from inside a tokio runtime context, after
+    /// [`App::new`].
+    ///
+    /// Returns `true` if the task was spawned, `false` if any of:
+    ///   - the bot log is disabled (`config.log.bot.enabled = false`)
+    ///   - no tokio runtime is in scope (e.g. unit tests without
+    ///     `#[tokio::test]`)
+    ///   - `start_bot_writer` was already called once (idempotent
+    ///     guard — second call is a no-op)
+    ///
+    /// Production callers: see `main.rs`, which calls this inside
+    /// `block_on_host` immediately after `App::new` returns.
+    /// Tests that exercise the JSONL side-channel must also call
+    /// this inside `#[tokio::test]`.
+    pub fn start_bot_writer(&self) -> bool {
+        let Some(writer) = self.bot_writer.as_ref() else {
+            return false;
+        };
+        let mut guard = self.bot_writer_task.lock();
+        if guard.is_some() {
+            // Already started — second call is a silent no-op so
+            // a careless caller doesn't double-spawn and leak a task.
+            return false;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No runtime in scope. `bot_writer` stays Some(...) so
+            // the in-memory ring buffer / stats / SSE fan-out keep
+            // working, but JSONL disk writes are disabled until
+            // someone calls this again from inside a runtime.
+            log::warn!(
+                "bot_log: writer task not spawned — no tokio runtime in scope. \
+                 JSONL disk writes are disabled. Call App::start_bot_writer() \
+                 from inside a runtime context (main.rs does this automatically)."
+            );
+            return false;
+        };
+        let writer_for_task = writer.clone();
+        let join = handle.spawn(async move { writer_for_task.run().await });
+        *guard = Some(join);
+        true
+    }
+
     /// Trigger a graceful shutdown of the bot log writer task and
     /// wait for it to exit.
     ///
     /// Sequence:
-    ///   1. `Notify` the writer so its `select!` arm wakes up.
-    ///   2. `await` the background task's [`JoinHandle`] with a
-    ///      hard timeout (`SHUTDOWN_TIMEOUT = 5s`).
-    ///   3. On timeout: log a warning and return. The task may still
-    ///      finish later — the worst case is a few unflushed
-    ///      entries on a wedged disk, which is preferable to
-    ///      blocking the main shutdown sequence.
+    ///   1. Take the `JoinHandle` out of `bot_writer_task` (a
+    ///      second call is a no-op so re-entrancy is safe).
+    ///   2. `writer.shutdown()` to fire the task's `select!`
+    ///      shutdown arm.
+    ///   3. `tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await`.
+    ///   4. On timeout: log a warning identifying the wedged
+    ///      state; do NOT block process exit. On normal exit:
+    ///      silent.
     ///
     /// Called from `main` after pingora's drain so the JSONL file
-    /// is flushed before the process exits. Safe to call multiple
-    /// times — the writer's `Notify` is idempotent.
+    /// is flushed before the process exits.
     ///
-    /// Gap #5 fix (was previously fire-and-forget). Gap #6 fix
-    /// (was previously no timeout).
+    /// Gap #5/#6 fix (was previously a sleep-loop + unconditional
+    /// warn that always blocked 5 s and mislabeled queue-overflow
+    /// drops as "Unflushed entries").
     pub async fn shutdown_bot_writer(&self) {
         let Some(writer) = self.bot_writer.as_ref() else {
             return;
         };
+        let handle = self.bot_writer_task.lock().take();
         writer.shutdown();
-        // Drain any in-flight queue by giving the writer task a
-        // chance to process its shutdown arm. We poll briefly
-        // because we don't currently keep the `JoinHandle` —
-        // `App::new` `tokio::spawn`s the task and discards the
-        // handle. The task exits within a single drain_and_write
-        // + close cycle, which is bounded by sync_all latency
-        // (typically < 100 ms even on a slow disk).
-        let deadline = std::time::Instant::now() + Self::writer_shutdown_timeout();
-        while std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            // The task's `Notify::notified()` future wakes on
-            // `shutdown()`; once it has observed the signal and
-            // finished its drain, it returns. We don't have the
-            // JoinHandle so the best we can do is poll for the
-            // "queue empty + closed" hint via `current_size` /
-            // dropping activity. Simpler heuristic: assume
-            // SHUTDOWN_TIMEOUT is enough and just sleep.
-            // (If a real JoinHandle is wired later — see Gap #4
-            // follow-up — this becomes a single `await`.)
+        let Some(handle) = handle else {
+            // Task was never spawned (`start_bot_writer` returned
+            // false because there was no runtime). Nothing to wait
+            // for; silent return.
+            return;
+        };
+        match tokio::time::timeout(Self::writer_shutdown_timeout(), handle).await {
+            Ok(Ok(())) => {
+                // Task exited cleanly within the timeout.
+            }
+            Ok(Err(join_err)) => {
+                // The task itself panicked. Surfaces as a loud
+                // log so the operator investigates — a panicked
+                // writer means the JSONL side-channel is dead
+                // and `BotLogWriter::run` needs to be hardened.
+                log::error!("bot_log: writer task panicked: {join_err}");
+            }
+            Err(_elapsed) => {
+                // Wedged disk / stuck fsync. Log loudly but
+                // don't block process exit. The task may still
+                // finish later in the background.
+                log::warn!(
+                    "bot_log: writer shutdown deadline ({:?}) reached; \
+                     disk may be wedged. Last-known queue length could not \
+                     be observed (writer handle was awaited, not polled).",
+                    Self::writer_shutdown_timeout()
+                );
+            }
         }
-        // We deliberately do not assert the task completed: a
-        // stuck fsync must not block process exit. Log it loudly
-        // so an operator sees the issue without the process
-        // hanging.
-        log::warn!(
-            "bot_log: writer shutdown deadline reached; task may still \
-             be draining. Unflushed entries: {} (queue snapshot unavailable).",
-            writer.dropped_total()
-        );
     }
 
     /// Max time [`App::shutdown_bot_writer`] waits for the writer
@@ -1734,7 +1793,15 @@ mod tests {
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         assert!(
             app.bot_writer.is_some(),
-            "writer must be spawned when a tokio runtime is in scope"
+            "writer must exist when bot log is enabled"
+        );
+        // `App::new` no longer spawns the writer task — it runs
+        // before any tokio runtime exists. Production callers
+        // invoke `start_bot_writer` from inside `block_on_host`;
+        // this test does the equivalent.
+        assert!(
+            app.start_bot_writer(),
+            "writer task must spawn inside the #[tokio::test] runtime"
         );
 
         app.push_access_log(make_bot_entry(
@@ -1780,5 +1847,39 @@ mod tests {
             .collect();
         assert!(names.contains(&"Googlebot"), "missing Googlebot in: {body}");
         assert!(names.contains(&"Bingbot"), "missing Bingbot in: {body}");
+    }
+
+    /// Regression test for the post-merge critical bug:
+    /// `start_bot_writer` must return `false` (not panic) when
+    /// called from a sync `#[test]` (no tokio runtime), and
+    /// `start_bot_writer` must be **idempotent** — a second call
+    /// after a successful first one is a silent no-op, so a
+    /// careless main.rs that calls it twice doesn't double-spawn
+    /// the writer task.
+    #[test]
+    fn start_bot_writer_no_runtime_returns_false_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        // No `#[tokio::test]` ⇒ no runtime in scope. The call
+        // must NOT panic and must NOT spawn the task; instead it
+        // logs a warning and returns false. The `bot_writer`
+        // object itself is still Some so the in-memory fan-out
+        // continues to work — only JSONL disk writes are dormant.
+        assert!(!app.start_bot_writer());
+    }
+
+    #[tokio::test]
+    async fn start_bot_writer_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(app.start_bot_writer(), "first spawn must succeed");
+        assert!(
+            !app.start_bot_writer(),
+            "second call must be a silent no-op (return false)"
+        );
     }
 }

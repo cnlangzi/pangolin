@@ -182,6 +182,17 @@ fn main() -> anyhow::Result<()> {
         let app_for_shutdown = app.clone();
         let ctx = runtime::ServiceContext::new(app, shutdown.clone());
 
+        // Spawn the bot-log JSONL writer task. Must happen
+        // **inside** the tokio runtime — `App::new` runs from
+        // synchronous `main()` before the runtime exists, so
+        // it can't spawn the task itself. Without this call, the
+        // bot-side-channel `bot-YYYY-MM-DD.jsonl` file is never
+        // written in production (a bug fixed in the post-merge
+        // review). Returns `true` on success; we ignore the bool
+        // and let `shutdown_bot_writer` be a silent no-op when
+        // disabled (so the call is always safe).
+        app_for_shutdown.start_bot_writer();
+
         let mut handles = Vec::with_capacity(services.len());
         for svc in services.into_iter() {
             handles.push(runtime::spawn_service(svc, ctx.clone()));
