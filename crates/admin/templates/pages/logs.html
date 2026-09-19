@@ -69,7 +69,7 @@
             <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
             <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
             <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-72">User-Agent</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase trackingider w-32 hidden xl:table-cell">Client</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
           </tr>
         </thead>
         <tbody id="logs-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
@@ -89,9 +89,12 @@
 </main>
 
 <style>
-  /* ── User-Agent cell: button toggles between truncated preview #}
-    `truncate` and full word-broken text. Class is toggled by #}
-    the inline `onclick` handler; no JS module needed.       #}
+  /* User-Agent cell: button toggles between truncated preview
+     (`.ua-preview`) and full word-broken text (`.ua-full`).
+     The class is toggled by the inline click handler; no JS
+     module needed. The accent color is hardcoded because this
+     is an inline `<style>` (Tailwind's `theme()` only resolves
+     through the PostCSS pipeline, not in SSR-served HTML). */
   .ua-toggle {
     display: block;
     width: 100%;
@@ -108,7 +111,7 @@
   .ua-toggle:hover { background-color: rgba(15, 23, 42, 0.04); }
   .dark .ua-toggle:hover { background-color: rgba(255, 255, 255, 0.04); }
   .ua-toggle:focus-visible {
-    outline: 2px solid theme('colors.accent.500');
+    outline: 2px solid #F59E0B;
     outline-offset: 1px;
   }
   .ua-toggle .ua-preview {
@@ -176,7 +179,8 @@
     const slice = s.slice(0, UA_PREVIEW_CHARS);
     const lastSpace = slice.lastIndexOf(" ");
     // If there's no space in the first 50 chars (a single very-long
-    // token), truncate without ellipsis rather than mid-word.
+    // token), truncate at the boundary with an ellipsis appended at
+    // the end of the long token.
     if (lastSpace <= 0) return slice + "…";
     return slice.slice(0, lastSpace) + "…";
   }
@@ -227,8 +231,10 @@
   // network round-trip). `title` attribute on the button
   // also surfaces the full UA on hover for non-touch users.
   function uaCellHtml(ua) {
-    const full = ua ? escapeHtml(ua) : '<span class="text-slate-400 dark:text-slate-500 font-sans">—</span>';
-    if (!ua) return '<td class="px-4 py-2 text-slate-400 dark:text-slate-500 font-sans">—</td>';
+    if (!ua) {
+      return '<td class="px-4 py-2 text-slate-400 dark:text-slate-500 font-sans">—</td>';
+    }
+    const full = escapeHtml(ua);
     const preview = escapeHtml(uaPreview(ua));
     return '<td class="px-4 py-2 align-top">' +
       '<button class="ua-toggle" type="button" title="' + full + '" aria-expanded="false">' +

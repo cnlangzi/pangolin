@@ -191,8 +191,9 @@
     if (n < 1000) return n + " ms";
     return (n / 1000).toFixed(2) + " s";
   }
-  // Render the relative "last seen" tag in the top-N table. Cheap
-  // version: show the same local-time string as the live tail.
+  // Render the absolute local "last seen" timestamp in the top-N
+  // table. Cheap implementation: show the same local-time string
+  // as the live tail.
   function paintLastSeen() {
     document.querySelectorAll("[data-last-seen]").forEach(function(el) {
       const iso = el.getAttribute("data-last-seen");
