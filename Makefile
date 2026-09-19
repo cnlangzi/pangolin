@@ -48,18 +48,20 @@ require-env:
 		exit 1; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
 	@echo "  make env-show      # Print effective vars loaded from .env"
 	@echo ""
 	@echo "=== Build ==="
-	@echo "  make build         # Local build ngx + tun (release)"
+	@echo "  make build         # Local build ngx + tun (release, unminified UI)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-ui      # Build admin UI CSS + JS bundles (Tailwind + esbuild)"
-	@echo "  make build-dist    # Docker build, export to build/output/"
+	@echo "  make build-ui      # Build admin UI CSS (unminified, dev — no esbuild)"
+	@echo "  make build-ui-prod # Build admin UI CSS + JS (minified, for production)"
+	@echo "  make dev-ui        # Watch templates + assets, rebuild UI on save"
+	@echo "  make build-dist    # Docker build with minified UI, export to build/output/"
 	@echo "  make dist          # Same as build-dist"
 	@echo ""
 	@echo "=== Local Run ==="
@@ -97,6 +99,17 @@ OUT_DIR ?= ./bin
 # unset) so CI builds that relocate the target dir still produce
 # binaries that the `mv` steps below can find.
 CARGO_TARGET_DIR ?= ./target
+
+# Admin UI asset pipeline — single source of truth at the repo root.
+# Tracked inputs (`tailwindcss.css`, `app.js`) live in `$(ASSETS_DIR)`;
+# generated outputs (`app.css`, `app.min.js`) are gitignored and produced
+# by the targets below. Dev skips minification; `build-ui-prod` and the
+# Docker `builder` stage run with `--minify`.
+ASSETS_DIR        := ./assets
+TAILWIND_INPUT    := $(ASSETS_DIR)/tailwindcss.css
+TAILWIND_OUTPUT   := $(ASSETS_DIR)/app.css
+ESBUILD_INPUT     := $(ASSETS_DIR)/app.js
+ESBUILD_OUTPUT    := $(ASSETS_DIR)/app.min.js
 
 # Output binary basenames (built from cargo crates `ngx` and `tun`).
 # Single source of truth so `clean` doesn't silently rot when a new
@@ -194,28 +207,57 @@ download-ui-tools:
 		echo "  esbuild downloaded"; \
 	fi
 
-# Build admin UI CSS and JS bundles.
+# Dev UI build — unminified, no esbuild.
+# `assets/app.js` has no imports, so the raw source is browser-ready; the
+# binary serves it via `PANGOLIN_ADMIN_JS=raw` (or via the js_bytes()
+# fallback when `app.min.js` is missing). Fast (~50ms tailwind run), no
+# docker setup needed.
 build-ui: download-ui-tools
-	@echo "Building admin UI CSS..."
-	bin/tailwindcss -i ./crates/admin/templates/public/tailwindcss.css -o ./crates/admin/templates/public/app.css --minify
-	@echo "Building admin UI JS bundle..."
-	bin/esbuild ./crates/admin/templates/public/app.js --bundle --minify --format=esm --target=es2020 --outfile=./crates/admin/templates/public/app.min.js
-	@echo "  build-ui done"
+	@echo "Building admin UI CSS (unminified, dev)..."
+	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT)
+	@echo "  build-ui done → $(TAILWIND_OUTPUT)"
+	@echo "  (run with: PANGOLIN_ADMIN_JS=raw ./bin/pangolin-ngx, or rely on the js_bytes() fallback)"
+
+# Prod UI build — minified Tailwind output + minified esbuild bundle.
+# Called by `build-dist`; also usable standalone for `make install-ngx` when
+# you want a minified production binary without the Docker pipeline.
+build-ui-prod: download-ui-tools
+	@echo "Building admin UI CSS (minified)..."
+	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT) --minify
+	@echo "Building admin UI JS bundle (minified)..."
+	@if [ -f $(ESBUILD_INPUT) ]; then \
+		bin/esbuild $(ESBUILD_INPUT) --bundle --minify --format=esm \
+			--target=es2020 --outfile=$(ESBUILD_OUTPUT); \
+		echo "  build-ui-prod done → $(TAILWIND_OUTPUT) + $(ESBUILD_OUTPUT)"; \
+	else \
+		echo "  build-ui-prod done → $(TAILWIND_OUTPUT) (no $(ESBUILD_INPUT), skipping esbuild)"; \
+	fi
+
+# Dev watch — rebuild CSS on save, then hand off to the runner. Foreground;
+# Ctrl-C to stop. Designed to be combined with `cargo run` in another
+# terminal (debug-embed re-reads `assets/` on every request).
+dev-ui: download-ui-tools
+	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT) --watch
 
 # Base image (`docker.io/imlangzi/yaitoo:rust-npm`) is a pre-built shared
 # dependency — Debian 12 + Rust toolchain + Node + pnpm + standalone
 # tailwindcss/esbuild CLIs.  It lives on docker.io, not in this repo.
 # `dist` just layers cargo-chef + cargo-config + project crates on top
-# (see build/docker/dist.dockerfile for the full pipeline).
-build-dist: dist
+# (see build/docker/dist.dockerfile for the full pipeline). The Docker
+# `builder` stage re-runs the UI build with `--minify`; depending on
+# `build-ui-prod` here keeps the local `./assets/app.min.js` consistent
+# with what the binary gets embedded.
+build-dist: build-ui-prod dist
 
 dist:
 	./build/dist.sh
 
 # Keep downloaded CLIs (./bin/tailwindcss, ./bin/esbuild); restored by
-# download-ui-tools. Only strip locally-built outputs.
+# download-ui-tools. Only strip locally-built outputs (cargo + generated
+# UI bundles + docker export dir).
 clean:
 	rm -rf ./build/output
+	rm -f $(TAILWIND_OUTPUT) $(ESBUILD_OUTPUT)
 	$(CARGO) clean
 
 # ── Lint / Test ──────────────────────────────────────────────────────────────
