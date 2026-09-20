@@ -57,10 +57,11 @@ async fn system_config_get_returns_defaults() {
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // V7 seeds the row with frontend_mode='direct' and
-    // trusted_headers='["X-Real-IP"]'.
+    // V7 seeds the row with frontend_mode='direct' and an EMPTY
+    // trusted_headers list — the column is irrelevant in direct
+    // mode (the resolver only consults it under custom_lb).
     assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
-    assert_eq!(body["trusted_headers"], serde_json::json!(["X-Real-IP"]));
+    assert_eq!(body["trusted_headers"], serde_json::json!([]));
     // updated_at is RFC-3339.
     let s = body["updated_at"].as_str().expect("updated_at string");
     assert!(

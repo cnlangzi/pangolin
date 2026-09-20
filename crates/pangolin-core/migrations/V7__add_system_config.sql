@@ -18,19 +18,22 @@
 -- ## frontend_mode values
 --
 --   'direct'     -- TCP peer is the visitor. Use session.client_addr(),
---                    stripped of port.
+--                    stripped of port. `trusted_headers` is ignored.
 --   'cloudflare' -- CF is in front. Use the CF-Connecting-IP header,
 --                    falling back to the peer if the header is missing.
+--                    `trusted_headers` is ignored.
 --   'custom_lb'  -- Operator-configured ordered list of header names;
 --                    first present + non-empty value wins. The list
---                    lives in trusted_headers (JSON-encoded TEXT). When
---                    frontend_mode='custom_lb' the list must be non-empty;
---                    the resolver falls back to the peer if none match.
+--                    lives in trusted_headers (JSON-encoded TEXT). The
+--                    admin POST handler validates that the list is
+--                    non-empty when this mode is selected; if it is
+--                    ever read as empty the resolver expands it to
+--                    `["X-Real-IP"]` as a built-in safety net.
 --
 -- trusted_headers is consulted only when frontend_mode='custom_lb'.
--- The default value `["X-Real-IP"]` is the resolver's fallback when
--- the list is empty (the row can never be empty in practice because
--- the migration seeds it with this default).
+-- The default value `[]` (empty array) matches the 'direct' mode that
+-- the row is seeded with: in direct mode the column is irrelevant,
+-- and an empty literal makes it obvious that no headers are trusted.
 --
 -- ## Bootstrap
 --
@@ -43,9 +46,9 @@ CREATE TABLE IF NOT EXISTS system_config (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     frontend_mode   TEXT    NOT NULL DEFAULT 'direct'
         CHECK (frontend_mode IN ('direct', 'cloudflare', 'custom_lb')),
-    trusted_headers TEXT    NOT NULL DEFAULT '["X-Real-IP"]',
+    trusted_headers TEXT    NOT NULL DEFAULT '[]',
     updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 INSERT OR IGNORE INTO system_config (id, frontend_mode, trusted_headers)
-VALUES (1, 'direct', '["X-Real-IP"]');
+VALUES (1, 'direct', '[]');

@@ -1928,10 +1928,20 @@ mod tests {
         // `get_system_config` (the App::new/reload_indexes fallback
         // path exists for defensive coverage but should not fire
         // in practice).
+        //
+        // The default row carries frontend_mode='direct' and an
+        // EMPTY trusted_headers list — the column is irrelevant in
+        // direct mode, and the empty literal makes the default
+        // unambiguous (vs. the misleading `["X-Real-IP"]` value
+        // shipped by an earlier draft).
         let conn = make_conn();
         let cfg = get_system_config(&conn).expect("system_config row exists post-V7");
         assert_eq!(cfg.frontend_mode, FrontendMode::Direct);
-        assert_eq!(cfg.trusted_headers, vec!["X-Real-IP".to_string()]);
+        assert!(
+            cfg.trusted_headers.is_empty(),
+            "default trusted_headers must be empty in direct mode, got {:?}",
+            cfg.trusted_headers
+        );
     }
 
     #[test]
