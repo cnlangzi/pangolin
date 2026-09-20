@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
@@ -78,6 +78,7 @@ help:
 	@echo "  make start-tun     # Build + run ./bin/pangolin-tun (foreground, no sudo)"
 	@echo "  make install-ngx   # Install + start ngx as systemd service (sudo)"
 	@echo "  make install-tun   # Install + start tun as systemd service (sudo)"
+	@echo "  make stop          # Stop dev-mode processes holding pangolin ports (lsof, SIGTERM→SIGKILL)"
 	@echo "  make stop-ngx      # Stop ngx systemd service"
 	@echo "  make stop-tun      # Stop tun systemd service"
 	@echo "  make status-ngx    # Check ngx systemd status"
@@ -383,6 +384,48 @@ stop-ngx:
 stop-tun:
 	sudo systemctl stop pangolin-tun || true
 	@echo "tun stopped"
+
+# Stop any pangolin processes holding the standard listener ports
+# (8080 / 8443 for ngx HTTP+HTTPS, 9001 for the tunnel WS endpoint,
+# 9081 for the admin UI). Detection is port-based — `lsof -ti
+# tcp:PORT -sTCP:LISTEN` — so:
+#   - We never accidentally kill a systemd-managed `pangolin-tun`
+#     or `pangolin-ngx` instance, which is what `stop-ngx` /
+#     `stop-tun` are for (those use `sudo systemctl stop ...`).
+#   - We catch anything holding the ports, even if the binary was
+#     renamed or moved.
+# SIGTERM first; SIGKILL after $(STOP_TIMEOUT)s for anyone still
+# alive (e.g. a service that ignores SIGTERM).
+STOP_PORTS := 8000 8443 9001 9081
+STOP_TIMEOUT := 3
+
+stop:
+	@echo "Stopping processes holding pangolin ports ($(STOP_PORTS))..."
+	@PIDS=""; \
+	for port in $(STOP_PORTS); do \
+		holders=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null || true); \
+		if [ -n "$$holders" ]; then \
+			echo "  port $$port held by PID(s): $$holders"; \
+			PIDS="$$PIDS $$holders"; \
+		fi; \
+	done; \
+	PIDS=$$(echo $$PIDS | tr ' ' '\n' | sort -u | grep -v '^$$' || true); \
+	if [ -z "$$PIDS" ]; then \
+		echo "  ✓ nothing to stop"; \
+		exit 0; \
+	fi; \
+	echo "  → SIGTERM: $$PIDS"; \
+	echo "$$PIDS" | xargs -r kill 2>/dev/null || true; \
+	sleep $(STOP_TIMEOUT); \
+	leftover=""; \
+	for pid in $$PIDS; do \
+		if kill -0 $$pid 2>/dev/null; then leftover="$$leftover $$pid"; fi; \
+	done; \
+	if [ -n "$$leftover" ]; then \
+		echo "  → SIGKILL (still alive):$$leftover"; \
+		echo "$$leftover" | xargs -r kill -9 2>/dev/null || true; \
+	fi; \
+	echo "  ✓ stopped"
 
 status-ngx:
 	@systemctl is-active pangolin-ngx || true
