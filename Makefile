@@ -8,12 +8,11 @@ TOOLCHAIN := 1.96
 APP_NAME := pangolin
 
 # ── .env auto-loading ────────────────────────────────────────────────────
-# `.env` is git-ignored; `.env.example` is the tracked template with
-# the same shape plus sane defaults. When `.env` is missing we fall
-# back to `.env.example` so `make start-ngx` (and friends) work
-# out-of-the-box on a fresh clone without forcing a manual
-# `cp .env.example .env`. Copy `.env` only when you actually want
-# to override a value.
+# `.env` is git-ignored; `.env.example` is the tracked template.
+# `.env` is **optional** — `make start-ngx` works on a fresh clone
+# without it: when the file is missing, `ENV_LOAD` is empty and the
+# binary boots with its compiled-in defaults. Copy `.env` only when
+# you actually want to override a value.
 #
 # Two layers of integration:
 #
@@ -33,11 +32,12 @@ APP_NAME := pangolin
 # semantics: existing env-vars override vars set in the file).
 ENV_FILE := .env
 ifeq ($(wildcard $(ENV_FILE)),)
-# No local `.env` — fall back to the tracked `.env.example` so the
-# binary boots with its template defaults. `ENV_FILE` keeps its
-# `.env` label below so the warning text stays stable.
-ENV_LOAD := set -a; . $(CURDIR)/.env.example; set +a;
-ENV_FROM_EXAMPLE := 1
+# No local `.env` — recipes prepend an empty `$(ENV_LOAD)` and the
+# binary uses its compiled-in defaults. No fallback to `.env.example`:
+# that file is a template the operator is expected to inspect and
+# curate, not a silent source of prod-bound defaults.
+ENV_LOAD :=
+ENV_FROM_EXAMPLE :=
 else
 # `$(CURDIR)/$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves
 # it as a path instead of searching `$PATH` — otherwise
@@ -49,20 +49,19 @@ include $(ENV_FILE)
 export
 endif
 
-# Soft notice for the "no .env, using .env.example" case. Non-fatal —
-# `make start-ngx` continues with the template defaults. Operators
-# who want to override a value copy `.env` and edit; this notice
-# tells them where the defaults came from.
+# Soft notice when `.env` is missing. Non-fatal — `make start-ngx`
+# continues with the binary's compiled-in defaults. Operators who
+# want to override a value copy `.env.example` to `.env` and edit.
 warn-env-fallback:
-	@if [ -n "$(ENV_FROM_EXAMPLE)" ]; then \
-		echo "  ℹ no .env found; using .env.example defaults (copy to .env to override)" >&2; \
+	@if [ ! -f $(ENV_FILE) ]; then \
+		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
 .PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
-	@echo "  make env-show      # Print effective vars loaded from .env (or .env.example if .env missing)"
+	@echo "  make env-show      # Print vars loaded from .env (or show .env.example template if .env missing)"
 	@echo ""
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release, unminified UI)"
@@ -344,14 +343,15 @@ start-tun: build-tun warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-tun
 
 # Debug helper: show which env vars are being injected. Useful for
-# "why isn't my .env value reaching the binary?" questions.
+# "why isn't my .env value reaching the binary?" questions. With no
+# `.env`, prints the template's contents as a starting point.
 env-show: warn-env-fallback
-	@if [ -n "$(ENV_FROM_EXAMPLE)" ]; then \
-		echo "Loaded from .env.example (no .env in $(CURDIR)):"; \
-		grep -vE '^[[:space:]]*(#|$$)' $(CURDIR)/.env.example | sed 's/^/  /'; \
-	else \
+	@if [ -f $(ENV_FILE) ]; then \
 		echo "Loaded from $(ENV_FILE):"; \
 		grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'; \
+	else \
+		echo "No $(ENV_FILE) — binary uses compiled-in defaults. Template ($(CURDIR)/.env.example):"; \
+		grep -vE '^[[:space:]]*(#|$$)' $(CURDIR)/.env.example | sed 's/^/  /'; \
 	fi
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
