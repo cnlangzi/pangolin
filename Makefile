@@ -8,26 +8,36 @@ TOOLCHAIN := 1.96
 APP_NAME := pangolin
 
 # ── .env auto-loading ────────────────────────────────────────────────────
-# `.env` is git-ignored; `.env.example` is the tracked template.
+# `.env` is git-ignored; `.env.example` is the tracked template with
+# the same shape plus sane defaults. When `.env` is missing we fall
+# back to `.env.example` so `make start-ngx` (and friends) work
+# out-of-the-box on a fresh clone without forcing a manual
+# `cp .env.example .env`. Copy `.env` only when you actually want
+# to override a value.
+#
 # Two layers of integration:
 #
-#   (a) `-include .env`  — make itself parses the file, so
+#   (a) `include $(ENV_FILE)` — make itself parses the file, so
 #       `$(ngx_admin_password)` works in any recipe line below.
 #       This is for *make-level* expansion only (currently unused
 #       in recipes, but keeps `.env` discoverable from `make -p`).
 #
-#   (b) `env-load` target — prints `export FOO=bar ...` so a recipe
-#       can prepend `$(ENV_LOAD)` and have every var from `.env`
-#       reach the subprocess. Ansible picks them up automatically
-#       (host facts from env), and the Rust binaries pick them up
-#       via their existing `NGX_*` / `TUN_*` env-override layer
-#       (see the mapping table in `.env.example`).
+#   (b) `ENV_LOAD` — when prepended to a recipe (`$(ENV_LOAD) ./bin/...`),
+#       sources the env file in a subshell so every var reaches the
+#       subprocess. Ansible picks them up automatically (host facts
+#       from env), and the Rust binaries pick them up via their
+#       existing `NGX_*` / `TUN_*` env-override layer (see the mapping
+#       table in `.env.example`).
 #
-# Already-exported shell vars win over `.env` (make's `-include`
+# Already-exported shell vars win over `.env` (make's `include`
 # semantics: existing env-vars override vars set in the file).
 ENV_FILE := .env
 ifeq ($(wildcard $(ENV_FILE)),)
-ENV_LOAD :=
+# No local `.env` — fall back to the tracked `.env.example` so the
+# binary boots with its template defaults. `ENV_FILE` keeps its
+# `.env` label below so the warning text stays stable.
+ENV_LOAD := set -a; . $(CURDIR)/.env.example; set +a;
+ENV_FROM_EXAMPLE := 1
 else
 # `$(CURDIR)/$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves
 # it as a path instead of searching `$PATH` — otherwise
@@ -39,20 +49,20 @@ include $(ENV_FILE)
 export
 endif
 
-# Fail-loud guard for targets that need $(ENV_FILE) to be present.
-# Used as a prerequisite by every target that consumes $(ENV_LOAD) so
-# the error wording and exit behavior stay consistent.
-require-env:
-	@if [ ! -f $(ENV_FILE) ]; then \
-		echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; \
-		exit 1; \
+# Soft notice for the "no .env, using .env.example" case. Non-fatal —
+# `make start-ngx` continues with the template defaults. Operators
+# who want to override a value copy `.env` and edit; this notice
+# tells them where the defaults came from.
+warn-env-fallback:
+	@if [ -n "$(ENV_FROM_EXAMPLE)" ]; then \
+		echo "  ℹ no .env found; using .env.example defaults (copy to .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
-	@echo "  make env-show      # Print effective vars loaded from .env"
+	@echo "  make env-show      # Print effective vars loaded from .env (or .env.example if .env missing)"
 	@echo ""
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release, unminified UI)"
@@ -314,10 +324,10 @@ play: play-ngx play-tun
 # subsequently-defined variable in the ansible-playbook process as
 # auto-exported too. The final `&&` chain runs ansible-playbook
 # *after* the subshell exits and we've `cd`'d into the playbooks dir.
-play-ngx: require-env
+play-ngx: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts
 
-play-tun: require-env
+play-tun: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
 
 # ── Local Run (no sudo) ───────────────────────────────────────────────────────
@@ -327,17 +337,22 @@ play-tun: require-env
 # `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
-start-ngx: build-ui build-ngx require-env
+start-ngx: build-ui build-ngx warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-ngx
 
-start-tun: build-tun require-env
+start-tun: build-tun warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-tun
 
 # Debug helper: show which env vars are being injected. Useful for
 # "why isn't my .env value reaching the binary?" questions.
-env-show: require-env
-	@echo "Loaded from $(ENV_FILE):"
-	@grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'
+env-show: warn-env-fallback
+	@if [ -n "$(ENV_FROM_EXAMPLE)" ]; then \
+		echo "Loaded from .env.example (no .env in $(CURDIR)):"; \
+		grep -vE '^[[:space:]]*(#|$$)' $(CURDIR)/.env.example | sed 's/^/  /'; \
+	else \
+		echo "Loaded from $(ENV_FILE):"; \
+		grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'; \
+	fi
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
