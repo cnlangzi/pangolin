@@ -39,7 +39,7 @@ use crate::error::{PangolinError, Result};
 pub struct Config {
     // ── Proxy listen (top level: this file IS the proxy config) ────────
     /// HTTP / HTTPS listen addresses (full `host:port` strings).
-    /// Defaults to `0.0.0.0:8080` + `0.0.0.0:8443` so a non-root
+    /// Defaults to `0.0.0.0:8000` + `0.0.0.0:8443` so a non-root
     /// developer can run `make start-ngx` straight from a fresh clone
     /// without sudo or a `.env`. Production hosts that bind the
     /// privileged ports set `addr.http` / `addr.https` to `:80` /
@@ -83,7 +83,7 @@ pub struct AddrConfig {
 }
 
 fn default_http_addr() -> String {
-    "0.0.0.0:8080".into()
+    "0.0.0.0:8000".into()
 }
 fn default_https_addr() -> String {
     "0.0.0.0:8443".into()
@@ -551,13 +551,13 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        // addr defaults — must be 0.0.0.0:8080 + 0.0.0.0:8443 so a
+        // addr defaults — must be 0.0.0.0:8000 + 0.0.0.0:8443 so a
         // non-root developer can run the binary straight from a
         // fresh clone. Privileged ports (80/443) are reserved for
         // production hosts that set them explicitly in their YAML
         // config. A regression to 127.0.0.1 would silently bind
         // loopback and exclude remote clients.
-        assert_eq!(c.addr.http, "0.0.0.0:8080");
+        assert_eq!(c.addr.http, "0.0.0.0:8000");
         assert_eq!(c.addr.https, "0.0.0.0:8443");
         // tunnel default — must be 0.0.0.0:9001 so a multi-host
         // deploy (tun on a separate host) works out of the box.
@@ -589,7 +589,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             let c = Config::from_str("").unwrap();
-            assert_eq!(c.addr.http, "0.0.0.0:8080");
+            assert_eq!(c.addr.http, "0.0.0.0:8000");
             assert_eq!(c.addr.https, "0.0.0.0:8443");
             // v2: cert.autorenew removed; no global ACME toggle to assert
             assert_eq!(c.acme.key_type, "ecdsa");
@@ -645,7 +645,7 @@ mod tests {
                   https: ":0"
             "#;
             let c = Config::from_str(s).unwrap();
-            assert_eq!(c.addr.http, "0.0.0.0:8080"); // default
+            assert_eq!(c.addr.http, "0.0.0.0:8000"); // default
             assert_eq!(c.addr.https, ":0"); // disabled
             Ok(())
         });

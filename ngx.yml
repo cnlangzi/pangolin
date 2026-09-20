@@ -44,13 +44,13 @@
 # ─────────────────────────────────────────────────────────────────────────
 
 # ── Proxy listen (top level: this file IS the proxy config) ──────────────
-# Full host:port strings. The Rust defaults are 0.0.0.0:8080 +
+# Full host:port strings. The Rust defaults are 0.0.0.0:8000 +
 # 0.0.0.0:8443 so a fresh-clone `make start-ngx` works without
 # sudo. Production hosts that bind the privileged ports override
 # to 0.0.0.0:80 / 0.0.0.0:443 here (or via NGX_ADDR__HTTP /
 # NGX_ADDR__HTTPS env vars).
 addr:
-  http: 0.0.0.0:8080    # HTTP listen addr
+  http: 0.0.0.0:8000    # HTTP listen addr
   https: 0.0.0.0:8443   # HTTPS listen addr; ":0" = disable TLS entirely
 host: null              # virtual host for per-domain cert resolution
                         # (null = "default" → ./certs/default/...)
