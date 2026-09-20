@@ -21,6 +21,27 @@
     </div>
   </div>
 
+  {# Sub-nav (stage-3). Two tabs: Live (this page, SSE tail)
+     and History (the `/logs/bots/history` JSONL query page).
+     Same visual treatment as the top-level nav so the two
+     levels read as one hierarchy. #}
+  <div class="mb-6 border-b border-slate-200 dark:border-slate-700">
+    <nav class="flex gap-6 -mb-px">
+      <a href="/logs/bots" class="px-1 py-2 text-sm font-medium border-b-2 transition-colors
+        {% if active_subnav == "live" %}
+          border-accent-500 text-accent-600 dark:text-accent-400
+        {% else %}
+          border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200
+        {% endif %}">Live</a>
+      <a href="/logs/bots/history" class="px-1 py-2 text-sm font-medium border-b-2 transition-colors
+        {% if active_subnav == "history" %}
+          border-accent-500 text-accent-600 dark:text-accent-400
+        {% else %}
+          border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200
+        {% endif %}">History</a>
+    </nav>
+  </div>
+
   {# ── Summary card (server-rendered) ─────────────────────────────────── #}
   {# On first paint the dashboard should show useful state, not a #}
   {# "no bots detected yet" skeleton. The top-N table + summary #}

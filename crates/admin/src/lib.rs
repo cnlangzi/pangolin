@@ -222,6 +222,9 @@ pub async fn handle(
         }
         ("logs", "GET") => routes::logs::render(&app, &csrf_token).await?,
         ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token).await?,
+        ("logs/bots/history", "GET") => {
+            routes::logs::render_bots_history(&app, &csrf_token, &merged_params).await?
+        }
         ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
         ("certs/new", "POST") => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
@@ -310,6 +313,15 @@ pub async fn handle(
                     } else {
                         not_found()
                     }
+                } else if rest == "bots/history" {
+                    // GET /api/bots/history — HTMX fragment endpoint for
+                    // the `/logs/bots/history` filter form. Returns
+                    // just the `#bots-history-result` region (summary +
+                    // table + pagination) so the surrounding page shell
+                    // (sub-nav, date sidebar, form) stays put. Same
+                    // query semantics as the page handler — both go
+                    // through `build_history_page`.
+                    routes::logs::api_bots_history(&app, &merged_params).await?
                 } else if let Some(domain) = rest.strip_prefix("domains/") {
                     if method == "DELETE" {
                         if domain.is_empty() {

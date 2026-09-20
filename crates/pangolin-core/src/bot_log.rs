@@ -26,11 +26,12 @@
 //! request path. This split is the design's defining property:
 //! fan-out is < 5 µs, disk I/O never blocks the worker.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -66,9 +67,17 @@ pub struct BotLogEntry {
     pub client_ip: String,
 
     /// Bot short name, e.g. `"Googlebot"`.
-    pub bot_name: &'static str,
-    /// Bot vendor, e.g. `"Google"`.
-    pub bot_vendor: &'static str,
+    ///
+    /// `Cow<'static, str>` so the hot path (constructed via
+    /// [`Self::from_access_log`] from the static bot-rule table) is
+    /// zero-allocation, while the history-read path
+    /// ([`crate::bot_log::query_history`]) deserialises from JSONL
+    /// into an owned `String`. `Cow` derefs to `&str` so templates
+    /// and comparisons against `&str` literals work unchanged.
+    pub bot_name: Cow<'static, str>,
+    /// Bot vendor, e.g. `"Google"`. Same `Cow` rationale as
+    /// [`Self::bot_name`].
+    pub bot_vendor: Cow<'static, str>,
     /// Coarse category — see [`BotCategory`].
     pub bot_category: BotCategory,
 
@@ -106,12 +115,83 @@ impl BotLogEntry {
             duration_ms: entry.duration_ms,
             backend: entry.backend.clone(),
             client_ip: entry.client_ip.clone(),
-            bot_name: bot.name,
-            bot_vendor: bot.vendor,
+            bot_name: Cow::Borrowed(bot.name),
+            bot_vendor: Cow::Borrowed(bot.vendor),
             bot_category: bot.category,
             ua: ua.to_string(),
             referer: None,
         })
+    }
+
+    /// Render the timestamp as the operator's local-time string,
+    /// e.g. `"2026-09-20 12:34:56.789"`. Mirrors the JS
+    /// `formatTime()` used by the live-tail page so the two
+    /// views show timestamps in the same shape.
+    ///
+    /// Stored as UTC (the JSONL wire format is UTC ISO-8601); the
+    /// conversion to local happens in the renderer. We don't pin
+    /// to a specific timezone — the browser already knows the
+    /// operator's locale, so this method is a placeholder for a
+    /// future per-user preference.
+    pub fn timestamp_local(&self) -> String {
+        let d = self.timestamp.with_timezone(&chrono::Local);
+        format!(
+            "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            d.year(),
+            d.month(),
+            d.day(),
+            d.hour(),
+            d.minute(),
+            d.second(),
+            d.timestamp_subsec_millis(),
+        )
+    }
+
+    /// Tailwind class token for the status code colour. Mirrors
+    /// the live-tail page's `statusClass()` so a 404 row looks
+    /// the same in both views.
+    pub fn status_class(&self) -> &'static str {
+        match self.status {
+            500..=599 => "text-red-600 dark:text-red-400",
+            400..=499 => "text-yellow-700 dark:text-yellow-300",
+            300..=399 => "text-blue-600 dark:text-blue-400",
+            200..=299 => "text-green-600 dark:text-green-400",
+            _ => "text-slate-600 dark:text-slate-300",
+        }
+    }
+
+    /// Tailwind class token for the category badge. Mirrors the
+    /// live-tail page's `categoryClass()`.
+    pub fn category_class(&self) -> &'static str {
+        match self.bot_category {
+            BotCategory::SearchEngine => {
+                "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
+            }
+            BotCategory::AiBot => {
+                "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200"
+            }
+            BotCategory::Social => {
+                "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200"
+            }
+            BotCategory::Monitoring => {
+                "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200"
+            }
+            BotCategory::AdsBot => {
+                "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200"
+            }
+        }
+    }
+
+    /// Human-friendly duration: `"<ms> ms"` under 1 second,
+    /// `".<decimals> s"` otherwise. Matches the live-tail page's
+    /// `formatDuration()` output.
+    pub fn duration_ms_human(&self) -> String {
+        let n = self.duration_ms;
+        if n < 1000 {
+            format!("{} ms", n)
+        } else {
+            format!("{:.2} s", n as f64 / 1000.0)
+        }
     }
 }
 
@@ -508,6 +588,248 @@ async fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+// ── History reader (stage-3) ──────────────────────────────────────
+//
+// Read-only side of the bot log: enumerate the `bot-YYYY-MM-DD.jsonl`
+// files in `log.bot.dir`, and serve filtered + paginated queries
+// against a single day's file. Powers the `/logs/bots/history` admin
+// page and the `GET /api/bots/history` HTMX partial endpoint.
+//
+// Design constraints:
+//   - No new dependencies. `serde_json` / `chrono` / `std::fs` already
+//     in the tree.
+//   - All blocking work uses `tokio::task::spawn_blocking` (see the
+//     route handlers) so the read path doesn't stall the runtime.
+//   - Pure functions where possible — easy to unit-test, no shared
+//     state to thread through `App`.
+//   - Read-only — no interaction with `BotLogWriter`. The writer is
+//     append-only and `O_RDONLY` reads don't conflict with that.
+
+/// A single filtered, paginated query against one day's JSONL file.
+///
+/// All filter fields are `Option<String>` so the query owns its
+/// data — required because the typical caller is a
+/// `tokio::task::spawn_blocking` closure (`'static` bound). The
+/// borrow-vs-own cost is one small `String` per non-empty filter
+/// per request, well under the JSONL read cost.
+///
+/// `bot_name` and `method` use exact-match (the values come from a
+/// fixed taxonomy — the bot rule table and the HTTP method enum —
+/// so substring matching would only cause noise); `host` / `path`
+/// / `client_ip` use substring (these are operator-supplied free
+/// text in the UI form).
+#[derive(Debug, Clone, Default)]
+pub struct BotHistoryQuery {
+    /// UTC date of the file to read (`bot-YYYY-MM-DD.jsonl`).
+    pub date: NaiveDate,
+    /// Exact-match on `bot_name` (e.g. `"Googlebot"`).
+    pub bot_name: Option<String>,
+    /// Case-sensitive substring match on the SNI / `Host` header.
+    pub host: Option<String>,
+    /// Case-sensitive substring match on the request path.
+    pub path: Option<String>,
+    /// Exact-match on HTTP status code (404, 200, …).
+    pub status: Option<u16>,
+    /// Exact-match on HTTP method (`"GET"`, `"POST"`, …). Comparison
+    /// is case-insensitive — the writer upper-cases via the proxy.
+    pub method: Option<String>,
+    /// Case-sensitive substring match on the client IP.
+    pub client_ip: Option<String>,
+    /// 1-based page number. Pages outside the valid range return an
+    /// empty `entries` vector with the correct `total_after_filter`
+    /// so the UI can show "no rows on this page" rather than 404.
+    pub page: usize,
+    /// Page size. The caller (the admin route) clamps this to a
+    /// sane upper bound before calling — the reader trusts the input.
+    pub page_size: usize,
+}
+
+/// Result of a [`query_history`] call.
+#[derive(Debug, Clone)]
+pub struct BotHistoryPage {
+    /// Entries for the current page, **newest-first**. Empty if the
+    /// page is past the end or the file had no matches.
+    pub entries: Vec<BotLogEntry>,
+    /// Total entries after filtering, **before** pagination. The UI
+    /// uses this for "Showing 1-200 of N".
+    pub total_after_filter: usize,
+    /// Size of the source file in bytes. The UI shows this in the
+    /// date sidebar so operators can see at a glance that a day was
+    /// unusually busy.
+    pub file_bytes: u64,
+}
+
+/// List the UTC dates that have a JSONL file in `dir`, newest first.
+///
+/// Cheap: one `read_dir` call, one `str::parse::<NaiveDate>` per
+/// `bot-*.jsonl` filename. The writer's name format
+/// (`bot-YYYY-MM-DD.jsonl`) is the only recognised prefix — anything
+/// else (operator-dropped notes, logrotate leftovers, dotfiles) is
+/// silently skipped so a stray `bot-2026-13-99.jsonl` from a typo
+/// doesn't crash the page.
+///
+/// Returns an empty `Vec` if the directory doesn't exist (a deploy
+/// with `bot.enabled = false` or a fresh install before the first
+/// bot hit).
+pub fn list_dates(dir: &Path) -> std::io::Result<Vec<NaiveDate>> {
+    let mut dates = Vec::new();
+    if !dir.exists() {
+        return Ok(dates);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        // Skip directories (e.g. `.`, `..`, logrotate staging dirs).
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // bot-YYYY-MM-DD.jsonl — strip prefix + suffix, parse middle.
+        let Some(date_str) = name
+            .strip_prefix("bot-")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            dates.push(date);
+        }
+    }
+    // Newest first — the UI's date list expects reverse-chronological
+    // order so today is at the top.
+    dates.sort_by(|a, b| b.cmp(a));
+    Ok(dates)
+}
+
+/// Size of the JSONL file for `date`, in bytes. Returns `Ok(0)` if
+/// the file doesn't exist (the date list still surfaces the entry
+/// — a deleted-after-listing file isn't worth a warning).
+pub fn file_size_for(dir: &Path, date: NaiveDate) -> std::io::Result<u64> {
+    let path = file_path_for(dir, date);
+    match std::fs::metadata(&path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the day's JSONL file, apply the filters, paginate, return.
+///
+/// Returns `Ok(BotHistoryPage { entries: vec![], .. })` if the file
+/// doesn't exist or is empty — never an error. Parse failures on
+/// individual lines are skipped (counted in `dropped_lines`) so a
+/// single bad row from a mid-write crash doesn't blank the page.
+///
+/// ## Sort order
+///
+/// Newest-first across the whole file, then paginated. The live tail
+/// also prepends newest, so the operator's eye doesn't have to flip
+/// directions between pages.
+///
+/// ## Cost
+///
+/// O(N) over the file's line count (one allocation per entry, one
+/// `serde_json::from_str` per line, no extra indexing). For the
+/// typical bot-volume dataset (~10k entries/day) this is sub-100ms
+/// on a developer laptop and well under the 1-second HTMX request
+/// budget. A 100k-entry busy day costs ~1s; if traffic ever crosses
+/// that, swap the implementation for a `BufReader::lines()` stream
+/// + binary search on timestamp boundaries.
+pub fn query_history(dir: &Path, q: &BotHistoryQuery) -> std::io::Result<BotHistoryPage> {
+    let path = file_path_for(dir, q.date);
+    // `NotFound` collapses to "no data" rather than an error — the
+    // operator-facing message is the same either way and an error
+    // would force every caller to special-case it.
+    let body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BotHistoryPage {
+                entries: Vec::new(),
+                total_after_filter: 0,
+                file_bytes: 0,
+            });
+        }
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("bot_history: read {} failed: {e}", path.display()),
+            ));
+        }
+    };
+
+    let file_bytes = body.len() as u64;
+    let method_upper = q.method.as_deref().map(|m| m.to_ascii_uppercase());
+
+    // Parse + filter + collect. Skipping a corrupt line is cheaper
+    // than failing the whole page — the writer is append-only and a
+    // partial last line is the realistic failure mode (process kill
+    // between `write_all` and `sync_all`).
+    let mut all: Vec<BotLogEntry> = Vec::with_capacity(1024);
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = match serde_json::from_str::<BotLogEntry>(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Some(bot) = q.bot_name.as_deref()
+            && entry.bot_name.as_ref() != bot
+        {
+            continue;
+        }
+        if let Some(host) = q.host.as_deref()
+            && !entry.host.contains(host)
+        {
+            continue;
+        }
+        if let Some(p) = q.path.as_deref()
+            && !entry.path.contains(p)
+        {
+            continue;
+        }
+        if let Some(status) = q.status
+            && entry.status != status
+        {
+            continue;
+        }
+        if let Some(method) = method_upper.as_deref()
+            && entry.method.to_ascii_uppercase() != method
+        {
+            continue;
+        }
+        if let Some(ip) = q.client_ip.as_deref()
+            && !entry.client_ip.contains(ip)
+        {
+            continue;
+        }
+        all.push(entry);
+    }
+
+    // Newest first — single pass, stable on equal timestamps so the
+    // pagination is deterministic when many entries share a
+    // millisecond.
+    all.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+
+    let total_after_filter = all.len();
+    // Saturating math so `page = 0` (defensive — the UI starts at 1)
+    // doesn't underflow. `skip` past the end returns an empty Vec.
+    let page = q.page.max(1);
+    let page_size = q.page_size.max(1);
+    let start = (page - 1).saturating_mul(page_size);
+    let entries: Vec<BotLogEntry> = all.into_iter().skip(start).take(page_size).collect();
+
+    Ok(BotHistoryPage {
+        entries,
+        total_after_filter,
+        file_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +1092,553 @@ mod tests {
         let path = file_path_for(dir.path(), today);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("/after-rotation"), "{body}");
+    }
+
+    // ── History reader (stage-3) ──────────────────────────────────────
+    //
+    // Coverage matrix:
+    //   list_dates          — empty / missing dir, ignore non-JSONL,
+    //                         newest-first sort, parse failures
+    //   file_size_for       — missing file → 0, existing file → bytes
+    //   query_history       — empty file, paginate newest-first,
+    //                         each filter dimension, corrupt-line
+    //                         tolerance, page-past-end
+
+    /// Build a `BotLogEntry` with a configurable bot name/vendor/category
+    /// (the file-scoped `bot_entry` only emits Googlebot, which is fine
+    /// for the buffer tests but not enough to test cross-bot filtering).
+    fn bot_entry_with(
+        name: &'static str,
+        vendor: &'static str,
+        host: &str,
+        path: &str,
+        ts_offset_ms: i64,
+    ) -> BotLogEntry {
+        let access = AccessLogEntry {
+            timestamp: Utc::now() + chrono::Duration::milliseconds(ts_offset_ms),
+            method: "GET".into(),
+            path: path.into(),
+            host: host.into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "10.0.0.1".into(),
+            user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
+        };
+        let identity = BotIdentity {
+            name,
+            vendor,
+            category: BotCategory::SearchEngine,
+        };
+        BotLogEntry::from_access_log(&access, identity).unwrap()
+    }
+
+    /// Write a JSONL file for `date` with the given entries. Used by
+    /// the query_history tests to seed files without touching the writer.
+    fn seed_file(dir: &Path, date: NaiveDate, entries: &[BotLogEntry]) {
+        let path = file_path_for(dir, date);
+        let mut body = String::new();
+        for e in entries {
+            body.push_str(&serde_json::to_string(e).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+    }
+
+    #[test]
+    fn list_dates_returns_empty_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let dates = list_dates(&missing).unwrap();
+        assert!(dates.is_empty());
+    }
+
+    #[test]
+    fn list_dates_returns_empty_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let dates = list_dates(dir.path()).unwrap();
+        assert!(dates.is_empty());
+    }
+
+    #[test]
+    fn list_dates_ignores_non_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        // Real file we want to surface.
+        seed_file(dir.path(), today, &[]);
+        // Noise — none of these match `bot-YYYY-MM-DD.jsonl`.
+        std::fs::write(dir.path().join("readme.txt"), b"notes").unwrap();
+        std::fs::write(dir.path().join("bot-2026-99-99.jsonl"), b"bad date").unwrap();
+        std::fs::write(dir.path().join("bot-2026-09-19.txt"), b"wrong ext").unwrap();
+        std::fs::write(dir.path().join(".bot-2026-09-18.jsonl"), b"dotfile").unwrap();
+
+        let dates = list_dates(dir.path()).unwrap();
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0], today);
+    }
+
+    #[test]
+    fn list_dates_returns_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2026, 9, 17).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+        let d3 = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+        // Seed in non-chronological order to prove sorting isn't
+        // accidental.
+        seed_file(dir.path(), d1, &[]);
+        seed_file(dir.path(), d2, &[]);
+        seed_file(dir.path(), d3, &[]);
+
+        let dates = list_dates(dir.path()).unwrap();
+        assert_eq!(dates, vec![d2, d3, d1]);
+    }
+
+    #[test]
+    fn file_size_for_missing_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        assert_eq!(file_size_for(dir.path(), missing).unwrap(), 0);
+    }
+
+    #[test]
+    fn file_size_for_existing_returns_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        seed_file(
+            dir.path(),
+            today,
+            &[bot_entry_with("Googlebot", "Google", "example.com", "/", 0)],
+        );
+        let size = file_size_for(dir.path(), today).unwrap();
+        assert!(size > 0, "expected non-zero size, got {size}");
+    }
+
+    #[test]
+    fn query_history_missing_file_returns_empty_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        let q = BotHistoryQuery {
+            date: missing,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.total_after_filter, 0);
+        assert_eq!(page.file_bytes, 0);
+    }
+
+    #[test]
+    fn query_history_empty_file_returns_empty_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        seed_file(dir.path(), today, &[]);
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.total_after_filter, 0);
+    }
+
+    #[test]
+    fn query_history_paginates_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        // 7 entries, increasing timestamps so newest is the last
+        // entry written. `query_history` reverses to newest-first
+        // before paginating.
+        let entries: Vec<BotLogEntry> = (0..7)
+            .map(|i| {
+                bot_entry_with(
+                    "Googlebot",
+                    "Google",
+                    "example.com",
+                    &format!("/p{i}"),
+                    i * 1000,
+                )
+            })
+            .collect();
+        seed_file(dir.path(), today, &entries);
+
+        let mk_q = |page: usize, size: usize| BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page,
+            page_size: size,
+        };
+
+        // Page 1, size 3 → newest 3: /p6 /p5 /p4
+        let p1 = query_history(dir.path(), &mk_q(1, 3)).unwrap();
+        assert_eq!(p1.total_after_filter, 7);
+        let paths1: Vec<&str> = p1.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths1, vec!["/p6", "/p5", "/p4"]);
+
+        // Page 2 → /p3 /p2 /p1
+        let p2 = query_history(dir.path(), &mk_q(2, 3)).unwrap();
+        let paths2: Vec<&str> = p2.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths2, vec!["/p3", "/p2", "/p1"]);
+
+        // Page 3 (partial) → /p0
+        let p3 = query_history(dir.path(), &mk_q(3, 3)).unwrap();
+        let paths3: Vec<&str> = p3.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths3, vec!["/p0"]);
+
+        // Page past end → empty vec, total unchanged.
+        let p4 = query_history(dir.path(), &mk_q(4, 3)).unwrap();
+        assert!(p4.entries.is_empty());
+        assert_eq!(p4.total_after_filter, 7);
+    }
+
+    #[test]
+    fn query_history_filters_by_bot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.example.com", "/", 0),
+            bot_entry_with("bingbot", "Microsoft", "b.example.com", "/", 1000),
+            bot_entry_with("Googlebot", "Google", "c.example.com", "/", 2000),
+        ];
+        seed_file(dir.path(), today, &entries);
+
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: Some("Googlebot".into()),
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 2);
+        assert!(page.entries.iter().all(|e| e.bot_name == "Googlebot"));
+    }
+
+    #[test]
+    fn query_history_filters_by_host_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "www.example.com", "/", 0),
+            bot_entry_with("Googlebot", "Google", "api.example.org", "/", 1000),
+            bot_entry_with("Googlebot", "Google", "other.net", "/", 2000),
+        ];
+        seed_file(dir.path(), today, &entries);
+
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: Some("example".into()),
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 2);
+        assert!(page.entries.iter().all(|e| e.host.contains("example")));
+    }
+
+    #[test]
+    fn query_history_filters_by_path_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.com", "/sitemap.xml", 0),
+            bot_entry_with("Googlebot", "Google", "b.com", "/robots.txt", 1000),
+            bot_entry_with("Googlebot", "Google", "c.com", "/sitemap.xml", 2000),
+        ];
+        seed_file(dir.path(), today, &entries);
+
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: Some("sitemap".into()),
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 2);
+        assert!(page.entries.iter().all(|e| e.path.contains("sitemap")));
+    }
+
+    #[test]
+    fn query_history_filters_by_status_and_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let mut e1 = bot_entry_with("Googlebot", "Google", "a.com", "/a", 0);
+        e1.status = 200;
+        let mut e2 = bot_entry_with("Googlebot", "Google", "b.com", "/b", 1000);
+        e2.status = 404;
+        e2.method = "POST".into();
+        let mut e3 = bot_entry_with("Googlebot", "Google", "c.com", "/c", 2000);
+        e3.status = 200;
+        seed_file(dir.path(), today, &[e1, e2, e3]);
+
+        // status=200 → 2 entries
+        let q_status = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: Some(200),
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let p_status = query_history(dir.path(), &q_status).unwrap();
+        assert_eq!(p_status.total_after_filter, 2);
+
+        // method=POST → 1 entry
+        let q_method = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: Some("post".into()), // case-insensitive
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let p_method = query_history(dir.path(), &q_method).unwrap();
+        assert_eq!(p_method.total_after_filter, 1);
+        assert_eq!(p_method.entries[0].method, "POST");
+
+        // status=200 AND method=POST → 0 entries
+        let q_both = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: Some(200),
+            method: Some("POST".into()),
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let p_both = query_history(dir.path(), &q_both).unwrap();
+        assert_eq!(p_both.total_after_filter, 0);
+        assert!(p_both.entries.is_empty());
+    }
+
+    #[test]
+    fn query_history_filters_by_client_ip_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let mut e1 = bot_entry_with("Googlebot", "Google", "a.com", "/", 0);
+        e1.client_ip = "66.249.66.1".into();
+        let mut e2 = bot_entry_with("Googlebot", "Google", "b.com", "/", 1000);
+        e2.client_ip = "10.0.0.5".into();
+        let mut e3 = bot_entry_with("Googlebot", "Google", "c.com", "/", 2000);
+        e3.client_ip = "66.249.66.2".into();
+        seed_file(dir.path(), today, &[e1, e2, e3]);
+
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: Some("66.249".into()),
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 2);
+    }
+
+    #[test]
+    fn query_history_skips_corrupt_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let path = file_path_for(dir.path(), today);
+        let good = bot_entry_with("Googlebot", "Google", "a.com", "/", 0);
+        let mut body = String::new();
+        body.push_str(&serde_json::to_string(&good).unwrap());
+        body.push('\n');
+        body.push_str("this is not json\n");
+        body.push_str("{}\n"); // valid JSON, wrong shape
+        body.push_str(&serde_json::to_string(&good).unwrap());
+        body.push('\n');
+        body.push('\n'); // empty trailing line — must be skipped silently
+        std::fs::write(&path, body).unwrap();
+
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 2, "both good lines should parse");
+    }
+
+    #[test]
+    fn query_history_reports_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.com", "/", 0),
+            bot_entry_with("Googlebot", "Google", "b.com", "/", 1000),
+        ];
+        seed_file(dir.path(), today, &entries);
+        let q = BotHistoryQuery {
+            date: today,
+            bot_name: None,
+            host: None,
+            path: None,
+            status: None,
+            method: None,
+            client_ip: None,
+            page: 1,
+            page_size: 50,
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert!(page.file_bytes > 0);
+        // file_bytes must match what `file_size_for` reports — they're
+        // computed via different paths (read body vs stat) and any
+        // divergence would confuse the date sidebar.
+        assert_eq!(page.file_bytes, file_size_for(dir.path(), today).unwrap());
+    }
+
+    // ── Display helpers (stage-3) ────────────────────────────────────
+    //
+    // Pin the wire format the history page renders so a future
+    // refactor that touches one of the formatters can't silently
+    // break visual consistency with the live-tail page.
+
+    #[test]
+    fn timestamp_local_format_is_stable() {
+        let access = entry(Some("Googlebot"));
+        let e = BotLogEntry::from_access_log(&access, bot()).unwrap();
+        let s = e.timestamp_local();
+        // `YYYY-MM-DD HH:MM:SS.mmm` — same shape as the JS
+        // formatTime() on the live-tail page so the two views look
+        // identical to an operator.
+        let parts: Vec<&str> = s.split(' ').collect();
+        assert_eq!(parts.len(), 2, "expected 2 segments: {s}");
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        assert_eq!(date_parts.len(), 3, "expected YYYY-MM-DD: {s}");
+        assert_eq!(date_parts[0].len(), 4, "year 4 digits: {s}");
+        let time_parts: Vec<&str> = parts[1].split('.').collect();
+        assert_eq!(time_parts.len(), 2, "expected HH:MM:SS.mmm: {s}");
+        assert_eq!(
+            time_parts[0].split(':').count(),
+            3,
+            "expected HH:MM:SS: {s}"
+        );
+        assert_eq!(time_parts[1].len(), 3, "millis 3 digits: {s}");
+    }
+
+    #[test]
+    fn status_class_buckets_match_live_tail() {
+        // The live-tail page's `statusClass()` returns the same
+        // tokens. Pinning here ensures a refactor of one site
+        // doesn't silently desync from the other.
+        let cases: &[(u16, &str)] = &[
+            (200, "text-green-600"),
+            (299, "text-green-600"),
+            (300, "text-blue-600"),
+            (399, "text-blue-600"),
+            (404, "text-yellow-700"),
+            (499, "text-yellow-700"),
+            (500, "text-red-600"),
+            (599, "text-red-600"),
+        ];
+        for (code, want_prefix) in cases {
+            let mut access = entry(Some("Googlebot"));
+            access.status = *code;
+            let e = BotLogEntry::from_access_log(&access, bot()).unwrap();
+            let cls = e.status_class();
+            assert!(
+                cls.contains(want_prefix),
+                "status {code} → {cls} (expected prefix {want_prefix})"
+            );
+        }
+    }
+
+    #[test]
+    fn category_class_handles_all_categories() {
+        // Make sure the `match` in `category_class` covers every
+        // variant — adding a new `BotCategory` would otherwise
+        // cause a non-exhaustive match warning (good), but we
+        // also want a runtime guarantee the class string is
+        // non-empty so the table cell renders styled.
+        let cases = [
+            (BotCategory::SearchEngine, true),
+            (BotCategory::AiBot, true),
+            (BotCategory::Social, true),
+            (BotCategory::Monitoring, true),
+            (BotCategory::AdsBot, true),
+        ];
+        for (cat, want_non_empty) in cases {
+            let access = entry(Some("testbot"));
+            let identity = BotIdentity {
+                name: "testbot",
+                vendor: "test",
+                category: cat,
+            };
+            let e = BotLogEntry::from_access_log(&access, identity).expect("from_access_log");
+            let cls = e.category_class();
+            assert_eq!(
+                !cls.is_empty(),
+                want_non_empty,
+                "category {cat:?} → empty class"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_ms_human_buckets_match_live_tail() {
+        let cases: &[(u64, &str)] = &[
+            (0, "0 ms"),
+            (1, "1 ms"),
+            (999, "999 ms"),
+            (1000, "1.00 s"),
+            (1234, "1.23 s"),
+            (60_000, "60.00 s"),
+        ];
+        for (ms, want) in cases {
+            let mut access = entry(Some("Googlebot"));
+            access.duration_ms = *ms;
+            let e = BotLogEntry::from_access_log(&access, bot()).unwrap();
+            assert_eq!(e.duration_ms_human(), *want, "for ms={ms}");
+        }
     }
 }

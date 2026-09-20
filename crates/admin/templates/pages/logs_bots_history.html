@@ -1,0 +1,175 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Bot Logs — History — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  {# ── Header + sub-nav ────────────────────────────────────────────── #}
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Bot Logs</h1>
+      <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
+        Query the per-day JSONL archive under <code>log.bot.dir</code> — survives restarts.
+      </p>
+    </div>
+  </div>
+
+  {# Sub-nav. Live = the SSE tail page; History = this page. Same
+     conditional pattern as the top-level nav in `base.html` so a
+     future "Stats" or "Export" sub-tab drops in without a layout
+     rework. The border-accent colour is the same token used by
+     the top nav so the two levels read as one hierarchy. #}
+  <div class="mb-6 border-b border-slate-200 dark:border-slate-700">
+    <nav class="flex gap-6 -mb-px">
+      <a href="/logs/bots" class="px-1 py-2 text-sm font-medium border-b-2 transition-colors
+        {% if active_subnav == "live" %}
+          border-accent-500 text-accent-600 dark:text-accent-400
+        {% else %}
+          border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200
+        {% endif %}">Live</a>
+      <a href="/logs/bots/history" class="px-1 py-2 text-sm font-medium border-b-2 transition-colors
+        {% if active_subnav == "history" %}
+          border-accent-500 text-accent-600 dark:text-accent-400
+        {% else %}
+          border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200
+        {% endif %}">History</a>
+    </nav>
+  </div>
+
+  {# ── Two-column layout: date sidebar + filter form / result ───────── #}
+  <div class="grid grid-cols-1 lg:grid-cols-[12rem_minmax(0,1fr)] gap-6">
+    {# ── Date sidebar ─────────────────────────────────────────────────── #}
+    {# Clicking a date is itself a filter change — the link is
+       HTMX-enabled so the swap goes through the same fragment
+       endpoint as the form. The fallback `href` makes the
+       links work without JS.
+
+       `hx-include="#bots-history-form [name]:not([name=date])"`
+       pulls in the form's current values EXCEPT the date input.
+       Why exclude date: the link's own `?date={{ date }}` is the
+       operator's click target — the link URL carries the date
+       they want to navigate to. `hx-include` merges form
+       values into the request, and on duplicate keys the form
+       value would win, so a click on the 2026-09-19 sidebar
+       link while the form input still shows 2026-09-20 would
+       silently jump back to 2026-09-20. The CSS selector
+       `#bots-history-form [name]:not([name=date])` matches
+       every form input whose name is not `date`, which is the
+       right set — we want all the other filters (bot, host,
+       path, status, method, client_ip) preserved across a date
+       change, but the date itself to come from the link. #}
+    <aside class="card p-4 h-fit">
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3">Available dates</h2>
+      {% if available_dates.is_empty() %}
+        <p class="text-xs text-slate-500 dark:text-slate-400">No JSONL files yet. Once a bot hits the gateway the file for that UTC day will appear here.</p>
+      {% else %}
+        <ul class="space-y-1 text-sm">
+          {% for date in available_dates %}
+            <li>
+              <a href="/logs/bots/history?date={{ date }}"
+                 hx-get="/api/bots/history?date={{ date }}"
+                 hx-include="#bots-history-form [name]:not([name=date])"
+                 hx-target="#bots-history-result"
+                 hx-swap="outerHTML"
+                 hx-push-url="true"
+                 class="block px-2 py-1 rounded font-mono tabular-nums
+                        {% if date.to_string() == filter.date %}
+                          bg-accent-50 dark:bg-accent-900/20 text-accent-700 dark:text-accent-300 font-semibold
+                        {% else %}
+                          text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800
+                        {% endif %}">{{ date }}</a>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </aside>
+
+    {# ── Right column: filter form + result region ──────────────────── #}
+    <div>
+      {# Filter form. Uses GET so the URL is bookmarkable; HTMX
+         swaps the result region in place. Inputs are `name`d so
+         the form serialisation picks them up automatically — no
+         `hx-include` needed. The submit button is for the no-JS
+         fallback; with JS, the `change` trigger fires as the
+         operator adjusts fields.
+
+         `hx-trigger="change"` only — NOT `change, submit`. Adding
+         `submit` causes a duplicate request when the operator
+         picks a date (change fires) and then clicks Apply
+         (submit fires). Both events fire on the same form state,
+         so the second request is pure waste. Trade-off: pressing
+         Enter in a text field no longer auto-applies via HTMX;
+         the browser falls back to the form's `action` URL, which
+         does a full page reload to the same destination.
+
+         `id="bots-history-form"` is referenced by
+         `hx-include` on the date sidebar links (further down) so
+         a date change preserves the operator's other filters. #}
+      <form method="get" action="/logs/bots/history"
+            id="bots-history-form"
+            hx-get="/api/bots/history"
+            hx-target="#bots-history-result"
+            hx-swap="outerHTML"
+            hx-trigger="change"
+            hx-push-url="true"
+            class="card p-4 mb-6 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <label class="flex flex-col gap-1 col-span-2 md:col-span-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date (UTC)</span>
+          <input type="date" name="date" value="{{ filter.date }}"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Bot</span>
+          <input type="text" name="bot" value="{{ filter.bot_name }}" placeholder="e.g. Googlebot"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Host</span>
+          <input type="text" name="host" value="{{ filter.host }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Path</span>
+          <input type="text" name="path" value="{{ filter.path }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Status</span>
+          <input type="number" name="status" value="{{ filter.status }}" placeholder="200, 404…" min="100" max="599"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Method</span>
+          <input type="text" name="method" value="{{ filter.method }}" placeholder="GET, POST…" maxlength="8"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Client IP</span>
+          <input type="text" name="client_ip" value="{{ filter.client_ip }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <div class="flex gap-2 col-span-2 md:col-span-1">
+          <button type="submit"
+                  class="inline-flex items-center px-3 py-1.5 rounded-lg bg-accent-500 hover:bg-accent-600 text-white text-sm font-medium transition-colors">
+            Apply
+          </button>
+          <a href="/logs/bots/history"
+             class="inline-flex items-center px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 text-sm font-medium transition-colors">
+            Reset
+          </a>
+        </div>
+      </form>
+
+      {# ── Result region (HTMX swap target) ─────────────────────────── #}
+      {# The id is the HTMX target. The wrapper is a real
+           `<div>` rather than a template-internal fragment so the
+           outerHTML swap keeps working after the first replace. #}
+      {% include "views/bots/_history_result.html" %}
+
+      <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+        Sourced from <code>{{ filter.date }}</code>'s JSONL file. Dates and rotation are <strong>UTC</strong> (a request at 2026-09-19 23:59 UTC lands in 2026-09-19 even if your local clock says 2026-09-20). The live view at <a href="/logs/bots" class="underline hover:text-accent-600">/logs/bots</a> shows recent in-memory traffic only.
+      </p>
+    </div>
+  </div>
+</main>
+{% endblock %}

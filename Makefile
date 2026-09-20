@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
@@ -72,6 +72,7 @@ help:
 	@echo "  make dev-ui        # Watch templates + assets, rebuild UI on save"
 	@echo "  make build-dist    # Docker build with minified UI, export to build/output/"
 	@echo "  make dist          # Same as build-dist"
+	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
 	@echo ""
 	@echo "=== Local Run ==="
 	@echo "  make start-ngx     # Build + run ./bin/pangolin-ngx (foreground, no sudo)"
@@ -132,6 +133,32 @@ BINS := pangolin-ngx pangolin-tun
 # existing partial file (-C -).
 CURL_FLAGS := -fL --progress-bar -C -
 
+# ── UI tool cache (3-tier pattern, mirrors xun-web) ──────────────────────────
+#
+# Tier 1 — system cache: one canonical copy per host per version, at
+#          `$(PANGOLIN_UI_CACHE)` (default `~/.cache/pangolin-ui-tools/`,
+#          override via env var). Downloaded once per (host × version),
+#          shared across every pangolin checkout on the host (multiple
+#          clones, worktrees, feature branches all reuse the same file).
+# Tier 2 — project-local symlink: `./bin/tailwindcss` and `./bin/esbuild`
+#          point at the tier-1 binary. Re-linked by `download-ui-tools`
+#          if missing or pointing elsewhere; gitignored (the symlink is
+#          per-checkout, the real file isn't).
+# Tier 3 — consumed: `build-ui`, `build-ui-prod`, `dev-ui` invoke the
+#          tools via the `./bin/` symlink (unchanged from before).
+#
+# Versions are baked into the cache filename so multiple versions
+# coexist. To roll forward, bump TAILWIND_VERSION / ESBUILD_VERSION;
+# old versions stay in the cache and can be purged with
+# `make purge-ui-cache`. To use a host-local cache, point
+# `PANGOLIN_UI_CACHE` at any writable dir (CI jobs sometimes set
+# `$HOME` to a fresh path per build, in which case set the env var
+# explicitly to a stable location like `/opt/pangolin-ui-tools`).
+PANGOLIN_UI_CACHE ?= $(HOME)/.cache/pangolin-ui-tools
+
+TAILWIND_VERSION := 3.4.17
+ESBUILD_VERSION  := 0.28.0
+
 # Release builds embed admin assets via rust-embed; building UI assets
 # first is required — without it the binary serves empty CSS/JS.
 #
@@ -165,11 +192,26 @@ build-tun:
 build-debug:
 	$(CARGO) build -p ngx -p tun
 
-# Download tailwindcss and esbuild CLIs to ./bin/.
-# Separated from build-ui so Docker can cache this layer independently.
-# Supports Linux/macOS × x64/ARM64.
+# Download tailwindcss + esbuild CLIs to the system cache, then
+# symlink them into ./bin/. Mirrors the 3-tier pattern from
+# yaitoo/xun-web: one canonical copy per host per version,
+# project-local symlinks per checkout, Makefile consumes via the
+# symlinks. `make build-ui` on a fresh clone is one download
+# total, not one per clone.
+#
+# `download-ui-tools` is split from `build-ui` so Docker can
+# cache this layer independently. Both targets depend on it.
 download-ui-tools:
-	@mkdir -p bin
+	@# Defensive: a previous failed run may have left a `.tmp`
+	@# behind. Clear it so the next run starts clean (and so a
+	@# `git status` of `./bin/` doesn't show surprise half-files).
+	@rm -f bin/tailwindcss.tmp bin/esbuild.tmp
+	@# (All comments live BEFORE the multi-line shell block —
+	@# in-recipe `#` comments without a trailing `\` consume the
+	@# previous line's `\` continuation and split the block
+	@# across separate shell invocations, losing shell variables.
+	@# Platform detection / cache / symlink blocks all share one
+	@# shell so the variables set here are visible below.)
 	@OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
 	ARCH=$$(uname -m); \
 	if [ "$$OS" = "darwin" ]; then \
@@ -192,30 +234,69 @@ download-ui-tools:
 		echo "  ERROR: Unsupported OS: $$OS" >&2; \
 		exit 1; \
 	fi; \
-	if [ ! -x bin/tailwindcss ]; then \
-		echo "Downloading tailwindcss v3.4.17 for $$TAILWIND_PLATFORM (from GitHub releases)..."; \
-		if ! curl $(CURL_FLAGS) -o bin/tailwindcss.tmp \
-			"https://github.com/tailwindlabs/tailwindcss/releases/download/v3.4.17/tailwindcss-$$TAILWIND_PLATFORM"; then \
-			echo "  ERROR: failed to download tailwindcss" >&2; \
-			rm -f bin/tailwindcss.tmp; \
-			exit 1; \
+	TAILWIND_CACHE="$(PANGOLIN_UI_CACHE)/tailwindcss-v$(TAILWIND_VERSION)-$$TAILWIND_PLATFORM"; \
+	ESBUILD_CACHE="$(PANGOLIN_UI_CACHE)/esbuild-v$(ESBUILD_VERSION)-$${ESBUILD_PACKAGE#@esbuild/}"; \
+	mkdir -p "$(PANGOLIN_UI_CACHE)"; \
+	# Tier 1a: PATH first. If a tailwindcss / esbuild binary is \
+	# already on $PATH (e.g. installed globally via npm or \
+	# copied to /usr/local/bin by the operator), use it directly \
+	# and skip the download + system cache entirely. Zero \
+	# bandwidth, zero disk. The operator can force a fresh \
+	# download with `make purge-ui-cache` followed by \
+	# `make download-ui-tools` if their PATH version drifts out \
+	# of sync with the pinned $(TAILWIND_VERSION) / $(ESBUILD_VERSION). \
+	TAILWIND_PATH=$$(command -v tailwindcss 2>/dev/null || true); \
+	if [ -x "$$TAILWIND_PATH" ]; then \
+		TAILWIND_BIN="$$TAILWIND_PATH"; \
+		echo "  tailwindcss on PATH at $$TAILWIND_PATH — skipping cache/download"; \
+	else \
+		if [ ! -x "$$TAILWIND_CACHE" ]; then \
+			echo "Downloading tailwindcss v$(TAILWIND_VERSION) for $$TAILWIND_PLATFORM → $$TAILWIND_CACHE"; \
+			if ! curl $(CURL_FLAGS) -o "$$TAILWIND_CACHE.tmp" \
+				"https://github.com/tailwindlabs/tailwindcss/releases/download/v$(TAILWIND_VERSION)/tailwindcss-$$TAILWIND_PLATFORM"; then \
+				echo "  ERROR: failed to download tailwindcss" >&2; \
+				rm -f "$$TAILWIND_CACHE.tmp"; \
+				exit 1; \
+			fi; \
+			mv "$$TAILWIND_CACHE.tmp" "$$TAILWIND_CACHE"; \
+			chmod +x "$$TAILWIND_CACHE"; \
+		else \
+			echo "  tailwindcss cached at $$TAILWIND_CACHE"; \
 		fi; \
-		mv bin/tailwindcss.tmp bin/tailwindcss; \
-		chmod +x bin/tailwindcss; \
-		echo "  tailwindcss downloaded"; \
+		TAILWIND_BIN="$$TAILWIND_CACHE"; \
 	fi; \
-	if [ ! -x bin/esbuild ]; then \
-		echo "Downloading esbuild v0.28.0 for $$ESBUILD_PACKAGE (via jsDelivr)..."; \
-		if ! curl $(CURL_FLAGS) -o bin/esbuild.tmp \
-			"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@0.28.0/bin/esbuild"; then \
-			echo "  ERROR: failed to download esbuild" >&2; \
-			rm -f bin/esbuild.tmp; \
-			exit 1; \
+	ESBUILD_PATH=$$(command -v esbuild 2>/dev/null || true); \
+	if [ -x "$$ESBUILD_PATH" ]; then \
+		ESBUILD_BIN="$$ESBUILD_PATH"; \
+		echo "  esbuild on PATH at $$ESBUILD_PATH — skipping cache/download"; \
+	else \
+		if [ ! -x "$$ESBUILD_CACHE" ]; then \
+			echo "Downloading esbuild v$(ESBUILD_VERSION) for $$ESBUILD_PACKAGE → $$ESBUILD_CACHE"; \
+			if ! curl $(CURL_FLAGS) -o "$$ESBUILD_CACHE.tmp" \
+				"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@$(ESBUILD_VERSION)/bin/esbuild"; then \
+				echo "  ERROR: failed to download esbuild" >&2; \
+				rm -f "$$ESBUILD_CACHE.tmp"; \
+				exit 1; \
+			fi; \
+			mv "$$ESBUILD_CACHE.tmp" "$$ESBUILD_CACHE"; \
+			chmod +x "$$ESBUILD_CACHE"; \
+		else \
+			echo "  esbuild cached at $$ESBUILD_CACHE"; \
 		fi; \
-		chmod +x bin/esbuild.tmp; \
-		mv bin/esbuild.tmp bin/esbuild; \
-		echo "  esbuild downloaded"; \
-	fi
+		ESBUILD_BIN="$$ESBUILD_CACHE"; \
+	fi; \
+	mkdir -p bin; \
+	for pair in "bin/tailwindcss $$TAILWIND_BIN" "bin/esbuild $$ESBUILD_BIN"; do \
+		set -- $$pair; \
+		LINK=$$1; \
+		TARGET=$$2; \
+		CURRENT=$$(readlink "$$LINK" 2>/dev/null || true); \
+		if [ ! -L "$$LINK" ] || [ "$$CURRENT" != "$$TARGET" ]; then \
+			ln -sf "$$TARGET" "$$LINK"; \
+		fi; \
+	done; \
+	echo "  bin/tailwindcss → $$(readlink bin/tailwindcss)"; \
+	echo "  bin/esbuild    → $$(readlink bin/esbuild)"
 
 # Dev UI build — unminified, no esbuild.
 # `assets/app.js` has no imports, so the raw source is browser-ready; the
@@ -248,6 +329,18 @@ build-ui-prod: download-ui-tools
 # terminal (debug-embed re-reads `assets/` on every request).
 dev-ui: download-ui-tools
 	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT) --watch
+
+# Wipe the system UI-tools cache (`$(PANGOLIN_UI_CACHE)`). Use
+# after a version bump or when an old binary is suspected
+# corrupted. Re-running `download-ui-tools` after this
+# re-downloads both CLIs from upstream — subsequent runs use
+# the freshly-fetched copies. Does NOT touch `./bin/` symlinks
+# (they're re-linked on the next `download-ui-tools` run if
+# their cache target disappears).
+purge-ui-cache:
+	@echo "Removing UI tools cache at $(PANGOLIN_UI_CACHE)..."
+	@rm -rf $(PANGOLIN_UI_CACHE)
+	@echo "  done. Next `make build-ui` will re-download."
 
 # Base image (`docker.io/imlangzi/yaitoo:rust-npm`) is a pre-built shared
 # dependency — Debian 12 + Rust toolchain + Node + pnpm + standalone
