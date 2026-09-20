@@ -19,7 +19,7 @@ use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
     db,
-    types::{ChallengeKind, ChallengeType, DnsProviderKind},
+    types::{ChallengeKind, ChallengeType, DnsProviderKind, FrontendMode, SystemConfig},
 };
 
 /// In-memory index of DNS-related state, rebuilt from DB on startup and
@@ -303,6 +303,14 @@ pub struct App {
     pub tunnel_domains: Arc<parking_lot::RwLock<Arc<std::collections::HashSet<String>>>>,
     /// DNS provider + per-domain association index, rebuilt alongside `indexes`
     pub dns_index: Arc<RwLock<DnsIndex>>,
+    /// System-level configuration (V7; fix-client-ip). Loaded once
+    /// at startup from the `system_config` singleton row and
+    /// refreshed by [`App::reload_indexes`] whenever an admin POST
+    /// to `/api/system/config` triggers it. The proxy hot path
+    /// (`record_access_log`, the tunnel frame builders) reads this
+    /// on every request via [`pangolin_core::client_ip::resolve`]
+    /// — see that module's doc comment for the per-mode semantics.
+    pub system_config: Arc<RwLock<SystemConfig>>,
     /// Global configuration
     pub config: Config,
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
@@ -437,6 +445,23 @@ impl App {
         let dns_index = DnsIndex::build(&providers, &domains);
         let tunnel_set = build_tunnel_domain_set(&indexes);
 
+        // fix-client-ip: load the singleton system config. V7
+        // seeds the row in the migration, so this normally just
+        // succeeds. `QueryReturnedNoRows` is the documented
+        // recovery path (a manual SQL DELETE slipped through);
+        // any other rusqlite error bubbles up so the binary
+        // refuses to launch on a real DB problem.
+        let system_config = match db::get_system_config(&conn) {
+            Ok(c) => c,
+            Err(rusqlite::Error::QueryReturnedNoRows) => SystemConfig {
+                frontend_mode: FrontendMode::Direct,
+                trusted_headers: Vec::new(),
+                updated_at: chrono::Utc::now(),
+            },
+            Err(e) => return Err(e.into()),
+        };
+        let system_config = Arc::new(RwLock::new(system_config));
+
         // fix/cert_www: build the domain → cert pre-computed link
         // cache. Pure derived view over `domains` and `certs`; the
         // SNI callback reads it on every TLS handshake. Built once
@@ -489,6 +514,7 @@ impl App {
             tunnel_domains: Arc::new(parking_lot::RwLock::new(Arc::new(tunnel_set))),
             ws_path: config.tunnel.ws_path.clone(),
             dns_index: Arc::new(RwLock::new(dns_index)),
+            system_config,
             config,
             tun_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             tun_last_seen: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -540,6 +566,24 @@ impl App {
         let tunnel_set = build_tunnel_domain_set(&indexes);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
+        // fix-client-ip: reload the singleton. A missing row is
+        // treated as "use defaults" rather than a hard error —
+        // same policy as App::new. The operator can recover by
+        // POSTing /api/system/config (which calls
+        // update_system_config + this reload again). A transient
+        // DB error is logged and the in-memory value is left
+        // untouched; the next reload tick will retry.
+        match db::get_system_config(&conn) {
+            Ok(c) => *self.system_config.write().await = c,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                *self.system_config.write().await = SystemConfig {
+                    frontend_mode: FrontendMode::Direct,
+                    trusted_headers: Vec::new(),
+                    updated_at: chrono::Utc::now(),
+                };
+            }
+            Err(e) => log::warn!("system_config: reload from DB failed: {e}"),
+        }
         // Rebuild cert_links (fix/cert_www). Best-effort: if the
         // rebuild fails (e.g. a transient DB error), log and keep
         // the existing cache. The cache is a derived view and will

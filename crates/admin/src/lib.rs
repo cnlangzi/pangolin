@@ -249,6 +249,10 @@ pub async fn handle(
 
         // ── System operations ───────────────────────────────────────
         ("api/reload", "POST") => routes::system::handle_reload(&app).await?,
+        ("api/system/config", "GET") => routes::system::handle_get_system_config(&app).await?,
+        ("api/system/config", "POST") => {
+            routes::system::handle_update_system_config(&app, &merged_params).await?
+        }
 
         // ── Auth ────────────────────────────────────────────────────
         ("login", "GET") => {

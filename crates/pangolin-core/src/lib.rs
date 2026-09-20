@@ -20,6 +20,7 @@ pub mod bot;
 pub mod bot_log;
 pub mod bot_stats;
 pub mod cert_link;
+pub mod client_ip;
 pub mod config;
 pub mod db;
 pub(crate) mod embedded_migrations;
@@ -57,7 +58,7 @@ pub use tunnel::{
 };
 pub use types::{
     BackendKind, Cert, CertErrorClass, CertStatus, ChallengeKind, ChallengeType, DnsProvider,
-    DnsProviderKind, Domain, HostMode, Site, Tun, next_backoff,
+    DnsProviderKind, Domain, FrontendMode, HostMode, Site, SystemConfig, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

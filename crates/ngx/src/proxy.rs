@@ -436,7 +436,15 @@ impl ProxyHttp for AppProxy {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
-                ws_relay_to_tun(session, &ws_target, &tunnel, HostMode::Passthrough, None).await?;
+                ws_relay_to_tun(
+                    &self.app,
+                    session,
+                    &ws_target,
+                    &tunnel,
+                    HostMode::Passthrough,
+                    None,
+                )
+                .await?;
                 return Ok(true);
             }
             // Direct WS: let pingora handle the 101 upgrade.
@@ -568,7 +576,8 @@ impl ProxyHttp for AppProxy {
                 ctx,
                 session,
                 parse_status_from_line(&resp.status_line),
-            );
+            )
+            .await;
             write_response_to_session(session, &resp).await;
             return Ok(true);
         }
@@ -606,6 +615,7 @@ impl ProxyHttp for AppProxy {
                 host, path, tun_name
             );
             ws_relay_to_tun(
+                &self.app,
                 session,
                 &target,
                 &tunnel,
@@ -757,7 +767,8 @@ impl ProxyHttp for AppProxy {
                         ctx,
                         session,
                         parse_status_from_line(&resp.status_line),
-                    );
+                    )
+                    .await;
                     write_response_to_session(session, &resp).await;
                     return Ok(true);
                 }
@@ -958,7 +969,7 @@ impl ProxyHttp for AppProxy {
     ) -> Result<()> {
         // Issue #73: construct AccessLogEntry and push to App
         let status = upstream_response.status.as_u16();
-        record_access_log(&self.app, ctx, session, status);
+        record_access_log(&self.app, ctx, session, status).await;
         Ok(())
     }
 }
@@ -998,6 +1009,7 @@ impl ProxyHttp for AppProxy {
 /// this resolves. On success the helper runs the byte-pump
 /// to completion and only then returns.
 async fn ws_relay_to_tun(
+    app: &Arc<App>,
     session: &mut Session,
     target: &BackendTarget,
     tunnel: &pangolin_core::YamuxTunnel,
@@ -1074,7 +1086,25 @@ async fn ws_relay_to_tun(
         host_custom,
         is_upgrade: true,
         is_streaming: false,
-        client_ip: session.client_addr().map(|a| a.to_string()),
+        // fix-client-ip: hand the tunnel-side code the *real*
+        // visitor IP (per the operator-configured frontend_mode),
+        // not the TCP peer that may be the CDN/LB hop closest to
+        // us. The downstream tun-side code (`tun::client`) just
+        // clones this into its own request context, so resolving
+        // here propagates cleanly through the tunnel.
+        client_ip: {
+            let cfg = app.system_config.read().await.clone();
+            Some(pangolin_core::client_ip::resolve(
+                &cfg,
+                peer_addr_std(session),
+                |name| {
+                    session
+                        .get_header(name)
+                        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+                        .map(|v| v.to_string())
+                },
+            ))
+        },
     };
 
     // 101 Switching Protocols — replicate the WS handshake on
@@ -1403,7 +1433,24 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
         host_custom: site.host_custom.clone(),
         is_upgrade: false,
         is_streaming: true,
-        client_ip: session.client_addr().map(|a| a.to_string()),
+        // fix-client-ip: resolve the real visitor IP via the
+        // operator-configured frontend_mode (same path as the WS
+        // relay above). Without this, the tun backend logs the
+        // CDN/LB hop instead of the actual visitor when pangolin
+        // is fronted by anything other than a direct connection.
+        client_ip: {
+            let cfg = app.system_config.read().await.clone();
+            Some(pangolin_core::client_ip::resolve(
+                &cfg,
+                peer_addr_std(session),
+                |name| {
+                    session
+                        .get_header(name)
+                        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+                        .map(|v| v.to_string())
+                },
+            ))
+        },
     };
 
     let mut yamux_stream = match tunnel.open_stream().await {
@@ -1780,12 +1827,56 @@ async fn respond_streaming_unsupported_on_file(session: &mut Session) {
     }
 }
 
-fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
+/// Convert a pingora [`SocketAddr`] reference into a
+/// `std::net::SocketAddr` (the type the
+/// `pangolin_core::client_ip::resolve` API consumes).
+///
+/// Pingora's `SocketAddr` is an enum wrapping the standard type
+/// plus a Unix-socket variant we never see in production. The
+/// `Inet` arm is the only one we care about; Unix sockets fall
+/// through to `None` (the resolver's peer-IP fallback chain).
+///
+/// `pangolin-core` deliberately avoids a pingora dependency, so
+/// this conversion lives at the boundary in `ngx` instead of in
+/// the resolver itself.
+fn peer_addr_std(session: &Session) -> Option<std::net::SocketAddr> {
+    use pingora::protocols::l4::socket::SocketAddr as PgSocketAddr;
+    session.client_addr().and_then(|a| match a {
+        PgSocketAddr::Inet(sa) => Some(*sa),
+        #[cfg(unix)]
+        PgSocketAddr::Unix(_) => None,
+    })
+}
+
+/// Resolve the real visitor IP and append the access-log entry to
+/// the live broadcast + ring buffer (issue #73 + fix-client-ip).
+///
+/// Async because the resolution snapshot (`app.system_config.read()`)
+/// holds an async lock. Both call sites (the pingora
+/// `response_filter` and the tunnel short-circuits in
+/// `request_filter`) are already async, so adding one `.await`
+/// here is free.
+///
+/// ## Pre-fix behaviour
+///
+/// Before fix-client-ip this function read `session.client_addr()`
+/// and emitted either the peer IP (with port) or the literal
+/// `"unknown"`. With pangolin fronted by Cloudflare / an LB, that
+/// recorded the CDN's IP, not the visitor's — silently breaking
+/// every downstream log-analysis tool. The fix delegates the
+/// resolution to [`pangolin_core::client_ip::resolve`], driven by
+/// the operator-configured `frontend_mode` (see [`SystemConfig`]).
+/// The `unknown` literal is preserved as the final fallback so old
+/// log-parsing scripts do not break.
+async fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
-    let client_ip = session
-        .client_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let cfg = app.system_config.read().await.clone();
+    let client_ip = pangolin_core::client_ip::resolve(&cfg, peer_addr_std(session), |name| {
+        session
+            .get_header(name)
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .map(str::to_owned)
+    });
     let entry = pangolin_core::AccessLogEntry {
         timestamp: chrono::Utc::now(),
         method: ctx.method.clone(),
