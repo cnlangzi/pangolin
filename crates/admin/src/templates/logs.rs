@@ -154,6 +154,12 @@ pub struct BotHistorySummary {
     /// URL for `page + 1`, with all current filter values
     /// baked in. `None` when already on the last page.
     pub next_url: Option<String>,
+    /// Human-readable error message when the query failed (file
+    /// read error, spawn_blocking panic, etc.). `None` on
+    /// success. The template renders this as a red banner above
+    /// the table so the operator can distinguish "no data" from
+    /// "query crashed".
+    pub error: Option<String>,
 }
 
 impl BotHistorySummary {

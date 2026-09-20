@@ -12,6 +12,16 @@
    use the same field names.
 #}
 <div id="bots-history-result">
+  {# ── Error banner ──────────────────────────────────────────────── #}
+  {# Surfaces query failures (file read error, spawn_blocking
+     panic) so the operator can distinguish them from "no data
+     matched the filter". `error` is `None` on success. #}
+  {% if let Some(msg) = summary.error %}
+    <div class="mb-4 px-4 py-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-200">
+      <strong class="font-semibold">Query failed:</strong> {{ msg }}
+    </div>
+  {% endif %}
+
   {# ── Summary line + table + pagination inside one card ───────── #}
   <div class="card overflow-hidden">
     {# ── Summary line ──────────────────────────────────────────── #}

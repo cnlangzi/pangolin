@@ -42,7 +42,22 @@
     {# Clicking a date is itself a filter change — the link is
        HTMX-enabled so the swap goes through the same fragment
        endpoint as the form. The fallback `href` makes the
-       links work without JS. #}
+       links work without JS.
+
+       `hx-include="#bots-history-form [name]:not([name=date])"`
+       pulls in the form's current values EXCEPT the date input.
+       Why exclude date: the link's own `?date={{ date }}` is the
+       operator's click target — the link URL carries the date
+       they want to navigate to. `hx-include` merges form
+       values into the request, and on duplicate keys the form
+       value would win, so a click on the 2026-09-19 sidebar
+       link while the form input still shows 2026-09-20 would
+       silently jump back to 2026-09-20. The CSS selector
+       `#bots-history-form [name]:not([name=date])` matches
+       every form input whose name is not `date`, which is the
+       right set — we want all the other filters (bot, host,
+       path, status, method, client_ip) preserved across a date
+       change, but the date itself to come from the link. #}
     <aside class="card p-4 h-fit">
       <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3">Available dates</h2>
       {% if available_dates.is_empty() %}
@@ -53,6 +68,7 @@
             <li>
               <a href="/logs/bots/history?date={{ date }}"
                  hx-get="/api/bots/history?date={{ date }}"
+                 hx-include="#bots-history-form [name]:not([name=date])"
                  hx-target="#bots-history-result"
                  hx-swap="outerHTML"
                  hx-push-url="true"
@@ -75,12 +91,26 @@
          the form serialisation picks them up automatically — no
          `hx-include` needed. The submit button is for the no-JS
          fallback; with JS, the `change` trigger fires as the
-         operator adjusts fields. #}
+         operator adjusts fields.
+
+         `hx-trigger="change"` only — NOT `change, submit`. Adding
+         `submit` causes a duplicate request when the operator
+         picks a date (change fires) and then clicks Apply
+         (submit fires). Both events fire on the same form state,
+         so the second request is pure waste. Trade-off: pressing
+         Enter in a text field no longer auto-applies via HTMX;
+         the browser falls back to the form's `action` URL, which
+         does a full page reload to the same destination.
+
+         `id="bots-history-form"` is referenced by
+         `hx-include` on the date sidebar links (further down) so
+         a date change preserves the operator's other filters. #}
       <form method="get" action="/logs/bots/history"
+            id="bots-history-form"
             hx-get="/api/bots/history"
             hx-target="#bots-history-result"
             hx-swap="outerHTML"
-            hx-trigger="change, submit"
+            hx-trigger="change"
             hx-push-url="true"
             class="card p-4 mb-6 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
         <label class="flex flex-col gap-1 col-span-2 md:col-span-1">
@@ -137,7 +167,7 @@
       {% include "views/bots/_history_result.html" %}
 
       <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
-        Sourced from <code>{{ filter.date }}</code>'s JSONL file. The live view at <a href="/logs/bots" class="underline hover:text-accent-600">/logs/bots</a> shows recent in-memory traffic only.
+        Sourced from <code>{{ filter.date }}</code>'s JSONL file. Dates and rotation are <strong>UTC</strong> (a request at 2026-09-19 23:59 UTC lands in 2026-09-19 even if your local clock says 2026-09-20). The live view at <a href="/logs/bots" class="underline hover:text-accent-600">/logs/bots</a> shows recent in-memory traffic only.
       </p>
     </div>
   </div>

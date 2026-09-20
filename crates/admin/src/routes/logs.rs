@@ -156,11 +156,6 @@ pub async fn render_bots(app: &Arc<App>, csrf: &str) -> http::Result<Response<Fu
 /// keep the JSONL read under ~5 ms for a 10 k-entry file.
 const BOT_HISTORY_PAGE_SIZE: usize = 50;
 
-/// Maximum page size the route accepts. Larger requests are
-/// silently clamped — protects against a URL-tampering client
-/// trying to make us slurp a multi-MB response.
-const BOT_HISTORY_MAX_PAGE_SIZE: usize = 500;
-
 /// Maximum `page` value the route accepts. Pure defensive clamp
 /// to keep the `(page - 1) * page_size` math in
 /// `query_history` from overflowing on a 32-bit platform (and to
@@ -241,7 +236,7 @@ pub async fn render_bots_history(
 ) -> http::Result<Response<Full<Bytes>>> {
     let dir = app.config.log.bot.dir.clone();
     let available_dates = list_dates(&dir).unwrap_or_default();
-    let page = build_history_page(app, dir.as_path(), merged_params).await;
+    let page = build_history_page(dir.as_path(), merged_params).await;
 
     let tmpl = BotLogsHistoryTemplate {
         csrf_token: csrf.to_string(),
@@ -274,7 +269,7 @@ pub async fn api_bots_history(
     merged_params: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
     let dir = app.config.log.bot.dir.clone();
-    let page = build_history_page(app, dir.as_path(), merged_params).await;
+    let page = build_history_page(dir.as_path(), merged_params).await;
 
     // Render only the result region — the surrounding shell
     // (sub-nav, date sidebar, form) is preserved by HTMX
@@ -323,11 +318,7 @@ pub async fn api_bots_history(
 /// pattern — the SSE handlers run the same fan-out on the hot
 /// path without `spawn_blocking` because the in-memory ring
 /// buffer is bounded; here we hit disk.)
-async fn build_history_page(
-    _app: &Arc<App>,
-    dir: &std::path::Path,
-    merged_params: &[u8],
-) -> HistoryPageView {
+async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> HistoryPageView {
     let p = parse_history_params(merged_params);
 
     // Date fallback: if no `date` was supplied (or it's malformed),
@@ -351,8 +342,17 @@ async fn build_history_page(
     let mut filter = p.filter;
     filter.date = date.to_string();
 
-    let page = p.page.clamp(1, BOT_HISTORY_MAX_PAGE);
-    let page_size = BOT_HISTORY_PAGE_SIZE.min(BOT_HISTORY_MAX_PAGE_SIZE);
+    // Page clamp: defensive upper bound to keep the
+    // `(page - 1) * page_size` math in `query_history` from
+    // overflowing on a 32-bit platform. The displayed page is
+    // re-clamped below to `[1, total_pages]` so a typo in the
+    // URL doesn't strand the operator on page 999999 of 3.
+    let page_unsafe = p.page.clamp(1, BOT_HISTORY_MAX_PAGE);
+    // Page size is currently a constant — left as a `const` here
+    // rather than a per-request field so a future operator knob
+    // is a one-line change (replace this with `q.page_size` once
+    // we expose it via config / URL).
+    let page_size = BOT_HISTORY_PAGE_SIZE;
 
     let query = pangolin_core::bot_log::BotHistoryQuery {
         date,
@@ -362,7 +362,7 @@ async fn build_history_page(
         status: p.status,
         method: (!filter.method.is_empty()).then(|| filter.method.clone()),
         client_ip: (!filter.client_ip.is_empty()).then(|| filter.client_ip.clone()),
-        page,
+        page: page_unsafe,
         page_size,
     };
 
@@ -372,22 +372,42 @@ async fn build_history_page(
     })
     .await;
 
-    let (entries, total_after_filter, file_bytes) = match result {
-        Ok(Ok(page)) => (page.entries, page.total_after_filter, page.file_bytes),
+    // Track query errors separately from "no matches" so the UI
+    // can surface them via a red banner instead of an empty table.
+    // `query_history` itself collapses `NotFound` to an empty
+    // page (per-file `Ok(..)`, `entries: vec![]`), so a missing
+    // file is NOT an error from the operator's perspective.
+    let (entries, total_after_filter, file_bytes, error) = match result {
+        Ok(Ok(page)) => (page.entries, page.total_after_filter, page.file_bytes, None),
         Ok(Err(e)) => {
             log::warn!("bot_history: query failed: {e}");
-            (Vec::new(), 0, 0)
+            (Vec::new(), 0, 0, Some(format!("Failed to read JSONL: {e}")))
         }
         Err(e) => {
             // spawn_blocking join error — the task panicked.
             log::warn!("bot_history: blocking task panicked: {e}");
-            (Vec::new(), 0, 0)
+            (
+                Vec::new(),
+                0,
+                0,
+                Some("Internal error while reading JSONL (see server log).".into()),
+            )
         }
     };
 
     let total_pages = total_after_filter
         .div_ceil(page_size)
         .max(if total_after_filter == 0 { 0 } else { 1 });
+
+    // Display-clamp `page` to `[1, total_pages]` so the operator
+    // never sees "Page 999999 of 3". The query above may have
+    // fetched an empty page past the end; the summary surfaces
+    // the snapped value so prev/next URLs use a sensible page.
+    let page = if total_pages == 0 {
+        1
+    } else {
+        page_unsafe.min(total_pages)
+    };
 
     // Pre-compute prev / next URLs so the template doesn't need
     // to construct query strings (askama method calls can't take
@@ -411,6 +431,7 @@ async fn build_history_page(
         file_bytes,
         prev_url,
         next_url,
+        error,
     };
 
     HistoryPageView {
@@ -966,6 +987,7 @@ mod tests {
             file_bytes: 3_200_000,
             prev_url: Some("/x".into()),
             next_url: Some("/y".into()),
+            error: None,
         };
         // page 3, size 50 → start = 101, end = 150.
         assert_eq!(s.start_row(), 101);
@@ -992,5 +1014,156 @@ mod tests {
             };
             assert_eq!(s.file_size_human(), want, "for n={n}");
         }
+    }
+
+    // ── HTMX wiring + page-clamp regression pins ───────────────────
+
+    /// Regression pin: the form must carry `id="bots-history-form"`
+    /// so the date sidebar links' `hx-include` can find it. If a
+    /// future refactor drops the id, the date sidebar silently
+    /// stops preserving filter state.
+    #[tokio::test]
+    async fn history_page_has_form_id_for_htmx_include() {
+        let (_dir, app) = make_test_app();
+        let resp = render_bots_history(&app, "csrf-token", b"")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(
+            html.contains("id=\"bots-history-form\""),
+            "form id missing — date sidebar hx-include will break: {html}"
+        );
+    }
+
+    /// Regression pin: trigger must be `change` only. Adding
+    /// `submit` to the trigger causes a duplicate request when the
+    /// operator picks a date (`change` fires) then clicks Apply
+    /// (`submit` fires). See design doc for the rationale.
+    #[tokio::test]
+    async fn history_page_htmx_trigger_is_change_only() {
+        let (_dir, app) = make_test_app();
+        let resp = render_bots_history(&app, "csrf-token", b"")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(
+            html.contains("hx-trigger=\"change\""),
+            "expected hx-trigger=\"change\": {html}"
+        );
+        // And specifically not the duplicate-firing combo.
+        assert!(
+            !html.contains("hx-trigger=\"change, submit\""),
+            "hx-trigger=\"change, submit\" causes duplicate requests on date+Apply: {html}"
+        );
+    }
+
+    /// Regression pin: date sidebar links must include the form's
+    /// filters via `hx-include="#bots-history-form [name]:not([name=date])"`.
+    /// The `:not([name=date])` part is critical: without it, the
+    /// form's date input value (the *old* date) overrides the
+    /// link's `?date={{ date }}` and the click silently jumps back
+    /// to the previously selected date. See the template comment
+    /// for the full rationale.
+    #[tokio::test]
+    async fn history_page_date_links_include_form_excluding_date() {
+        let today = chrono::Utc::now().date_naive();
+        let (_file_dir, bot_dir) = seed_history_file(
+            today,
+            &[bot_entry_with("Googlebot", "Google", "x.com", "/", 0)],
+        );
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+        let resp = render_bots_history(&app, "csrf-token", b"")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        // Must include the form's other fields so filters like
+        // `bot=Googlebot` survive a date change.
+        assert!(
+            html.contains("hx-include=\"#bots-history-form [name]:not([name=date])\""),
+            "date sidebar links must hx-include the form (excluding date) to preserve filters: {html}"
+        );
+        // And explicitly NOT include the bare form selector, which
+        // would re-introduce the bug where the form's stale date
+        // overrides the link's target date.
+        assert!(
+            !html.contains("hx-include=\"#bots-history-form\""),
+            "bare hx-include without :not([name=date]) would let stale form date win: {html}"
+        );
+    }
+
+    /// Display-clamp regression pin: `?page=999999` with a
+    /// 3-page dataset must snap the rendered summary to page 3
+    /// so the operator doesn't end up stranded on "Page 999999
+    /// of 3" with a useless Prev button.
+    #[tokio::test]
+    async fn history_page_clamps_oversized_page_param() {
+        let today = chrono::Utc::now().date_naive();
+        // 60 entries → with page_size=50, total_pages=2.
+        let entries: Vec<BotLogEntry> = (0..60)
+            .map(|i| bot_entry_with("Googlebot", "Google", "x.com", &format!("/p{i}"), i * 1000))
+            .collect();
+        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+
+        // page=999999 → must clamp to 2 (the last real page).
+        let resp = render_bots_history(&app, "csrf-token", b"page=999999")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        // Summary line shows "Page 2 of 2", not "Page 999999 of 2".
+        assert!(
+            html.contains("Page <span class=\"font-semibold\">2</span> of <span class=\"font-semibold\">2</span>"),
+            "page not display-clamped to total_pages: {html}"
+        );
+        // Prev URL points to page 1 (the snapped-to-last-page minus 1).
+        assert!(
+            html.contains("page=1"),
+            "expected prev URL with page=1: {html}"
+        );
+        // No next button (we're on the last page).
+        assert!(
+            !html.contains("page=3"),
+            "unexpected page=3 in URL — page clamp broken: {html}"
+        );
+    }
+
+    /// On a clean query, `summary.error` is `None` and the
+    /// error banner is not rendered. Pin both ends.
+    #[tokio::test]
+    async fn history_page_no_error_banner_on_success() {
+        let today = chrono::Utc::now().date_naive();
+        let (_file_dir, bot_dir) = seed_history_file(
+            today,
+            &[bot_entry_with("Googlebot", "Google", "x.com", "/", 0)],
+        );
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+        let resp = render_bots_history(&app, "csrf-token", b"")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(
+            !html.contains("Query failed"),
+            "error banner should not render on success: {html}"
+        );
     }
 }
