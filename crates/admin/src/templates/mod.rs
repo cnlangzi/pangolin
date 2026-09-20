@@ -51,7 +51,10 @@ pub use domains::{
     DomainsEditTemplate, DomainsFormFieldsView, DomainsListTemplate, DomainsNewTemplate,
     DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
-pub use logs::{BotLogsTemplate, LogsTemplate};
+pub use logs::{
+    BotHistoryFilter, BotHistoryResultView, BotHistorySummary, BotLogsHistoryTemplate,
+    BotLogsTemplate, LogsTemplate, subnav,
+};
 pub use settings::SettingsTemplate;
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,

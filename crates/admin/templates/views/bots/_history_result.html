@@ -1,0 +1,134 @@
+{# ── History result region (HTMX swap target) ───────────────────── #}
+{#
+   Wrapped in a real `<div id="bots-history-result">` so the
+   `hx-swap="outerHTML"` directive on the form + sidebar links keeps
+   working after the first replace. The wrapper carries no
+   styling — the inner `<div class="card …">` does.
+
+   Inputs (filter, summary, entries) come from the parent template
+   when this file is `{% include %}`d from `pages/logs_bots_history.html`,
+   and from `BotHistoryResultView` when rendered standalone for
+   the `/api/bots/history` HTMX fragment. Both call sites must
+   use the same field names.
+#}
+<div id="bots-history-result">
+  {# ── Summary line + table + pagination inside one card ───────── #}
+  <div class="card overflow-hidden">
+    {# ── Summary line ──────────────────────────────────────────── #}
+    {# `start_row` / `end_row` clamp to 0 when the page is empty so
+       the "Showing X-Y of Z" text reads as "Showing 0-0 of 0" rather
+       than "Showing 1-50 of 0". The file size is a quick operator
+       sanity check — a 50 MB day is worth eyeballing. #}
+    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+      <p class="text-sm text-slate-600 dark:text-slate-300">
+        {% if summary.total_after_filter == 0 %}
+          No matches.
+        {% else %}
+          Showing
+          <span class="font-semibold tabular-nums">{{ summary.start_row() }}–{{ summary.end_row() }}</span>
+          of <span class="font-semibold tabular-nums">{{ summary.total_after_filter }}</span>
+          entries
+        {% endif %}
+      </p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+        {% if summary.file_bytes > 0 %}
+          Source file: {{ summary.file_size_human() }}
+        {% endif %}
+      </p>
+    </div>
+
+    {# ── Table ────────────────────────────────────────────────── #}
+    {# Same column set as the live tail page so the two views are
+       visually consistent: Time | Request | Bot | Category | Host
+       | Duration | Client. Operators don't have to relearn. #}
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+        <thead class="bg-slate-50 dark:bg-slate-800/50">
+          <tr>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Request</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Bot</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Category</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
+          {% if entries.is_empty() %}
+            <tr>
+              <td colspan="7" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
+                {% if summary.total_after_filter == 0 %}
+                  No entries match the current filter.
+                {% else %}
+                  No rows on this page.
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            {% for e in entries %}
+            <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+              <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 align-top">{{ e.timestamp_local() }}</td>
+              <td class="px-4 py-2 align-top">
+                <div class="flex items-center gap-3 min-w-0">
+                  <span class="font-semibold tabular-nums {{ e.status_class() }}">{{ e.status }}</span>
+                  <span class="font-semibold text-slate-700 dark:text-slate-200">{{ e.method }}</span>
+                  <span class="truncate font-mono text-slate-700 dark:text-slate-200" title="{{ e.path }}">{{ e.path }}</span>
+                </div>
+              </td>
+              <td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100 align-top">{{ e.bot_name }}</td>
+              <td class="px-4 py-2 align-top">
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium {{ e.category_class() }}">{{ e.bot_category }}</span>
+              </td>
+              <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300 align-top" title="{{ e.host }}">{{ e.host }}</td>
+              <td class="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600 dark:text-slate-300 align-top">{{ e.duration_ms_human() }}</td>
+              <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 hidden xl:table-cell align-top" title="{{ e.client_ip }}">{{ e.client_ip }}</td>
+            </tr>
+            {% endfor %}
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+
+    {# ── Pagination ───────────────────────────────────────────── #}
+    {# Render only when there are multiple pages — a single-page
+       result with "Prev / 1 / Next" is just visual noise. The
+       URLs are pre-computed by the route handler with every
+       other filter dimension baked in (askama method calls
+       can't take additional arguments), so a click here doesn't
+       accidentally widen the query. #}
+    {% if summary.total_pages > 1 %}
+      <div class="px-4 py-3 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between text-sm">
+        <p class="text-slate-500 dark:text-slate-400 tabular-nums">
+          Page <span class="font-semibold">{{ summary.page }}</span> of <span class="font-semibold">{{ summary.total_pages }}</span>
+        </p>
+        <div class="flex items-center gap-1">
+          {% if let Some(prev) = summary.prev_url %}
+            <a href="{{ prev }}"
+               hx-get="{{ prev }}"
+               hx-target="#bots-history-result"
+               hx-swap="outerHTML"
+               hx-push-url="true"
+               class="inline-flex items-center px-3 py-1.5 rounded border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
+              ‹ Prev
+            </a>
+          {% else %}
+            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">‹ Prev</span>
+          {% endif %}
+          {% if let Some(next) = summary.next_url %}
+            <a href="{{ next }}"
+               hx-get="{{ next }}"
+               hx-target="#bots-history-result"
+               hx-swap="outerHTML"
+               hx-push-url="true"
+               class="inline-flex items-center px-3 py-1.5 rounded border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
+              Next ›
+            </a>
+          {% else %}
+            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">Next ›</span>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>

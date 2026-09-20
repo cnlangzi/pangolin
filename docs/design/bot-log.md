@@ -74,13 +74,17 @@ Pure-function UA → bot matching. No I/O, no async.
 
 ### `crates/pangolin-core/src/bot_log.rs`
 
-JSONL writer + ring buffer.
+JSONL writer + ring buffer + (stage-3) history reader.
 
 - `BotLogEntry` — flat JSONL row, `Clone + Serialize + Deserialize`.
   Field set: timestamp / host / method / path / status / duration_ms /
   backend / client_ip / bot_name / bot_vendor / bot_category / ua /
   referer (always `None` in v1; reserved for a future
-  `RequestState::referer` capture).
+  `RequestState::referer` capture). `bot_name` / `bot_vendor` are
+  `Cow<'static, str>` — borrowed from the static bot-rule table
+  on the hot path (`Cow::Borrowed`), owned `String` when
+  re-hydrated from JSONL by the history reader. Zero-cost on
+  write, one alloc per field on read.
 - `BotLogBuffer` — bounded ring buffer mirroring `AccessLogBuffer`.
   Capacity 0 → no-op (the JSONL stream + stats counters still work).
 - `BotLogWriter` — `Arc<Self>` shared between the request hot path
@@ -93,6 +97,26 @@ JSONL writer + ring buffer.
 - `run_periodic_sync` — companion task that `sync_all`s the open file
   every `fsync_interval_secs` (default 5 s) so a crash loses at most
   ~5 seconds of bot data.
+- **stage-3** history reader — read-only path that powers
+  `/logs/bots/history`. No new dependencies.
+  - `list_dates(dir)` — `read_dir` + parse `bot-YYYY-MM-DD.jsonl`
+    filenames, newest-first. Returns empty `Vec` for missing /
+    empty dir.
+  - `file_size_for(dir, date)` — `stat` for the date sidebar.
+  - `query_history(dir, &BotHistoryQuery)` — `read_to_string` +
+    per-line `serde_json::from_str` + filter + sort newest-first
+    + paginate. Skips corrupt lines silently. `BotHistoryQuery`
+    owns its filter fields (`Option<String>`) so the typical
+    caller — `tokio::task::spawn_blocking` on the admin route —
+    crosses the `'static` bound cleanly.
+  - `BotHistoryPage { entries, total_after_filter, file_bytes }`
+    — the admin route maps this into the
+    `BotLogsHistoryTemplate` / `BotHistoryResultView` askama
+    structs.
+  - `BotLogEntry::timestamp_local` / `status_class` /
+    `category_class` / `duration_ms_human` — presentation
+    helpers, pin the same wire format the live-tail page renders
+    so the two views look identical.
 
 ### `crates/pangolin-core/src/bot_stats.rs`
 
@@ -193,6 +217,33 @@ duckdb -c "
   `ngx.yml` (`log.bot` block), `docs/configuration.md` + this file.
 - **stage-2** — UI: SSE handler for `/api/logs/bots/stream` +
   `/logs/bots` admin page + nav link.
+- **stage-3** — Historical view. Read-only side of the JSONL
+  archive:
+  - `pangolin-core::bot_log` — `BotHistoryQuery` / `BotHistoryPage`
+    / `list_dates` / `file_size_for` / `query_history` (read-only,
+    zero new deps). `BotLogEntry.bot_name` / `bot_vendor` switched
+    from `&'static str` to `Cow<'static, str>` so the JSONL wire
+    format round-trips through `Deserialize` while the hot path
+    (`from_access_log`) stays zero-allocation via `Cow::Borrowed`.
+  - `admin/templates/pages/logs_bots_history.html` — full page
+    with sub-nav (Live / History), date sidebar, filter form,
+    result region.
+  - `admin/templates/views/bots/_history_result.html` —
+    self-contained fragment (`#bots-history-result` wrapper) for
+    the HTMX swap target. Reused via `{% include %}` from the
+    full page so the JS and no-JS paths render identical HTML.
+  - `admin/src/templates/logs.rs` — `BotLogsHistoryTemplate` (full
+    page) + `BotHistoryResultView` (fragment) + `BotHistoryFilter`
+    + `BotHistorySummary` (carries pre-computed `prev_url` /
+    `next_url` so the template doesn't need to construct query
+    strings — askama method calls can't take additional args).
+  - `admin/src/routes/logs.rs` — `render_bots_history` (full
+    page), `api_bots_history` (HTMX fragment), shared
+    `build_history_page` async helper that hops to
+    `tokio::task::spawn_blocking` for the JSONL read so the
+    runtime stays responsive on busy days.
+  - `admin/src/lib.rs` — register `GET /logs/bots/history` and
+    `GET /api/bots/history`.
 - **later, separate PRs** — reverse-DNS validation, optional
   `extra_user_agent_patterns` config knob, `Referer` capture in
   `RequestState`.
@@ -202,6 +253,7 @@ duckdb -c "
 | Layer | Where | What's pinned |
 | ----- | ----- | ------------- |
 | Unit | `bot::tests::*` | All 5 categories detected, case-insensitive, more-specific patterns shadow generic ones, no duplicate needles, every category has at least one rule |
-| Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today |
+| Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
 | Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; `bot.enabled = false` is a no-op fan-out; multi-bot stats aggregation |
+| Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; `api_bots_history` returns the fragment wrapper but not the page-level chrome; `BotHistorySummary` row range + `file_size_human` bucketing |

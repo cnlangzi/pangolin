@@ -22,6 +22,7 @@
 //! is a useful sanity check ("did all detected bots actually get
 //! written?"); if the two diverge the writer is dropping.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,10 +32,17 @@ use crate::bot::BotCategory;
 use crate::bot_log::BotLogEntry;
 
 /// Snapshot row for the admin UI: one per `(bot_name, host)`.
+///
+/// `bot_name` / `bot_vendor` are `Cow<'static, str>` for the same
+/// reason as in [`BotLogEntry`](crate::bot_log::BotLogEntry):
+/// borrowed from the static bot-rule table on the hot path, owned
+/// `String` when re-hydrated from JSONL by the history reader. The
+/// `Cow` deref means templates and string comparisons work
+/// unchanged.
 #[derive(Clone, Debug, Serialize)]
 pub struct BotStatsRow {
-    pub bot_name: &'static str,
-    pub bot_vendor: &'static str,
+    pub bot_name: Cow<'static, str>,
+    pub bot_vendor: Cow<'static, str>,
     pub bot_category: BotCategory,
     pub host: String,
     pub hits: u64,
@@ -94,13 +102,13 @@ pub const MAX_UNIQUE_PAIRS: usize = 50_000;
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 struct RowKey {
-    bot_name: &'static str,
+    bot_name: Cow<'static, str>,
     host: String,
 }
 
 #[derive(Clone)]
 struct RowData {
-    bot_vendor: &'static str,
+    bot_vendor: Cow<'static, str>,
     bot_category: BotCategory,
     hits: u64,
     last_seen: chrono::DateTime<chrono::Utc>,
@@ -142,7 +150,7 @@ impl BotStats {
         {
             let mut g = self.inner.write();
             let key = RowKey {
-                bot_name: entry.bot_name,
+                bot_name: entry.bot_name.clone(),
                 host: entry.host.clone(),
             };
             if let Some(row) = g.rows.get_mut(&key) {
@@ -165,7 +173,7 @@ impl BotStats {
                 g.rows.insert(
                     key,
                     RowData {
-                        bot_vendor: entry.bot_vendor,
+                        bot_vendor: entry.bot_vendor.clone(),
                         bot_category: entry.bot_category,
                         hits: 1,
                         last_seen: entry.timestamp,
@@ -200,8 +208,8 @@ impl BotStats {
             .rows
             .iter()
             .map(|(k, v)| BotStatsRow {
-                bot_name: k.bot_name,
-                bot_vendor: v.bot_vendor,
+                bot_name: k.bot_name.clone(),
+                bot_vendor: v.bot_vendor.clone(),
                 bot_category: v.bot_category,
                 host: k.host.clone(),
                 hits: v.hits,
