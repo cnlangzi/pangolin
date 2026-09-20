@@ -234,34 +234,56 @@ download-ui-tools:
 		echo "  ERROR: Unsupported OS: $$OS" >&2; \
 		exit 1; \
 	fi; \
-	TAILWIND_BIN="$(PANGOLIN_UI_CACHE)/tailwindcss-v$(TAILWIND_VERSION)-$$TAILWIND_PLATFORM"; \
-	ESBUILD_BIN="$(PANGOLIN_UI_CACHE)/esbuild-v$(ESBUILD_VERSION)-$${ESBUILD_PACKAGE#@esbuild/}"; \
+	TAILWIND_CACHE="$(PANGOLIN_UI_CACHE)/tailwindcss-v$(TAILWIND_VERSION)-$$TAILWIND_PLATFORM"; \
+	ESBUILD_CACHE="$(PANGOLIN_UI_CACHE)/esbuild-v$(ESBUILD_VERSION)-$${ESBUILD_PACKAGE#@esbuild/}"; \
 	mkdir -p "$(PANGOLIN_UI_CACHE)"; \
-	if [ ! -x "$$TAILWIND_BIN" ]; then \
-		echo "Downloading tailwindcss v$(TAILWIND_VERSION) for $$TAILWIND_PLATFORM → $$TAILWIND_BIN"; \
-		if ! curl $(CURL_FLAGS) -o "$$TAILWIND_BIN.tmp" \
-			"https://github.com/tailwindlabs/tailwindcss/releases/download/v$(TAILWIND_VERSION)/tailwindcss-$$TAILWIND_PLATFORM"; then \
-			echo "  ERROR: failed to download tailwindcss" >&2; \
-			rm -f "$$TAILWIND_BIN.tmp"; \
-			exit 1; \
-		fi; \
-		mv "$$TAILWIND_BIN.tmp" "$$TAILWIND_BIN"; \
-		chmod +x "$$TAILWIND_BIN"; \
+	# Tier 1a: PATH first. If a tailwindcss / esbuild binary is \
+	# already on $PATH (e.g. installed globally via npm or \
+	# copied to /usr/local/bin by the operator), use it directly \
+	# and skip the download + system cache entirely. Zero \
+	# bandwidth, zero disk. The operator can force a fresh \
+	# download with `make purge-ui-cache` followed by \
+	# `make download-ui-tools` if their PATH version drifts out \
+	# of sync with the pinned $(TAILWIND_VERSION) / $(ESBUILD_VERSION). \
+	TAILWIND_PATH=$$(command -v tailwindcss 2>/dev/null || true); \
+	if [ -x "$$TAILWIND_PATH" ]; then \
+		TAILWIND_BIN="$$TAILWIND_PATH"; \
+		echo "  tailwindcss on PATH at $$TAILWIND_PATH — skipping cache/download"; \
 	else \
-		echo "  tailwindcss cached at $$TAILWIND_BIN"; \
+		if [ ! -x "$$TAILWIND_CACHE" ]; then \
+			echo "Downloading tailwindcss v$(TAILWIND_VERSION) for $$TAILWIND_PLATFORM → $$TAILWIND_CACHE"; \
+			if ! curl $(CURL_FLAGS) -o "$$TAILWIND_CACHE.tmp" \
+				"https://github.com/tailwindlabs/tailwindcss/releases/download/v$(TAILWIND_VERSION)/tailwindcss-$$TAILWIND_PLATFORM"; then \
+				echo "  ERROR: failed to download tailwindcss" >&2; \
+				rm -f "$$TAILWIND_CACHE.tmp"; \
+				exit 1; \
+			fi; \
+			mv "$$TAILWIND_CACHE.tmp" "$$TAILWIND_CACHE"; \
+			chmod +x "$$TAILWIND_CACHE"; \
+		else \
+			echo "  tailwindcss cached at $$TAILWIND_CACHE"; \
+		fi; \
+		TAILWIND_BIN="$$TAILWIND_CACHE"; \
 	fi; \
-	if [ ! -x "$$ESBUILD_BIN" ]; then \
-		echo "Downloading esbuild v$(ESBUILD_VERSION) for $$ESBUILD_PACKAGE → $$ESBUILD_BIN"; \
-		if ! curl $(CURL_FLAGS) -o "$$ESBUILD_BIN.tmp" \
-			"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@$(ESBUILD_VERSION)/bin/esbuild"; then \
-			echo "  ERROR: failed to download esbuild" >&2; \
-			rm -f "$$ESBUILD_BIN.tmp"; \
-			exit 1; \
-		fi; \
-		mv "$$ESBUILD_BIN.tmp" "$$ESBUILD_BIN"; \
-		chmod +x "$$ESBUILD_BIN"; \
+	ESBUILD_PATH=$$(command -v esbuild 2>/dev/null || true); \
+	if [ -x "$$ESBUILD_PATH" ]; then \
+		ESBUILD_BIN="$$ESBUILD_PATH"; \
+		echo "  esbuild on PATH at $$ESBUILD_PATH — skipping cache/download"; \
 	else \
-		echo "  esbuild cached at $$ESBUILD_BIN"; \
+		if [ ! -x "$$ESBUILD_CACHE" ]; then \
+			echo "Downloading esbuild v$(ESBUILD_VERSION) for $$ESBUILD_PACKAGE → $$ESBUILD_CACHE"; \
+			if ! curl $(CURL_FLAGS) -o "$$ESBUILD_CACHE.tmp" \
+				"https://cdn.jsdelivr.net/npm/$$ESBUILD_PACKAGE@$(ESBUILD_VERSION)/bin/esbuild"; then \
+				echo "  ERROR: failed to download esbuild" >&2; \
+				rm -f "$$ESBUILD_CACHE.tmp"; \
+				exit 1; \
+			fi; \
+			mv "$$ESBUILD_CACHE.tmp" "$$ESBUILD_CACHE"; \
+			chmod +x "$$ESBUILD_CACHE"; \
+		else \
+			echo "  esbuild cached at $$ESBUILD_CACHE"; \
+		fi; \
+		ESBUILD_BIN="$$ESBUILD_CACHE"; \
 	fi; \
 	mkdir -p bin; \
 	for pair in "bin/tailwindcss $$TAILWIND_BIN" "bin/esbuild $$ESBUILD_BIN"; do \
