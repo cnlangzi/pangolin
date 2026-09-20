@@ -1,0 +1,99 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Settings — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-2xl mx-auto">
+  <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Settings</h1>
+  <p class="mt-1 text-sm text-slate-600 dark:text-slate-300">
+    System-wide configuration for the access log and bot log. Changes take effect on
+    the next request — no restart required.
+  </p>
+
+  <form method="POST" action="/settings" class="card p-6 mt-6 space-y-6">
+    {% include "components/_csrf.html" %}
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
+        Client IP resolution
+      </label>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        How the proxy should pick the <code class="font-mono">client_ip</code> field for each
+        access log row. The "real" visitor IP may differ from the TCP peer when pangolin
+        sits behind a CDN or load balancer.
+      </p>
+      <div class="space-y-2">
+        <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+          <input type="radio" name="frontend_mode" value="direct" {% if frontend_mode == "direct" %}checked{% endif %}
+            class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+          <div>
+            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Direct</div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              The TCP peer address is the visitor. No header lookup. Use when pangolin is
+              reached directly (no CDN / LB).
+            </div>
+          </div>
+        </label>
+
+        <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+          <input type="radio" name="frontend_mode" value="cloudflare" {% if frontend_mode == "cloudflare" %}checked{% endif %}
+            class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+          <div>
+            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Cloudflare</div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Read the <code class="font-mono">CF-Connecting-IP</code> header. Falls back to
+              the TCP peer if the header is missing.
+            </div>
+          </div>
+        </label>
+
+        <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+          <input type="radio" name="frontend_mode" value="custom_lb" {% if frontend_mode == "custom_lb" %}checked{% endif %}
+            class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+          <div>
+            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Custom LB</div>
+            <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Read the configured list of headers in priority order; first present + non-empty
+              value wins. Configure the list below.
+            </div>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="trusted-headers">
+        Trusted headers
+        <span class="text-xs font-normal text-slate-400 ml-1">(only used when mode is "Custom LB")</span>
+      </label>
+      <textarea name="trusted_headers" id="trusted-headers" rows="3"
+        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
+        placeholder='["X-Real-IP"]'
+        spellcheck="false">{{ trusted_headers_json }}</textarea>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        JSON array of header names in priority order. Example:
+        <code class="font-mono">["X-Real-IP", "X-Forwarded-For"]</code>. Required and must be
+        non-empty when "Custom LB" is selected.
+      </p>
+    </div>
+
+    {% if let Some(e) = error %}
+    <div class="alert-error text-sm" role="alert" data-testid="settings-error">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <span>{{ e }}</span>
+    </div>
+    {% endif %}
+
+    <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
+      <div class="text-xs text-slate-500 dark:text-slate-400">
+        Last updated: <span class="font-mono">{{ updated_at }}</span>
+      </div>
+      <div class="flex gap-2">
+        <a href="/" class="inline-flex items-center justify-center rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">Cancel</a>
+        <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">Save</button>
+      </div>
+    </div>
+  </form>
+</main>
+{% endblock %}

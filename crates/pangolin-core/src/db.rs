@@ -34,7 +34,8 @@ use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
 use crate::types::{
-    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, Site, Tun,
+    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, FrontendMode, Site,
+    SystemConfig, Tun,
 };
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
@@ -781,6 +782,48 @@ pub fn delete_dns_provider(conn: &Connection, name: &str) -> rusqlite::Result<bo
     Ok(n > 0)
 }
 
+// ---- System config (singleton; V7) ----
+
+/// Read the singleton system config row.
+///
+/// The V7 migration seeds the row, so this almost always returns
+/// `Ok(cfg)`. `QueryReturnedNoRows` is possible only if a manual
+/// `DELETE FROM system_config` slipped through; the callers in
+/// `App::new` / `App::reload_indexes` treat that as "use defaults"
+/// rather than a hard error, since the operator can recover by
+/// POSTing `/api/system/config` (which calls `update_system_config`
+/// + `reload_indexes`).
+pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
+    let mut stmt = conn.prepare(
+        "SELECT frontend_mode, trusted_headers, updated_at
+         FROM system_config WHERE id = 1",
+    )?;
+    stmt.query_row([], row_to_system_config)
+}
+
+/// Update the singleton system config row in place.
+///
+/// Caller is responsible for holding the DB write lock if used
+/// concurrently. The admin route handler takes `app.db.lock()`
+/// around this call.
+pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::Result<()> {
+    let headers_json =
+        serde_json::to_string(&cfg.trusted_headers).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "UPDATE system_config
+            SET frontend_mode = ?1,
+                trusted_headers = ?2,
+                updated_at = ?3
+          WHERE id = 1",
+        params![
+            cfg.frontend_mode.to_string(),
+            headers_json,
+            cfg.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 // ---- Row mappers ----
 
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
@@ -875,6 +918,20 @@ fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider>
     })
 }
 
+fn row_to_system_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<SystemConfig> {
+    let mode_raw: String = row.get(0)?;
+    let trusted_raw: String = row.get(1)?;
+    let updated_at: String = row.get(2)?;
+    let frontend_mode: FrontendMode = mode_raw.parse().map_err(|e: String| {
+        rusqlite::Error::InvalidParameterName(format!("invalid frontend_mode: {e}"))
+    })?;
+    Ok(SystemConfig {
+        frontend_mode,
+        trusted_headers: crate::client_ip::parse_trusted_headers(&trusted_raw),
+        updated_at: parse_dt(&updated_at)?,
+    })
+}
+
 fn row_to_tun(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tun> {
     let name: String = row.get(0)?;
     let token: Option<String> = row.get(1)?;
@@ -959,7 +1016,9 @@ fn parse_dt_opt(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, Tun};
+    use crate::types::{
+        DnsProvider, DnsProviderKind, Domain, FrontendMode, HostMode, Site, SystemConfig, Tun,
+    };
 
     fn make_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -999,8 +1058,8 @@ mod tests {
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 6,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 to be applied"
+            count, 7,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -1860,5 +1919,70 @@ mod tests {
         upsert_dns_provider(&conn, &p).unwrap();
         assert!(delete_dns_provider(&conn, "main-cf").unwrap());
         assert!(!delete_dns_provider(&conn, "main-cf").unwrap());
+    }
+
+    #[test]
+    fn system_config_seeded_after_migrate() {
+        // V7 must INSERT the default row as part of the migration,
+        // so a fresh DB never sees `QueryReturnedNoRows` from
+        // `get_system_config` (the App::new/reload_indexes fallback
+        // path exists for defensive coverage but should not fire
+        // in practice).
+        //
+        // The default row carries frontend_mode='direct' and an
+        // EMPTY trusted_headers list — the column is irrelevant in
+        // direct mode, and the empty literal makes the default
+        // unambiguous (vs. the misleading `["X-Real-IP"]` value
+        // shipped by an earlier draft).
+        let conn = make_conn();
+        let cfg = get_system_config(&conn).expect("system_config row exists post-V7");
+        assert_eq!(cfg.frontend_mode, FrontendMode::Direct);
+        assert!(
+            cfg.trusted_headers.is_empty(),
+            "default trusted_headers must be empty in direct mode, got {:?}",
+            cfg.trusted_headers
+        );
+    }
+
+    #[test]
+    fn system_config_update_round_trip() {
+        // Each FrontendMode variant must survive
+        // update → get round-trip through the DB.
+        let conn = make_conn();
+        for mode in [
+            FrontendMode::Direct,
+            FrontendMode::Cloudflare,
+            FrontendMode::CustomLb,
+        ] {
+            let updated = SystemConfig {
+                frontend_mode: mode,
+                trusted_headers: vec!["X-Real-IP".into(), "X-Forwarded-For".into()],
+                updated_at: dt("2026-03-15T12:34:56+00:00"),
+            };
+            update_system_config(&conn, &updated).unwrap();
+            let back = get_system_config(&conn).unwrap();
+            assert_eq!(back, updated);
+        }
+    }
+
+    #[test]
+    fn system_config_check_constraint_blocks_bogus_mode() {
+        // The DB CHECK constraint is the primary defence against an
+        // invalid frontend_mode — the FromStr parse in
+        // `row_to_system_config` is the second line of defence if a
+        // future migration accidentally drops it. We assert that
+        // the constraint fires, so a reviewer who weakens the
+        // schema must also remove this test.
+        let conn = make_conn();
+        let res = conn.execute(
+            "UPDATE system_config SET frontend_mode = 'bogus' WHERE id = 1",
+            [],
+        );
+        let err = res.expect_err("CHECK constraint must reject 'bogus'");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CHECK constraint failed"),
+            "expected CHECK constraint violation, got: {msg}"
+        );
     }
 }

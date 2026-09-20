@@ -13,7 +13,7 @@
 //! Environment variables override file values: any var named
 //! `NGX_<SECTION>__<KEY>` (the `__` is the nested-key separator)
 //! wins over the corresponding YAML path, e.g.
-//! `NGX_ADDR__HTTP=":8080"` overrides `addr.http`,
+//! `NGX_ADDR__HTTP=":80"` overrides `addr.http`,
 //! `NGX_LOG__LEVEL=debug` overrides `log.level`. This replaces the
 //! old `${VAR}` text-substitution scheme (which scanned the raw
 //! YAML text, comments and all, and so could not tell a
@@ -39,10 +39,13 @@ use crate::error::{PangolinError, Result};
 pub struct Config {
     // ── Proxy listen (top level: this file IS the proxy config) ────────
     /// HTTP / HTTPS listen addresses (full `host:port` strings).
-    /// Defaults to `0.0.0.0:80` + `0.0.0.0:443` so the shipped
-    /// example is immediately usable for a public, single-host
-    /// production deploy. Set a port to `:0` to disable that listener
-    /// entirely (e.g. `https: ":0"` to run HTTP-only).
+    /// Defaults to `0.0.0.0:8000` + `0.0.0.0:8443` so a non-root
+    /// developer can run `make start-ngx` straight from a fresh clone
+    /// without sudo or a `.env`. Production hosts that bind the
+    /// privileged ports set `addr.http` / `addr.https` to `:80` /
+    /// `:443` in their YAML config or `.env`. Set a port to `:0`
+    /// to disable that listener entirely (e.g. `https: ":0"` to run
+    /// HTTP-only).
     #[serde(default)]
     pub addr: AddrConfig,
     /// Virtual host used to resolve per-domain certs. `null` (default)
@@ -80,10 +83,10 @@ pub struct AddrConfig {
 }
 
 fn default_http_addr() -> String {
-    "0.0.0.0:80".into()
+    "0.0.0.0:8000".into()
 }
 fn default_https_addr() -> String {
-    "0.0.0.0:443".into()
+    "0.0.0.0:8443".into()
 }
 
 impl Default for AddrConfig {
@@ -548,11 +551,14 @@ mod tests {
     #[test]
     fn default_config() {
         let c = Config::default();
-        // addr defaults — must be 0.0.0.0:80 + 0.0.0.0:443 so the
-        // shipped example is immediately usable for a public deploy.
-        // A regression to 127.0.0.1 would silently bind loopback.
-        assert_eq!(c.addr.http, "0.0.0.0:80");
-        assert_eq!(c.addr.https, "0.0.0.0:443");
+        // addr defaults — must be 0.0.0.0:8000 + 0.0.0.0:8443 so a
+        // non-root developer can run the binary straight from a
+        // fresh clone. Privileged ports (80/443) are reserved for
+        // production hosts that set them explicitly in their YAML
+        // config. A regression to 127.0.0.1 would silently bind
+        // loopback and exclude remote clients.
+        assert_eq!(c.addr.http, "0.0.0.0:8000");
+        assert_eq!(c.addr.https, "0.0.0.0:8443");
         // tunnel default — must be 0.0.0.0:9001 so a multi-host
         // deploy (tun on a separate host) works out of the box.
         // Loopback still works because 0.0.0.0 accepts 127.0.0.1
@@ -575,15 +581,24 @@ mod tests {
     #[test]
     fn parse_minimal_yaml() {
         // Empty config: all fields take their defaults.
-        let c = Config::from_str("").unwrap();
-        assert_eq!(c.addr.http, "0.0.0.0:80");
-        assert_eq!(c.addr.https, "0.0.0.0:443");
-        // v2: cert.autorenew removed; no global ACME toggle to assert
-        assert_eq!(c.acme.key_type, "ecdsa");
-        // v3 (issue #73): access log knobs default to 100 / 1000
-        // so a YAML without `[log]` keys still parses.
-        assert_eq!(c.log.access_log_recent, 100);
-        assert_eq!(c.log.access_log_capacity, 1000);
+        // Wrap in Jail so an ambient NGX_ADDR__HTTP / NGX_ADDR__HTTPS
+        // from another parallel test's set-env doesn't clobber the
+        // defaults we're asserting here. Without this, the test
+        // became flaky when client_ip / system_config test additions
+        // changed the parallel scheduler.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.addr.http, "0.0.0.0:8000");
+            assert_eq!(c.addr.https, "0.0.0.0:8443");
+            // v2: cert.autorenew removed; no global ACME toggle to assert
+            assert_eq!(c.acme.key_type, "ecdsa");
+            // v3 (issue #73): access log knobs default to 100 / 1000
+            // so a YAML without `[log]` keys still parses.
+            assert_eq!(c.log.access_log_recent, 100);
+            assert_eq!(c.log.access_log_capacity, 1000);
+            Ok(())
+        });
     }
 
     #[test]
@@ -630,7 +645,7 @@ mod tests {
                   https: ":0"
             "#;
             let c = Config::from_str(s).unwrap();
-            assert_eq!(c.addr.http, "0.0.0.0:80"); // default
+            assert_eq!(c.addr.http, "0.0.0.0:8000"); // default
             assert_eq!(c.addr.https, ":0"); // disabled
             Ok(())
         });

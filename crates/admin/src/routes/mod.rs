@@ -23,6 +23,7 @@ pub mod dns;
 pub mod domains;
 pub mod helpers;
 pub mod logs;
+pub mod settings;
 pub mod sites;
 pub mod system;
 pub mod tun;

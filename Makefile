@@ -9,25 +9,35 @@ APP_NAME := pangolin
 
 # ── .env auto-loading ────────────────────────────────────────────────────
 # `.env` is git-ignored; `.env.example` is the tracked template.
+# `.env` is **optional** — `make start-ngx` works on a fresh clone
+# without it: when the file is missing, `ENV_LOAD` is empty and the
+# binary boots with its compiled-in defaults. Copy `.env` only when
+# you actually want to override a value.
+#
 # Two layers of integration:
 #
-#   (a) `-include .env`  — make itself parses the file, so
+#   (a) `include $(ENV_FILE)` — make itself parses the file, so
 #       `$(ngx_admin_password)` works in any recipe line below.
 #       This is for *make-level* expansion only (currently unused
 #       in recipes, but keeps `.env` discoverable from `make -p`).
 #
-#   (b) `env-load` target — prints `export FOO=bar ...` so a recipe
-#       can prepend `$(ENV_LOAD)` and have every var from `.env`
-#       reach the subprocess. Ansible picks them up automatically
-#       (host facts from env), and the Rust binaries pick them up
-#       via their existing `NGX_*` / `TUN_*` env-override layer
-#       (see the mapping table in `.env.example`).
+#   (b) `ENV_LOAD` — when prepended to a recipe (`$(ENV_LOAD) ./bin/...`),
+#       sources the env file in a subshell so every var reaches the
+#       subprocess. Ansible picks them up automatically (host facts
+#       from env), and the Rust binaries pick them up via their
+#       existing `NGX_*` / `TUN_*` env-override layer (see the mapping
+#       table in `.env.example`).
 #
-# Already-exported shell vars win over `.env` (make's `-include`
+# Already-exported shell vars win over `.env` (make's `include`
 # semantics: existing env-vars override vars set in the file).
 ENV_FILE := .env
 ifeq ($(wildcard $(ENV_FILE)),)
+# No local `.env` — recipes prepend an empty `$(ENV_LOAD)` and the
+# binary uses its compiled-in defaults. No fallback to `.env.example`:
+# that file is a template the operator is expected to inspect and
+# curate, not a silent source of prod-bound defaults.
 ENV_LOAD :=
+ENV_FROM_EXAMPLE :=
 else
 # `$(CURDIR)/$(ENV_FILE)` (not bare `$(ENV_FILE)`) so POSIX `.` resolves
 # it as a path instead of searching `$PATH` — otherwise
@@ -39,20 +49,19 @@ include $(ENV_FILE)
 export
 endif
 
-# Fail-loud guard for targets that need $(ENV_FILE) to be present.
-# Used as a prerequisite by every target that consumes $(ENV_LOAD) so
-# the error wording and exit behavior stay consistent.
-require-env:
+# Soft notice when `.env` is missing. Non-fatal — `make start-ngx`
+# continues with the binary's compiled-in defaults. Operators who
+# want to override a value copy `.env.example` to `.env` and edit.
+warn-env-fallback:
 	@if [ ! -f $(ENV_FILE) ]; then \
-		echo "  ! $(ENV_FILE) not found — copy .env.example to .env first" >&2; \
-		exit 1; \
+		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools require-env clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load
 
 help:
 	@echo "=== Config ==="
-	@echo "  make env-show      # Print effective vars loaded from .env"
+	@echo "  make env-show      # Print vars loaded from .env (or show .env.example template if .env missing)"
 	@echo ""
 	@echo "=== Build ==="
 	@echo "  make build         # Local build ngx + tun (release, unminified UI)"
@@ -69,6 +78,7 @@ help:
 	@echo "  make start-tun     # Build + run ./bin/pangolin-tun (foreground, no sudo)"
 	@echo "  make install-ngx   # Install + start ngx as systemd service (sudo)"
 	@echo "  make install-tun   # Install + start tun as systemd service (sudo)"
+	@echo "  make stop          # Stop dev-mode processes holding pangolin ports (lsof, SIGTERM→SIGKILL)"
 	@echo "  make stop-ngx      # Stop ngx systemd service"
 	@echo "  make stop-tun      # Stop tun systemd service"
 	@echo "  make status-ngx    # Check ngx systemd status"
@@ -314,10 +324,10 @@ play: play-ngx play-tun
 # subsequently-defined variable in the ansible-playbook process as
 # auto-exported too. The final `&&` chain runs ansible-playbook
 # *after* the subshell exits and we've `cd`'d into the playbooks dir.
-play-ngx: require-env
+play-ngx: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts
 
-play-tun: require-env
+play-tun: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
 
 # ── Local Run (no sudo) ───────────────────────────────────────────────────────
@@ -327,17 +337,23 @@ play-tun: require-env
 # `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
-start-ngx: build-ui build-ngx require-env
+start-ngx: build-ui build-ngx warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-ngx
 
-start-tun: build-tun require-env
+start-tun: build-tun warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-tun
 
 # Debug helper: show which env vars are being injected. Useful for
-# "why isn't my .env value reaching the binary?" questions.
-env-show: require-env
-	@echo "Loaded from $(ENV_FILE):"
-	@grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'
+# "why isn't my .env value reaching the binary?" questions. With no
+# `.env`, prints the template's contents as a starting point.
+env-show: warn-env-fallback
+	@if [ -f $(ENV_FILE) ]; then \
+		echo "Loaded from $(ENV_FILE):"; \
+		grep -vE '^[[:space:]]*(#|$$)' $(ENV_FILE) | sed 's/^/  /'; \
+	else \
+		echo "No $(ENV_FILE) — binary uses compiled-in defaults. Template ($(CURDIR)/.env.example):"; \
+		grep -vE '^[[:space:]]*(#|$$)' $(CURDIR)/.env.example | sed 's/^/  /'; \
+	fi
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
@@ -368,6 +384,48 @@ stop-ngx:
 stop-tun:
 	sudo systemctl stop pangolin-tun || true
 	@echo "tun stopped"
+
+# Stop any pangolin processes holding the standard listener ports
+# (8080 / 8443 for ngx HTTP+HTTPS, 9001 for the tunnel WS endpoint,
+# 9081 for the admin UI). Detection is port-based — `lsof -ti
+# tcp:PORT -sTCP:LISTEN` — so:
+#   - We never accidentally kill a systemd-managed `pangolin-tun`
+#     or `pangolin-ngx` instance, which is what `stop-ngx` /
+#     `stop-tun` are for (those use `sudo systemctl stop ...`).
+#   - We catch anything holding the ports, even if the binary was
+#     renamed or moved.
+# SIGTERM first; SIGKILL after $(STOP_TIMEOUT)s for anyone still
+# alive (e.g. a service that ignores SIGTERM).
+STOP_PORTS := 8000 8443 9001 9081
+STOP_TIMEOUT := 3
+
+stop:
+	@echo "Stopping processes holding pangolin ports ($(STOP_PORTS))..."
+	@PIDS=""; \
+	for port in $(STOP_PORTS); do \
+		holders=$$(lsof -ti tcp:$$port -sTCP:LISTEN 2>/dev/null || true); \
+		if [ -n "$$holders" ]; then \
+			echo "  port $$port held by PID(s): $$holders"; \
+			PIDS="$$PIDS $$holders"; \
+		fi; \
+	done; \
+	PIDS=$$(echo $$PIDS | tr ' ' '\n' | sort -u | grep -v '^$$' || true); \
+	if [ -z "$$PIDS" ]; then \
+		echo "  ✓ nothing to stop"; \
+		exit 0; \
+	fi; \
+	echo "  → SIGTERM: $$PIDS"; \
+	echo "$$PIDS" | xargs -r kill 2>/dev/null || true; \
+	sleep $(STOP_TIMEOUT); \
+	leftover=""; \
+	for pid in $$PIDS; do \
+		if kill -0 $$pid 2>/dev/null; then leftover="$$leftover $$pid"; fi; \
+	done; \
+	if [ -n "$$leftover" ]; then \
+		echo "  → SIGKILL (still alive):$$leftover"; \
+		echo "$$leftover" | xargs -r kill -9 2>/dev/null || true; \
+	fi; \
+	echo "  ✓ stopped"
 
 status-ngx:
 	@systemctl is-active pangolin-ngx || true

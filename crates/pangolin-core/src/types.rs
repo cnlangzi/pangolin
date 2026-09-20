@@ -768,6 +768,82 @@ pub enum BackendKind {
     Tunnel { tun_name: String },
 }
 
+// ---- System-level configuration (V7; fix-client-ip) ----
+//
+// Singleton row describing what sits between the visitor and
+// pangolin, so the access log resolver can pick the right strategy
+// for recording the *real* client IP. See `client_ip::resolve` for
+// the per-mode semantics.
+
+/// What sits between the visitor and pangolin — used by the
+/// access-log resolver to decide whether to trust an upstream
+/// header for the client IP. See `pangolin_core::client_ip::resolve`
+/// for the per-mode resolution rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `serde(rename_all = "lowercase")` would turn `CustomLb` into
+// `customlb`, but the DB CHECK constraint (and the row mapper's
+// FromStr) expect `custom_lb`. We default to lowercase and rename
+// just the variant that breaks the pattern. Adding new modes later
+// is intentionally a one-line edit here.
+#[serde(rename_all = "lowercase")]
+pub enum FrontendMode {
+    /// TCP peer is the visitor. The resolver returns
+    /// `session.client_addr().ip()` (port stripped). This is the
+    /// default for fresh deployments.
+    Direct,
+    /// Cloudflare (or any CDN that proxies via `CF-Connecting-IP`)
+    /// is in front. The resolver returns that header value,
+    /// falling back to the peer IP if the header is missing.
+    Cloudflare,
+    /// Operator-configured ordered list of header names. The
+    /// first present + non-empty value wins. `trusted_headers` on
+    /// the singleton row carries the list; the resolver expands
+    /// an empty list to its built-in default (`["X-Real-IP"]`).
+    #[serde(rename = "custom_lb")]
+    CustomLb,
+}
+
+impl std::str::FromStr for FrontendMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "direct" => Ok(FrontendMode::Direct),
+            "cloudflare" => Ok(FrontendMode::Cloudflare),
+            "custom_lb" => Ok(FrontendMode::CustomLb),
+            other => Err(format!("unknown frontend_mode: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for FrontendMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrontendMode::Direct => f.write_str("direct"),
+            FrontendMode::Cloudflare => f.write_str("cloudflare"),
+            FrontendMode::CustomLb => f.write_str("custom_lb"),
+        }
+    }
+}
+
+/// Singleton system config row (system_config table, V7).
+///
+/// Loaded once at startup via `db::get_system_config` and refreshed
+/// by `App::reload_indexes` whenever an admin POSTs to
+/// `/api/system/config`. The proxy hot path (record_access_log and
+/// the tunnel frame builders) reads this through
+/// `Arc<RwLock<SystemConfig>>` on the shared [`App`](crate::App).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemConfig {
+    pub frontend_mode: FrontendMode,
+    /// Header names to try in priority order when
+    /// `frontend_mode = CustomLb`. The resolver treats an empty
+    /// list as "use the built-in default" (currently
+    /// `["X-Real-IP"]`); the admin POST handler validates that a
+    /// `custom_lb` row carries a non-empty list.
+    pub trusted_headers: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 // ---- Tunnel messages (used by both ngx and tun) ----
 //
 // As of issue #39, the tunnel carries raw HTTP/1.1 bytes inside
@@ -1016,5 +1092,49 @@ mod tests {
     #[test]
     fn host_port_empty() {
         assert_eq!(site_with("").backend_host_port(), "");
+    }
+
+    #[test]
+    fn system_config_serde_roundtrip() {
+        // Regression (fix-client-ip): SystemConfig + FrontendMode
+        // must survive a JSON round-trip with the wire format used
+        // by the admin GET/POST endpoints and the DB row mapper.
+        let ts = Utc::now();
+        for mode in [
+            FrontendMode::Direct,
+            FrontendMode::Cloudflare,
+            FrontendMode::CustomLb,
+        ] {
+            let cfg = SystemConfig {
+                frontend_mode: mode,
+                trusted_headers: vec!["X-Real-IP".into(), "X-Forwarded-For".into()],
+                updated_at: ts,
+            };
+            let json = serde_json::to_string(&cfg).unwrap();
+            let back: SystemConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, cfg);
+            // Wire form of frontend_mode is lowercase (matches the
+            // DB CHECK constraint).
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v["frontend_mode"],
+                serde_json::Value::String(mode.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn frontend_mode_from_str_and_display() {
+        // Wire format must round-trip: the DB stores the
+        // Display form, and the row mapper parses with FromStr.
+        for (s, m) in [
+            ("direct", FrontendMode::Direct),
+            ("cloudflare", FrontendMode::Cloudflare),
+            ("custom_lb", FrontendMode::CustomLb),
+        ] {
+            assert_eq!(s.parse::<FrontendMode>().unwrap(), m);
+            assert_eq!(m.to_string(), s);
+        }
+        assert!("bogus".parse::<FrontendMode>().is_err());
     }
 }
