@@ -80,52 +80,72 @@ pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<F
 ///
 /// On success: 302 redirect to `/` so the operator sees the
 /// dashboard. On validation failure: 400 with a plain-text reason.
+///
+/// The HTML form (`/settings`) reuses the same validation +
+/// persistence via [`parse_system_config_form`] and
+/// [`save_system_config`]; only the success/failure rendering
+/// differs between the two endpoints.
 pub async fn handle_update_system_config(
     app: &Arc<App>,
     body: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
-    let mode_str = require_param(body, "frontend_mode").unwrap_or_default();
-    let mode: FrontendMode = match mode_str.parse() {
-        Ok(m) => m,
-        Err(e) => {
-            return flash_error(&format!(
-                "Invalid frontend_mode '{mode_str}': {e}. \
-                 Expected one of: direct, cloudflare, custom_lb."
-            ));
-        }
+    let parsed = match parse_system_config_form(body) {
+        Ok(c) => c,
+        Err(msg) => return flash_error(&msg),
     };
+    if let Err(msg) = save_system_config(app, parsed).await {
+        return flash_error(&msg);
+    }
+    Ok(redirect("/"))
+}
+
+/// Parse the form-encoded body for the system config endpoint.
+///
+/// Returns the parsed [`SystemConfig`] (with `updated_at` set to the
+/// current UTC time) on success, or a human-readable error message
+/// on failure. Shared between the JSON API handler and the HTML
+/// `/settings` page so both endpoints enforce identical validation.
+pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
+    let mode_str = require_param(body, "frontend_mode").unwrap_or_default();
+    let mode: FrontendMode = mode_str.parse().map_err(|e: String| {
+        format!(
+            "Invalid frontend_mode '{mode_str}': {e}. \
+             Expected one of: direct, cloudflare, custom_lb."
+        )
+    })?;
 
     let trusted_headers: Vec<String> = match require_param(body, "trusted_headers") {
-        Some(raw) => match serde_json::from_str::<Vec<String>>(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                return flash_error(&format!(
-                    "trusted_headers must be a JSON array of strings: {e}"
-                ));
-            }
-        },
+        Some(raw) => serde_json::from_str::<Vec<String>>(&raw)
+            .map_err(|e| format!("trusted_headers must be a JSON array of strings: {e}"))?,
         None => Vec::new(),
     };
 
     if mode == FrontendMode::CustomLb && trusted_headers.is_empty() {
-        return flash_error("frontend_mode=custom_lb requires a non-empty trusted_headers list.");
+        return Err(
+            "frontend_mode=custom_lb requires a non-empty trusted_headers list.".to_string(),
+        );
     }
 
-    let new_cfg = SystemConfig {
+    Ok(SystemConfig {
         frontend_mode: mode,
         trusted_headers,
         updated_at: chrono::Utc::now(),
-    };
+    })
+}
 
+/// Persist a parsed [`SystemConfig`] and hot-reload the in-memory
+/// `Arc<RwLock<SystemConfig>>` on the [`App`] so the next proxied
+/// request picks up the new mode without a process restart.
+///
+/// Returns `Ok(())` on success, or a human-readable error message
+/// on DB failure (the only failure mode — validation has already
+/// happened upstream via [`parse_system_config_form`]).
+pub async fn save_system_config(app: &Arc<App>, cfg: SystemConfig) -> Result<(), String> {
     {
         let db = app.db.lock().await;
-        if let Err(e) = pangolin_core::db::update_system_config(&db, &new_cfg) {
-            return flash_error(&format!("Database error: {e}"));
-        }
+        pangolin_core::db::update_system_config(&db, &cfg)
+            .map_err(|e| format!("Database error: {e}"))?;
     }
-    // Hot-reload: App::reload_indexes re-reads the row and updates
-    // the in-memory Arc<RwLock<SystemConfig>>. Subsequent proxied
-    // requests see the new mode without a process restart.
     app.reload_indexes().await;
-    Ok(redirect("/"))
+    Ok(())
 }

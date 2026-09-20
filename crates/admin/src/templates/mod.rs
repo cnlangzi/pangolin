@@ -34,6 +34,7 @@ pub mod dashboard;
 pub mod dns;
 pub mod domains;
 pub mod logs;
+pub mod settings;
 pub mod sites;
 pub mod tun;
 
@@ -51,6 +52,7 @@ pub use domains::{
     DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
 pub use logs::{BotLogsTemplate, LogsTemplate};
+pub use settings::SettingsTemplate;
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };

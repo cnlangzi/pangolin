@@ -581,15 +581,24 @@ mod tests {
     #[test]
     fn parse_minimal_yaml() {
         // Empty config: all fields take their defaults.
-        let c = Config::from_str("").unwrap();
-        assert_eq!(c.addr.http, "0.0.0.0:8080");
-        assert_eq!(c.addr.https, "0.0.0.0:8443");
-        // v2: cert.autorenew removed; no global ACME toggle to assert
-        assert_eq!(c.acme.key_type, "ecdsa");
-        // v3 (issue #73): access log knobs default to 100 / 1000
-        // so a YAML without `[log]` keys still parses.
-        assert_eq!(c.log.access_log_recent, 100);
-        assert_eq!(c.log.access_log_capacity, 1000);
+        // Wrap in Jail so an ambient NGX_ADDR__HTTP / NGX_ADDR__HTTPS
+        // from another parallel test's set-env doesn't clobber the
+        // defaults we're asserting here. Without this, the test
+        // became flaky when client_ip / system_config test additions
+        // changed the parallel scheduler.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.addr.http, "0.0.0.0:8080");
+            assert_eq!(c.addr.https, "0.0.0.0:8443");
+            // v2: cert.autorenew removed; no global ACME toggle to assert
+            assert_eq!(c.acme.key_type, "ecdsa");
+            // v3 (issue #73): access log knobs default to 100 / 1000
+            // so a YAML without `[log]` keys still parses.
+            assert_eq!(c.log.access_log_recent, 100);
+            assert_eq!(c.log.access_log_capacity, 1000);
+            Ok(())
+        });
     }
 
     #[test]
