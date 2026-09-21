@@ -119,7 +119,7 @@ COPY . .
 # the directory into the binary via rust-embed. The binary therefore
 # serves a single `app.js` filename in both dev and prod.
 RUN tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
-    esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.js
+    esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --allow-overwrite --outfile=./assets/app.js
 
 # Build ngx + tun binaries.  Single cargo invocation so shared crates
 # (pangolin-core, admin, pingora, …) are compiled and linked exactly
