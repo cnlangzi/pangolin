@@ -111,14 +111,15 @@ COPY . .
 # Build UI assets using the standalone CLIs baked into the base image
 # (`tailwindcss` and `esbuild` are on PATH — same approach as
 # `starter/build/docker/dist.dockerfile`, which also calls them bare).
-# Only the production pipeline minifies — local `make build-ui` (dev) runs
-# without `--minify` and skips esbuild entirely, since `assets/app.js` has
-# no imports and the raw source is browser-ready. Mirrors the recipe in
-# `make build-ui-prod`.
+#
+# Only the production pipeline minifies — local `make build-ui` (dev)
+# runs tailwindcss without `--minify` and skips esbuild entirely. Here
+# in the `builder` stage, esbuild overwrites `assets/app.js` in-place
+# with the minified bundle before `cargo build --release` snapshots
+# the directory into the binary via rust-embed. The binary therefore
+# serves a single `app.js` filename in both dev and prod.
 RUN tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
-    if [ -f ./assets/app.js ]; then \
-        esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.min.js; \
-    fi
+    esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --outfile=./assets/app.js
 
 # Build ngx + tun binaries.  Single cargo invocation so shared crates
 # (pangolin-core, admin, pingora, …) are compiled and linked exactly

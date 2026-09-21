@@ -16,9 +16,9 @@
 //! `ok_html_with_csrf` helper, mirroring every other page route.
 //! Each route handler is responsible for this substitution (the
 //! parent `admin::handle()` does not post-process responses), so
-//! skipping it here would leave `__JS_FILE__` / `__JS_HASH__` /
-//! `__CSS_HASH__` / `__CSRF__` placeholders in the rendered HTML
-//! and the browser would 404 on `/assets/__JS_FILE__?v=__JS_HASH__`
+//! skipping it here would leave `__JS_HASH__` / `__CSS_HASH__` /
+//! `__CSRF__` placeholders in the rendered HTML
+//! and the browser would 404 on `/assets/app.js?v=__JS_HASH__`
 //! (observed symptom: the page renders but JS never loads and the
 //! SSE status pill stays on "disconnected").
 //!

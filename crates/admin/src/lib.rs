@@ -523,11 +523,11 @@ fn query_param(body: &[u8], key: &str) -> String {
 }
 
 /// Substitute the `__CSS_HASH__`, `__JS_FILE__`, and `__JS_HASH__` placeholders
-/// in rendered HTML with the runtime asset hashes and active JS filename.
-/// Used to prevent browser caching of stale CSS/JS after rebuilds.
+/// in rendered HTML with the runtime asset hashes and the (always-`app.js`)
+/// JS filename. Used to prevent browser caching of stale CSS/JS after rebuilds.
 pub fn render_with_assets(html: String) -> String {
     html.replace("__CSS_HASH__", &assets::CSS_HASH)
-        .replace("__JS_FILE__", *assets::JS_FILE)
+        .replace("__JS_FILE__", assets::JS_FILE)
         .replace("__JS_HASH__", &assets::JS_HASH)
 }
 
