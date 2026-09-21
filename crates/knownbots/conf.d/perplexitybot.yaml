@@ -1,0 +1,9 @@
+# PerplexityBot - Perplexity AI crawler
+# https://docs.perplexity.ai/guides/bots
+kind: AITraining
+name: perplexitybot
+vendor: "Perplexity"
+ua: "PerplexityBot"
+rdns: true
+domains:
+  - "perplexity.ai"

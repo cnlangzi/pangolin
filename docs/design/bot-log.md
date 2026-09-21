@@ -20,17 +20,13 @@ For the corresponding config keys, see
 
 ## Non-goals
 
-- **Reverse-DNS validation** of claimed Googlebot / Bingbot IPs. v1 fully
-  trusts the `User-Agent` header. A future commit may add an optional PTR
-  lookup behind a feature flag (see `bot::reverse_dns_check` stub).
+- **Logging unverified claims.** Forged UAs, cold RDNS, and unknown
+  agents never enter the bot log (fail closed). Pending async RDNS
+  only warms the cache for a later request.
 - **Per-domain rate limiting / robots.txt enforcement**. The gateway observes
   crawlers; it does not police them.
 - **Replacing the Google Search Console crawler stats**. That data is the
   authoritative view of how Google actually indexes a site.
-- **User-extensible UA rules**. v1's rules are entirely built-in. The
-  `extra_user_agent_patterns` config field is reserved on the struct but
-  `#[serde(skip)]` — exposing it would invite user misconfiguration (a
-  too-greedy substring shadows real bots).
 
 ## Architecture
 
@@ -41,9 +37,9 @@ For the corresponding config keys, see
 proxy.rs ──────►│ App::push_access_log(entry)                    │
                 │   ├── access_log_recent.push(entry)            │
                 │   ├── access_log_tx.send(entry)    ──► /api/logs/stream
-                │   └── (NEW) bot side-channel:                  │
-                │         if let Some(ua) = entry.user_agent     │
-                │         if let Some(bot) = detect_bot(ua)      │
+                │   └── bot side-channel (fail closed):          │
+                │         verify_bot(ua, client_ip)              │
+                │         only if Verified:                      │
                 │             BotLogEntry::from_access_log       │
                 │             ├── bot_log_recent.push            │
                 │             ├── bot_stats.record               │
@@ -52,25 +48,37 @@ proxy.rs ──────►│ App::push_access_log(entry)                   
                 └────────────────────────────────────────────────┘
 ```
 
-The fan-out is **fully synchronous** (no `.await`) on the request hot path.
-`detect_bot` is a single `to_ascii_lowercase` + linear scan over ~50
-rules — well under 5 µs. Disk I/O happens in the spawned background
-`BotLogWriter::run` task.
+`verify_bot` is synchronous on the hot path (UA word-boundary match +
+CIDR / RDNS-cache lookup). Cold RDNS and official IP-list downloads run
+in background tasks started by `App::start_bot_writer`. Disk I/O for
+JSONL happens in `BotLogWriter::run`.
 
 ## Components
 
+### `crates/knownbots`
+
+Rust port of the knownbots verification model:
+
+- Embedded YAML under `conf.d/` (search / AI / social / monitoring).
+- Case-sensitive word-boundary UA match; longest marker wins.
+  Mixed-case UAs are rejected on purpose: official crawlers publish
+  a fixed token, and folding case would accept trivial forgeries.
+- IP ownership via official CIDR lists and/or RDNS (+ FCrDNS).
+- Immediate IP-list refresh on startup; retry with backoff on failure.
+  Until that first refresh lands, URL-backed bots with an empty
+  prefix cache fail closed. Startup logs how many are in that window.
+- JSONL `bot_name` is the YAML `name` (the id chosen when the UA
+  matched). `ua` is the raw User-Agent header. Readers filter on
+  `bot_name` and do not scan `ua` again.
+- `vendor` in the YAML is the JSONL `bot_vendor`.
+- RDNS success updates an in-memory dirty cache; the scheduler flushes
+  `rdns.txt` periodically. The dirty flag is cleared before the
+  snapshot so a concurrent insert is not lost.
+
 ### `crates/pangolin-core/src/bot.rs`
 
-Pure-function UA → bot matching. No I/O, no async.
-
-- `BotIdentity { name: &'static str, vendor: &'static str, category: BotCategory }`
-- `BotCategory` enum: `SearchEngine`, `AiBot`, `Social`, `Monitoring`, `AdsBot`.
-- `static BOT_RULES: &[(&str, BotIdentity)]` — substring table, ordered so
-  more specific patterns win (e.g. `google-inspectiontool` before
-  `googlebot`; `telegrambot` before `twitterbot` because Telegram's UA
-  literally contains "TwitterBot" in the user-agent string).
-- `detect_bot(ua) -> Option<BotIdentity>` — allocates at most one
-  `String` (the lowercase UA), then linear-scans the table.
+Thin adapter: `verify_bot` → `Option<BotIdentity>` only when verified.
+`BotCategory` wire labels unchanged (`search_engine`, `ai_bot`, …).
 
 ### `crates/pangolin-core/src/bot_log.rs`
 
@@ -81,10 +89,11 @@ JSONL writer + ring buffer + (stage-3) history reader.
   backend / client_ip / bot_name / bot_vendor / bot_category / ua /
   referer (always `None` in v1; reserved for a future
   `RequestState::referer` capture). `bot_name` / `bot_vendor` are
-  `Cow<'static, str>` — borrowed from the static bot-rule table
-  on the hot path (`Cow::Borrowed`), owned `String` when
-  re-hydrated from JSONL by the history reader. Zero-cost on
-  write, one alloc per field on read.
+  `Cow<'static, str>` so the history reader and the verifier share
+  one field. Both paths own the string: knownbots display names
+  come from YAML, and JSONL lines are parsed text. There is no
+  `Cow::Borrowed` hot path after the `'static` rule table was
+  removed.
 - `BotLogBuffer` — bounded ring buffer mirroring `AccessLogBuffer`.
   Capacity 0 → no-op (the JSONL stream + stats counters still work).
 - `BotLogWriter` — `Arc<Self>` shared between the request hot path
@@ -161,7 +170,7 @@ One JSON object per line, no nested `bot:` wrapper, ISO-8601 timestamps,
 snake_case category enum:
 
 ```json
-{"ts":"2026-09-19T08:23:11.452Z","host":"blog.example.com","method":"GET","path":"/sitemap.xml","status":200,"duration_ms":12,"backend":"direct:127.0.0.1:8080","client_ip":"66.249.66.1","bot_name":"Googlebot","bot_vendor":"Google","bot_category":"search_engine","ua":"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+{"ts":"2026-09-19T08:23:11.452Z","host":"blog.example.com","method":"GET","path":"/sitemap.xml","status":200,"duration_ms":12,"backend":"direct:127.0.0.1:8080","client_ip":"66.249.66.1","bot_name":"googlebot","bot_vendor":"Google","bot_category":"search_engine","ua":"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
 ```
 
 Filename: `bot-YYYY-MM-DD.jsonl`. UTC day boundary. Operators handle
@@ -172,22 +181,22 @@ itself does not auto-clean up.
 
 | Failure | Behaviour |
 | ------- | --------- |
-| `bot.enabled = false` | `bot_writer` is `None`; first branch in `push_access_log` returns. Zero CPU cost beyond the option check. |
-| `detect_bot` returns `None` | Skip the bot fan-out entirely. The generic access log still fires. |
+| `bot.enabled = false` | `bot_writer` / `bot_verifier` are `None`; first branch in `push_access_log` returns. |
+| `verify_bot` returns `None` (unknown / forged / pending RDNS) | Skip the bot fan-out. The generic access log still fires. |
 | `BotLogWriter::enqueue` queue full (10 000 entries backlogged) | Drop oldest entry, `log::warn!` once. The ring buffer + stats still receive the current entry; only the JSONL write is best-effort. |
 | `tokio::fs::OpenOptions::open` fails on first write | `log::warn!` and drop the batch. The generic access log keeps working. Retry on the next batch. |
 | Disk fills mid-day | `write_all` returns `Err`; `log::warn!`; current batch is dropped. Next `drain_and_write` retries. The `sync_all` after `write_all` surfaces the error before `current_size` is updated. |
 | Process crash mid-write | At most `fsync_interval_secs` (5 s default) of unflushed bytes lost. JSONL's "one line per request" format means a partial line at EOF is silently skipped by `jq` / DuckDB on recovery. |
-| `push_access_log` is called from a request whose UA is exactly 12 bytes | `detect_bot` short-circuits on `ua.len() < 12`. No allocation, no rule scan. |
+| Official IP list refresh fails on a cold install | URL-based bots stay unverified until retry backoff succeeds (5s → 5min). Prior non-empty `ips.txt` is never wiped by an empty/failed refresh. |
 
 ## Operator workflow
 
 ```bash
 # How many Googlebot hits today?
-grep '"bot_name":"Googlebot"' logs/bots/bot-$(date -u +%Y-%m-%d).jsonl | wc -l
+grep '"bot_name":"googlebot"' logs/bots/bot-$(date -u +%Y-%m-%d).jsonl | wc -l
 
 # What did Baiduspider crawl most on our blog?
-grep '"bot_name":"Baiduspider"' logs/bots/bot-*.jsonl \
+grep '"bot_name":"baiduspider"' logs/bots/bot-*.jsonl \
   | jq -r '.host + .path' \
   | sort | uniq -c | sort -rn | head 20
 
@@ -221,10 +230,10 @@ duckdb -c "
   archive:
   - `pangolin-core::bot_log` — `BotHistoryQuery` / `BotHistoryPage`
     / `list_dates` / `file_size_for` / `query_history` (read-only,
-    zero new deps). `BotLogEntry.bot_name` / `bot_vendor` switched
-    from `&'static str` to `Cow<'static, str>` so the JSONL wire
-    format round-trips through `Deserialize` while the hot path
-    (`from_access_log`) stays zero-allocation via `Cow::Borrowed`.
+    zero new deps). `BotLogEntry.bot_name` / `bot_vendor` are
+    `Cow<'static, str>` so JSONL round-trips through `Deserialize`.
+    The hot path owns the strings (`Cow::Owned`) because display
+    names come from the knownbots YAML, not a `'static` table.
   - `admin/templates/pages/logs_bots_history.html` — full page
     with sub-nav (Live / History), date sidebar, filter form,
     result region.

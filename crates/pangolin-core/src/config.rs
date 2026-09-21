@@ -401,6 +401,17 @@ pub struct BotLogConfig {
     #[serde(default = "default_bot_dir")]
     pub dir: PathBuf,
 
+    /// Cache directory for knownbots IP lists (`<bot>/ips.txt`) and
+    /// RDNS results (`<bot>/rdns.txt`). Default `./logs/bots/cache`.
+    #[serde(default = "default_bot_cache_dir")]
+    pub cache_dir: PathBuf,
+
+    /// Interval between official IP-list refreshes, in seconds.
+    /// Default 86400 (24h). Set to `0` to disable the background
+    /// refresh (cached files are still loaded at startup).
+    #[serde(default = "default_bot_refresh_secs")]
+    pub refresh_interval_secs: u64,
+
     /// Size-based rotation threshold in bytes. Currently skipped
     /// from `ngx.yml` (v1 is daily-rotation-only). Default
     /// `u64::MAX` means "never rotate by size".
@@ -427,6 +438,14 @@ fn default_bot_capacity() -> usize {
 
 fn default_bot_dir() -> PathBuf {
     PathBuf::from("./logs/bots")
+}
+
+fn default_bot_cache_dir() -> PathBuf {
+    PathBuf::from("./logs/bots/cache")
+}
+
+fn default_bot_refresh_secs() -> u64 {
+    86_400
 }
 
 fn default_log_level() -> String {
@@ -460,6 +479,8 @@ impl Default for BotLogConfig {
             recent: default_bot_recent(),
             capacity: default_bot_capacity(),
             dir: default_bot_dir(),
+            cache_dir: default_bot_cache_dir(),
+            refresh_interval_secs: default_bot_refresh_secs(),
             // Skipped from YAML today — picked conservatively so a
             // accidental operator mutation can't silently disable
             // something v1 relies on.

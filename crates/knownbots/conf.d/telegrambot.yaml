@@ -1,0 +1,8 @@
+# TelegramBot - Telegram link preview unfurler
+kind: SocialMedia
+name: telegrambot
+vendor: "Telegram"
+ua: "TelegramBot"
+rdns: true
+domains:
+  - "telegram.org"

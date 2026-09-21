@@ -1,0 +1,9 @@
+# Slackbot - Slack link preview unfurler
+kind: SocialMedia
+name: slackbot
+vendor: "Slack"
+ua: "Slackbot"
+rdns: true
+domains:
+  - "slack.com"
+  - "slack-bots.com"

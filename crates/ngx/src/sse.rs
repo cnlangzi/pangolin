@@ -326,7 +326,7 @@ async fn write_sse_unauth(mut session: ServerSession, topic: &str) -> Option<Reu
 /// that subscribes to [`App::bot_log_tx`] instead. The bot
 /// side-channel is populated by [`App::push_access_log`] whenever
 /// a request's `User-Agent` matches a known bot (see
-/// `pangolin_core::bot::detect_bot`). Real-browser / curl /
+/// `pangolin_core::bot::verify_bot`). Real-browser / curl /
 /// Postman traffic never reaches this stream.
 ///
 /// All the auth / prelude / replay / live-loop / shutdown handling

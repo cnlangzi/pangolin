@@ -1,0 +1,9 @@
+# Bytespider - ByteDance AI crawler
+kind: AITraining
+name: bytespider
+vendor: "ByteDance"
+ua: "Bytespider"
+rdns: true
+domains:
+  - "bytedance.com"
+  - "byteimg.com"

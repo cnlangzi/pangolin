@@ -1,0 +1,13 @@
+# Google StoreBot (SEO tool)
+# https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
+# https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers#google-storebot
+kind: SEO
+name: google-storebot
+vendor: "Google"
+ua: "GoogleStoreBot"
+parser: google
+urls:
+  - "https://developers.google.com/static/search/apis/ipranges/googlebot.json"
+domains:
+  - "google.com"
+  - "googlebot.com"

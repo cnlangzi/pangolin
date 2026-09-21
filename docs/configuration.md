@@ -195,10 +195,12 @@ Shape of the `config` JSON per kind:
 | `file`                 | `string` | `""`    | no       | Log file path. Empty → stderr only. |
 | `access_log_recent`    | `usize`  | `100`   | no       | Capacity of the in-memory access-log ring buffer used to **replay** recent entries to a fresh SSE subscriber (`GET /api/logs/stream`). Each entry is ~150 B serialised, so the default costs ≈ 15 KB. Set to `0` to disable replay entirely (live SSE still works). Issue #73. |
 | `access_log_capacity`  | `usize`  | `1000`  | no       | Capacity of the `tokio::sync::broadcast` channel that fans live access-log entries out to every SSE subscriber. A subscriber that falls behind by more than this many entries sees a `: lagged N events` SSE comment and the stream keeps flowing — no crash. Default 1000 ≈ 150 KB. |
-| `bot.enabled`          | `bool`   | `true`  | no       | Master switch for the bot log side-channel (search-engine crawlers, AI scrapers, social link-unfurlers, monitoring probes). When `false`, [`App::push_access_log`](../../crates/pangolin-core/src/app.rs) returns before invoking `detect_bot`, so the entire feature is **zero-cost** on the request hot path. |
+| `bot.enabled`          | `bool`   | `true`  | no       | Master switch for the bot log side-channel. When `false`, [`App::push_access_log`](../../crates/pangolin-core/src/app.rs) skips knownbots verification entirely. |
 | `bot.recent`           | `usize`  | `200`   | no       | Capacity of the in-memory ring buffer for `/logs/bots` late-join replay. Set to `0` to disable replay (the live SSE + JSONL still work). |
 | `bot.capacity`         | `usize`  | `1000`  | no       | Capacity of the dedicated `tokio::sync::broadcast` channel for bot entries. A lagged subscriber sees `: lagged N events` on `/api/logs/bots/stream`. |
 | `bot.dir`              | `path`   | `./logs/bots` | no | Output directory for `bot-YYYY-MM-DD.jsonl`. Created lazily on first write. Rotation is **daily at UTC 00:00**; no size-based rotation in v1 (the operator can `logrotate` / `find -mtime` for retention). |
+| `bot.cache_dir`        | `path`   | `./logs/bots/cache` | no | knownbots cache root: per-bot `ips.txt` (downloaded CIDRs) and `rdns.txt` (successful PTR results). |
+| `bot.refresh_interval_secs` | `u64` | `86400` | no | Seconds between successful official IP-list refreshes. On refresh failure the scheduler retries with exponential backoff (5s → 5min) instead of waiting a full interval. `0` still runs one startup refresh, then sleeps for a very long time. |
 
 > **In-memory access log + `/logs` admin page (issue #73).** Every
 > proxied request that lands on `ngx` is captured by
@@ -209,23 +211,21 @@ Shape of the `config` JSON per kind:
 > disk I/O; cleared on restart. See [design/access-log.md](design/access-log.md)
 > for the architecture, wire format, auth and failure modes.
 
-> **Bot log side-channel (searchenginebots stage-1).** Each request's
-> `User-Agent` header is matched against a built-in rule list
-> (~50 entries covering Googlebot / Bingbot / Baiduspider / GPTBot /
-> ClaudeBot / facebookexternalhit / UptimeRobot / AdsBot-Google / …).
-> Detected bots are fanned out to four sinks:
-> 1. `bot_log_recent` — in-memory ring buffer (above).
-> 2. `bot_log_tx` — dedicated SSE channel
->    (`GET /api/logs/bots/stream`, stage-2 UI).
-> 3. `bot_stats` — per-(bot, host) hit counters for the dashboard.
-> 4. `BotLogWriter` — async JSONL writer appending to
->    `bot-YYYY-MM-DD.jsonl` under `bot.dir`.
+> **Bot log side-channel.** Each request's `User-Agent` + client IP
+> is verified by the `knownbots` crate (embedded YAML configs for
+> Googlebot / Bingbot / GPTBot / ClaudeBot / facebookexternalhit /
+> UptimeRobot / …). **Only verified** claims fan out to the four
+> sinks; forged UAs, cold RDNS, and unknown agents are fail-closed
+> (never written to the bot log). Each written row stores `bot_name`
+> (the YAML id, e.g. `googlebot`) and `ua` (the raw User-Agent).
+> Readers use `bot_name` directly and do not scan `ua` again.
+> Cold RDNS only warms a persistent
+> cache for the next request. Official IP lists refresh immediately
+> on startup, then on `bot.refresh_interval_secs`.
 >
-> The detector is a synchronous pure function (`detect_bot(ua) -> Option<BotIdentity>`)
-> with a budget of < 5 µs per request; the JSONL write happens in
-> a spawned background task and never touches the request hot path.
-> Detection in v1 fully trusts the client-supplied UA — a future
-> commit may add optional reverse-DNS validation for `SearchEngine` bots.
+> Verification order: case-sensitive word-boundary UA match →
+> official/custom CIDR → cached RDNS (with FCrDNS on cold lookup).
+> See [design/bot-log.md](design/bot-log.md).
 
 ### `[tls]` — TLS listener tuning
 

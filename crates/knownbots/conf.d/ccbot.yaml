@@ -1,0 +1,9 @@
+# CCBot - Common Crawl
+# https://commoncrawl.org/faq
+kind: AITraining
+name: ccbot
+vendor: "CommonCrawl"
+ua: "CCBot"
+rdns: true
+domains:
+  - "commoncrawl.org"

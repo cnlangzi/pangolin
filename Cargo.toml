@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pangolin-core",
+    "crates/knownbots",
     "crates/ngx",
     "crates/tun",
     "crates/admin",

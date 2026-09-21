@@ -1,0 +1,10 @@
+# DuckDuckGo bot
+# Official IP list: https://duckduckgo.com/duckduckbot.json
+# Supports IP-based verification (no RDNS needed)
+kind: SearchEngine
+name: duckduckbot
+vendor: "DuckDuckGo"
+parser: google
+ua: "DuckDuckBot"
+urls:
+  - "https://duckduckgo.com/duckduckbot.json"

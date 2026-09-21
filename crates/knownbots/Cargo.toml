@@ -1,0 +1,29 @@
+[package]
+name = "knownbots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Verify search-engine / AI / social bots via UA + official IP ranges / RDNS"
+
+[dependencies]
+anyhow.workspace = true
+ipnet = "2"
+log.workspace = true
+parking_lot.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+# Bounded fail-cache for RDNS negatives; same crate family as
+# pangolin-core's CertLinkCache, so locking behaviour is familiar.
+lru = "0.12"
+# Sync getaddrinfo / getnameinfo wrappers used off the hot path
+# (spawn_blocking) for RDNS + forward confirmation.
+dns-lookup = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

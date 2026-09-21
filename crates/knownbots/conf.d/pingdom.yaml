@@ -1,0 +1,10 @@
+# Pingdom - uptime monitoring probes
+# https://documentation.solarwinds.com/en/success_center/observability/content/intro/website/probes.htm
+kind: Monitor
+name: pingdom
+vendor: "Pingdom"
+parser: txt
+ua: "Pingdom"
+urls:
+  - "https://my.pingdom.com/probes/ipv4"
+  - "https://my.pingdom.com/probes/ipv6"

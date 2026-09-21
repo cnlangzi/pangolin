@@ -1,0 +1,10 @@
+# Twitter/X link preview bot
+# https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
+kind: SocialMedia
+name: twitterbot
+vendor: "Twitter"
+ua: "twitterbot"
+rdns: true
+domains:
+  - "twitter.com"
+  - "t.co"
