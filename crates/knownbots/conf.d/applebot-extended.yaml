@@ -1,0 +1,9 @@
+# Applebot-Extended - Apple AI training opt-out token / crawler
+# Shares Apple's published Applebot IP ranges.
+# https://support.apple.com/en-us/119829
+kind: AITraining
+name: applebot-extended
+parser: google
+ua: "Applebot-Extended"
+urls:
+  - "https://search.developer.apple.com/applebot.json"

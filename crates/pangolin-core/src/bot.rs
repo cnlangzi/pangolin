@@ -8,7 +8,6 @@
 //! "not a bot" for the side-channel (fail closed).
 
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -101,11 +100,6 @@ pub fn verify_bot(validator: &Validator, ua: &str, ip: IpAddr) -> Option<BotIden
     } else {
         None
     }
-}
-
-/// Convenience for call sites that already hold `Arc<Validator>`.
-pub fn verify_bot_arc(validator: &Arc<Validator>, ua: &str, ip: IpAddr) -> Option<BotIdentity> {
-    verify_bot(validator, ua, ip)
 }
 
 #[cfg(test)]

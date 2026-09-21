@@ -189,16 +189,23 @@ pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
         "apis-google.yaml",
         include_str!("../conf.d/apis-google.yaml"),
     ),
+    (
+        "applebot-extended.yaml",
+        include_str!("../conf.d/applebot-extended.yaml"),
+    ),
     ("applebot.yaml", include_str!("../conf.d/applebot.yaml")),
     (
         "baiduspider.yaml",
         include_str!("../conf.d/baiduspider.yaml"),
     ),
     ("bingbot.yaml", include_str!("../conf.d/bingbot.yaml")),
+    ("bytespider.yaml", include_str!("../conf.d/bytespider.yaml")),
+    ("ccbot.yaml", include_str!("../conf.d/ccbot.yaml")),
     (
         "chatgpt-user.yaml",
         include_str!("../conf.d/chatgpt-user.yaml"),
     ),
+    ("claudebot.yaml", include_str!("../conf.d/claudebot.yaml")),
     (
         "cloudflare-alwaysonline.yaml",
         include_str!("../conf.d/cloudflare-alwaysonline.yaml"),
@@ -207,6 +214,7 @@ pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
         "cloudflare-healthchecks.yaml",
         include_str!("../conf.d/cloudflare-healthchecks.yaml"),
     ),
+    ("discordbot.yaml", include_str!("../conf.d/discordbot.yaml")),
     (
         "duckduckbot.yaml",
         include_str!("../conf.d/duckduckbot.yaml"),
@@ -258,22 +266,34 @@ pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
         "perplexity-user.yaml",
         include_str!("../conf.d/perplexity-user.yaml"),
     ),
+    (
+        "perplexitybot.yaml",
+        include_str!("../conf.d/perplexitybot.yaml"),
+    ),
     ("petalbot.yaml", include_str!("../conf.d/petalbot.yaml")),
+    ("pingdom.yaml", include_str!("../conf.d/pingdom.yaml")),
     (
         "pinterestbot.yaml",
         include_str!("../conf.d/pinterestbot.yaml"),
     ),
+    ("redditbot.yaml", include_str!("../conf.d/redditbot.yaml")),
     (
         "semrushbot-backlinks.yaml",
         include_str!("../conf.d/semrushbot-backlinks.yaml"),
     ),
     ("semrushbot.yaml", include_str!("../conf.d/semrushbot.yaml")),
+    ("slackbot.yaml", include_str!("../conf.d/slackbot.yaml")),
     ("sogou.yaml", include_str!("../conf.d/sogou.yaml")),
+    (
+        "telegrambot.yaml",
+        include_str!("../conf.d/telegrambot.yaml"),
+    ),
     ("twitterbot.yaml", include_str!("../conf.d/twitterbot.yaml")),
     (
         "uptimerobot.yaml",
         include_str!("../conf.d/uptimerobot.yaml"),
     ),
+    ("whatsapp.yaml", include_str!("../conf.d/whatsapp.yaml")),
     ("yandexbot.yaml", include_str!("../conf.d/yandexbot.yaml")),
 ];
 
@@ -355,16 +375,24 @@ pub fn vendor_for(bot_name: &str) -> &'static str {
         "yandexbot" => "Yandex",
         "duckduckbot" => "DuckDuckGo",
         "sogou" => "Sogou",
-        "applebot" => "Apple",
+        "applebot" | "applebot-extended" => "Apple",
         "petalbot" => "Huawei",
         "gptbot" | "chatgpt-user" | "oai-searchbot" => "OpenAI",
+        "claudebot" => "Anthropic",
         "amazonbot" => "Amazon",
-        "meta-externalagent" | "facebookexternalhit" => "Meta",
-        "perplexity-user" => "Perplexity",
+        "meta-externalagent" | "facebookexternalhit" | "whatsapp" => "Meta",
+        "perplexity-user" | "perplexitybot" => "Perplexity",
+        "bytespider" => "ByteDance",
+        "ccbot" => "CommonCrawl",
         "linkedinbot" => "LinkedIn",
         "twitterbot" => "Twitter",
         "pinterestbot" => "Pinterest",
+        "telegrambot" => "Telegram",
+        "slackbot" => "Slack",
+        "discordbot" => "Discord",
+        "redditbot" => "Reddit",
         "uptimerobot" => "UptimeRobot",
+        "pingdom" => "Pingdom",
         n if n.starts_with("cloudflare") => "Cloudflare",
         n if n.starts_with("semrush") => "Semrush",
         "ahrefsbot" => "Ahrefs",
@@ -381,7 +409,9 @@ mod tests {
     fn load_embedded_has_googlebot() {
         let bots = load_bots(None).unwrap();
         assert!(bots.iter().any(|b| b.name == "googlebot"));
-        assert!(bots.len() >= 30);
+        assert!(bots.iter().any(|b| b.name == "claudebot"));
+        assert!(bots.iter().any(|b| b.name == "applebot-extended"));
+        assert!(bots.len() >= 40);
     }
 
     #[test]

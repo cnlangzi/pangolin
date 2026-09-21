@@ -3,15 +3,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 
 /// Copy-on-write style map behind an `RwLock`. Reads are the common
 /// case; writes (a handful of new IPs per day) clone + replace.
+///
+/// Disk persistence is **dirty-flagged**: [`Self::set`] only updates
+/// memory; [`Self::persist_if_dirty`] (called from the background
+/// scheduler) writes the file. That avoids a full rewrite on every
+/// cold RDNS success under a crawl burst.
 pub struct RdnsCache {
     path: PathBuf,
     map: RwLock<Arc<HashMap<String, String>>>,
+    dirty: AtomicBool,
 }
 
 impl RdnsCache {
@@ -24,6 +31,7 @@ impl RdnsCache {
         Ok(Self {
             path,
             map: RwLock::new(Arc::new(map)),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -39,18 +47,35 @@ impl RdnsCache {
         let mut next = (**guard).clone();
         next.insert(ip.to_string(), hostname.to_string());
         *guard = Arc::new(next);
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Drop entries whose hostname no longer matches `domains`.
     pub fn prune(&self, domains: &[String]) {
         let mut guard = self.map.write();
+        let before = guard.len();
         let mut next = HashMap::new();
         for (ip, host) in guard.iter() {
             if match_domain(host, domains) {
                 next.insert(ip.clone(), host.clone());
             }
         }
+        let changed = next.len() != before;
         *guard = Arc::new(next);
+        if changed {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Write the cache to disk if [`Self::set`] / [`Self::prune`]
+    /// marked it dirty since the last successful persist.
+    pub fn persist_if_dirty(&self) -> Result<()> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.persist()?;
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn persist(&self) -> Result<()> {
@@ -122,13 +147,19 @@ mod tests {
     }
 
     #[test]
-    fn persist_roundtrip() {
+    fn persist_if_dirty_skips_clean() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rdns.txt");
         let cache = RdnsCache::open(&path).unwrap();
+        // No set → nothing to write; file stays absent.
+        cache.persist_if_dirty().unwrap();
+        assert!(!path.exists());
         cache.set("1.2.3.4", "a.example.com");
-        cache.persist().unwrap();
-        let cache2 = RdnsCache::open(&path).unwrap();
-        assert_eq!(cache2.get("1.2.3.4").as_deref(), Some("a.example.com"));
+        cache.persist_if_dirty().unwrap();
+        assert!(path.exists());
+        // Second call is a no-op (dirty cleared).
+        std::fs::remove_file(&path).unwrap();
+        cache.persist_if_dirty().unwrap();
+        assert!(!path.exists());
     }
 }

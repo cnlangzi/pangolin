@@ -9,6 +9,10 @@
 //! Hyphen is a boundary, so `Applebot-Extended` contains the word
 //! `Applebot`. When several markers match, the **longest** wins so
 //! more-specific bots are preferred.
+//!
+//! Matching is a linear scan over the bot table (~40 entries). That
+//! beats a per-byte index once longest-match forces a full pass
+//! anyway, and keeps the hot path branch-predictable.
 
 use crate::bot::Bot;
 
@@ -47,42 +51,22 @@ fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Byte → candidate bots indexed by the first byte of each UA marker.
-pub fn build_ua_index(bots: &[Bot]) -> Vec<Vec<usize>> {
-    // 256 buckets; most stay empty. Cheap and lock-free to consult.
-    let mut index = vec![Vec::new(); 256];
+/// Find the bot whose UA marker matches `ua`, preferring the longest
+/// marker when several match. Returns the bot index into `bots`.
+pub fn find_bot_by_ua(ua: &str, bots: &[Bot]) -> Option<usize> {
+    if ua.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (len, bot_idx)
     for (i, bot) in bots.iter().enumerate() {
         if bot.ua.is_empty() {
             continue;
         }
-        let first = bot.ua.as_bytes()[0] as usize;
-        index[first].push(i);
-    }
-    // Within each bucket, longer markers first so a single pass
-    // prefers specificity (Applebot-Extended over Applebot).
-    for bucket in &mut index {
-        bucket.sort_by(|&a, &b| bots[b].ua.len().cmp(&bots[a].ua.len()));
-    }
-    index
-}
-
-/// Find the bot whose UA marker matches `ua`, preferring the longest
-/// marker when several match. Returns the bot index into `bots`.
-pub fn find_bot_by_ua(ua: &str, bots: &[Bot], index: &[Vec<usize>]) -> Option<usize> {
-    if ua.is_empty() || index.is_empty() {
-        return None;
-    }
-    let mut best: Option<(usize, usize)> = None; // (len, bot_idx)
-    let bytes = ua.as_bytes();
-    for &b in bytes {
-        for &bot_idx in &index[b as usize] {
-            let marker = &bots[bot_idx].ua;
-            if contains_word(ua, marker) {
-                let len = marker.len();
-                match best {
-                    Some((best_len, _)) if best_len >= len => {}
-                    _ => best = Some((len, bot_idx)),
-                }
+        if contains_word(ua, &bot.ua) {
+            let len = bot.ua.len();
+            match best {
+                Some((best_len, _)) if best_len >= len => {}
+                _ => best = Some((len, i)),
             }
         }
     }
@@ -133,7 +117,6 @@ mod tests {
 
     #[test]
     fn contains_word_hyphen_is_boundary() {
-        // Hyphen separates words — Applebot matches inside Applebot-Extended.
         assert!(contains_word(
             "Mozilla/5.0 (compatible; Applebot-Extended/1.0)",
             "Applebot"
@@ -150,9 +133,8 @@ mod tests {
             bot("applebot", "Applebot"),
             bot("applebot-extended", "Applebot-Extended"),
         ];
-        let index = build_ua_index(&bots);
         let ua = "Mozilla/5.0 (compatible; Applebot-Extended/1.0)";
-        let idx = find_bot_by_ua(ua, &bots, &index).expect("match");
+        let idx = find_bot_by_ua(ua, &bots).expect("match");
         assert_eq!(bots[idx].name, "applebot-extended");
     }
 
@@ -162,9 +144,8 @@ mod tests {
             bot("googlebot", "Googlebot"),
             bot("google-inspectiontool", "Google-InspectionTool"),
         ];
-        let index = build_ua_index(&bots);
         let ua = "Mozilla/5.0 (compatible; Google-InspectionTool/1.0)";
-        let idx = find_bot_by_ua(ua, &bots, &index).expect("match");
+        let idx = find_bot_by_ua(ua, &bots).expect("match");
         assert_eq!(bots[idx].name, "google-inspectiontool");
     }
 }

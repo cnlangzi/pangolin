@@ -1,0 +1,9 @@
+# ClaudeBot - Anthropic AI training crawler
+# https://support.claude.com/en/articles/8896518-does-anthropic-crawl-data-from-the-web-and-how-can-site-owners-block-the-crawler
+# IP list uses Google-style ipv4Prefix fields.
+kind: AITraining
+name: claudebot
+parser: google
+ua: "ClaudeBot"
+urls:
+  - "https://claude.com/crawling/bots.json"

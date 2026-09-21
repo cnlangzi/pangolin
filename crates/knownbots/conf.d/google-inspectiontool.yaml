@@ -1,6 +1,6 @@
 # Google-InspectionTool - Search Console URL Inspection tool
 # https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers#google-inspectiontool
-kind: Monitor
+kind: SearchEngine
 name: google-inspectiontool
 parser: google
 ua: "Google-InspectionTool"

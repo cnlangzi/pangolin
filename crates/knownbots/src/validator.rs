@@ -14,13 +14,15 @@ use crate::bot::{Bot, BotKind, load_bots, vendor_for};
 use crate::lru::FailLru;
 use crate::parser;
 use crate::rdns::{RdnsCache, match_domain};
-use crate::ua::{build_ua_index, find_bot_by_ua};
+use crate::ua::find_bot_by_ua;
 
 const DEFAULT_FAIL_LIMIT: usize = 1000;
 const DEFAULT_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 const RDNS_QUEUE: usize = 1024;
 const RDNS_TIMEOUT: Duration = Duration::from_secs(2);
 const RDNS_CONCURRENCY: usize = 32;
+const REFRESH_RETRY_MIN: Duration = Duration::from_secs(5);
+const REFRESH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Outcome of [`Validator::verify`].
 ///
@@ -55,6 +57,41 @@ impl VerifyResult {
     pub fn is_verified(&self) -> bool {
         self.status == VerifyStatus::Verified
     }
+
+    fn unknown() -> Self {
+        // `String::new()` is heap-free; Unknown is the common path.
+        Self {
+            status: VerifyStatus::Unknown,
+            name: String::new(),
+            display_name: String::new(),
+            vendor: String::new(),
+            kind: BotKind::Unknown,
+            category: "monitoring",
+        }
+    }
+
+    fn non_verified(status: VerifyStatus, bot: &Bot) -> Self {
+        // Failed / Pending: App discards identity fields; skip clones.
+        Self {
+            status,
+            name: String::new(),
+            display_name: String::new(),
+            vendor: String::new(),
+            kind: bot.kind,
+            category: bot.kind.to_category_label(&bot.name),
+        }
+    }
+
+    fn verified(bot: &Bot) -> Self {
+        Self {
+            status: VerifyStatus::Verified,
+            name: bot.name.clone(),
+            display_name: bot.ua.clone(),
+            vendor: vendor_for(&bot.name).to_string(),
+            kind: bot.kind,
+            category: bot.kind.to_category_label(&bot.name),
+        }
+    }
 }
 
 struct RdnsJob {
@@ -67,7 +104,6 @@ struct RdnsJob {
 pub struct Validator {
     root: PathBuf,
     bots: Vec<Bot>,
-    ua_index: Vec<Vec<usize>>,
     rdns_tx: mpsc::Sender<RdnsJob>,
     /// Taken by [`Self::start_background`] once a tokio runtime exists.
     rdns_rx: Mutex<Option<mpsc::Receiver<RdnsJob>>>,
@@ -117,7 +153,6 @@ impl Validator {
             }
         }
 
-        let ua_index = build_ua_index(&bots);
         let (rdns_tx, rdns_rx) = mpsc::channel(RDNS_QUEUE);
 
         let http = reqwest::Client::builder()
@@ -128,7 +163,6 @@ impl Validator {
         Ok(Arc::new(Self {
             root: opts.root,
             bots,
-            ua_index,
             rdns_tx,
             rdns_rx: Mutex::new(Some(rdns_rx)),
             shutdown: AtomicBool::new(false),
@@ -147,7 +181,12 @@ impl Validator {
         })
     }
 
-    /// Spawn RDNS workers + the 24h IP refresh scheduler.
+    /// Spawn RDNS workers + the IP refresh scheduler.
+    ///
+    /// The scheduler runs an **immediate** refresh (no startup delay)
+    /// so URL-based bots are usable within seconds of process start.
+    /// On refresh failure it retries with exponential backoff
+    /// (5s → 5min) instead of waiting a full day.
     /// Idempotent. Must be called from a tokio runtime context.
     pub fn start_background(self: &Arc<Self>) -> bool {
         if self
@@ -199,29 +238,14 @@ impl Validator {
     /// [`VerifyStatus::Pending`] — the current request is **not** a
     /// bot for logging purposes; the next request may succeed.
     pub fn verify(&self, ua: &str, ip: IpAddr) -> VerifyResult {
-        let Some(idx) = find_bot_by_ua(ua, &self.bots, &self.ua_index) else {
-            return VerifyResult {
-                status: VerifyStatus::Unknown,
-                name: String::new(),
-                display_name: String::new(),
-                vendor: String::new(),
-                kind: BotKind::Unknown,
-                category: "monitoring",
-            };
+        let Some(idx) = find_bot_by_ua(ua, &self.bots) else {
+            return VerifyResult::unknown();
         };
         let bot = &self.bots[idx];
-        let meta = |status: VerifyStatus| VerifyResult {
-            status,
-            name: bot.name.clone(),
-            display_name: bot.ua.clone(),
-            vendor: vendor_for(&bot.name).to_string(),
-            kind: bot.kind,
-            category: bot.kind.to_category_label(&bot.name),
-        };
 
         // 1) Official / custom CIDR — fastest path.
         if bot.contains_ip(ip) {
-            return meta(VerifyStatus::Verified);
+            return VerifyResult::verified(bot);
         }
 
         // 2) RDNS path (only when configured).
@@ -229,23 +253,24 @@ impl Validator {
             if let Some(fail) = bot.fail_cache.as_ref()
                 && fail.contains(&ip.to_string())
             {
-                return meta(VerifyStatus::Failed);
+                return VerifyResult::non_verified(VerifyStatus::Failed, bot);
             }
             if let Some(cache) = bot.rdns_cache.as_ref()
                 && let Some(host) = cache.get(&ip.to_string())
             {
                 if match_domain(&host, &bot.domains) {
-                    return meta(VerifyStatus::Verified);
+                    return VerifyResult::verified(bot);
                 }
-                return meta(VerifyStatus::Failed);
+                return VerifyResult::non_verified(VerifyStatus::Failed, bot);
             }
             // Cache miss → warm asynchronously; this request fails closed.
             self.enqueue_rdns(bot.name.clone(), ip);
-            return meta(VerifyStatus::Pending);
+            return VerifyResult::non_verified(VerifyStatus::Pending, bot);
         }
 
-        // UA claimed a bot that only has IP verification, and IP missed.
-        meta(VerifyStatus::Failed)
+        // UA claimed a bot that only has IP verification, and IP missed
+        // (including the cold-cache window before the first refresh).
+        VerifyResult::non_verified(VerifyStatus::Failed, bot)
     }
 
     fn enqueue_rdns(&self, bot_name: String, ip: IpAddr) {
@@ -294,8 +319,8 @@ impl Validator {
             match result {
                 Ok(Ok(hostname)) if match_domain(&hostname, &bot.domains) => {
                     if let Some(cache) = bot.rdns_cache.as_ref() {
+                        // Memory only — disk flush is the scheduler's job.
                         cache.set(&job.ip.to_string(), &hostname);
-                        let _ = cache.persist();
                     }
                 }
                 Ok(Ok(_)) | Ok(Err(LookupError::NotFound)) => {
@@ -312,20 +337,39 @@ impl Validator {
 
     fn spawn_scheduler(v: Arc<Self>) {
         tokio::spawn(async move {
-            // First refresh shortly after start so a cold cache fills
-            // without blocking App::new.
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut backoff = REFRESH_RETRY_MIN;
+            // Immediate first pass — no startup sleep. Cold installs
+            // would otherwise fail-close every URL-based bot for the
+            // duration of the old 2s delay (and longer if the first
+            // fetch failed and we waited a full day).
             loop {
                 if v.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                v.refresh_all().await;
-                tokio::time::sleep(v.refresh_interval).await;
+                let ok = v.refresh_all().await;
+                let sleep_for = if ok {
+                    backoff = REFRESH_RETRY_MIN;
+                    v.refresh_interval
+                } else {
+                    let wait = backoff;
+                    backoff = (backoff * 2).min(REFRESH_RETRY_MAX);
+                    log::warn!(
+                        "knownbots: refresh incomplete; retrying in {}s",
+                        wait.as_secs()
+                    );
+                    wait
+                };
+                tokio::time::sleep(sleep_for).await;
             }
         });
     }
 
-    async fn refresh_all(&self) {
+    /// Refresh every bot's IP list and flush dirty RDNS caches.
+    /// Returns `true` when every URL-backed bot either has no URLs
+    /// or produced a non-empty prefix set (or kept a prior non-empty
+    /// set after a soft failure).
+    async fn refresh_all(&self) -> bool {
+        let mut all_ok = true;
         for bot in &self.bots {
             if !bot.urls.is_empty() {
                 match download_prefixes(&self.http, bot).await {
@@ -334,6 +378,7 @@ impl Validator {
                         let path = self.root.join(&bot.name).join("ips.txt");
                         if let Err(e) = bot.persist_ips(&path) {
                             log::warn!("knownbots: persist ips for {}: {e}", bot.name);
+                            all_ok = false;
                         } else {
                             log::info!(
                                 "knownbots: refreshed {} ({} prefixes)",
@@ -344,9 +389,15 @@ impl Validator {
                     }
                     Ok(_) => {
                         log::warn!("knownbots: empty refresh for {}, keeping prior", bot.name);
+                        if bot.prefixes.read().is_empty() && bot.custom.is_empty() {
+                            all_ok = false;
+                        }
                     }
                     Err(e) => {
                         log::warn!("knownbots: refresh {} failed: {e}", bot.name);
+                        if bot.prefixes.read().is_empty() && bot.custom.is_empty() {
+                            all_ok = false;
+                        }
                     }
                 }
             }
@@ -354,9 +405,12 @@ impl Validator {
                 && let Some(cache) = bot.rdns_cache.as_ref()
             {
                 cache.prune(&bot.domains);
-                let _ = cache.persist();
+                if let Err(e) = cache.persist_if_dirty() {
+                    log::warn!("knownbots: persist rdns for {}: {e}", bot.name);
+                }
             }
         }
+        all_ok
     }
 
     pub fn bot_count(&self) -> usize {
@@ -415,10 +469,6 @@ async fn download_prefixes(http: &reqwest::Client, bot: &Bot) -> Result<Vec<ipne
     }
     Ok(all)
 }
-
-// `dns_lookup` is a thin sync wrapper; declare as optional soft dep via
-// the std library's `to_socket_addrs` + `lookup_addr` from the `dns-lookup`
-// crate. We add it in Cargo.toml.
 
 #[cfg(test)]
 mod tests {
@@ -489,8 +539,6 @@ mod tests {
     #[test]
     fn rdns_cache_miss_is_pending_not_verified() {
         let dir = tempfile::tempdir().unwrap();
-        // spawn_workers=false → enqueue is a no-op channel drop, but
-        // status is still Pending (fail closed for this request).
         let v = Validator::new_sync_only(dir.path()).unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(220, 181, 108, 94));
         let ua = "Mozilla/5.0 (compatible; Baiduspider/2.0)";
@@ -503,11 +551,22 @@ mod tests {
     fn facebook_custom_cidr() {
         let dir = tempfile::tempdir().unwrap();
         let v = Validator::new_sync_only(dir.path()).unwrap();
-        // custom range is baked into the YAML.
         let ip = IpAddr::V4(Ipv4Addr::new(31, 13, 24, 10));
         let ua = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)";
         let r = v.verify(ua, ip);
         assert!(r.is_verified());
         assert_eq!(r.category, "social");
+    }
+
+    #[test]
+    fn cold_url_bot_fails_until_seeded() {
+        // Without a cached/seeded prefix list, a Googlebot claim is
+        // Failed (not Verified). Production relies on the immediate
+        // scheduler refresh to fill this gap.
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
+        let r = v.verify(google_ua(), ip);
+        assert_eq!(r.status, VerifyStatus::Failed);
     }
 }

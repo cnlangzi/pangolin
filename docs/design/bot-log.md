@@ -20,17 +20,13 @@ For the corresponding config keys, see
 
 ## Non-goals
 
-- **Reverse-DNS validation** of claimed Googlebot / Bingbot IPs. v1 fully
-  trusts the `User-Agent` header. A future commit may add an optional PTR
-  lookup behind a feature flag (see `bot::reverse_dns_check` stub).
+- **Logging unverified claims.** Forged UAs, cold RDNS, and unknown
+  agents never enter the bot log (fail closed). Pending async RDNS
+  only warms the cache for a later request.
 - **Per-domain rate limiting / robots.txt enforcement**. The gateway observes
   crawlers; it does not police them.
 - **Replacing the Google Search Console crawler stats**. That data is the
   authoritative view of how Google actually indexes a site.
-- **User-extensible UA rules**. v1's rules are entirely built-in. The
-  `extra_user_agent_patterns` config field is reserved on the struct but
-  `#[serde(skip)]` — exposing it would invite user misconfiguration (a
-  too-greedy substring shadows real bots).
 
 ## Architecture
 
@@ -41,9 +37,9 @@ For the corresponding config keys, see
 proxy.rs ──────►│ App::push_access_log(entry)                    │
                 │   ├── access_log_recent.push(entry)            │
                 │   ├── access_log_tx.send(entry)    ──► /api/logs/stream
-                │   └── (NEW) bot side-channel:                  │
-                │         if let Some(ua) = entry.user_agent     │
-                │         if let Some(bot) = detect_bot(ua)      │
+                │   └── bot side-channel (fail closed):          │
+                │         verify_bot(ua, client_ip)              │
+                │         only if Verified:                      │
                 │             BotLogEntry::from_access_log       │
                 │             ├── bot_log_recent.push            │
                 │             ├── bot_stats.record               │
@@ -52,25 +48,28 @@ proxy.rs ──────►│ App::push_access_log(entry)                   
                 └────────────────────────────────────────────────┘
 ```
 
-The fan-out is **fully synchronous** (no `.await`) on the request hot path.
-`detect_bot` is a single `to_ascii_lowercase` + linear scan over ~50
-rules — well under 5 µs. Disk I/O happens in the spawned background
-`BotLogWriter::run` task.
+`verify_bot` is synchronous on the hot path (UA word-boundary match +
+CIDR / RDNS-cache lookup). Cold RDNS and official IP-list downloads run
+in background tasks started by `App::start_bot_writer`. Disk I/O for
+JSONL happens in `BotLogWriter::run`.
 
 ## Components
 
+### `crates/knownbots`
+
+Rust port of the knownbots verification model:
+
+- Embedded YAML under `conf.d/` (search / AI / social / monitoring).
+- Case-sensitive word-boundary UA match; longest marker wins.
+- IP ownership via official CIDR lists and/or RDNS (+ FCrDNS).
+- Immediate IP-list refresh on startup; retry with backoff on failure.
+- RDNS success updates an in-memory dirty cache; the scheduler flushes
+  `rdns.txt` periodically.
+
 ### `crates/pangolin-core/src/bot.rs`
 
-Pure-function UA → bot matching. No I/O, no async.
-
-- `BotIdentity { name: &'static str, vendor: &'static str, category: BotCategory }`
-- `BotCategory` enum: `SearchEngine`, `AiBot`, `Social`, `Monitoring`, `AdsBot`.
-- `static BOT_RULES: &[(&str, BotIdentity)]` — substring table, ordered so
-  more specific patterns win (e.g. `google-inspectiontool` before
-  `googlebot`; `telegrambot` before `twitterbot` because Telegram's UA
-  literally contains "TwitterBot" in the user-agent string).
-- `detect_bot(ua) -> Option<BotIdentity>` — allocates at most one
-  `String` (the lowercase UA), then linear-scans the table.
+Thin adapter: `verify_bot` → `Option<BotIdentity>` only when verified.
+`BotCategory` wire labels unchanged (`search_engine`, `ai_bot`, …).
 
 ### `crates/pangolin-core/src/bot_log.rs`
 
@@ -172,13 +171,13 @@ itself does not auto-clean up.
 
 | Failure | Behaviour |
 | ------- | --------- |
-| `bot.enabled = false` | `bot_writer` is `None`; first branch in `push_access_log` returns. Zero CPU cost beyond the option check. |
-| `detect_bot` returns `None` | Skip the bot fan-out entirely. The generic access log still fires. |
+| `bot.enabled = false` | `bot_writer` / `bot_verifier` are `None`; first branch in `push_access_log` returns. |
+| `verify_bot` returns `None` (unknown / forged / pending RDNS) | Skip the bot fan-out. The generic access log still fires. |
 | `BotLogWriter::enqueue` queue full (10 000 entries backlogged) | Drop oldest entry, `log::warn!` once. The ring buffer + stats still receive the current entry; only the JSONL write is best-effort. |
 | `tokio::fs::OpenOptions::open` fails on first write | `log::warn!` and drop the batch. The generic access log keeps working. Retry on the next batch. |
 | Disk fills mid-day | `write_all` returns `Err`; `log::warn!`; current batch is dropped. Next `drain_and_write` retries. The `sync_all` after `write_all` surfaces the error before `current_size` is updated. |
 | Process crash mid-write | At most `fsync_interval_secs` (5 s default) of unflushed bytes lost. JSONL's "one line per request" format means a partial line at EOF is silently skipped by `jq` / DuckDB on recovery. |
-| `push_access_log` is called from a request whose UA is exactly 12 bytes | `detect_bot` short-circuits on `ua.len() < 12`. No allocation, no rule scan. |
+| Official IP list refresh fails on a cold install | URL-based bots stay unverified until retry backoff succeeds (5s → 5min). Prior non-empty `ips.txt` is never wiped by an empty/failed refresh. |
 
 ## Operator workflow
 

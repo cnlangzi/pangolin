@@ -1,0 +1,7 @@
+# RedditBot - Reddit link preview / crawler
+kind: SocialMedia
+name: redditbot
+ua: "Redditbot"
+rdns: true
+domains:
+  - "reddit.com"

@@ -1,0 +1,10 @@
+# WhatsApp - Meta WhatsApp link preview
+kind: SocialMedia
+name: whatsapp
+ua: "WhatsApp"
+rdns: true
+domains:
+  - "whatsapp.com"
+  - "whatsapp.net"
+  - "facebook.com"
+  - "fbcdn.net"

@@ -1,0 +1,8 @@
+# Discordbot - Discord link preview unfurler
+kind: SocialMedia
+name: discordbot
+ua: "Discordbot"
+rdns: true
+domains:
+  - "discord.com"
+  - "discordapp.com"
