@@ -3,6 +3,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers#google-storebot
 kind: SEO
 name: google-storebot
+vendor: "Google"
 ua: "GoogleStoreBot"
 parser: google
 urls:

@@ -6,6 +6,14 @@ use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
+/// Parser names [`parse`] handles without falling through to txt.
+pub fn is_known(parser: &str) -> bool {
+    matches!(
+        parser,
+        "google" | "openai" | "uptimerobot" | "ahrefs" | "amazon" | "txt"
+    )
+}
+
 /// Parse a response body into CIDR prefixes using the named parser.
 pub fn parse(parser: &str, body: &[u8]) -> Result<Vec<IpNet>> {
     match parser {

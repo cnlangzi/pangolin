@@ -61,6 +61,9 @@ struct BotConfigFile {
     parser: String,
     #[serde(default)]
     ua: String,
+    /// Owning organisation for `bot_vendor`. Empty → [`vendor_for`].
+    #[serde(default)]
+    vendor: String,
     #[serde(default)]
     urls: Vec<String>,
     #[serde(default)]
@@ -78,9 +81,11 @@ pub struct Bot {
     pub name: String,
     pub kind: BotKind,
     pub parser: String,
-    /// Case-sensitive UA marker (e.g. `"Googlebot"`). Also used as
-    /// the display name in the bot log.
+    /// Case-sensitive UA marker (e.g. `"Googlebot"`, `"bingbot"`).
+    /// Matching only — the JSONL `bot_name` is [`Self::name`].
     pub ua: String,
+    /// Owning organisation written to JSONL `bot_vendor`.
+    pub vendor: String,
     pub urls: Vec<String>,
     pub custom: Vec<IpNet>,
     pub domains: Vec<String>,
@@ -94,11 +99,31 @@ pub struct Bot {
 
 impl Bot {
     fn from_config(cfg: BotConfigFile) -> Result<Self> {
+        // Empty parser means "no structured format" — plain CIDR lines.
+        // Substituting `cfg.name` used to look like a custom parser and
+        // then silently hit the txt fallback inside `parser::parse`.
         let parser = if cfg.parser.is_empty() {
-            // Unknown parser names fall back to `txt` in [`crate::parser`].
-            cfg.name.clone()
+            "txt".to_string()
         } else {
             cfg.parser
+        };
+        if !cfg.urls.is_empty() && !crate::parser::is_known(&parser) {
+            log::warn!(
+                "bot {}: unknown parser {parser:?}; IP lists will be parsed as plain text",
+                cfg.name
+            );
+        }
+        let vendor = if cfg.vendor.is_empty() {
+            let fallback = vendor_for(&cfg.name);
+            if fallback == "Unknown" {
+                log::warn!(
+                    "bot {}: no vendor in config; JSONL bot_vendor will be \"Unknown\"",
+                    cfg.name
+                );
+            }
+            fallback.to_string()
+        } else {
+            cfg.vendor
         };
         let mut custom = Vec::new();
         for cidr in &cfg.custom {
@@ -112,6 +137,7 @@ impl Bot {
             kind: cfg.kind,
             parser,
             ua: cfg.ua,
+            vendor,
             urls: cfg.urls,
             custom: custom.clone(),
             domains: cfg.domains,
@@ -359,6 +385,16 @@ pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
     Ok(bots)
 }
 
+/// URL-backed bots that still have an empty prefix set.
+///
+/// Fresh processes (no `ips.txt` yet) sit in this window until the
+/// scheduler's first refresh. Claims against them fail closed.
+pub(crate) fn count_cold_url_bots(bots: &[Bot]) -> usize {
+    bots.iter()
+        .filter(|b| !b.urls.is_empty() && b.prefixes.read().is_empty())
+        .count()
+}
+
 /// Heuristic vendor label for the admin UI / JSONL `bot_vendor` field.
 pub fn vendor_for(bot_name: &str) -> &'static str {
     match bot_name {
@@ -421,5 +457,66 @@ mod tests {
             BotKind::Monitor.to_category_label("uptimerobot"),
             "monitoring"
         );
+    }
+
+    #[test]
+    fn embedded_bots_declare_vendor() {
+        let bots = load_bots(None).unwrap();
+        assert!(count_cold_url_bots(&bots) > 0);
+        for b in &bots {
+            assert_ne!(
+                b.vendor, "Unknown",
+                "bot {} has no vendor; add it to the YAML",
+                b.name
+            );
+        }
+    }
+
+    /// JSONL `bot_name` is the registry id (`name`), not the UA
+    /// marker and not a second spelling of it. The raw header is
+    /// stored separately, so readers never re-scan it.
+    #[test]
+    fn registry_name_is_independent_of_ua_marker() {
+        let bots = load_bots(None).unwrap();
+        let bing = bots.iter().find(|b| b.name == "bingbot").unwrap();
+        assert_eq!(bing.ua, "bingbot");
+        let google = bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.ua, "Googlebot");
+        let extended = bots.iter().find(|b| b.name == "applebot-extended").unwrap();
+        assert_eq!(extended.ua, "Applebot-Extended");
+    }
+
+    #[test]
+    fn empty_parser_defaults_to_txt_not_bot_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(
+            conf.join("custombot.yaml"),
+            "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\n",
+        )
+        .unwrap();
+        let bots = load_bots(Some(dir.path())).unwrap();
+        let bot = bots.iter().find(|b| b.name == "custombot").unwrap();
+        assert_eq!(bot.parser, "txt");
+        assert_eq!(bot.vendor, "Example");
+        assert_eq!(bot.name, "custombot");
+        assert_eq!(bot.ua, "CustomBot");
+    }
+
+    #[test]
+    fn unknown_parser_name_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(
+            conf.join("typo.yaml"),
+            "name: typobot\nua: \"TypoBot\"\nparser: googel\nurls:\n  - \"https://example.invalid/ips.json\"\n",
+        )
+        .unwrap();
+        let bots = load_bots(Some(dir.path())).unwrap();
+        let bot = bots.iter().find(|b| b.name == "typobot").unwrap();
+        assert_eq!(bot.parser, "googel");
+        assert!(!crate::parser::is_known(&bot.parser));
     }
 }

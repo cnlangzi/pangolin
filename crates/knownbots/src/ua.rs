@@ -84,6 +84,7 @@ mod tests {
             kind: BotKind::SearchEngine,
             parser: "txt".into(),
             ua: ua.into(),
+            vendor: "Test".into(),
             urls: Vec::new(),
             custom: Vec::new(),
             domains: Vec::new(),

@@ -2,6 +2,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers#googleother
 kind: SearchEngine
 name: googleother
+vendor: "Google"
 parser: google
 ua: "GoogleOther"
 urls:

@@ -696,6 +696,14 @@ impl App {
             return;
         };
         let Ok(ip) = entry.client_ip.parse::<std::net::IpAddr>() else {
+            // "unknown" (no peer, no forwarding header) and other
+            // non-IP sentinels fail closed. debug so a misconfigured
+            // frontend is visible under RUST_LOG=pangolin_core=debug
+            // without a warn on every request.
+            log::debug!(
+                "bot verify skipped: client_ip {:?} is not an IP",
+                entry.client_ip
+            );
             return;
         };
         let Some(bot) = verify_bot(verifier, ua, ip) else {
@@ -1749,7 +1757,7 @@ mod tests {
         // 1) Bot ring buffer received it.
         let snap = app.recent_bot_log();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].bot_name, "Googlebot");
+        assert_eq!(snap[0].bot_name, "googlebot");
         assert_eq!(snap[0].bot_vendor, "Google");
         assert_eq!(snap[0].path, "/sitemap.xml");
         assert!(snap[0].ua.contains("Googlebot"));
@@ -1757,7 +1765,7 @@ mod tests {
         // 2) Stats counter incremented.
         let (rows, summary) = app.bot_stats_snapshot();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].bot_name, "Googlebot");
+        assert_eq!(rows[0].bot_name, "googlebot");
         assert_eq!(rows[0].hits, 1);
         assert_eq!(summary.total_records, 1);
 
@@ -1768,7 +1776,7 @@ mod tests {
                 .expect("bot recv timed out")
                 .expect("bot broadcast channel closed unexpectedly")
         });
-        assert_eq!(delivered.bot_name, "Googlebot");
+        assert_eq!(delivered.bot_name, "googlebot");
         assert_eq!(delivered.path, "/sitemap.xml");
 
         // 4) Generic access log ALSO received it (both paths run).
@@ -1839,6 +1847,30 @@ mod tests {
     }
 
     #[test]
+    fn push_access_log_unparseable_client_ip_skips_bot_sinks() {
+        // `client_ip::UNKNOWN` ("unknown") and any other non-IP
+        // sentinel must not enter the bot log, even with a real
+        // Googlebot UA and a seeded CIDR.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config_with_bot(50, 16, true);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        seed_googlebot_cidr(&app);
+
+        let mut entry = make_bot_entry(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "/sitemap.xml",
+        );
+        entry.client_ip = crate::client_ip::UNKNOWN.into();
+        app.push_access_log(entry);
+
+        assert!(app.recent_bot_log().is_empty());
+        let (rows, _) = app.bot_stats_snapshot();
+        assert!(rows.is_empty());
+        assert_eq!(app.recent_access_log().len(), 1);
+    }
+
+    #[test]
     fn push_access_log_disabled_skips_bot_fan_out_entirely() {
         // When `log.bot.enabled = false`, `bot_writer` is None and
         // the side-channel short-circuits on the very first
@@ -1863,7 +1895,7 @@ mod tests {
 
     #[test]
     fn push_access_log_multiple_bots_aggregate_in_stats() {
-        // Three Googlebot hits + two Bingbot hits → two rows,
+        // Three googlebot hits + two bingbot hits → two rows,
         // correct hit counts, summary reflects the total.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
@@ -1883,7 +1915,7 @@ mod tests {
         }
         for path in ["/x", "/y"] {
             let mut e = make_bot_entry(bing, path);
-            // Bingbot seed above; use an IP inside that range.
+            // bingbot seed above; use an IP inside that range.
             e.client_ip = "40.77.167.12".into();
             app.push_access_log(e);
         }
@@ -1892,7 +1924,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(summary.total_records, 5);
         assert_eq!(summary.total_hits, 5);
-        let google_row = rows.iter().find(|r| r.bot_name == "Googlebot").unwrap();
+        let google_row = rows.iter().find(|r| r.bot_name == "googlebot").unwrap();
         let bing_row = rows.iter().find(|r| r.bot_name == "bingbot").unwrap();
         assert_eq!(google_row.hits, 3);
         assert_eq!(bing_row.hits, 2);
@@ -1976,7 +2008,7 @@ mod tests {
             .iter()
             .filter_map(|s| *s)
             .collect();
-        assert!(names.contains(&"Googlebot"), "missing Googlebot in: {body}");
+        assert!(names.contains(&"googlebot"), "missing googlebot in: {body}");
         assert!(names.contains(&"bingbot"), "missing bingbot in: {body}");
     }
 

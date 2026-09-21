@@ -15,12 +15,13 @@ use knownbots::{Validator, VerifyResult, VerifyStatus};
 
 /// Identity of a verified bot, ready for the JSONL / SSE / stats sinks.
 ///
-/// `name` is the display label (typically the case-sensitive UA marker,
-/// e.g. `"Googlebot"`). Strings are owned because they come from the
-/// YAML-loaded knownbots registry rather than a `'static` table.
+/// `name` is the registry id (YAML `name`, e.g. `"googlebot"`).
+/// It is stored as JSONL `bot_name` so readers do not scan the
+/// raw User-Agent again. Strings are owned because they come from
+/// the YAML-loaded knownbots registry rather than a `'static` table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BotIdentity {
-    /// Short name shown in the UI and JSONL output, e.g. `"Googlebot"`.
+    /// Registry id written to JSONL `bot_name`, e.g. `"googlebot"`.
     pub name: String,
     /// Owning organisation, e.g. `"Google"`.
     pub vendor: String,
@@ -81,7 +82,7 @@ impl BotIdentity {
     /// Build from a knownbots verified result.
     pub fn from_verified(r: &VerifyResult) -> Self {
         Self {
-            name: r.display_name.clone(),
+            name: r.name.clone(),
             vendor: r.vendor.clone(),
             category: BotCategory::from_label(r.category),
         }
@@ -115,7 +116,7 @@ mod tests {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
         let ident = verify_bot(&v, ua, ip).expect("verified");
-        assert_eq!(ident.name, "Googlebot");
+        assert_eq!(ident.name, "googlebot");
         assert_eq!(ident.vendor, "Google");
         assert_eq!(ident.category, BotCategory::SearchEngine);
     }

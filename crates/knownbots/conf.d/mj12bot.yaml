@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: SEO
 name: mj12bot
+vendor: "Majestic"
 ua: "MJ12Bot"
 rdns: true
 domains:

@@ -2,6 +2,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers#google-inspectiontool
 kind: SearchEngine
 name: google-inspectiontool
+vendor: "Google"
 parser: google
 ua: "Google-InspectionTool"
 urls:

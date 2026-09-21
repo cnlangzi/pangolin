@@ -3,6 +3,7 @@
 # JSON format: https://search.apple.com/applebot.json
 kind: SearchEngine
 name: applebot
+vendor: "Apple"
 parser: google
 ua: "Applebot"
 urls:

@@ -2,6 +2,7 @@
 # Monitors origin server availability
 kind: Monitor
 name: cloudflare-healthchecks
+vendor: "Cloudflare"
 ua: "Cloudflare-Healthchecks"
 urls:
   - "https://www.cloudflare.com/ips-v4/"

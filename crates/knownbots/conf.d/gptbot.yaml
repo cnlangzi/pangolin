@@ -3,6 +3,7 @@
 # JSON format: https://openai.com/gptbot.json
 kind: AITraining
 name: gptbot
+vendor: "OpenAI"
 parser: google
 ua: "GPTBot"
 urls:

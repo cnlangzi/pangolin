@@ -3,6 +3,7 @@
 # https://support.apple.com/en-us/119829
 kind: AITraining
 name: applebot-extended
+vendor: "Apple"
 parser: google
 ua: "Applebot-Extended"
 urls:

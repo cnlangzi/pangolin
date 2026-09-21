@@ -69,32 +69,49 @@ impl RdnsCache {
 
     /// Write the cache to disk if [`Self::set`] / [`Self::prune`]
     /// marked it dirty since the last successful persist.
+    ///
+    /// The dirty flag is cleared **before** the snapshot is taken,
+    /// under the same write lock as the map. A `set` that lands
+    /// after the snapshot re-dirties the cache, so the next flush
+    /// picks it up. Clearing the flag *after* the write would drop
+    /// that concurrent `set` (the new entry is in memory, the flag
+    /// is then forced false, and a crash before the next `set`
+    /// loses it). A failed write puts the flag back.
     pub fn persist_if_dirty(&self) -> Result<()> {
-        if !self.dirty.load(Ordering::Relaxed) {
-            return Ok(());
+        let snapshot = {
+            let guard = self.map.write();
+            if !self.dirty.swap(false, Ordering::AcqRel) {
+                return Ok(());
+            }
+            Arc::clone(&guard)
+        };
+        if let Err(e) = write_map(&self.path, &snapshot) {
+            self.dirty.store(true, Ordering::Release);
+            return Err(e);
         }
-        self.persist()?;
-        self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn persist(&self) -> Result<()> {
         let map = Arc::clone(&self.map.read());
-        let mut body = String::new();
-        for (ip, host) in map.iter() {
-            body.push_str(ip);
-            body.push(' ');
-            body.push_str(host);
-            body.push('\n');
-        }
-        std::fs::write(&self.path, body)
-            .with_context(|| format!("persist rdns cache {}", self.path.display()))?;
-        Ok(())
+        write_map(&self.path, &map)
     }
 
     pub fn size(&self) -> usize {
         self.map.read().len()
     }
+}
+
+fn write_map(path: &Path, map: &HashMap<String, String>) -> Result<()> {
+    let mut body = String::new();
+    for (ip, host) in map.iter() {
+        body.push_str(ip);
+        body.push(' ');
+        body.push_str(host);
+        body.push('\n');
+    }
+    std::fs::write(path, body).with_context(|| format!("persist rdns cache {}", path.display()))?;
+    Ok(())
 }
 
 fn load_file(path: &Path) -> Result<HashMap<String, String>> {
@@ -161,5 +178,30 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         cache.persist_if_dirty().unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn persist_failure_keeps_dirty_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rdns.txt");
+        let cache = RdnsCache::open(&path).unwrap();
+        cache.set("1.2.3.4", "a.example.com");
+
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let err = cache.persist_if_dirty().unwrap_err();
+        assert!(err.to_string().contains("rdns"));
+
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(original);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        cache.persist_if_dirty().unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("1.2.3.4 a.example.com"));
     }
 }

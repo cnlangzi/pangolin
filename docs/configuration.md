@@ -216,7 +216,10 @@ Shape of the `config` JSON per kind:
 > Googlebot / Bingbot / GPTBot / ClaudeBot / facebookexternalhit /
 > UptimeRobot / …). **Only verified** claims fan out to the four
 > sinks; forged UAs, cold RDNS, and unknown agents are fail-closed
-> (never written to the bot log). Cold RDNS only warms a persistent
+> (never written to the bot log). Each written row stores `bot_name`
+> (the YAML id, e.g. `googlebot`) and `ua` (the raw User-Agent).
+> Readers use `bot_name` directly and do not scan `ua` again.
+> Cold RDNS only warms a persistent
 > cache for the next request. Official IP lists refresh immediately
 > on startup, then on `bot.refresh_interval_secs`.
 >

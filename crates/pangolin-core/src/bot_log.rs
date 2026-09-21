@@ -66,17 +66,17 @@ pub struct BotLogEntry {
     pub backend: String,
     pub client_ip: String,
 
-    /// Bot short name, e.g. `"Googlebot"`.
+    /// Bot short name: the knownbots registry id, e.g. `"googlebot"`.
     ///
-    /// `Cow<'static, str>` so the hot path can borrow from a
-    /// `'static` table when one exists, while the history-read path
-    /// ([`crate::bot_log::query_history`]) and the knownbots
-    /// verifier (owned display names) deserialise / construct into
-    /// an owned `String`. `Cow` derefs to `&str` so templates and
-    /// comparisons against `&str` literals work unchanged.
+    /// `Cow<'static, str>` so the history reader and the verifier
+    /// share one field type: both construct `Cow::Owned` (YAML
+    /// display names are not `'static`; JSONL lines aren't either).
+    /// `Cow` derefs to `&str`, so templates and `&str` comparisons
+    /// stay the same. There is no borrowed hot path anymore — the
+    /// old `'static` rule table is gone.
     pub bot_name: Cow<'static, str>,
     /// Bot vendor, e.g. `"Google"`. Same `Cow` rationale as
-    /// [`Self::bot_name`].
+    /// [`Self::bot_name`]: always owned after knownbots verification.
     pub bot_vendor: Cow<'static, str>,
     /// Coarse category — see [`BotCategory`].
     pub bot_category: BotCategory,
@@ -622,7 +622,7 @@ async fn ensure_dir(dir: &Path) -> std::io::Result<()> {
 pub struct BotHistoryQuery {
     /// UTC date of the file to read (`bot-YYYY-MM-DD.jsonl`).
     pub date: NaiveDate,
-    /// Exact-match on `bot_name` (e.g. `"Googlebot"`).
+    /// Exact-match on `bot_name` (the registry id, e.g. `"googlebot"`).
     pub bot_name: Option<String>,
     /// Case-sensitive substring match on the SNI / `Host` header.
     pub host: Option<String>,

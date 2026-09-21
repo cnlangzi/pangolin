@@ -3,6 +3,7 @@
 # JSON format: https://www.bing.com/toolbox/bingbot.json
 kind: SearchEngine
 name: bingbot
+vendor: "Microsoft"
 parser: google
 ua: "bingbot"
 urls:

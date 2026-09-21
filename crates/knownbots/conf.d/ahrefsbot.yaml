@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: SEO
 name: ahrefsbot
+vendor: "Ahrefs"
 ua: "AhrefsBot"
 parser: ahrefs
 urls:

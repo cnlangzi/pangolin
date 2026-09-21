@@ -2,6 +2,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/google-special-case-crawlers#adsbot
 kind: Monitor
 name: adsbot
+vendor: "Google"
 parser: google
 ua: "AdsBot"
 urls:

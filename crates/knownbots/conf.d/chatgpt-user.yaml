@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: AIAssist
 name: chatgpt-user
+vendor: "OpenAI"
 ua: "ChatGPT-User"
 rdns: true
 domains:

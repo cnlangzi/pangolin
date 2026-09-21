@@ -3,6 +3,7 @@
 # Verification: RDNS (no official IP list available)
 kind: SearchEngine
 name: baiduspider
+vendor: "Baidu"
 ua: "Baiduspider"
 domains:
   - "baidu.com"

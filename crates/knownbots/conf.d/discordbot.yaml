@@ -1,6 +1,7 @@
 # Discordbot - Discord link preview unfurler
 kind: SocialMedia
 name: discordbot
+vendor: "Discord"
 ua: "Discordbot"
 rdns: true
 domains:

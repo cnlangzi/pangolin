@@ -3,6 +3,7 @@
 # JSON format: {"prefixes": [{"ip_prefix": "3.12.251.153/32"}, {"ipv6_prefix": "..."}]}
 kind: Monitor
 name: uptimerobot
+vendor: "UptimeRobot"
 parser: uptimerobot
 ua: "UptimeRobot"
 urls:

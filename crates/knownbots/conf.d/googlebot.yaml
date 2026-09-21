@@ -2,6 +2,7 @@
 # https://developers.google.com/search/docs/crawling-indexing/googlebot
 kind: SearchEngine
 name: googlebot
+vendor: "Google"
 parser: google
 ua: "Googlebot"
 urls:

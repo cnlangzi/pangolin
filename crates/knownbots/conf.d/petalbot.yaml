@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: AITraining
 name: petalbot
+vendor: "Huawei"
 ua: "PetalBot"
 rdns: true
 domains:

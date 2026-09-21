@@ -2,6 +2,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/feedfetcher
 kind: SearchEngine
 name: feedfetcher
+vendor: "Google"
 parser: google
 ua: "FeedFetcher"
 urls:

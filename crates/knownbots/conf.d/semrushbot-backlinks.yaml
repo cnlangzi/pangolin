@@ -3,6 +3,7 @@
 # https://www.semrush.com/bot.html
 kind: SEO
 name: semrushbot-ba
+vendor: "Semrush"
 ua: "SemrushBot-BA"
 rdns: true
 domains:

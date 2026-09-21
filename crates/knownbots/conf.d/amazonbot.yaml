@@ -2,6 +2,7 @@
 # https://developer.amazon.com/amazonbot
 kind: AITraining
 name: amazonbot
+vendor: "Amazon"
 ua: "Amazonbot"
 parser: amazon
 urls:

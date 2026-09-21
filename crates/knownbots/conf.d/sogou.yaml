@@ -3,6 +3,7 @@
 # Verification: RDNS (no official IP list available)
 kind: SearchEngine
 name: sogou
+vendor: "Sogou"
 ua: "Sogou"
 domains:
   - "sogou.com"

@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: AIAssist
 name: perplexity-user
+vendor: "Perplexity"
 ua: "Perplexity-User"
 rdns: true
 domains:

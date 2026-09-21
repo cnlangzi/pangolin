@@ -2,6 +2,7 @@
 # Populates Internet Archive cache for downtime protection
 kind: SearchEngine
 name: cloudflare-alwaysonline
+vendor: "Cloudflare"
 ua: "CloudFlare-AlwaysOnline"
 urls:
   - "https://www.cloudflare.com/ips-v4/"

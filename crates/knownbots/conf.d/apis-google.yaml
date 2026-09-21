@@ -2,6 +2,7 @@
 # https://developers.google.com/crawling/docs/crawlers-fetchers/apis-user-agent
 kind: Monitor
 name: apis-google
+vendor: "Google"
 parser: google
 ua: "APIs-Google"
 urls:

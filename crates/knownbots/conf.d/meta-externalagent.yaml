@@ -2,6 +2,7 @@
 # https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
 kind: AITraining
 name: meta-externalagent
+vendor: "Meta"
 ua: "Meta-ExternalAgent"
 rdns: true
 domains:

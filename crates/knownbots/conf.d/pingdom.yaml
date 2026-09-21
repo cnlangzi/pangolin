@@ -2,6 +2,7 @@
 # https://documentation.solarwinds.com/en/success_center/observability/content/intro/website/probes.htm
 kind: Monitor
 name: pingdom
+vendor: "Pingdom"
 parser: txt
 ua: "Pingdom"
 urls:

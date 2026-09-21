@@ -3,14 +3,14 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::bot::{Bot, BotKind, load_bots, vendor_for};
+use crate::bot::{Bot, BotKind, count_cold_url_bots, load_bots};
 use crate::lru::FailLru;
 use crate::parser;
 use crate::rdns::{RdnsCache, match_domain};
@@ -45,8 +45,10 @@ pub enum VerifyStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyResult {
     pub status: VerifyStatus,
+    /// Registry id (`googlebot`, `bingbot`). This is the value
+    /// written to JSONL `bot_name`. The raw User-Agent is not
+    /// copied here — callers store it separately.
     pub name: String,
-    pub display_name: String,
     pub vendor: String,
     pub kind: BotKind,
     /// Wire label for pangolin `BotCategory` (`search_engine`, …).
@@ -63,7 +65,6 @@ impl VerifyResult {
         Self {
             status: VerifyStatus::Unknown,
             name: String::new(),
-            display_name: String::new(),
             vendor: String::new(),
             kind: BotKind::Unknown,
             category: "monitoring",
@@ -75,7 +76,6 @@ impl VerifyResult {
         Self {
             status,
             name: String::new(),
-            display_name: String::new(),
             vendor: String::new(),
             kind: bot.kind,
             category: bot.kind.to_category_label(&bot.name),
@@ -86,8 +86,7 @@ impl VerifyResult {
         Self {
             status: VerifyStatus::Verified,
             name: bot.name.clone(),
-            display_name: bot.ua.clone(),
-            vendor: vendor_for(&bot.name).to_string(),
+            vendor: bot.vendor.clone(),
             kind: bot.kind,
             category: bot.kind.to_category_label(&bot.name),
         }
@@ -109,6 +108,9 @@ pub struct Validator {
     rdns_rx: Mutex<Option<mpsc::Receiver<RdnsJob>>>,
     shutdown: AtomicBool,
     workers_started: AtomicBool,
+    /// RDNS jobs dropped because [`RDNS_QUEUE`] was full or the
+    /// worker side had shut down. See `rdns_queue_overflow_clears_inflight`.
+    rdns_overflow: AtomicU64,
     /// Prevents duplicate in-flight RDNS for the same (bot, ip).
     in_flight: Mutex<std::collections::HashSet<(String, IpAddr)>>,
     http: reqwest::Client,
@@ -153,6 +155,13 @@ impl Validator {
             }
         }
 
+        let cold = count_cold_url_bots(&bots);
+        if cold > 0 {
+            log::warn!(
+                "knownbots: cold start, {cold} URL-backed bots unverified until first refresh succeeds"
+            );
+        }
+
         let (rdns_tx, rdns_rx) = mpsc::channel(RDNS_QUEUE);
 
         let http = reqwest::Client::builder()
@@ -167,6 +176,7 @@ impl Validator {
             rdns_rx: Mutex::new(Some(rdns_rx)),
             shutdown: AtomicBool::new(false),
             workers_started: AtomicBool::new(false),
+            rdns_overflow: AtomicU64::new(0),
             in_flight: Mutex::new(std::collections::HashSet::new()),
             http,
             refresh_interval: opts.refresh_interval,
@@ -288,6 +298,13 @@ impl Validator {
             Err(mpsc::error::TrySendError::Full(job))
             | Err(mpsc::error::TrySendError::Closed(job)) => {
                 self.in_flight.lock().remove(&(job.bot_name, job.ip));
+                let total = self.rdns_overflow.fetch_add(1, Ordering::Relaxed) + 1;
+                // Same cadence as BotLogWriter: first drop, then every 1000.
+                if total == 1 || total.is_multiple_of(1000) {
+                    log::warn!(
+                        "knownbots: RDNS queue overflow, dropped {total} lookups (queue {RDNS_QUEUE}); bot verification stays fail-closed until the queue drains"
+                    );
+                }
             }
         }
     }
@@ -487,7 +504,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
         let r = v.verify(google_ua(), ip);
         assert!(r.is_verified());
-        assert_eq!(r.display_name, "Googlebot");
+        assert_eq!(r.name, "googlebot");
         assert_eq!(r.vendor, "Google");
         assert_eq!(r.category, "search_engine");
     }
@@ -533,7 +550,7 @@ mod tests {
             "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)";
         let r = v.verify(ua, ip);
         assert!(r.is_verified());
-        assert_eq!(r.display_name, "Baiduspider");
+        assert_eq!(r.name, "baiduspider");
     }
 
     #[test]
@@ -556,6 +573,7 @@ mod tests {
         let r = v.verify(ua, ip);
         assert!(r.is_verified());
         assert_eq!(r.category, "social");
+        assert_eq!(r.name, "facebookexternalhit");
     }
 
     #[test]
@@ -568,5 +586,40 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
         let r = v.verify(google_ua(), ip);
         assert_eq!(r.status, VerifyStatus::Failed);
+    }
+
+    #[test]
+    fn rdns_queue_overflow_clears_inflight() {
+        // Workers are not started, so the channel stays full.
+        // Overflow must drop the in-flight key (so a later request
+        // can retry) and count the drop.
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let ua = "Mozilla/5.0 (compatible; Baiduspider/2.0)";
+        let extra = 8;
+        for i in 0..(RDNS_QUEUE + extra) {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + i as u32));
+            let r = v.verify(ua, ip);
+            assert_eq!(r.status, VerifyStatus::Pending);
+        }
+        assert_eq!(v.rdns_overflow.load(Ordering::Relaxed), extra as u64);
+        assert_eq!(v.in_flight.lock().len(), RDNS_QUEUE);
+    }
+
+    #[test]
+    fn verified_name_is_registry_id() {
+        // `bot_name` is the YAML `name`, decided at match time.
+        // The header stays in the log's `ua` field; readers do not
+        // scan it again to recover the bot.
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        v.seed_prefix("bingbot", "40.77.0.0/16").unwrap();
+        let ip = IpAddr::V4(Ipv4Addr::new(40, 77, 167, 12));
+        let header = "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)";
+        let r = v.verify(header, ip);
+        assert!(r.is_verified());
+        assert_eq!(r.name, "bingbot");
+        assert_ne!(r.name, header);
+        assert_eq!(r.vendor, "Microsoft");
     }
 }

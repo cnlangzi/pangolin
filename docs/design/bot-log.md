@@ -61,10 +61,19 @@ Rust port of the knownbots verification model:
 
 - Embedded YAML under `conf.d/` (search / AI / social / monitoring).
 - Case-sensitive word-boundary UA match; longest marker wins.
+  Mixed-case UAs are rejected on purpose: official crawlers publish
+  a fixed token, and folding case would accept trivial forgeries.
 - IP ownership via official CIDR lists and/or RDNS (+ FCrDNS).
 - Immediate IP-list refresh on startup; retry with backoff on failure.
+  Until that first refresh lands, URL-backed bots with an empty
+  prefix cache fail closed. Startup logs how many are in that window.
+- JSONL `bot_name` is the YAML `name` (the id chosen when the UA
+  matched). `ua` is the raw User-Agent header. Readers filter on
+  `bot_name` and do not scan `ua` again.
+- `vendor` in the YAML is the JSONL `bot_vendor`.
 - RDNS success updates an in-memory dirty cache; the scheduler flushes
-  `rdns.txt` periodically.
+  `rdns.txt` periodically. The dirty flag is cleared before the
+  snapshot so a concurrent insert is not lost.
 
 ### `crates/pangolin-core/src/bot.rs`
 
@@ -80,10 +89,11 @@ JSONL writer + ring buffer + (stage-3) history reader.
   backend / client_ip / bot_name / bot_vendor / bot_category / ua /
   referer (always `None` in v1; reserved for a future
   `RequestState::referer` capture). `bot_name` / `bot_vendor` are
-  `Cow<'static, str>` — borrowed from the static bot-rule table
-  on the hot path (`Cow::Borrowed`), owned `String` when
-  re-hydrated from JSONL by the history reader. Zero-cost on
-  write, one alloc per field on read.
+  `Cow<'static, str>` so the history reader and the verifier share
+  one field. Both paths own the string: knownbots display names
+  come from YAML, and JSONL lines are parsed text. There is no
+  `Cow::Borrowed` hot path after the `'static` rule table was
+  removed.
 - `BotLogBuffer` — bounded ring buffer mirroring `AccessLogBuffer`.
   Capacity 0 → no-op (the JSONL stream + stats counters still work).
 - `BotLogWriter` — `Arc<Self>` shared between the request hot path
@@ -160,7 +170,7 @@ One JSON object per line, no nested `bot:` wrapper, ISO-8601 timestamps,
 snake_case category enum:
 
 ```json
-{"ts":"2026-09-19T08:23:11.452Z","host":"blog.example.com","method":"GET","path":"/sitemap.xml","status":200,"duration_ms":12,"backend":"direct:127.0.0.1:8080","client_ip":"66.249.66.1","bot_name":"Googlebot","bot_vendor":"Google","bot_category":"search_engine","ua":"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+{"ts":"2026-09-19T08:23:11.452Z","host":"blog.example.com","method":"GET","path":"/sitemap.xml","status":200,"duration_ms":12,"backend":"direct:127.0.0.1:8080","client_ip":"66.249.66.1","bot_name":"googlebot","bot_vendor":"Google","bot_category":"search_engine","ua":"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
 ```
 
 Filename: `bot-YYYY-MM-DD.jsonl`. UTC day boundary. Operators handle
@@ -183,10 +193,10 @@ itself does not auto-clean up.
 
 ```bash
 # How many Googlebot hits today?
-grep '"bot_name":"Googlebot"' logs/bots/bot-$(date -u +%Y-%m-%d).jsonl | wc -l
+grep '"bot_name":"googlebot"' logs/bots/bot-$(date -u +%Y-%m-%d).jsonl | wc -l
 
 # What did Baiduspider crawl most on our blog?
-grep '"bot_name":"Baiduspider"' logs/bots/bot-*.jsonl \
+grep '"bot_name":"baiduspider"' logs/bots/bot-*.jsonl \
   | jq -r '.host + .path' \
   | sort | uniq -c | sort -rn | head 20
 
@@ -220,10 +230,10 @@ duckdb -c "
   archive:
   - `pangolin-core::bot_log` — `BotHistoryQuery` / `BotHistoryPage`
     / `list_dates` / `file_size_for` / `query_history` (read-only,
-    zero new deps). `BotLogEntry.bot_name` / `bot_vendor` switched
-    from `&'static str` to `Cow<'static, str>` so the JSONL wire
-    format round-trips through `Deserialize` while the hot path
-    (`from_access_log`) stays zero-allocation via `Cow::Borrowed`.
+    zero new deps). `BotLogEntry.bot_name` / `bot_vendor` are
+    `Cow<'static, str>` so JSONL round-trips through `Deserialize`.
+    The hot path owns the strings (`Cow::Owned`) because display
+    names come from the knownbots YAML, not a `'static` table.
   - `admin/templates/pages/logs_bots_history.html` — full page
     with sub-nav (Live / History), date sidebar, filter form,
     result region.

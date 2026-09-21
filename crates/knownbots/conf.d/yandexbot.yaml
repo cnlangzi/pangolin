@@ -3,6 +3,7 @@
 # Verification: RDNS (no official IP list available)
 kind: SearchEngine
 name: yandexbot
+vendor: "Yandex"
 ua: "YandexBot"
 domains:
   - "yandex.com"
