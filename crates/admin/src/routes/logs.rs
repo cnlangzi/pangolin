@@ -611,8 +611,8 @@ mod tests {
             ),
         };
         let bot = BotIdentity {
-            name: "Googlebot",
-            vendor: "Google",
+            name: "Googlebot".into(),
+            vendor: "Google".into(),
             category: BotCategory::SearchEngine,
         };
         let bot_entry =
@@ -735,8 +735,8 @@ mod tests {
             user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
         };
         let identity = BotIdentity {
-            name,
-            vendor,
+            name: name.into(),
+            vendor: vendor.into(),
             category: BotCategory::SearchEngine,
         };
         BotLogEntry::from_access_log(&access, identity).unwrap()

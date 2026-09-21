@@ -1,0 +1,8 @@
+# Amazon AI crawler
+# https://developer.amazon.com/amazonbot
+kind: AITraining
+name: amazonbot
+ua: "Amazonbot"
+parser: amazon
+urls:
+  - "https://developer.amazon.com/amazonbot/ip-addresses/"

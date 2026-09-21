@@ -36,7 +36,7 @@ pub mod types;
 pub use app::{
     App, CertManager, CertRetrier, DnsIndex, IssuancePlan, TunnelMessage, plan_issuance,
 };
-pub use bot::{BotCategory, BotIdentity, detect_bot};
+pub use bot::{BotCategory, BotIdentity, verify_bot};
 pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;

@@ -68,12 +68,12 @@ pub struct BotLogEntry {
 
     /// Bot short name, e.g. `"Googlebot"`.
     ///
-    /// `Cow<'static, str>` so the hot path (constructed via
-    /// [`Self::from_access_log`] from the static bot-rule table) is
-    /// zero-allocation, while the history-read path
-    /// ([`crate::bot_log::query_history`]) deserialises from JSONL
-    /// into an owned `String`. `Cow` derefs to `&str` so templates
-    /// and comparisons against `&str` literals work unchanged.
+    /// `Cow<'static, str>` so the hot path can borrow from a
+    /// `'static` table when one exists, while the history-read path
+    /// ([`crate::bot_log::query_history`]) and the knownbots
+    /// verifier (owned display names) deserialise / construct into
+    /// an owned `String`. `Cow` derefs to `&str` so templates and
+    /// comparisons against `&str` literals work unchanged.
     pub bot_name: Cow<'static, str>,
     /// Bot vendor, e.g. `"Google"`. Same `Cow` rationale as
     /// [`Self::bot_name`].
@@ -97,10 +97,10 @@ impl BotLogEntry {
     /// + the bot identification result.
     ///
     /// Returns `None` if `entry.user_agent` is `None` or
-    /// [`crate::bot::detect_bot`] doesn't recognise the UA — the
-    /// caller (in `App::push_access_log`) has already performed
-    /// both checks, so this helper exists for tests and the
-    /// `BotStats::record` path.
+    /// [`crate::bot::verify_bot`] doesn't recognise / verify the
+    /// request — the caller (in `App::push_access_log`) has already
+    /// performed both checks, so this helper exists for tests and
+    /// the `BotStats::record` path.
     pub fn from_access_log(
         entry: &crate::events::AccessLogEntry,
         bot: BotIdentity,
@@ -115,8 +115,8 @@ impl BotLogEntry {
             duration_ms: entry.duration_ms,
             backend: entry.backend.clone(),
             client_ip: entry.client_ip.clone(),
-            bot_name: Cow::Borrowed(bot.name),
-            bot_vendor: Cow::Borrowed(bot.vendor),
+            bot_name: Cow::Owned(bot.name),
+            bot_vendor: Cow::Owned(bot.vendor),
             bot_category: bot.category,
             ua: ua.to_string(),
             referer: None,
@@ -838,8 +838,8 @@ mod tests {
 
     fn bot() -> BotIdentity {
         BotIdentity {
-            name: "Googlebot",
-            vendor: "Google",
+            name: "Googlebot".into(),
+            vendor: "Google".into(),
             category: BotCategory::SearchEngine,
         }
     }
@@ -1126,8 +1126,8 @@ mod tests {
             user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
         };
         let identity = BotIdentity {
-            name,
-            vendor,
+            name: name.into(),
+            vendor: vendor.into(),
             category: BotCategory::SearchEngine,
         };
         BotLogEntry::from_access_log(&access, identity).unwrap()
@@ -1610,8 +1610,8 @@ mod tests {
         for (cat, want_non_empty) in cases {
             let access = entry(Some("testbot"));
             let identity = BotIdentity {
-                name: "testbot",
-                vendor: "test",
+                name: "testbot".into(),
+                vendor: "test".into(),
                 category: cat,
             };
             let e = BotLogEntry::from_access_log(&access, identity).expect("from_access_log");

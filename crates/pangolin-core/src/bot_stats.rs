@@ -242,18 +242,15 @@ mod tests {
 
     fn bot(name: &'static str, vendor: &'static str) -> BotIdentity {
         BotIdentity {
-            name,
-            vendor,
+            name: name.into(),
+            vendor: vendor.into(),
             category: BotCategory::SearchEngine,
         }
     }
 
     /// Build a `BotLogEntry` with the supplied UA/host/path. The
-    /// bot identity is inferred from the UA — the helper detects
-    /// which bot the UA string claims to be and uses that as the
-    /// `bot_name`. UA fragments like `"Mozilla/5.0 (compatible;
-    /// bingbot/2.0)"` correctly resolve to Bingbot; a plain
-    /// `"Googlebot"` resolves to Googlebot.
+    /// bot identity is taken from `name`/`vendor` — these helpers
+    /// exercise the stats aggregator, not the verifier.
     fn entry(ua: &str, host: &str, path: &str) -> BotLogEntry {
         let access = AccessLogEntry {
             timestamp: chrono::Utc::now(),
@@ -266,7 +263,11 @@ mod tests {
             client_ip: "10.0.0.1".into(),
             user_agent: Some(ua.into()),
         };
-        let identity = crate::bot::detect_bot(ua).unwrap_or(bot("Googlebot", "Google"));
+        let identity = if ua.to_ascii_lowercase().contains("bingbot") {
+            bot("Bingbot", "Microsoft")
+        } else {
+            bot("Googlebot", "Google")
+        };
         BotLogEntry::from_access_log(&access, identity).unwrap()
     }
 

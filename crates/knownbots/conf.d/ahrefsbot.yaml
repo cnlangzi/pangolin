@@ -1,0 +1,8 @@
+# Ahrefs SEO crawler
+# https://developers.cloudflare.com/bots/concepts/bot/verified-bots/
+kind: SEO
+name: ahrefsbot
+ua: "AhrefsBot"
+parser: ahrefs
+urls:
+  - "https://api.ahrefs.com/v3/public/crawler-ips"

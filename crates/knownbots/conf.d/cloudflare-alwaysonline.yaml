@@ -1,0 +1,8 @@
+# Cloudflare Always Online crawler
+# Populates Internet Archive cache for downtime protection
+kind: SearchEngine
+name: cloudflare-alwaysonline
+ua: "CloudFlare-AlwaysOnline"
+urls:
+  - "https://www.cloudflare.com/ips-v4/"
+  - "https://www.cloudflare.com/ips-v6/"

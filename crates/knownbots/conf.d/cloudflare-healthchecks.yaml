@@ -1,0 +1,8 @@
+# Cloudflare Health Checks crawler
+# Monitors origin server availability
+kind: Monitor
+name: cloudflare-healthchecks
+ua: "Cloudflare-Healthchecks"
+urls:
+  - "https://www.cloudflare.com/ips-v4/"
+  - "https://www.cloudflare.com/ips-v6/"

@@ -50,6 +50,10 @@ httpdate.workspace = true
 # us lock-free reads in the common case.
 dashmap.workspace = true
 
+# Bot verification (UA + official IP ranges / RDNS). Side-channel only;
+# the request hot path calls `verify` synchronously and never awaits.
+knownbots = { path = "../knownbots" }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `figment::Jail` lives behind the `test` feature flag — used by the

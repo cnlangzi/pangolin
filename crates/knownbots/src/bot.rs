@@ -1,0 +1,395 @@
+//! Bot configuration loaded from YAML (embedded + optional override dir).
+
+use std::net::IpAddr;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use ipnet::IpNet;
+use parking_lot::RwLock;
+use serde::Deserialize;
+
+use crate::lru::FailLru;
+use crate::rdns::RdnsCache;
+
+/// Coarse bot category from the upstream YAML `kind` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+pub enum BotKind {
+    SearchEngine,
+    SocialMedia,
+    AITraining,
+    AIAssist,
+    AIMixed,
+    SEO,
+    Monitor,
+    Security,
+    Scraper,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl BotKind {
+    /// Map to pangolin's five-bucket `BotCategory` wire labels.
+    ///
+    /// Ads-related monitors (`adsbot*`, `mediapartners*`) land in
+    /// `ads_bot` so the existing admin filter keeps working; other
+    /// `Monitor` bots become `monitoring`.
+    pub fn to_category_label(self, bot_name: &str) -> &'static str {
+        match self {
+            BotKind::SearchEngine | BotKind::SEO => "search_engine",
+            BotKind::AITraining | BotKind::AIAssist | BotKind::AIMixed => "ai_bot",
+            BotKind::SocialMedia => "social",
+            BotKind::Monitor => {
+                if bot_name.contains("ads") || bot_name.contains("mediapartners") {
+                    "ads_bot"
+                } else {
+                    "monitoring"
+                }
+            }
+            BotKind::Security | BotKind::Scraper | BotKind::Unknown => "monitoring",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BotConfigFile {
+    name: String,
+    #[serde(default)]
+    kind: BotKind,
+    #[serde(default)]
+    parser: String,
+    #[serde(default)]
+    ua: String,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default)]
+    custom: Vec<String>,
+    #[serde(default)]
+    domains: Vec<String>,
+    #[serde(default)]
+    rdns: bool,
+}
+
+/// Runtime bot definition. Prefixes / RDNS state live behind locks so
+/// the background scheduler can swap them without blocking readers
+/// for long.
+pub struct Bot {
+    pub name: String,
+    pub kind: BotKind,
+    pub parser: String,
+    /// Case-sensitive UA marker (e.g. `"Googlebot"`). Also used as
+    /// the display name in the bot log.
+    pub ua: String,
+    pub urls: Vec<String>,
+    pub custom: Vec<IpNet>,
+    pub domains: Vec<String>,
+    pub rdns: bool,
+    /// Merged custom + downloaded prefixes. Readers take a short
+    /// `RwLock` read; writers replace the whole `Vec`.
+    pub prefixes: RwLock<Vec<IpNet>>,
+    pub rdns_cache: Option<Arc<RdnsCache>>,
+    pub fail_cache: Option<Arc<FailLru>>,
+}
+
+impl Bot {
+    fn from_config(cfg: BotConfigFile) -> Result<Self> {
+        let parser = if cfg.parser.is_empty() {
+            // Unknown parser names fall back to `txt` in [`crate::parser`].
+            cfg.name.clone()
+        } else {
+            cfg.parser
+        };
+        let mut custom = Vec::new();
+        for cidr in &cfg.custom {
+            match cidr.parse::<IpNet>() {
+                Ok(net) => custom.push(net),
+                Err(e) => log::warn!("bot {}: skip bad custom CIDR {cidr:?}: {e}", cfg.name),
+            }
+        }
+        Ok(Self {
+            name: cfg.name,
+            kind: cfg.kind,
+            parser,
+            ua: cfg.ua,
+            urls: cfg.urls,
+            custom: custom.clone(),
+            domains: cfg.domains,
+            rdns: cfg.rdns,
+            prefixes: RwLock::new(custom),
+            rdns_cache: None,
+            fail_cache: None,
+        })
+    }
+
+    /// True if `ip` is covered by the current prefix set.
+    pub fn contains_ip(&self, ip: IpAddr) -> bool {
+        let prefixes = self.prefixes.read();
+        prefixes.iter().any(|net| net.contains(&ip))
+    }
+
+    /// Replace downloaded prefixes while keeping static `custom` ones.
+    pub fn store_downloaded(&self, downloaded: Vec<IpNet>) {
+        if downloaded.is_empty() {
+            // Never wipe a working set on a failed refresh.
+            return;
+        }
+        let mut merged = self.custom.clone();
+        merged.extend(downloaded);
+        *self.prefixes.write() = merged;
+    }
+
+    /// Load prefixes from a previously persisted `ips.txt`.
+    pub fn load_cached_ips(&self, path: &Path) {
+        let Ok(data) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let mut nets = Vec::new();
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Ok(net) = line.parse::<IpNet>() {
+                nets.push(net);
+            }
+        }
+        if !nets.is_empty() {
+            self.store_downloaded(nets);
+        }
+    }
+
+    /// Persist current prefixes (custom + downloaded) to `ips.txt`.
+    pub fn persist_ips(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let prefixes = self.prefixes.read();
+        let mut body = String::new();
+        for net in prefixes.iter() {
+            body.push_str(&net.to_string());
+            body.push('\n');
+        }
+        std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Embedded YAML shipped with the crate (search / AI / social /
+/// monitoring bots only — HTTP-client fingerprints are omitted).
+pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
+    (
+        "adsbot-mobile.yaml",
+        include_str!("../conf.d/adsbot-mobile.yaml"),
+    ),
+    ("adsbot.yaml", include_str!("../conf.d/adsbot.yaml")),
+    ("ahrefsbot.yaml", include_str!("../conf.d/ahrefsbot.yaml")),
+    ("amazonbot.yaml", include_str!("../conf.d/amazonbot.yaml")),
+    (
+        "apis-google.yaml",
+        include_str!("../conf.d/apis-google.yaml"),
+    ),
+    ("applebot.yaml", include_str!("../conf.d/applebot.yaml")),
+    (
+        "baiduspider.yaml",
+        include_str!("../conf.d/baiduspider.yaml"),
+    ),
+    ("bingbot.yaml", include_str!("../conf.d/bingbot.yaml")),
+    (
+        "chatgpt-user.yaml",
+        include_str!("../conf.d/chatgpt-user.yaml"),
+    ),
+    (
+        "cloudflare-alwaysonline.yaml",
+        include_str!("../conf.d/cloudflare-alwaysonline.yaml"),
+    ),
+    (
+        "cloudflare-healthchecks.yaml",
+        include_str!("../conf.d/cloudflare-healthchecks.yaml"),
+    ),
+    (
+        "duckduckbot.yaml",
+        include_str!("../conf.d/duckduckbot.yaml"),
+    ),
+    (
+        "facebookexternalhit.yaml",
+        include_str!("../conf.d/facebookexternalhit.yaml"),
+    ),
+    (
+        "feedfetcher.yaml",
+        include_str!("../conf.d/feedfetcher.yaml"),
+    ),
+    (
+        "google-extended.yaml",
+        include_str!("../conf.d/google-extended.yaml"),
+    ),
+    (
+        "google-inspectiontool.yaml",
+        include_str!("../conf.d/google-inspectiontool.yaml"),
+    ),
+    (
+        "google-storebot.yaml",
+        include_str!("../conf.d/google-storebot.yaml"),
+    ),
+    ("googlebot.yaml", include_str!("../conf.d/googlebot.yaml")),
+    (
+        "googleother.yaml",
+        include_str!("../conf.d/googleother.yaml"),
+    ),
+    ("gptbot.yaml", include_str!("../conf.d/gptbot.yaml")),
+    (
+        "linkedinbot.yaml",
+        include_str!("../conf.d/linkedinbot.yaml"),
+    ),
+    (
+        "mediapartners-google.yaml",
+        include_str!("../conf.d/mediapartners-google.yaml"),
+    ),
+    (
+        "meta-externalagent.yaml",
+        include_str!("../conf.d/meta-externalagent.yaml"),
+    ),
+    ("mj12bot.yaml", include_str!("../conf.d/mj12bot.yaml")),
+    (
+        "oai-searchbot.yaml",
+        include_str!("../conf.d/oai-searchbot.yaml"),
+    ),
+    (
+        "perplexity-user.yaml",
+        include_str!("../conf.d/perplexity-user.yaml"),
+    ),
+    ("petalbot.yaml", include_str!("../conf.d/petalbot.yaml")),
+    (
+        "pinterestbot.yaml",
+        include_str!("../conf.d/pinterestbot.yaml"),
+    ),
+    (
+        "semrushbot-backlinks.yaml",
+        include_str!("../conf.d/semrushbot-backlinks.yaml"),
+    ),
+    ("semrushbot.yaml", include_str!("../conf.d/semrushbot.yaml")),
+    ("sogou.yaml", include_str!("../conf.d/sogou.yaml")),
+    ("twitterbot.yaml", include_str!("../conf.d/twitterbot.yaml")),
+    (
+        "uptimerobot.yaml",
+        include_str!("../conf.d/uptimerobot.yaml"),
+    ),
+    ("yandexbot.yaml", include_str!("../conf.d/yandexbot.yaml")),
+];
+
+fn parse_yaml(data: &str, filename: &str) -> Result<Option<Bot>> {
+    let cfg: BotConfigFile =
+        serde_yaml::from_str(data).with_context(|| format!("parse bot config {filename}"))?;
+    if cfg.name.is_empty() {
+        log::warn!("skip {filename}: missing required 'name' field");
+        return Ok(None);
+    }
+    if cfg.ua.is_empty() {
+        log::warn!("skip {filename}: missing required 'ua' field");
+        return Ok(None);
+    }
+    Ok(Some(Bot::from_config(cfg)?))
+}
+
+/// Load embedded configs, then overlay any `*.yaml` / `*.yml` from
+/// `override_dir/conf.d` (same-name wins).
+pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<String, Bot> = HashMap::new();
+    for (filename, data) in EMBEDDED_CONFIGS {
+        if let Some(bot) = parse_yaml(data, filename)? {
+            by_name.insert(bot.name.clone(), bot);
+        }
+    }
+
+    if let Some(root) = override_dir {
+        let conf_d = root.join("conf.d");
+        if conf_d.is_dir() {
+            for entry in
+                std::fs::read_dir(&conf_d).with_context(|| format!("read {}", conf_d.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext != "yaml" && ext != "yml" {
+                    continue;
+                }
+                let data = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?;
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("custom.yaml");
+                if let Some(bot) = parse_yaml(&data, name)? {
+                    log::info!("knownbots: custom config overrides bot {}", bot.name);
+                    by_name.insert(bot.name.clone(), bot);
+                }
+            }
+        }
+    }
+
+    let mut bots: Vec<Bot> = by_name.into_values().collect();
+    // Stable order for tests / debugging.
+    bots.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(bots)
+}
+
+/// Heuristic vendor label for the admin UI / JSONL `bot_vendor` field.
+pub fn vendor_for(bot_name: &str) -> &'static str {
+    match bot_name {
+        n if n.starts_with("google")
+            || n.starts_with("adsbot")
+            || n.starts_with("apis-")
+            || n.starts_with("mediapartners")
+            || n.starts_with("feedfetcher") =>
+        {
+            "Google"
+        }
+        "bingbot" => "Microsoft",
+        "baiduspider" => "Baidu",
+        "yandexbot" => "Yandex",
+        "duckduckbot" => "DuckDuckGo",
+        "sogou" => "Sogou",
+        "applebot" => "Apple",
+        "petalbot" => "Huawei",
+        "gptbot" | "chatgpt-user" | "oai-searchbot" => "OpenAI",
+        "amazonbot" => "Amazon",
+        "meta-externalagent" | "facebookexternalhit" => "Meta",
+        "perplexity-user" => "Perplexity",
+        "linkedinbot" => "LinkedIn",
+        "twitterbot" => "Twitter",
+        "pinterestbot" => "Pinterest",
+        "uptimerobot" => "UptimeRobot",
+        n if n.starts_with("cloudflare") => "Cloudflare",
+        n if n.starts_with("semrush") => "Semrush",
+        "ahrefsbot" => "Ahrefs",
+        "mj12bot" => "Majestic",
+        _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_embedded_has_googlebot() {
+        let bots = load_bots(None).unwrap();
+        assert!(bots.iter().any(|b| b.name == "googlebot"));
+        assert!(bots.len() >= 30);
+    }
+
+    #[test]
+    fn kind_maps_ads_to_ads_bot() {
+        assert_eq!(BotKind::Monitor.to_category_label("adsbot"), "ads_bot");
+        assert_eq!(
+            BotKind::Monitor.to_category_label("uptimerobot"),
+            "monitoring"
+        );
+    }
+}
