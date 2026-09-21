@@ -36,6 +36,7 @@ pub mod domains;
 pub mod logs;
 pub mod settings;
 pub mod sites;
+pub mod traffic;
 pub mod tun;
 
 // Re-export per-resource template structs for ergonomic use at the call site:
@@ -59,6 +60,7 @@ pub use settings::SettingsTemplate;
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };
+pub use traffic::{TrafficKpisView, TrafficPageTemplate, TrafficTablesView};
 pub use tun::{
     TunnelsEditTemplate, TunnelsFormFieldsView, TunnelsListTemplate, TunnelsNewTemplate,
 };

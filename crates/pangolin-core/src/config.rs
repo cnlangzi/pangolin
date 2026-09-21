@@ -364,6 +364,24 @@ pub struct LogConfig {
     /// `/logs/bots` page.
     #[serde(default)]
     pub bot: BotLogConfig,
+    /// In-memory traffic stats (no persistence). When `false` the
+    /// aggregator thread is not spawned and `on_start`/`on_finish`
+    /// are no-ops. Default `true`.
+    #[serde(default)]
+    pub traffic: TrafficConfig,
+}
+
+/// Kill switch for the in-memory traffic side-channel.
+///
+/// A missing `log.traffic:` block in `ngx.yml` enables the feature
+/// (same "safe default" policy as `log.bot`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrafficConfig {
+    /// Master switch. When `false`, [`crate::traffic::TrafficHub`]
+    /// does not spawn the aggregator thread and the proxy hot path
+    /// skips `try_send`.
+    #[serde(default = "default_traffic_enabled")]
+    pub enabled: bool,
 }
 
 /// Per-day JSONL side-channel for crawler / AI / social / monitoring
@@ -460,6 +478,10 @@ fn default_access_log_capacity() -> usize {
     1000
 }
 
+fn default_traffic_enabled() -> bool {
+    true
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -468,6 +490,15 @@ impl Default for LogConfig {
             access_log_recent: default_access_log_recent(),
             access_log_capacity: default_access_log_capacity(),
             bot: BotLogConfig::default(),
+            traffic: TrafficConfig::default(),
+        }
+    }
+}
+
+impl Default for TrafficConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_traffic_enabled(),
         }
     }
 }
@@ -618,6 +649,28 @@ mod tests {
             // so a YAML without `[log]` keys still parses.
             assert_eq!(c.log.access_log_recent, 100);
             assert_eq!(c.log.access_log_capacity, 1000);
+            assert!(c.log.traffic.enabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_traffic_enabled_parses_and_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert!(c.log.traffic.enabled);
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                log:
+                  traffic:
+                    enabled: false
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert!(!c.log.traffic.enabled);
             Ok(())
         });
     }

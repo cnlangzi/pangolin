@@ -61,6 +61,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         .map(|e| activity_row(e, now))
         .collect();
 
+    let traffic = app.traffic_snapshot();
     let dashboard = DashboardTemplate {
         site_count: sites.len(),
         domain_count: domains.len(),
@@ -70,6 +71,9 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         cert_in_flight_count,
         cert_failed_count,
         activity,
+        traffic_rps: traffic.rps_display(),
+        traffic_error_pct: traffic.error_pct_display(),
+        traffic_active: traffic.active_requests,
         active_nav: "dashboard",
     };
 

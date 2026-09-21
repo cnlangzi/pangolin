@@ -220,6 +220,8 @@ pub async fn handle(
             )
             .await?
         }
+        ("traffic", "GET") => routes::traffic::render(&app, &csrf_token).await?,
+        ("traffic/reset", "POST") => routes::traffic::handle_reset(&app).await?,
         ("logs", "GET") => routes::logs::render(&app, &csrf_token).await?,
         ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token).await?,
         ("logs/bots/history", "GET") => {
@@ -313,6 +315,10 @@ pub async fn handle(
                     } else {
                         not_found()
                     }
+                } else if rest == "traffic/kpis" && method == "GET" {
+                    routes::traffic::api_kpis(&app).await?
+                } else if rest == "traffic/tables" && method == "GET" {
+                    routes::traffic::api_tables(&app).await?
                 } else if rest == "bots/history" {
                     // GET /api/bots/history — HTMX fragment endpoint for
                     // the `/logs/bots/history` filter form. Returns

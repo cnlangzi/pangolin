@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use crate::bot::verify_bot;
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
+use crate::traffic::TrafficHub;
 use crate::tunnel::YamuxTunnel;
 use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
@@ -407,6 +408,10 @@ pub struct App {
     /// always a single `Option::take` and we never hold the guard
     /// across an await.
     bot_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// In-memory traffic stats (no persistence). Hot path is
+    /// `on_start` / `on_finish` (`try_send` only); aggregation
+    /// lives on a dedicated OS thread. See `docs/design/traffic.md`.
+    pub traffic: Arc<TrafficHub>,
     /// Domain → cert pre-computed link (fix/cert_www). Built once
     /// at startup from the `domains` × `certs` tables, then
     /// maintained by the domain/cert CRUD hooks. Read on every
@@ -530,6 +535,7 @@ impl App {
             (None, None)
         };
 
+        let traffic_enabled = config.log.traffic.enabled;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             indexes: Arc::new(RwLock::new(indexes)),
@@ -553,6 +559,7 @@ impl App {
             bot_verifier,
             bot_writer_task: parking_lot::Mutex::new(None),
             cert_links,
+            traffic: TrafficHub::new(traffic_enabled),
         })
     }
 
@@ -746,6 +753,15 @@ impl App {
     ) {
         self.bot_stats.snapshot()
     }
+
+    /// Latest traffic snapshot (cloned `Arc`). Cheap — no wait on
+    /// the aggregator thread.
+    pub fn traffic_snapshot(&self) -> Arc<crate::traffic::TrafficSnapshot> {
+        self.traffic.snapshot()
+    }
+
+    // traffic fan-out is tested in `traffic::tests` via TrafficHub
+    // directly — App just holds the Arc.
 
     /// Spawn the background bot-log writer task. Must be called
     /// **once**, from inside a tokio runtime context, after
@@ -1525,6 +1541,7 @@ mod tests {
                 // `make_log_config_with_bot`; the default here keeps
                 // the pre-existing access-log tests compiling.
                 bot: crate::BotLogConfig::default(),
+                traffic: crate::TrafficConfig::default(),
             },
             ..Config::default()
         }

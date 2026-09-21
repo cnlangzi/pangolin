@@ -100,6 +100,9 @@ mod admin_dns_e2e;
 mod access_log_e2e;
 
 #[cfg(feature = "integration")]
+mod traffic_e2e;
+
+#[cfg(feature = "integration")]
 mod admin_system_config_e2e;
 
 #[cfg(feature = "integration")]

@@ -26,4 +26,5 @@ pub mod logs;
 pub mod settings;
 pub mod sites;
 pub mod system;
+pub mod traffic;
 pub mod tun;

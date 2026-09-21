@@ -211,6 +211,10 @@ fn main() -> anyhow::Result<()> {
         // drain and `await` its completion (Gap #5/#6 fix — was
         // previously fire-and-forget).
         app_for_shutdown.shutdown_bot_writer().await;
+        // Disconnect the traffic side-channel. The aggregator
+        // thread exits on the next tick; we do not join here
+        // (blocking join would stall the host runtime).
+        app_for_shutdown.traffic.shutdown();
 
         Ok::<(), anyhow::Error>(())
     });
