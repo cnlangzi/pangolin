@@ -57,20 +57,19 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
 
 help:
 	@echo "=== Config ==="
 	@echo "  make env-show      # Print vars loaded from .env (or show .env.example template if .env missing)"
 	@echo ""
 	@echo "=== Build ==="
-	@echo "  make build         # Local build ngx + tun (release, unminified UI)"
+	@echo "  make build         # Local build ngx + tun (release; unstyled UI unless build-ui run)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-ui      # Build admin UI CSS (unminified, dev — no esbuild)"
-	@echo "  make build-ui-prod # Build admin UI CSS + JS (minified, for production)"
-	@echo "  make dev-ui        # Watch templates + assets, rebuild UI on save"
-	@echo "  make build-dist    # Docker build with minified UI, export to build/output/"
+	@echo "  make build-ui      # Opt-in: build admin UI CSS so local binary serves styled pages"
+	@echo "  make dev-ui        # Opt-in: watch templates + assets, rebuild UI on save"
+	@echo "  make build-dist    # Docker build (UI minified in-container), export to build/output/"
 	@echo "  make dist          # Same as build-dist"
 	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
 	@echo ""
@@ -114,14 +113,14 @@ CARGO_TARGET_DIR ?= ./target
 
 # Admin UI asset pipeline — single source of truth at the repo root.
 # Tracked inputs (`tailwindcss.css`, `app.js`) live in `$(ASSETS_DIR)`;
-# generated outputs (`app.css`, `app.min.js`) are gitignored and produced
-# by the targets below. Dev skips minification; `build-ui-prod` and the
-# Docker `builder` stage run with `--minify`.
+# generated `app.css` is gitignored. Only Tailwind runs on the host
+# (dev, unminified); esbuild only runs inside the Docker `builder` stage
+# where it overwrites `app.js` in-place with the minified bundle. The
+# binary therefore always serves the single file `app.js` — no env
+# switch, no separate `.min.js`.
 ASSETS_DIR        := ./assets
 TAILWIND_INPUT    := $(ASSETS_DIR)/tailwindcss.css
 TAILWIND_OUTPUT   := $(ASSETS_DIR)/app.css
-ESBUILD_INPUT     := $(ASSETS_DIR)/app.js
-ESBUILD_OUTPUT    := $(ASSETS_DIR)/app.min.js
 
 # Output binary basenames (built from cargo crates `ngx` and `tun`).
 # Single source of truth so `clean` doesn't silently rot when a new
@@ -145,8 +144,10 @@ CURL_FLAGS := -fL --progress-bar -C -
 #          point at the tier-1 binary. Re-linked by `download-ui-tools`
 #          if missing or pointing elsewhere; gitignored (the symlink is
 #          per-checkout, the real file isn't).
-# Tier 3 — consumed: `build-ui`, `build-ui-prod`, `dev-ui` invoke the
-#          tools via the `./bin/` symlink (unchanged from before).
+# Tier 3 — consumed: `build-ui`, `dev-ui` invoke the tools via the
+#          `./bin/` symlink (unchanged from before). `build-dist` does
+#          NOT consume the host CLIs — UI minification happens inside
+#          the Docker `builder` stage, see build/docker/dist.dockerfile.
 #
 # Versions are baked into the cache filename so multiple versions
 # coexist. To roll forward, bump TAILWIND_VERSION / ESBUILD_VERSION;
@@ -172,7 +173,12 @@ ESBUILD_VERSION  := 0.28.0
 # `target/release/<bin>` and `bin/<bin>` are hardlinks of each other
 # (e.g. after a previous run that did `cp` rather than `mv`). Plain
 # `mv same-file` errors out and aborts the Make target.
-build: build-ui
+#
+# Deliberately does NOT depend on `build-ui` — all UI bundling lives in
+# the Docker `builder` stage. Local binaries will serve unstyled admin
+# pages until the operator runs `make build-ui` (or `make dev-ui`) once
+# to populate `assets/app.css`.
+build:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx -p tun
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
@@ -180,7 +186,8 @@ build: build-ui
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-build-ngx: build-ui
+# Same opt-in UI build convention as `build` above.
+build-ngx:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
@@ -299,31 +306,14 @@ download-ui-tools:
 	echo "  bin/tailwindcss → $$(readlink bin/tailwindcss)"; \
 	echo "  bin/esbuild    → $$(readlink bin/esbuild)"
 
-# Dev UI build — unminified, no esbuild.
-# `assets/app.js` has no imports, so the raw source is browser-ready; the
-# binary serves it via `PANGOLIN_ADMIN_JS=raw` (or via the js_bytes()
-# fallback when `app.min.js` is missing). Fast (~50ms tailwind run), no
-# docker setup needed.
+# Dev UI build — unminified Tailwind output. `assets/app.js` is the
+# tracked source; esbuild only runs inside the Docker `builder` stage
+# (overwriting `app.js` in-place with the minified bundle). Fast
+# (~50ms tailwind run), no esbuild CLI needed on the host.
 build-ui: download-ui-tools
 	@echo "Building admin UI CSS (unminified, dev)..."
 	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT)
 	@echo "  build-ui done → $(TAILWIND_OUTPUT)"
-	@echo "  (run with: PANGOLIN_ADMIN_JS=raw ./bin/pangolin-ngx, or rely on the js_bytes() fallback)"
-
-# Prod UI build — minified Tailwind output + minified esbuild bundle.
-# Called by `build-dist`; also usable standalone for `make install-ngx` when
-# you want a minified production binary without the Docker pipeline.
-build-ui-prod: download-ui-tools
-	@echo "Building admin UI CSS (minified)..."
-	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT) --minify
-	@echo "Building admin UI JS bundle (minified)..."
-	@if [ -f $(ESBUILD_INPUT) ]; then \
-		bin/esbuild $(ESBUILD_INPUT) --bundle --minify --format=esm \
-			--target=es2020 --outfile=$(ESBUILD_OUTPUT); \
-		echo "  build-ui-prod done → $(TAILWIND_OUTPUT) + $(ESBUILD_OUTPUT)"; \
-	else \
-		echo "  build-ui-prod done → $(TAILWIND_OUTPUT) (no $(ESBUILD_INPUT), skipping esbuild)"; \
-	fi
 
 # Dev watch — rebuild CSS on save, then hand off to the runner. Foreground;
 # Ctrl-C to stop. Designed to be combined with `cargo run` in another
@@ -347,11 +337,15 @@ purge-ui-cache:
 # dependency — Debian 12 + Rust toolchain + Node + pnpm + standalone
 # tailwindcss/esbuild CLIs.  It lives on docker.io, not in this repo.
 # `dist` just layers cargo-chef + cargo-config + project crates on top
-# (see build/docker/dist.dockerfile for the full pipeline). The Docker
-# `builder` stage re-runs the UI build with `--minify`; depending on
-# `build-ui-prod` here keeps the local `./assets/app.min.js` consistent
-# with what the binary gets embedded.
-build-dist: build-ui-prod dist
+# (see build/docker/dist.dockerfile for the full pipeline).
+#
+# The Docker `builder` stage runs the UI build with `--minify` (esbuild
+# overwrites `assets/app.js` in-place). `make build-dist` deliberately
+# does NOT depend on `build-ui` either — there's no need to download the
+# tailwindcss CLI onto the host just to build a self-contained image.
+# The host-side UI build is only needed when producing a local binary
+# (see `build`, `build-ngx`).
+build-dist: dist
 
 dist:
 	./build/dist.sh
@@ -361,7 +355,7 @@ dist:
 # UI bundles + docker export dir).
 clean:
 	rm -rf ./build/output
-	rm -f $(TAILWIND_OUTPUT) $(ESBUILD_OUTPUT)
+	rm -f $(TAILWIND_OUTPUT)
 	$(CARGO) clean
 
 # ── Lint / Test ──────────────────────────────────────────────────────────────
@@ -447,7 +441,7 @@ play-tun: warn-env-fallback
 # `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
-start-ngx: build-ui build-ngx warn-env-fallback
+start-ngx: build-ngx warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-ngx
 
 start-tun: build-tun warn-env-fallback
@@ -467,7 +461,7 @@ env-show: warn-env-fallback
 
 # ── Install as systemd service (needs sudo) ──────────────────────────────────
 
-install-ngx: build-ui build-ngx
+install-ngx: build-ngx
 	$(MAKE) install-service SVC=ngx
 
 install-tun: build-tun

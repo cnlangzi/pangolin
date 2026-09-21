@@ -15,15 +15,16 @@ Cargo.lock.bak
 /assets/static/*.js
 
 # Standalone Tailwind + esbuild binaries, and generated admin-UI bundles.
-# The bundle files are produced by `make build-ui` (dev, unminified) or
-# `make build-ui-prod` / the Docker `builder` stage (minified) from
-# `tailwindcss.css` and `app.js` in `assets/`. They MUST exist on disk at
-# compile time — `rust-embed` snapshots `assets/` into the binary via
-# `crates/admin/src/assets.rs` — but are regenerated deterministically
-# from the tracked sources, so we don't track the artifacts.
-/bin/
+# `app.css` is produced by `make build-ui` (dev, unminified) or the Docker
+# `builder` stage (minified) from `tailwindcss.css` in `assets/`. It MUST
+# exist on disk at compile time — `rust-embed` snapshots `assets/` into
+# the binary via `crates/admin/src/assets.rs` — but is regenerated
+# deterministically from the tracked source, so we don't track the
+# artifact. `app.js` is the tracked source; the Docker `builder` stage
+# overwrites it in-place with the minified bundle, so the host copy is
+# always the raw source.
+#/bin/
 /assets/app.css
-/assets/app.min.js
 
 # Intentionally absent: there is no `assets/vendor/` directory. JS deps
 # (htmx today, anything else we add later) load from a public CDN pinned
