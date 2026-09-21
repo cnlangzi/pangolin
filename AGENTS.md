@@ -2,9 +2,7 @@
 
 Working guidance for AI agents (and humans) contributing to this repo.
 
-**Pangolin** is a reverse proxy + ACME + tunnel server (Rust workspace:
-`crates/{ngx,tun,admin,core,…}`). Reverse proxies HTTP/HTTPS, manages ACME
-certs, and tunnels TCP through a yamux/fastwebsockets relay.
+See [README.md](./README.md) for project overview, architecture, and terminology.
 
 ## Before every commit
 
