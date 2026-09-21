@@ -127,13 +127,22 @@ pub struct BotHistoryFilter {
 /// 1-200 of 1,234 entries · page 1 / 7") and embedded in the
 /// pagination control's hidden inputs.
 ///
-/// `prev_url` / `next_url` are pre-computed by
-/// [`crate::routes::logs::build_history_page`] so the template
-/// doesn't need to construct query strings (askama method calls
-/// can't take additional arguments). `None` means "no button
-/// rendered for that direction". Both URLs include all current
-/// filter values so navigating to a new page preserves the
-/// operator's query.
+/// `prev_url` / `next_url` (page-route form, e.g.
+/// `/logs/bots/history?...`) and `prev_api_url` / `next_api_url`
+/// (HTMX-fragment form, e.g. `/api/bots/history?...`) are
+/// pre-computed by [`crate::routes::logs::build_history_page`]
+/// so the template doesn't need to construct query strings
+/// (askama method calls can't take additional arguments).
+/// `None` means "no button rendered for that direction".
+///
+/// Both forms include all current filter values so navigating
+/// to a new page preserves the operator's query. The page URL
+/// is used for the `<a href=...>` of Prev/Next — it's the
+/// bookmarkable / no-JS fallback (middle-click "open in new
+/// tab" should land on the real page, not an HTMX fragment).
+/// The API URL is used for `hx-get=...` — pointing that at the
+/// page route would swap the full layout into
+/// `#bots-history-result` and nest the page inside itself.
 #[derive(Clone, Debug, Default)]
 pub struct BotHistorySummary {
     /// Total entries after filtering (== before pagination).
@@ -148,12 +157,26 @@ pub struct BotHistorySummary {
     /// Size of the source JSONL file in bytes. Shown in the
     /// date sidebar; `0` when the file doesn't exist.
     pub file_bytes: u64,
-    /// URL for `page - 1`, with all current filter values
-    /// baked in. `None` when already on page 1.
+    /// Page-route URL for `page - 1` (e.g.
+    /// `/logs/bots/history?...&page=N`), with all current
+    /// filter values baked in. `None` when already on page 1.
+    /// Used for Prev/Next `<a href=...>`.
     pub prev_url: Option<String>,
-    /// URL for `page + 1`, with all current filter values
-    /// baked in. `None` when already on the last page.
+    /// Page-route URL for `page + 1`, with all current filter
+    /// values baked in. `None` when already on the last page.
+    /// Used for Prev/Next `<a href=...>`.
     pub next_url: Option<String>,
+    /// HTMX-fragment URL for `page - 1` (e.g.
+    /// `/api/bots/history?...&page=N`), with all current
+    /// filter values baked in. `None` when already on page 1.
+    /// Used for Prev/Next `hx-get=...` so a click swaps only
+    /// the result region instead of re-rendering the whole
+    /// page (which would nest the layout inside itself).
+    pub prev_api_url: Option<String>,
+    /// HTMX-fragment URL for `page + 1`, with all current
+    /// filter values baked in. `None` when already on the last
+    /// page. Used for Prev/Next `hx-get=...`.
+    pub next_api_url: Option<String>,
     /// Human-readable error message when the query failed (file
     /// read error, spawn_blocking panic, etc.). `None` on
     /// success. The template renders this as a red banner above

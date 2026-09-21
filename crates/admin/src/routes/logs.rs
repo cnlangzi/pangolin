@@ -412,6 +412,16 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     // Pre-compute prev / next URLs so the template doesn't need
     // to construct query strings (askama method calls can't take
     // additional arguments). `None` ⇒ don't render that button.
+    //
+    // Two URL flavours per direction:
+    // - `prev_url` / `next_url` — full page route, used for
+    //   `<a href=...>` (bookmarkable, no-JS fallback,
+    //   middle-click "open in new tab").
+    // - `prev_api_url` / `next_api_url` — HTMX fragment route,
+    //   used for `hx-get=...`. The page route returns the entire
+    //   layout, so swapping it into `#bots-history-result` would
+    //   nest the page inside itself; the fragment route returns
+    //   only the result region.
     let prev_url = if page > 1 && total_pages > 1 {
         Some(build_history_url(&filter, page - 1, p.status))
     } else {
@@ -419,6 +429,16 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     };
     let next_url = if page < total_pages {
         Some(build_history_url(&filter, page + 1, p.status))
+    } else {
+        None
+    };
+    let prev_api_url = if page > 1 && total_pages > 1 {
+        Some(build_history_api_url(&filter, page - 1, p.status))
+    } else {
+        None
+    };
+    let next_api_url = if page < total_pages {
+        Some(build_history_api_url(&filter, page + 1, p.status))
     } else {
         None
     };
@@ -431,6 +451,8 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
         file_bytes,
         prev_url,
         next_url,
+        prev_api_url,
+        next_api_url,
         error,
     };
 
@@ -441,14 +463,17 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     }
 }
 
-/// Build a `/logs/bots/history?<query>` URL with all filter
-/// values preserved plus the supplied `page`. The status filter
-/// (already validated to `u16` by `parse_history_params`) is
-/// passed in separately so we don't re-parse the form input.
+/// Build the `?<filter>&page=<n>` query portion shared by both
+/// the page-route URL and the HTMX-fragment URL. Splitting the
+/// query builder out keeps the two URL variants in lockstep —
+/// they can't drift in which filter fields they emit.
 ///
 /// URL-encoding is per-field — `urlencoding::encode` covers the
 /// common case (spaces, `&`, `=`, slashes in host values, etc.).
-fn build_history_url(
+/// The status filter (already validated to `u16` by
+/// `parse_history_params`) is passed in separately so we don't
+/// re-parse the form input.
+fn build_history_url_query(
     filter: &crate::templates::logs::BotHistoryFilter,
     page: usize,
     status: Option<u16>,
@@ -477,7 +502,47 @@ fn build_history_url(
         ));
     }
     parts.push(format!("page={page}"));
-    format!("/logs/bots/history?{}", parts.join("&"))
+    parts.join("&")
+}
+
+/// Build a `/logs/bots/history?<query>` URL with all filter
+/// values preserved plus the supplied `page`. Used for the
+/// `<a href=...>` of the Prev/Next pagination buttons — the
+/// full-page URL is what middle-click "open in new tab" and
+/// the no-JS fallback need (a fragment-only URL would 404 in
+/// those contexts).
+fn build_history_url(
+    filter: &crate::templates::logs::BotHistoryFilter,
+    page: usize,
+    status: Option<u16>,
+) -> String {
+    format!(
+        "/logs/bots/history?{}",
+        build_history_url_query(filter, page, status)
+    )
+}
+
+/// Build an `/api/bots/history?<query>` URL for the same
+/// query — the HTMX fragment endpoint that returns only the
+/// result region (`<div id="bots-history-result">`). Used for
+/// the `hx-get=...` of the Prev/Next buttons.
+///
+/// Why this can't just be the page URL: the page route returns
+/// the whole layout (header, sub-nav, sidebar, form + result),
+/// so a `hx-swap="outerHTML"` of it into `#bots-history-result`
+/// nests the layout inside itself — visible as a duplicated
+/// Pangolin header, duplicated "Bot Logs" title, duplicated
+/// sub-nav, duplicated sidebar inside what should be just the
+/// table area.
+fn build_history_api_url(
+    filter: &crate::templates::logs::BotHistoryFilter,
+    page: usize,
+    status: Option<u16>,
+) -> String {
+    format!(
+        "/api/bots/history?{}",
+        build_history_url_query(filter, page, status)
+    )
 }
 
 /// Internal result of [`build_history_page`] — just a rename of
@@ -813,6 +878,58 @@ mod tests {
         assert_eq!(url, "/logs/bots/history?date=2026-09-19&page=1");
     }
 
+    /// Mirror of `build_history_url_preserves_all_filters` for
+    /// the HTMX-fragment endpoint variant. The two URLs must
+    /// share every filter dimension — they only differ in the
+    /// path prefix — so a refactor that drops a field from one
+    /// but not the other is caught here.
+    #[test]
+    fn build_history_api_url_targets_fragment_endpoint() {
+        let filter = crate::templates::logs::BotHistoryFilter {
+            date: "2026-09-19".into(),
+            bot_name: "Googlebot".into(),
+            host: "example.com".into(),
+            path: "/sitemap.xml".into(),
+            status: "".into(),
+            method: "GET".into(),
+            client_ip: "".into(),
+        };
+        let url = build_history_api_url(&filter, 3, Some(404));
+        assert!(
+            url.starts_with("/api/bots/history?"),
+            "want API prefix: {url}"
+        );
+        assert!(
+            !url.starts_with("/logs/bots/history?"),
+            "want API, not page: {url}"
+        );
+        assert!(url.contains("date=2026-09-19"));
+        assert!(url.contains("bot=Googlebot"));
+        assert!(url.contains("host=example.com"));
+        assert!(url.contains("path=%2Fsitemap.xml"));
+        assert!(url.contains("status=404"));
+        assert!(url.contains("method=GET"));
+        assert!(
+            !url.contains("client_ip="),
+            "empty filter should be omitted"
+        );
+        assert!(url.contains("page=3"));
+    }
+
+    /// Mirror of `build_history_url_omits_empty_filters` for the
+    /// HTMX-fragment variant — pins the exact output format so
+    /// a refactor that introduces a stray `=` doesn't silently
+    /// change the URL the browser caches.
+    #[test]
+    fn build_history_api_url_omits_empty_filters() {
+        let filter = crate::templates::logs::BotHistoryFilter {
+            date: "2026-09-19".into(),
+            ..Default::default()
+        };
+        let url = build_history_api_url(&filter, 1, None);
+        assert_eq!(url, "/api/bots/history?date=2026-09-19&page=1");
+    }
+
     #[tokio::test]
     async fn render_bots_history_with_empty_dir_renders_empty_state() {
         let dir = TempDir::new().expect("tempdir");
@@ -987,6 +1104,8 @@ mod tests {
             file_bytes: 3_200_000,
             prev_url: Some("/x".into()),
             next_url: Some("/y".into()),
+            prev_api_url: Some("/api/x".into()),
+            next_api_url: Some("/api/y".into()),
             error: None,
         };
         // page 3, size 50 → start = 101, end = 150.
@@ -1100,6 +1219,73 @@ mod tests {
         assert!(
             !html.contains("hx-include=\"#bots-history-form\""),
             "bare hx-include without :not([name=date]) would let stale form date win: {html}"
+        );
+    }
+
+    /// Regression pin: Prev/Next pagination buttons must use
+    /// the `/api/bots/history` fragment endpoint for `hx-get`,
+    /// NOT the full-page `/logs/bots/history` route. The page
+    /// route returns the entire layout (header, sub-nav,
+    /// sidebar, form + result), so a `hx-swap="outerHTML"` of
+    /// it into `#bots-history-result` nests the layout inside
+    /// itself — visible as a duplicated Pangolin header, a
+    /// duplicated "Bot Logs" title, a duplicated sub-nav, and
+    /// a duplicated sidebar inside what should be just the
+    /// table area.
+    ///
+    /// `href` must still point at the page URL — middle-click
+    /// / bookmark / no-JS fallback needs a bookmarkable URL,
+    /// not an HTMX fragment. The bug was that both `href` and
+    /// `hx-get` pointed at the page URL.
+    #[tokio::test]
+    async fn history_pagination_links_use_fragment_endpoint() {
+        let today = chrono::Utc::now().date_naive();
+        // 60 entries → page_size=50 → total_pages=2. Land on
+        // page 2 so the Prev button is the only one rendered
+        // (no Next because we're on the last page). A single
+        // button is enough to assert both href (page route)
+        // and hx-get (fragment route) on the same `<a>` tag.
+        let entries: Vec<BotLogEntry> = (0..60)
+            .map(|i| bot_entry_with("Googlebot", "Google", "x.com", &format!("/p{i}"), i * 1000))
+            .collect();
+        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+
+        let resp = render_bots_history(&app, "csrf-token", b"page=2")
+            .await
+            .expect("render_bots_history should succeed");
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+
+        // The killer assertion: no `hx-get` anywhere in the
+        // page may target the full page route. (The date
+        // sidebar links and the filter form already target
+        // `/api/bots/history` correctly — this catches a
+        // regression in the pagination buttons specifically,
+        // since they sit behind `summary.prev_api_url` /
+        // `summary.next_api_url`.)
+        assert!(
+            !html.contains("hx-get=\"/logs/bots/history"),
+            "hx-get must not target full page route — pagination would nest the layout: {html}"
+        );
+
+        // And specifically, the Prev button's hx-get must
+        // target the fragment endpoint with `page=1` baked in.
+        // (`&amp;` because askama HTML-escapes the `&` in the
+        // attribute value; the underlying URL is still `&page=1`.)
+        assert!(
+            html.contains("hx-get=\"/api/bots/history?date=") && html.contains("&amp;page=1\""),
+            "Prev hx-get must target /api/bots/history with page=1: {html}"
+        );
+
+        // The Prev button's href must STILL point at the full
+        // page route — that's the bookmarkable / no-JS URL.
+        assert!(
+            html.contains("href=\"/logs/bots/history?date=") && html.contains("&amp;page=1\""),
+            "Prev href must target /logs/bots/history for bookmark / no-JS fallback: {html}"
         );
     }
 

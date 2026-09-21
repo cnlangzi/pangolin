@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui build-ui-prod dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
 
 help:
 	@echo "=== Config ==="
@@ -88,6 +88,7 @@ help:
 	@echo "=== Deploy ==="
 	@echo "  make play          # Deploy ngx + tun"
 	@echo "  make play-ngx      # Deploy ngx to [ngx] hosts"
+	@echo "  make play-ngx-qa   # Deploy ngx to the QA host only (sh-ali)"
 	@echo "  make play-tun      # Deploy tun to [tun] hosts"
 	@echo ""
 	@echo "=== Development ==="
@@ -419,6 +420,22 @@ play: play-ngx play-tun
 # *after* the subshell exits and we've `cd`'d into the playbooks dir.
 play-ngx: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts
+
+# Single-host variant of `play-ngx` for the QA / staging slot.
+# Same playbook, just limited to one host via ansible's
+# `--limit` — reuses the role's templates and task graph so the
+# single-host path can't drift from the all-hosts path.
+#
+# The limit string is the inventory hostname (the leftmost
+# token on the `[ngx]` line), not `ansible_host` — `--limit`
+# matches inventory names, not connection targets. The Makefile
+# target name is the *role* ("qa") while the limit is the
+# underlying *host* ("sh-ali") — the two are intentionally
+# decoupled so swapping the host behind the qa role (e.g.
+# standing up a fresh ECS for QA) is a one-line Makefile edit
+# with no inventory churn.
+play-ngx-qa: warn-env-fallback
+	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./ngx.yml -i hosts --limit sh-ali
 
 play-tun: warn-env-fallback
 	( $(ENV_LOAD) ) && cd ./deploy/playbooks && ansible-playbook ./tun.yml -i hosts
