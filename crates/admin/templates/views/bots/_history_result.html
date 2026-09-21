@@ -106,16 +106,26 @@
        URLs are pre-computed by the route handler with every
        other filter dimension baked in (askama method calls
        can't take additional arguments), so a click here doesn't
-       accidentally widen the query. #}
+       accidentally widen the query.
+
+       `href` points at the full page route (the bookmarkable /
+       no-JS / middle-click URL). `hx-get` points at the HTMX
+       fragment endpoint that returns only the result region —
+       swapping the full page into `#bots-history-result` would
+       nest the layout inside itself (a second Pangolin header,
+       Bot Logs title, sub-nav, and sidebar would render inside
+       what should be just the table area). The page + fragment
+       URLs share a query string, so the two `{{ ..._url }}`
+       fields differ only in the path prefix. #}
     {% if summary.total_pages > 1 %}
       <div class="px-4 py-3 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between text-sm">
         <p class="text-slate-500 dark:text-slate-400 tabular-nums">
           Page <span class="font-semibold">{{ summary.page }}</span> of <span class="font-semibold">{{ summary.total_pages }}</span>
         </p>
         <div class="flex items-center gap-1">
-          {% if let Some(prev) = summary.prev_url %}
+          {% if let Some(prev) = summary.prev_url.as_deref() %}
             <a href="{{ prev }}"
-               hx-get="{{ prev }}"
+               hx-get="{{ summary.prev_api_url.as_deref().unwrap_or(prev) }}"
                hx-target="#bots-history-result"
                hx-swap="outerHTML"
                hx-push-url="true"
@@ -125,9 +135,9 @@
           {% else %}
             <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">‹ Prev</span>
           {% endif %}
-          {% if let Some(next) = summary.next_url %}
+          {% if let Some(next) = summary.next_url.as_deref() %}
             <a href="{{ next }}"
-               hx-get="{{ next }}"
+               hx-get="{{ summary.next_api_url.as_deref().unwrap_or(next) }}"
                hx-target="#bots-history-result"
                hx-swap="outerHTML"
                hx-push-url="true"
