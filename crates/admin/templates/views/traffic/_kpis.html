@@ -1,0 +1,101 @@
+{% if snap.dropped_samples > 0 %}
+<div class="mb-4 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+  Side-channel dropped <span class="font-semibold tabular-nums">{{ snap.dropped_samples }}</span> sample(s). The proxy was not delayed — the aggregator is behind.
+</div>
+{% endif %}
+
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 md:gap-4 mb-6">
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">RPS</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.rps_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">last complete second</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Requests</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.requests_total }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">since start · {{ snap.uptime_display() }}</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Body out</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.bytes_out_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">in {{ snap.bytes_in_display() }}</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Error rate</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.error_pct_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">15s {{ snap.error_15s_pct_display() }}</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">p95</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.p95_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">p50 {{ snap.p50_display() }} · p99 {{ snap.p99_display() }}</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">In-flight</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.active_requests }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">requests, not connections</div>
+  </div>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+  <div class="card p-4">
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Network</h2>
+    <div class="grid grid-cols-3 gap-3 text-sm">
+      <div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Direct</div>
+        <div class="tabular-nums font-medium">{{ snap.route_direct_req }}</div>
+        <div class="text-xs text-slate-500">{{ snap.route_direct_bytes }} B</div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Tunnel</div>
+        <div class="tabular-nums font-medium">{{ snap.route_tunnel_req }}</div>
+        <div class="text-xs text-slate-500">{{ snap.route_tunnel_bytes }} B</div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">File</div>
+        <div class="tabular-nums font-medium">{{ snap.route_file_req }}</div>
+        <div class="text-xs text-slate-500">{{ snap.route_file_bytes }} B</div>
+      </div>
+    </div>
+    <div class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+      TLS {{ snap.tls_req }} · stream {{ snap.stream_req }} · websocket {{ snap.ws_req }} · unknown host {{ snap.unknown_req }}
+    </div>
+  </div>
+  <div class="card p-4">
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Request status</h2>
+    <div class="grid grid-cols-5 gap-2 text-sm">
+      <div>
+        <div class="text-xs text-emerald-600 dark:text-emerald-400">2xx</div>
+        <div class="tabular-nums font-medium">{{ snap.status_2xx }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-sky-600 dark:text-sky-400">3xx</div>
+        <div class="tabular-nums font-medium">{{ snap.status_3xx }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-amber-600 dark:text-amber-400">4xx</div>
+        <div class="tabular-nums font-medium">{{ snap.status_4xx }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-red-600 dark:text-red-400">5xx</div>
+        <div class="tabular-nums font-medium">{{ snap.status_5xx }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500">other</div>
+        <div class="tabular-nums font-medium">{{ snap.status_other }}</div>
+      </div>
+    </div>
+    <div class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+      GET {{ snap.method_get }} · POST {{ snap.method_post }} · HEAD {{ snap.method_head }} · other {{ snap.method_other }}
+    </div>
+  </div>
+</div>
+
+<div class="card p-4">
+  <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Requests per minute (last hour)</h2>
+  <div class="flex items-end gap-px h-16">
+    {% for h in spark_bars %}
+    <div class="flex-1 bg-accent-500/70 dark:bg-accent-400/70 rounded-t-sm" style="height: {{ h }}%"></div>
+    {% endfor %}
+  </div>
+</div>

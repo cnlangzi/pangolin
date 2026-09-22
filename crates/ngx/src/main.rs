@@ -211,6 +211,9 @@ fn main() -> anyhow::Result<()> {
         // drain and `await` its completion (Gap #5/#6 fix — was
         // previously fire-and-forget).
         app_for_shutdown.shutdown_bot_writer().await;
+        // Ask the traffic aggregator to exit on its next tick.
+        // Join happens when `App` drops, not on the host runtime.
+        app_for_shutdown.traffic.shutdown();
 
         Ok::<(), anyhow::Error>(())
     });

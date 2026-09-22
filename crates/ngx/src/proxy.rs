@@ -238,6 +238,11 @@ pub struct RequestState {
     /// `request_filter`. `None` if the client didn't send one or
     /// the header wasn't valid UTF-8.
     pub user_agent: Option<String>,
+    /// Traffic side-channel classification. Written at site lookup
+    /// so `logging` never re-takes the indexes lock.
+    pub traffic_route: pangolin_core::TrafficRoute,
+    pub traffic_kind: pangolin_core::TrafficKind,
+    pub host_known: bool,
 }
 
 impl Default for RequestState {
@@ -249,6 +254,9 @@ impl Default for RequestState {
             host: String::new(),
             backend: String::new(),
             user_agent: None,
+            traffic_route: pangolin_core::TrafficRoute::Unknown,
+            traffic_kind: pangolin_core::TrafficKind::Http,
+            host_known: false,
         }
     }
 }
@@ -263,6 +271,8 @@ impl ProxyHttp for AppProxy {
     type CTX = RequestState;
 
     fn new_ctx(&self) -> Self::CTX {
+        // Inflight +1. Wait-free; paired with `logging` → on_finish.
+        self.app.traffic.on_start();
         RequestState::default()
     }
 
@@ -436,6 +446,7 @@ impl ProxyHttp for AppProxy {
                     warn!("Tun {} not online for WS relay", tun_name);
                     return Ok(true);
                 };
+                ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
                 ws_relay_to_tun(
                     &self.app,
                     session,
@@ -448,6 +459,7 @@ impl ProxyHttp for AppProxy {
                 return Ok(true);
             }
             // Direct WS: let pingora handle the 101 upgrade.
+            ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
             return Ok(false);
         }
 
@@ -481,6 +493,14 @@ impl ProxyHttp for AppProxy {
         } else {
             format!("tun:{}", tun_name)
         };
+        ctx.host_known = true;
+        ctx.traffic_route = if !tun_name.is_empty() {
+            pangolin_core::TrafficRoute::Tunnel
+        } else if matches!(target, BackendTarget::File { .. }) {
+            pangolin_core::TrafficRoute::File
+        } else {
+            pangolin_core::TrafficRoute::Direct
+        };
 
         // ── SSE / streaming response short-circuit (tunnel only) ──
         // Branch on the routing decision we just made:
@@ -500,6 +520,7 @@ impl ProxyHttp for AppProxy {
         //                the bottom of `request_filter`).
         if is_streaming {
             if !tun_name.is_empty() {
+                ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
                 return handle_streaming_request(&self.app, session).await;
             }
             if matches!(target, BackendTarget::File { .. }) {
@@ -516,6 +537,10 @@ impl ProxyHttp for AppProxy {
             // already populated above (`ctx.backend`), and
             // `response_filter` will record the final status
             // when pingora finishes the stream.
+            //
+            // Mark Stream so the traffic histogram / RPS rings
+            // ignore the hang time of a long-lived SSE response.
+            ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
             debug!(
                 "SSE: direct path (pingora-native streaming) \
                  {} → {}",
@@ -614,6 +639,7 @@ impl ProxyHttp for AppProxy {
                 "Tunnel WS upgrade relay: {} path={} → tun {}",
                 host, path, tun_name
             );
+            ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
             ws_relay_to_tun(
                 &self.app,
                 session,
@@ -971,6 +997,19 @@ impl ProxyHttp for AppProxy {
         let status = upstream_response.status.as_u16();
         record_access_log(&self.app, ctx, session, status).await;
         Ok(())
+    }
+
+    /// Single emit point for traffic stats. Pingora calls this on
+    /// every request end — `request_filter` short-circuit, success
+    /// `finish`, and `handle_error`. `try_send` only; see
+    /// `docs/design/traffic.md`.
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        self.app.traffic.on_finish(traffic_sample(session, ctx));
     }
 }
 
@@ -1892,6 +1931,43 @@ async fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session
         user_agent: ctx.user_agent.clone(),
     };
     app.push_access_log(entry);
+}
+
+/// Build a [`pangolin_core::TrafficSample`] for the side-channel.
+/// Allocates only host + optional truncated path; everything else
+/// is `Copy`. Called from `logging` — never awaits.
+fn traffic_sample(session: &Session, ctx: &RequestState) -> pangolin_core::TrafficSample {
+    let host = if ctx.host_known && !ctx.host.is_empty() {
+        ctx.host.clone()
+    } else {
+        pangolin_core::traffic::UNKNOWN_HOST.to_string()
+    };
+    let path = if ctx.traffic_kind == pangolin_core::TrafficKind::Http && ctx.host_known {
+        Some(pangolin_core::normalize_path(&ctx.path))
+    } else {
+        None
+    };
+    let status = session
+        .response_written()
+        .map(|h| h.status.as_u16())
+        .unwrap_or(0);
+    let tls = session
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .is_some();
+    pangolin_core::TrafficSample {
+        host,
+        path,
+        method: pangolin_core::TrafficMethod::parse(&ctx.method),
+        status,
+        duration_ms: ctx.start.elapsed().as_millis() as u64,
+        bytes_in: session.body_bytes_read() as u64,
+        bytes_out: session.body_bytes_sent() as u64,
+        route: ctx.traffic_route,
+        kind: ctx.traffic_kind,
+        tls,
+        host_known: ctx.host_known,
+    }
 }
 
 /// Parse the status code from an `HttpResponse::status_line`

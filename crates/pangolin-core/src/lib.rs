@@ -30,6 +30,7 @@ pub mod index;
 pub mod normalize;
 pub mod parse;
 pub mod proxy;
+pub mod traffic;
 pub mod tunnel;
 pub mod types;
 
@@ -40,7 +41,7 @@ pub use bot::{BotCategory, BotIdentity, verify_bot};
 pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
-pub use config::{BotLogConfig, Config, LogConfig, init_logger};
+pub use config::{BotLogConfig, Config, LogConfig, TrafficConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, lookup_site};
@@ -52,6 +53,10 @@ pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_request, parse_backend_to_target,
     serve_file_target,
+};
+pub use traffic::{
+    TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,
+    classify_route, normalize_path,
 };
 pub use tunnel::{
     TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,

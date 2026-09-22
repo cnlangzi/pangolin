@@ -201,6 +201,7 @@ Shape of the `config` JSON per kind:
 | `bot.dir`              | `path`   | `./logs/bots` | no | Output directory for `bot-YYYY-MM-DD.jsonl`. Created lazily on first write. Rotation is **daily at UTC 00:00**; no size-based rotation in v1 (the operator can `logrotate` / `find -mtime` for retention). |
 | `bot.cache_dir`        | `path`   | `./logs/bots/cache` | no | knownbots cache root: per-bot `ips.txt` (downloaded CIDRs) and `rdns.txt` (successful PTR results). |
 | `bot.refresh_interval_secs` | `u64` | `86400` | no | Seconds between successful official IP-list refreshes. On refresh failure the scheduler retries with exponential backoff (5s → 5min) instead of waiting a full interval. `0` still runs one startup refresh, then sleeps for a very long time. |
+| `traffic.enabled`      | `bool`   | `true`  | no       | Master switch for the in-memory traffic side-channel. When `false` the aggregator thread is not spawned and the proxy hot path skips `try_send`. See [design/traffic.md](design/traffic.md). |
 
 > **In-memory access log + `/logs` admin page (issue #73).** Every
 > proxied request that lands on `ngx` is captured by

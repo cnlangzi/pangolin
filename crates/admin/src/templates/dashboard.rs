@@ -43,5 +43,10 @@ pub struct DashboardTemplate<'a> {
     /// rendered into the "Recent ACME activity" panel. Capped to a
     /// reasonable display size in the route handler.
     pub activity: Vec<ActivityRow>,
+    /// Current RPS from the in-memory traffic snapshot (last
+    /// complete 1s bucket). Linked to `/traffic`.
+    pub traffic_rps: String,
+    pub traffic_error_pct: String,
+    pub traffic_active: u64,
     pub active_nav: &'a str,
 }
