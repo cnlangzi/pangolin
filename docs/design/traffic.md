@@ -36,8 +36,10 @@ persistence — restart clears everything. Complements the per-request
   GET /traffic  ──►  clone published Arc  (never waits on aggregator)
 ```
 
-Hot-path budget: two `Relaxed` atomics + one `try_send`. No HashMap,
-no `await`, no `send().await`.
+Hot-path budget: two `Relaxed` atomics + one `try_send` on a
+`SyncSender` (`&self`, no extra mutex). No HashMap, no `await`,
+no `send().await`. Direct SSE is `TrafficKind::Stream` so a long
+stream does not enter the latency histogram.
 
 The aggregator is a dedicated OS thread, not a tokio task on the
 2-worker host runtime. Idle RPS is kept honest by a 200 ms

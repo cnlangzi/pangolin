@@ -537,6 +537,10 @@ impl ProxyHttp for AppProxy {
             // already populated above (`ctx.backend`), and
             // `response_filter` will record the final status
             // when pingora finishes the stream.
+            //
+            // Mark Stream so the traffic histogram / RPS rings
+            // ignore the hang time of a long-lived SSE response.
+            ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
             debug!(
                 "SSE: direct path (pingora-native streaming) \
                  {} → {}",

@@ -243,8 +243,12 @@ enum Msg {
 }
 
 /// Process-wide traffic hub. Cheap to `Arc` onto [`crate::App`].
+///
+/// `tx` is a plain `SyncSender`: `try_send` takes `&self`, so the
+/// request path does not take an extra mutex. Shutdown is a flag
+/// the aggregator polls; dropping the hub drops the sender.
 pub struct TrafficHub {
-    tx: parking_lot::Mutex<Option<SyncSender<Msg>>>,
+    tx: Option<SyncSender<Msg>>,
     active: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     enabled: bool,
@@ -295,7 +299,7 @@ impl TrafficHub {
         };
 
         Arc::new(Self {
-            tx: parking_lot::Mutex::new(if enabled { Some(tx) } else { None }),
+            tx: if enabled { Some(tx) } else { None },
             active,
             dropped,
             enabled,
@@ -310,7 +314,6 @@ impl TrafficHub {
 impl Drop for TrafficHub {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        self.tx.lock().take();
         if let Some(h) = self.thread.lock().take() {
             let _ = h.join();
         }
@@ -335,15 +338,13 @@ impl TrafficHub {
             return;
         }
         saturating_sub(&self.active);
-        let g = self.tx.lock();
-        let Some(tx) = g.as_ref() else {
+        let Some(tx) = self.tx.as_ref() else {
             return;
         };
         match tx.try_send(Msg::Sample(sample)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                drop(g);
                 if total == 1 || total.is_multiple_of(1000) {
                     log::warn!(
                         "traffic: side-channel full (cap {CHANNEL_CAP}); \
@@ -361,8 +362,7 @@ impl TrafficHub {
         if !self.enabled {
             return;
         }
-        let g = self.tx.lock();
-        if let Some(tx) = g.as_ref() {
+        if let Some(tx) = self.tx.as_ref() {
             let _ = tx.try_send(Msg::Reset);
         }
     }
@@ -392,7 +392,6 @@ impl TrafficHub {
     /// than once. Does not join — process exit / `Drop` joins.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        self.tx.lock().take();
     }
 
     #[cfg(test)]
@@ -423,6 +422,9 @@ fn saturating_sub(a: &AtomicU64) {
 
 struct HostRow {
     req: u64,
+    /// HTTP samples only. `avg_ms` divides by this so a websocket
+    /// on the same host does not dilute the mean.
+    http_req: u64,
     bytes_out: u64,
     s4xx: u64,
     s5xx: u64,
@@ -662,21 +664,20 @@ impl Inner {
                     row.s5xx += 1;
                 }
                 if s.kind == TrafficKind::Http {
+                    row.http_req += 1;
                     row.latency_sum_ms += s.duration_ms;
                 }
             } else if self.by_host.len() < MAX_HOSTS {
+                let http = s.kind == TrafficKind::Http;
                 self.by_host.insert(
                     s.host.clone(),
                     HostRow {
                         req: 1,
+                        http_req: u64::from(http),
                         bytes_out: s.bytes_out,
                         s4xx: u64::from((400..500).contains(&s.status)),
                         s5xx: u64::from((500..600).contains(&s.status)),
-                        latency_sum_ms: if s.kind == TrafficKind::Http {
-                            s.duration_ms
-                        } else {
-                            0
-                        },
+                        latency_sum_ms: if http { s.duration_ms } else { 0 },
                     },
                 );
             } else {
@@ -745,7 +746,7 @@ impl Inner {
                 bytes_out: row.bytes_out,
                 s4xx: row.s4xx,
                 s5xx: row.s5xx,
-                avg_ms: row.latency_sum_ms.checked_div(row.req).unwrap_or(0),
+                avg_ms: row.latency_sum_ms.checked_div(row.http_req).unwrap_or(0),
             })
             .collect();
         by_host.sort_by_key(|b| std::cmp::Reverse(b.req));
@@ -1097,6 +1098,20 @@ mod tests {
         let snap = wait_until(&hub, |x| x.unknown_req >= 1);
         assert!(snap.by_host.is_empty());
         assert_eq!(snap.status_4xx, 1);
+    }
+
+    #[test]
+    fn host_avg_ignores_websocket_duration() {
+        let mut inner = Inner::new(Instant::now());
+        inner.record(sample("a.example.com", 200, 10), Instant::now());
+        let mut ws = sample("a.example.com", 101, 60_000);
+        ws.kind = TrafficKind::Websocket;
+        ws.path = None;
+        inner.record(ws, Instant::now());
+        let row = inner.by_host.get("a.example.com").expect("host row");
+        assert_eq!(row.req, 2);
+        assert_eq!(row.http_req, 1);
+        assert_eq!(row.latency_sum_ms.checked_div(row.http_req), Some(10));
     }
 
     #[test]
