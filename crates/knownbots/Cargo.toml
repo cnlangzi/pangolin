@@ -11,6 +11,8 @@ anyhow.workspace = true
 ipnet = "2"
 log.workspace = true
 parking_lot.workspace = true
+# manual-roots: no CA bundle. IP-list downloads skip certificate checks
+# (see `build_http_client`); a verifying client would reject every URL.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -25,5 +27,6 @@ lru = "0.12"
 dns-lookup = "2"
 
 [dev-dependencies]
+rustls.workspace = true
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
