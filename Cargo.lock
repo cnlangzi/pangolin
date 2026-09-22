@@ -1865,6 +1865,7 @@ dependencies = [
  "lru 0.12.5",
  "parking_lot",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
