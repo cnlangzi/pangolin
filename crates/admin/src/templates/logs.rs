@@ -29,7 +29,7 @@
 //!
 //! [`BotLogsStatsTemplate`] is the sibling page at
 //! `/logs/bots/stats`: one UTC file, exact host, bot and URL
-//! rollups, plus that host's trend across files.
+//! rollups.
 
 use askama::Template;
 use chrono::NaiveDate;

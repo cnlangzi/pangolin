@@ -618,6 +618,13 @@ pub struct BotHistoryQuery {
     pub host: Option<String>,
     /// Case-sensitive substring match on the request path.
     pub path: Option<String>,
+    /// When `true`, `host` and `path` must equal the entry's value
+    /// instead of being substrings of it. The stats page sets this
+    /// on its `entries` links: its rows are exact host+path groups,
+    /// so a substring match would also list `/xyz` under `/x` and
+    /// `data.com` under `a.com`, and the rows would not add up to
+    /// the number the operator just clicked.
+    pub exact: bool,
     /// Exact-match on HTTP status code (404, 200, …).
     pub status: Option<u16>,
     /// Exact-match on HTTP method (`"GET"`, `"POST"`, …). Comparison
@@ -647,6 +654,16 @@ pub struct BotHistoryPage {
     /// date sidebar so operators can see at a glance that a day was
     /// unusually busy.
     pub file_bytes: u64,
+}
+
+/// Substring match for the free-text filters, or equality when the
+/// caller asked for exact rows (see [`BotHistoryQuery::exact`]).
+fn text_matches(value: &str, want: &str, exact: bool) -> bool {
+    if exact {
+        value == want
+    } else {
+        value.contains(want)
+    }
 }
 
 /// List the UTC dates that have a JSONL file in `dir`, newest first.
@@ -773,12 +790,12 @@ pub fn query_history(dir: &Path, q: &BotHistoryQuery) -> std::io::Result<BotHist
             continue;
         }
         if let Some(host) = q.host.as_deref()
-            && !entry.host.contains(host)
+            && !text_matches(&entry.host, host, q.exact)
         {
             continue;
         }
         if let Some(p) = q.path.as_deref()
-            && !entry.path.contains(p)
+            && !text_matches(&entry.path, p, q.exact)
         {
             continue;
         }
@@ -869,10 +886,6 @@ pub struct BotHistoryStatsQuery {
     /// Max URL rows returned, after sorting by hits descending.
     /// `url_total` still counts every retained path.
     pub url_limit: usize,
-    /// Other files to fold into the per-host trend. The selected
-    /// [`Self::date`] is filled from the primary scan; listing it
-    /// here again is a no-op.
-    pub trend_dates: Vec<NaiveDate>,
 }
 
 /// Per-host totals inside one file. `distinct_bots` is the number
@@ -919,22 +932,6 @@ pub struct BotDayUrlRow {
     pub last_status: u16,
 }
 
-/// One file's contribution to a host's trend. Absent when that
-/// host has zero hits in the file.
-#[derive(Debug, Clone)]
-pub struct BotTrendDay {
-    pub date: NaiveDate,
-    pub total_hits: u64,
-    pub bots: Vec<BotTrendBot>,
-}
-
-/// Hit count for one bot inside a [`BotTrendDay`].
-#[derive(Debug, Clone)]
-pub struct BotTrendBot {
-    pub bot_name: String,
-    pub hits: u64,
-}
-
 /// Result of [`query_history_stats`].
 #[derive(Debug, Clone)]
 pub struct BotHistoryStats {
@@ -962,15 +959,11 @@ pub struct BotHistoryStats {
     /// `true` when new paths were dropped after
     /// [`MAX_STATS_URLS_PER_HOST`]. Bot `hits` are still exact.
     pub urls_capped: bool,
-    /// Selected host across files, newest file first. Empty when
-    /// no host is selected.
-    pub trend: Vec<BotTrendDay>,
     /// Byte size of the selected file. `0` when the file is missing.
     pub file_bytes: u64,
 }
 
-/// Summarise one UTC bot-log file, plus the selected host's trend
-/// across `trend_dates`.
+/// Summarise one UTC bot-log file.
 ///
 /// Host comparison is exact (the stats UI picks a host that
 /// actually appears in the file). A missing file is an empty
@@ -995,31 +988,6 @@ pub fn query_history_stats(
         },
     );
     stats.file_bytes = file_bytes;
-
-    // The stats page does not chart other days — the sidebar
-    // already picked this file. Trend is computed only when the
-    // caller passes dates, so a normal page render reads one file.
-    if let Some(host) = host
-        && !q.trend_dates.is_empty()
-    {
-        let mut trend = Vec::new();
-        if let Some(day) = trend_day_from_bots(q.date, &stats.bots) {
-            trend.push(day);
-        }
-        for date in &q.trend_dates {
-            if *date == q.date {
-                continue;
-            }
-            let Some(text) = read_jsonl(dir, *date)? else {
-                continue;
-            };
-            if let Some(day) = trend_day_from_body(*date, &text, host) {
-                trend.push(day);
-            }
-        }
-        trend.sort_by_key(|day| std::cmp::Reverse(day.date));
-        stats.trend = trend;
-    }
 
     Ok(stats)
 }
@@ -1273,15 +1241,16 @@ fn summarize_lines(body: &str, opts: &SummarizeOpts<'_>) -> BotHistoryStats {
         paths_301,
         paths_5xx,
         urls_capped,
-        trend: Vec::new(),
         file_bytes: 0,
     }
 }
 
-/// `/robots.txt` and `/sitemap.xml` are the crawl files an operator
-/// checks on every host, so the summary keeps them with the other
-/// non-200 paths.
-fn is_seo_crawl_path(path: &str) -> bool {
+/// `/robots.txt` and `/sitemap.xml` are the crawl files an
+/// operator checks on every host, so the stats summary keeps
+/// them pinned next to the other non-200 paths even past the
+/// display limit. Public so the admin route can share the
+/// definition instead of duplicating it.
+pub fn is_seo_crawl_path(path: &str) -> bool {
     path == "/robots.txt" || path == "/sitemap.xml"
 }
 
@@ -1361,65 +1330,12 @@ fn note_bot_hit(
     *path_total += 1;
 }
 
-fn trend_day_from_bots(date: NaiveDate, bots: &[BotDayBotRow]) -> Option<BotTrendDay> {
-    if bots.is_empty() {
-        return None;
-    }
-    let total_hits = bots.iter().map(|b| b.hits).sum();
-    let trend_bots = bots
-        .iter()
-        .map(|b| BotTrendBot {
-            bot_name: b.bot_name.clone(),
-            hits: b.hits,
-        })
-        .collect();
-    Some(BotTrendDay {
-        date,
-        total_hits,
-        bots: trend_bots,
-    })
-}
-
-fn trend_day_from_body(date: NaiveDate, body: &str, host: &str) -> Option<BotTrendDay> {
-    let mut counts: HashMap<String, u64> = HashMap::new();
-    for line in body.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let entry = match serde_json::from_str::<BotLogEntry>(line) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if entry.host != host {
-            continue;
-        }
-        *counts.entry(entry.bot_name.to_string()).or_insert(0) += 1;
-    }
-    if counts.is_empty() {
-        return None;
-    }
-    let mut bots: Vec<BotTrendBot> = counts
-        .into_iter()
-        .map(|(bot_name, hits)| BotTrendBot { bot_name, hits })
-        .collect();
-    bots.sort_by(|a, b| {
-        b.hits
-            .cmp(&a.hits)
-            .then_with(|| a.bot_name.cmp(&b.bot_name))
-    });
-    let total_hits = bots.iter().map(|b| b.hits).sum();
-    Some(BotTrendDay {
-        date,
-        total_hits,
-        bots,
-    })
-}
-
 /// How many UTC files [`write_dev_fixture`] replaces, including today.
 ///
-/// Seven days is enough for the stats trend to show a slope, and
-/// short enough that `make start-ngx` does not wipe an operator's
-/// older real logs sitting further back in the same directory.
+/// Seven days is enough for the dev dashboard to show a small
+/// history, and short enough that `make start-ngx` does not
+/// wipe an operator's older real logs sitting further back in
+/// the same directory.
 pub const DEV_FIXTURE_DAYS: usize = 7;
 
 /// One crawl hit in the dev fixture. `'static` so the tables below
@@ -1580,8 +1496,9 @@ const FIXTURE_CORE: &[FixtureHit] = &[
     },
 ];
 
-/// Shop traffic only on the three newest fixture days, so a trend
-/// for this host is shorter than the file list.
+/// Shop traffic only on the three newest fixture days, so an
+/// operator that opens `shop.example.com` on an older file sees
+/// an empty stats panel (an easy regression to spot).
 const FIXTURE_SHOP: &[FixtureHit] = &[
     FixtureHit {
         bot_name: "googlebot",
@@ -1627,9 +1544,10 @@ fn fixture_entry(hit: &FixtureHit, timestamp: DateTime<Utc>, seq: u64) -> BotLog
 }
 
 fn fixture_day(date: NaiveDate, age: usize) -> Vec<BotLogEntry> {
-    // Six passes on the newest file: 14 core rows × 6 = 84, past the
-    // history page size of 50. Older files are one pass so the trend
-    // for `www.example.com` slopes down as the files get older.
+    // Six passes on the newest file: 14 core rows × 6 = 84, past
+    // the history page size of 50. Older files are one pass so
+    // the bot hit counts visibly decline as the operator scrolls
+    // back through the date sidebar.
     let repeats = if age == 0 { 6 } else { 1 };
     let start = date
         .and_hms_opt(1, 0, 0)
@@ -1653,17 +1571,60 @@ fn fixture_day(date: NaiveDate, age: usize) -> Vec<BotLogEntry> {
 
 /// Replace the last [`DEV_FIXTURE_DAYS`] UTC bot-log files under `dir`.
 ///
+/// Replace the last [`DEV_FIXTURE_DAYS`] UTC bot-log files under
+/// `dir`.
+///
 /// `today` is the newest file name. Each file is a complete rewrite, so
 /// running this again yields the same rows for those dates. Files older
 /// than the window are not deleted. The rows are real [`BotLogEntry`]
 /// JSONL: several hosts, every bot category, a 404, and enough lines on
 /// `today` to paginate History. `www.example.com` is in every file;
 /// `shop.example.com` is only in the three newest.
-pub fn write_dev_fixture(dir: &Path, today: NaiveDate) -> std::io::Result<usize> {
+///
+/// ## Safety: refuse to overwrite non-fixture data
+///
+/// Without `force`, an existing file is only overwritten when the
+/// first JSONL line parses and its host matches the fixture's
+/// known dev hosts (`*.example.com`, `*.example.org`, `*.test`).
+/// A real bot log captured on this host — e.g. a production
+/// domain in `./logs/bots` — fails the check and gets an
+/// [`std::io::ErrorKind::AlreadyExists`] error instead of being
+/// silently clobbered. Callers that genuinely want to replace
+/// non-fixture data (the `make init-data` dev convenience) pass
+/// `force = true`.
+pub fn write_dev_fixture(dir: &Path, today: NaiveDate, force: bool) -> std::io::Result<usize> {
     std::fs::create_dir_all(dir)?;
     for age in 0..DEV_FIXTURE_DAYS {
         let date = today - chrono::Duration::days(age as i64);
         let path = file_path_for(dir, date);
+        if !force && path.exists() {
+            // Peek at the first JSONL line. An empty file or one
+            // whose first line matches the fixture dev hosts is
+            // safe to overwrite; anything else is real traffic.
+            match std::fs::read_to_string(&path) {
+                Ok(body) => {
+                    let first = body.lines().find(|l| !l.is_empty());
+                    if let Some(line) = first
+                        && !is_fixture_host_line(line)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "bot_log: {} already contains non-fixture data; \
+                                 refusing to overwrite (pass force=true to replace)",
+                                path.display(),
+                            ),
+                        ));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Race: the file vanished between `path.exists()`
+                    // and `read_to_string`. Treat as "no data yet" —
+                    // the write below will create it.
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let mut body = String::new();
         for entry in fixture_day(date, age) {
             let line = serde_json::to_string(&entry).map_err(|err| {
@@ -1675,6 +1636,24 @@ pub fn write_dev_fixture(dir: &Path, today: NaiveDate) -> std::io::Result<usize>
         std::fs::write(path, body)?;
     }
     Ok(DEV_FIXTURE_DAYS)
+}
+
+/// Heuristic: the dev fixture only writes entries under
+/// `*.example.com`, `*.example.org`, and `*.test`. A real
+/// production host (e.g. `shop.acme.com`) fails the check, and
+/// `make init-data` will refuse to overwrite instead of
+/// silently wiping it. False positives (a dev box that
+/// actually uses example.com and has real bot traffic) cost
+/// one `--force` round-trip — far better than the silent
+/// overwrite we're avoiding.
+fn is_fixture_host_line(line: &str) -> bool {
+    let Ok(entry) = serde_json::from_str::<BotLogEntry>(line) else {
+        // Unparseable: don't claim it's a fixture — let the
+        // caller decide via `--force`.
+        return false;
+    };
+    let host = entry.host.as_str();
+    host.ends_with(".example.com") || host.ends_with(".example.org") || host.ends_with(".test")
 }
 
 #[cfg(test)]
@@ -2066,6 +2045,7 @@ mod tests {
         let missing = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
         let q = BotHistoryQuery {
             date: missing,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2088,6 +2068,7 @@ mod tests {
         seed_file(dir.path(), today, &[]);
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2124,6 +2105,7 @@ mod tests {
 
         let mk_q = |page: usize, size: usize| BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2169,6 +2151,7 @@ mod tests {
 
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: Some("Googlebot".into()),
             host: None,
             path: None,
@@ -2196,6 +2179,7 @@ mod tests {
 
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: Some("example".into()),
             path: None,
@@ -2208,6 +2192,56 @@ mod tests {
         let page = query_history(dir.path(), &q).unwrap();
         assert_eq!(page.total_after_filter, 2);
         assert!(page.entries.iter().all(|e| e.host.contains("example")));
+    }
+
+    /// Regression: the stats page's `entries` link opens History with
+    /// a host and path that name one exact group. With the default
+    /// substring match, `/` listed every path and `a.com` also
+    /// listed `data.com` (because `"a.com"` is a substring of
+    /// `"data.com"`), so the rows did not add up to the count on
+    /// the stats row. `exact` pins both to equality.
+    #[test]
+    fn query_history_exact_matches_whole_host_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.com", "/", 0),
+            bot_entry_with("Googlebot", "Google", "a.com", "/x", 1000),
+            bot_entry_with("Googlebot", "Google", "a.com", "/xyz", 2000),
+            bot_entry_with("Googlebot", "Google", "data.com", "/x", 3000),
+        ];
+        seed_file(dir.path(), today, &entries);
+
+        let query = |exact: bool, host: &str, path: &str| BotHistoryQuery {
+            date: today,
+            exact,
+            host: Some(host.into()),
+            path: Some(path.into()),
+            page: 1,
+            page_size: 50,
+            ..Default::default()
+        };
+
+        // Substring: `a.com` matches `data.com` too (`"a.com"` is a
+        // substring of `"data.com"`), and `/` matches every path
+        // — so all four rows are returned.
+        let sub = query_history(dir.path(), &query(false, "a.com", "/")).unwrap();
+        assert_eq!(
+            sub.total_after_filter, 4,
+            "substring matches bleed into data.com and every path"
+        );
+
+        // Exact: only the one (a.com, /) row.
+        let root = query_history(dir.path(), &query(true, "a.com", "/")).unwrap();
+        assert_eq!(root.total_after_filter, 1);
+        assert_eq!(root.entries[0].host, "a.com");
+        assert_eq!(root.entries[0].path, "/");
+
+        // Exact: `/x` excludes `/xyz` and the data.com row.
+        let x = query_history(dir.path(), &query(true, "a.com", "/x")).unwrap();
+        assert_eq!(x.total_after_filter, 1, "not /xyz, not data.com/x");
+        assert_eq!(x.entries[0].host, "a.com");
+        assert_eq!(x.entries[0].path, "/x");
     }
 
     #[test]
@@ -2223,6 +2257,7 @@ mod tests {
 
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: Some("sitemap".into()),
@@ -2253,6 +2288,7 @@ mod tests {
         // status=200 → 2 entries
         let q_status = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2268,6 +2304,7 @@ mod tests {
         // method=POST → 1 entry
         let q_method = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2284,6 +2321,7 @@ mod tests {
         // status=200 AND method=POST → 0 entries
         let q_both = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2312,6 +2350,7 @@ mod tests {
 
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2343,6 +2382,7 @@ mod tests {
 
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2367,6 +2407,7 @@ mod tests {
         seed_file(dir.path(), today, &entries);
         let q = BotHistoryQuery {
             date: today,
+            exact: false,
             bot_name: None,
             host: None,
             path: None,
@@ -2532,7 +2573,6 @@ mod tests {
                 bot_name: None,
                 path: None,
                 url_limit: 50,
-                trend_dates: vec![day],
             },
         )
         .unwrap();
@@ -2567,10 +2607,6 @@ mod tests {
                 .iter()
                 .all(|u| u.path != "/nope" && u.path != "/nope2")
         );
-
-        assert_eq!(stats.trend.len(), 1);
-        assert_eq!(stats.trend[0].date, day);
-        assert_eq!(stats.trend[0].total_hits, 4);
     }
 
     /// `bot_name` narrows the URL table only. The bot table stays
@@ -2598,7 +2634,6 @@ mod tests {
                 bot_name: Some("bingbot".into()),
                 path: None,
                 url_limit: 50,
-                trend_dates: vec![],
             },
         )
         .unwrap();
@@ -2639,7 +2674,6 @@ mod tests {
                 bot_name: None,
                 path: Some("/x".into()),
                 url_limit: 50,
-                trend_dates: vec![],
             },
         )
         .unwrap();
@@ -2685,7 +2719,6 @@ mod tests {
                 bot_name: None,
                 path: None,
                 url_limit: 1,
-                trend_dates: vec![],
             },
         )
         .unwrap();
@@ -2734,11 +2767,9 @@ mod tests {
                 bot_name: None,
                 path: None,
                 url_limit: 50,
-                trend_dates: vec![],
             },
         )
         .unwrap();
-        assert!(stats.trend.is_empty());
         assert_eq!(stats.bots.len(), 2);
         assert_eq!(stats.bots[0].bot_name, "googlebot");
         assert_eq!(stats.bots[0].hits, 2);
@@ -2755,71 +2786,6 @@ mod tests {
         assert_eq!(b.path, "/x");
         assert_eq!(b.hits, 1);
         assert_eq!(b.bot_name, "googlebot");
-    }
-
-    /// Trend dates are the file names, not the timestamp inside the
-    /// line. A row written into the Oct 1 file counts as Oct 1 even
-    /// when its timestamp falls on Oct 2. A second file is a second
-    /// group. Another host in that file is ignored.
-    #[test]
-    fn history_stats_trend_follows_file_not_timestamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let day1 = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let day2 = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
-        let ts_day2 = DateTime::parse_from_rfc3339("2026-10-02T03:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        seed_file(
-            dir.path(),
-            day1,
-            &[stats_line(
-                "googlebot",
-                "Google",
-                "a.com",
-                "/from-file-1",
-                200,
-                ts_day2,
-            )],
-        );
-        seed_file(
-            dir.path(),
-            day2,
-            &[
-                stats_line("googlebot", "Google", "a.com", "/from-file-2", 200, ts_day2),
-                stats_line(
-                    "bingbot",
-                    "Microsoft",
-                    "a.com",
-                    "/from-file-2",
-                    200,
-                    ts_day2,
-                ),
-                stats_line("googlebot", "Google", "other.test", "/ignore", 200, ts_day2),
-            ],
-        );
-
-        let stats = query_history_stats(
-            dir.path(),
-            &BotHistoryStatsQuery {
-                date: day2,
-                host: Some("a.com".into()),
-                bot_name: None,
-                path: None,
-                url_limit: 50,
-                trend_dates: vec![day1, day2],
-            },
-        )
-        .unwrap();
-
-        assert_eq!(stats.trend.len(), 2);
-        assert_eq!(stats.trend[0].date, day2);
-        assert_eq!(stats.trend[0].total_hits, 2);
-        assert_eq!(stats.trend[1].date, day1);
-        assert_eq!(stats.trend[1].total_hits, 1);
-        assert_eq!(stats.trend[1].bots[0].bot_name, "googlebot");
-        assert!(stats.urls.iter().all(|u| u.path != "/ignore"));
-        assert!(stats.urls.iter().any(|u| u.path == "/from-file-2"));
-        assert!(stats.urls.iter().all(|u| u.path != "/from-file-1"));
     }
 
     /// Past the path cap, bot hit counts still include the dropped
@@ -2859,15 +2825,97 @@ mod tests {
         assert_eq!(stats.urls[0].hits, 2);
     }
 
-    /// The dev fixture is what `make init-data` writes. History must
-    /// paginate on the newest file, Stats must see every category on
-    /// `www.example.com` across all seven files, and the shop host
-    /// must be missing from the four older files.
+    /// `write_dev_fixture` must refuse to overwrite a file that
+    /// already holds real bot traffic — otherwise `make init-data`
+    /// silently wipes the last 7 days the operator was about to
+    /// investigate. The fixture's hosts all live under
+    /// `*.example.com`, so a line on `shop.acme.com` fails the
+    /// check. `force=true` still goes through, and the test
+    /// covers that path too.
     #[test]
-    fn dev_fixture_fills_history_pages_and_stats_trend() {
+    fn write_dev_fixture_refuses_to_overwrite_real_traffic() {
         let dir = tempfile::tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
-        let written = write_dev_fixture(dir.path(), today).unwrap();
+        // Drop a single real-looking line on today's file.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let path = file_path_for(dir.path(), today);
+        let real_entry = crate::bot_log::BotLogEntry::from_access_log(
+            &crate::events::AccessLogEntry {
+                timestamp: chrono::Utc::now(),
+                method: "GET".into(),
+                path: "/products/widget".into(),
+                host: "shop.acme.com".into(),
+                status: 200,
+                duration_ms: 12,
+                backend: "direct:127.0.0.1:8080".into(),
+                client_ip: "203.0.113.7".into(),
+                user_agent: Some("Mozilla/5.0 (compatible; Googlebot/2.1)".into()),
+            },
+            crate::bot::BotIdentity {
+                name: "googlebot".into(),
+                vendor: "Google".into(),
+                category: crate::bot::BotCategory::SearchEngine,
+            },
+        )
+        .unwrap();
+        let body = serde_json::to_string(&real_entry).unwrap();
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+
+        // Without force: refuses, leaves the file alone.
+        let err = write_dev_fixture(dir.path(), today, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, format!("{body}\n"), "real data must not be touched");
+
+        // With force: replaces the file.
+        let n = write_dev_fixture(dir.path(), today, true).unwrap();
+        assert_eq!(n, DEV_FIXTURE_DAYS);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("www.example.com"),
+            "force=true should have written the fixture: {after}"
+        );
+        assert!(
+            !after.contains("shop.acme.com"),
+            "force=true should have replaced the real line: {after}"
+        );
+    }
+
+    /// `write_dev_fixture` is allowed to overwrite a file whose
+    /// first line matches the fixture dev hosts — that path is
+    /// the common re-run case where the previous fixture is being
+    /// refreshed.
+    #[test]
+    fn write_dev_fixture_overwrites_existing_fixture_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        // First run writes the fixture (force=true because the
+        // dir is empty, but force is the safe default for any
+        // re-run).
+        write_dev_fixture(dir.path(), today, true).unwrap();
+        let path = file_path_for(dir.path(), today);
+        let first_run_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(first_run_bytes > 0);
+
+        // Second run without force: still allowed (the first
+        // line is a fixture line), and overwrites the file.
+        write_dev_fixture(dir.path(), today, false).unwrap();
+        let second_run_bytes = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            first_run_bytes, second_run_bytes,
+            "fixture is deterministic — re-run must produce identical bytes"
+        );
+    }
+
+    /// The dev fixture is what `make init-data` writes. History must
+    /// paginate on the newest file, and Stats must see every bot
+    /// category on `www.example.com`. The shop host is only present
+    /// in the three newest files.
+    #[test]
+    fn dev_fixture_fills_history_and_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let written = write_dev_fixture(dir.path(), today, true).unwrap();
         assert_eq!(written, DEV_FIXTURE_DAYS);
 
         let dates = list_dates(dir.path()).unwrap();
@@ -2878,6 +2926,7 @@ mod tests {
             dir.path(),
             &BotHistoryQuery {
                 date: today,
+                exact: false,
                 page: 1,
                 page_size: 50,
                 ..BotHistoryQuery::default()
@@ -2893,6 +2942,7 @@ mod tests {
             dir.path(),
             &BotHistoryQuery {
                 date: today,
+                exact: false,
                 page: 2,
                 page_size: 50,
                 ..BotHistoryQuery::default()
@@ -2905,6 +2955,7 @@ mod tests {
             dir.path(),
             &BotHistoryQuery {
                 date: today,
+                exact: false,
                 status: Some(404),
                 page: 1,
                 page_size: 50,
@@ -2923,7 +2974,6 @@ mod tests {
                 bot_name: None,
                 path: None,
                 url_limit: 50,
-                trend_dates: dates.clone(),
             },
         )
         .unwrap();
@@ -2941,8 +2991,6 @@ mod tests {
         }
         assert!(www.urls.iter().any(|u| u.path == "/sitemap.xml"));
         assert!(www.urls.iter().all(|u| u.path != "/health"));
-        assert_eq!(www.trend.len(), DEV_FIXTURE_DAYS);
-        assert!(www.trend[0].total_hits > www.trend.last().unwrap().total_hits);
 
         let shop = query_history_stats(
             dir.path(),
@@ -2952,11 +3000,9 @@ mod tests {
                 bot_name: None,
                 path: None,
                 url_limit: 50,
-                trend_dates: dates,
             },
         )
         .unwrap();
-        assert_eq!(shop.trend.len(), 3);
         assert!(shop.urls.iter().any(|u| u.path == "/products/widget"));
     }
 }
