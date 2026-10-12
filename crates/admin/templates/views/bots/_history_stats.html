@@ -1,0 +1,384 @@
+{# Stats for one UTC bot-log file. The host table is the picker.
+   Once a host is chosen it is the scope of the tables below, so
+   the picker is not shown again. Every control is a full-page GET
+   to `/logs/bots/stats`. #}
+<div id="bots-stats-panel">
+  {% if let Some(msg) = stats.error %}
+    <div class="mb-4 px-4 py-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-200">
+      <strong class="font-semibold">Query failed:</strong> {{ msg }}
+    </div>
+  {% endif %}
+
+  {% if filter.host.is_empty() %}
+  <div class="card overflow-hidden mb-6">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          Hosts in this file
+        </h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+          File <span class="font-mono">{{ filter.date }}</span>
+          {% if stats.file_bytes > 0 %}
+            · {{ stats.file_size_human() }}
+          {% endif %}
+        </p>
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Bots</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.hosts.is_empty() %}
+              <tr>
+                <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400">No bot hits in this file.</td>
+              </tr>
+            {% else %}
+              {% for h in stats.hosts %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                <td class="px-4 py-2">
+                  <a href="{{ h.page_url }}"
+                     class="font-medium text-accent-600 dark:text-accent-400 hover:underline">{{ h.host }}</a>
+                </td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ h.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums text-slate-600 dark:text-slate-300">{{ h.distinct_bots }}</td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+
+    {% if !filter.path.is_empty() || !filter.bot_name.is_empty() %}
+    <a href="{{ stats.back_url }}" class="mb-4 inline-flex items-center gap-1 text-sm text-slate-600 dark:text-slate-300 hover:text-accent-500">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+      {{ stats.back_label }}
+    </a>
+    {% endif %}
+
+    {% if !filter.path.is_empty() %}
+    <div class="card overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          Bots
+          <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.path }}</span>
+          {% if !filter.host.is_empty() %}
+            <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
+          {% endif %}
+        </h2>
+        {% if !filter.host.is_empty() %}
+          <a href="{{ stats.clear_host_page_url }}"
+             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+        {% endif %}
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Last seen</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Entries</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.bots.is_empty() %}
+              <tr>
+                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No bots hit this path.</td>
+              </tr>
+            {% else %}
+              {% for b in stats.bots %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                <td class="px-4 py-2">
+                  <a href="{{ b.page_url }}"
+                     class="font-medium text-accent-600 dark:text-accent-400 hover:underline">{{ b.bot_name }}</a>
+                </td>
+                <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ b.bot_vendor }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ b.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ b.last_status }}</td>
+                <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 font-mono text-xs">{{ b.last_seen }}</td>
+                <td class="px-4 py-2 text-right">
+                  <a href="{{ b.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">entries</a>
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else if !filter.bot_name.is_empty() %}
+    <div class="card overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          Paths
+          <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.bot_name }}</span>
+          {% if !filter.host.is_empty() %}
+            <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
+          {% endif %}
+        </h2>
+        {% if !filter.host.is_empty() %}
+          <a href="{{ stats.clear_host_page_url }}"
+             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+        {% endif %}
+      </div>
+      <p class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700 tabular-nums">
+        {% if stats.url_total == 0 %}
+          No paths.
+        {% else if stats.urls.len() < stats.url_total %}
+          Showing {{ stats.urls.len() }} of {{ stats.url_total }} paths, by hit count.
+        {% else %}
+          {{ stats.url_total }} paths.
+        {% endif %}
+        {% if stats.urls_capped %}
+          Path list is capped; hit counts above are complete.
+        {% endif %}
+      </p>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              {% if filter.host.is_empty() %}
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+              {% endif %}
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Entries</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.urls.is_empty() %}
+              <tr>
+                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths for this bot.</td>
+              </tr>
+            {% else %}
+              {% for u in stats.urls %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                {% if filter.host.is_empty() %}
+                <td class="px-4 py-2 font-mono text-xs text-slate-800 dark:text-slate-100 break-all">{{ u.host }}</td>
+                {% endif %}
+                <td class="px-4 py-2 font-mono text-xs break-all">
+                  <a href="{{ u.page_url }}"
+                     class="text-accent-600 dark:text-accent-400 hover:underline">{{ u.path }}</a>
+                </td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.last_status }}</td>
+                <td class="px-4 py-2 text-right">
+                  <a href="{{ u.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">entries</a>
+                </td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else if !filter.host.is_empty() %}
+    <div id="bots-stats-summary" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+      <div class="card px-4 py-3">
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Crawl</p>
+        {% if stats.focus.bot_name.is_empty() %}
+          <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">No bot hits.</p>
+        {% else %}
+          <p id="stats-focus" class="mt-1 text-sm text-slate-800 dark:text-slate-100">
+            <span class="font-semibold">{{ stats.focus.bot_name }}</span>
+            · {{ stats.focus.hits }} hits
+            · {{ stats.focus.unique_urls }} URLs
+            · last {{ stats.focus.last_status }}
+          </p>
+        {% endif %}
+      </div>
+      <div class="card px-4 py-3">
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Last status</p>
+        <p class="mt-1 text-sm text-slate-700 dark:text-slate-200 tabular-nums">
+          404 <span id="stats-404">{{ stats.paths_404 }}</span>
+          · 301 <span id="stats-301">{{ stats.paths_301 }}</span>
+          · 5xx <span id="stats-5xx">{{ stats.paths_5xx }}</span>
+        </p>
+      </div>
+      <div class="card px-4 py-3">
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Crawl files</p>
+        <p id="stats-robots" class="mt-1 text-sm font-mono text-slate-700 dark:text-slate-200">
+          {% if stats.robots.seen %}
+            <a href="{{ stats.robots.page_url }}" class="text-accent-600 dark:text-accent-400 hover:underline">/robots.txt</a>
+            · {{ stats.robots.last_status }}
+          {% else %}
+            /robots.txt · not seen
+          {% endif %}
+        </p>
+        <p id="stats-sitemap" class="text-sm font-mono text-slate-700 dark:text-slate-200">
+          {% if stats.sitemap.seen %}
+            <a href="{{ stats.sitemap.page_url }}" class="text-accent-600 dark:text-accent-400 hover:underline">/sitemap.xml</a>
+            · {{ stats.sitemap.last_status }}
+          {% else %}
+            /sitemap.xml · not seen
+          {% endif %}
+        </p>
+      </div>
+    </div>
+
+    <div class="card overflow-hidden mb-6">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          By bot
+          {% if !filter.host.is_empty() %}
+            <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
+          {% endif %}
+        </h2>
+        {% if !filter.host.is_empty() %}
+          <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+            File <span class="font-mono">{{ filter.date }}</span>
+            {% if stats.file_bytes > 0 %}
+              · {{ stats.file_size_human() }}
+            {% endif %}
+            <a href="{{ stats.clear_host_page_url }}"
+               class="ml-2 text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+          </p>
+        {% endif %}
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">URLs</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Last seen</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.bots.is_empty() %}
+              <tr>
+                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No bot hits for this selection.</td>
+              </tr>
+            {% else %}
+              {% for b in stats.bots %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                <td class="px-4 py-2">
+                  <a href="{{ b.page_url }}"
+                     class="font-medium text-accent-600 dark:text-accent-400 hover:underline">{{ b.bot_name }}</a>
+                </td>
+                <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ b.bot_vendor }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ b.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums text-slate-600 dark:text-slate-300">{{ b.unique_urls }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ b.last_status }}</td>
+                <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 font-mono text-xs">{{ b.last_seen }}</td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card overflow-hidden mb-6">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          Needs attention
+          <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
+        </h2>
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bots</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.attention.is_empty() %}
+              <tr>
+                <td colspan="4" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths need attention.</td>
+              </tr>
+            {% else %}
+              {% for u in stats.attention %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                <td class="px-4 py-2 font-mono text-xs break-all">
+                  <a href="{{ u.page_url }}"
+                     class="text-accent-600 dark:text-accent-400 hover:underline">{{ u.path }}</a>
+                </td>
+                <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ u.bots_label }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.last_status }}</td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card overflow-hidden">
+      <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          By path
+          {% if !filter.host.is_empty() %}
+            <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
+          {% endif %}
+        </h2>
+        <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+          {% if stats.healthy_total == 0 %}
+            No paths.
+          {% else if stats.urls.len() < stats.healthy_total %}
+            Showing {{ stats.urls.len() }} of {{ stats.healthy_total }} paths, by hit count.
+          {% else %}
+            {{ stats.healthy_total }} paths.
+          {% endif %}
+          {% if stats.urls_capped %}
+            Path list is capped; bot hit counts above are complete.
+          {% endif %}
+        </p>
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+          <thead class="bg-slate-50 dark:bg-slate-800/50">
+            <tr>
+              {% if filter.host.is_empty() %}
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+              {% endif %}
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bots</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
+            {% if stats.urls.is_empty() %}
+              <tr>
+                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths for this selection.</td>
+              </tr>
+            {% else %}
+              {% for u in stats.urls %}
+              <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                {% if filter.host.is_empty() %}
+                <td class="px-4 py-2 font-mono text-xs text-slate-800 dark:text-slate-100 break-all">{{ u.host }}</td>
+                {% endif %}
+                <td class="px-4 py-2 font-mono text-xs break-all">
+                  <a href="{{ u.page_url }}"
+                     class="text-accent-600 dark:text-accent-400 hover:underline">{{ u.path }}</a>
+                </td>
+                <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ u.bots_label }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.hits }}</td>
+                <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.last_status }}</td>
+              </tr>
+              {% endfor %}
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+</div>

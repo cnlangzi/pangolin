@@ -1,0 +1,27 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Bot Logs — Stats — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  <div class="mb-6">
+    <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Bot Logs</h1>
+    <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
+      One day and one host. See which bots crawled, which URLs came back unhealthy, then open a bot or a path.
+    </p>
+  </div>
+
+  {% include "views/bots/_subnav.html" %}
+
+  <div class="grid grid-cols-1 lg:grid-cols-[12rem_minmax(0,1fr)] gap-6">
+    {% include "views/bots/_date_sidebar.html" %}
+
+    <div>
+      {% include "views/bots/_history_stats.html" %}
+      <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+        Counts come from <span class="font-mono">bot-{{ filter.date }}.jsonl</span>. The date is the file name, not the timestamp inside each line. Raw rows are on <a href="/logs/bots/history?date={{ filter.date }}" class="underline hover:text-accent-600">History</a>.
+      </p>
+    </div>
+  </div>
+</main>
+{% endblock %}

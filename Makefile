@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist start-ngx start-tun install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
 
 help:
 	@echo "=== Config ==="
@@ -67,14 +67,16 @@ help:
 	@echo "  make build         # Local build ngx + tun (release; unstyled UI unless build-ui run)"
 	@echo "  make build-ngx     # Local build ngx only"
 	@echo "  make build-tun     # Local build tun only"
-	@echo "  make build-ui      # Opt-in: build admin UI CSS so local binary serves styled pages"
+	@echo "  make build-css     # Minify assets/tailwindcss.css → assets/app.css"
+	@echo "  make build-ui      # Opt-in: unminified admin CSS (dev watch input)"
 	@echo "  make dev-ui        # Opt-in: watch templates + assets, rebuild UI on save"
 	@echo "  make build-dist    # Docker build (UI minified in-container), export to build/output/"
 	@echo "  make dist          # Same as build-dist"
 	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
 	@echo ""
 	@echo "=== Local Run ==="
-	@echo "  make start-ngx     # Build + run ./bin/pangolin-ngx (foreground, no sudo)"
+	@echo "  make init-data     # Write 7 days of bot JSONL under ./logs/bots (History / Stats)"
+	@echo "  make start-ngx     # build-css, build ngx, fixture logs, stop previous, run"
 	@echo "  make start-tun     # Build + run ./bin/pangolin-tun (foreground, no sudo)"
 	@echo "  make install-ngx   # Install + start ngx as systemd service (sudo)"
 	@echo "  make install-tun   # Install + start tun as systemd service (sudo)"
@@ -174,10 +176,10 @@ ESBUILD_VERSION  := 0.28.0
 # (e.g. after a previous run that did `cp` rather than `mv`). Plain
 # `mv same-file` errors out and aborts the Make target.
 #
-# Deliberately does NOT depend on `build-ui` — all UI bundling lives in
-# the Docker `builder` stage. Local binaries will serve unstyled admin
-# pages until the operator runs `make build-ui` (or `make dev-ui`) once
-# to populate `assets/app.css`.
+# Does not run Tailwind. `build-ngx` / `start-ngx` depend on `build-css`
+# so the release binary embeds minified `assets/app.css`. `app.js` is
+# still the tracked source here; esbuild minify stays in the Docker
+# builder stage.
 build:
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx -p tun
@@ -186,9 +188,17 @@ build:
 
 # Individual binary targets for callers that want only one.  These
 # each run their own cargo invocation, so they re-link shared deps.
-# Same opt-in UI build convention as `build` above.
-build-ngx:
+# `build-css` runs first: rust-embed snapshots `assets/` at compile
+# time, so the CSS file has to exist before `cargo build`.
+#
+# A newly created `app.css` is not an input of the previous admin
+# compile, so cargo will not rebuild it on its own. If the CSS is
+# newer than the embed module, touch that module first.
+build-ngx: build-css
 	mkdir -p $(OUT_DIR)
+	@if [ $(TAILWIND_OUTPUT) -nt crates/admin/src/assets.rs ]; then \
+		touch crates/admin/src/assets.rs; \
+	fi
 	$(CARGO) build --release -p ngx
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
 
@@ -305,6 +315,13 @@ download-ui-tools:
 	done; \
 	echo "  bin/tailwindcss → $$(readlink bin/tailwindcss)"; \
 	echo "  bin/esbuild    → $$(readlink bin/esbuild)"
+
+# Minified `assets/app.css`, same Tailwind command as the Docker
+# builder stage. Does not touch `assets/app.js`.
+build-css: download-ui-tools
+	@echo "Building admin UI CSS..."
+	bin/tailwindcss -i $(TAILWIND_INPUT) -o $(TAILWIND_OUTPUT) --minify
+	@echo "  build-css done → $(TAILWIND_OUTPUT)"
 
 # Dev UI build — unminified Tailwind output. `assets/app.js` is the
 # tracked source; esbuild only runs inside the Docker `builder` stage
@@ -441,8 +458,68 @@ play-tun: warn-env-fallback
 # `ENV_LOAD` sources .env so every `ngx_*` / `tun_*` value reaches the
 # binary as a `NGX_*` / `TUN_*` env var (binary reads via figment —
 # see ngx.yml / tun.yml header comments for the env-var schema).
-start-ngx: build-ngx warn-env-fallback
+#
+# `stop-local-ngx` runs in the recipe, after `build-ngx`. The previous
+# process keeps the ports through the compile, then we signal it and
+# exec. Stopping first would leave the ports empty for the whole build,
+# and a leftover `pangolin-ngx` makes the new process exit on
+# EADDRINUSE.
+#
+# `init-data` runs after the build and before the old process is
+# stopped. It rewrites the last 7 UTC bot JSONL files so History and
+# Stats have pages, hosts, and a trend on a fresh start. A cargo
+# invocation here would race `build-ngx` if it were a prerequisite.
+start-ngx: build-css build-ngx warn-env-fallback
+	@$(MAKE) --no-print-directory init-data
+	@$(MAKE) --no-print-directory stop-local-ngx
 	$(ENV_LOAD) ./bin/pangolin-ngx
+
+# Dev bot logs for History and Stats. Overwrites
+# `./logs/bots/bot-<today>.jsonl` and the six UTC days before it.
+# Older files in that directory are left alone. The rows are produced
+# by `BotLogEntry`'s own serializer so the fixture cannot drift from
+# the reader.
+BOT_LOG_DIR := ./logs/bots
+init-data:
+	$(CARGO) run --release -p pangolin-core --example init_bot_logs -- --dir $(BOT_LOG_DIR)
+
+# Stop a foreground `pangolin-ngx` left by a previous `make start-ngx`.
+# Matches the executable name only, so a different program listening on
+# 8000 or 9081 is left alone. No matching process is success.
+# SIGTERM, then SIGKILL after $(STOP_TIMEOUT)s.
+stop-local-ngx:
+	@PIDS=$$(pgrep -x pangolin-ngx || true); \
+	if [ -z "$$PIDS" ]; then \
+		exit 0; \
+	fi; \
+	echo "Stopping previous pangolin-ngx ($$PIDS)"; \
+	echo "$$PIDS" | xargs -r kill 2>/dev/null || true; \
+	i=0; \
+	alive="$$PIDS"; \
+	while [ $$i -lt $(STOP_TIMEOUT) ]; do \
+		alive=""; \
+		for pid in $$PIDS; do \
+			if kill -0 $$pid 2>/dev/null; then alive="$$alive $$pid"; fi; \
+		done; \
+		if [ -z "$$alive" ]; then \
+			echo "  ✓ previous pangolin-ngx stopped"; \
+			exit 0; \
+		fi; \
+		i=$$((i + 1)); \
+		sleep 1; \
+	done; \
+	echo "  → SIGKILL (still alive):$$alive"; \
+	echo "$$alive" | xargs -r kill -9 2>/dev/null || true; \
+	sleep 1; \
+	still=""; \
+	for pid in $$alive; do \
+		if kill -0 $$pid 2>/dev/null; then still="$$still $$pid"; fi; \
+	done; \
+	if [ -n "$$still" ]; then \
+		echo "pangolin-ngx still running:$$still" >&2; \
+		exit 1; \
+	fi; \
+	echo "  ✓ previous pangolin-ngx killed"
 
 start-tun: build-tun warn-env-fallback
 	$(ENV_LOAD) ./bin/pangolin-tun

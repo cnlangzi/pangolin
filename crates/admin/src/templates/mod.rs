@@ -53,7 +53,7 @@ pub use domains::{
     DomainsTableView, SiteDomainsTableView, SiteDomainsTemplate,
 };
 pub use logs::{
-    BotHistoryFilter, BotHistoryResultView, BotHistorySummary, BotLogsHistoryTemplate,
+    BotHistoryFilter, BotHistorySummary, BotLogsHistoryTemplate, BotLogsStatsTemplate,
     BotLogsTemplate, LogsTemplate, subnav,
 };
 pub use settings::SettingsTemplate;

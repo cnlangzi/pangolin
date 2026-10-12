@@ -59,6 +59,10 @@ Cargo.lock.bak
 /pangolin.db-shm
 /pangolin.db-wal
 
+# Local log files. `make init-data` writes fixture JSONL under ./logs/bots;
+# the running process also keeps its bot cache here.
+/logs/
+
 # IDE
 .idea/
 .vscode/

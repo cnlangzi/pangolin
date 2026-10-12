@@ -27,7 +27,7 @@
 //! fan-out is < 5 µs, disk I/O never blocks the worker.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -134,17 +134,7 @@ impl BotLogEntry {
     /// operator's locale, so this method is a placeholder for a
     /// future per-user preference.
     pub fn timestamp_local(&self) -> String {
-        let d = self.timestamp.with_timezone(&chrono::Local);
-        format!(
-            "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-            d.year(),
-            d.month(),
-            d.day(),
-            d.hour(),
-            d.minute(),
-            d.second(),
-            d.timestamp_subsec_millis(),
-        )
+        format_timestamp_local(self.timestamp)
     }
 
     /// Tailwind class token for the status code colour. Mirrors
@@ -593,7 +583,7 @@ async fn ensure_dir(dir: &Path) -> std::io::Result<()> {
 // Read-only side of the bot log: enumerate the `bot-YYYY-MM-DD.jsonl`
 // files in `log.bot.dir`, and serve filtered + paginated queries
 // against a single day's file. Powers the `/logs/bots/history` admin
-// page and the `GET /api/bots/history` HTMX partial endpoint.
+// page, which reloads the full document for every filter change.
 //
 // Design constraints:
 //   - No new dependencies. `serde_json` / `chrono` / `std::fs` already
@@ -828,6 +818,863 @@ pub fn query_history(dir: &Path, q: &BotHistoryQuery) -> std::io::Result<BotHist
         total_after_filter,
         file_bytes,
     })
+}
+
+/// Local-time rendering shared by the detail rows and the stats
+/// tables, so a hit at the same instant reads the same in both views.
+fn format_timestamp_local(ts: DateTime<Utc>) -> String {
+    let d = ts.with_timezone(&chrono::Local);
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        d.year(),
+        d.month(),
+        d.day(),
+        d.hour(),
+        d.minute(),
+        d.second(),
+        d.timestamp_subsec_millis(),
+    )
+}
+
+/// Distinct `(bot, path)` keys retained while summarising one host
+/// in one file. Bot hit counts stay exact past the cap; further
+/// paths are dropped from the URL table and [`BotHistoryStats::urls_capped`]
+/// is set. The cap exists so one host crawled across millions of
+/// paths cannot OOM the admin process during a stats render.
+pub const MAX_STATS_URLS_PER_HOST: usize = 50_000;
+
+/// One UTC log file (`bot-YYYY-MM-DD.jsonl`) summarised for the
+/// history stats view.
+///
+/// The file name is the date. Rows are not re-bucketed by the
+/// timestamp inside the line: a batch flushed just after UTC
+/// midnight counts toward the file it was written into. That is
+/// the grain operators compare across days.
+#[derive(Debug, Clone)]
+pub struct BotHistoryStatsQuery {
+    /// Which `bot-YYYY-MM-DD.jsonl` to summarise.
+    pub date: NaiveDate,
+    /// Exact `host` match. `None` summarises the whole file: bot
+    /// rows merge one `bot_name` across hosts, and each path row
+    /// stays tied to its own host so the same path on two hosts
+    /// does not collapse.
+    pub host: Option<String>,
+    /// Exact `bot_name` match. Narrows the path table only; the
+    /// bot table stays the full rollup unless [`Self::path`] is
+    /// also set.
+    pub bot_name: Option<String>,
+    /// Exact `path` match. Bot rows then count hits on this path
+    /// only, which is the bot breakdown opened from a path row.
+    pub path: Option<String>,
+    /// Max URL rows returned, after sorting by hits descending.
+    /// `url_total` still counts every retained path.
+    pub url_limit: usize,
+    /// Other files to fold into the per-host trend. The selected
+    /// [`Self::date`] is filled from the primary scan; listing it
+    /// here again is a no-op.
+    pub trend_dates: Vec<NaiveDate>,
+}
+
+/// Per-host totals inside one file. `distinct_bots` is the number
+/// of different `bot_name` values that hit this host.
+#[derive(Debug, Clone)]
+pub struct BotDayHostRow {
+    pub host: String,
+    pub hits: u64,
+    pub distinct_bots: usize,
+}
+
+/// One bot's activity against the selected host in this file.
+#[derive(Debug, Clone)]
+pub struct BotDayBotRow {
+    pub bot_name: String,
+    pub bot_vendor: String,
+    pub hits: u64,
+    pub unique_urls: usize,
+    pub last_status: u16,
+    pub last_seen: DateTime<Utc>,
+}
+
+impl BotDayBotRow {
+    /// Same shape as [`BotLogEntry::timestamp_local`].
+    pub fn last_seen_local(&self) -> String {
+        format_timestamp_local(self.last_seen)
+    }
+}
+
+/// One path inside the selected file, after merging every bot that
+/// crawled it. `host` keeps two hosts' `/` from collapsing when the
+/// query has no host filter. `bot_name` is set only when a single
+/// bot owns the row (a bot filter, or only one bot hit the path);
+/// `bots_label` always lists every bot and its hits.
+#[derive(Debug, Clone)]
+pub struct BotDayUrlRow {
+    pub host: String,
+    /// Single bot for this path, or empty when several bots share it.
+    pub bot_name: String,
+    /// `"googlebot 2 · bingbot 1"`, hits descending.
+    pub bots_label: String,
+    pub path: String,
+    pub hits: u64,
+    pub last_status: u16,
+}
+
+/// One file's contribution to a host's trend. Absent when that
+/// host has zero hits in the file.
+#[derive(Debug, Clone)]
+pub struct BotTrendDay {
+    pub date: NaiveDate,
+    pub total_hits: u64,
+    pub bots: Vec<BotTrendBot>,
+}
+
+/// Hit count for one bot inside a [`BotTrendDay`].
+#[derive(Debug, Clone)]
+pub struct BotTrendBot {
+    pub bot_name: String,
+    pub hits: u64,
+}
+
+/// Result of [`query_history_stats`].
+#[derive(Debug, Clone)]
+pub struct BotHistoryStats {
+    /// Every host in the selected file, hits descending.
+    pub hosts: Vec<BotDayHostRow>,
+    /// Bots in the selected file, optionally narrowed to
+    /// [`BotHistoryStatsQuery::host`]. When [`BotHistoryStatsQuery::path`]
+    /// is set, `hits` count that path only. One row per `bot_name`.
+    pub bots: Vec<BotDayBotRow>,
+    /// Paths after the optional bot filter and `url_limit`. One
+    /// row per host+path, with every bot that hit it merged.
+    /// On the summary, `/robots.txt`, `/sitemap.xml`, and every
+    /// other non-200 path stay in this list even past `url_limit`.
+    /// A bot's path list keeps every non-200 the same way, and
+    /// sorts those rows ahead of 200s.
+    pub urls: Vec<BotDayUrlRow>,
+    /// URL rows matching the filters before the display limit.
+    pub url_total: usize,
+    /// Paths whose last status is 404. Counted before the display limit.
+    pub paths_404: usize,
+    /// Paths whose last status is 301.
+    pub paths_301: usize,
+    /// Paths whose last status is 500–599.
+    pub paths_5xx: usize,
+    /// `true` when new paths were dropped after
+    /// [`MAX_STATS_URLS_PER_HOST`]. Bot `hits` are still exact.
+    pub urls_capped: bool,
+    /// Selected host across files, newest file first. Empty when
+    /// no host is selected.
+    pub trend: Vec<BotTrendDay>,
+    /// Byte size of the selected file. `0` when the file is missing.
+    pub file_bytes: u64,
+}
+
+/// Summarise one UTC bot-log file, plus the selected host's trend
+/// across `trend_dates`.
+///
+/// Host comparison is exact (the stats UI picks a host that
+/// actually appears in the file). A missing file is an empty
+/// summary, not an error — same contract as [`query_history`].
+pub fn query_history_stats(
+    dir: &Path,
+    q: &BotHistoryStatsQuery,
+) -> std::io::Result<BotHistoryStats> {
+    let host = non_empty(q.host.as_deref());
+    let bot = non_empty(q.bot_name.as_deref());
+    let path = non_empty(q.path.as_deref());
+    let body = read_jsonl(dir, q.date)?;
+    let file_bytes = body.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+    let mut stats = summarize_lines(
+        body.as_deref().unwrap_or(""),
+        &SummarizeOpts {
+            host,
+            bot_name: bot,
+            path,
+            url_limit: q.url_limit,
+            url_cap: MAX_STATS_URLS_PER_HOST,
+        },
+    );
+    stats.file_bytes = file_bytes;
+
+    // The stats page does not chart other days — the sidebar
+    // already picked this file. Trend is computed only when the
+    // caller passes dates, so a normal page render reads one file.
+    if let Some(host) = host
+        && !q.trend_dates.is_empty()
+    {
+        let mut trend = Vec::new();
+        if let Some(day) = trend_day_from_bots(q.date, &stats.bots) {
+            trend.push(day);
+        }
+        for date in &q.trend_dates {
+            if *date == q.date {
+                continue;
+            }
+            let Some(text) = read_jsonl(dir, *date)? else {
+                continue;
+            };
+            if let Some(day) = trend_day_from_body(*date, &text, host) {
+                trend.push(day);
+            }
+        }
+        trend.sort_by_key(|day| std::cmp::Reverse(day.date));
+        stats.trend = trend;
+    }
+
+    Ok(stats)
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|s| !s.is_empty())
+}
+
+fn read_jsonl(dir: &Path, date: NaiveDate) -> std::io::Result<Option<String>> {
+    let path = file_path_for(dir, date);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("bot_history: read {} failed: {e}", path.display()),
+        )),
+    }
+}
+
+struct SummarizeOpts<'a> {
+    host: Option<&'a str>,
+    bot_name: Option<&'a str>,
+    path: Option<&'a str>,
+    url_limit: usize,
+    url_cap: usize,
+}
+
+struct HostAcc {
+    hits: u64,
+    bots: HashSet<String>,
+}
+
+struct BotAcc {
+    vendor: String,
+    hits: u64,
+    last_status: u16,
+    last_seen: DateTime<Utc>,
+    paths: HashMap<String, PathAcc>,
+}
+
+struct PathAcc {
+    hits: u64,
+    last_status: u16,
+    last_seen: DateTime<Utc>,
+}
+
+/// Paths merged across bots for one host+path key.
+struct PathFold {
+    hits: u64,
+    last_status: u16,
+    last_seen: DateTime<Utc>,
+    bots: Vec<(String, u64)>,
+}
+
+/// Map key so the same path on two hosts stays two rows.
+fn path_map_key(host: &str, path: &str) -> String {
+    let mut key = String::with_capacity(host.len() + path.len() + 1);
+    key.push_str(host);
+    key.push('\0');
+    key.push_str(path);
+    key
+}
+
+fn split_path_key(key: &str) -> (&str, &str) {
+    key.split_once('\0').unwrap_or(("", key))
+}
+
+fn summarize_lines(body: &str, opts: &SummarizeOpts<'_>) -> BotHistoryStats {
+    let mut hosts: HashMap<String, HostAcc> = HashMap::new();
+    let mut selected: HashMap<String, BotAcc> = HashMap::new();
+    let mut path_total: usize = 0;
+    let mut urls_capped = false;
+
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = match serde_json::from_str::<BotLogEntry>(line) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let host_acc = hosts.entry(entry.host.clone()).or_insert_with(|| HostAcc {
+            hits: 0,
+            bots: HashSet::new(),
+        });
+        host_acc.hits += 1;
+        if !host_acc.bots.contains(entry.bot_name.as_ref()) {
+            host_acc.bots.insert(entry.bot_name.to_string());
+        }
+
+        if let Some(want_host) = opts.host
+            && entry.host != want_host
+        {
+            continue;
+        }
+
+        if let Some(bot) = selected.get_mut(entry.bot_name.as_ref()) {
+            note_bot_hit(bot, &entry, &mut path_total, opts.url_cap, &mut urls_capped);
+        } else {
+            let mut bot = BotAcc {
+                vendor: entry.bot_vendor.to_string(),
+                hits: 0,
+                last_status: entry.status,
+                last_seen: entry.timestamp,
+                paths: HashMap::new(),
+            };
+            note_bot_hit(
+                &mut bot,
+                &entry,
+                &mut path_total,
+                opts.url_cap,
+                &mut urls_capped,
+            );
+            selected.insert(entry.bot_name.to_string(), bot);
+        }
+    }
+
+    let mut host_rows: Vec<BotDayHostRow> = hosts
+        .into_iter()
+        .map(|(host, acc)| BotDayHostRow {
+            host,
+            hits: acc.hits,
+            distinct_bots: acc.bots.len(),
+        })
+        .collect();
+    host_rows.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.host.cmp(&b.host)));
+
+    let mut bot_rows = Vec::with_capacity(selected.len());
+    let mut folded: HashMap<String, PathFold> = HashMap::new();
+    for (bot_name, acc) in selected {
+        let matched: Vec<(&str, &PathAcc)> = match opts.path {
+            Some(want) => acc
+                .paths
+                .iter()
+                .filter(|(key, _)| split_path_key(key).1 == want)
+                .map(|(key, path_acc)| (key.as_str(), path_acc))
+                .collect(),
+            None => acc
+                .paths
+                .iter()
+                .map(|(key, path_acc)| (key.as_str(), path_acc))
+                .collect(),
+        };
+        if opts.path.is_some() && matched.is_empty() {
+            continue;
+        }
+        let (hits, unique_urls, last_status, last_seen) = if opts.path.is_some() {
+            let hits = matched.iter().map(|(_, path_acc)| path_acc.hits).sum();
+            let latest = matched
+                .iter()
+                .max_by_key(|(_, path_acc)| path_acc.last_seen)
+                .expect("matched path");
+            (
+                hits,
+                matched.len(),
+                latest.1.last_status,
+                latest.1.last_seen,
+            )
+        } else {
+            (acc.hits, acc.paths.len(), acc.last_status, acc.last_seen)
+        };
+        let include_urls = match opts.bot_name {
+            Some(name) => name == bot_name,
+            None => true,
+        };
+        if include_urls {
+            for (key, path_acc) in matched {
+                let fold = folded.entry(key.to_string()).or_insert_with(|| PathFold {
+                    hits: 0,
+                    last_status: path_acc.last_status,
+                    last_seen: path_acc.last_seen,
+                    bots: Vec::new(),
+                });
+                fold.hits += path_acc.hits;
+                if path_acc.last_seen >= fold.last_seen {
+                    fold.last_seen = path_acc.last_seen;
+                    fold.last_status = path_acc.last_status;
+                }
+                fold.bots.push((bot_name.clone(), path_acc.hits));
+            }
+        }
+        bot_rows.push(BotDayBotRow {
+            bot_name,
+            bot_vendor: acc.vendor,
+            hits,
+            unique_urls,
+            last_status,
+            last_seen,
+        });
+    }
+    bot_rows.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| a.bot_name.cmp(&b.bot_name))
+    });
+    let mut url_rows: Vec<BotDayUrlRow> = folded
+        .into_iter()
+        .map(|(key, fold)| {
+            let (host, path) = split_path_key(&key);
+            let mut bots = fold.bots;
+            bots.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let bots_label = bots
+                .iter()
+                .map(|(name, hits)| format!("{name} {hits}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let bot_name = if bots.len() == 1 {
+                bots[0].0.clone()
+            } else {
+                String::new()
+            };
+            BotDayUrlRow {
+                host: host.to_string(),
+                path: path.to_string(),
+                bot_name,
+                bots_label,
+                hits: fold.hits,
+                last_status: fold.last_status,
+            }
+        })
+        .collect();
+    let bot_drill = opts.bot_name.is_some();
+    let (paths_404, paths_301, paths_5xx) = status_tallies(&url_rows);
+    url_rows.sort_by(|a, b| {
+        url_display_rank(a, bot_drill)
+            .cmp(&url_display_rank(b, bot_drill))
+            .then(b.hits.cmp(&a.hits))
+            .then(a.host.cmp(&b.host))
+            .then(a.path.cmp(&b.path))
+    });
+    let url_total = url_rows.len();
+    let mut kept = Vec::with_capacity(url_rows.len().min(opts.url_limit.saturating_add(64)));
+    let mut healthy_kept = 0usize;
+    for row in url_rows {
+        if url_kept_past_limit(&row, bot_drill) {
+            kept.push(row);
+        } else if healthy_kept < opts.url_limit {
+            kept.push(row);
+            healthy_kept += 1;
+        }
+    }
+
+    BotHistoryStats {
+        hosts: host_rows,
+        bots: bot_rows,
+        urls: kept,
+        url_total,
+        paths_404,
+        paths_301,
+        paths_5xx,
+        urls_capped,
+        trend: Vec::new(),
+        file_bytes: 0,
+    }
+}
+
+/// `/robots.txt` and `/sitemap.xml` are the crawl files an operator
+/// checks on every host, so the summary keeps them with the other
+/// non-200 paths.
+fn is_seo_crawl_path(path: &str) -> bool {
+    path == "/robots.txt" || path == "/sitemap.xml"
+}
+
+/// Lower ranks are listed first. A bot drill only lifts non-200
+/// paths. The summary also pins the two crawl files, including when
+/// their last status is 200.
+fn url_display_rank(row: &BotDayUrlRow, bot_drill: bool) -> u8 {
+    if bot_drill {
+        return u8::from(row.last_status == 200);
+    }
+    match row.path.as_str() {
+        "/robots.txt" => 0,
+        "/sitemap.xml" => 1,
+        _ if row.last_status != 200 => 2,
+        _ => 3,
+    }
+}
+
+fn url_kept_past_limit(row: &BotDayUrlRow, bot_drill: bool) -> bool {
+    if bot_drill {
+        row.last_status != 200
+    } else {
+        is_seo_crawl_path(&row.path) || row.last_status != 200
+    }
+}
+
+fn status_tallies(urls: &[BotDayUrlRow]) -> (usize, usize, usize) {
+    let mut paths_404 = 0usize;
+    let mut paths_301 = 0usize;
+    let mut paths_5xx = 0usize;
+    for row in urls {
+        if row.last_status == 404 {
+            paths_404 += 1;
+        } else if row.last_status == 301 {
+            paths_301 += 1;
+        } else if (500..600).contains(&row.last_status) {
+            paths_5xx += 1;
+        }
+    }
+    (paths_404, paths_301, paths_5xx)
+}
+
+fn note_bot_hit(
+    bot: &mut BotAcc,
+    entry: &BotLogEntry,
+    path_total: &mut usize,
+    url_cap: usize,
+    urls_capped: &mut bool,
+) {
+    bot.hits += 1;
+    if entry.timestamp >= bot.last_seen {
+        bot.last_seen = entry.timestamp;
+        bot.last_status = entry.status;
+        bot.vendor = entry.bot_vendor.to_string();
+    }
+    let key = path_map_key(&entry.host, &entry.path);
+    if let Some(path) = bot.paths.get_mut(&key) {
+        path.hits += 1;
+        if entry.timestamp >= path.last_seen {
+            path.last_seen = entry.timestamp;
+            path.last_status = entry.status;
+        }
+        return;
+    }
+    if *path_total >= url_cap {
+        *urls_capped = true;
+        return;
+    }
+    bot.paths.insert(
+        key,
+        PathAcc {
+            hits: 1,
+            last_status: entry.status,
+            last_seen: entry.timestamp,
+        },
+    );
+    *path_total += 1;
+}
+
+fn trend_day_from_bots(date: NaiveDate, bots: &[BotDayBotRow]) -> Option<BotTrendDay> {
+    if bots.is_empty() {
+        return None;
+    }
+    let total_hits = bots.iter().map(|b| b.hits).sum();
+    let trend_bots = bots
+        .iter()
+        .map(|b| BotTrendBot {
+            bot_name: b.bot_name.clone(),
+            hits: b.hits,
+        })
+        .collect();
+    Some(BotTrendDay {
+        date,
+        total_hits,
+        bots: trend_bots,
+    })
+}
+
+fn trend_day_from_body(date: NaiveDate, body: &str, host: &str) -> Option<BotTrendDay> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = match serde_json::from_str::<BotLogEntry>(line) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry.host != host {
+            continue;
+        }
+        *counts.entry(entry.bot_name.to_string()).or_insert(0) += 1;
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let mut bots: Vec<BotTrendBot> = counts
+        .into_iter()
+        .map(|(bot_name, hits)| BotTrendBot { bot_name, hits })
+        .collect();
+    bots.sort_by(|a, b| {
+        b.hits
+            .cmp(&a.hits)
+            .then_with(|| a.bot_name.cmp(&b.bot_name))
+    });
+    let total_hits = bots.iter().map(|b| b.hits).sum();
+    Some(BotTrendDay {
+        date,
+        total_hits,
+        bots,
+    })
+}
+
+/// How many UTC files [`write_dev_fixture`] replaces, including today.
+///
+/// Seven days is enough for the stats trend to show a slope, and
+/// short enough that `make start-ngx` does not wipe an operator's
+/// older real logs sitting further back in the same directory.
+pub const DEV_FIXTURE_DAYS: usize = 7;
+
+/// One crawl hit in the dev fixture. `'static` so the tables below
+/// can live in the binary instead of being rebuilt per row.
+struct FixtureHit {
+    bot_name: &'static str,
+    bot_vendor: &'static str,
+    category: BotCategory,
+    host: &'static str,
+    path: &'static str,
+    status: u16,
+    method: &'static str,
+    client_ip: &'static str,
+}
+
+/// Hits written into every fixture day. Today's file repeats this
+/// table so the history table paginates (page size 50).
+const FIXTURE_CORE: &[FixtureHit] = &[
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/robots.txt",
+        status: 200,
+        method: "HEAD",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/sitemap.xml",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/docs/install",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/missing",
+        status: 404,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "bingbot",
+        bot_vendor: "Microsoft",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/",
+        status: 200,
+        method: "GET",
+        client_ip: "157.55.39.1",
+    },
+    FixtureHit {
+        bot_name: "bingbot",
+        bot_vendor: "Microsoft",
+        category: BotCategory::SearchEngine,
+        host: "www.example.com",
+        path: "/sitemap.xml",
+        status: 200,
+        method: "GET",
+        client_ip: "157.55.39.1",
+    },
+    FixtureHit {
+        bot_name: "gptbot",
+        bot_vendor: "OpenAI",
+        category: BotCategory::AiBot,
+        host: "www.example.com",
+        path: "/blog/hello",
+        status: 200,
+        method: "GET",
+        client_ip: "20.15.240.1",
+    },
+    FixtureHit {
+        bot_name: "claudebot",
+        bot_vendor: "Anthropic",
+        category: BotCategory::AiBot,
+        host: "www.example.com",
+        path: "/docs/install",
+        status: 200,
+        method: "GET",
+        client_ip: "160.79.104.1",
+    },
+    FixtureHit {
+        bot_name: "mediapartners-google",
+        bot_vendor: "Google",
+        category: BotCategory::AdsBot,
+        host: "www.example.com",
+        path: "/",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.2",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "blog.example.com",
+        path: "/",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "blog.example.com",
+        path: "/feed",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "facebookexternalhit",
+        bot_vendor: "Meta",
+        category: BotCategory::Social,
+        host: "blog.example.com",
+        path: "/blog/hello",
+        status: 200,
+        method: "GET",
+        client_ip: "173.252.64.1",
+    },
+    FixtureHit {
+        bot_name: "uptimerobot",
+        bot_vendor: "UptimeRobot",
+        category: BotCategory::Monitoring,
+        host: "status.example.com",
+        path: "/health",
+        status: 200,
+        method: "GET",
+        client_ip: "216.144.250.1",
+    },
+];
+
+/// Shop traffic only on the three newest fixture days, so a trend
+/// for this host is shorter than the file list.
+const FIXTURE_SHOP: &[FixtureHit] = &[
+    FixtureHit {
+        bot_name: "googlebot",
+        bot_vendor: "Google",
+        category: BotCategory::SearchEngine,
+        host: "shop.example.com",
+        path: "/products/widget",
+        status: 200,
+        method: "GET",
+        client_ip: "66.249.66.1",
+    },
+    FixtureHit {
+        bot_name: "amazonbot",
+        bot_vendor: "Amazon",
+        category: BotCategory::SearchEngine,
+        host: "shop.example.com",
+        path: "/products/widget",
+        status: 301,
+        method: "GET",
+        client_ip: "3.224.220.1",
+    },
+];
+
+fn fixture_entry(hit: &FixtureHit, timestamp: DateTime<Utc>, seq: u64) -> BotLogEntry {
+    BotLogEntry {
+        timestamp,
+        host: hit.host.to_string(),
+        method: hit.method.to_string(),
+        path: hit.path.to_string(),
+        status: hit.status,
+        duration_ms: 8 + (seq % 40),
+        backend: "direct:127.0.0.1:8080".to_string(),
+        client_ip: hit.client_ip.to_string(),
+        bot_name: Cow::Owned(hit.bot_name.to_string()),
+        bot_vendor: Cow::Owned(hit.bot_vendor.to_string()),
+        bot_category: hit.category,
+        ua: format!(
+            "Mozilla/5.0 (compatible; {}/1.0; +https://example.test/bot)",
+            hit.bot_name
+        ),
+        referer: None,
+    }
+}
+
+fn fixture_day(date: NaiveDate, age: usize) -> Vec<BotLogEntry> {
+    // Six passes on the newest file: 14 core rows × 6 = 84, past the
+    // history page size of 50. Older files are one pass so the trend
+    // for `www.example.com` slopes down as the files get older.
+    let repeats = if age == 0 { 6 } else { 1 };
+    let start = date
+        .and_hms_opt(1, 0, 0)
+        .expect("01:00 is a valid time")
+        .and_utc();
+    let mut hits: Vec<&FixtureHit> = FIXTURE_CORE.iter().collect();
+    if age < 3 {
+        hits.extend(FIXTURE_SHOP.iter());
+    }
+    let mut entries = Vec::with_capacity(repeats * hits.len());
+    let mut seq = 0u64;
+    for _ in 0..repeats {
+        for hit in &hits {
+            let timestamp = start + chrono::Duration::seconds((seq as i64) * 30);
+            entries.push(fixture_entry(hit, timestamp, seq));
+            seq += 1;
+        }
+    }
+    entries
+}
+
+/// Replace the last [`DEV_FIXTURE_DAYS`] UTC bot-log files under `dir`.
+///
+/// `today` is the newest file name. Each file is a complete rewrite, so
+/// running this again yields the same rows for those dates. Files older
+/// than the window are not deleted. The rows are real [`BotLogEntry`]
+/// JSONL: several hosts, every bot category, a 404, and enough lines on
+/// `today` to paginate History. `www.example.com` is in every file;
+/// `shop.example.com` is only in the three newest.
+pub fn write_dev_fixture(dir: &Path, today: NaiveDate) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dir)?;
+    for age in 0..DEV_FIXTURE_DAYS {
+        let date = today - chrono::Duration::days(age as i64);
+        let path = file_path_for(dir, date);
+        let mut body = String::new();
+        for entry in fixture_day(date, age) {
+            let line = serde_json::to_string(&entry).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
+            })?;
+            body.push_str(&line);
+            body.push('\n');
+        }
+        std::fs::write(path, body)?;
+    }
+    Ok(DEV_FIXTURE_DAYS)
 }
 
 #[cfg(test)]
@@ -1640,5 +2487,476 @@ mod tests {
             let e = BotLogEntry::from_access_log(&access, bot()).unwrap();
             assert_eq!(e.duration_ms_human(), *want, "for ms={ms}");
         }
+    }
+
+    fn stats_line(
+        name: &'static str,
+        vendor: &'static str,
+        host: &str,
+        path: &str,
+        status: u16,
+        ts: DateTime<Utc>,
+    ) -> BotLogEntry {
+        let mut entry = bot_entry_with(name, vendor, host, path, 0);
+        entry.status = status;
+        entry.timestamp = ts;
+        entry
+    }
+
+    /// One file, two hosts. Selecting `a.com` must not pick up a
+    /// suffix/prefix lookalike, must merge repeat crawls of the same
+    /// path, and must keep the later status as last_status.
+    #[test]
+    fn history_stats_groups_one_file_by_host_bot_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + chrono::Duration::seconds(10);
+        let entries = vec![
+            stats_line("googlebot", "Google", "a.com", "/x", 200, t0),
+            stats_line("googlebot", "Google", "a.com", "/x", 404, t1),
+            stats_line("googlebot", "Google", "a.com", "/y", 200, t0),
+            stats_line("bingbot", "Microsoft", "a.com", "/x", 200, t0),
+            stats_line("googlebot", "Google", "a.com.extra", "/nope", 200, t0),
+            stats_line("googlebot", "Google", "na.com", "/nope2", 200, t0),
+        ];
+        seed_file(dir.path(), day, &entries);
+
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day,
+                host: Some("a.com".into()),
+                bot_name: None,
+                path: None,
+                url_limit: 50,
+                trend_dates: vec![day],
+            },
+        )
+        .unwrap();
+
+        let a = stats.hosts.iter().find(|h| h.host == "a.com").unwrap();
+        assert_eq!(a.hits, 4);
+        assert_eq!(a.distinct_bots, 2);
+        assert!(stats.hosts.iter().any(|h| h.host == "a.com.extra"));
+        assert!(stats.hosts.iter().any(|h| h.host == "na.com"));
+
+        assert_eq!(stats.bots.len(), 2);
+        assert_eq!(stats.bots[0].bot_name, "googlebot");
+        assert_eq!(stats.bots[0].hits, 3);
+        assert_eq!(stats.bots[0].unique_urls, 2);
+        assert_eq!(stats.bots[0].last_status, 404);
+        assert_eq!(stats.bots[1].bot_name, "bingbot");
+        assert_eq!(stats.bots[1].hits, 1);
+
+        assert_eq!(stats.url_total, 2);
+        assert_eq!(stats.urls[0].path, "/x");
+        assert_eq!(stats.urls[0].host, "a.com");
+        assert!(stats.urls[0].bot_name.is_empty());
+        assert_eq!(stats.urls[0].bots_label, "googlebot 2 · bingbot 1");
+        assert_eq!(stats.urls[0].hits, 3);
+        assert_eq!(stats.urls[0].last_status, 404);
+        assert_eq!(stats.urls[1].path, "/y");
+        assert_eq!(stats.urls[1].hits, 1);
+        assert_eq!(stats.urls[1].bot_name, "googlebot");
+        assert!(
+            stats
+                .urls
+                .iter()
+                .all(|u| u.path != "/nope" && u.path != "/nope2")
+        );
+
+        assert_eq!(stats.trend.len(), 1);
+        assert_eq!(stats.trend[0].date, day);
+        assert_eq!(stats.trend[0].total_hits, 4);
+    }
+
+    /// `bot_name` narrows the URL table only. The bot table stays
+    /// complete so the UI can switch bots from the same response.
+    #[test]
+    fn history_stats_bot_filter_narrows_urls_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let ts = DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        seed_file(
+            dir.path(),
+            day,
+            &[
+                stats_line("googlebot", "Google", "a.com", "/g", 200, ts),
+                stats_line("bingbot", "Microsoft", "a.com", "/b", 200, ts),
+            ],
+        );
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day,
+                host: Some("a.com".into()),
+                bot_name: Some("bingbot".into()),
+                path: None,
+                url_limit: 50,
+                trend_dates: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.bots.len(), 2);
+        assert_eq!(stats.urls.len(), 1);
+        assert_eq!(stats.urls[0].bot_name, "bingbot");
+        assert_eq!(stats.urls[0].bots_label, "bingbot 1");
+        assert_eq!(stats.urls[0].path, "/b");
+        assert_eq!(stats.url_total, 1);
+    }
+
+    /// Opening a path shows the bots that hit it, with hit counts
+    /// for that path only. Other paths crawled by the same bot
+    /// stay out of the bot row.
+    #[test]
+    fn history_stats_path_drill_counts_hits_on_that_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-10-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + chrono::Duration::seconds(10);
+        seed_file(
+            dir.path(),
+            day,
+            &[
+                stats_line("googlebot", "Google", "a.com", "/x", 200, t0),
+                stats_line("googlebot", "Google", "a.com", "/x", 404, t1),
+                stats_line("googlebot", "Google", "a.com", "/y", 200, t0),
+                stats_line("bingbot", "Microsoft", "a.com", "/x", 200, t0),
+            ],
+        );
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day,
+                host: Some("a.com".into()),
+                bot_name: None,
+                path: Some("/x".into()),
+                url_limit: 50,
+                trend_dates: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.bots.len(), 2);
+        assert_eq!(stats.bots[0].bot_name, "googlebot");
+        assert_eq!(stats.bots[0].hits, 2);
+        assert_eq!(stats.bots[0].unique_urls, 1);
+        assert_eq!(stats.bots[0].last_status, 404);
+        assert_eq!(stats.bots[1].bot_name, "bingbot");
+        assert_eq!(stats.bots[1].hits, 1);
+        assert!(stats.urls.iter().all(|u| u.path == "/x"));
+        assert_eq!(stats.url_total, 1);
+    }
+
+    /// The summary keeps crawl files and non-200 paths even when
+    /// the healthy-path display limit would have dropped them.
+    /// Counts are paths, using each path's last status.
+    #[test]
+    fn history_stats_pins_attention_paths_past_the_display_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        seed_file(
+            dir.path(),
+            day,
+            &[
+                stats_line("googlebot", "Google", "a.com", "/popular", 200, t0),
+                stats_line("googlebot", "Google", "a.com", "/popular", 200, t0),
+                stats_line("googlebot", "Google", "a.com", "/gone", 404, t0),
+                stats_line("googlebot", "Google", "a.com", "/old", 301, t0),
+                stats_line("googlebot", "Google", "a.com", "/boom", 500, t0),
+                stats_line("googlebot", "Google", "a.com", "/robots.txt", 200, t0),
+                stats_line("googlebot", "Google", "a.com", "/sitemap.xml", 404, t0),
+            ],
+        );
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day,
+                host: Some("a.com".into()),
+                bot_name: None,
+                path: None,
+                url_limit: 1,
+                trend_dates: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.url_total, 6);
+        assert_eq!(stats.paths_404, 2);
+        assert_eq!(stats.paths_301, 1);
+        assert_eq!(stats.paths_5xx, 1);
+        let paths: Vec<&str> = stats.urls.iter().map(|u| u.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/robots.txt",
+                "/sitemap.xml",
+                "/boom",
+                "/gone",
+                "/old",
+                "/popular",
+            ]
+        );
+    }
+
+    /// No host filter still returns both dimensions for the whole
+    /// file. The same path on two hosts stays two rows; one bot's
+    /// hits add up across those hosts.
+    #[test]
+    fn history_stats_whole_file_groups_by_bot_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 4).unwrap();
+        let ts = DateTime::parse_from_rfc3339("2026-10-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        seed_file(
+            dir.path(),
+            day,
+            &[
+                stats_line("googlebot", "Google", "a.com", "/x", 200, ts),
+                stats_line("bingbot", "Microsoft", "a.com", "/x", 200, ts),
+                stats_line("googlebot", "Google", "b.com", "/x", 200, ts),
+            ],
+        );
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day,
+                host: None,
+                bot_name: None,
+                path: None,
+                url_limit: 50,
+                trend_dates: vec![],
+            },
+        )
+        .unwrap();
+        assert!(stats.trend.is_empty());
+        assert_eq!(stats.bots.len(), 2);
+        assert_eq!(stats.bots[0].bot_name, "googlebot");
+        assert_eq!(stats.bots[0].hits, 2);
+        assert_eq!(stats.bots[0].unique_urls, 2);
+        assert_eq!(stats.bots[1].bot_name, "bingbot");
+        assert_eq!(stats.bots[1].hits, 1);
+
+        assert_eq!(stats.url_total, 2);
+        let a = stats.urls.iter().find(|u| u.host == "a.com").unwrap();
+        assert_eq!(a.path, "/x");
+        assert_eq!(a.hits, 2);
+        assert_eq!(a.bots_label, "bingbot 1 · googlebot 1");
+        let b = stats.urls.iter().find(|u| u.host == "b.com").unwrap();
+        assert_eq!(b.path, "/x");
+        assert_eq!(b.hits, 1);
+        assert_eq!(b.bot_name, "googlebot");
+    }
+
+    /// Trend dates are the file names, not the timestamp inside the
+    /// line. A row written into the Oct 1 file counts as Oct 1 even
+    /// when its timestamp falls on Oct 2. A second file is a second
+    /// group. Another host in that file is ignored.
+    #[test]
+    fn history_stats_trend_follows_file_not_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let day1 = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        let ts_day2 = DateTime::parse_from_rfc3339("2026-10-02T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        seed_file(
+            dir.path(),
+            day1,
+            &[stats_line(
+                "googlebot",
+                "Google",
+                "a.com",
+                "/from-file-1",
+                200,
+                ts_day2,
+            )],
+        );
+        seed_file(
+            dir.path(),
+            day2,
+            &[
+                stats_line("googlebot", "Google", "a.com", "/from-file-2", 200, ts_day2),
+                stats_line(
+                    "bingbot",
+                    "Microsoft",
+                    "a.com",
+                    "/from-file-2",
+                    200,
+                    ts_day2,
+                ),
+                stats_line("googlebot", "Google", "other.test", "/ignore", 200, ts_day2),
+            ],
+        );
+
+        let stats = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: day2,
+                host: Some("a.com".into()),
+                bot_name: None,
+                path: None,
+                url_limit: 50,
+                trend_dates: vec![day1, day2],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stats.trend.len(), 2);
+        assert_eq!(stats.trend[0].date, day2);
+        assert_eq!(stats.trend[0].total_hits, 2);
+        assert_eq!(stats.trend[1].date, day1);
+        assert_eq!(stats.trend[1].total_hits, 1);
+        assert_eq!(stats.trend[1].bots[0].bot_name, "googlebot");
+        assert!(stats.urls.iter().all(|u| u.path != "/ignore"));
+        assert!(stats.urls.iter().any(|u| u.path == "/from-file-2"));
+        assert!(stats.urls.iter().all(|u| u.path != "/from-file-1"));
+    }
+
+    /// Past the path cap, bot hit counts still include the dropped
+    /// paths. The URL table only retains the first `url_cap` paths.
+    #[test]
+    fn history_stats_url_cap_keeps_bot_hits_exact() {
+        let ts = DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entries = [
+            stats_line("googlebot", "Google", "a.com", "/a", 200, ts),
+            stats_line("googlebot", "Google", "a.com", "/b", 200, ts),
+            stats_line("googlebot", "Google", "a.com", "/a", 200, ts),
+        ];
+        let mut body = String::new();
+        for entry in &entries {
+            body.push_str(&serde_json::to_string(entry).unwrap());
+            body.push('\n');
+        }
+        body.push_str("not json\n");
+        let stats = summarize_lines(
+            &body,
+            &SummarizeOpts {
+                host: Some("a.com"),
+                bot_name: None,
+                path: None,
+                url_limit: 10,
+                url_cap: 1,
+            },
+        );
+        assert!(stats.urls_capped);
+        assert_eq!(stats.bots.len(), 1);
+        assert_eq!(stats.bots[0].hits, 3);
+        assert_eq!(stats.bots[0].unique_urls, 1);
+        assert_eq!(stats.urls.len(), 1);
+        assert_eq!(stats.urls[0].path, "/a");
+        assert_eq!(stats.urls[0].hits, 2);
+    }
+
+    /// The dev fixture is what `make init-data` writes. History must
+    /// paginate on the newest file, Stats must see every category on
+    /// `www.example.com` across all seven files, and the shop host
+    /// must be missing from the four older files.
+    #[test]
+    fn dev_fixture_fills_history_pages_and_stats_trend() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let written = write_dev_fixture(dir.path(), today).unwrap();
+        assert_eq!(written, DEV_FIXTURE_DAYS);
+
+        let dates = list_dates(dir.path()).unwrap();
+        assert_eq!(dates.len(), DEV_FIXTURE_DAYS);
+        assert_eq!(dates[0], today);
+
+        let page = query_history(
+            dir.path(),
+            &BotHistoryQuery {
+                date: today,
+                page: 1,
+                page_size: 50,
+                ..BotHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            page.total_after_filter > 50,
+            "newest file should paginate, got {}",
+            page.total_after_filter
+        );
+        let page2 = query_history(
+            dir.path(),
+            &BotHistoryQuery {
+                date: today,
+                page: 2,
+                page_size: 50,
+                ..BotHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert!(!page2.entries.is_empty(), "page 2 should have rows");
+
+        let missing = query_history(
+            dir.path(),
+            &BotHistoryQuery {
+                date: today,
+                status: Some(404),
+                page: 1,
+                page_size: 50,
+                ..BotHistoryQuery::default()
+            },
+        )
+        .unwrap();
+        assert!(missing.total_after_filter > 0);
+        assert!(missing.entries.iter().all(|e| e.path == "/missing"));
+
+        let www = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: today,
+                host: Some("www.example.com".into()),
+                bot_name: None,
+                path: None,
+                url_limit: 50,
+                trend_dates: dates.clone(),
+            },
+        )
+        .unwrap();
+        for name in [
+            "googlebot",
+            "bingbot",
+            "gptbot",
+            "claudebot",
+            "mediapartners-google",
+        ] {
+            assert!(
+                www.bots.iter().any(|b| b.bot_name == name),
+                "missing bot {name}"
+            );
+        }
+        assert!(www.urls.iter().any(|u| u.path == "/sitemap.xml"));
+        assert!(www.urls.iter().all(|u| u.path != "/health"));
+        assert_eq!(www.trend.len(), DEV_FIXTURE_DAYS);
+        assert!(www.trend[0].total_hits > www.trend.last().unwrap().total_hits);
+
+        let shop = query_history_stats(
+            dir.path(),
+            &BotHistoryStatsQuery {
+                date: today,
+                host: Some("shop.example.com".into()),
+                bot_name: None,
+                path: None,
+                url_limit: 50,
+                trend_dates: dates,
+            },
+        )
+        .unwrap();
+        assert_eq!(shop.trend.len(), 3);
+        assert!(shop.urls.iter().any(|u| u.path == "/products/widget"));
     }
 }
