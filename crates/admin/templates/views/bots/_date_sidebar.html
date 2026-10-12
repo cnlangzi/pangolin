@@ -1,0 +1,22 @@
+{# UTC JSONL dates. Each `link.href` is a full-page GET for the
+   page that included this sidebar (history or stats). #}
+<aside class="card p-4 h-fit">
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3">Available dates</h2>
+  {% if date_links.is_empty() %}
+    <p class="text-xs text-slate-500 dark:text-slate-400">No JSONL files yet. Once a bot hits the gateway the file for that UTC day will appear here.</p>
+  {% else %}
+    <ul class="space-y-1 text-sm">
+      {% for link in date_links %}
+        <li>
+          <a href="{{ link.href }}"
+             class="block px-2 py-1 rounded font-mono tabular-nums
+                    {% if link.active %}
+                      bg-accent-50 dark:bg-accent-900/20 text-accent-700 dark:text-accent-300 font-semibold
+                    {% else %}
+                      text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800
+                    {% endif %}">{{ link.date }}</a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</aside>

@@ -22,31 +22,29 @@
 //! ## `/logs/bots/history` (searchenginebots stage-3)
 //!
 //! [`BotLogsHistoryTemplate`] renders the historical JSONL
-//! query view. Unlike the live page, this one is **fully
-//! server-rendered** — the page handler reads the
-//! `bot-YYYY-MM-DD.jsonl` file via
-//! [`pangolin_core::bot_log::query_history`], filters +
-//! paginates, and ships the rows inline. The page also accepts
-//! `hx-get` / `hx-push-url` HTMX swaps on the filter form +
-//! pagination controls so changing a filter doesn't re-render
-//! the form (and so the URL stays bookmarkable).
+//! query view. The page is a full document on every request:
+//! the filter form, date sidebar, and pagination are ordinary
+//! GETs to `/logs/bots/history`, so a refresh always redraws
+//! the sidebar against the date in the URL.
+//!
+//! [`BotLogsStatsTemplate`] is the sibling page at
+//! `/logs/bots/stats`: one UTC file, exact host, bot and URL
+//! rollups, plus that host's trend across files.
 
 use askama::Template;
 use chrono::NaiveDate;
 use pangolin_core::bot_log::BotLogEntry;
 use pangolin_core::bot_stats::{BotStatsRow, BotStatsSummary};
 
-/// Sub-nav slot for the bot-log pages. The base template
-/// includes the Live / History tabs and lights up the matching
-/// one based on this value.
+/// Sub-nav slot for the bot-log pages. The shared sub-nav
+/// partial lights up the matching tab.
 ///
-/// Values: `"live"` for the `/logs/bots` SSE tail page,
-/// `"history"` for the `/logs/bots/history` JSONL query page.
-/// Anything else falls through to "no active sub-tab" (used by
-/// non-bot pages that share the sub-tab partial).
+/// Values: `"live"` for `/logs/bots`, `"history"` for
+/// `/logs/bots/history`, `"stats"` for `/logs/bots/stats`.
 pub mod subnav {
     pub const LIVE: &str = "live";
     pub const HISTORY: &str = "history";
+    pub const STATS: &str = "stats";
 }
 
 /// Full-page template for `GET /logs`.
@@ -127,22 +125,15 @@ pub struct BotHistoryFilter {
 /// 1-200 of 1,234 entries · page 1 / 7") and embedded in the
 /// pagination control's hidden inputs.
 ///
-/// `prev_url` / `next_url` (page-route form, e.g.
-/// `/logs/bots/history?...`) and `prev_api_url` / `next_api_url`
-/// (HTMX-fragment form, e.g. `/api/bots/history?...`) are
-/// pre-computed by [`crate::routes::logs::build_history_page`]
-/// so the template doesn't need to construct query strings
-/// (askama method calls can't take additional arguments).
-/// `None` means "no button rendered for that direction".
+/// `prev_url` / `next_url` are pre-computed by
+/// [`crate::routes::logs::build_history_page`] so the template
+/// doesn't need to construct query strings (askama method calls
+/// can't take additional arguments). `None` means "no button
+/// rendered for that direction".
 ///
-/// Both forms include all current filter values so navigating
-/// to a new page preserves the operator's query. The page URL
-/// is used for the `<a href=...>` of Prev/Next — it's the
-/// bookmarkable / no-JS fallback (middle-click "open in new
-/// tab" should land on the real page, not an HTMX fragment).
-/// The API URL is used for `hx-get=...` — pointing that at the
-/// page route would swap the full layout into
-/// `#bots-history-result` and nest the page inside itself.
+/// Each URL is a full `/logs/bots/history` GET with the current
+/// filters baked in. Following it reloads the whole page,
+/// including the date sidebar.
 #[derive(Clone, Debug, Default)]
 pub struct BotHistorySummary {
     /// Total entries after filtering (== before pagination).
@@ -166,17 +157,6 @@ pub struct BotHistorySummary {
     /// values baked in. `None` when already on the last page.
     /// Used for Prev/Next `<a href=...>`.
     pub next_url: Option<String>,
-    /// HTMX-fragment URL for `page - 1` (e.g.
-    /// `/api/bots/history?...&page=N`), with all current
-    /// filter values baked in. `None` when already on page 1.
-    /// Used for Prev/Next `hx-get=...` so a click swaps only
-    /// the result region instead of re-rendering the whole
-    /// page (which would nest the layout inside itself).
-    pub prev_api_url: Option<String>,
-    /// HTMX-fragment URL for `page + 1`, with all current
-    /// filter values baked in. `None` when already on the last
-    /// page. Used for Prev/Next `hx-get=...`.
-    pub next_api_url: Option<String>,
     /// Human-readable error message when the query failed (file
     /// read error, spawn_blocking panic, etc.). `None` on
     /// success. The template renders this as a red banner above
@@ -244,12 +224,9 @@ fn format_bytes(n: u64) -> String {
 /// paginates, and ships the result inline — the page renders in
 /// one round-trip with no client-side SSE / JS dependency.
 ///
-/// The form controls + pagination links use HTMX
-/// (`hx-get="/api/bots/history" hx-target="#bots-history-result"
-/// hx-swap="outerHTML" hx-push-url="true"`) so changing a filter
-/// or clicking a page number swaps the result region without
-/// re-rendering the form. On a no-JS client the same URLs work
-/// as plain GETs that render the full page.
+/// Filter changes, date clicks, and pagination are full-page
+/// GETs. The date sidebar is rebuilt on each response, so the
+/// highlighted day and the links' query strings match the URL.
 #[derive(Template)]
 #[template(path = "pages/logs_bots_history.html")]
 pub struct BotLogsHistoryTemplate<'a> {
@@ -260,9 +237,10 @@ pub struct BotLogsHistoryTemplate<'a> {
     pub active_nav: &'a str,
     /// Sub-nav token. [`subnav::HISTORY`].
     pub active_subnav: &'a str,
-    /// Dates that have a JSONL file in `log.bot.dir`, newest
-    /// first. Surfaced as clickable chips in the date sidebar.
-    pub available_dates: Vec<NaiveDate>,
+    /// One link per JSONL file, newest first. `href` already
+    /// carries the current filters with that file's date, so a
+    /// click reloads the page without dropping host or bot.
+    pub date_links: Vec<BotHistoryDateLink>,
     /// Current filter values (echoed back into the form inputs).
     pub filter: BotHistoryFilter,
     /// Pagination summary.
@@ -271,25 +249,138 @@ pub struct BotLogsHistoryTemplate<'a> {
     pub entries: Vec<BotLogEntry>,
 }
 
-/// Standalone fragment template for the HTMX swap region.
+/// Full-page template for `GET /logs/bots/stats`.
 ///
-/// The full page template (`pages/logs_bots_history.html`)
-/// `{% include %}`s this file at `{% include
-/// "views/bots/_history_result.html" %}` so the page-render and
-/// fragment-render paths produce byte-identical inner HTML.
-///
-/// Rendered by [`BotHistoryResultView`] for the
-/// `GET /api/bots/history` HTMX endpoint. Wrapped in
-/// `<div id="bots-history-result">` so the `hx-swap="outerHTML"`
-/// directive on the form controls keeps working across swaps.
+/// The sidebar picks one UTC file. The page then breaks that file
+/// into bots and paths. A path row's entries link jumps to History.
 #[derive(Template)]
-#[template(path = "views/bots/_history_result.html")]
-pub struct BotHistoryResultView<'a> {
-    /// Current filter values — used to render pagination URLs that
-    /// preserve the user's filter state across page changes.
-    pub filter: &'a BotHistoryFilter,
-    /// Pagination summary.
-    pub summary: &'a BotHistorySummary,
-    /// Entries for the current page, newest-first.
-    pub entries: &'a [BotLogEntry],
+#[template(path = "pages/logs_bots_stats.html")]
+pub struct BotLogsStatsTemplate<'a> {
+    #[allow(dead_code)]
+    pub csrf_token: String,
+    pub active_nav: &'a str,
+    /// Sub-nav token. [`subnav::STATS`].
+    pub active_subnav: &'a str,
+    /// One link per JSONL file. Href stays on `/logs/bots/stats`
+    /// and keeps the selected host and bot.
+    pub date_links: Vec<BotHistoryDateLink>,
+    pub filter: BotHistoryFilter,
+    pub stats: BotHistoryStatsPage,
+}
+
+/// One UTC log file in the history date sidebar.
+#[derive(Clone, Debug)]
+pub struct BotHistoryDateLink {
+    pub date: NaiveDate,
+    /// Full-page URL for this file on the page that owns the sidebar.
+    pub href: String,
+    /// `true` when this file is the one the page is showing.
+    pub active: bool,
+}
+
+/// One host inside the selected UTC file, with the link that selects it.
+#[derive(Clone, Debug)]
+pub struct BotStatsHostRow {
+    pub host: String,
+    pub hits: u64,
+    pub distinct_bots: usize,
+    pub page_url: String,
+}
+
+/// One bot in the selected file, optionally narrowed to one host.
+#[derive(Clone, Debug)]
+pub struct BotStatsBotRow {
+    pub bot_name: String,
+    pub bot_vendor: String,
+    pub hits: u64,
+    pub unique_urls: usize,
+    pub last_status: u16,
+    pub last_seen: String,
+    pub selected: bool,
+    /// Opens this bot's path list.
+    pub page_url: String,
+    /// Raw History rows for this bot. On a path drill, `path` is included.
+    pub entries_url: String,
+}
+
+/// One path in the selected file, with every bot that hit it.
+#[derive(Clone, Debug)]
+pub struct BotStatsUrlRow {
+    pub host: String,
+    /// Single bot when the row belongs to one bot; empty when several share the path.
+    pub bot_name: String,
+    /// `"googlebot 2 · bingbot 1"`, hits descending.
+    pub bots_label: String,
+    pub path: String,
+    pub hits: u64,
+    pub last_status: u16,
+    /// Summary row: crawl file or a non-200 last status.
+    pub attention: bool,
+    /// Opens the bots that hit this path.
+    pub page_url: String,
+    /// Raw History rows for this path.
+    pub entries_url: String,
+}
+
+/// The bot the summary leads with. Googlebot when it crawled
+/// this host today, otherwise the bot with the most hits.
+#[derive(Clone, Debug, Default)]
+pub struct BotStatsFocus {
+    pub bot_name: String,
+    pub hits: u64,
+    pub unique_urls: usize,
+    pub last_status: u16,
+}
+
+/// `/robots.txt` or `/sitemap.xml` on the selected host today.
+#[derive(Clone, Debug, Default)]
+pub struct BotStatsSeoFile {
+    pub path: String,
+    pub seen: bool,
+    pub last_status: u16,
+    pub page_url: String,
+}
+
+/// Stats panel for one UTC log file.
+///
+/// The file name is the date. With neither bot nor path set, the
+/// page shows both summary tables. A bot opens that bot's paths.
+/// A path opens the bots that hit it, with hits counted on that
+/// path only.
+#[derive(Clone, Debug, Default)]
+pub struct BotHistoryStatsPage {
+    pub hosts: Vec<BotStatsHostRow>,
+    pub bots: Vec<BotStatsBotRow>,
+    /// Healthy paths on the summary. On a bot drill, every path,
+    /// non-200 first.
+    pub urls: Vec<BotStatsUrlRow>,
+    /// Crawl files and non-200 paths. Empty on a drill page.
+    pub attention: Vec<BotStatsUrlRow>,
+    pub url_total: usize,
+    /// Healthy paths before the display limit.
+    pub healthy_total: usize,
+    pub paths_404: usize,
+    pub paths_301: usize,
+    pub paths_5xx: usize,
+    pub focus: BotStatsFocus,
+    pub robots: BotStatsSeoFile,
+    pub sitemap: BotStatsSeoFile,
+    pub urls_capped: bool,
+    pub file_bytes: u64,
+    /// Stats URL for this file with the host filter cleared.
+    pub clear_host_page_url: String,
+    /// Both summary tables for this file and host.
+    pub summary_page_url: String,
+    /// One step above the current drill.
+    pub back_url: String,
+    /// `Back to blog.example.com`, `Back to googlebot`, or `Back to /x`.
+    pub back_label: String,
+    pub error: Option<String>,
+}
+
+impl BotHistoryStatsPage {
+    /// Same byte buckets as [`BotHistorySummary::file_size_human`].
+    pub fn file_size_human(&self) -> String {
+        format_bytes(self.file_bytes)
+    }
 }

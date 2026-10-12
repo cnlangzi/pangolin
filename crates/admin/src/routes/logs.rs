@@ -35,11 +35,13 @@
 //! It reads the per-day `bot-YYYY-MM-DD.jsonl` file under
 //! `log.bot.dir` (default `./logs/bots`), applies the filter form
 //! (`date`, `bot_name`, `host`, `path`, `status`, `method`,
-//! `client_ip`), paginates, and renders the rows inline. The
-//! filter form + pagination controls submit to
-//! [`api_bots_history`] which returns just the result fragment
-//! for HTMX swaps (`hx-target="#bots-history-result"`); on a no-JS
-//! client the same URLs serve the full page.
+//! `client_ip`), paginates, and renders a full page. Filter
+//! changes, date clicks, and pagination are ordinary GETs, so
+//! the date sidebar is redrawn with the request.
+//!
+//! [`render_bots_stats`] is the separate rollup at
+//! `/logs/bots/stats`. A leftover `?view=stats` on the history
+//! URL redirects there.
 
 use std::sync::Arc;
 
@@ -51,8 +53,9 @@ use http_body_util::Full;
 use crate::App;
 use crate::ok_html_with_csrf;
 use crate::templates::logs::subnav;
+use crate::templates::logs::{BotHistoryDateLink, BotHistoryStatsPage};
 use crate::templates::{
-    BotHistoryResultView, BotLogsHistoryTemplate, BotLogsTemplate, LogsTemplate,
+    BotLogsHistoryTemplate, BotLogsStatsTemplate, BotLogsTemplate, LogsTemplate,
 };
 use pangolin_core::bot_log::list_dates;
 
@@ -135,21 +138,9 @@ pub async fn render_bots(app: &Arc<App>, csrf: &str) -> http::Result<Response<Fu
 // ── `/logs/bots/history` (stage-3) ───────────────────────────────────────
 //
 // Read-only query view over the on-disk `bot-YYYY-MM-DD.jsonl`
-// files. Composed of:
-//
-//   - [`render_bots_history`] — full page (header + sub-nav +
-//     filter form + date sidebar + result region). The result
-//     region is an inline `{% include %}` of the same fragment
-//     the HTMX endpoint returns, so a no-JS client sees the same
-//     layout as the JS-enhanced one.
-//   - [`api_bots_history`] — HTMX fragment endpoint, returns
-//     only the result region (`#bots-history-result`). Same
-//     query semantics, no header / form / sidebar (those don't
-//     change when filters change).
-//
-// Both routes share the same `parse_history_params` helper so the
-// filter parsing + clamping behaviour is identical across the two
-// entry points.
+// files. History is the row list. Stats is its own page. Every
+// control reloads the document so the sidebar highlight matches
+// the date in the URL.
 
 /// Default page size for the history table. Picked to match the
 /// common viewport (operators scan ~25 rows without scrolling) and
@@ -162,10 +153,14 @@ const BOT_HISTORY_PAGE_SIZE: usize = 50;
 /// keep the pagination UI honest).
 const BOT_HISTORY_MAX_PAGE: usize = 10_000;
 
+/// URL rows kept on the stats panel, after sorting by hits.
+/// The underlying counts still cover every retained path.
+const BOT_STATS_URL_LIMIT: usize = 200;
+
 /// Parse a `application/x-www-form-urlencoded` blob (body or
 /// query string — `serve.rs` concatenates them) into a typed
-/// filter + page state. Used by both the full page handler and
-/// the HTMX fragment endpoint so the two paths can't drift.
+/// filter + page state. History and stats share the parser so
+/// the field names can't drift.
 ///
 /// All filters are optional. Missing / unparseable values
 /// silently fall back to "no filter" — an operator typo in the
@@ -226,23 +221,31 @@ struct HistoryParams {
 /// Build the `/logs/bots/history` HTML page (stage-3).
 ///
 /// Renders the full layout (sub-nav, date sidebar, filter form,
-/// result region). The result region is populated by an inline
-/// `{% include %}` of the same fragment
-/// [`api_bots_history`] returns, so the two views stay in lockstep.
+/// result region). `?view=stats` is the old in-page mode; it
+/// redirects to [`render_bots_stats`] so a saved link still lands
+/// on the rollup.
 pub async fn render_bots_history(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
+    if is_stats_view(merged_params) {
+        let p = parse_history_params(merged_params);
+        return Ok(crate::routes::helpers::redirect(&stats_page_url(
+            &p.filter.date,
+            &p.filter.host,
+            &p.filter.bot_name,
+            &p.filter.path,
+        )));
+    }
     let dir = app.config.log.bot.dir.clone();
-    let available_dates = list_dates(&dir).unwrap_or_default();
     let page = build_history_page(dir.as_path(), merged_params).await;
 
     let tmpl = BotLogsHistoryTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-bots",
         active_subnav: subnav::HISTORY,
-        available_dates,
+        date_links: page.date_links,
         filter: page.filter,
         summary: page.summary,
         entries: page.entries,
@@ -258,51 +261,7 @@ pub async fn render_bots_history(
     ok_html_with_csrf(html, csrf)
 }
 
-/// HTMX fragment endpoint: `GET /api/bots/history`.
-///
-/// Returns the result region (`#bots-history-result`) wrapped in
-/// an `outerHTML`-swappable container. The page handler delegates
-/// the same query to [`build_history_page`] so the two routes
-/// can't disagree about filter semantics.
-pub async fn api_bots_history(
-    app: &Arc<App>,
-    merged_params: &[u8],
-) -> http::Result<Response<Full<Bytes>>> {
-    let dir = app.config.log.bot.dir.clone();
-    let page = build_history_page(dir.as_path(), merged_params).await;
-
-    // Render only the result region — the surrounding shell
-    // (sub-nav, date sidebar, form) is preserved by HTMX
-    // outerHTML swap, so re-rendering it would just bloat the
-    // response and cause unnecessary DOM work.
-    let tmpl = BotHistoryResultView {
-        filter: &page.filter,
-        summary: &page.summary,
-        entries: &page.entries,
-    };
-    let html = match tmpl.render() {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("bot history api template error: {e}");
-            String::new()
-        }
-    };
-
-    // Use render_with_assets_and_csrf so the CSRF / asset placeholders
-    // in the surrounding template are substituted even on the fragment
-    // path (the fragment references `__CSRF__` only when forms are
-    // nested, but the substitution is idempotent and cheap).
-    let bytes = crate::render_with_assets_and_csrf(html, "");
-    let resp = Response::builder()
-        .status(200)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(bytes)))
-        .unwrap();
-    Ok(resp)
-}
-
-/// Shared query logic for [`render_bots_history`] and
-/// [`api_bots_history`]. Reads the day's JSONL, applies the
+/// Shared query logic for [`render_bots_history`]. Reads the day's JSONL, applies the
 /// filters, paginates, and packages the result into a
 /// `(filter, summary, entries)` triple ready for
 /// [`BotLogsHistoryTemplate`].
@@ -413,15 +372,8 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     // to construct query strings (askama method calls can't take
     // additional arguments). `None` ⇒ don't render that button.
     //
-    // Two URL flavours per direction:
-    // - `prev_url` / `next_url` — full page route, used for
-    //   `<a href=...>` (bookmarkable, no-JS fallback,
-    //   middle-click "open in new tab").
-    // - `prev_api_url` / `next_api_url` — HTMX fragment route,
-    //   used for `hx-get=...`. The page route returns the entire
-    //   layout, so swapping it into `#bots-history-result` would
-    //   nest the page inside itself; the fragment route returns
-    //   only the result region.
+    // Full-page URLs. A click reloads the document, including the
+    // date sidebar, with every current filter preserved.
     let prev_url = if page > 1 && total_pages > 1 {
         Some(build_history_url(&filter, page - 1, p.status))
     } else {
@@ -432,17 +384,6 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     } else {
         None
     };
-    let prev_api_url = if page > 1 && total_pages > 1 {
-        Some(build_history_api_url(&filter, page - 1, p.status))
-    } else {
-        None
-    };
-    let next_api_url = if page < total_pages {
-        Some(build_history_api_url(&filter, page + 1, p.status))
-    } else {
-        None
-    };
-
     let summary = crate::templates::logs::BotHistorySummary {
         total_after_filter,
         page,
@@ -451,22 +392,426 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
         file_bytes,
         prev_url,
         next_url,
-        prev_api_url,
-        next_api_url,
         error,
     };
+
+    let date_links = detail_date_links(&available, &filter, p.status);
 
     HistoryPageView {
         filter,
         summary,
         entries,
+        date_links,
     }
 }
 
-/// Build the `?<filter>&page=<n>` query portion shared by both
-/// the page-route URL and the HTMX-fragment URL. Splitting the
-/// query builder out keeps the two URL variants in lockstep —
-/// they can't drift in which filter fields they emit.
+/// `view=stats` is the previous in-page mode. The history handler
+/// redirects it to `/logs/bots/stats`.
+fn is_stats_view(merged_params: &[u8]) -> bool {
+    for pair in std::str::from_utf8(merged_params).unwrap_or("").split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k != "view" {
+            continue;
+        }
+        let Ok(val) = urlencoding::decode(v) else {
+            continue;
+        };
+        return val == "stats";
+    }
+    false
+}
+
+/// Build the `/logs/bots/stats` HTML page.
+///
+/// Own sub-nav slot and own URLs. The date sidebar keeps the
+/// selected host and bot; a URL row links into History for the
+/// raw lines.
+pub async fn render_bots_stats(
+    app: &Arc<App>,
+    csrf: &str,
+    merged_params: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let dir = app.config.log.bot.dir.clone();
+    let page = build_stats_page(dir.as_path(), merged_params).await;
+
+    let tmpl = BotLogsStatsTemplate {
+        csrf_token: csrf.to_string(),
+        active_nav: "logs-bots",
+        active_subnav: subnav::STATS,
+        date_links: page.date_links,
+        filter: page.filter,
+        stats: page.stats,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("bot stats template error: {e}");
+            String::new()
+        }
+    };
+    ok_html_with_csrf(html, csrf)
+}
+
+struct StatsPageView {
+    filter: crate::templates::logs::BotHistoryFilter,
+    stats: BotHistoryStatsPage,
+    date_links: Vec<BotHistoryDateLink>,
+}
+
+/// Read one UTC file and break it into bots and paths. The date
+/// sidebar already picked the file, so other files are not scanned.
+/// Disk work runs on `spawn_blocking`, same reason as
+/// [`build_history_page`].
+async fn build_stats_page(dir: &std::path::Path, merged_params: &[u8]) -> StatsPageView {
+    let p = parse_history_params(merged_params);
+    let available = list_dates(dir).unwrap_or_default();
+    let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {
+        d
+    } else if let Some(&first) = available.first() {
+        first
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let mut filter = p.filter;
+    filter.date = date.to_string();
+    let from = parse_stats_from(merged_params);
+    let date_links = stats_date_links(&available, &filter, &from);
+
+    let query = pangolin_core::bot_log::BotHistoryStatsQuery {
+        date,
+        host: (!filter.host.is_empty()).then(|| filter.host.clone()),
+        bot_name: (!filter.bot_name.is_empty()).then(|| filter.bot_name.clone()),
+        path: (!filter.path.is_empty()).then(|| filter.path.clone()),
+        url_limit: BOT_STATS_URL_LIMIT,
+        trend_dates: Vec::new(),
+    };
+
+    let dir_owned = dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        pangolin_core::bot_log::query_history_stats(&dir_owned, &query)
+    })
+    .await;
+
+    let (raw, error) = match result {
+        Ok(Ok(stats)) => (stats, None),
+        Ok(Err(e)) => {
+            log::warn!("bot_history stats: query failed: {e}");
+            (
+                empty_bot_history_stats(),
+                Some(format!("Failed to read JSONL: {e}")),
+            )
+        }
+        Err(e) => {
+            log::warn!("bot_history stats: blocking task panicked: {e}");
+            (
+                empty_bot_history_stats(),
+                Some("Internal error while reading JSONL (see server log).".into()),
+            )
+        }
+    };
+
+    let mut stats = present_stats(&filter, raw, &from);
+    stats.error = error;
+    StatsPageView {
+        filter,
+        stats,
+        date_links,
+    }
+}
+
+fn empty_bot_history_stats() -> pangolin_core::bot_log::BotHistoryStats {
+    pangolin_core::bot_log::BotHistoryStats {
+        hosts: Vec::new(),
+        bots: Vec::new(),
+        urls: Vec::new(),
+        url_total: 0,
+        urls_capped: false,
+        paths_404: 0,
+        paths_301: 0,
+        paths_5xx: 0,
+        trend: Vec::new(),
+        file_bytes: 0,
+    }
+}
+
+fn present_stats(
+    filter: &crate::templates::logs::BotHistoryFilter,
+    raw: pangolin_core::bot_log::BotHistoryStats,
+    from: &str,
+) -> BotHistoryStatsPage {
+    use crate::templates::logs::{BotStatsBotRow, BotStatsFocus, BotStatsHostRow, BotStatsUrlRow};
+
+    let hosts = raw
+        .hosts
+        .iter()
+        .map(|h| BotStatsHostRow {
+            host: h.host.clone(),
+            hits: h.hits,
+            distinct_bots: h.distinct_bots,
+            // A new host opens the two summary tables, not the previous drill.
+            page_url: stats_page_url(&filter.date, &h.host, "", ""),
+        })
+        .collect();
+    let bots = raw
+        .bots
+        .iter()
+        .map(|b| BotStatsBotRow {
+            bot_name: b.bot_name.clone(),
+            bot_vendor: b.bot_vendor.clone(),
+            hits: b.hits,
+            unique_urls: b.unique_urls,
+            last_status: b.last_status,
+            last_seen: b.last_seen_local(),
+            selected: b.bot_name == filter.bot_name,
+            // A bot opens its path list. From a path drill, Back returns here.
+            page_url: with_stats_from(
+                stats_page_url(&filter.date, &filter.host, &b.bot_name, ""),
+                if filter.path.is_empty() {
+                    ""
+                } else {
+                    &filter.path
+                },
+            ),
+            entries_url: detail_entries_url(&filter.date, &filter.host, &b.bot_name, &filter.path),
+        })
+        .collect();
+    let summary = !filter.host.is_empty() && filter.bot_name.is_empty() && filter.path.is_empty();
+    let mut attention = Vec::new();
+    let mut urls = Vec::new();
+    for u in &raw.urls {
+        let entries_bot = if filter.bot_name.is_empty() {
+            u.bot_name.as_str()
+        } else {
+            filter.bot_name.as_str()
+        };
+        let row_attention = u.last_status != 200 || is_stats_crawl_path(&u.path);
+        let row = BotStatsUrlRow {
+            host: u.host.clone(),
+            bot_name: u.bot_name.clone(),
+            bots_label: u.bots_label.clone(),
+            path: u.path.clone(),
+            hits: u.hits,
+            last_status: u.last_status,
+            attention: row_attention,
+            // A path opens the bots that hit it. From a bot drill, Back returns here.
+            page_url: with_stats_from(
+                stats_page_url(&filter.date, &u.host, "", &u.path),
+                if filter.bot_name.is_empty() {
+                    ""
+                } else {
+                    &filter.bot_name
+                },
+            ),
+            entries_url: detail_entries_url(&filter.date, &u.host, entries_bot, &u.path),
+        };
+        if summary && row_attention {
+            attention.push(row);
+        } else {
+            urls.push(row);
+        }
+    }
+    let attention_count = attention.len();
+    let focus_bot = raw
+        .bots
+        .iter()
+        .find(|b| b.bot_name.eq_ignore_ascii_case("googlebot"))
+        .or_else(|| raw.bots.first());
+    let focus = focus_bot.map_or_else(BotStatsFocus::default, |b| BotStatsFocus {
+        bot_name: b.bot_name.clone(),
+        hits: b.hits,
+        unique_urls: b.unique_urls,
+        last_status: b.last_status,
+    });
+    let (back_url, back_label) = stats_back_target(filter, from);
+    BotHistoryStatsPage {
+        hosts,
+        bots,
+        urls,
+        attention,
+        url_total: raw.url_total,
+        healthy_total: raw.url_total.saturating_sub(attention_count),
+        paths_404: raw.paths_404,
+        paths_301: raw.paths_301,
+        paths_5xx: raw.paths_5xx,
+        focus,
+        robots: seo_file_row(&raw.urls, filter, "/robots.txt"),
+        sitemap: seo_file_row(&raw.urls, filter, "/sitemap.xml"),
+        urls_capped: raw.urls_capped,
+        file_bytes: raw.file_bytes,
+        clear_host_page_url: stats_page_url(&filter.date, "", "", ""),
+        summary_page_url: stats_page_url(&filter.date, &filter.host, "", ""),
+        back_url,
+        back_label,
+        error: None,
+    }
+}
+
+/// One step up from the current drill. `from` is the bot or path
+/// the operator opened this page from.
+fn stats_back_target(
+    filter: &crate::templates::logs::BotHistoryFilter,
+    from: &str,
+) -> (String, String) {
+    if !filter.path.is_empty() && !from.is_empty() {
+        (
+            stats_page_url(&filter.date, &filter.host, from, ""),
+            format!("Back to {from}"),
+        )
+    } else if !filter.bot_name.is_empty() && !from.is_empty() {
+        (
+            stats_page_url(&filter.date, &filter.host, "", from),
+            format!("Back to {from}"),
+        )
+    } else if !filter.host.is_empty() {
+        (
+            stats_page_url(&filter.date, &filter.host, "", ""),
+            format!("Back to {}", filter.host),
+        )
+    } else {
+        (stats_page_url(&filter.date, "", "", ""), "Back".to_string())
+    }
+}
+
+fn is_stats_crawl_path(path: &str) -> bool {
+    path == "/robots.txt" || path == "/sitemap.xml"
+}
+
+fn seo_file_row(
+    urls: &[pangolin_core::bot_log::BotDayUrlRow],
+    filter: &crate::templates::logs::BotHistoryFilter,
+    path: &str,
+) -> crate::templates::logs::BotStatsSeoFile {
+    match urls.iter().find(|u| u.path == path) {
+        Some(row) => crate::templates::logs::BotStatsSeoFile {
+            path: path.to_string(),
+            seen: true,
+            last_status: row.last_status,
+            page_url: stats_page_url(&filter.date, &row.host, "", path),
+        },
+        None => crate::templates::logs::BotStatsSeoFile {
+            path: path.to_string(),
+            seen: false,
+            last_status: 0,
+            page_url: String::new(),
+        },
+    }
+}
+
+fn stats_query(date: &str, host: &str, bot: &str, path: &str) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if !date.is_empty() {
+        parts.push(format!("date={}", urlencoding::encode(date)));
+    }
+    if !host.is_empty() {
+        parts.push(format!("host={}", urlencoding::encode(host)));
+    }
+    if !bot.is_empty() {
+        parts.push(format!("bot={}", urlencoding::encode(bot)));
+    }
+    if !path.is_empty() {
+        parts.push(format!("path={}", urlencoding::encode(path)));
+    }
+    parts.join("&")
+}
+
+fn stats_page_url(date: &str, host: &str, bot: &str, path: &str) -> String {
+    let query = stats_query(date, host, bot, path);
+    if query.is_empty() {
+        "/logs/bots/stats".to_string()
+    } else {
+        format!("/logs/bots/stats?{query}")
+    }
+}
+
+/// Sidebar links for the detail view. Each href keeps the current
+/// filters and lands on page 1 of that file.
+fn detail_date_links(
+    dates: &[chrono::NaiveDate],
+    filter: &crate::templates::logs::BotHistoryFilter,
+    status: Option<u16>,
+) -> Vec<BotHistoryDateLink> {
+    dates
+        .iter()
+        .copied()
+        .map(|date| {
+            let mut day = filter.clone();
+            day.date = date.to_string();
+            BotHistoryDateLink {
+                active: day.date == filter.date,
+                href: build_history_url(&day, 1, status),
+                date,
+            }
+        })
+        .collect()
+}
+
+/// Sidebar links for the stats view. Host, the open drill, and the
+/// step Back returns to stay on the URL so changing day keeps the cut.
+fn stats_date_links(
+    dates: &[chrono::NaiveDate],
+    filter: &crate::templates::logs::BotHistoryFilter,
+    from: &str,
+) -> Vec<BotHistoryDateLink> {
+    dates
+        .iter()
+        .copied()
+        .map(|date| {
+            let label = date.to_string();
+            BotHistoryDateLink {
+                active: label == filter.date,
+                href: with_stats_from(
+                    stats_page_url(&label, &filter.host, &filter.bot_name, &filter.path),
+                    from,
+                ),
+                date,
+            }
+        })
+        .collect()
+}
+
+/// `from` records the bot or path this drill was opened from, so
+/// Back returns there instead of skipping to the host summary.
+fn with_stats_from(url: String, from: &str) -> String {
+    if from.is_empty() {
+        return url;
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}from={}", urlencoding::encode(from))
+}
+
+fn parse_stats_from(params: &[u8]) -> String {
+    for pair in std::str::from_utf8(params).unwrap_or("").split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k != "from" {
+            continue;
+        }
+        if let Ok(val) = urlencoding::decode(v) {
+            return val.into_owned();
+        }
+    }
+    String::new()
+}
+
+/// History URL for one stats URL row. Host is the full host from
+/// the file, which the detail filter matches as a substring.
+fn detail_entries_url(date: &str, host: &str, bot: &str, path: &str) -> String {
+    format!(
+        "/logs/bots/history?date={}&host={}&bot={}&path={}",
+        urlencoding::encode(date),
+        urlencoding::encode(host),
+        urlencoding::encode(bot),
+        urlencoding::encode(path),
+    )
+}
+
+/// Build the `?<filter>&page=<n>` query the history page uses
+/// for its own links. The page reloads on every navigation, so
+/// there is no separate fragment URL to keep in sync.
 ///
 /// URL-encoding is per-field — `urlencoding::encode` covers the
 /// common case (spaces, `&`, `=`, slashes in host values, etc.).
@@ -507,10 +852,7 @@ fn build_history_url_query(
 
 /// Build a `/logs/bots/history?<query>` URL with all filter
 /// values preserved plus the supplied `page`. Used for the
-/// `<a href=...>` of the Prev/Next pagination buttons — the
-/// full-page URL is what middle-click "open in new tab" and
-/// the no-JS fallback need (a fragment-only URL would 404 in
-/// those contexts).
+/// Prev/Next links, which reload the page.
 fn build_history_url(
     filter: &crate::templates::logs::BotHistoryFilter,
     page: usize,
@@ -522,29 +864,6 @@ fn build_history_url(
     )
 }
 
-/// Build an `/api/bots/history?<query>` URL for the same
-/// query — the HTMX fragment endpoint that returns only the
-/// result region (`<div id="bots-history-result">`). Used for
-/// the `hx-get=...` of the Prev/Next buttons.
-///
-/// Why this can't just be the page URL: the page route returns
-/// the whole layout (header, sub-nav, sidebar, form + result),
-/// so a `hx-swap="outerHTML"` of it into `#bots-history-result`
-/// nests the layout inside itself — visible as a duplicated
-/// Pangolin header, duplicated "Bot Logs" title, duplicated
-/// sub-nav, duplicated sidebar inside what should be just the
-/// table area.
-fn build_history_api_url(
-    filter: &crate::templates::logs::BotHistoryFilter,
-    page: usize,
-    status: Option<u16>,
-) -> String {
-    format!(
-        "/api/bots/history?{}",
-        build_history_url_query(filter, page, status)
-    )
-}
-
 /// Internal result of [`build_history_page`] — just a rename of
 /// the three template fields so we can `?`-propagate them through
 /// the async fn without naming each individually.
@@ -552,6 +871,7 @@ struct HistoryPageView {
     filter: crate::templates::logs::BotHistoryFilter,
     summary: crate::templates::logs::BotHistorySummary,
     entries: Vec<pangolin_core::bot_log::BotLogEntry>,
+    date_links: Vec<BotHistoryDateLink>,
 }
 
 #[cfg(test)]
@@ -709,6 +1029,8 @@ mod tests {
         let html = tmpl.render().expect("BotLogsTemplate render");
         assert!(html.contains("Bot Logs"));
         assert!(html.contains("EventSource"));
+        assert!(html.contains("href=\"/logs/bots/history\""));
+        assert!(html.contains("href=\"/logs/bots/stats\""));
     }
 
     // ── /logs/bots/history (stage-3) ─────────────────────────────────
@@ -878,58 +1200,6 @@ mod tests {
         assert_eq!(url, "/logs/bots/history?date=2026-09-19&page=1");
     }
 
-    /// Mirror of `build_history_url_preserves_all_filters` for
-    /// the HTMX-fragment endpoint variant. The two URLs must
-    /// share every filter dimension — they only differ in the
-    /// path prefix — so a refactor that drops a field from one
-    /// but not the other is caught here.
-    #[test]
-    fn build_history_api_url_targets_fragment_endpoint() {
-        let filter = crate::templates::logs::BotHistoryFilter {
-            date: "2026-09-19".into(),
-            bot_name: "Googlebot".into(),
-            host: "example.com".into(),
-            path: "/sitemap.xml".into(),
-            status: "".into(),
-            method: "GET".into(),
-            client_ip: "".into(),
-        };
-        let url = build_history_api_url(&filter, 3, Some(404));
-        assert!(
-            url.starts_with("/api/bots/history?"),
-            "want API prefix: {url}"
-        );
-        assert!(
-            !url.starts_with("/logs/bots/history?"),
-            "want API, not page: {url}"
-        );
-        assert!(url.contains("date=2026-09-19"));
-        assert!(url.contains("bot=Googlebot"));
-        assert!(url.contains("host=example.com"));
-        assert!(url.contains("path=%2Fsitemap.xml"));
-        assert!(url.contains("status=404"));
-        assert!(url.contains("method=GET"));
-        assert!(
-            !url.contains("client_ip="),
-            "empty filter should be omitted"
-        );
-        assert!(url.contains("page=3"));
-    }
-
-    /// Mirror of `build_history_url_omits_empty_filters` for the
-    /// HTMX-fragment variant — pins the exact output format so
-    /// a refactor that introduces a stray `=` doesn't silently
-    /// change the URL the browser caches.
-    #[test]
-    fn build_history_api_url_omits_empty_filters() {
-        let filter = crate::templates::logs::BotHistoryFilter {
-            date: "2026-09-19".into(),
-            ..Default::default()
-        };
-        let url = build_history_api_url(&filter, 1, None);
-        assert_eq!(url, "/api/bots/history?date=2026-09-19&page=1");
-    }
-
     #[tokio::test]
     async fn render_bots_history_with_empty_dir_renders_empty_state() {
         let dir = TempDir::new().expect("tempdir");
@@ -993,19 +1263,14 @@ mod tests {
         assert!(html.contains("Googlebot"), "Googlebot row missing: {html}");
         assert!(html.contains("bingbot"), "bingbot row missing: {html}");
         assert!(html.contains("a.example.com"), "host missing: {html}");
-        // Date sidebar lists today.
+        // Date sidebar lists today as a full-page link.
         assert!(
-            html.contains(&today.to_string()),
+            html.contains(&format!("href=\"/logs/bots/history?date={today}")),
             "date sidebar missing today: {html}"
         );
-        // HTMX wiring.
         assert!(
-            html.contains("hx-get=\"/api/bots/history"),
-            "HTMX endpoint not wired: {html}"
-        );
-        assert!(
-            html.contains("hx-target=\"#bots-history-result\""),
-            "HTMX target id missing: {html}"
+            !html.contains("hx-"),
+            "history page must reload instead of swapping a fragment: {html}"
         );
     }
 
@@ -1047,46 +1312,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_bots_history_returns_fragment_only() {
-        let today = chrono::Utc::now().date_naive();
-        let entries = vec![bot_entry_with(
-            "Googlebot",
-            "Google",
-            "example.com",
-            "/sitemap.xml",
-            0,
-        )];
-        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
-        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
-
-        let resp = api_bots_history(&app, b"")
-            .await
-            .expect("api_bots_history should succeed");
-        assert_eq!(resp.status(), http::StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .expect("collect body")
-            .to_bytes();
-        let html = String::from_utf8(body.to_vec()).expect("utf-8");
-
-        // Fragment must wrap the result region with the
-        // HTMX-target id so the next swap works.
-        assert!(
-            html.contains("id=\"bots-history-result\""),
-            "result wrapper missing: {html}"
-        );
-        // And must NOT include the page-level chrome (sub-nav /
-        // form / sidebar) — those are stable across swaps.
-        assert!(
-            !html.contains("Available dates"),
-            "sidebar leaked into fragment: {html}"
-        );
-        assert!(!html.contains("Apply"), "form leaked into fragment: {html}");
-        // Row content is present.
-        assert!(html.contains("Googlebot"), "row missing: {html}");
-    }
-
-    #[tokio::test]
     async fn history_summary_helpers_handle_zero_total() {
         let s = crate::templates::logs::BotHistorySummary::default();
         assert_eq!(s.start_row(), 0);
@@ -1104,8 +1329,6 @@ mod tests {
             file_bytes: 3_200_000,
             prev_url: Some("/x".into()),
             next_url: Some("/y".into()),
-            prev_api_url: Some("/api/x".into()),
-            next_api_url: Some("/api/y".into()),
             error: None,
         };
         // page 3, size 50 → start = 101, end = 150.
@@ -1135,116 +1358,44 @@ mod tests {
         }
     }
 
-    // ── HTMX wiring + page-clamp regression pins ───────────────────
+    // ── Full-page navigation + page-clamp regression pins ──────────
 
-    /// Regression pin: the form must carry `id="bots-history-form"`
-    /// so the date sidebar links' `hx-include` can find it. If a
-    /// future refactor drops the id, the date sidebar silently
-    /// stops preserving filter state.
+    /// Date sidebar hrefs are full-page GETs that keep the other
+    /// filters. A partial link (`?date=` only) drops the host when
+    /// the operator opens the day in a new tab.
     #[tokio::test]
-    async fn history_page_has_form_id_for_htmx_include() {
-        let (_dir, app) = make_test_app();
-        let resp = render_bots_history(&app, "csrf-token", b"")
-            .await
-            .expect("render_bots_history should succeed");
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .expect("collect body")
-            .to_bytes();
-        let html = String::from_utf8(body.to_vec()).expect("utf-8");
-        assert!(
-            html.contains("id=\"bots-history-form\""),
-            "form id missing — date sidebar hx-include will break: {html}"
-        );
-    }
-
-    /// Regression pin: trigger must be `change` only. Adding
-    /// `submit` to the trigger causes a duplicate request when the
-    /// operator picks a date (`change` fires) then clicks Apply
-    /// (`submit` fires). See design doc for the rationale.
-    #[tokio::test]
-    async fn history_page_htmx_trigger_is_change_only() {
-        let (_dir, app) = make_test_app();
-        let resp = render_bots_history(&app, "csrf-token", b"")
-            .await
-            .expect("render_bots_history should succeed");
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .expect("collect body")
-            .to_bytes();
-        let html = String::from_utf8(body.to_vec()).expect("utf-8");
-        assert!(
-            html.contains("hx-trigger=\"change\""),
-            "expected hx-trigger=\"change\": {html}"
-        );
-        // And specifically not the duplicate-firing combo.
-        assert!(
-            !html.contains("hx-trigger=\"change, submit\""),
-            "hx-trigger=\"change, submit\" causes duplicate requests on date+Apply: {html}"
-        );
-    }
-
-    /// Regression pin: date sidebar links must include the form's
-    /// filters via `hx-include="#bots-history-form [name]:not([name=date])"`.
-    /// The `:not([name=date])` part is critical: without it, the
-    /// form's date input value (the *old* date) overrides the
-    /// link's `?date={{ date }}` and the click silently jumps back
-    /// to the previously selected date. See the template comment
-    /// for the full rationale.
-    #[tokio::test]
-    async fn history_page_date_links_include_form_excluding_date() {
+    async fn history_page_date_links_keep_filters() {
         let today = chrono::Utc::now().date_naive();
         let (_file_dir, bot_dir) = seed_history_file(
             today,
             &[bot_entry_with("Googlebot", "Google", "x.com", "/", 0)],
         );
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
-        let resp = render_bots_history(&app, "csrf-token", b"")
+        let resp = render_bots_history(&app, "csrf-token", b"bot=Googlebot&host=x.com")
             .await
             .expect("render_bots_history should succeed");
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .expect("collect body")
-            .to_bytes();
-        let html = String::from_utf8(body.to_vec()).expect("utf-8");
-        // Must include the form's other fields so filters like
-        // `bot=Googlebot` survive a date change.
+        let html = response_html(resp).await;
         assert!(
-            html.contains("hx-include=\"#bots-history-form [name]:not([name=date])\""),
-            "date sidebar links must hx-include the form (excluding date) to preserve filters: {html}"
+            html.contains(&format!(
+                "href=\"/logs/bots/history?date={today}&amp;bot=Googlebot&amp;host=x.com&amp;page=1\""
+            )),
+            "date link must carry bot and host: {html}"
         );
-        // And explicitly NOT include the bare form selector, which
-        // would re-introduce the bug where the form's stale date
-        // overrides the link's target date.
         assert!(
-            !html.contains("hx-include=\"#bots-history-form\""),
-            "bare hx-include without :not([name=date]) would let stale form date win: {html}"
+            !html.contains("hx-"),
+            "history page must not use HTMX: {html}"
         );
     }
 
-    /// Regression pin: Prev/Next pagination buttons must use
-    /// the `/api/bots/history` fragment endpoint for `hx-get`,
-    /// NOT the full-page `/logs/bots/history` route. The page
-    /// route returns the entire layout (header, sub-nav,
-    /// sidebar, form + result), so a `hx-swap="outerHTML"` of
-    /// it into `#bots-history-result` nests the layout inside
-    /// itself — visible as a duplicated Pangolin header, a
-    /// duplicated "Bot Logs" title, a duplicated sub-nav, and
-    /// a duplicated sidebar inside what should be just the
-    /// table area.
-    ///
-    /// `href` must still point at the page URL — middle-click
-    /// / bookmark / no-JS fallback needs a bookmarkable URL,
-    /// not an HTMX fragment. The bug was that both `href` and
-    /// `hx-get` pointed at the page URL.
+    /// Prev reloads the history page itself. The previous version
+    /// fetched `/api/bots/history`, and a refresh of that URL
+    /// showed only the table fragment.
     #[tokio::test]
-    async fn history_pagination_links_use_fragment_endpoint() {
+    async fn history_pagination_links_reload_the_page() {
         let today = chrono::Utc::now().date_naive();
         // 60 entries → page_size=50 → total_pages=2. Land on
         // page 2 so the Prev button is the only one rendered
-        // (no Next because we're on the last page). A single
-        // button is enough to assert both href (page route)
-        // and hx-get (fragment route) on the same `<a>` tag.
+        // (no Next because we're on the last page).
         let entries: Vec<BotLogEntry> = (0..60)
             .map(|i| bot_entry_with("Googlebot", "Google", "x.com", &format!("/p{i}"), i * 1000))
             .collect();
@@ -1260,32 +1411,13 @@ mod tests {
             .to_bytes();
         let html = String::from_utf8(body.to_vec()).expect("utf-8");
 
-        // The killer assertion: no `hx-get` anywhere in the
-        // page may target the full page route. (The date
-        // sidebar links and the filter form already target
-        // `/api/bots/history` correctly — this catches a
-        // regression in the pagination buttons specifically,
-        // since they sit behind `summary.prev_api_url` /
-        // `summary.next_api_url`.)
-        assert!(
-            !html.contains("hx-get=\"/logs/bots/history"),
-            "hx-get must not target full page route — pagination would nest the layout: {html}"
-        );
-
-        // And specifically, the Prev button's hx-get must
-        // target the fragment endpoint with `page=1` baked in.
-        // (`&amp;` because askama HTML-escapes the `&` in the
-        // attribute value; the underlying URL is still `&page=1`.)
-        assert!(
-            html.contains("hx-get=\"/api/bots/history?date=") && html.contains("&amp;page=1\""),
-            "Prev hx-get must target /api/bots/history with page=1: {html}"
-        );
-
-        // The Prev button's href must STILL point at the full
-        // page route — that's the bookmarkable / no-JS URL.
         assert!(
             html.contains("href=\"/logs/bots/history?date=") && html.contains("&amp;page=1\""),
-            "Prev href must target /logs/bots/history for bookmark / no-JS fallback: {html}"
+            "Prev href must reload /logs/bots/history with page=1: {html}"
+        );
+        assert!(
+            !html.contains("/api/bots/history"),
+            "pagination must not point at a fragment endpoint: {html}"
         );
     }
 
@@ -1351,5 +1483,274 @@ mod tests {
             !html.contains("Query failed"),
             "error banner should not render on success: {html}"
         );
+    }
+
+    /// Stats is its own page. A date starts at the host picker.
+    /// A host opens that day's crawl summary: the lead bot, status
+    /// counts, crawl files, then bots and paths. Non-200 paths and
+    /// the crawl files sit above the healthy path list. A bot opens
+    /// its paths with non-200 first. A path opens the bots that hit
+    /// it. History stays the row list.
+    #[tokio::test]
+    async fn history_stats_page_rolls_up_selected_host() {
+        let today = chrono::Utc::now().date_naive();
+        let mut gone = bot_entry_with("googlebot", "Google", "a.com", "/gone", 4_000);
+        gone.status = 404;
+        let mut old = bot_entry_with("googlebot", "Google", "a.com", "/old", 5_000);
+        old.status = 301;
+        let mut boom = bot_entry_with("googlebot", "Google", "a.com", "/boom", 8_000);
+        boom.status = 500;
+        let mut sitemap = bot_entry_with("googlebot", "Google", "a.com", "/sitemap.xml", 6_000);
+        sitemap.status = 404;
+        let entries = vec![
+            bot_entry_with("googlebot", "Google", "a.com", "/x", 0),
+            bot_entry_with("googlebot", "Google", "a.com", "/x", 1_000),
+            bot_entry_with("googlebot", "Google", "a.com", "/y", 2_000),
+            bot_entry_with("bingbot", "Microsoft", "a.com", "/x", 3_000),
+            bot_entry_with("bingbot", "Microsoft", "a.com", "/shared", 0),
+            bot_entry_with("bingbot", "Microsoft", "b.com", "/only-b", 0),
+            bot_entry_with("googlebot", "Google", "a.com", "/robots.txt", 7_000),
+            sitemap,
+            gone,
+            old,
+            boom,
+        ];
+        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+
+        let detail = render_bots_history(&app, "csrf-token", b"")
+            .await
+            .expect("detail render");
+        let detail_html = response_html(detail).await;
+        assert!(
+            detail_html.contains("id=\"bots-history-result\""),
+            "detail list missing: {detail_html}"
+        );
+        assert!(
+            !detail_html.contains("id=\"bots-stats-panel\""),
+            "detail view must not render the stats panel: {detail_html}"
+        );
+        assert!(
+            detail_html.contains("href=\"/logs/bots/stats"),
+            "history page must link to the stats module: {detail_html}"
+        );
+        assert!(
+            !detail_html.contains("view=stats"),
+            "history page must not embed the stats view: {detail_html}"
+        );
+
+        let day = render_bots_stats(&app, "csrf-token", format!("date={today}").as_bytes())
+            .await
+            .expect("stats render for the whole file");
+        let day_html = response_html(day).await;
+        assert!(
+            !day_html.contains("By bot") && !day_html.contains("Needs attention"),
+            "a date alone should stay on the host picker: {day_html}"
+        );
+        assert!(
+            !day_html.contains("Trend"),
+            "the selected date should not expand into more dates: {day_html}"
+        );
+        assert!(
+            day_html.contains("Hosts in this file") && day_html.contains("b.com"),
+            "the host picker should list every host before one is chosen: {day_html}"
+        );
+
+        let query = format!("date={today}&host=a.com");
+        let stats = render_bots_stats(&app, "csrf-token", query.as_bytes())
+            .await
+            .expect("stats render");
+        let html = response_html(stats).await;
+        assert!(
+            html.contains("id=\"bots-stats-panel\""),
+            "stats panel missing: {html}"
+        );
+        assert!(
+            !html.contains("id=\"bots-history-result\""),
+            "stats view must not render the detail table: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"/logs/bots/stats?date={today}&amp;host=a.com\""
+            )),
+            "stats date link must keep the selected host: {html}"
+        );
+        assert!(
+            html.contains("<title>Bot Logs — Stats"),
+            "stats page must be its own document: {html}"
+        );
+        assert!(
+            !html.contains("hx-"),
+            "stats page must reload instead of swapping a fragment: {html}"
+        );
+        assert!(
+            !html.contains("Hosts in this file") && !html.contains("b.com"),
+            "the host picker should leave once a host is selected: {html}"
+        );
+        assert!(
+            html.contains(&format!("href=\"/logs/bots/stats?date={today}\"")),
+            "All hosts should return to the picker: {html}"
+        );
+        assert!(
+            !html.contains("name=\"host\""),
+            "host dropdown duplicates the host table: {html}"
+        );
+        assert!(
+            html.contains("By bot") && html.contains("By path"),
+            "both dimensions missing: {html}"
+        );
+        assert!(
+            !html.contains("Trend"),
+            "host selection should not bring the date chart back: {html}"
+        );
+        assert!(
+            html.contains("id=\"stats-focus\"") && html.contains("googlebot"),
+            "the summary should lead with Googlebot: {html}"
+        );
+        assert!(
+            html.contains("id=\"stats-404\">2<")
+                && html.contains("id=\"stats-301\">1<")
+                && html.contains("id=\"stats-5xx\">1<"),
+            "status counts should be paths, split by 404, 301, and 5xx: {html}"
+        );
+        assert!(
+            html.contains("Needs attention")
+                && html.contains("/robots.txt")
+                && html.contains("/sitemap.xml")
+                && html.contains("/gone"),
+            "crawl files and non-200 paths should sit in Needs attention: {html}"
+        );
+        assert!(html.contains("/x"), "selected host path missing: {html}");
+        assert!(html.contains("/y"), "second path missing: {html}");
+        assert!(
+            html.contains("googlebot 2"),
+            "repeat crawls of one path should merge under that bot: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"/logs/bots/stats?date={today}&amp;host=a.com&amp;bot=googlebot\""
+            )),
+            "a bot row should open that bot's paths: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"/logs/bots/stats?date={today}&amp;host=a.com&amp;path=%2Fx\""
+            )),
+            "a path row should open the bots on that path: {html}"
+        );
+        assert!(
+            !html.contains("/only-b"),
+            "other host's path leaked into the selected-host rollup: {html}"
+        );
+
+        let narrowed = format!("date={today}&host=a.com&bot=googlebot");
+        let filtered = render_bots_stats(&app, "csrf-token", narrowed.as_bytes())
+            .await
+            .expect("bot path-detail render");
+        let filtered_html = response_html(filtered).await;
+        assert!(
+            filtered_html.contains("Paths")
+                && filtered_html.contains("/x")
+                && filtered_html.contains("/y"),
+            "bot drill should list that bot's paths: {filtered_html}"
+        );
+        assert!(
+            !filtered_html.contains("/shared") && !filtered_html.contains("By bot"),
+            "bot drill should leave the summary and the other bot's paths: {filtered_html}"
+        );
+        let boom_at = filtered_html.find(">/boom</a>").expect("404-class path");
+        let x_at = filtered_html.find(">/x</a>").expect("healthy path");
+        assert!(
+            boom_at < x_at,
+            "non-200 paths should lead the bot's path list"
+        );
+        assert!(
+            filtered_html.contains("Back to a.com")
+                && filtered_html.contains(&format!(
+                    "href=\"/logs/bots/stats?date={today}&amp;host=a.com\""
+                )),
+            "a bot drill should link back to the host summary: {filtered_html}"
+        );
+        assert!(
+            filtered_html.contains("from=googlebot"),
+            "opening a path from a bot should remember that bot for Back: {filtered_html}"
+        );
+
+        let nested = format!("date={today}&host=a.com&path=%2Fgone&from=googlebot");
+        let nested_page = render_bots_stats(&app, "csrf-token", nested.as_bytes())
+            .await
+            .expect("path opened from a bot");
+        let nested_html = response_html(nested_page).await;
+        assert!(
+            nested_html.contains("Back to googlebot")
+                && nested_html.contains(&format!(
+                    "href=\"/logs/bots/stats?date={today}&amp;host=a.com&amp;bot=googlebot\""
+                )),
+            "Back from a nested path should return to that bot: {nested_html}"
+        );
+        assert!(
+            !filtered_html.contains("Hosts in this file") && !filtered_html.contains("host=b.com"),
+            "a drilled host should not bring the host picker back: {filtered_html}"
+        );
+
+        let path_drill = format!("date={today}&host=a.com&path=%2Fx");
+        let path_page = render_bots_stats(&app, "csrf-token", path_drill.as_bytes())
+            .await
+            .expect("path bot-detail render");
+        let path_html = response_html(path_page).await;
+        assert!(
+            path_html.contains("Bots")
+                && path_html.contains("googlebot")
+                && path_html.contains("bingbot"),
+            "path drill should list the bots that hit it: {path_html}"
+        );
+        assert!(
+            path_html.contains("Back to a.com"),
+            "a path drill should link back to the host summary: {path_html}"
+        );
+        assert!(
+            !path_html.contains("/y") && !path_html.contains("By path"),
+            "path drill should not keep the path summary or other paths: {path_html}"
+        );
+        assert!(
+            path_html.contains(&format!(
+                "href=\"/logs/bots/stats?date={today}&amp;host=a.com&amp;bot=googlebot&amp;from=%2Fx\""
+            )),
+            "a bot in the path drill should open that bot's paths and remember the path: {path_html}"
+        );
+    }
+
+    /// `?view=stats` used to be a mode of the history page. It now
+    /// redirects so a saved link opens the stats module with the
+    /// same date, host, and bot.
+    #[tokio::test]
+    async fn history_view_stats_redirects_to_stats_page() {
+        let (_dir, app) = make_test_app();
+        let resp = render_bots_history(
+            &app,
+            "csrf-token",
+            b"view=stats&date=2026-10-01&host=a.com&bot=Googlebot",
+        )
+        .await
+        .expect("redirect");
+        assert_eq!(resp.status(), http::StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("location")
+            .to_str()
+            .expect("location utf-8");
+        assert_eq!(
+            loc,
+            "/logs/bots/stats?date=2026-10-01&host=a.com&bot=Googlebot"
+        );
+    }
+
+    async fn response_html(resp: Response<Full<Bytes>>) -> String {
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(body.to_vec()).expect("utf-8")
     }
 }

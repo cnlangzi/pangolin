@@ -235,24 +235,36 @@ duckdb -c "
     The hot path owns the strings (`Cow::Owned`) because display
     names come from the knownbots YAML, not a `'static` table.
   - `admin/templates/pages/logs_bots_history.html` — full page
-    with sub-nav (Live / History), date sidebar, filter form,
-    result region.
+    with sub-nav (Live / History / Stats), date sidebar, filter
+    form, result region.
   - `admin/templates/views/bots/_history_result.html` —
-    self-contained fragment (`#bots-history-result` wrapper) for
-    the HTMX swap target. Reused via `{% include %}` from the
-    full page so the JS and no-JS paths render identical HTML.
-  - `admin/src/templates/logs.rs` — `BotLogsHistoryTemplate` (full
-    page) + `BotHistoryResultView` (fragment) + `BotHistoryFilter`
-    + `BotHistorySummary` (carries pre-computed `prev_url` /
+    detail table included by the history page. Filters, the date
+    sidebar, and pagination are full-page GETs to
+    `/logs/bots/history`, so the sidebar highlight and the
+    selected host stay in the same response.
+  - `admin/src/templates/logs.rs` — `BotLogsHistoryTemplate`,
+    `BotLogsStatsTemplate`, `BotHistoryFilter`, and
+    `BotHistorySummary` (carries pre-computed `prev_url` /
     `next_url` so the template doesn't need to construct query
     strings — askama method calls can't take additional args).
-  - `admin/src/routes/logs.rs` — `render_bots_history` (full
-    page), `api_bots_history` (HTMX fragment), shared
-    `build_history_page` async helper that hops to
-    `tokio::task::spawn_blocking` for the JSONL read so the
-    runtime stays responsive on busy days.
+    Date sidebar hrefs are `BotHistoryDateLink`s built in the
+    route for the same reason.
+  - `admin/src/routes/logs.rs` — `render_bots_history` renders
+    the detail list. `render_bots_stats` renders the separate
+    `/logs/bots/stats` page: the sidebar picks one UTC file, and
+    that file starts at a host picker. A host opens one day's
+    crawl summary for that host: Googlebot (or the busiest bot),
+    404/301/5xx path counts, `/robots.txt` and `/sitemap.xml`,
+    then bots and paths. Non-200 paths and those two crawl files
+    stay above the healthy path list. Opening a bot lists that
+    bot's paths, non-200 first. Opening a path lists the bots
+    that hit it, with hits counted on that path only. Other
+    files are not scanned. `?view=stats` on the history URL
+    redirects there. Both hop to `tokio::task::spawn_blocking`
+    for the JSONL read so the runtime stays responsive on busy
+    days.
   - `admin/src/lib.rs` — register `GET /logs/bots/history` and
-    `GET /api/bots/history`.
+    `GET /logs/bots/stats`.
 - **later, separate PRs** — reverse-DNS validation, optional
   `extra_user_agent_patterns` config knob, `Referer` capture in
   `RequestState`.
@@ -265,4 +277,4 @@ duckdb -c "
 | Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
 | Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; `bot.enabled = false` is a no-op fan-out; multi-bot stats aggregation |
-| Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; `api_bots_history` returns the fragment wrapper but not the page-level chrome; `BotHistorySummary` row range + `file_size_human` bucketing |
+| Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
