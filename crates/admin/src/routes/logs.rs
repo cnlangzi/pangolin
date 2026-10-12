@@ -165,6 +165,14 @@ const BOT_STATS_URL_LIMIT: usize = 200;
 /// All filters are optional. Missing / unparseable values
 /// silently fall back to "no filter" — an operator typo in the
 /// host field should show "no results", not a 400.
+///
+/// `exact=1` is a private channel between the stats page and
+/// [`pangolin_core::bot_log::query_history`] — the stats rows
+/// are exact host+path groups, so substring matching would
+/// list `/xyz` under `/x` and inflate the row count past what
+/// the operator clicked. The History form does **not** set
+/// `exact`; the only source of `exact=1` in user-facing URLs
+/// is `detail_entries_url`.
 fn parse_history_params(merged_params: &[u8]) -> HistoryParams {
     let mut p = HistoryParams::default();
     for pair in std::str::from_utf8(merged_params).unwrap_or("").split('&') {
@@ -198,6 +206,13 @@ fn parse_history_params(merged_params: &[u8]) -> HistoryParams {
                     p.page = n;
                 }
             }
+            "exact" => {
+                // Accept `1` / `true` only — any other value
+                // (typos, an operator's URL-hacking) keeps the
+                // safe substring-match behaviour so a bad link
+                // doesn't silently lose rows.
+                p.exact = matches!(val.as_str(), "1" | "true");
+            }
             _ => {}
         }
     }
@@ -214,6 +229,11 @@ struct HistoryParams {
     /// Parsed status code (only set when the input was a valid
     /// `u16`).
     status: Option<u16>,
+    /// `exact=1` switches `host` and `path` from substring to
+    /// equality matching. Only [`detail_entries_url`] sets this;
+    /// the History form leaves it off so free-text search keeps
+    /// its substring semantics.
+    exact: bool,
     /// 1-based page number, defaulted to 1 by `parse_history_params`.
     page: usize,
 }
@@ -224,6 +244,14 @@ struct HistoryParams {
 /// result region). `?view=stats` is the old in-page mode; it
 /// redirects to [`render_bots_stats`] so a saved link still lands
 /// on the rollup.
+///
+/// The redirect normalises `bot` to lowercase: the bot registry
+/// in `bot_log::query_history_stats` is keyed on lowercase ids
+/// (e.g. `"googlebot"`, not `"Googlebot"`), and a saved link
+/// with `bot=Googlebot` would otherwise land on an empty stats
+/// page even when traffic exists. Old History links keep the
+/// raw value for the substring filter, so the case fix is
+/// scoped to the redirect path.
 pub async fn render_bots_history(
     app: &Arc<App>,
     csrf: &str,
@@ -231,10 +259,11 @@ pub async fn render_bots_history(
 ) -> http::Result<Response<Full<Bytes>>> {
     if is_stats_view(merged_params) {
         let p = parse_history_params(merged_params);
+        let bot = p.filter.bot_name.to_ascii_lowercase();
         return Ok(crate::routes::helpers::redirect(&stats_page_url(
             &p.filter.date,
             &p.filter.host,
-            &p.filter.bot_name,
+            &bot,
             &p.filter.path,
         )));
     }
@@ -318,6 +347,7 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
         bot_name: (!filter.bot_name.is_empty()).then(|| filter.bot_name.clone()),
         host: (!filter.host.is_empty()).then(|| filter.host.clone()),
         path: (!filter.path.is_empty()).then(|| filter.path.clone()),
+        exact: p.exact,
         status: p.status,
         method: (!filter.method.is_empty()).then(|| filter.method.clone()),
         client_ip: (!filter.client_ip.is_empty()).then(|| filter.client_ip.clone()),
@@ -375,12 +405,12 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
     // Full-page URLs. A click reloads the document, including the
     // date sidebar, with every current filter preserved.
     let prev_url = if page > 1 && total_pages > 1 {
-        Some(build_history_url(&filter, page - 1, p.status))
+        Some(build_history_url(&filter, page - 1, p.status, p.exact))
     } else {
         None
     };
     let next_url = if page < total_pages {
-        Some(build_history_url(&filter, page + 1, p.status))
+        Some(build_history_url(&filter, page + 1, p.status, p.exact))
     } else {
         None
     };
@@ -395,7 +425,7 @@ async fn build_history_page(dir: &std::path::Path, merged_params: &[u8]) -> Hist
         error,
     };
 
-    let date_links = detail_date_links(&available, &filter, p.status);
+    let date_links = detail_date_links(&available, &filter, p.status, p.exact);
 
     HistoryPageView {
         filter,
@@ -486,7 +516,6 @@ async fn build_stats_page(dir: &std::path::Path, merged_params: &[u8]) -> StatsP
         bot_name: (!filter.bot_name.is_empty()).then(|| filter.bot_name.clone()),
         path: (!filter.path.is_empty()).then(|| filter.path.clone()),
         url_limit: BOT_STATS_URL_LIMIT,
-        trend_dates: Vec::new(),
     };
 
     let dir_owned = dir.to_path_buf();
@@ -532,7 +561,6 @@ fn empty_bot_history_stats() -> pangolin_core::bot_log::BotHistoryStats {
         paths_404: 0,
         paths_301: 0,
         paths_5xx: 0,
-        trend: Vec::new(),
         file_bytes: 0,
     }
 }
@@ -676,7 +704,10 @@ fn stats_back_target(
 }
 
 fn is_stats_crawl_path(path: &str) -> bool {
-    path == "/robots.txt" || path == "/sitemap.xml"
+    // Same predicate as [`pangolin_core::bot_log::is_seo_crawl_path`].
+    // Re-exported here so the template only depends on what the
+    // route module already pulls in.
+    pangolin_core::bot_log::is_seo_crawl_path(path)
 }
 
 fn seo_file_row(
@@ -732,6 +763,7 @@ fn detail_date_links(
     dates: &[chrono::NaiveDate],
     filter: &crate::templates::logs::BotHistoryFilter,
     status: Option<u16>,
+    exact: bool,
 ) -> Vec<BotHistoryDateLink> {
     dates
         .iter()
@@ -741,7 +773,7 @@ fn detail_date_links(
             day.date = date.to_string();
             BotHistoryDateLink {
                 active: day.date == filter.date,
-                href: build_history_url(&day, 1, status),
+                href: build_history_url(&day, 1, status, exact),
                 date,
             }
         })
@@ -798,10 +830,19 @@ fn parse_stats_from(params: &[u8]) -> String {
 }
 
 /// History URL for one stats URL row. Host is the full host from
-/// the file, which the detail filter matches as a substring.
+/// the file.
+///
+/// `exact=1` is appended unconditionally: the stats rows are
+/// exact `(host, path)` groups, and substring matching would
+/// also list `/xyz` under `/x` and `data.com` under `a.com`,
+/// inflating the row count past what the operator just
+/// clicked. The History form keeps substring matching because
+/// `parse_history_params` only sets `exact` when the URL
+/// carries `exact=1`; nothing else in the route or template
+/// emits it.
 fn detail_entries_url(date: &str, host: &str, bot: &str, path: &str) -> String {
     format!(
-        "/logs/bots/history?date={}&host={}&bot={}&path={}",
+        "/logs/bots/history?date={}&host={}&bot={}&path={}&exact=1",
         urlencoding::encode(date),
         urlencoding::encode(host),
         urlencoding::encode(bot),
@@ -817,13 +858,16 @@ fn detail_entries_url(date: &str, host: &str, bot: &str, path: &str) -> String {
 /// common case (spaces, `&`, `=`, slashes in host values, etc.).
 /// The status filter (already validated to `u16` by
 /// `parse_history_params`) is passed in separately so we don't
-/// re-parse the form input.
+/// re-parse the form input. `exact` is threaded through for the
+/// same reason — `exact=1` is a request-scoped channel that has
+/// to survive the Prev/Next click.
 fn build_history_url_query(
     filter: &crate::templates::logs::BotHistoryFilter,
     page: usize,
     status: Option<u16>,
+    exact: bool,
 ) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(8);
+    let mut parts: Vec<String> = Vec::with_capacity(9);
     parts.push(format!("date={}", urlencoding::encode(&filter.date)));
     if !filter.bot_name.is_empty() {
         parts.push(format!("bot={}", urlencoding::encode(&filter.bot_name)));
@@ -833,6 +877,9 @@ fn build_history_url_query(
     }
     if !filter.path.is_empty() {
         parts.push(format!("path={}", urlencoding::encode(&filter.path)));
+    }
+    if exact {
+        parts.push("exact=1".to_string());
     }
     if let Some(s) = status {
         parts.push(format!("status={s}"));
@@ -857,10 +904,11 @@ fn build_history_url(
     filter: &crate::templates::logs::BotHistoryFilter,
     page: usize,
     status: Option<u16>,
+    exact: bool,
 ) -> String {
     format!(
         "/logs/bots/history?{}",
-        build_history_url_query(filter, page, status)
+        build_history_url_query(filter, page, status, exact)
     )
 }
 
@@ -1118,11 +1166,30 @@ mod tests {
         let p = parse_history_params(b"");
         assert_eq!(p.page, 0); // caller (build_history_page) clamps to 1
         assert_eq!(p.status, None);
+        assert!(!p.exact);
         assert!(p.filter.bot_name.is_empty());
         assert!(p.filter.host.is_empty());
         assert!(p.filter.path.is_empty());
         assert!(p.filter.method.is_empty());
         assert!(p.filter.client_ip.is_empty());
+    }
+
+    #[test]
+    fn parse_history_params_accepts_exact_markers() {
+        // Stats sets `exact=1` on its entries links. The History
+        // form leaves `exact` off (substring matching). Anything
+        // other than `1` / `true` must keep substring matching so
+        // a typo'd URL can't silently lose rows.
+        let on: &[&[u8]] = &[b"exact=1", b"exact=true"];
+        for v in on {
+            let p = parse_history_params(v);
+            assert!(p.exact, "expected exact=true for {v:?}");
+        }
+        let off: &[&[u8]] = &[b"exact=0", b"exact=false", b"exact=yes", b"exact=on"];
+        for v in off {
+            let p = parse_history_params(v);
+            assert!(!p.exact, "expected exact=false for {v:?}");
+        }
     }
 
     #[test]
@@ -1175,7 +1242,7 @@ mod tests {
             method: "GET".into(),
             client_ip: "".into(),
         };
-        let url = build_history_url(&filter, 3, Some(404));
+        let url = build_history_url(&filter, 3, Some(404), false);
         assert!(url.starts_with("/logs/bots/history?"));
         assert!(url.contains("date=2026-09-19"));
         assert!(url.contains("bot=Googlebot"));
@@ -1188,6 +1255,10 @@ mod tests {
             "empty filter should be omitted"
         );
         assert!(url.contains("page=3"));
+        assert!(
+            !url.contains("exact="),
+            "exact=0 should be omitted, not encoded"
+        );
     }
 
     #[test]
@@ -1196,8 +1267,27 @@ mod tests {
             date: "2026-09-19".into(),
             ..Default::default()
         };
-        let url = build_history_url(&filter, 1, None);
+        let url = build_history_url(&filter, 1, None, false);
         assert_eq!(url, "/logs/bots/history?date=2026-09-19&page=1");
+    }
+
+    #[test]
+    fn build_history_url_carries_exact_when_set() {
+        // Regression pin: when stats sends the user to History
+        // via `detail_entries_url`, every subsequent pagination
+        // / date-sidebar click must keep `exact=1`, otherwise the
+        // row count silently grows back to substring matching.
+        let filter = crate::templates::logs::BotHistoryFilter {
+            date: "2026-09-19".into(),
+            host: "example.com".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let url = build_history_url(&filter, 2, None, true);
+        assert!(
+            url.contains("exact=1"),
+            "exact=1 must survive pagination: {url}"
+        );
     }
 
     #[tokio::test]
@@ -1742,8 +1832,129 @@ mod tests {
             .expect("location utf-8");
         assert_eq!(
             loc,
-            "/logs/bots/stats?date=2026-10-01&host=a.com&bot=Googlebot"
+            "/logs/bots/stats?date=2026-10-01&host=a.com&bot=googlebot"
         );
+    }
+
+    /// Regression pin for the entries-link inconsistency: clicking
+    /// "entries" from a stats URL row should open History with
+    /// `exact=1` so the row count the operator just clicked does
+    /// not balloon with substring matches.
+    ///
+    /// Without `exact=1` a `/` row would list every path that day,
+    /// and `a.com` would also list `data.com` — the operator would
+    /// see five Googlebot rows when they clicked the one with two
+    /// and lose trust in the numbers.
+    #[tokio::test]
+    async fn stats_entries_link_opens_history_with_exact_match() {
+        let today = chrono::Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.com", "/", 0),
+            bot_entry_with("Googlebot", "Google", "a.com", "/x", 1000),
+            bot_entry_with("Googlebot", "Google", "a.com", "/xyz", 2000),
+            bot_entry_with("Googlebot", "Google", "data.com", "/", 3000),
+        ];
+        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+
+        // Step 1: render the stats page and grab the "entries"
+        // URL on the path row for `/`. The stats rows for
+        // Googlebot on host `a.com` cover the three a.com paths;
+        // the URL for `/` must point at History with `exact=1`.
+        let stats_query = format!("date={today}&host=a.com&bot=Googlebot");
+        let stats = render_bots_stats(&app, "csrf-token", stats_query.as_bytes())
+            .await
+            .expect("stats render");
+        let stats_html = response_html(stats).await;
+        // Each entries link is `href="...">entries</a>` — find the
+        // first one whose href carries `path=` (the path drill's
+        // entries links, not the host picker).
+        let entries_url = stats_html
+            .split("href=\"")
+            .filter_map(|s| {
+                // Take the href up to the next quote, then look
+                // for the `>entries</a>` literal later in the
+                // same chunk to confirm we found a real entries
+                // link rather than the `From`/`Back` summary
+                // links that share `path=` in their query.
+                let href_end = s.find('"')?;
+                let href = &s[..href_end];
+                if href.contains("/logs/bots/history?") && s.contains(">entries</a>") {
+                    Some(href.to_string())
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no entries link in stats page; HTML snippet:\n{}\n\nlast 4000: {}",
+                    &stats_html[..stats_html.len().min(2000)],
+                    &stats_html[stats_html.len().saturating_sub(4000)..]
+                )
+            });
+        assert!(
+            entries_url.contains("exact=1"),
+            "stats entries link must carry exact=1: {entries_url}"
+        );
+        assert!(
+            entries_url.contains("/logs/bots/history?"),
+            "entries link must land on /logs/bots/history: {entries_url}"
+        );
+
+        // Step 2: follow the URL. History must show only the
+        // exact (a.com, /) row, not the four other matching rows.
+        // The rendered HTML uses the `&` entity for query-string
+        // `&`; the browser decodes it before sending, so we do
+        // the same before handing the string to the route.
+        let query = entries_url
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or("")
+            .replace("&amp;", "&");
+        let resp = render_bots_history(&app, "csrf-token", query.as_bytes())
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        // The single exact (a.com, /) entry — exactly one row.
+        assert!(
+            html.contains("Showing") && html.contains(">1</span>"),
+            "exact match should return one row, got: {html}"
+        );
+        assert!(
+            !html.contains("data.com"),
+            "host=data.com must not appear under host=a.com"
+        );
+        assert!(
+            !html.contains("/x") && !html.contains("/xyz"),
+            "paths /x and /xyz must not appear under path=/"
+        );
+    }
+
+    /// Symmetry check: the History form leaves `exact` off so
+    /// free-text host/path searches keep their substring
+    /// semantics. A `host=a` filter must still surface
+    /// `data.com`.
+    #[tokio::test]
+    async fn history_form_keeps_substring_match_for_host_filter() {
+        let today = chrono::Utc::now().date_naive();
+        let entries = vec![
+            bot_entry_with("Googlebot", "Google", "a.com", "/", 0),
+            bot_entry_with("Googlebot", "Google", "data.com", "/", 1000),
+        ];
+        let (_file_dir, bot_dir) = seed_history_file(today, &entries);
+        let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
+
+        let resp = render_bots_history(&app, "csrf-token", b"host=a&path=/")
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains(">2</span>"),
+            "substring match should return both rows, got: {html}"
+        );
+        assert!(html.contains("data.com"));
+        assert!(html.contains("a.com"));
     }
 
     async fn response_html(resp: Response<Full<Bytes>>) -> String {

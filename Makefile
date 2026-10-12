@@ -176,11 +176,12 @@ ESBUILD_VERSION  := 0.28.0
 # (e.g. after a previous run that did `cp` rather than `mv`). Plain
 # `mv same-file` errors out and aborts the Make target.
 #
-# Does not run Tailwind. `build-ngx` / `start-ngx` depend on `build-css`
-# so the release binary embeds minified `assets/app.css`. `app.js` is
-# still the tracked source here; esbuild minify stays in the Docker
-# builder stage.
-build:
+# Depends on `build-css` so the local binary embeds the minified
+# `assets/app.css` — matching what the Docker `builder` stage
+# produces. Without this dependency the binary serves an empty
+# stylesheet and the admin UI looks unstyled, even though the
+# code compiled fine. AGENTS.md explains the chain.
+build: build-css
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx -p tun
 	install -m 0755 $(CARGO_TARGET_DIR)/release/ngx $(OUT_DIR)/pangolin-ngx
@@ -479,9 +480,23 @@ start-ngx: build-css build-ngx warn-env-fallback
 # Older files in that directory are left alone. The rows are produced
 # by `BotLogEntry`'s own serializer so the fixture cannot drift from
 # the reader.
-BOT_LOG_DIR := ./logs/bots
+#
+# `BOT_LOG_DIR` defaults to `./logs/bots` — the same path the
+# binary defaults to (`log.bot.dir`). Operators who point the
+# binary at a non-default path via `NGX_LOG__BOT__DIR` should set
+# `BOT_LOG_DIR` to the same value (the Makefile does not auto-read
+# it because the binary is launched as a subshell and the var is
+# not always exported).
+#
+# `--force` lets `init-data` replace existing fixture files
+# (the dev convenience). Without it, `write_dev_fixture` refuses
+# to overwrite any file whose first JSONL line is not on a
+# dev-fixture host, so a real bot-log capture on this host is
+# not silently wiped. See `bot_log::write_dev_fixture` for the
+# full heuristic.
+BOT_LOG_DIR ?= ./logs/bots
 init-data:
-	$(CARGO) run --release -p pangolin-core --example init_bot_logs -- --dir $(BOT_LOG_DIR)
+	$(CARGO) run --release -p pangolin-core --example init_bot_logs -- --dir $(BOT_LOG_DIR) --force
 
 # Stop a foreground `pangolin-ngx` left by a previous `make start-ngx`.
 # Matches the executable name only, so a different program listening on
