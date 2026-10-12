@@ -112,12 +112,11 @@ COPY . .
 # (`tailwindcss` and `esbuild` are on PATH — same approach as
 # `starter/build/docker/dist.dockerfile`, which also calls them bare).
 #
-# Only the production pipeline minifies — local `make build-ui` (dev)
-# runs tailwindcss without `--minify` and skips esbuild entirely. Here
-# in the `builder` stage, esbuild overwrites `assets/app.js` in-place
-# with the minified bundle before `cargo build --release` snapshots
-# the directory into the binary via rust-embed. The binary therefore
-# serves a single `app.js` filename in both dev and prod.
+# CSS matches local `make build-css` (`tailwindcss --minify`). esbuild
+# overwrites `assets/app.js` in-place only in this image build; local
+# binaries keep the tracked `app.js` source. The overwrite happens
+# before `cargo build --release` snapshots the directory into the
+# binary via rust-embed, so both environments serve a single `app.js`.
 RUN tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
     esbuild ./assets/app.js --bundle --minify --format=esm --target=es2020 --allow-overwrite --outfile=./assets/app.js
 
