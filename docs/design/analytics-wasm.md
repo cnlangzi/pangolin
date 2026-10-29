@@ -23,6 +23,15 @@ cannot stall or kill the proxy.
 
 ## Non-goals (v1)
 
+- **Bot log stream coverage.** `pangolin-ngx` already has a separate
+  bot log side-channel that fires only for knownbots-**verified** bots
+  and carries bot-specific fields (`bot_name`, `bot_vendor`,
+  `bot_category`, verbatim `ua`). The WASM hub deliberately does **not**
+  subscribe to it in v1. Plugins that want bot analytics must do their
+  own UA matching (the `user_agent` field is in the `AccessLogEntry`).
+  Adding `streams: ["bot"]` is a v2 extension; the design space and ABI
+  trade-offs are in the discussion above this section. See
+  [`docs/design/bot-log.md`](./bot-log.md) for the existing system.
 - **Response body sampling.** Plugins only see the metadata; body capture
   is its own design and has privacy + size implications.
 - **Header access.** The entry has `host` but not arbitrary request headers.
@@ -38,6 +47,34 @@ cannot stall or kill the proxy.
   state (their linear memory survives for the lifetime of their worker).
   Restarting the proxy starts every plugin from zero.
 
+### Why v1 is access-only, not both streams
+
+Three reasons, listed so a future "why didn't you just include both?"
+reviewer can answer without re-running the analysis:
+
+1. **Two distinct wire shapes.** `AccessLogEntry` and `BotLogEntry` have
+   different field sets (`user_agent` vs `bot_name/vendor/category/full_ua`).
+   Supporting both in v1 means either two ABI functions per plugin, or a
+   synthesised unified entry with `Option`s everywhere. Both add ABI
+   surface for a benefit that is small in v1 (bot-only dashboards can
+   reimplement UA matching from `user_agent`).
+2. **Bot data is a strictly-narrower subset.** Every bot request also
+   flows through the access stream first. A plugin that wants both can
+   do its own UA match against `user_agent` and produce its own
+   `bot_name` guess; that guess will be slightly less authoritative than
+   knownbots-verified, but for analytics (not security gating) the
+   difference is invisible.
+3. **Cleaner isolation.** Bot-specific semantics (verified-only,
+   fail-closed on forged UA) stay inside the existing bot-log subsystem.
+   The WASM hub inherits only the access stream's "every request"
+   semantics — predictable, simple, no "why didn't my plugin see this
+   request" support questions.
+
+A v2 that adds `streams: ["bot"]` is a small, additive change: one more
+subscription on `bot_log_tx`, one more filterable field in the manifest,
+one more exported function in the plugin ABI. We pay no v1 complexity
+for a v2 feature that is well-understood today.
+
 ## Architecture
 
 ```
@@ -50,8 +87,9 @@ cannot stall or kill the proxy.
                   │             │           │              │                  │
                   ▼             ▼           ▼              ▼                  ▼
           access_log_recent  access_   bot_*  sinks    AnalyticsHub      (existing)
-                            log_tx        (verified       │
-                                          UA only)       │
+                            log_tx        (verified       │  ACCESS STREAM ONLY
+                                          UA only)       │  (see "Streams" below)
+                                                         │
                                                          │  per-plugin
                                                          │  mpsc::Sender
                                                          │  (bounded)
@@ -77,6 +115,27 @@ cannot stall or kill the proxy.
 The hot path does not call into wasm. It only does `try_send` to each
 plugin's bounded channel; a full channel drops the sample for that plugin
 only and increments a per-plugin `dropped` counter. The proxy is unaffected.
+
+## Streams (v1: access only)
+
+`pangolin-ngx` has two side-channels that the proxy populates per request:
+
+| Stream | Sink | Shape | Fires when |
+| ------ | ---- | ----- | ---------- |
+| **access** | `access_log_recent`, `access_log_tx` | `AccessLogEntry` | Every proxied request, regardless of UA |
+| bot | `bot_log_recent`, `bot_log_tx`, `bot_stats`, `bot_writer` | `BotLogEntry` | Only when knownbots verifies UA + IP |
+
+**v1: the WASM hub subscribes to the access stream only.** It does **not**
+listen on `bot_log_tx`. Every plugin receives `AccessLogEntry` — never
+`BotLogEntry`. This is a deliberate scope choice (rationale in
+[Non-goals](#non-goals-v1)); the bot stream stays the exclusive domain of
+the existing bot-log subsystem described in
+[`docs/design/bot-log.md`](./bot-log.md).
+
+Plugins that want bot analytics in v1 must do their own UA matching using
+the `user_agent` field of the `AccessLogEntry`. A v2 extension can
+add a manifest `streams: ["access", "bot"]` setting and the matching
+ABI hook; that change is additive and does not affect v1 plugins.
 
 ## Crate layout
 
@@ -423,11 +482,15 @@ Each step ships a regression test pinned by name (see `AGENTS.md`).
 - `crates/pangolin-core/src/traffic.rs` — `TrafficHub`, the closest
   precedent for "side-channel that never blocks the hot path".
 - `crates/pangolin-core/src/bot_log.rs` — async-fan-out pattern
-  (`Mutex<VecDeque>` + `Notify` + spawned writer task).
+  (`Mutex<VecDeque>` + `Notify` + spawned writer task). **Read for the
+  shape, but the WASM hub does not subscribe to this stream in v1.**
 - `crates/pangolin-core/src/app.rs::push_access_log` — single fan-out
-  point we extend.
+  point we extend with one line.
 - `docs/design/access-log.md` — bounded ring buffer + SSE broadcast
   pattern reused for the per-plugin `log()` capture.
 - `docs/design/traffic.md` — "drop-on-overflow is fine" doctrine.
+- `docs/design/bot-log.md` — the bot stream side-channel. The WASM hub
+  does **not** integrate with this subsystem in v1; this doc is referenced
+  only to make the boundary explicit.
 - `wasmtime::Store`, `wasmtime::Module`, `wasmtime::Linker` — Rust API
   docs for the host embedding.
