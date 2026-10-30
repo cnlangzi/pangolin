@@ -92,6 +92,10 @@ webpki-roots = "0.26"
 # Hashing — issue #39 stores `tun.token` as `sha256(token)` hex (V3 migration).
 sha2 = "0.10"
 
+# CIDR parsing / matching for the IP rules (issue #117). The
+# knownbots crate already depends on it for its official IP ranges.
+ipnet = "2"
+
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"

@@ -12,6 +12,8 @@ use http_body_util::Full;
 
 use crate::App;
 use crate::redirect_response;
+use crate::routes::ratelimit::{parse_policy, submitted_custom_429};
+use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{HostMode, Site};
 
 use super::helpers::{assemble_backend_from_form, parse_form};
@@ -40,26 +42,46 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         .and_then(|v| v.parse::<HostMode>().ok())
         .unwrap_or(HostMode::Passthrough);
     let host_custom = params.get("host_custom").cloned().filter(|v| !v.is_empty());
+    // Issue #117: the per-site rate-limit policy. `None` means the
+    // form carried no rate-limit field at all (an API client that
+    // predates the feature) — the site then simply has no policy row
+    // and the default (limits off) applies.
+    let rate_limit = match parse_policy(&params) {
+        Ok(p) => p,
+        Err(e) => {
+            // Keep what the operator typed in the textarea.
+            let policy = RateLimitPolicy {
+                custom_429_body: submitted_custom_429(&params),
+                ..RateLimitPolicy::default()
+            };
+            return render_create_page_with_error(
+                app,
+                Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                policy,
+                &e,
+                Some("rate_limit"),
+                csrf,
+            )
+            .await;
+        }
+    };
 
     // Build a prefill Site from the submitted form values. This is what
     // gets passed back to the template on error so the user doesn't lose
     // their input (name, protocol/host/tunnel selections, host_mode,
     // host_custom) when the server rejects the submission.
-    let prefill = || Site {
-        name: name.clone(),
-        backend: backend.clone(),
-        enabled: true,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        host_mode,
-        host_custom: host_custom.clone(),
-        domain_count: 0,
-    };
+    let prefill = || prefill_site(&name, &backend, host_mode, host_custom.clone());
 
     if name.is_empty() {
         return render_create_page_with_error(
             app,
             Some(prefill()),
+            rate_limit.unwrap_or_default(),
             "Site name is required",
             Some("name"),
             csrf,
@@ -70,6 +92,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         return render_create_page_with_error(
             app,
             Some(prefill()),
+            rate_limit.unwrap_or_default(),
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
@@ -80,6 +103,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         return render_create_page_with_error(
             app,
             Some(prefill()),
+            rate_limit.unwrap_or_default(),
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
@@ -91,10 +115,16 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_site(&db, &site);
+    let limit_result = rate_limit
+        .as_ref()
+        .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p));
     drop(db);
 
     match result {
         Ok(()) => {
+            if let Some(Err(e)) = limit_result {
+                log::warn!("rate limit policy for {name} not saved: {e}");
+            }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
         }
@@ -102,6 +132,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             render_create_page_with_error(
                 app,
                 Some(prefill()),
+                rate_limit.unwrap_or_default(),
                 &format!("Database error: {}", e),
                 None,
                 csrf,
@@ -140,19 +171,47 @@ pub async fn handle_update(
         .and_then(|v| v.parse::<HostMode>().ok())
         .unwrap_or(HostMode::Passthrough);
     let host_custom = params.get("host_custom").cloned().filter(|v| !v.is_empty());
-
-    let prefill = || -> Site {
-        Site {
-            name: name.clone(),
-            backend: backend.clone(),
-            enabled: true,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            host_mode,
-            host_custom: host_custom.clone(),
-            domain_count: 0,
+    // Issue #117: the per-site rate-limit policy. `None` means the
+    // form carried no rate-limit field at all — the existing policy
+    // (if any) is then left untouched.
+    let rate_limit = match parse_policy(&params) {
+        Ok(p) => p,
+        Err(e) => {
+            // Keep what the operator typed in the textarea.
+            let policy = RateLimitPolicy {
+                custom_429_body: submitted_custom_429(&params),
+                ..RateLimitPolicy::default()
+            };
+            return render_edit_page_with_error(
+                app,
+                prefill_site(&name, &backend, host_mode, host_custom.clone()),
+                policy,
+                &e,
+                Some("rate_limit"),
+                csrf,
+            )
+            .await;
         }
     };
+
+    // A form that carries the limit knobs but not the custom-page
+    // textarea (an API client that only knows the numeric knobs) must
+    // not wipe the stored page.
+    let rate_limit = match rate_limit {
+        Some(mut policy) => {
+            if !params.contains_key(crate::routes::ratelimit::CUSTOM_429_FIELD) {
+                let db = app.db.lock().await;
+                policy.custom_429_body = pangolin_core::db::get_site_rate_limit(&db, &name)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.custom_429_body);
+            }
+            Some(policy)
+        }
+        None => None,
+    };
+
+    let prefill = || -> Site { prefill_site(&name, &backend, host_mode, host_custom.clone()) };
 
     // For edit mode, fetch the existing site once so we can fall back to
     // its backend when the submission was empty (better UX than a
@@ -168,21 +227,20 @@ pub async fn handle_update(
     };
     let effective_backend_submitted = backend.clone();
     let backend_for_prefill = existing_backend.unwrap_or(effective_backend_submitted);
-    let prefill_with_fallback = || Site {
-        name: name.clone(),
-        backend: backend_for_prefill.clone(),
-        enabled: true,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        host_mode,
-        host_custom: host_custom.clone(),
-        domain_count: 0,
+    let prefill_with_fallback = || {
+        prefill_site(
+            &name,
+            &backend_for_prefill.clone(),
+            host_mode,
+            host_custom.clone(),
+        )
     };
 
     if backend.is_empty() {
         return render_edit_page_with_error(
             app,
             prefill_with_fallback(),
+            rate_limit.unwrap_or_default(),
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
@@ -193,6 +251,7 @@ pub async fn handle_update(
         return render_edit_page_with_error(
             app,
             prefill(),
+            rate_limit.unwrap_or_default(),
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
@@ -204,10 +263,16 @@ pub async fn handle_update(
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_site(&db, &site);
+    let limit_result = rate_limit
+        .as_ref()
+        .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p));
     drop(db);
 
     match result {
         Ok(()) => {
+            if let Some(Err(e)) = limit_result {
+                log::warn!("rate limit policy for {name} not saved: {e}");
+            }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
         }
@@ -215,12 +280,33 @@ pub async fn handle_update(
             render_edit_page_with_error(
                 app,
                 prefill(),
+                rate_limit.unwrap_or_default(),
                 &format!("Database error: {}", e),
                 None,
                 csrf,
             )
             .await
         }
+    }
+}
+
+/// Rebuild the `Site` shown back to the operator when a submission is
+/// rejected, so they don't lose their input.
+fn prefill_site(
+    name: &str,
+    backend: &str,
+    host_mode: HostMode,
+    host_custom: Option<String>,
+) -> Site {
+    Site {
+        name: name.to_string(),
+        backend: backend.to_string(),
+        enabled: true,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        host_mode,
+        host_custom,
+        domain_count: 0,
     }
 }
 

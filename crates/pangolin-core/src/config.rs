@@ -390,6 +390,11 @@ pub struct TrafficConfig {
 /// All fields have safe defaults — a missing `log.bot:` block in
 /// `ngx.yml` (or no `ngx.yml` at all) produces a working bot log.
 ///
+/// The bot log and the knownbots verifier are **always on** (issue
+/// #117). The former `log.bot.enabled` key has been retired; a
+/// configuration file that still carries it parses fine and logs a
+/// warning naming the key.
+///
 /// The two "growth-cap" fields (`max_file_size_bytes`,
 /// `max_age_days`) are kept in the struct but marked
 /// `#[serde(skip)]` so v1 doesn't expose them to operators. Daily
@@ -398,11 +403,6 @@ pub struct TrafficConfig {
 /// without touching call sites.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BotLogConfig {
-    /// Master switch. When `false`, [`App::push_access_log`](crate::app::App::push_access_log)
-    /// returns before invoking the bot detector so the feature has
-    /// effectively zero cost.
-    #[serde(default = "default_bot_enabled")]
-    pub enabled: bool,
     /// Capacity of the in-memory ring buffer used by `/logs/bots`
     /// late-join replay. Default 200 — bot traffic is sparse so a
     /// smaller buffer than the main access log is fine. Set to 0
@@ -440,10 +440,6 @@ pub struct BotLogConfig {
     /// `0` means "never auto-delete".
     #[serde(skip)]
     pub max_age_days: u32,
-}
-
-fn default_bot_enabled() -> bool {
-    true
 }
 
 fn default_bot_recent() -> usize {
@@ -506,7 +502,6 @@ impl Default for TrafficConfig {
 impl Default for BotLogConfig {
     fn default() -> Self {
         Self {
-            enabled: default_bot_enabled(),
             recent: default_bot_recent(),
             capacity: default_bot_capacity(),
             dir: default_bot_dir(),
@@ -582,11 +577,40 @@ impl Config {
     /// load explicit at the call site.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
+        warn_retired_keys(s);
         Figment::new()
             .merge(Yaml::string(s))
             .merge(Env::prefixed("NGX_").split("__"))
             .extract()
             .map_err(|e| PangolinError::Config(format!("config: {}", e)))
+    }
+}
+
+/// Warn about configuration keys that have been retired.
+///
+/// The key is *not* an error: an old `ngx.yml` must keep working —
+/// the operator just learns that the knob is gone. Today that is
+/// `log.bot.enabled`: the bot log and the knownbots verifier are
+/// always on (issue #117), and a disabled bot log used to silently
+/// turn the gateway's `P-Known-Bot` header into `0`.
+fn warn_retired_keys(s: &str) {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(s) else {
+        // A YAML syntax error is reported by the figment parse below;
+        // don't double-report it here.
+        return;
+    };
+    let Some(log_section) = value.get("log") else {
+        return;
+    };
+    let Some(bot_section) = log_section.get("bot") else {
+        return;
+    };
+    if bot_section.get("enabled").is_some() {
+        log::warn!(
+            "config: `log.bot.enabled` has been retired and is ignored — \
+             the bot log and the knownbots verifier are always on. \
+             Remove the key from your configuration."
+        );
     }
 }
 
@@ -650,6 +674,28 @@ mod tests {
             assert_eq!(c.log.access_log_recent, 100);
             assert_eq!(c.log.access_log_capacity, 1000);
             assert!(c.log.traffic.enabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn retired_bot_enabled_key_still_parses() {
+        // Issue #117: the bot log is always on, so `log.bot.enabled`
+        // was retired. An old configuration file must keep working —
+        // the key is ignored (and `warn_retired_keys` logs a warning
+        // naming it).
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                log:
+                  bot:
+                    enabled: false
+            "#;
+            let c = Config::from_str(s).expect("an old config must still parse");
+            // The key had no effect — the other knobs keep their
+            // defaults.
+            assert_eq!(c.log.bot.recent, 200);
+            assert_eq!(c.log.bot.capacity, 1000);
             Ok(())
         });
     }

@@ -34,6 +34,7 @@ pub mod dashboard;
 pub mod dns;
 pub mod domains;
 pub mod logs;
+pub mod ratelimit;
 pub mod settings;
 pub mod sites;
 pub mod traffic;
@@ -55,6 +56,9 @@ pub use domains::{
 pub use logs::{
     BotHistoryFilter, BotHistorySummary, BotLogsHistoryTemplate, BotLogsStatsTemplate,
     BotLogsTemplate, LogsTemplate, subnav,
+};
+pub use ratelimit::{
+    RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView,
 };
 pub use settings::SettingsTemplate;
 pub use sites::{

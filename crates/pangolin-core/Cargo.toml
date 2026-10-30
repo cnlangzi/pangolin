@@ -11,6 +11,9 @@ rusqlite.workspace = true
 refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
+# Raw-YAML inspection for the retired-key warning (issue #117):
+# `log.bot.enabled` is gone but an old config must still parse.
+serde_yaml.workspace = true
 figment.workspace = true
 log.workspace = true
 thiserror.workspace = true
@@ -53,6 +56,9 @@ dashmap.workspace = true
 # Bot verification (UA + official IP ranges / RDNS). Side-channel only;
 # the request hot path calls `verify` synchronously and never awaits.
 knownbots = { path = "../knownbots" }
+
+# CIDR parsing / matching for the per-site IP rules (issue #117).
+ipnet.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
+use crate::ratelimit::{IpRule, RateLimitPolicy, SiteLimitConfig, build_limit_configs};
 use crate::types::{Domain, Site};
 
 /// Site + its domains, as assembled in `Indexes::build`.
@@ -35,6 +36,15 @@ pub struct Indexes {
     pub domain: HashMap<String, Arc<Site>>,
     /// tun_name → domains that route through that tun
     pub tun: HashMap<String, Vec<Arc<Domain>>>,
+    /// site name → effective rate-limit configuration (policy + IP
+    /// rules).
+    ///
+    /// Built in the same pass that assembles the site index, so a
+    /// reload swaps the routing table and the limits together — a
+    /// request never sees the policy of one revision and the rules of
+    /// another. One entry per site; a site without a policy row gets
+    /// the default (limits off) policy.
+    pub limits: HashMap<String, Arc<SiteLimitConfig>>,
 }
 
 impl Indexes {
@@ -48,6 +58,22 @@ impl Indexes {
     /// domains). The relationship is logical: `domains[i].site_name`
     /// must match a `sites[j].name`, otherwise the domain is dropped.
     pub fn build(sites: Vec<Site>, domains: Vec<Domain>) -> Self {
+        Self::build_with_limits(sites, domains, &HashMap::new(), &[])
+    }
+
+    /// Build the indexes together with the per-site rate-limit
+    /// configuration.
+    ///
+    /// `policies` holds the persisted policy of the sites that have
+    /// one; `rules` holds the global and site-scoped IP rules. A
+    /// policy row whose site no longer exists is ignored, the same way
+    /// a `domains` row without a matching site is ignored.
+    pub fn build_with_limits(
+        sites: Vec<Site>,
+        domains: Vec<Domain>,
+        policies: &HashMap<String, RateLimitPolicy>,
+        rules: &[IpRule],
+    ) -> Self {
         // 1. Wrap sites in Arc and group domains by site_name.
         let mut sites_arc: Vec<Arc<Site>> = sites.into_iter().map(Arc::new).collect();
         // Sort sites by name for deterministic iteration order.
@@ -88,9 +114,14 @@ impl Indexes {
         // 4. tunIndex: sites whose backend has `tun_name:` prefix.
         let tun_idx = rebuild_tun_index(&sites_with_domains);
 
+        // 5. limits: one entry per site, merged with the global rules.
+        let site_names: Vec<String> = sites_arc.iter().map(|s| s.name.clone()).collect();
+        let limits = build_limit_configs(&site_names, policies, rules);
+
         Self {
             domain: domain_idx,
             tun: tun_idx,
+            limits,
         }
     }
 }

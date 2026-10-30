@@ -14,6 +14,7 @@ use http_body_util::Full;
 
 use crate::App;
 use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
+use pangolin_core::ratelimit::RateLimitPolicy;
 
 type Resp = Response<Full<Bytes>>;
 
@@ -61,6 +62,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         active_nav: "sites",
         tunnels,
         action: "create",
+        rate_limit: RateLimitPolicy::default(),
     }
     .render()
     .unwrap();
@@ -81,6 +83,11 @@ pub async fn render_edit_page(
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let tunnels = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     let site = sites.into_iter().find(|s| s.name == name);
+    // Issue #117: the per-site rate-limit policy.
+    let rate_limit = pangolin_core::db::get_site_rate_limit(&db, &name)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     drop(db);
     let html = SitesEditTemplate {
         site,
@@ -89,6 +96,7 @@ pub async fn render_edit_page(
         active_nav: "sites",
         tunnels,
         action: "update",
+        rate_limit,
     }
     .render()
     .unwrap();
@@ -101,6 +109,7 @@ pub async fn render_edit_page(
 pub(super) async fn render_create_page_with_error(
     app: &Arc<App>,
     prefill: Option<pangolin_core::types::Site>,
+    rate_limit: RateLimitPolicy,
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
@@ -116,6 +125,7 @@ pub(super) async fn render_create_page_with_error(
         active_nav: "sites",
         tunnels,
         action: "create",
+        rate_limit,
     }
     .render()
     .unwrap();
@@ -127,6 +137,7 @@ pub(super) async fn render_create_page_with_error(
 pub(super) async fn render_edit_page_with_error(
     app: &Arc<App>,
     prefill: pangolin_core::types::Site,
+    rate_limit: RateLimitPolicy,
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
@@ -142,6 +153,7 @@ pub(super) async fn render_edit_page_with_error(
         active_nav: "sites",
         tunnels,
         action: "update",
+        rate_limit,
     }
     .render()
     .unwrap();

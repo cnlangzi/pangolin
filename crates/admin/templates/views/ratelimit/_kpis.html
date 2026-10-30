@@ -1,0 +1,32 @@
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 md:gap-4 mb-6">
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Limited sites</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.totals.enabled_sites }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">of {{ snap.sites.len() }} sites</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Counted</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.totals.counted }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">requests counted</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Over limit</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-amber-600 dark:text-amber-400">{{ snap.totals.over_events }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">limit events</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">429 sent</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-red-600 dark:text-red-400">{{ snap.totals.throttled }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">throttled requests</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Rule blocks</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-red-600 dark:text-red-400">{{ snap.totals.rule_blocks }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">403 answers</div>
+  </div>
+  <div class="card p-4">
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Exempt</div>
+    <div class="mt-1 text-2xl font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">{{ snap.totals.exempt }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">allow-listed / known bots</div>
+  </div>
+</div>

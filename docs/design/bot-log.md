@@ -15,7 +15,7 @@ For the corresponding config keys, see
 | ---- | ----- |
 | Give SEO / DevRel teams a queryable record of "who hit what, when, with which UA" | JSONL is the wire format; `jq` and DuckDB pick it up natively |
 | Persist across process restarts | In-memory ring buffers do not — the JSONL file does |
-| Stay zero-cost for non-bot traffic | The detector short-circuits on the first branch when `bot.enabled = false` and on every `None` UA / `None` bot identity result |
+| Stay zero-cost for non-bot traffic | The detector short-circuits on every `None` UA / `None` bot identity result |
 | Not regress the existing access log | `AccessLogEntry` is unchanged except for the optional `user_agent` field (back-compat via `#[serde(default, skip_serializing_if = "Option::is_none")]`) |
 
 ## Non-goals
@@ -143,8 +143,9 @@ Wires everything together. New `App` fields:
 - `bot_log_tx: broadcast::Sender<BotLogEntry>`
 - `bot_log_recent: Arc<BotLogBuffer>`
 - `bot_stats: Arc<BotStats>`
-- `bot_writer: Option<Arc<BotLogWriter>>` — `None` when `bot.enabled = false`
-  so the side-channel short-circuits at the very first branch.
+- `bot_writer: Option<Arc<BotLogWriter>>` — always populated (the bot log is
+  always on, see issue #117); the `Option` stays so a caller can build an
+  `App` without the side-channel.
 
 `App::new` spawns the writer task on the current tokio runtime (no-op in
 test contexts without a runtime). `App::push_access_log` runs the fan-out.
@@ -181,7 +182,7 @@ itself does not auto-clean up.
 
 | Failure | Behaviour |
 | ------- | --------- |
-| `bot.enabled = false` | `bot_writer` / `bot_verifier` are `None`; first branch in `push_access_log` returns. |
+| The knownbots verifier cannot be built | `App::new` fails with a configuration error — the verifier is mandatory (issue #117). |
 | `verify_bot` returns `None` (unknown / forged / pending RDNS) | Skip the bot fan-out. The generic access log still fires. |
 | `BotLogWriter::enqueue` queue full (10 000 entries backlogged) | Drop oldest entry, `log::warn!` once. The ring buffer + stats still receive the current entry; only the JSONL write is best-effort. |
 | `tokio::fs::OpenOptions::open` fails on first write | `log::warn!` and drop the batch. The generic access log keeps working. Retry on the next batch. |
@@ -276,5 +277,5 @@ duckdb -c "
 | Unit | `bot::tests::*` | All 5 categories detected, case-insensitive, more-specific patterns shadow generic ones, no duplicate needles, every category has at least one rule |
 | Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
 | Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
-| Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; `bot.enabled = false` is a no-op fan-out; multi-bot stats aggregation |
+| Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |

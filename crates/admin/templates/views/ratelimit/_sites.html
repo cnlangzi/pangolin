@@ -1,0 +1,87 @@
+<div class="card overflow-hidden">
+  <h2 class="px-4 py-3 text-sm font-semibold text-slate-700 dark:text-slate-200 border-b border-slate-200 dark:border-slate-700">Per-site policy</h2>
+  <div class="overflow-x-auto">
+    <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 text-sm">
+      <thead class="bg-slate-50 dark:bg-slate-800/50">
+        <tr>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Site</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Requests</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Pages</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">Clients</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">Counted</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">Over</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">429</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">Untracked</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
+        {% if snap.sites.is_empty() %}
+        <tr><td colspan="8" class="px-4 py-6 text-center text-slate-400">No sites yet.</td></tr>
+        {% else %}
+        {% for row in snap.sites %}
+        <tr>
+          <td class="px-4 py-2 font-mono text-xs">
+            {{ row.site }}
+            {% if !row.enabled %}
+            <span class="ml-1 text-[10px] uppercase tracking-wider text-slate-400">off</span>
+            {% endif %}
+            {% if row.custom_429 %}
+            <span class="ml-1 text-[10px] uppercase tracking-wider text-accent-500">custom 429</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 tabular-nums text-xs">
+            {% if row.req_limit > 0 %}
+            {{ row.req_limit }} / {{ row.req_window_secs }}s
+            {% else %}
+            <span class="text-slate-400">off</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 tabular-nums text-xs">
+            {% if row.page_limit > 0 %}
+            {{ row.page_limit }} / {{ row.page_window_secs }}s
+            {% else %}
+            <span class="text-slate-400">off</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.tracked_clients }} / {{ row.ip_capacity }}</td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.counted }}</td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">
+            {{ row.req_over_events }} / {{ row.page_over_events }}
+          </td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.throttled }}</td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.untracked }}</td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card overflow-hidden mt-4">
+  <h2 class="px-4 py-3 text-sm font-semibold text-slate-700 dark:text-slate-200 border-b border-slate-200 dark:border-slate-700">Top over-limit clients</h2>
+  <div class="overflow-x-auto">
+    <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 text-sm">
+      <thead class="bg-slate-50 dark:bg-slate-800/50">
+        <tr>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Site</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Client IP</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500">Rejections</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
+        {% if snap.top_over.is_empty() %}
+        <tr><td colspan="3" class="px-4 py-6 text-center text-slate-400">No client has been throttled yet.</td></tr>
+        {% else %}
+        {% for row in snap.top_over %}
+        <tr>
+          <td class="px-4 py-2 font-mono text-xs">{{ row.site }}</td>
+          <td class="px-4 py-2 font-mono text-xs">{{ row.ip }}</td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.events }}</td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>

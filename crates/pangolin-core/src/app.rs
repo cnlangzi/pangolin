@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use crate::bot::verify_bot;
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
+use crate::ratelimit::RateLimiter;
 use crate::traffic::TrafficHub;
 use crate::tunnel::YamuxTunnel;
 use crate::{
@@ -358,7 +359,6 @@ pub struct App {
     pub access_log_recent: Arc<AccessLogBuffer>,
     /// Bot log side-channel (searchenginebots).
     ///
-    /// When `config.log.bot.enabled` is `true`,
     /// [`App::push_access_log`] runs knownbots verification on the
     /// request's `User-Agent` + client IP and, **only when verified**,
     /// fans the entry out to:
@@ -385,9 +385,8 @@ pub struct App {
     pub bot_log_recent: Arc<BotLogBuffer>,
     /// Per-(bot, host) hit counters.
     pub bot_stats: Arc<BotStats>,
-    /// Background JSONL writer. `None` when the bot log is
-    /// disabled (`config.log.bot.enabled = false`) — the
-    /// side-channel then short-circuits in `push_access_log`.
+    /// Background JSONL writer. Always populated — the bot log is
+    /// always on (issue #117).
     ///
     /// The writer *exists* in this struct from `App::new` time, but
     /// the task that drains its queue is **not** spawned by `App::new`
@@ -397,7 +396,9 @@ pub struct App {
     /// [`App::start_bot_writer`] exactly once after entering a tokio
     /// runtime (production: inside `block_on_host` in `main.rs`).
     pub bot_writer: Option<Arc<BotLogWriter>>,
-    /// knownbots verifier. `None` when the bot log is disabled.
+    /// knownbots verifier. Always populated — the bot log is always
+    /// on (issue #117).
+    ///
     /// Built in [`App::new`] (sync, loads disk caches); background
     /// RDNS / IP-refresh workers start in [`App::start_bot_writer`].
     pub bot_verifier: Option<Arc<Validator>>,
@@ -419,6 +420,14 @@ pub struct App {
     /// TLS handshake by the SNI callback in `ngx::tls`. See
     /// `docs/design/cert-link.md` for the full design.
     pub cert_links: CertLinkCache,
+    /// Per-site rate limiting (issue #117). Owns the in-memory
+    /// runtime state (the request ring, the page ring and the
+    /// penalty box of every site) plus the snapshot publisher the
+    /// admin UI reads. The *configuration* lives in
+    /// [`Indexes::limits`] so it is swapped atomically with the
+    /// routing table; the counters here are in-memory only and reset
+    /// when the process restarts.
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl App {
@@ -456,9 +465,20 @@ impl App {
         let sites = db::list_sites(&conn)?;
         let domains = db::list_domains(&conn)?;
         let providers = db::list_dns_providers(&conn)?;
-        let indexes = Indexes::build(sites, domains.clone());
+        // Issue #117: the per-site rate limits and the IP rules are
+        // built into the index so a reload swaps the routing table and
+        // the limits together.
+        let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
+        let rules = db::list_ip_rules(&conn).unwrap_or_default();
+        let indexes = Indexes::build_with_limits(sites, domains.clone(), &policies, &rules);
         let dns_index = DnsIndex::build(&providers, &domains);
         let tunnel_set = build_tunnel_domain_set(&indexes);
+
+        // The runtime state of the rate limiter (the rings and the
+        // penalty box) is in-memory only — it starts empty on every
+        // boot.
+        let rate_limiter = RateLimiter::new();
+        rate_limiter.reconfigure(&indexes.limits);
 
         // fix-client-ip: load the singleton system config. V7
         // seeds the row in the migration, so this normally just
@@ -497,12 +517,14 @@ impl App {
         let access_log_recent_capacity = config.log.access_log_recent;
         let (access_log_tx, _initial_rx) = broadcast::channel(access_log_capacity);
 
-        // Bot log side-channel (searchenginebots stage-1). Disabled
-        // → all four fields are inert (broadcast has zero
-        // subscribers, ring buffer is capacity-0, stats has no
-        // rows, writer is None) so the cost of the feature in the
-        // disabled case is a single `if !enabled { return; }` at
-        // the top of `push_access_log`.
+        // Bot log side-channel (searchenginebots stage-1).
+        //
+        // The bot log and the knownbots verifier are **always on**
+        // (issue #117): the rate limiter's known-bot exemption must
+        // be unconditional, and a disabled bot log silently turned
+        // the gateway's `P-Known-Bot` header into `0`. The retired
+        // `log.bot.enabled` key is ignored — `Config::from_str`
+        // warns about it.
         //
         // The writer *object* is built here, but the task that
         // drains its queue is NOT spawned here. `App::new` runs
@@ -519,25 +541,21 @@ impl App {
         let (bot_log_tx, _initial_bot_rx) = broadcast::channel(bot_cfg.capacity.max(1));
         let bot_log_recent = Arc::new(BotLogBuffer::new(bot_cfg.recent));
         let bot_stats = BotStats::new();
-        let (bot_writer, bot_verifier) = if bot_cfg.enabled {
-            let refresh = if bot_cfg.refresh_interval_secs == 0 {
-                // Effectively disable periodic refresh; workers still
-                // handle cold RDNS. A very large interval is fine.
-                std::time::Duration::from_secs(u64::MAX / 4)
-            } else {
-                std::time::Duration::from_secs(bot_cfg.refresh_interval_secs)
-            };
-            let verifier = Validator::new(ValidatorOptions {
-                root: bot_cfg.cache_dir.clone(),
-                refresh_interval: refresh,
-                ..ValidatorOptions::default()
-            })
-            .map_err(|e| crate::PangolinError::Config(format!("knownbots init failed: {e}")))?;
-            (Some(BotLogWriter::new(bot_cfg.dir.clone())), Some(verifier))
+        let refresh = if bot_cfg.refresh_interval_secs == 0 {
+            // Effectively disable periodic refresh; workers still
+            // handle cold RDNS. A very large interval is fine.
+            std::time::Duration::from_secs(u64::MAX / 4)
         } else {
-            log::info!("bot log side-channel disabled by log.bot.enabled=false");
-            (None, None)
+            std::time::Duration::from_secs(bot_cfg.refresh_interval_secs)
         };
+        let verifier = Validator::new(ValidatorOptions {
+            root: bot_cfg.cache_dir.clone(),
+            refresh_interval: refresh,
+            ..ValidatorOptions::default()
+        })
+        .map_err(|e| crate::PangolinError::Config(format!("knownbots init failed: {e}")))?;
+        let bot_writer = Some(BotLogWriter::new(bot_cfg.dir.clone()));
+        let bot_verifier = Some(verifier);
 
         let traffic_enabled = config.log.traffic.enabled;
         Ok(Self {
@@ -564,6 +582,7 @@ impl App {
             bot_writer_task: parking_lot::Mutex::new(None),
             cert_links,
             traffic: TrafficHub::new(traffic_enabled),
+            rate_limiter,
         })
     }
 
@@ -591,13 +610,21 @@ impl App {
         let sites = db::list_sites(&conn).unwrap_or_default();
         let domains = db::list_domains(&conn).unwrap_or_default();
         let providers = db::list_dns_providers(&conn).unwrap_or_default();
-        let indexes = Indexes::build(sites, domains.clone());
+        // Issue #117: reload the per-site rate limits + IP rules with
+        // the routing table.
+        let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
+        let rules = db::list_ip_rules(&conn).unwrap_or_default();
+        let indexes = Indexes::build_with_limits(sites, domains.clone(), &policies, &rules);
         let dns_index = DnsIndex::build(&providers, &domains);
         // Sync mirror: every domain that resolves to a tunnel-backed
         // site. The TLS ALPN callback consults this set on the
         // handshake hot path. We derive it from the freshly-built
         // `indexes` (single source of truth) so the two never drift.
         let tunnel_set = build_tunnel_domain_set(&indexes);
+        // Reconfigure the rate limiter *before* the new index becomes
+        // visible: the runtime state (rings, penalty box) must exist
+        // by the time a request sees the new policy.
+        self.rate_limiter.reconfigure(&indexes.limits);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
         // fix-client-ip: reload the singleton. A missing row is
@@ -697,9 +724,10 @@ impl App {
         //    SSE endpoint's responsibility to surface.
         let _ = self.access_log_tx.send(entry.clone());
 
-        // 3) Bot side-channel. Short-circuit first on the cheapest
-        //    predicate (`bot_writer.is_none()`) so the disabled
-        //    case is one branch + return.
+        // 3) Bot side-channel. The writer is always present (the bot
+        //    log is always on — issue #117), but the `Option` stays
+        //    so a caller that wants to run without the side-channel
+        //    can build an `App` without one.
         let Some(writer) = self.bot_writer.as_ref() else {
             return;
         };
@@ -767,6 +795,12 @@ impl App {
         self.traffic.snapshot()
     }
 
+    /// Latest rate-limit snapshot (cloned `Arc`). Cheap — no wait on
+    /// the publisher thread.
+    pub fn ratelimit_snapshot(&self) -> Arc<crate::ratelimit::RateLimitSnapshot> {
+        self.rate_limiter.snapshot()
+    }
+
     // traffic fan-out is tested in `traffic::tests` via TrafficHub
     // directly — App just holds the Arc.
 
@@ -775,7 +809,6 @@ impl App {
     /// [`App::new`].
     ///
     /// Returns `true` if the task was spawned, `false` if any of:
-    ///   - the bot log is disabled (`config.log.bot.enabled = false`)
     ///   - no tokio runtime is in scope (e.g. unit tests without
     ///     `#[tokio::test]`)
     ///   - `start_bot_writer` was already called once (idempotent
@@ -1544,9 +1577,8 @@ mod tests {
                 file: String::new(),
                 access_log_recent: recent,
                 access_log_capacity: capacity,
-                // `bot` is overridden per-test by
-                // `make_log_config_with_bot`; the default here keeps
-                // the pre-existing access-log tests compiling.
+                // The bot log is always on (issue #117) — the
+                // defaults are the operator-visible knobs.
                 bot: crate::BotLogConfig::default(),
                 traffic: crate::TrafficConfig::default(),
             },
@@ -1751,22 +1783,34 @@ mod tests {
     // fan-out: every detected bot must land in the four sinks
     // (ring buffer / stats / writer queue / broadcast), and
     // non-bot traffic must NOT touch any of them. They also pin
-    // the "disabled" behaviour — when `log.bot.enabled = false`,
-    // the entire fan-out is skipped at the cheapest branch.
+    // the "always on" behaviour (issue #117): there is no switch
+    // that turns the side-channel off.
 
-    /// Stage-1 helper: build a `Config` with the bot log knobs
-    /// overridden so we can exercise the enabled/disabled paths.
-    fn make_log_config_with_bot(recent: usize, capacity: usize, bot_enabled: bool) -> Config {
-        let mut cfg = make_log_config(recent, capacity);
-        cfg.log.bot.enabled = bot_enabled;
-        cfg
+    #[test]
+    fn bot_log_is_always_on() {
+        // The knownbots verifier and the JSONL writer exist in every
+        // `App` — the rate limiter's known-bot exemption depends on
+        // the verifier being present, and the retired
+        // `log.bot.enabled` key no longer has any effect.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.bot_verifier.is_some(),
+            "the knownbots verifier must always be present"
+        );
+        assert!(
+            app.bot_writer.is_some(),
+            "the bot log writer must always be present"
+        );
     }
 
     #[test]
     fn push_access_log_googlebot_routes_to_bot_sinks() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let cert_mgr = CertManager::default();
         let app = App::new(&db_path, cfg, cert_mgr).unwrap();
         seed_googlebot_cidr(&app);
@@ -1813,7 +1857,7 @@ mod tests {
         // → fail closed, no bot-log entry.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         seed_googlebot_cidr(&app);
 
@@ -1838,7 +1882,7 @@ mod tests {
         // therefore must not produce any bot-side writes.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
 
         let chrome_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -1859,7 +1903,7 @@ mod tests {
         // No UA → detect_bot returns None → bot fan-out skipped.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
 
         // make_entry has user_agent=None.
@@ -1877,7 +1921,7 @@ mod tests {
         // Googlebot UA and a seeded CIDR.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         seed_googlebot_cidr(&app);
 
@@ -1895,22 +1939,23 @@ mod tests {
     }
 
     #[test]
-    fn push_access_log_disabled_skips_bot_fan_out_entirely() {
-        // When `log.bot.enabled = false`, `bot_writer` is None and
-        // the side-channel short-circuits on the very first
-        // branch. The test passes iff `push_access_log` does not
-        // panic and the bot sinks remain empty.
+    fn push_access_log_unverified_ua_never_reaches_the_bot_sinks() {
+        // An unverified claim (the UA says Googlebot but the IP is
+        // not in Google's range) must stay out of every sink — the
+        // side-channel is fail-closed.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, false);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
-        assert!(
-            app.bot_writer.is_none(),
-            "writer must be None when disabled"
-        );
+        seed_googlebot_cidr(&app);
 
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1)";
-        app.push_access_log(make_bot_entry(ua, "/sitemap.xml"));
+        // `make_bot_entry` reports 66.249.66.1 — inside the seeded
+        // Googlebot range. Use an address outside it so the claim
+        // stays unverified.
+        let mut entry = make_bot_entry(ua, "/sitemap.xml");
+        entry.client_ip = "203.0.113.9".into();
+        app.push_access_log(entry);
 
         assert!(app.recent_bot_log().is_empty());
         let (rows, _) = app.bot_stats_snapshot();
@@ -1923,7 +1968,7 @@ mod tests {
         // correct hit counts, summary reflects the total.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         seed_googlebot_cidr(&app);
         app.bot_verifier
@@ -1968,7 +2013,7 @@ mod tests {
     async fn push_access_log_writer_task_writes_jsonl_to_disk() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let mut cfg = make_log_config_with_bot(50, 16, true);
+        let mut cfg = make_log_config(50, 16);
         // Point the writer at the same tempdir so we can read the
         // file back without crossing mount points.
         cfg.log.bot.dir = dir.path().to_path_buf();
@@ -2047,7 +2092,7 @@ mod tests {
     fn start_bot_writer_no_runtime_returns_false_without_panic() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         // No `#[tokio::test]` ⇒ no runtime in scope. The call
         // must NOT panic and must NOT spawn the task; instead it
@@ -2061,7 +2106,7 @@ mod tests {
     async fn start_bot_writer_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let cfg = make_log_config_with_bot(50, 16, true);
+        let cfg = make_log_config(50, 16);
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         assert!(app.start_bot_writer(), "first spawn must succeed");
         assert!(

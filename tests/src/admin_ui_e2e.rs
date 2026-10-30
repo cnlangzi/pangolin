@@ -3813,3 +3813,192 @@ async fn dns_hx_delete_no_csrf_forbidden() {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// ── §19 — Per-site rate limiting (issue #117) ───────────────────────────────
+
+/// The site form persists the per-site rate-limit policy, and the
+/// `/ratelimit` page shows the policy of every site.
+#[tokio::test]
+async fn ratelimit_site_form_persists_the_policy() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // Create the site with a rate-limit policy.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "limited"),
+                ("rate_limit_enabled", "on"),
+                ("rate_limit_req_limit", "42"),
+                ("rate_limit_req_window_secs", "60"),
+                ("rate_limit_page_limit", "7"),
+                ("rate_limit_page_window_secs", "3600"),
+                ("rate_limit_ip_capacity", "1024"),
+                ("rate_limit_throttle_capacity", "2048"),
+                ("rate_limit_throttle_secs", "600"),
+                (
+                    "rate_limit_custom_429_body",
+                    "<!DOCTYPE html><html><body><h1 id=\"custom\">Slow down</h1></body></html>",
+                ),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "create should redirect, got {}",
+        resp.status()
+    );
+
+    // The policy landed in the database.
+    {
+        let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+        let req_limit: i64 = conn
+            .query_row(
+                "SELECT req_limit FROM site_rate_limits WHERE site_name = 'limited'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the policy row must exist");
+        assert_eq!(req_limit, 42);
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM site_rate_limits WHERE site_name = 'limited'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the policy row must exist");
+        assert_eq!(enabled, 1, "the policy must be enabled");
+        let custom: String = conn
+            .query_row(
+                "SELECT custom_429_body FROM site_rate_limits WHERE site_name = 'limited'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the policy row must exist");
+        assert!(
+            custom.contains(r#"id="custom""#),
+            "the custom 429 page must be stored: {custom}"
+        );
+    }
+
+    // The edit form shows the stored policy.
+    let edit = client
+        .get("/sites/edit?name=limited")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        edit.contains(r#"name="rate_limit_req_limit""#),
+        "the edit form must carry the rate-limit fields: {edit}"
+    );
+    assert!(
+        edit.contains(r#"value="42""#),
+        "the edit form must show the stored request limit: {edit}"
+    );
+
+    // The /ratelimit page lists the site and its policy. The page
+    // renders the published snapshot, which the background thread
+    // refreshes once per second — so poll for the new site instead
+    // of assuming it is there on the first paint.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let page = client.get("/ratelimit").await.unwrap();
+        assert_eq!(page.status().as_u16(), 200);
+        html = page.text().await.unwrap();
+        // The policy summary of the per-site table is the marker — the
+        // site name also shows up in the scope picker of the "add
+        // rule" form.
+        if html.contains("42 / 60s") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("42 / 60s"),
+        "the policy summary must be rendered: {html}"
+    );
+
+    // The HTMX fragments answer too.
+    for path in [
+        "/api/ratelimit/kpis",
+        "/api/ratelimit/sites",
+        "/api/ratelimit/rules",
+    ] {
+        let resp = client.get(path).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{path} must answer 200");
+    }
+}
+
+/// An IP rule can be added through the `/ratelimit` page and removed
+/// again with the HTMX delete endpoint.
+#[tokio::test]
+async fn ratelimit_ip_rule_add_and_delete() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let page = client.get("/ratelimit").await.unwrap();
+    let html = page.text().await.unwrap();
+    let csrf = client.csrf_token(&html).unwrap_or_default();
+
+    let resp = client
+        .post_form(
+            "/ratelimit/rules",
+            &[
+                ("scope", "global"),
+                ("kind", "blacklist"),
+                ("cidr", "203.0.113.0/24"),
+                ("note", "scrapers"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302, "add should redirect");
+
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ip_rules", [], |r| r.get(0))
+        .expect("count ip_rules");
+    assert_eq!(count, 1, "the rule must be stored");
+
+    // The rules fragment renders it.
+    let resp = client.get("/api/ratelimit/rules").await.unwrap();
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("203.0.113.0/24"), "{html}");
+
+    // The HTMX delete removes it.
+    let resp = client
+        .delete_form(
+            "/api/ratelimit/rules",
+            &[
+                ("scope", "global"),
+                ("kind", "blacklist"),
+                ("cidr", "203.0.113.0/24"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ip_rules", [], |r| r.get(0))
+        .expect("count ip_rules");
+    assert_eq!(count, 0, "the rule must be gone");
+}

@@ -1,0 +1,47 @@
+<div class="card overflow-hidden">
+  <h2 class="px-4 py-3 text-sm font-semibold text-slate-700 dark:text-slate-200 border-b border-slate-200 dark:border-slate-700">IP rules</h2>
+  <div class="overflow-x-auto">
+    <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700 text-sm">
+      <thead class="bg-slate-50 dark:bg-slate-800/50">
+        <tr>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Scope</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Kind</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Address</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Note</th>
+          <th class="px-4 py-2 text-right font-medium text-slate-500"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
+        {% if rules.is_empty() %}
+        <tr><td colspan="5" class="px-4 py-6 text-center text-slate-400">No IP rules yet.</td></tr>
+        {% else %}
+        {% for rule in rules %}
+        <tr>
+          <td class="px-4 py-2 font-mono text-xs">{{ rule.scope }}</td>
+          <td class="px-4 py-2 text-xs">
+            {% if rule.kind.as_str() == "whitelist" %}
+            <span class="text-emerald-600 dark:text-emerald-400">whitelist</span>
+            {% else %}
+            <span class="text-red-600 dark:text-red-400">blacklist</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 font-mono text-xs">{{ rule.cidr }}</td>
+          <td class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400">{{ rule.note.as_deref().unwrap_or("") }}</td>
+          <td class="px-4 py-2 text-right">
+            <button hx-delete="/api/ratelimit/rules?scope={{ rule.scope }}&kind={{ rule.kind }}&cidr={{ rule.cidr }}"
+              hx-vals='{"_csrf": "__CSRF__"}'
+              hx-confirm="Delete rule {{ rule.cidr }}?"
+              hx-swap="delete"
+              hx-target="closest tr"
+              class="text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+              title="Delete">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>

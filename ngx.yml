@@ -138,8 +138,12 @@ log:
   # the detector runs only on the hot path's already-built
   # AccessLogEntry.
   #
-  #   * `enabled`     master switch. When false, the entire
-  #                   side-channel is bypassed at zero cost.
+  # The side-channel is always on — the rate limiter's known-bot
+  # exemption depends on it, and a disabled bot log used to silently
+  # turn the gateway's `P-Known-Bot` header into `0`. The old
+  # `enabled` key is retired: a config that still carries it parses
+  # fine and logs a warning.
+  #
   #   * `recent`      in-memory ring buffer for `/logs/bots`
   #                   late-join replay. 0 disables replay; the
   #                   live SSE + JSONL still work. Default 200.
@@ -148,7 +152,6 @@ log:
   #   * `dir`         output directory for `bot-YYYY-MM-DD.jsonl`.
   #                   Created lazily on first write.
   bot:
-    enabled: true
     recent: 200
     capacity: 1000
     dir: ./logs/bots
