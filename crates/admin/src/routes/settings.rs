@@ -39,10 +39,12 @@ async fn render_page(
             pangolin_core::FrontendMode::Cloudflare => "cloudflare",
             pangolin_core::FrontendMode::CustomLb => "custom_lb",
         },
-        // Display the current value as JSON in the textarea so the
-        // operator sees what they have. Empty list renders as `[]`
-        // (a valid JSON array) rather than blank.
-        trusted_headers_json: render_trusted_headers(&cfg.trusted_headers),
+        pgl_headers_enabled: cfg.pgl_headers_enabled,
+        // The header keys are rendered as plain text inputs; an
+        // unset key renders as an empty field ("not configured").
+        client_ip_header: cfg.client_ip_header.as_deref().unwrap_or(""),
+        client_country_header: cfg.client_country_header.as_deref().unwrap_or(""),
+        client_region_header: cfg.client_region_header.as_deref().unwrap_or(""),
         updated_at: cfg.updated_at.to_rfc3339(),
         error,
         active_nav: "settings",
@@ -86,12 +88,4 @@ pub async fn handle_update_settings(
         }
         Err(msg) => render_page(app, csrf, Some(&msg)).await,
     }
-}
-
-/// Render `headers` as the textarea default value.
-///
-/// * `[]` (empty) → `"[]"` so the textarea is never blank and
-///   remains valid JSON.
-fn render_trusted_headers(headers: &[String]) -> String {
-    serde_json::to_string(headers).unwrap_or_else(|_| "[]".to_string())
 }

@@ -117,12 +117,19 @@ pub struct ProxyCtx {
     pub original_scheme: Scheme,   // scheme the client used
     pub host_mode:       HostMode, // per-site
     pub host_custom:     Option<String>, // when host_mode=Custom
+    pub peer_ip:         Option<String>, // the TCP peer (appended to X-Forwarded-For)
 }
 ```
 
 Carries the inputs needed to apply the proxy policy. The
 `original_host` is preserved through the entire request lifecycle so
 that `X-Forwarded-Host` can echo it back.
+
+`peer_ip` is the address of the host we accepted the connection
+from — the **hop path**, not the visitor. It is the only value
+`apply_proxy_policy` appends to `X-Forwarded-For`. The visitor's own
+address travels in the `P-Client-Ip` gateway header (see
+[gateway-headers.md](gateway-headers.md)).
 
 ### 4.3 `apply_proxy_policy` — the shared policy application layer
 
@@ -198,6 +205,7 @@ pub struct TunnelHttpFrame {
     pub host_custom: Option<String>,
     pub is_upgrade:  bool,          // WebSocket upgrade flag
     pub is_streaming: bool,         // SSE / chunked streaming response
+    pub peer_ip:     Option<String>, // the TCP peer (appended to X-Forwarded-For)
 }
 
 pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8>;
@@ -484,6 +492,9 @@ These are the testable contracts. Each row gets a unit test in
 | I-22 | Tunnel WS upgrade: `host_mode` rewrites Host | `real_e2e_tunnel_ws_upgrade_host_mode` |
 | I-23 | Tunnel + https backend: TLS works through pingora client | `real_e2e_tunnel_https_backend` |
 | I-24 | Direct + `host_mode`: same behaviour as tunnel + `host_mode` | `real_e2e_direct_host_mode_parity` |
+| I-25 | Every forwarded request carries exactly one of each `P-*` gateway header | `real_e2e_proxy_injects_x_forwarded_headers_all_paths`, `real_e2e_gateway_headers_reach_the_backend_through_the_tunnel` |
+| I-26 | A client-supplied `P-*` header is replaced by pangolin's value | `real_e2e_gateway_headers_replace_client_supplied_values` |
+| I-27 | `X-Real-IP` is never emitted | `apply_proxy_policy_appends_peer_ip_to_xff_chain`, `real_e2e_proxy_injects_x_forwarded_headers_all_paths` |
 
 ---
 
@@ -558,6 +569,12 @@ To keep the scope tight:
   ([tunnel.md](tunnel.md) gap #7).
 - **No changes to admin UI, ACME, cert management, DNS
   providers.** Out of scope.
+- **No stripping of Cloudflare's own headers.** The `P-*` gateway
+  headers are added and the client-supplied copies of *those* names
+  are removed, but `CF-Connecting-IP` & friends are forwarded
+  untouched — backends that read them today keep working. The
+  spoofing surface they represent is pre-existing; see
+  [gateway-headers.md](gateway-headers.md).
 
 ---
 

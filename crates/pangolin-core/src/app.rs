@@ -469,7 +469,10 @@ impl App {
             Ok(c) => c,
             Err(rusqlite::Error::QueryReturnedNoRows) => SystemConfig {
                 frontend_mode: FrontendMode::Direct,
-                trusted_headers: Vec::new(),
+                pgl_headers_enabled: true,
+                client_ip_header: None,
+                client_country_header: None,
+                client_region_header: None,
                 updated_at: chrono::Utc::now(),
             },
             Err(e) => return Err(e.into()),
@@ -608,7 +611,10 @@ impl App {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 *self.system_config.write().await = SystemConfig {
                     frontend_mode: FrontendMode::Direct,
-                    trusted_headers: Vec::new(),
+                    pgl_headers_enabled: true,
+                    client_ip_header: None,
+                    client_country_header: None,
+                    client_region_header: None,
                     updated_at: chrono::Utc::now(),
                 };
             }

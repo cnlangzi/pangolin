@@ -53,8 +53,8 @@
           <div>
             <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Custom LB</div>
             <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Read the configured list of headers in priority order; first present + non-empty
-              value wins. Configure the list below.
+              Read the header names configured below — one per value. An unset name yields an
+              empty value.
             </div>
           </div>
         </label>
@@ -62,19 +62,68 @@
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="trusted-headers">
-        Trusted headers
+      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
+           form always carries an explicit value. #}
+        <input type="hidden" name="pgl_headers_enabled" value="false">
+        <input type="checkbox" name="pgl_headers_enabled" value="true" {% if pgl_headers_enabled %}checked{% endif %}
+          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <div>
+          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Gateway headers</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Add <code class="font-mono">P-Known-Bot</code>, <code class="font-mono">P-Client-Ip</code>,
+            <code class="font-mono">P-Client-Country</code> and <code class="font-mono">P-Client-Region</code>
+            to every forwarded request. The names are always stripped from the incoming request,
+            so a client can never impersonate them — only the sending is switched off here.
+          </div>
+        </div>
+      </label>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
+        First-level headers
         <span class="text-xs font-normal text-slate-400 ml-1">(only used when mode is "Custom LB")</span>
       </label>
-      <textarea name="trusted_headers" id="trusted-headers" rows="3"
-        class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
-        placeholder='["X-Real-IP"]'
-        spellcheck="false">{{ trusted_headers_json }}</textarea>
-      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-        JSON array of header names in priority order. Example:
-        <code class="font-mono">["X-Real-IP", "X-Forwarded-For"]</code>. Required and must be
-        non-empty when "Custom LB" is selected.
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        The headers your load balancer sets to describe the original visitor. Each field is
+        independent: leave one empty and the matching value stays empty.
       </p>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-ip-header">
+            Client IP
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+          </label>
+          <input type="text" name="client_ip_header" id="client-ip-header"
+            value="{{ client_ip_header }}"
+            placeholder="X-Client-IP"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-country-header">
+            Client country
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+          </label>
+          <input type="text" name="client_country_header" id="client-country-header"
+            value="{{ client_country_header }}"
+            placeholder="X-Client-Country"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-region-header">
+            Client region
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+          </label>
+          <input type="text" name="client_region_header" id="client-region-header"
+            value="{{ client_region_header }}"
+            placeholder="X-Client-Region"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        </div>
+      </div>
     </div>
 
     {% if let Some(e) = error %}

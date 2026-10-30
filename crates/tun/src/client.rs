@@ -143,7 +143,11 @@ impl TunnelClient {
         let (mut tcp_read, mut tcp_write) = tcp.into_split();
         let path = format!("/tunnel?name={}", self.config.name);
         let host = &self.config.server;
-        let (req_bytes, key) = build_ws_upgrade_request(&path, host, &self.config.token);
+        // The registration handshake carries no client context, so
+        // it adds no extra headers — the bytes are identical to
+        // what this builder produced before the gateway-header
+        // contract existed.
+        let (req_bytes, key) = build_ws_upgrade_request(&path, host, &self.config.token, &[]);
         tcp_write.write_all(&req_bytes).await?;
         tcp_write.flush().await?;
         read_ws_accept_response(&mut tcp_read, &key).await?;
@@ -285,11 +289,11 @@ where
         original_scheme: Scheme::Http,
         host_mode: frame.host_mode,
         host_custom: frame.host_custom.clone(),
-        // Client IP was detected by ngx from `session.client_addr()`
-        // and shipped to us inside the frame. When the frame
-        // predates the field, `client_ip` is `None` and we
-        // degrade gracefully (no X-Forwarded-For / X-Real-IP).
-        client_ip: frame.client_ip.clone(),
+        // The TCP peer was detected by ngx from
+        // `session.client_addr()` and shipped to us inside the
+        // frame. When the frame predates the field, `peer_ip` is
+        // `None` and we degrade gracefully (no X-Forwarded-For).
+        peer_ip: frame.peer_ip.clone(),
     };
 
     info!(
@@ -350,7 +354,7 @@ where
         original_scheme: Scheme::Http,
         host_mode,
         host_custom: host_custom.clone(),
-        client_ip: frame.client_ip.clone(),
+        peer_ip: frame.peer_ip.clone(),
     };
     let mut request = frame.request;
     apply_proxy_policy(&mut request, &ctx);
@@ -444,12 +448,44 @@ where
         },
     };
 
-    let (req_bytes, key) = build_ws_upgrade_request(path, &host_hdr, "");
+    // The upgrade request is built from scratch, so it does not
+    // inherit the frame's headers the way the regular HTTP path
+    // does. Carry over the ones the backend needs: the four `P-*`
+    // gateway headers (computed by the gateway and shipped inside
+    // the frame) and the forwarded-for chain (the incoming chain
+    // with the TCP peer appended — `apply_proxy_policy` above
+    // already did the append).
+    let extra_headers = ws_upgrade_extra_headers(&request.headers);
+    let (req_bytes, key) = build_ws_upgrade_request(path, &host_hdr, "", &extra_headers);
     backend.write_all(&req_bytes).await?;
     backend.flush().await?;
     read_ws_accept_response(&mut backend, &key).await?;
     pump_ws_relay(stream, backend, "ngx", "backend").await?;
     Ok(())
+}
+
+/// The headers the tun carries on the WS upgrade request to the
+/// backend: the four `P-*` gateway headers plus the
+/// forwarded-for chain.
+///
+/// The names are fixed by the gateway-header contract; a header
+/// that is not present in the frame (e.g. an older gateway that
+/// does not send them) is simply not forwarded.
+fn ws_upgrade_extra_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    const WANTED: [&str; 5] = [
+        "P-Known-Bot",
+        "P-Client-Ip",
+        "P-Client-Country",
+        "P-Client-Region",
+        "X-Forwarded-For",
+    ];
+    let mut out = Vec::new();
+    for want in WANTED {
+        if let Some((_, value)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)) {
+            out.push((want.to_string(), value.clone()));
+        }
+    }
+    out
 }
 
 /// Handle a streaming response (SSE, long-lived chunked) from a
@@ -490,7 +526,7 @@ where
         original_scheme: Scheme::Http,
         host_mode,
         host_custom: host_custom.clone(),
-        client_ip: frame.client_ip.clone(),
+        peer_ip: frame.peer_ip.clone(),
     };
     let mut request = frame.request;
     apply_proxy_policy(&mut request, &ctx);

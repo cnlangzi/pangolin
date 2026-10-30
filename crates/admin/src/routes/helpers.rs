@@ -56,6 +56,64 @@ pub fn require_param(body: &[u8], key: &str) -> Option<String> {
     None
 }
 
+/// Pull a form-field value out of a form-encoded body, decoding
+/// `+` as a space.
+///
+/// `application/x-www-form-urlencoded` encodes a space as `+` (see
+/// RFC 3986 §"application/x-www-form-urlencoded"). The shared
+/// [`require_param`] keeps `+` literal because other fields carry
+/// values where `+` is meaningful (base64, JSON); the first-level
+/// header keys use this variant because a header name can never
+/// contain a space — `bad header` has to be rejected, not silently
+/// accepted as the (perfectly valid!) token `bad+header`.
+pub fn require_form_param(body: &[u8], key: &str) -> Option<String> {
+    let body_str = std::str::from_utf8(body).ok()?;
+    for pair in body_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            let decoded = urlencoding::decode(&v.replace('+', " "))
+                .unwrap_or_default()
+                .to_string();
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+/// Read a boolean form field.
+///
+/// An HTML checkbox only submits when it is checked, so the settings
+/// form pairs every checkbox with a hidden `false` field carrying the
+/// same name. The value is therefore true when **any** occurrence of
+/// the key carries a truthy value, and false when the key is present
+/// but carries no truthy value. A key that is absent entirely falls
+/// back to `default` — that keeps an API POST that does not mention
+/// the field on the documented default instead of silently flipping
+/// it.
+pub fn param_bool(body: &[u8], key: &str, default: bool) -> bool {
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        return default;
+    };
+    let mut present = false;
+    let mut truthy = false;
+    for pair in body_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            present = true;
+            let decoded = urlencoding::decode(v).unwrap_or_default();
+            let normalized = decoded.trim().to_ascii_lowercase();
+            if matches!(normalized.as_str(), "1" | "true" | "on" | "yes") {
+                truthy = true;
+            }
+        }
+    }
+    if present { truthy } else { default }
+}
+
 /// Render a small "flash error" page used to bounce back to the form with
 /// an error message. Kept as HTML for symmetry with the rest of the admin
 /// UI, but the body is plain enough that it can be lifted into a

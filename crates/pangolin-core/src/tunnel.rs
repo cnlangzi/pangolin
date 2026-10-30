@@ -1247,19 +1247,47 @@ where
 /// Build a WebSocket upgrade request bytes for the client
 /// side. Returns the full HTTP/1.1 request text. The caller
 /// writes it to the stream and then awaits the 101 response.
-pub fn build_ws_upgrade_request(path: &str, host: &str, token: &str) -> (Vec<u8>, String) {
+///
+/// `extra_headers` are appended after the built-in ones. The tun's
+/// own registration handshake (tun → gateway) carries no client
+/// context and passes an empty slice, so its bytes are unchanged.
+/// The tun's backend upgrade (gateway → backend) passes the four
+/// `P-*` gateway headers plus the forwarded-for chain, which the
+/// regular HTTP path forwards implicitly.
+///
+/// Header values are sanitized: CR / LF are stripped so a value
+/// that reached us from the wire can never inject a header into the
+/// backend's request.
+pub fn build_ws_upgrade_request(
+    path: &str,
+    host: &str,
+    token: &str,
+    extra_headers: &[(String, String)],
+) -> (Vec<u8>, String) {
     let key = generate_ws_key();
-    let req = format!(
+    let mut req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\n\
          Sec-WebSocket-Version: 13\r\n\
-         Authorization: Bearer {token}\r\n\
-         \r\n"
+         Authorization: Bearer {token}\r\n"
     );
+    for (name, value) in extra_headers {
+        req.push_str(name);
+        req.push_str(": ");
+        req.push_str(&sanitize_header_value(value));
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
     (req.into_bytes(), key)
+}
+
+/// Strip CR / LF from a header value so it cannot terminate the
+/// header line it is written into.
+fn sanitize_header_value(value: &str) -> String {
+    value.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
 /// Read the 101 response off the stream and validate the

@@ -158,6 +158,12 @@ If the database has fewer rows than files, those migrations are pending and will
 | ------- | ------------------------- | ---- | ----- |
 | V1      | `initial_schema`          | —    | Sites, domains, tun (v1: separate `tokens` table), certs, dns_providers |
 | V2      | `merge_tokens_into_tun`   | #23  | Collapsed `tokens` into `tun` (1:1 relationship enforced in code anyway); `tun.token` + `tun.expires_at` added |
+| V3      | `tun_token_sha256`        | —    | `tun.token_hash` (sha256) replaces the plaintext comparison |
+| V4      | `cert_status`             | —    | ACME lifecycle columns on `certs` |
+| V5      | `cert_error_class`        | —    | Per-row retry schedule (`next_retry_at`, `error_class`, `attempt_count`, `order_url`) |
+| V6      | `add_domain_challenge_kind` | — | Per-domain ACME challenge kind |
+| V7      | `add_system_config`       | —    | The `system_config` singleton (`frontend_mode`, `trusted_headers`) |
+| V8      | `add_gateway_header_config` | #115 | The `P-*` gateway header configuration (`pgl_headers_enabled`, `client_ip_header`, `client_country_header`, `client_region_header`); drops `trusted_headers` after copying its first entry into `client_ip_header` |
 
 ## Troubleshooting
 

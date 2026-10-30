@@ -23,7 +23,7 @@ use http::{Response, StatusCode};
 use http_body_util::Full;
 use pangolin_core::{App, FrontendMode, SystemConfig};
 
-use super::helpers::{flash_error, redirect, require_param};
+use super::helpers::{flash_error, param_bool, redirect, require_form_param, require_param};
 
 /// Handle `POST /api/reload` — reload indexes from database.
 ///
@@ -52,7 +52,10 @@ pub async fn handle_reload(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>
 /// ```json
 /// {
 ///   "frontend_mode": "direct|cloudflare|custom_lb",
-///   "trusted_headers": ["X-Real-IP", ...],
+///   "pgl_headers_enabled": true,
+///   "client_ip_header": null,
+///   "client_country_header": null,
+///   "client_region_header": null,
 ///   "updated_at": "2026-…Z"
 /// }
 /// ```
@@ -60,7 +63,10 @@ pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<F
     let cfg = app.system_config.read().await.clone();
     let body = serde_json::json!({
         "frontend_mode": cfg.frontend_mode.to_string(),
-        "trusted_headers": cfg.trusted_headers,
+        "pgl_headers_enabled": cfg.pgl_headers_enabled,
+        "client_ip_header": cfg.client_ip_header,
+        "client_country_header": cfg.client_country_header,
+        "client_region_header": cfg.client_region_header,
         "updated_at": cfg.updated_at.to_rfc3339(),
     });
     Response::builder()
@@ -74,9 +80,12 @@ pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<F
 /// Form body:
 /// * `frontend_mode` — one of `direct`, `cloudflare`, `custom_lb`
 ///   (required).
-/// * `trusted_headers` — JSON-encoded `Vec<String>` of header names
-///   in priority order. Required and **must be non-empty** when
-///   `frontend_mode = custom_lb`; ignored otherwise.
+/// * `pgl_headers_enabled` — `true` / `false`; master switch for
+///   the four `P-*` gateway headers. Absent means the default
+///   (`true`).
+/// * `client_ip_header`, `client_country_header`,
+///   `client_region_header` — the first-level header names used in
+///   `custom_lb` mode. An empty value means "not configured".
 ///
 /// On success: 302 redirect to `/` so the operator sees the
 /// dashboard. On validation failure: 400 with a plain-text reason.
@@ -114,23 +123,46 @@ pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
         )
     })?;
 
-    let trusted_headers: Vec<String> = match require_param(body, "trusted_headers") {
-        Some(raw) => serde_json::from_str::<Vec<String>>(&raw)
-            .map_err(|e| format!("trusted_headers must be a JSON array of strings: {e}"))?,
-        None => Vec::new(),
-    };
-
-    if mode == FrontendMode::CustomLb && trusted_headers.is_empty() {
-        return Err(
-            "frontend_mode=custom_lb requires a non-empty trusted_headers list.".to_string(),
-        );
-    }
+    // The three first-level header keys are independent: each one
+    // names the single header the load balancer sets for that
+    // value. An empty field means "not configured" — the value is
+    // then empty, never inferred from another field.
+    let client_ip_header = header_key(body, "client_ip_header")?;
+    let client_country_header = header_key(body, "client_country_header")?;
+    let client_region_header = header_key(body, "client_region_header")?;
 
     Ok(SystemConfig {
         frontend_mode: mode,
-        trusted_headers,
+        // Absent → the documented default (`true`); the settings
+        // form always sends it explicitly.
+        pgl_headers_enabled: param_bool(body, "pgl_headers_enabled", true),
+        client_ip_header,
+        client_country_header,
+        client_region_header,
         updated_at: chrono::Utc::now(),
     })
+}
+
+/// Read + validate one first-level header name from the form body.
+///
+/// An empty value means "not configured" (`None`). A non-empty
+/// value must be a valid HTTP header name (RFC 9110 token) —
+/// anything else is rejected with a message naming the field, so
+/// the operator knows which input to fix.
+fn header_key(body: &[u8], field: &str) -> Result<Option<String>, String> {
+    let Some(value) = require_form_param(body, field) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if http::HeaderName::from_bytes(trimmed.as_bytes()).is_err() {
+        return Err(format!(
+            "{field} must be a valid HTTP header name, got '{trimmed}'."
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Persist a parsed [`SystemConfig`] and hot-reload the in-memory

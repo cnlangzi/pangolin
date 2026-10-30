@@ -29,6 +29,7 @@ pub mod events;
 pub mod index;
 pub mod normalize;
 pub mod parse;
+pub mod pgl;
 pub mod proxy;
 pub mod traffic;
 pub mod tunnel;
@@ -48,6 +49,10 @@ pub use index::{Indexes, lookup_site};
 pub use parse::{
     BackendScheme, ParseError, TUN_NAME_MAX, detect_scheme, file_url_to_path, is_valid_domain,
     is_valid_tun_name, matches_tun_name_charset, parse_backend,
+};
+pub use pgl::{
+    HEADER_CLIENT_COUNTRY, HEADER_CLIENT_IP, HEADER_CLIENT_REGION, HEADER_KNOWN_BOT,
+    PGL_HEADER_NAMES, PglHeaders, resolve_headers,
 };
 pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
