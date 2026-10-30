@@ -795,7 +795,8 @@ pub fn delete_dns_provider(conn: &Connection, name: &str) -> rusqlite::Result<bo
 /// + `reload_indexes`).
 pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
     let mut stmt = conn.prepare(
-        "SELECT frontend_mode, trusted_headers, updated_at
+        "SELECT frontend_mode, pgl_headers_enabled, client_ip_header,
+                client_country_header, client_region_header, updated_at
          FROM system_config WHERE id = 1",
     )?;
     stmt.query_row([], row_to_system_config)
@@ -807,17 +808,21 @@ pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
 /// concurrently. The admin route handler takes `app.db.lock()`
 /// around this call.
 pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::Result<()> {
-    let headers_json =
-        serde_json::to_string(&cfg.trusted_headers).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "UPDATE system_config
             SET frontend_mode = ?1,
-                trusted_headers = ?2,
-                updated_at = ?3
+                pgl_headers_enabled = ?2,
+                client_ip_header = ?3,
+                client_country_header = ?4,
+                client_region_header = ?5,
+                updated_at = ?6
           WHERE id = 1",
         params![
             cfg.frontend_mode.to_string(),
-            headers_json,
+            cfg.pgl_headers_enabled as i64,
+            cfg.client_ip_header,
+            cfg.client_country_header,
+            cfg.client_region_header,
             cfg.updated_at.to_rfc3339(),
         ],
     )?;
@@ -920,14 +925,20 @@ fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider>
 
 fn row_to_system_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<SystemConfig> {
     let mode_raw: String = row.get(0)?;
-    let trusted_raw: String = row.get(1)?;
-    let updated_at: String = row.get(2)?;
+    let pgl_enabled: i64 = row.get(1)?;
+    let client_ip_header: Option<String> = row.get(2)?;
+    let client_country_header: Option<String> = row.get(3)?;
+    let client_region_header: Option<String> = row.get(4)?;
+    let updated_at: String = row.get(5)?;
     let frontend_mode: FrontendMode = mode_raw.parse().map_err(|e: String| {
         rusqlite::Error::InvalidParameterName(format!("invalid frontend_mode: {e}"))
     })?;
     Ok(SystemConfig {
         frontend_mode,
-        trusted_headers: crate::client_ip::parse_trusted_headers(&trusted_raw),
+        pgl_headers_enabled: pgl_enabled != 0,
+        client_ip_header,
+        client_country_header,
+        client_region_header,
         updated_at: parse_dt(&updated_at)?,
     })
 }
@@ -1046,20 +1057,21 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V6 as applied. (V2 merges
+        // it's there and lists V1..V8 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
         // the per-row backoff schedule; V6 adds per-domain challenge_kind
-        // for issue #55.)
+        // for issue #55; V7 adds the system_config singleton; V8 adds
+        // the gateway-header configuration for issue #115.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 7,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 to be applied"
+            count, 8,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -1929,18 +1941,35 @@ mod tests {
         // path exists for defensive coverage but should not fire
         // in practice).
         //
-        // The default row carries frontend_mode='direct' and an
-        // EMPTY trusted_headers list — the column is irrelevant in
-        // direct mode, and the empty literal makes the default
-        // unambiguous (vs. the misleading `["X-Real-IP"]` value
-        // shipped by an earlier draft).
+        // The default row carries frontend_mode='direct' and the
+        // gateway-header knobs keep their documented defaults: the
+        // `P-*` headers are enabled, `client_ip_header` holds the
+        // value V8 migrated over from the old `trusted_headers`
+        // list, and the two geo keys are unset.
         let conn = make_conn();
         let cfg = get_system_config(&conn).expect("system_config row exists post-V7");
         assert_eq!(cfg.frontend_mode, FrontendMode::Direct);
         assert!(
-            cfg.trusted_headers.is_empty(),
-            "default trusted_headers must be empty in direct mode, got {:?}",
-            cfg.trusted_headers
+            cfg.pgl_headers_enabled,
+            "the P-* gateway headers must be enabled by default"
+        );
+        // V8 copies the first entry of the old `trusted_headers`
+        // list into `client_ip_header`, seeding `X-Real-IP` when
+        // the list was empty. That keeps the pre-migration
+        // behaviour of `custom_lb` mode (which read `X-Real-IP`
+        // when no list was configured) intact across the upgrade.
+        assert_eq!(
+            cfg.client_ip_header.as_deref(),
+            Some("X-Real-IP"),
+            "V8 must seed client_ip_header from the old trusted_headers list"
+        );
+        assert_eq!(
+            cfg.client_country_header, None,
+            "default client_country_header must be unset"
+        );
+        assert_eq!(
+            cfg.client_region_header, None,
+            "default client_region_header must be unset"
         );
     }
 
@@ -1956,12 +1985,44 @@ mod tests {
         ] {
             let updated = SystemConfig {
                 frontend_mode: mode,
-                trusted_headers: vec!["X-Real-IP".into(), "X-Forwarded-For".into()],
+                pgl_headers_enabled: mode == FrontendMode::Direct,
+                client_ip_header: Some("X-Client-IP".into()),
+                client_country_header: Some("X-Client-Country".into()),
+                client_region_header: None,
                 updated_at: dt("2026-03-15T12:34:56+00:00"),
             };
             update_system_config(&conn, &updated).unwrap();
             let back = get_system_config(&conn).unwrap();
             assert_eq!(back, updated);
+        }
+    }
+
+    #[test]
+    fn system_config_v8_drops_trusted_headers_column() {
+        // R21: the `trusted_headers` column is gone entirely — no
+        // fallback to it remains anywhere.
+        let conn = make_conn();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('system_config')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "trusted_headers"),
+            "trusted_headers column still present: {cols:?}"
+        );
+        for expected in [
+            "pgl_headers_enabled",
+            "client_ip_header",
+            "client_country_header",
+            "client_region_header",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "missing column {expected}: {cols:?}"
+            );
         }
     }
 

@@ -17,4 +17,4 @@ mod validator;
 pub use bot::{Bot, BotKind, load_bots, vendor_for};
 pub use rdns::match_domain;
 pub use ua::{contains_word, find_bot_by_ua};
-pub use validator::{Validator, ValidatorOptions, VerifyResult, VerifyStatus};
+pub use validator::{RefreshFailure, Validator, ValidatorOptions, VerifyResult, VerifyStatus};

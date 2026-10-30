@@ -2270,23 +2270,26 @@ async fn real_e2e_proxy_propagates_backend_error_codes() {
     }
 }
 
-/// A reverse proxy must surface the real client IP / scheme /
-/// host to the upstream so log analysis and per-IP policy can
-/// run.  The contract: on every delivery path (direct + tun,
-/// every host_mode), the proxy must inject
-///   - `X-Forwarded-For: <client_ip>`  (or append to existing chain)
-///   - `X-Real-IP: <client_ip>`
+/// A reverse proxy must surface the hop path / scheme / host to
+/// the upstream so log analysis and per-IP policy can run.  The
+/// contract: on every delivery path (direct + tun, every
+/// host_mode), the proxy must inject
+///   - `X-Forwarded-For: <incoming chain>, <tcp peer>`  (append)
 ///   - `X-Forwarded-Proto: <http|https>`
 ///   - `X-Forwarded-Host: <original_public_host>`
 ///
-/// These are the four headers every well-behaved upstream
+/// and the visitor's own address travels in the four `P-*`
+/// gateway headers (`P-Client-Ip`, `P-Known-Bot`,
+/// `P-Client-Country`, `P-Client-Region` — issue #115).
+///
+/// These are the headers every well-behaved upstream
 /// (frtpilot, kinnit, standard nginx) inspects.
 ///
-/// Implementation note: injection lives in
+/// Implementation note: the `X-Forwarded-*` injection lives in
 /// `pangolin_core::apply_proxy_policy` so the direct path
 /// (ngx → upstream TCP) and the tunnel path (ngx → tun →
 ///
-/// upstream) are both covered. The client IP is detected
+/// upstream) are both covered. The TCP peer is detected
 /// from `session.client_addr()` on the ngx side and shipped
 /// to the tun inside the `TunnelHttpFrame`.
 #[tokio::test]
@@ -2331,9 +2334,11 @@ async fn real_e2e_proxy_adds_x_forwarded_for() {
 
 /// The X-Forwarded-* family must be injected on every path
 /// variant.  This matrix test seeds four sites (one per
-/// host_mode × transport pair) and verifies all four headers
-/// (X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
-/// X-Forwarded-Host) appear on every backend request.
+/// host_mode × transport pair) and verifies the headers
+/// (X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host)
+/// appear on every backend request, that `X-Real-IP` is gone
+/// (issue #115) and that the four `P-*` gateway headers are
+/// present exactly once.
 #[tokio::test]
 async fn real_e2e_proxy_injects_x_forwarded_headers_all_paths() {
     // 4 sites: 1 direct, 1 tun; 1 Passthrough, 1 Backend.
@@ -2410,10 +2415,51 @@ async fn real_e2e_proxy_injects_x_forwarded_headers_all_paths() {
             "{host}: X-Forwarded-For must contain 127.0.0.1, got {:?}",
             h("X-Forwarded-For")
         );
+        // `X-Real-IP` was removed in issue #115: the client IP has
+        // exactly one name now — `P-Client-Ip`.
+        assert!(
+            !last
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("X-Real-IP")),
+            "{host}: X-Real-IP must not be emitted, got {:?}",
+            last.headers
+        );
+        // The four gateway headers must be present exactly once.
+        for name in [
+            "P-Known-Bot",
+            "P-Client-Ip",
+            "P-Client-Country",
+            "P-Client-Region",
+        ] {
+            let count = last
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .count();
+            assert_eq!(count, 1, "{host}: expected exactly one {name}, got {count}");
+        }
+        // direct mode → the TCP peer is the visitor, the geo values
+        // stay empty.
         assert_eq!(
-            h("X-Real-IP"),
+            h("P-Client-Ip"),
             "127.0.0.1",
-            "{host}: X-Real-IP must be 127.0.0.1"
+            "{host}: P-Client-Ip must be the peer IP in direct mode"
+        );
+        assert_eq!(
+            h("P-Known-Bot"),
+            "0",
+            "{host}: P-Known-Bot must be 0 without a verified bot"
+        );
+        assert_eq!(
+            h("P-Client-Country"),
+            "",
+            "{host}: P-Client-Country must be empty in direct mode"
+        );
+        assert_eq!(
+            h("P-Client-Region"),
+            "",
+            "{host}: P-Client-Region must be empty in direct mode"
         );
         assert_eq!(
             h("X-Forwarded-Proto"),
@@ -2424,6 +2470,441 @@ async fn real_e2e_proxy_injects_x_forwarded_headers_all_paths() {
             h("X-Forwarded-Host"),
             expected_xfh.to_string(),
             "{host}: X-Forwarded-Host must be {expected_xfh}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gateway headers (issue #115) — the four `P-*` headers.
+// ---------------------------------------------------------------------------
+
+/// Issue a raw HTTP/1.1 GET with extra request headers, returning
+/// the response status.
+///
+/// The gateway-header tests need to send first-level headers
+/// (`CF-Connecting-IP`, …) and *forged* `P-*` headers, so the
+/// shared `raw_request` helper (which sends a fixed header set) is
+/// not enough.
+async fn raw_request_with_headers(
+    addr: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> u16 {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0)
+}
+
+/// Count the occurrences of `name` in the recorded request headers
+/// (case-insensitive).
+fn header_count(req: &RecordedRequest, name: &str) -> usize {
+    req.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .count()
+}
+
+/// The value of `name` in the recorded request headers
+/// (case-insensitive), or "" when the header is absent.
+fn header_value(req: &RecordedRequest, name: &str) -> String {
+    req.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+/// A client that sends the gateway header names itself must not be
+/// able to influence what the backend sees: every occurrence is
+/// stripped and exactly one copy of each header — carrying
+/// pangolin's value — is forwarded (R3).
+#[tokio::test]
+async fn real_e2e_gateway_headers_replace_client_supplied_values() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "pgl-site", &format!("http://{addr}"));
+            seed_domain(&conn, "pgl.test", "pgl-site");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "pgl.test",
+        "/api/x",
+        &[
+            // The same name twice, with different cases.
+            ("P-Client-Ip", "9.9.9.9"),
+            ("p-client-ip", "8.8.8.8"),
+            ("P-Known-Bot", "1"),
+            ("P-Client-Country", "DE"),
+            ("P-Client-Region", "BE"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    for name in [
+        "P-Known-Bot",
+        "P-Client-Ip",
+        "P-Client-Country",
+        "P-Client-Region",
+    ] {
+        assert_eq!(
+            header_count(last, name),
+            1,
+            "expected exactly one {name}, got {:?}",
+            last.headers
+        );
+    }
+    // direct mode → the TCP peer is the visitor and the geo values
+    // stay empty (a client cannot smuggle them in).
+    assert_eq!(
+        header_value(last, "P-Client-Ip"),
+        "127.0.0.1",
+        "the forged P-Client-Ip must be replaced by pangolin's value"
+    );
+    assert_eq!(
+        header_value(last, "P-Known-Bot"),
+        "0",
+        "the forged P-Known-Bot must be replaced by pangolin's value"
+    );
+    assert_eq!(
+        header_value(last, "P-Client-Country"),
+        "",
+        "the forged P-Client-Country must be replaced by pangolin's value"
+    );
+    assert_eq!(
+        header_value(last, "P-Client-Region"),
+        "",
+        "the forged P-Client-Region must be replaced by pangolin's value"
+    );
+}
+
+/// In `cloudflare` mode the visitor's address and geo come from the
+/// Cloudflare first-level headers (R6, R16).
+#[tokio::test]
+async fn real_e2e_gateway_headers_read_cloudflare_first_level_headers() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "pgl-cf-site", &format!("http://{addr}"));
+            seed_domain(&conn, "pgl-cf.test", "pgl-cf-site");
+            db::update_system_config(
+                &conn,
+                &pangolin_core::SystemConfig {
+                    frontend_mode: pangolin_core::FrontendMode::Cloudflare,
+                    pgl_headers_enabled: true,
+                    client_ip_header: None,
+                    client_country_header: None,
+                    client_region_header: None,
+                    updated_at: Utc::now(),
+                },
+            )
+            .expect("seed system config");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "pgl-cf.test",
+        "/api/x",
+        &[
+            ("CF-Connecting-IP", "203.0.113.7"),
+            ("CF-IPCountry", "DE"),
+            ("CF-Region-Code", "BE"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    assert_eq!(header_value(last, "P-Client-Ip"), "203.0.113.7");
+    assert_eq!(header_value(last, "P-Client-Country"), "DE");
+    assert_eq!(header_value(last, "P-Client-Region"), "BE");
+}
+
+/// In `custom_lb` mode the operator names the first-level header
+/// per value; each key is independent (R14, R15).
+#[tokio::test]
+async fn real_e2e_gateway_headers_read_custom_lb_first_level_headers() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "pgl-lb-site", &format!("http://{addr}"));
+            seed_domain(&conn, "pgl-lb.test", "pgl-lb-site");
+            db::update_system_config(
+                &conn,
+                &pangolin_core::SystemConfig {
+                    frontend_mode: pangolin_core::FrontendMode::CustomLb,
+                    pgl_headers_enabled: true,
+                    client_ip_header: Some("X-Client-IP".into()),
+                    client_country_header: Some("X-Client-Country".into()),
+                    client_region_header: None,
+                    updated_at: Utc::now(),
+                },
+            )
+            .expect("seed system config");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "pgl-lb.test",
+        "/api/x",
+        &[
+            ("X-Client-IP", "198.51.100.9"),
+            ("X-Client-Country", "FR"),
+            // The country key must not be consulted to find the IP.
+            ("CF-Connecting-IP", "203.0.113.7"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    assert_eq!(
+        header_value(last, "P-Client-Ip"),
+        "198.51.100.9",
+        "custom_lb must read the configured client_ip_header"
+    );
+    assert_eq!(header_value(last, "P-Client-Country"), "FR");
+    assert_eq!(
+        header_value(last, "P-Client-Region"),
+        "",
+        "an unconfigured region key yields an empty value"
+    );
+}
+
+/// The tunnel WebSocket relay builds the backend's upgrade request
+/// from scratch, so it has to carry the gateway headers over
+/// explicitly — otherwise a WS backend sees none of them (R25).
+#[tokio::test]
+async fn real_e2e_tunnel_ws_upgrade_carries_gateway_headers() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site(
+                &conn,
+                "office-ws-pgl-site",
+                &format!("office:http://{backend_addr}"),
+            );
+            seed_domain(&conn, "office.test", "office-ws-pgl-site");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    let (mut ws, response) = open_ws_client(ngx.http_port, "office.test", "/chat").await;
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "tun WS relay must answer 101, got {}\nngx log:\n{}\n-- tun log --\n{}",
+        response.status(),
+        ngx.log_string(),
+        _tun.log_string()
+    );
+
+    // Send one frame so we know the relay is running end-to-end
+    // before we inspect the recorded handshake.
+    ws.send(Message::Text("over-tun".into()))
+        .await
+        .expect("ws.send");
+    let echoed = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .expect("ws frame");
+    assert_eq!(echoed, Message::Text("over-tun".into()));
+
+    let h = backend.handshake().await.expect("backend saw WS upgrade");
+    let header_lookup = |name: &str| -> Option<String> {
+        h.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    for name in [
+        "P-Known-Bot",
+        "P-Client-Ip",
+        "P-Client-Country",
+        "P-Client-Region",
+    ] {
+        assert_eq!(
+            h.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .count(),
+            1,
+            "the WS upgrade must carry exactly one {name}, got {:?}",
+            h.headers
+        );
+    }
+    assert_eq!(
+        header_lookup("P-Client-Ip").as_deref(),
+        Some("127.0.0.1"),
+        "the WS upgrade must carry the resolved client IP"
+    );
+    let xff = header_lookup("X-Forwarded-For").unwrap_or_default();
+    assert!(
+        xff.ends_with("127.0.0.1"),
+        "the forwarded-for chain must end with the TCP peer, got {xff:?}"
+    );
+}
+
+/// The tunnel path must carry the same four headers as the direct
+/// path — the gateway computes them once and the tun forwards them
+/// verbatim (R1).
+#[tokio::test]
+async fn real_e2e_gateway_headers_reach_the_backend_through_the_tunnel() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site(&conn, "pgl-tun-site", &format!("office:http://{addr}"));
+            seed_domain(&conn, "pgl-tun.test", "pgl-tun-site");
+        }
+    })
+    .await;
+
+    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "pgl-tun.test",
+        "/api/x",
+        &[("P-Client-Ip", "9.9.9.9")],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    for name in [
+        "P-Known-Bot",
+        "P-Client-Ip",
+        "P-Client-Country",
+        "P-Client-Region",
+    ] {
+        assert_eq!(
+            header_count(last, name),
+            1,
+            "expected exactly one {name} on the tunnel path, got {:?}",
+            last.headers
+        );
+    }
+    assert_eq!(
+        header_value(last, "P-Client-Ip"),
+        "127.0.0.1",
+        "the tunnel path must carry the same client IP as the direct path"
+    );
+}
+
+/// With `pgl_headers_enabled = false` the four headers are not
+/// added — but their names are still stripped, so a client can never
+/// impersonate them (R14).
+#[tokio::test]
+async fn real_e2e_gateway_headers_disabled_strips_client_values() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "pgl-off-site", &format!("http://{addr}"));
+            seed_domain(&conn, "pgl-off.test", "pgl-off-site");
+            db::update_system_config(
+                &conn,
+                &pangolin_core::SystemConfig {
+                    frontend_mode: pangolin_core::FrontendMode::Direct,
+                    pgl_headers_enabled: false,
+                    client_ip_header: None,
+                    client_country_header: None,
+                    client_region_header: None,
+                    updated_at: Utc::now(),
+                },
+            )
+            .expect("seed system config");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "pgl-off.test",
+        "/api/x",
+        &[("P-Client-Ip", "9.9.9.9"), ("P-Known-Bot", "1")],
+    )
+    .await;
+    assert_eq!(status, 200, "expected 200, got {status}");
+
+    let seen = backend.seen().await;
+    let last = seen.last().expect("backend saw request");
+    for name in [
+        "P-Known-Bot",
+        "P-Client-Ip",
+        "P-Client-Country",
+        "P-Client-Region",
+    ] {
+        assert_eq!(
+            header_count(last, name),
+            0,
+            "{name} must not be forwarded when the gateway headers are disabled, got {:?}",
+            last.headers
         );
     }
 }

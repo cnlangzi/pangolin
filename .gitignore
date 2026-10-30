@@ -73,3 +73,4 @@ Cargo.lock.bak
 .DS_Store
 Thumbs.db
 .nightme/
+.codegraph/

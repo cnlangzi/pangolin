@@ -89,19 +89,19 @@ pub trait BackendExecutor: Send + Sync {
     /// Send `request` to the backend described by `target` and
     /// return the response.
     ///
-    /// `client_ip` is the source IP of the original client
-    /// (from `session.client_addr()`); it is forwarded to the
-    /// backend so the tun's `apply_proxy_policy` can inject
-    /// `X-Forwarded-For` / `X-Real-IP`. `None` for sessions
-    /// where the peer address is unknown (e.g. a test that
-    /// doesn't bind a real client).
+    /// `peer_ip` is the TCP peer address (from
+    /// `session.client_addr()`); it is forwarded to the backend
+    /// so the tun's `apply_proxy_policy` can append it to
+    /// `X-Forwarded-For`. `None` for sessions where the peer
+    /// address is unknown (e.g. a test that doesn't bind a real
+    /// client).
     async fn execute_http(
         &self,
         request: HttpRequest,
         target: &BackendTarget,
         host_mode: HostMode,
         host_custom: Option<String>,
-        client_ip: Option<String>,
+        peer_ip: Option<String>,
     ) -> Result<HttpResponse, ProxyError>;
 }
 
@@ -134,7 +134,7 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
         target: &BackendTarget,
         host_mode: HostMode,
         host_custom: Option<String>,
-        client_ip: Option<String>,
+        peer_ip: Option<String>,
     ) -> Result<HttpResponse, ProxyError> {
         let is_upgrade = is_ws_upgrade(&request);
         // The buffered tunnel executor never carries a streaming
@@ -150,7 +150,7 @@ impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
             host_custom,
             is_upgrade,
             is_streaming: false,
-            client_ip,
+            peer_ip,
         };
         let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
 
@@ -238,6 +238,25 @@ pub struct RequestState {
     /// `request_filter`. `None` if the client didn't send one or
     /// the header wasn't valid UTF-8.
     pub user_agent: Option<String>,
+    /// The authoritative client IP, resolved **once** per request
+    /// in `request_filter` (issue #115). `None` when there is no
+    /// trusted source for it — behind a CDN / LB without the
+    /// configured first-level header, the TCP peer is a proxy hop
+    /// and must not be reported as the visitor.
+    ///
+    /// The same value feeds the `P-Client-Ip` header, the
+    /// knownbots verification and (as the fallback) the access
+    /// log, so all three agree by construction.
+    pub client_ip: Option<std::net::IpAddr>,
+    /// The access-log `client_ip` value: the authoritative client
+    /// IP when there is one, otherwise the TCP peer, otherwise the
+    /// literal `"unknown"`. Resolved in `request_filter` from the
+    /// same snapshot as `client_ip`.
+    pub log_client_ip: String,
+    /// The TCP peer address, normalized (no port). This is the
+    /// value appended to `X-Forwarded-For` — the hop path, not
+    /// the visitor.
+    pub peer_ip: Option<String>,
     /// Traffic side-channel classification. Written at site lookup
     /// so `logging` never re-takes the indexes lock.
     pub traffic_route: pangolin_core::TrafficRoute,
@@ -254,6 +273,9 @@ impl Default for RequestState {
             host: String::new(),
             backend: String::new(),
             user_agent: None,
+            client_ip: None,
+            log_client_ip: pangolin_core::client_ip::UNKNOWN.to_string(),
+            peer_ip: None,
             traffic_route: pangolin_core::TrafficRoute::Unknown,
             traffic_kind: pangolin_core::TrafficKind::Http,
             host_known: false,
@@ -310,6 +332,41 @@ impl ProxyHttp for AppProxy {
             .headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok().map(String::from));
+
+        // ── Client IP resolution + gateway headers (issue #115) ──
+        //
+        // The client IP is resolved **once** per request, here. The
+        // single result feeds the access log, the four `P-*` gateway
+        // headers and the knownbots verification, so the three can
+        // never disagree (R10).
+        //
+        // The first-level headers have to be snapshotted into owned
+        // strings first: the resolver borrows them immutably while
+        // we are about to mutate the request header.
+        let peer = peer_addr_std(session);
+        let cfg = self.app.system_config.read().await.clone();
+        let first_level = snapshot_first_level_headers(&cfg, session);
+        let pgl = pangolin_core::pgl::resolve_headers(
+            &cfg,
+            peer,
+            |name: &str| first_level.get(name).cloned(),
+            ctx.user_agent.as_deref(),
+            // No verifier when the gateway headers are disabled: the
+            // result would be thrown away, so skip the verification
+            // work entirely.
+            self.app
+                .bot_verifier
+                .as_deref()
+                .filter(|_| cfg.pgl_headers_enabled),
+        );
+        ctx.client_ip = pgl.client_ip;
+        ctx.log_client_ip = pangolin_core::client_ip::log_value(pgl.client_ip, peer);
+        ctx.peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()).to_string());
+        // Strip any client-supplied copies of the four gateway
+        // headers and write pangolin's own values. The stripping is
+        // unconditional — a client must never be able to impersonate
+        // a gateway header, even when the headers are disabled.
+        apply_pgl_headers(session, cfg.pgl_headers_enabled, &pgl);
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
         if let Some(token) = crate::acme::parse_http01_path(&path) {
@@ -448,12 +505,12 @@ impl ProxyHttp for AppProxy {
                 };
                 ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
                 ws_relay_to_tun(
-                    &self.app,
                     session,
                     &ws_target,
                     &tunnel,
                     HostMode::Passthrough,
                     None,
+                    ctx.peer_ip.clone(),
                 )
                 .await?;
                 return Ok(true);
@@ -521,7 +578,7 @@ impl ProxyHttp for AppProxy {
         if is_streaming {
             if !tun_name.is_empty() {
                 ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
-                return handle_streaming_request(&self.app, session).await;
+                return handle_streaming_request(&self.app, session, ctx.peer_ip.clone()).await;
             }
             if matches!(target, BackendTarget::File { .. }) {
                 warn!(
@@ -585,9 +642,8 @@ impl ProxyHttp for AppProxy {
                 original_scheme: scheme,
                 host_mode: site.host_mode,
                 host_custom: site.host_custom.clone(),
-                client_ip: session
-                    .client_addr()
-                    .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
+                // The TCP peer, resolved once in `request_filter`.
+                peer_ip: ctx.peer_ip.clone(),
             };
             apply_proxy_policy(&mut req, &proxy_ctx);
             let resp = serve_file_target(&req, doc_root);
@@ -596,13 +652,7 @@ impl ProxyHttp for AppProxy {
             // tunnel + direct paths. `ctx` (the trait's
             // `RequestState`) is unaffected because the proxy
             // policy `ProxyCtx` was renamed to `proxy_ctx` above.
-            record_access_log(
-                &self.app,
-                ctx,
-                session,
-                parse_status_from_line(&resp.status_line),
-            )
-            .await;
+            record_access_log(&self.app, ctx, parse_status_from_line(&resp.status_line)).await;
             write_response_to_session(session, &resp).await;
             return Ok(true);
         }
@@ -641,12 +691,12 @@ impl ProxyHttp for AppProxy {
             );
             ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
             ws_relay_to_tun(
-                &self.app,
                 session,
                 &target,
                 &tunnel,
                 site.host_mode,
                 site.host_custom.clone(),
+                ctx.peer_ip.clone(),
             )
             .await?;
             return Ok(true);
@@ -768,9 +818,8 @@ impl ProxyHttp for AppProxy {
                 host_custom: site.host_custom.clone(),
                 is_upgrade: false,
                 is_streaming: false,
-                client_ip: session
-                    .client_addr()
-                    .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
+                // The TCP peer, resolved once in `request_filter`.
+                peer_ip: ctx.peer_ip.clone(),
             };
             let exec = YamuxTunnelExecutor { tunnel: &tunnel };
             match exec
@@ -779,7 +828,7 @@ impl ProxyHttp for AppProxy {
                     &target,
                     frame.host_mode,
                     frame.host_custom,
-                    frame.client_ip,
+                    frame.peer_ip,
                 )
                 .await
             {
@@ -788,13 +837,8 @@ impl ProxyHttp for AppProxy {
                     // pingora so the proxy `response_filter` never
                     // runs — record the access log here so the entry
                     // shows up on /logs.
-                    record_access_log(
-                        &self.app,
-                        ctx,
-                        session,
-                        parse_status_from_line(&resp.status_line),
-                    )
-                    .await;
+                    record_access_log(&self.app, ctx, parse_status_from_line(&resp.status_line))
+                        .await;
                     write_response_to_session(session, &resp).await;
                     return Ok(true);
                 }
@@ -856,7 +900,7 @@ impl ProxyHttp for AppProxy {
         &self,
         session: &mut Session,
         upstream: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
         let original_host = host_from_session(session);
         let scheme = match session.req_header().uri.scheme_str() {
@@ -883,16 +927,13 @@ impl ProxyHttp for AppProxy {
             original_scheme: scheme,
             host_mode: site.host_mode,
             host_custom: site.host_custom.clone(),
-            // Detected from the client's TCP peer. `SocketAddr::ip()`
-            // returns the bare `IpAddr` (no `:port`); we want the
-            // bare IP for `X-Forwarded-For` / `X-Real-IP` (the
-            // upstream already knows its own port via the Host
-            // header or the listening socket). `None` only happens
-            // in tests that fabricate a session without a peer
-            // address, in which case we degrade gracefully.
-            client_ip: session
-                .client_addr()
-                .and_then(|a| a.as_inet().map(|s| s.ip().to_string())),
+            // The TCP peer, resolved once in `request_filter`. It is
+            // the value appended to `X-Forwarded-For` — the hop
+            // path, not the visitor (the visitor travels in
+            // `P-Client-Ip`). `None` only happens in tests that
+            // fabricate a session without a peer address, in which
+            // case we degrade gracefully.
+            peer_ip: ctx.peer_ip.clone(),
         };
 
         // Collect current headers as Vec<(String, String)>.
@@ -942,19 +983,22 @@ impl ProxyHttp for AppProxy {
         // we only need to handle:
         //   - Host header rewrites (for Backend/Custom modes)
         //   - X-Forwarded-* additions on every mode (issue: we
-        //     now inject X-Forwarded-For / X-Real-IP / etc on
-        //     Passthrough too, so upstreams always see the real
-        //     client)
+        //     now inject X-Forwarded-For / etc on Passthrough too,
+        //     so upstreams always see the hop path)
         //
         // Pingora handles hop-by-hop headers automatically, so we
         // don't need to remove them here.
         //
+        // The four `P-*` gateway headers were already written on
+        // the downstream request header in `request_filter`; the
+        // upstream request is a clone of it, so they arrive here
+        // unchanged (the `already_same` check below skips them).
+        //
         // For headers the policy may have MODIFIED (X-Forwarded-*
-        // chain appends, X-Real-IP overwrite, Host rewrite), we
-        // must use `insert_header` (replace) — otherwise the
-        // original client-sent value would survive alongside the
-        // policy-injected one, producing duplicate X-Forwarded-For
-        // entries on the wire. For headers the policy did NOT
+        // chain appends, Host rewrite), we must use `insert_header`
+        // (replace) — otherwise the original client-sent value
+        // would survive alongside the policy-injected one,
+        // producing duplicate X-Forwarded-For entries on the wire. For headers the policy did NOT
         // touch, `append_header` is the right call so we preserve
         // legitimate multi-value headers like `Via` or RFC 7239
         // `Forwarded` chains.
@@ -989,13 +1033,13 @@ impl ProxyHttp for AppProxy {
 
     async fn response_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Issue #73: construct AccessLogEntry and push to App
         let status = upstream_response.status.as_u16();
-        record_access_log(&self.app, ctx, session, status).await;
+        record_access_log(&self.app, ctx, status).await;
         Ok(())
     }
 
@@ -1048,12 +1092,12 @@ impl ProxyHttp for AppProxy {
 /// this resolves. On success the helper runs the byte-pump
 /// to completion and only then returns.
 async fn ws_relay_to_tun(
-    app: &Arc<App>,
     session: &mut Session,
     target: &BackendTarget,
     tunnel: &pangolin_core::YamuxTunnel,
     host_mode: HostMode,
     host_custom: Option<String>,
+    peer_ip: Option<String>,
 ) -> Result<()> {
     debug!("ws_relay_to_tun: helper entered");
     // Build the HttpRequest from the session and encode as a
@@ -1125,25 +1169,11 @@ async fn ws_relay_to_tun(
         host_custom,
         is_upgrade: true,
         is_streaming: false,
-        // fix-client-ip: hand the tunnel-side code the *real*
-        // visitor IP (per the operator-configured frontend_mode),
-        // not the TCP peer that may be the CDN/LB hop closest to
-        // us. The downstream tun-side code (`tun::client`) just
-        // clones this into its own request context, so resolving
-        // here propagates cleanly through the tunnel.
-        client_ip: {
-            let cfg = app.system_config.read().await.clone();
-            Some(pangolin_core::client_ip::resolve(
-                &cfg,
-                peer_addr_std(session),
-                |name| {
-                    session
-                        .get_header(name)
-                        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-                        .map(|v| v.to_string())
-                },
-            ))
-        },
+        // The TCP peer, resolved once in `request_filter`. The
+        // tunnel-side code appends it to `X-Forwarded-For`; the
+        // visitor's own address travels in the `P-Client-Ip`
+        // header, which the frame's request headers already carry.
+        peer_ip,
     };
 
     // 101 Switching Protocols — replicate the WS handshake on
@@ -1347,7 +1377,11 @@ fn patch_moved_from_stream_in_h1(h1: &mut pingora::protocols::http::v1::server::
 /// This mirrors what `handle_ws_upgrade` does in the tun:
 /// both sides treat the yamux stream as a transparent byte
 /// pipe once the handshake is done.
-async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bool> {
+async fn handle_streaming_request(
+    app: &App,
+    session: &mut Session,
+    peer_ip: Option<String>,
+) -> Result<bool> {
     let host = host_from_session(session);
 
     let indexes = app.indexes.read().await;
@@ -1472,24 +1506,9 @@ async fn handle_streaming_request(app: &App, session: &mut Session) -> Result<bo
         host_custom: site.host_custom.clone(),
         is_upgrade: false,
         is_streaming: true,
-        // fix-client-ip: resolve the real visitor IP via the
-        // operator-configured frontend_mode (same path as the WS
-        // relay above). Without this, the tun backend logs the
-        // CDN/LB hop instead of the actual visitor when pangolin
-        // is fronted by anything other than a direct connection.
-        client_ip: {
-            let cfg = app.system_config.read().await.clone();
-            Some(pangolin_core::client_ip::resolve(
-                &cfg,
-                peer_addr_std(session),
-                |name| {
-                    session
-                        .get_header(name)
-                        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-                        .map(|v| v.to_string())
-                },
-            ))
-        },
+        // The TCP peer, resolved once in `request_filter` (same
+        // path as the WS relay above).
+        peer_ip,
     };
 
     let mut yamux_stream = match tunnel.open_stream().await {
@@ -1868,7 +1887,7 @@ async fn respond_streaming_unsupported_on_file(session: &mut Session) {
 
 /// Convert a pingora [`SocketAddr`] reference into a
 /// `std::net::SocketAddr` (the type the
-/// `pangolin_core::client_ip::resolve` API consumes).
+/// `pangolin_core::client_ip` / `pangolin_core::pgl` APIs consume).
 ///
 /// Pingora's `SocketAddr` is an enum wrapping the standard type
 /// plus a Unix-socket variant we never see in production. The
@@ -1887,35 +1906,67 @@ fn peer_addr_std(session: &Session) -> Option<std::net::SocketAddr> {
     })
 }
 
-/// Resolve the real visitor IP and append the access-log entry to
-/// the live broadcast + ring buffer (issue #73 + fix-client-ip).
+/// Snapshot the first-level headers the resolver consults off the
+/// request.
 ///
-/// Async because the resolution snapshot (`app.system_config.read()`)
-/// holds an async lock. Both call sites (the pingora
-/// `response_filter` and the tunnel short-circuits in
-/// `request_filter`) are already async, so adding one `.await`
-/// here is free.
+/// The resolver's header lookup is a closure over owned strings:
+/// the request header cannot be borrowed immutably while it is
+/// being mutated (we strip + write the gateway headers right
+/// after). Only the headers the configured mode actually consults
+/// are read — in `direct` mode that is none of them.
+fn snapshot_first_level_headers(
+    cfg: &pangolin_core::SystemConfig,
+    session: &Session,
+) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    for name in pangolin_core::pgl::first_level_headers(cfg) {
+        if let Some(value) = session.get_header(name.as_str())
+            && let Ok(value) = std::str::from_utf8(value.as_bytes())
+        {
+            headers.insert(name, value.to_string());
+        }
+    }
+    headers
+}
+
+/// Strip the four gateway header names from the request and write
+/// pangolin's own values.
 ///
-/// ## Pre-fix behaviour
+/// The strip is **unconditional**: a client-supplied `P-Client-Ip`
+/// must never reach the backend, otherwise the unified headers are
+/// just one more opinion the backend has to weigh. The write is
+/// gated by `pgl_headers_enabled` — but the names are still
+/// stripped when the headers are disabled, so a client can never
+/// impersonate them.
+fn apply_pgl_headers(session: &mut Session, enabled: bool, pgl: &pangolin_core::PglHeaders) {
+    let req = session.req_header_mut();
+    for name in pangolin_core::pgl::PGL_HEADER_NAMES {
+        req.remove_header(name);
+    }
+    if !enabled {
+        return;
+    }
+    for (name, value) in pgl.to_pairs() {
+        // An empty value is legal (the header must be present even
+        // when the value is unknown) — `HeaderValue::from_str`
+        // accepts it.
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            req.insert_header(name, value).ok();
+        }
+    }
+}
+
+/// Append the access-log entry to the live broadcast + ring buffer
+/// (issue #73 + fix-client-ip + issue #115).
 ///
-/// Before fix-client-ip this function read `session.client_addr()`
-/// and emitted either the peer IP (with port) or the literal
-/// `"unknown"`. With pangolin fronted by Cloudflare / an LB, that
-/// recorded the CDN's IP, not the visitor's — silently breaking
-/// every downstream log-analysis tool. The fix delegates the
-/// resolution to [`pangolin_core::client_ip::resolve`], driven by
-/// the operator-configured `frontend_mode` (see [`SystemConfig`]).
-/// The `unknown` literal is preserved as the final fallback so old
+/// The client IP is **not** resolved here: `request_filter` resolves
+/// it once per request and stores the result on the
+/// [`RequestState`], so the log, the `P-Client-Ip` header and the
+/// knownbots verification all show the same string (R10). The
+/// `unknown` literal is preserved as the final fallback so old
 /// log-parsing scripts do not break.
-async fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session, status: u16) {
+async fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
-    let cfg = app.system_config.read().await.clone();
-    let client_ip = pangolin_core::client_ip::resolve(&cfg, peer_addr_std(session), |name| {
-        session
-            .get_header(name)
-            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
-            .map(str::to_owned)
-    });
     let entry = pangolin_core::AccessLogEntry {
         timestamp: chrono::Utc::now(),
         method: ctx.method.clone(),
@@ -1924,7 +1975,7 @@ async fn record_access_log(app: &Arc<App>, ctx: &RequestState, session: &Session
         status,
         duration_ms,
         backend: ctx.backend.clone(),
-        client_ip,
+        client_ip: ctx.log_client_ip.clone(),
         // Captured once in `request_filter` (searchenginebots
         // stage-1). Consumed by `App::push_access_log`'s bot
         // side-channel; a missing UA simply skips the bot path.

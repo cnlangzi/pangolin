@@ -115,6 +115,15 @@ pub struct Validator {
     in_flight: Mutex<std::collections::HashSet<(String, IpAddr)>>,
     http: reqwest::Client,
     refresh_interval: Duration,
+    /// Why the most recent refresh failed for each bot.
+    ///
+    /// A bot that is absent from the map refreshed fine. An entry
+    /// says how it failed — [`RefreshFailure::Unreachable`] (the
+    /// vendor refused us, the network was down) or
+    /// [`RefreshFailure::Broken`] (the list did not parse, our own
+    /// TLS handshake failed). That distinction is what lets a caller
+    /// tell an environment problem from a code regression.
+    refresh_errors: Mutex<std::collections::HashMap<String, RefreshFailure>>,
 }
 
 pub struct ValidatorOptions {
@@ -177,6 +186,7 @@ impl Validator {
             in_flight: Mutex::new(std::collections::HashSet::new()),
             http,
             refresh_interval: opts.refresh_interval,
+            refresh_errors: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -417,9 +427,14 @@ impl Validator {
             match result {
                 Ok(prefixes) if !prefixes.is_empty() => {
                     bot.store_downloaded(prefixes);
+                    self.refresh_errors.lock().remove(&name);
                     let path = self.root.join(&bot.name).join("ips.txt");
                     if let Err(e) = bot.persist_ips(&path) {
                         log::warn!("knownbots: persist ips for {}: {e}", bot.name);
+                        self.refresh_errors.lock().insert(
+                            name.clone(),
+                            RefreshFailure::Broken(format!("persist ips: {e}")),
+                        );
                         all_ok = false;
                     } else {
                         log::info!(
@@ -431,12 +446,17 @@ impl Validator {
                 }
                 Ok(_) => {
                     log::warn!("knownbots: empty refresh for {name}, keeping prior");
+                    self.refresh_errors.lock().insert(
+                        name.clone(),
+                        RefreshFailure::Broken("downloaded list produced no prefixes".to_string()),
+                    );
                     if bot.prefixes.read().is_empty() && bot.custom.is_empty() {
                         all_ok = false;
                     }
                 }
                 Err(e) => {
                     log::warn!("knownbots: refresh {name} failed: {e}");
+                    self.refresh_errors.lock().insert(name.clone(), e);
                     if bot.prefixes.read().is_empty() && bot.custom.is_empty() {
                         all_ok = false;
                     }
@@ -455,6 +475,17 @@ impl Validator {
             }
         }
         all_ok
+    }
+
+    /// Why the most recent refresh of `bot_name` failed, if it did.
+    ///
+    /// `None` means the last refresh succeeded (or never ran).
+    /// [`RefreshFailure::Unreachable`] is an *environment* signal —
+    /// the vendor's endpoint refused the request or the network was
+    /// down — while [`RefreshFailure::Broken`] points at this crate
+    /// (the list did not parse, the TLS handshake failed).
+    pub fn last_refresh_error(&self, bot_name: &str) -> Option<RefreshFailure> {
+        self.refresh_errors.lock().get(bot_name).cloned()
     }
 
     /// An address inside the bot's current prefix set, if one exists.
@@ -484,6 +515,33 @@ impl Validator {
 enum LookupError {
     NotFound,
     Transient,
+}
+
+/// Why a bot's IP list could not be refreshed.
+///
+/// The split matters: an *environmental* failure (the vendor's
+/// endpoint refused us, the network was down) says nothing about
+/// this crate's correctness, while a *broken* failure (the list
+/// downloaded but did not parse, the TLS handshake failed) is a
+/// regression that must fail the build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshFailure {
+    /// The vendor's endpoint could not be reached or refused the
+    /// request. The list itself may be fine.
+    Unreachable(String),
+    /// The list was fetched but is unusable (parse failure, empty
+    /// prefix set), or the transfer failed in a way that points at
+    /// our own client (TLS handshake).
+    Broken(String),
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshFailure::Unreachable(m) => write!(f, "unreachable: {m}"),
+            RefreshFailure::Broken(m) => write!(f, "broken: {m}"),
+        }
+    }
 }
 
 /// Reverse DNS + forward confirmation (FCrDNS).
@@ -538,43 +596,97 @@ fn http_client(proxy: Option<&str>) -> Result<reqwest::Client> {
     builder.build().map_err(Into::into)
 }
 
-fn is_unreachable(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|e| e.is_connect() || e.is_timeout())
-    })
+/// How many times a transient refusal is retried before giving up.
+const FETCH_RETRIES: usize = 2;
+
+/// Delay between those retries.
+const FETCH_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// Why one IP-list download failed.
+#[derive(Debug)]
+enum FetchError {
+    /// The endpoint could not be reached (DNS / TCP / timeout) or
+    /// refused the request (an HTTP status). The list itself may be
+    /// perfectly fine — this is an *environment* problem.
+    Unreachable(String),
+    /// The transfer failed in a way that points at our own client
+    /// (TLS handshake, protocol error, …) — a code regression.
+    Transport(String),
 }
 
-async fn fetch_body(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let resp = http.get(url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("{url} returned {}", resp.status());
+async fn fetch_body(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, FetchError> {
+    let mut attempt = 0;
+    loop {
+        let resp = http.get(url).send().await.map_err(|e| {
+            // A connect error or a timeout is the environment (the
+            // host is down, the runner has no route to it). Every
+            // other transport error — a TLS handshake failure above
+            // all — is our own client, and must stay a hard failure.
+            if e.is_connect() || e.is_timeout() {
+                FetchError::Unreachable(format!("{url}: {e}"))
+            } else {
+                FetchError::Transport(format!("{url}: {e}"))
+            }
+        })?;
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| FetchError::Transport(format!("{url}: {e}")));
+        }
+        // 429 / 5xx are transient (CDN rate limits, upstream
+        // hiccups) — retry them. A 403 / 404 is a deliberate refusal
+        // and retrying it only wastes time.
+        let transient =
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+        if !transient || attempt >= FETCH_RETRIES {
+            // The vendor answered and refused us: rate limit, bot
+            // protection, or the endpoint moved. Environmental.
+            return Err(FetchError::Unreachable(format!("{url} returned {status}")));
+        }
+        attempt += 1;
+        log::warn!("knownbots: {url} returned {status}; retry {attempt}/{FETCH_RETRIES}");
+        tokio::time::sleep(FETCH_RETRY_DELAY).await;
     }
-    Ok(resp.bytes().await?.to_vec())
 }
 
 async fn download_prefixes(
     http: &reqwest::Client,
     parser_name: &str,
     urls: &[String],
-) -> Result<Vec<ipnet::IpNet>> {
+) -> Result<Vec<ipnet::IpNet>, RefreshFailure> {
     let mut via_proxy: Option<reqwest::Client> = None;
     let mut all = Vec::new();
     for url in urls {
         let bytes = match fetch_body(http, url).await {
             Ok(body) => body,
-            Err(e) if is_unreachable(&e) => {
-                log::warn!("knownbots: {url} unreachable ({e}); retrying via {FALLBACK_PROXY}");
+            Err(FetchError::Unreachable(msg)) => {
+                log::warn!("knownbots: {msg}; retrying via {FALLBACK_PROXY}");
                 if via_proxy.is_none() {
-                    via_proxy = Some(http_client(Some(FALLBACK_PROXY))?);
+                    via_proxy = http_client(Some(FALLBACK_PROXY)).ok();
                 }
-                let client = via_proxy.as_ref().expect("proxy client just built");
-                fetch_body(client, url).await?
+                match via_proxy.as_ref() {
+                    Some(client) => match fetch_body(client, url).await {
+                        Ok(body) => body,
+                        // The fallback proxy is a convenience for a
+                        // workstation behind a local proxy; it is
+                        // absent on a CI runner. Report the
+                        // *original* failure in that case instead of
+                        // the proxy's connect error.
+                        Err(proxy_err) => {
+                            log::warn!("knownbots: fallback proxy failed too: {proxy_err:?}");
+                            return Err(RefreshFailure::Unreachable(msg));
+                        }
+                    },
+                    None => return Err(RefreshFailure::Unreachable(msg)),
+                }
             }
-            Err(e) => return Err(e),
+            Err(FetchError::Transport(msg)) => return Err(RefreshFailure::Broken(msg)),
         };
-        let nets = parser::parse(parser_name, &bytes)?;
+        let nets = parser::parse(parser_name, &bytes)
+            .map_err(|e| RefreshFailure::Broken(format!("parse {parser_name} for {url}: {e:#}")))?;
         all.extend(nets);
     }
     Ok(all)
@@ -716,15 +828,33 @@ mod tests {
     /// handshake with `UnknownIssuer`, so URL-backed bots never verify.
     ///
     /// Uses Bing's list (same `google` parser as Googlebot).
+    ///
+    /// The endpoint is on the public internet, so a *connect* error
+    /// (the host is unreachable from this runner) is an environment
+    /// problem and the assertion is skipped with a printed note. A
+    /// TLS handshake failure — the regression this test guards — is
+    /// a hard failure, as is a status the endpoint should not
+    /// return.
     #[tokio::test]
     async fn http_client_downloads_ip_list_without_cert_check() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = build_http_client().expect("client");
-        let resp = http
+        let resp = match http
             .get("https://www.bing.com/toolbox/bingbot.json")
             .send()
             .await
-            .expect("bingbot IP list download");
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                eprintln!(
+                    "SKIP http_client_downloads_ip_list_without_cert_check: \
+                     bing.com unreachable ({e}) — the download path is not exercised \
+                     in this run"
+                );
+                return;
+            }
+            Err(e) => panic!("bingbot IP list download failed: {e}"),
+        };
         assert!(
             resp.status().is_success(),
             "bingbot IP list status {}",

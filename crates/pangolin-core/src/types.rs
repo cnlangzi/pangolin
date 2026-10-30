@@ -772,13 +772,16 @@ pub enum BackendKind {
 //
 // Singleton row describing what sits between the visitor and
 // pangolin, so the access log resolver can pick the right strategy
-// for recording the *real* client IP. See `client_ip::resolve` for
+// for recording the *real* client IP. See `client_ip::resolve` (the
+// log value) and `pgl::resolve_headers` (the forwarded headers) for
 // the per-mode semantics.
 
 /// What sits between the visitor and pangolin — used by the
 /// access-log resolver to decide whether to trust an upstream
 /// header for the client IP. See `pangolin_core::client_ip::resolve`
-/// for the per-mode resolution rules.
+/// for the per-mode resolution rules and
+/// `pangolin_core::pgl::resolve_headers` for the forwarded header
+/// values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 // `serde(rename_all = "lowercase")` would turn `CustomLb` into
 // `customlb`, but the DB CHECK constraint (and the row mapper's
@@ -795,10 +798,10 @@ pub enum FrontendMode {
     /// is in front. The resolver returns that header value,
     /// falling back to the peer IP if the header is missing.
     Cloudflare,
-    /// Operator-configured ordered list of header names. The
-    /// first present + non-empty value wins. `trusted_headers` on
-    /// the singleton row carries the list; the resolver expands
-    /// an empty list to its built-in default (`["X-Real-IP"]`).
+    /// Operator-configured first-level header names. Each of
+    /// `client_ip_header`, `client_country_header` and
+    /// `client_region_header` names the single header the load
+    /// balancer sets; an unset key yields an empty value.
     #[serde(rename = "custom_lb")]
     CustomLb,
 }
@@ -835,12 +838,24 @@ impl std::fmt::Display for FrontendMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemConfig {
     pub frontend_mode: FrontendMode,
-    /// Header names to try in priority order when
-    /// `frontend_mode = CustomLb`. The resolver treats an empty
-    /// list as "use the built-in default" (currently
-    /// `["X-Real-IP"]`); the admin POST handler validates that a
-    /// `custom_lb` row carries a non-empty list.
-    pub trusted_headers: Vec<String>,
+    /// Master switch for the unified `P-*` gateway headers
+    /// (`P-Known-Bot`, `P-Client-Ip`, `P-Client-Country`,
+    /// `P-Client-Region`). When `false` the headers are not added
+    /// to forwarded requests — but their names are still stripped
+    /// from the incoming request, so a client can never
+    /// impersonate them.
+    pub pgl_headers_enabled: bool,
+    /// First-level header carrying the visitor's IP. Used in
+    /// `custom_lb` mode only; `cloudflare` mode uses the built-in
+    /// `CF-Connecting-IP` / `CF-Connecting-IPv6` names and
+    /// `direct` mode uses the TCP peer.
+    pub client_ip_header: Option<String>,
+    /// First-level header carrying the visitor's country code.
+    /// Used in `custom_lb` mode only.
+    pub client_country_header: Option<String>,
+    /// First-level header carrying the visitor's region code.
+    /// Used in `custom_lb` mode only.
+    pub client_region_header: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1107,7 +1122,10 @@ mod tests {
         ] {
             let cfg = SystemConfig {
                 frontend_mode: mode,
-                trusted_headers: vec!["X-Real-IP".into(), "X-Forwarded-For".into()],
+                pgl_headers_enabled: true,
+                client_ip_header: Some("X-Client-IP".into()),
+                client_country_header: Some("X-Client-Country".into()),
+                client_region_header: None,
                 updated_at: ts,
             };
             let json = serde_json::to_string(&cfg).unwrap();

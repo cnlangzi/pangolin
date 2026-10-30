@@ -309,9 +309,10 @@ pub struct App {
     /// at startup from the `system_config` singleton row and
     /// refreshed by [`App::reload_indexes`] whenever an admin POST
     /// to `/api/system/config` triggers it. The proxy hot path
-    /// (`record_access_log`, the tunnel frame builders) reads this
-    /// on every request via [`pangolin_core::client_ip::resolve`]
-    /// — see that module's doc comment for the per-mode semantics.
+    /// reads this on every request (in `AppProxy::request_filter`)
+    /// and resolves the client IP through
+    /// [`pangolin_core::pgl::resolve_headers`] — see that module's
+    /// doc comment for the per-mode semantics.
     pub system_config: Arc<RwLock<SystemConfig>>,
     /// Global configuration
     pub config: Config,
@@ -469,7 +470,10 @@ impl App {
             Ok(c) => c,
             Err(rusqlite::Error::QueryReturnedNoRows) => SystemConfig {
                 frontend_mode: FrontendMode::Direct,
-                trusted_headers: Vec::new(),
+                pgl_headers_enabled: true,
+                client_ip_header: None,
+                client_country_header: None,
+                client_region_header: None,
                 updated_at: chrono::Utc::now(),
             },
             Err(e) => return Err(e.into()),
@@ -608,7 +612,10 @@ impl App {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 *self.system_config.write().await = SystemConfig {
                     frontend_mode: FrontendMode::Direct,
-                    trusted_headers: Vec::new(),
+                    pgl_headers_enabled: true,
+                    client_ip_header: None,
+                    client_country_header: None,
+                    client_region_header: None,
                     updated_at: chrono::Utc::now(),
                 };
             }

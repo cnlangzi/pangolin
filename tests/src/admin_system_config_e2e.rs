@@ -5,8 +5,9 @@
 //! - GET returns the default seeded values
 //! - POST updates the row, hot-reloads App's in-memory cache,
 //!   and a follow-up GET reflects the new values
-//! - POST validation rejects invalid modes and empty custom_lb
-//!   header lists with 4xx
+//! - POST validation rejects invalid modes and invalid first-level
+//!   header names with 4xx
+//! - POST pgl_headers_enabled=false is persisted
 //! - CSRF is enforced globally; POST without a valid token is 403
 //!
 //! Prerequisite: `make build` (or `cargo build --release -p ngx -p tun`).
@@ -57,11 +58,18 @@ async fn system_config_get_returns_defaults() {
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // V7 seeds the row with frontend_mode='direct' and an EMPTY
-    // trusted_headers list — the column is irrelevant in direct
-    // mode (the resolver only consults it under custom_lb).
+    // V7 seeds the row with frontend_mode='direct'. The gateway
+    // header knobs keep their documented defaults: the `P-*`
+    // headers are enabled, the three first-level header keys are
+    // unset (they are irrelevant in direct mode).
     assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
-    assert_eq!(body["trusted_headers"], serde_json::json!([]));
+    assert_eq!(body["pgl_headers_enabled"], serde_json::json!(true));
+    // V8 seeds `client_ip_header` from the first entry of the old
+    // `trusted_headers` list — `X-Real-IP` when the list was empty
+    // (the pre-migration default for `custom_lb` mode).
+    assert_eq!(body["client_ip_header"], serde_json::json!("X-Real-IP"));
+    assert_eq!(body["client_country_header"], serde_json::json!(null));
+    assert_eq!(body["client_region_header"], serde_json::json!(null));
     // updated_at is RFC-3339.
     let s = body["updated_at"].as_str().expect("updated_at string");
     assert!(
@@ -82,7 +90,7 @@ async fn system_config_post_updates_and_reloads() {
     let csrf_page = client.get("/").await.unwrap().text().await.unwrap();
     let csrf = client.csrf_token(&csrf_page).expect("csrf token on /");
 
-    // Switch to cloudflare mode (no trusted_headers needed).
+    // Switch to cloudflare mode (the built-in CF-* headers are used).
     let resp = client
         .post_form(
             "/api/system/config",
@@ -107,8 +115,7 @@ async fn system_config_post_updates_and_reloads() {
     assert_eq!(body["frontend_mode"], serde_json::json!("cloudflare"));
 }
 
-// ── §4 — POST custom_lb with non-empty headers updates ──────────────────────
-
+// ── §4 — POST custom_lb with a configured header key updates ─────────────────
 #[tokio::test]
 async fn system_config_post_custom_lb_with_headers() {
     let ngx = start_ngx().await;
@@ -124,7 +131,8 @@ async fn system_config_post_custom_lb_with_headers() {
             "/api/system/config",
             &[
                 ("frontend_mode", "custom_lb"),
-                ("trusted_headers", r#"["X-Forwarded-For","X-Real-IP"]"#),
+                ("client_ip_header", "X-Client-IP"),
+                ("client_country_header", "X-Client-Country"),
                 ("_csrf", &csrf),
             ],
         )
@@ -140,16 +148,56 @@ async fn system_config_post_custom_lb_with_headers() {
         .await
         .unwrap();
     assert_eq!(body["frontend_mode"], serde_json::json!("custom_lb"));
+    assert_eq!(body["client_ip_header"], serde_json::json!("X-Client-IP"));
     assert_eq!(
-        body["trusted_headers"],
-        serde_json::json!(["X-Forwarded-For", "X-Real-IP"])
+        body["client_country_header"],
+        serde_json::json!("X-Client-Country")
     );
+    // An unset key stays unset.
+    assert_eq!(body["client_region_header"], serde_json::json!(null));
 }
 
-// ── §5 — POST custom_lb with empty headers is rejected ──────────────────────
-
+// ── §5 — POST custom_lb without a header key is accepted ────────────────────
 #[tokio::test]
-async fn system_config_post_custom_lb_empty_headers_rejected() {
+async fn system_config_post_custom_lb_without_headers_accepted() {
+    // An unconfigured key is valid: the matching value is simply
+    // empty. The old `trusted_headers` list was mandatory in this
+    // mode; the per-value keys are not (issue #115).
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/").await.unwrap().text().await.unwrap())
+        .unwrap();
+
+    let resp = client
+        .post_form(
+            "/api/system/config",
+            &[("frontend_mode", "custom_lb"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "custom_lb without a header key must be accepted"
+    );
+
+    let body: serde_json::Value = client
+        .get("/api/system/config")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["frontend_mode"], serde_json::json!("custom_lb"));
+    assert_eq!(body["client_ip_header"], serde_json::json!(null));
+}
+
+// ── §5b — POST with an invalid header name is rejected ──────────────────────
+#[tokio::test]
+async fn system_config_post_invalid_header_name_rejected() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
@@ -163,7 +211,7 @@ async fn system_config_post_custom_lb_empty_headers_rejected() {
             "/api/system/config",
             &[
                 ("frontend_mode", "custom_lb"),
-                ("trusted_headers", "[]"),
+                ("client_ip_header", "bad header"),
                 ("_csrf", &csrf),
             ],
         )
@@ -171,11 +219,15 @@ async fn system_config_post_custom_lb_empty_headers_rejected() {
         .unwrap();
     // 400 from flash_error (200 OK) — the helper returns 200 OK
     // with an error body so the browser's back button survives.
-    // Accept either 4xx (handler may change) or 200 + error text.
     let status = resp.status().as_u16();
     assert!(
         (400..500).contains(&status) || status == 200,
-        "empty custom_lb headers should be rejected, got {status}"
+        "an invalid header name should be rejected, got {status}"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("client_ip_header"),
+        "the error must name the offending field, got: {body}"
     );
 
     // GET still shows the prior mode (defaults) — the update was not applied.
@@ -187,6 +239,42 @@ async fn system_config_post_custom_lb_empty_headers_rejected() {
         .await
         .unwrap();
     assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
+    // The row is untouched — still the V8-seeded default.
+    assert_eq!(body["client_ip_header"], serde_json::json!("X-Real-IP"));
+}
+
+// ── §5c — POST pgl_headers_enabled=false is persisted ───────────────────────
+#[tokio::test]
+async fn system_config_post_disables_gateway_headers() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/").await.unwrap().text().await.unwrap())
+        .unwrap();
+
+    let resp = client
+        .post_form(
+            "/api/system/config",
+            &[
+                ("frontend_mode", "direct"),
+                ("pgl_headers_enabled", "false"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let body: serde_json::Value = client
+        .get("/api/system/config")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["pgl_headers_enabled"], serde_json::json!(false));
 }
 
 // ── §6 — POST invalid mode is rejected ──────────────────────────────────────

@@ -238,6 +238,31 @@ knobs land in one place.
 | ------------ | ------ | ------- | -------- | ----- |
 | `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN for **non-tunnel sites**. Tunnel sites (`site.backend = "<tun>:<url>"`) always negotiate h1 at runtime — this is the per-SNI dynamic ALPN policy in `ngx::tls::build_sni_settings` that works around the upstream `tokio-yamux 0.3.18` stream-state race (issue #66 / commit `0c35ede`). Modern browsers fall back to h1 automatically when h2 is not advertised; the per-SNI override is transparent to clients — no 4xx, no 421, no manual retry. |
 
+### `system_config` table (DB) — client IP + gateway headers
+
+Some knobs are **not** in `ngx.yml`: they describe what sits *in
+front of* pangolin (a CDN / load balancer), they change at runtime,
+and they are edited from the admin UI (`/settings`) or the admin
+API (`GET` / `POST /api/system/config`) — not by restarting the
+binary. They live in the `system_config` singleton row.
+
+| Field                  | Type              | Default      | Notes |
+| ---------------------- | ----------------- | ------------ | ----- |
+| `frontend_mode`        | `direct` \| `cloudflare` \| `custom_lb` | `direct` | How the visitor's IP is resolved. `direct` → the TCP peer is the visitor. `cloudflare` → the `CF-Connecting-IP` / `CF-Connecting-IPv6` headers. `custom_lb` → the header names configured below. |
+| `pgl_headers_enabled`  | `bool`            | `true`       | Master switch for the four `P-*` gateway headers (`P-Known-Bot`, `P-Client-Ip`, `P-Client-Country`, `P-Client-Region`). When off, the headers are not added — their names are still stripped from the incoming request, so a client can never impersonate them. |
+| `client_ip_header`     | `string \| null`  | `null`       | The first-level header carrying the visitor's IP. Used in `custom_lb` mode only. |
+| `client_country_header`| `string \| null`  | `null`       | The first-level header carrying the country code. Used in `custom_lb` mode only. |
+| `client_region_header` | `string \| null`  | `null`       | The first-level header carrying the region code. Used in `custom_lb` mode only. |
+
+The three header keys are independent: a configured key is read, an
+unconfigured key yields an empty value. They apply to `custom_lb`
+mode only — `cloudflare` mode uses the built-in `CF-*` names and
+`direct` mode uses the TCP peer.
+
+The gateway-header contract (which headers are sent, how the client
+IP is resolved, the failure matrix) is documented in
+[design/gateway-headers.md](design/gateway-headers.md).
+
 ## `tun.yml` — tunnel client configuration
 
 ### Top-level fields
