@@ -351,7 +351,13 @@ impl ProxyHttp for AppProxy {
             peer,
             |name: &str| first_level.get(name).cloned(),
             ctx.user_agent.as_deref(),
-            self.app.bot_verifier.as_deref(),
+            // No verifier when the gateway headers are disabled: the
+            // result would be thrown away, so skip the verification
+            // work entirely.
+            self.app
+                .bot_verifier
+                .as_deref()
+                .filter(|_| cfg.pgl_headers_enabled),
         );
         ctx.client_ip = pgl.client_ip;
         ctx.log_client_ip = pangolin_core::client_ip::log_value(pgl.client_ip, peer);
@@ -1881,7 +1887,7 @@ async fn respond_streaming_unsupported_on_file(session: &mut Session) {
 
 /// Convert a pingora [`SocketAddr`] reference into a
 /// `std::net::SocketAddr` (the type the
-/// `pangolin_core::client_ip::resolve` API consumes).
+/// `pangolin_core::client_ip` / `pangolin_core::pgl` APIs consume).
 ///
 /// Pingora's `SocketAddr` is an enum wrapping the standard type
 /// plus a Unix-socket variant we never see in production. The

@@ -42,12 +42,26 @@ pub fn redirect(location: &str) -> Response<Full<Bytes>> {
 /// `None` when the key is missing or has an empty value. Handlers can use
 /// this to short-circuit to a 400 with a clear error message.
 pub fn require_param(body: &[u8], key: &str) -> Option<String> {
+    form_param(body, key, /* plus_as_space */ false)
+}
+
+/// Shared body of [`require_param`] and [`require_form_param`].
+///
+/// `plus_as_space` selects the `application/x-www-form-urlencoded`
+/// rule for `+` (see [`require_form_param`] for why only some
+/// fields want it).
+fn form_param(body: &[u8], key: &str, plus_as_space: bool) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
     for pair in body_str.split('&') {
         if let Some((k, v)) = pair.split_once('=')
             && k == key
         {
-            let decoded = urlencoding::decode(v).unwrap_or_default().to_string();
+            let raw = if plus_as_space {
+                v.replace('+', " ")
+            } else {
+                v.to_string()
+            };
+            let decoded = urlencoding::decode(&raw).unwrap_or_default().to_string();
             if !decoded.is_empty() {
                 return Some(decoded);
             }
@@ -67,20 +81,7 @@ pub fn require_param(body: &[u8], key: &str) -> Option<String> {
 /// contain a space — `bad header` has to be rejected, not silently
 /// accepted as the (perfectly valid!) token `bad+header`.
 pub fn require_form_param(body: &[u8], key: &str) -> Option<String> {
-    let body_str = std::str::from_utf8(body).ok()?;
-    for pair in body_str.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
-            let decoded = urlencoding::decode(&v.replace('+', " "))
-                .unwrap_or_default()
-                .to_string();
-            if !decoded.is_empty() {
-                return Some(decoded);
-            }
-        }
-    }
-    None
+    form_param(body, key, /* plus_as_space */ true)
 }
 
 /// Read a boolean form field.

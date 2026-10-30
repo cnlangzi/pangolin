@@ -73,8 +73,15 @@ const PSEUDO_IPV4_FIRST_OCTET: u8 = 240;
 
 /// Resolve the visitor IP that should appear in the access log.
 ///
-/// See the module-level doc comment for the per-mode rules and
-/// the rationale for the owned-string header lookup.
+/// The one-shot form of the resolution: the authoritative client IP
+/// ([`resolve_authoritative`]) with the peer fallback and the
+/// `unknown` placeholder applied ([`log_value`]).
+///
+/// The proxy hot path does **not** use this function — it needs the
+/// authoritative IP on its own (for the `P-Client-Ip` header and the
+/// bot verification) and therefore calls the two functions directly
+/// so the client IP is resolved exactly once per request. Use this
+/// entry point when only the log value is wanted.
 pub fn resolve<F>(cfg: &SystemConfig, peer: Option<SocketAddr>, get_header: F) -> String
 where
     F: Fn(&str) -> Option<String>,

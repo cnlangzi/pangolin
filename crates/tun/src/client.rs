@@ -472,15 +472,16 @@ where
 /// that is not present in the frame (e.g. an older gateway that
 /// does not send them) is simply not forwarded.
 fn ws_upgrade_extra_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    const WANTED: [&str; 5] = [
-        "P-Known-Bot",
-        "P-Client-Ip",
-        "P-Client-Country",
-        "P-Client-Region",
-        "X-Forwarded-For",
-    ];
+    // The names come from the shared contract
+    // (`pangolin_core::PGL_HEADER_NAMES`) so a rename or a fifth
+    // gateway header cannot silently stop being forwarded here.
+    let wanted: Vec<&str> = pangolin_core::PGL_HEADER_NAMES
+        .iter()
+        .copied()
+        .chain(std::iter::once("X-Forwarded-For"))
+        .collect();
     let mut out = Vec::new();
-    for want in WANTED {
+    for want in wanted {
         if let Some((_, value)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)) {
             out.push((want.to_string(), value.clone()));
         }

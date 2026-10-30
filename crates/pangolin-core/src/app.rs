@@ -309,9 +309,10 @@ pub struct App {
     /// at startup from the `system_config` singleton row and
     /// refreshed by [`App::reload_indexes`] whenever an admin POST
     /// to `/api/system/config` triggers it. The proxy hot path
-    /// (`record_access_log`, the tunnel frame builders) reads this
-    /// on every request via [`pangolin_core::client_ip::resolve`]
-    /// — see that module's doc comment for the per-mode semantics.
+    /// reads this on every request (in `AppProxy::request_filter`)
+    /// and resolves the client IP through
+    /// [`pangolin_core::pgl::resolve_headers`] — see that module's
+    /// doc comment for the per-mode semantics.
     pub system_config: Arc<RwLock<SystemConfig>>,
     /// Global configuration
     pub config: Config,

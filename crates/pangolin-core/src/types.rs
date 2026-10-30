@@ -772,13 +772,16 @@ pub enum BackendKind {
 //
 // Singleton row describing what sits between the visitor and
 // pangolin, so the access log resolver can pick the right strategy
-// for recording the *real* client IP. See `client_ip::resolve` for
+// for recording the *real* client IP. See `client_ip::resolve` (the
+// log value) and `pgl::resolve_headers` (the forwarded headers) for
 // the per-mode semantics.
 
 /// What sits between the visitor and pangolin — used by the
 /// access-log resolver to decide whether to trust an upstream
 /// header for the client IP. See `pangolin_core::client_ip::resolve`
-/// for the per-mode resolution rules.
+/// for the per-mode resolution rules and
+/// `pangolin_core::pgl::resolve_headers` for the forwarded header
+/// values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 // `serde(rename_all = "lowercase")` would turn `CustomLb` into
 // `customlb`, but the DB CHECK constraint (and the row mapper's
