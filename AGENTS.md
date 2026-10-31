@@ -207,6 +207,62 @@ the compiler version, the host builds with rustc 1.96.0 and the image
 with 1.98.1, so entries written by one side are never hits on the
 other.
 
+### The Docker build context is an allow-list, not a deny-list
+
+`build/docker/dist.dockerfile` copies the *whole* repo into the `builder`
+stage (`COPY . .`), so everything not filtered by `.dockerignore` is
+uploaded on every build and baked into a layer.
+
+**The rule: exclude only what is 100 % certain the build never reads, and
+that either churns a lot or is per-machine state.**  Source-level files
+are never excluded — not even ones that look like junk.  A template
+askama embeds, a YAML `include_str!` reads, a SQL migration
+`include_str!` embeds, a fixture a test `include_bytes!`s: if it goes
+missing the build breaks, or worse, produces a subtly wrong binary.  A few
+KB of context is cheap insurance against a silent break.
+
+The build needs exactly this much:
+
+| Path | Needed by |
+| --- | --- |
+| `Cargo.toml`, `Cargo.lock` | cargo (every workspace member's manifest must parse, including `tests`) |
+| `crates/` | the workspace crates; `crates/admin/templates/` is also Tailwind's content glob |
+| `tests/` | workspace member `tests` |
+| `assets/tailwindcss.css`, `assets/app.js` | `rust-embed` snapshot (`#[folder = "../../assets/"]`) |
+| `tailwind.config.js` | Tailwind CLI — **without it the build still succeeds but the admin UI ships unstyled**, because Tailwind scans no content globs |
+| `build/docker/cargo-config.toml` | copied to `/usr/local/cargo/config.toml` (registry mirror + mold linker) |
+
+The `Makefile`, `ngx.yml`, `tun.yml` and `rustfmt.toml` ride along too,
+although nothing in the image reads them — they are tiny, low-churn,
+"normal code", and keeping them means the container's view of the repo
+matches a developer's checkout.  Everything *else* outside the table is
+host-side tooling, runtime state, or a local secret — `.env` alone holds
+`NGX_ADMIN__PASSWORD` and `TUN_TOKEN`.  `.codegraph/` alone was ~15 MB
+of sqlite, ~85 % of the context.
+
+Two Docker-specific traps, both of which have bitten this repo:
+
+- **`.dockerignore` is not gitignore.** A pattern without a slash matches
+  the repo ROOT only, not every level.  `*.md` does not exclude
+  `tests/CHECKLIST.md`; `certs/` does not exclude
+  `crates/admin/src/routes/certs/` (which is *source*, not a certificate
+  dump).  Use an explicit `**/` prefix when you mean every level.
+- **A missing input can fail silently.** The tailwind case above compiles
+  fine and produces a broken binary, so "the build passed" is not proof
+  that the context was complete.
+
+Hidden files are excluded as one class — `**/.*` — rather than a list of
+names, so a dot-tool nobody has installed yet cannot slip through.  If the
+build ever *does* need a dotfile, re-include it explicitly rather than
+weakening the rule.
+
+`make check-context` (→ `build/check-context.sh`) probes the context
+with a `FROM scratch` + `COPY . /ctx` image — Docker's own matcher, no
+Rust toolchain, ~2 s — and asserts that the top-level entries are exactly
+the allow-list above, that every required input is present, and that
+nothing hidden, generated, or secret leaked in.  Run it after touching
+`.dockerignore`; `make ci-full` runs it before `build-dist`.
+
 ## Style
 
 Match the surrounding code:
