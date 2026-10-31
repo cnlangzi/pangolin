@@ -16,7 +16,7 @@
 #     Node.js is needed to run them).
 #
 #   pangolin-chef  → + project-specific build tools (cmake, libssl-dev,
-#                    pkg-config, sccache, clang, mold) + cargo-chef
+#                    pkg-config, clang, mold) + cargo-chef + sccache
 #                    + cargo config (registry mirrors, linker)
 #   planner        → recipe.json
 #   cooker         → compile third-party dependencies
@@ -46,9 +46,12 @@ WORKDIR /pangolin
 #   - clang + mold:  mold is a drop-in `ld` replacement; `cargo-config.toml`
 #     invokes it via clang's `-fuse-ld=mold` so release linking drops
 #     from ~30s to ~3s on a cold cache.
-#   - sccache: shared compiler cache mounted at /root/.cache/sccache
-#     below so artefacts survive across `docker build` runs AND across
-#     CI jobs.
+#
+# The base image also ships Debian's sccache (0.4.0-pre.6, 2017), which
+# classifies every `rustc` invocation it observes as non-cacheable and
+# never writes a cache entry.  It is purged here so the image carries
+# exactly one sccache: the current release, installed from crates.io
+# further down.
 #
 # Apt runs before any Rust-related layer so changing only the apt list
 # invalidates only this layer, not cargo-chef or the cargo-config layer
@@ -60,13 +63,20 @@ RUN apt-get update -y && \
         clang \
         mold \
         pkg-config \
-        libssl-dev \
-        sccache && \
+        libssl-dev && \
+    apt-get purge -y sccache && \
     rm -rf /var/lib/apt/lists/*
 
-# cargo config — registry mirrors + clang/mold linker + sccache wrapper.
+# cargo config — registry mirrors + clang/mold linker.
 # Placed AFTER the apt layer so editing `cargo-config.toml` invalidates
 # only this layer; the heavier apt-install layer above is preserved.
+# It also has to come BEFORE the `cargo install` steps below, so those
+# resolve their dependencies through the configured crates.io mirror
+# instead of crates.io itself.
+#
+# The sccache compiler wrapper is NOT configured here: it lives in the
+# ENV block further down, because a wrapper pointing at a binary that
+# does not exist yet breaks `cargo install sccache` itself.
 COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
 
 # cargo-chef — installed binary, versioned so the layer survives until
@@ -74,6 +84,38 @@ COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo install cargo-chef --locked --version 0.1.71
+
+# sccache — the compiler cache used by the build stages.  Version-pinned
+# like cargo-chef above.
+#
+# `--no-default-features` drops the `all` feature set (s3 / gcs / azure
+# / oss / webdav / memcached / …), which would add minutes of
+# compilation for backends this build never uses.  `redis` is kept so a
+# shared cache backend remains available.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
+    cargo install sccache --locked --version 0.19.0 --no-default-features --features redis
+
+# Compiler cache wiring.  These must come AFTER the sccache install:
+# pointing a compiler wrapper at a binary that does not exist yet breaks
+# the `cargo install` step above.
+#
+# SCCACHE_SERVER_PORT is deliberately not sccache's default 4226.  The
+# build runs with host networking (see build/dist.sh), so a client that
+# looked for 4226 would find a developer's host-side sccache server and
+# hand it compilations built by a different toolchain.
+#
+# SCCACHE_DIR matches the BuildKit cache mount on /root/.cache/sccache
+# in the cooker and builder stages, so cache entries survive across
+# `docker build` runs on the same machine.  CI never runs Docker, so
+# there is no cache to share with the pipeline.
+#
+# The ENV block lives in the `pangolin-chef` stage, so the planner,
+# cooker and builder stages — which all derive from it — inherit it.
+ENV CARGO_BUILD_RUSTC_WRAPPER=/usr/local/cargo/bin/sccache \
+    SCCACHE_DIR=/root/.cache/sccache \
+    SCCACHE_SERVER_PORT=4227 \
+    SCCACHE_CACHE_SIZE=20G
 
 # ── Stage B: produce recipe.json ───────────────────────────────────────────
 FROM pangolin-chef AS planner
@@ -96,6 +138,16 @@ FROM pangolin-chef AS cooker
 
 COPY --from=planner /pangolin/recipe.json recipe.json
 
+# The two cache mounts below are where the compilation reuse comes from:
+#
+#   /pangolin/target     — the cargo target dir.  This is what carries
+#                          the bulk of the reuse between `docker build`
+#                          runs.
+#   /root/.cache/sccache — the sccache compiler cache, wired up by the
+#                          ENV block in the pangolin-chef stage.
+#
+# Both are BuildKit cache mounts: they survive across `docker build`
+# runs on the same machine and are dropped by `docker builder prune`.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
