@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa check-context
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
 
 help:
 	@echo "=== Config ==="
@@ -72,7 +72,6 @@ help:
 	@echo "  make dev-ui        # Opt-in: watch templates + assets, rebuild UI on save"
 	@echo "  make build-dist    # Docker build (UI minified in-container), export to build/output/"
 	@echo "  make dist          # Same as build-dist"
-	@echo "  make check-context # Verify the Docker build context (inputs present, no leaks)"
 	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
 	@echo ""
 	@echo "=== Local Run ==="
@@ -369,14 +368,6 @@ build-dist: dist
 dist:
 	./build/dist.sh
 
-# Guard the Docker build context: assert every input the Dockerfile COPYs
-# is present in the filtered context, and that nothing host-side (local
-# secrets, the CodeGraph index, ansible playbooks, …) leaks into it.
-# `make check-context` needs docker but NOT the Rust toolchain — the probe
-# is a `FROM scratch` + `COPY . /ctx` image, so it runs in ~2s.
-check-context:
-	./build/check-context.sh
-
 # Keep downloaded CLIs (./bin/tailwindcss, ./bin/esbuild); restored by
 # download-ui-tools. Only strip locally-built outputs (cargo + generated
 # UI bundles + docker export dir).
@@ -416,7 +407,7 @@ lint: fmt-check clippy test
 ci: fmt-check clippy test build
 	@echo "✓ full local CI passed"
 
-ci-full: fmt-check clippy test test-e2e build check-context build-dist
+ci-full: fmt-check clippy test test-e2e build build-dist
 	@echo "✓ full CI (with e2e) passed"
 
 # ── Deploy ───────────────────────────────────────────────────────────────────

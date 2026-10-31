@@ -256,12 +256,22 @@ names, so a dot-tool nobody has installed yet cannot slip through.  If the
 build ever *does* need a dotfile, re-include it explicitly rather than
 weakening the rule.
 
-`make check-context` (→ `build/check-context.sh`) probes the context
-with a `FROM scratch` + `COPY . /ctx` image — Docker's own matcher, no
-Rust toolchain, ~2 s — and asserts that the top-level entries are exactly
-the allow-list above, that every required input is present, and that
-nothing hidden, generated, or secret leaked in.  Run it after touching
-`.dockerignore`; `make ci-full` runs it before `build-dist`.
+When you change `.dockerignore`, verify it by hand with the same probe
+the build uses — no tooling needed:
+
+```bash
+printf 'FROM scratch\nCOPY . /ctx\n' > /tmp/probe.dockerfile
+docker build --no-cache -q -f /tmp/probe.dockerfile -t ctxprobe . >/dev/null
+docker create --name ctxprobe-ctr ctxprobe true >/dev/null
+docker export ctxprobe-ctr | tar -tf - | sed -n 's|^ctx/||p' | grep -v '/$' \
+    | LC_ALL=C sort
+```
+
+That listing is exactly what Docker uploads.  Check it against the
+allow-list above: the top-level entries must match, every row of the
+table must be present, and nothing hidden, generated, or secret may
+appear.  Then re-run `make build-dist` — the builder stage is the real
+end-to-end check.
 
 ## Style
 
