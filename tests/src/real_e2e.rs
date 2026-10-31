@@ -4776,3 +4776,53 @@ async fn real_e2e_rate_limit_serves_the_custom_429_page() {
     let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
     assert_eq!(body, custom, "the custom page must be served verbatim");
 }
+
+/// The ACME HTTP-01 challenge is answered **before** the site is
+/// resolved, so it is never rate limited — a validation request must
+/// succeed even while the site's limit is exhausted (issue #117,
+/// R15).
+#[tokio::test]
+async fn real_e2e_acme_http01_challenge_is_not_rate_limited() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "acme-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "acme.test", "acme-site");
+        seed_rate_limit(&conn, "acme-site", 1, 60);
+    })
+    .await;
+
+    // Exhaust the site's limit with an ordinary request.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _) = raw_get(&addr, "acme.test", "/").await;
+    assert_eq!(status, 200, "the first request must be served");
+    let (status, _) = raw_get(&addr, "acme.test", "/").await;
+    assert_eq!(status, 429, "the limit must be exhausted");
+
+    // Plant the challenge file like the ACME client does.
+    let cert_dir = ngx.cert_dir();
+    let ch_dir = cert_dir.join(".well-known").join("acme-challenge");
+    std::fs::create_dir_all(&ch_dir).expect("mkdir .well-known/acme-challenge");
+    let token = "rate-limited-token-abc123";
+    let key_auth = format!("{}.thumbprint-def456", token);
+    std::fs::write(ch_dir.join(token), &key_auth).expect("write challenge file");
+
+    // The challenge must still be served.
+    let path = format!("/.well-known/acme-challenge/{}", token);
+    let (status, body) = raw_get(&addr, "acme.test", &path).await;
+    assert_eq!(
+        status,
+        200,
+        "the ACME challenge must not be rate limited, got {status}. \
+         body={body:?}. ngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(
+        body,
+        key_auth,
+        "the challenge body must be served verbatim. ngx log:\n{}",
+        ngx.log_string()
+    );
+}

@@ -1898,6 +1898,35 @@ mod tests {
     }
 
     #[test]
+    fn the_penalty_box_expires_after_the_block_window() {
+        // The block window is what keeps a throttled client out; once
+        // it elapses the client is served again (and — with a block
+        // window that is at least as long as the counting window —
+        // it gets a fresh counting window).
+        let mut p = policy(1, 0);
+        p.req_window_secs = 1;
+        p.throttle_secs = 1;
+        let (limiter, cfg) = limiter_with(p);
+        let client = ip(198, 51, 100, 20);
+
+        assert_eq!(
+            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            LimitDecision::Throttled { .. }
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(
+            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            LimitDecision::Allow,
+            "the client must be served again once the block window elapsed"
+        );
+    }
+
+    #[test]
     fn the_blocked_list_records_the_rejected_clients() {
         let (limiter, mut cfg) = limiter_with(policy(1, 0));
         cfg.blacklist.insert("192.0.2.0/24").unwrap();

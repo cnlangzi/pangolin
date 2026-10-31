@@ -303,6 +303,13 @@ restarts; the configuration lives in SQLite and survives restarts.
   thread that owns the snapshot, and the admin handler reads the
   published snapshot instead of iterating the rings on the request
   path.
+- The **dashboard** (`GET /`) carries a live "Blocked clients" card:
+  the client addresses the limiter rejected, with the number of 403s
+  (a blacklist rule matched) and 429s (over a limit), the site that
+  rejected them last and how long ago. The card refreshes through
+  htmx (`GET /api/ratelimit/blocked`) every two seconds, so the
+  operator sees an attack as it happens. The counters are per address
+  across all sites and are cleared when the process restarts.
 
 ## The bot log is always on
 
