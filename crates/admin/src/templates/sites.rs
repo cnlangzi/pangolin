@@ -8,6 +8,7 @@
 //! and localised to the form-context shape.
 
 use askama::Template;
+use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{Site, Tun};
 
 // ─── List page (GET /sites) ────────────────────────────────────────────────────
@@ -34,6 +35,8 @@ pub struct SitesNewTemplate<'a> {
     /// Available tunnel names, for the hierarchical backend URL form's
     /// "Tunnel" dropdown.
     pub tunnels: Vec<Tun>,
+    /// The per-site rate-limit policy (issue #117).
+    pub rate_limit: RateLimitPolicy,
 }
 
 impl<'a> SitesNewTemplate<'a> {
@@ -102,6 +105,8 @@ pub struct SitesEditTemplate<'a> {
     pub field_error: Option<&'a str>,
     pub active_nav: &'a str,
     pub tunnels: Vec<Tun>,
+    /// The per-site rate-limit policy (issue #117).
+    pub rate_limit: RateLimitPolicy,
 }
 
 impl<'a> SitesEditTemplate<'a> {
@@ -179,6 +184,8 @@ pub struct SitesFormFieldsView<'a> {
     pub field_error: Option<&'a str>,
     pub active_nav: &'a str,
     pub tunnels: Vec<Tun>,
+    /// The per-site rate-limit policy (issue #117).
+    pub rate_limit: RateLimitPolicy,
 }
 
 impl<'a> SitesFormFieldsView<'a> {

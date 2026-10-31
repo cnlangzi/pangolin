@@ -8,13 +8,18 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
-use crate::templates::{ActivityRow, DashboardTemplate};
+use crate::templates::{ActivityRow, BlockedRow, DashboardTemplate};
 
 /// How many of the most-recent EventBuffer entries to surface in the
 /// dashboard "Recent ACME activity" panel. The buffer is bounded at
 /// 100 (see `events::MAX_EVENTS`); 20 is enough to cover the typical
 /// few-minute ACME flow without blowing the card's vertical budget.
 const DASHBOARD_ACTIVITY_LIMIT: usize = 20;
+
+/// How many rejected clients the dashboard's live list shows. The
+/// list is sorted by "last seen", so the most recent rejections are
+/// always on top.
+pub const DASHBOARD_BLOCKED_LIMIT: usize = 20;
 
 fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
@@ -62,6 +67,9 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         .collect();
 
     let traffic = app.traffic_snapshot();
+    // The live "blocked clients" list (issue #117): the client IPs
+    // the rate limiter rejected, most recent first.
+    let blocked = blocked_rows(app);
     let dashboard = DashboardTemplate {
         site_count: sites.len(),
         domain_count: domains.len(),
@@ -74,6 +82,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         traffic_rps: traffic.rps_display(),
         traffic_error_pct: traffic.error_pct_display(),
         traffic_active: traffic.active_requests,
+        blocked,
         active_nav: "dashboard",
     };
 
@@ -81,6 +90,25 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         dashboard.render().unwrap(),
         csrf,
     ))
+}
+
+/// The live "blocked clients" rows of the dashboard.
+///
+/// Reads the rate limiter's published snapshot — the counters are
+/// in-memory and reset when the process restarts.
+pub fn blocked_rows(app: &Arc<App>) -> Vec<BlockedRow> {
+    app.ratelimit_snapshot()
+        .blocked
+        .iter()
+        .take(DASHBOARD_BLOCKED_LIMIT)
+        .map(|c| BlockedRow {
+            ip: c.ip.clone(),
+            site: c.site.clone(),
+            rule_blocks: c.rule_blocks,
+            throttled: c.throttled,
+            last_seen: format!("{}s ago", c.last_seen_secs),
+        })
+        .collect()
 }
 
 /// Convert an `EventBuffer` entry into the template-friendly
@@ -116,5 +144,46 @@ fn activity_row(e: pangolin_core::Event, now: chrono::DateTime<chrono::Utc>) -> 
         kind,
         message,
         is_error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pangolin_core::CertManager;
+    use pangolin_core::config::Config;
+    use tempfile::TempDir;
+
+    fn make_test_app() -> (TempDir, Arc<App>) {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let app = Arc::new(
+            App::new(
+                db_path.to_str().expect("utf8"),
+                Config::default(),
+                CertManager::default(),
+            )
+            .expect("App::new"),
+        );
+        (dir, app)
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_shows_the_blocked_clients_panel() {
+        let (_dir, app) = make_test_app();
+        let resp = render(&app, "csrf").await.expect("render");
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body();
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("body")
+            .to_bytes();
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(html.contains("Blocked clients"), "{html}");
+        assert!(html.contains("/api/ratelimit/blocked"), "{html}");
+        assert!(
+            html.contains("No client has been blocked"),
+            "the empty state must be rendered: {html}"
+        );
     }
 }

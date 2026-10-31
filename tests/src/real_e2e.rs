@@ -4510,3 +4510,319 @@ async fn real_e2e_tunnel_ws_upgrade_host_mode() {
 
     ws.close(None).await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// Per-site rate limiting + IP rules (issue #117).
+// ---------------------------------------------------------------------------
+
+/// Seed the per-site rate-limit policy (the `site_rate_limits` table
+/// added by the V9 migration).
+fn seed_rate_limit(conn: &Connection, site_name: &str, req_limit: i64, window_secs: i64) {
+    seed_rate_limit_with_body(conn, site_name, req_limit, window_secs, None);
+}
+
+/// Seed the per-site rate-limit policy with a custom 429 page.
+fn seed_rate_limit_with_body(
+    conn: &Connection,
+    site_name: &str,
+    req_limit: i64,
+    window_secs: i64,
+    custom_429_body: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO site_rate_limits (site_name, enabled, req_limit, req_window_secs,
+                page_limit, page_window_secs, ip_capacity, throttle_capacity, throttle_secs,
+                custom_429_body)
+         VALUES (?1, 1, ?2, ?3, 0, 3600, 1024, 1024, 600, ?4)",
+        rusqlite::params![site_name, req_limit, window_secs, custom_429_body],
+    )
+    .expect("insert site_rate_limits");
+}
+
+/// Seed a global IP rule (the `ip_rules` table added by V9).
+fn seed_ip_rule(conn: &Connection, kind: &str, cidr: &str) {
+    conn.execute(
+        "INSERT INTO ip_rules (id, scope, kind, cidr, note, created_at)
+         VALUES (?1, 'global', ?2, ?3, NULL, ?4)",
+        rusqlite::params![
+            format!("global|{kind}|{cidr}"),
+            kind,
+            cidr,
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .expect("insert ip_rules");
+}
+
+/// Issue a raw HTTP/1.1 GET and return `(status, full response text)`.
+///
+/// The full text is needed to assert on response headers — the
+/// `Retry-After` of a 429 in particular.
+async fn raw_get_full(addr: &str, host: &str, path: &str) -> (u16, String) {
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        .await
+        .expect("connect (5s timeout)")
+        .expect("connect");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write request");
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+        .await
+        .expect("read response (5s timeout)")
+        .expect("read response");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+/// Read a header value out of a raw HTTP response.
+fn response_header(response: &str, name: &str) -> Option<String> {
+    response.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case(name) {
+            Some(v.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// A site whose request limit is 2 per minute must serve the first two
+/// requests and answer the third with 429 + `Retry-After` — without
+/// letting it reach the backend.
+#[tokio::test]
+async fn real_e2e_rate_limit_rejects_the_third_request_with_429() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit(&conn, "rl-site", 2, 60);
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    for i in 0..2 {
+        let (status, body) = raw_get(&addr, "rl.test", "/").await;
+        assert_eq!(
+            status,
+            200,
+            "request {i} must be served, got {status} ({body})\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+
+    let (status, text) = raw_get_full(&addr, "rl.test", "/").await;
+    assert_eq!(
+        status,
+        429,
+        "the third request must be throttled, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    let retry_after = response_header(&text, "Retry-After").expect("Retry-After header on a 429");
+    let secs: u64 = retry_after.parse().expect("numeric Retry-After");
+    assert!(
+        (1..=60).contains(&secs),
+        "Retry-After must be within the counting window, got {secs}"
+    );
+
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        2,
+        "the rejected request must never reach the backend, saw {} request(s)",
+        seen.len()
+    );
+}
+
+/// A blacklisted client IP is rejected with 403 — even when the site
+/// has no limits at all.
+#[tokio::test]
+async fn real_e2e_rate_limit_blacklist_returns_403() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        // The e2e client connects over loopback.
+        seed_ip_rule(&conn, "blacklist", "127.0.0.0/8");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, text) = raw_get_full(&addr, "rl.test", "/").await;
+    assert_eq!(
+        status,
+        403,
+        "a blacklisted client must get 403, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        backend.seen().await.is_empty(),
+        "a blocked request must never reach the backend"
+    );
+}
+
+/// A whitelisted client IP is exempt: it is served even while the
+/// site's limit is exhausted.
+#[tokio::test]
+async fn real_e2e_rate_limit_whitelist_is_exempt() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit(&conn, "rl-site", 1, 60);
+        seed_ip_rule(&conn, "whitelist", "127.0.0.0/8");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    for i in 0..5 {
+        let (status, body) = raw_get(&addr, "rl.test", "/").await;
+        assert_eq!(
+            status, 200,
+            "request {i} must be served — the client is whitelisted, got {status} ({body})"
+        );
+    }
+    assert_eq!(backend.seen().await.len(), 5);
+}
+
+/// A throttled request is answered with the built-in default 429
+/// page — a self-contained HTML document.
+#[tokio::test]
+async fn real_e2e_rate_limit_serves_the_default_429_page() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit(&conn, "rl-site", 1, 60);
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _) = raw_get(&addr, "rl.test", "/").await;
+    assert_eq!(status, 200);
+
+    let (status, text) = raw_get_full(&addr, "rl.test", "/").await;
+    assert_eq!(status, 429, "{text}");
+    assert!(
+        text.contains("Content-Type: text/html"),
+        "the default page must be served as HTML: {text}"
+    );
+    assert!(
+        text.contains("<!DOCTYPE html>"),
+        "the default page must be a full HTML document: {text}"
+    );
+    assert!(
+        text.contains("Too Many Requests"),
+        "the default page must name the status: {text}"
+    );
+}
+
+/// A site can serve its own 429 page — the operator writes the raw
+/// HTML in the admin UI and it is sent verbatim.
+#[tokio::test]
+async fn real_e2e_rate_limit_serves_the_custom_429_page() {
+    let backend = InspectingBackend::start().await;
+    let custom = "<!DOCTYPE html><html><body><h1 id=\"custom\">Slow down</h1></body></html>";
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit_with_body(&conn, "rl-site", 1, 60, Some(custom));
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _) = raw_get(&addr, "rl.test", "/").await;
+    assert_eq!(status, 200);
+
+    let (status, text) = raw_get_full(&addr, "rl.test", "/").await;
+    assert_eq!(status, 429, "{text}");
+    assert!(
+        text.contains("Content-Type: text/html"),
+        "the custom page must be served as HTML: {text}"
+    );
+    assert!(
+        text.contains(r#"id="custom""#),
+        "the custom page must be served verbatim: {text}"
+    );
+    // The status line itself says "429 Too Many Requests" — the body
+    // must be the custom page only, not the built-in default.
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert_eq!(body, custom, "the custom page must be served verbatim");
+}
+
+/// The ACME HTTP-01 challenge is answered **before** the site is
+/// resolved, so it is never rate limited — a validation request must
+/// succeed even while the site's limit is exhausted (issue #117,
+/// R15).
+#[tokio::test]
+async fn real_e2e_acme_http01_challenge_is_not_rate_limited() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "acme-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "acme.test", "acme-site");
+        seed_rate_limit(&conn, "acme-site", 1, 60);
+    })
+    .await;
+
+    // Exhaust the site's limit with an ordinary request.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _) = raw_get(&addr, "acme.test", "/").await;
+    assert_eq!(status, 200, "the first request must be served");
+    let (status, _) = raw_get(&addr, "acme.test", "/").await;
+    assert_eq!(status, 429, "the limit must be exhausted");
+
+    // Plant the challenge file like the ACME client does.
+    let cert_dir = ngx.cert_dir();
+    let ch_dir = cert_dir.join(".well-known").join("acme-challenge");
+    std::fs::create_dir_all(&ch_dir).expect("mkdir .well-known/acme-challenge");
+    let token = "rate-limited-token-abc123";
+    let key_auth = format!("{}.thumbprint-def456", token);
+    std::fs::write(ch_dir.join(token), &key_auth).expect("write challenge file");
+
+    // The challenge must still be served.
+    let path = format!("/.well-known/acme-challenge/{}", token);
+    let (status, body) = raw_get(&addr, "acme.test", &path).await;
+    assert_eq!(
+        status,
+        200,
+        "the ACME challenge must not be rate limited, got {status}. \
+         body={body:?}. ngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(
+        body,
+        key_auth,
+        "the challenge body must be served verbatim. ngx log:\n{}",
+        ngx.log_string()
+    );
+}

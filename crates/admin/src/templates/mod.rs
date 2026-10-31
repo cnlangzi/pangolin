@@ -34,6 +34,7 @@ pub mod dashboard;
 pub mod dns;
 pub mod domains;
 pub mod logs;
+pub mod ratelimit;
 pub mod settings;
 pub mod sites;
 pub mod traffic;
@@ -43,7 +44,7 @@ pub mod tun;
 // `use crate::templates::SitesListTemplate;`
 pub use auth::LoginTemplate;
 pub use certs::{CertRow, CertsListTemplate, CertsNewTemplate};
-pub use dashboard::{ActivityRow, DashboardTemplate};
+pub use dashboard::{ActivityRow, BlockedRow, DashboardBlockedView, DashboardTemplate};
 pub use dns::{
     DnsProvidersEditTemplate, DnsProvidersFormFieldsView, DnsProvidersListTemplate,
     DnsProvidersNewTemplate,
@@ -55,6 +56,9 @@ pub use domains::{
 pub use logs::{
     BotHistoryFilter, BotHistorySummary, BotLogsHistoryTemplate, BotLogsStatsTemplate,
     BotLogsTemplate, LogsTemplate, subnav,
+};
+pub use ratelimit::{
+    RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
 };
 pub use settings::SettingsTemplate;
 pub use sites::{

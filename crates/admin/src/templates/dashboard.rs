@@ -23,6 +23,35 @@ pub struct ActivityRow {
     pub is_error: bool,
 }
 
+/// One row of the dashboard's live "blocked clients" list.
+///
+/// The data comes from the rate limiter's published snapshot (the
+/// client IPs the limiter rejected), so it is a live view of what is
+/// being blocked right now — not an audit log.
+#[derive(Clone, Debug)]
+pub struct BlockedRow {
+    /// The client address.
+    pub ip: String,
+    /// The site that rejected the client last.
+    pub site: String,
+    /// 403 answers — a blacklist rule matched the client.
+    pub rule_blocks: u64,
+    /// 429 answers — the client was over one of the site's limits.
+    pub throttled: u64,
+    /// How long ago the client was last rejected ("12s ago").
+    pub last_seen: String,
+}
+
+/// The "blocked clients" panel of the dashboard — refreshed through
+/// htmx (`GET /api/ratelimit/blocked`).
+#[derive(Template)]
+#[template(path = "views/dashboard/_blocked.html")]
+pub struct DashboardBlockedView {
+    /// The same shape the dashboard page carries, so the fragment can
+    /// be rendered by both.
+    pub blocked: Vec<BlockedRow>,
+}
+
 /// Dashboard stats overview.
 #[derive(Template)]
 #[template(path = "pages/dashboard.html")]
@@ -48,5 +77,7 @@ pub struct DashboardTemplate<'a> {
     pub traffic_rps: String,
     pub traffic_error_pct: String,
     pub traffic_active: u64,
+    /// The live "blocked clients" list (issue #117).
+    pub blocked: Vec<BlockedRow>,
     pub active_nav: &'a str,
 }

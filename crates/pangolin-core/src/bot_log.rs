@@ -675,9 +675,8 @@ fn text_matches(value: &str, want: &str, exact: bool) -> bool {
 /// silently skipped so a stray `bot-2026-13-99.jsonl` from a typo
 /// doesn't crash the page.
 ///
-/// Returns an empty `Vec` if the directory doesn't exist (a deploy
-/// with `bot.enabled = false` or a fresh install before the first
-/// bot hit).
+/// Returns an empty `Vec` if the directory doesn't exist (a fresh
+/// install before the first bot hit).
 pub fn list_dates(dir: &Path) -> std::io::Result<Vec<NaiveDate>> {
     let mut dates = Vec::new();
     if !dir.exists() {

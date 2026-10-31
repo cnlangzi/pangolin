@@ -532,7 +532,91 @@ impl ProxyHttp for AppProxy {
                 return Ok(true);
             }
         };
+        // Issue #117: fetch the site's rate-limit configuration in
+        // the same lock scope as the routing entry, so the policy and
+        // the IP rules always come from the same revision.
+        let limit_cfg = indexes.limits.get(&site.name).cloned();
         drop(indexes);
+        // The host is known from here on — a rate-limited request is
+        // still attributed to its host in the traffic side-channel.
+        ctx.host_known = true;
+
+        // ── Per-site rate limiting + IP rules (issue #117) ────
+        //
+        // The decision is taken after the routing entry has been
+        // resolved and before the request is forwarded: a rejected
+        // request never reaches the backend. The ACME HTTP-01
+        // challenge and the tunnel control channel are answered
+        // *before* the site lookup, so they are never limited.
+        //
+        // The client IP is the authoritative one (the CDN / LB
+        // header, or the TCP peer in direct mode); when it is
+        // unavailable the TCP peer is used instead. A request
+        // without any client IP is neither counted nor limited.
+        let limit_ip = ctx
+            .client_ip
+            .or_else(|| peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip())));
+        // The known-bot verdict is reused from the `P-Known-Bot`
+        // computation — but only when the gateway headers are on:
+        // `resolve_headers` skips the verification when they are
+        // off, so its verdict would be unusable. In that case the
+        // limiter verifies the bot itself (the verifier is always
+        // present — the bot log is always on).
+        let known_bot = if cfg.pgl_headers_enabled {
+            pgl.known_bot
+        } else {
+            match (
+                self.app.bot_verifier.as_deref(),
+                ctx.user_agent.as_deref(),
+                limit_ip,
+            ) {
+                (Some(v), Some(ua), Some(ip)) => pangolin_core::verify_bot(v, ua, ip).is_some(),
+                _ => false,
+            }
+        };
+        if let Some(limit_cfg) = limit_cfg {
+            let decision = {
+                let pq = session.req_header().uri.path_and_query();
+                self.app.rate_limiter.check(
+                    &site.name,
+                    &limit_cfg,
+                    limit_ip,
+                    known_bot,
+                    pq.map(|p| p.as_str()),
+                )
+            };
+            match decision {
+                pangolin_core::LimitDecision::Allow => {}
+                pangolin_core::LimitDecision::Blocked => {
+                    respond_rate_limited(
+                        session,
+                        403,
+                        None,
+                        "text/plain; charset=utf-8",
+                        BLOCKED_BODY,
+                    )
+                    .await;
+                    return Ok(true);
+                }
+                pangolin_core::LimitDecision::Throttled { retry_after } => {
+                    // The site's own page wins; otherwise the
+                    // built-in default page is served.
+                    let body = match limit_cfg.policy.custom_429_body.as_deref() {
+                        Some(custom) if !custom.trim().is_empty() => custom.to_string(),
+                        _ => pangolin_core::ratelimit::default_429_page(retry_after),
+                    };
+                    respond_rate_limited(
+                        session,
+                        429,
+                        Some(retry_after),
+                        "text/html; charset=utf-8",
+                        &body,
+                    )
+                    .await;
+                    return Ok(true);
+                }
+            }
+        }
 
         // Parse backend into a typed target.
         let (tun_name, target) = match parse_backend_to_target(&site.backend) {
@@ -550,7 +634,6 @@ impl ProxyHttp for AppProxy {
         } else {
             format!("tun:{}", tun_name)
         };
-        ctx.host_known = true;
         ctx.traffic_route = if !tun_name.is_empty() {
             pangolin_core::TrafficRoute::Tunnel
         } else if matches!(target, BackendTarget::File { .. }) {
@@ -1882,6 +1965,51 @@ async fn respond_streaming_unsupported_on_file(session: &mut Session) {
         .await
     {
         warn!("failed to write 415 response body: {e}");
+    }
+}
+
+/// Body of a 403 answer from the IP rules.
+const BLOCKED_BODY: &str = "Forbidden by site policy.\n";
+
+/// Answer a request the rate limiter rejected (issue #117).
+///
+/// `status` is 403 (the client's IP matches a blacklist rule) or 429
+/// (the client is over one of the site's limits). The 429 carries a
+/// `Retry-After` header with the number of seconds left in the
+/// counting window that tripped, and its body is the site's custom
+/// page or the built-in default one.
+async fn respond_rate_limited(
+    session: &mut Session,
+    status: u16,
+    retry_after: Option<u64>,
+    content_type: &str,
+    body: &str,
+) {
+    let mut hdr = match ResponseHeader::build(status, None) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("failed to build rate-limit response: {e}");
+            let _ = session.respond_error(500).await;
+            return;
+        }
+    };
+    hdr.insert_header("Content-Type", content_type.as_bytes())
+        .ok();
+    if let Some(secs) = retry_after {
+        hdr.insert_header("Retry-After", secs.to_string().as_bytes())
+            .ok();
+    }
+    hdr.insert_header("Content-Length", body.len().to_string().as_bytes())
+        .ok();
+    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
+        warn!("failed to write {status} response header: {e}");
+        return;
+    }
+    if let Err(e) = session
+        .write_response_body(Some(Bytes::from(body.to_string())), true)
+        .await
+    {
+        warn!("failed to write {status} response body: {e}");
     }
 }
 

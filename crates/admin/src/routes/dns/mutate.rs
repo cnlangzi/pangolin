@@ -13,8 +13,9 @@ use pangolin_core::DnsProviderKind;
 
 use crate::{App, redirect_response};
 
-use super::helpers::{is_valid_dns_name, parse_form};
+use super::helpers::is_valid_dns_name;
 use super::pages::build_new_form;
+use crate::routes::helpers::parse_form;
 
 type Resp = Response<Full<Bytes>>;
 

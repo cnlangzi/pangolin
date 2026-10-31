@@ -222,6 +222,18 @@ pub async fn handle(
         }
         ("traffic", "GET") => routes::traffic::render(&app, &csrf_token).await?,
         ("traffic/reset", "POST") => routes::traffic::handle_reset(&app).await?,
+        // ── Rate limits + IP rules (issue #117) ───────────────────
+        ("ratelimit", "GET") => {
+            routes::ratelimit::render(
+                &app,
+                &csrf_token,
+                query_param_opt(&merged_params, "error").as_deref(),
+            )
+            .await?
+        }
+        ("ratelimit/rules", "POST") => {
+            routes::ratelimit::handle_add_rule(&app, &merged_params, &csrf_token).await?
+        }
         ("logs", "GET") => routes::logs::render(&app, &csrf_token).await?,
         ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token).await?,
         ("logs/bots/history", "GET") => {
@@ -322,6 +334,23 @@ pub async fn handle(
                     routes::traffic::api_kpis(&app).await?
                 } else if rest == "traffic/tables" && method == "GET" {
                     routes::traffic::api_tables(&app).await?
+                } else if rest == "ratelimit/kpis" && method == "GET" {
+                    routes::ratelimit::api_kpis(&app).await?
+                } else if rest == "ratelimit/sites" && method == "GET" {
+                    routes::ratelimit::api_sites(&app).await?
+                } else if rest == "ratelimit/rules" && method == "GET" {
+                    routes::ratelimit::api_rules(&app, &csrf_token).await?
+                } else if rest == "ratelimit/blocked" && method == "GET" {
+                    routes::ratelimit::api_blocked(&app).await?
+                } else if rest == "ratelimit/rules" && method == "DELETE" {
+                    routes::ratelimit::api_handle_delete_rule(
+                        &app,
+                        query_param(&merged_params, "scope"),
+                        query_param(&merged_params, "kind"),
+                        query_param(&merged_params, "cidr"),
+                        &csrf_token,
+                    )
+                    .await?
                 } else if let Some(domain) = rest.strip_prefix("domains/") {
                     if method == "DELETE" {
                         if domain.is_empty() {

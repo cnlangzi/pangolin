@@ -17,6 +17,11 @@
 //! forced operators to pre-register both halves; the merged model is a
 //! single SELECT.
 //!
+//! v9 (V9 migration): the per-site rate limits and the IP rules live
+//! in their own tables, owned by the rate-limit module:
+//!   site_rate_limits (site_name PK, enabled, req_limit, ...)
+//!   ip_rules         (id PK = "<scope>|<kind>|<cidr>", scope, kind, cidr, note, ...)
+//!
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
 //!
@@ -25,6 +30,7 @@
 //! keeping the link consistent — in particular, deleting a provider is done
 //! transactionally with a `SET NULL` on the referencing domains.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -33,6 +39,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
+use crate::ratelimit::{IpRule, RateLimitPolicy, RuleKind};
 use crate::types::{
     Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, FrontendMode, Site,
     SystemConfig, Tun,
@@ -122,8 +129,26 @@ pub fn upsert_site(conn: &Connection, site: &Site) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Delete a site and everything that belongs to it.
+///
+/// The V9 tables have no foreign key, so the cleanup is explicit:
+/// the site's rate-limit policy and the IP rules scoped to it are
+/// removed with the site. Leaving them behind would silently revive
+/// the old limits (and the old custom 429 page) when a site with the
+/// same name is created again.
+///
+/// The `domains` rows of a deleted site are *not* removed — that is
+/// pre-existing behaviour (a domain may be re-attached to a new
+/// site), and the domain cleanup lives in the domain CRUD.
 pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let n = conn.execute("DELETE FROM sites WHERE name = ?1", params![name])?;
+    if n > 0 {
+        conn.execute(
+            "DELETE FROM site_rate_limits WHERE site_name = ?1",
+            params![name],
+        )?;
+        conn.execute("DELETE FROM ip_rules WHERE scope = ?1", params![name])?;
+    }
     Ok(n > 0)
 }
 
@@ -829,6 +854,140 @@ pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::
     Ok(())
 }
 
+// ---- Site rate limits + IP rules (V9) ----
+
+/// Read the rate-limit policy of every site that has one.
+///
+/// Sites without a row are simply absent from the map — the caller
+/// gives them the default policy (limits off).
+pub fn list_site_rate_limits(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, RateLimitPolicy>> {
+    let mut stmt = conn.prepare(
+        "SELECT site_name, enabled, req_limit, req_window_secs,
+                page_limit, page_window_secs, ip_capacity,
+                throttle_capacity, throttle_secs, custom_429_body
+         FROM site_rate_limits",
+    )?;
+    let rows = stmt.query_map([], row_to_rate_limit_policy)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (site_name, policy) = row?;
+        out.insert(site_name, policy);
+    }
+    Ok(out)
+}
+
+/// Read the rate-limit policy of one site.
+pub fn get_site_rate_limit(
+    conn: &Connection,
+    site_name: &str,
+) -> rusqlite::Result<Option<RateLimitPolicy>> {
+    let mut stmt = conn.prepare(
+        "SELECT site_name, enabled, req_limit, req_window_secs,
+                page_limit, page_window_secs, ip_capacity,
+                throttle_capacity, throttle_secs, custom_429_body
+         FROM site_rate_limits WHERE site_name = ?1",
+    )?;
+    stmt.query_row(params![site_name], |row| {
+        let (name, policy) = row_to_rate_limit_policy(row)?;
+        Ok((name, policy))
+    })
+    .optional()
+    .map(|v| v.map(|(_, policy)| policy))
+}
+
+/// Insert or update the rate-limit policy of a site.
+///
+/// The row is keyed by the site name, so re-submitting the form
+/// overwrites the previous policy instead of adding a second row.
+pub fn upsert_site_rate_limit(
+    conn: &Connection,
+    site_name: &str,
+    policy: &RateLimitPolicy,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO site_rate_limits (
+            site_name, enabled, req_limit, req_window_secs,
+            page_limit, page_window_secs, ip_capacity,
+            throttle_capacity, throttle_secs, custom_429_body, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(site_name) DO UPDATE SET
+            enabled = excluded.enabled,
+            req_limit = excluded.req_limit,
+            req_window_secs = excluded.req_window_secs,
+            page_limit = excluded.page_limit,
+            page_window_secs = excluded.page_window_secs,
+            ip_capacity = excluded.ip_capacity,
+            throttle_capacity = excluded.throttle_capacity,
+            throttle_secs = excluded.throttle_secs,
+            custom_429_body = excluded.custom_429_body,
+            updated_at = excluded.updated_at",
+        params![
+            site_name,
+            policy.enabled as i64,
+            policy.req_limit as i64,
+            policy.req_window_secs as i64,
+            policy.page_limit as i64,
+            policy.page_window_secs as i64,
+            policy.ip_capacity as i64,
+            policy.throttle_capacity as i64,
+            policy.throttle_secs as i64,
+            policy.custom_429_body,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete the rate-limit policy of a site. Returns whether a row
+/// was removed.
+pub fn delete_site_rate_limit(conn: &Connection, site_name: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM site_rate_limits WHERE site_name = ?1",
+        params![site_name],
+    )?;
+    Ok(n > 0)
+}
+
+/// Read every IP rule.
+pub fn list_ip_rules(conn: &Connection) -> rusqlite::Result<Vec<IpRule>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, scope, kind, cidr, note, created_at
+         FROM ip_rules ORDER BY scope, kind, cidr",
+    )?;
+    let rows = stmt.query_map([], row_to_ip_rule)?;
+    rows.collect()
+}
+
+/// Insert or update an IP rule.
+///
+/// The row is keyed by the natural id `"<scope>|<kind>|<cidr>"`, so
+/// adding the same rule twice is an upsert.
+pub fn upsert_ip_rule(conn: &Connection, rule: &IpRule) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO ip_rules (id, scope, kind, cidr, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            note = excluded.note",
+        params![
+            rule.id,
+            rule.scope,
+            rule.kind.as_str(),
+            rule.cidr,
+            rule.note,
+            rule.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete an IP rule by its id. Returns whether a row was removed.
+pub fn delete_ip_rule(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute("DELETE FROM ip_rules WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
 // ---- Row mappers ----
 
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
@@ -1014,6 +1173,59 @@ fn row_to_cert(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cert> {
     })
 }
 
+/// Map a `site_rate_limits` row to `(site_name, policy)`.
+fn row_to_rate_limit_policy(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, RateLimitPolicy)> {
+    let site_name: String = row.get(0)?;
+    let enabled: i64 = row.get(1)?;
+    let req_limit: i64 = row.get(2)?;
+    let req_window_secs: i64 = row.get(3)?;
+    let page_limit: i64 = row.get(4)?;
+    let page_window_secs: i64 = row.get(5)?;
+    let ip_capacity: i64 = row.get(6)?;
+    let throttle_capacity: i64 = row.get(7)?;
+    let throttle_secs: i64 = row.get(8)?;
+    let custom_429_body: Option<String> = row.get(9)?;
+    Ok((
+        site_name,
+        RateLimitPolicy {
+            enabled: enabled != 0,
+            req_limit: req_limit.max(0) as u32,
+            req_window_secs: req_window_secs.max(0) as u64,
+            page_limit: page_limit.max(0) as u32,
+            page_window_secs: page_window_secs.max(0) as u64,
+            ip_capacity: ip_capacity.max(0) as u32,
+            throttle_capacity: throttle_capacity.max(0) as u32,
+            throttle_secs: throttle_secs.max(0) as u64,
+            // An empty body means "no custom page" — the built-in
+            // default is served instead.
+            custom_429_body: custom_429_body.filter(|b| !b.trim().is_empty()),
+        },
+    ))
+}
+
+/// Map an `ip_rules` row to an [`IpRule`].
+fn row_to_ip_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<IpRule> {
+    let id: String = row.get(0)?;
+    let scope: String = row.get(1)?;
+    let kind_raw: String = row.get(2)?;
+    let cidr: String = row.get(3)?;
+    let note: Option<String> = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    let kind = RuleKind::parse(&kind_raw).ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("invalid ip_rules.kind: {kind_raw}"))
+    })?;
+    Ok(IpRule {
+        id,
+        scope,
+        kind,
+        cidr,
+        note,
+        created_at: parse_dt(&created_at)?,
+    })
+}
+
 fn parse_dt(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::from_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1057,21 +1269,22 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V8 as applied. (V2 merges
+        // it's there and lists V1..V9 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
         // the per-row backoff schedule; V6 adds per-domain challenge_kind
         // for issue #55; V7 adds the system_config singleton; V8 adds
-        // the gateway-header configuration for issue #115.)
+        // the gateway-header configuration for issue #115; V9 adds the
+        // per-site rate limits + IP rules for issue #117.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 8,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 to be applied"
+            count, 9,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 to be applied"
         );
 
         // Verify V2 is recorded.

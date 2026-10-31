@@ -220,3 +220,80 @@
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
       </div>
     </div>
+
+    {# ── Rate limit (issue #117) ────────────────────────────────────── #}
+    <div class="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <label class="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200 mb-3">
+        <input type="checkbox" name="rate_limit_enabled" id="rate-limit-enabled"
+          {% if rate_limit.enabled %}checked{% endif %}
+          class="w-4 h-4 rounded border-slate-300 dark:border-slate-600 text-accent-500 focus:ring-accent-500">
+        Enable rate limiting for this site
+      </label>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-4">
+        Counters are per client IP and live in memory only — they are cleared when the process restarts.
+        Verified known bots are always exempt. A limit of <code>0</code> turns that dimension off.
+      </p>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-limit">Request limit</label>
+          <input type="number" name="rate_limit_req_limit" id="rate-limit-req-limit" min="0" max="1000000"
+            value="{{ rate_limit.req_limit }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">requests per client IP per window (0 = off)</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-window">Request window (s)</label>
+          <input type="number" name="rate_limit_req_window_secs" id="rate-limit-req-window" min="1" max="86400"
+            value="{{ rate_limit.req_window_secs }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">length of the counting window</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-limit">Distinct page limit</label>
+          <input type="number" name="rate_limit_page_limit" id="rate-limit-page-limit" min="0" max="1000000"
+            value="{{ rate_limit.page_limit }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">distinct URLs (path + query) per client IP (0 = off)</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-window">Page window (s)</label>
+          <input type="number" name="rate_limit_page_window_secs" id="rate-limit-page-window" min="1" max="86400"
+            value="{{ rate_limit.page_window_secs }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">length of the page counting window</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-ip-capacity">Tracked clients</label>
+          <input type="number" name="rate_limit_ip_capacity" id="rate-limit-ip-capacity" min="1" max="262144"
+            value="{{ rate_limit.ip_capacity }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">client-IP slots per ring (1 – 262144)</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-capacity">Penalty box size</label>
+          <input type="number" name="rate_limit_throttle_capacity" id="rate-limit-throttle-capacity" min="1" max="262144"
+            value="{{ rate_limit.throttle_capacity }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">how many throttled clients are remembered</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-secs">Block window (s)</label>
+          <input type="number" name="rate_limit_throttle_secs" id="rate-limit-throttle-secs" min="1" max="86400"
+            value="{{ rate_limit.throttle_secs }}"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">how long a throttled client stays blocked</p>
+        </div>
+      </div>
+
+      <div class="mt-4">
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-custom-429">Custom 429 page (HTML)</label>
+        <textarea name="rate_limit_custom_429_body" id="rate-limit-custom-429" rows="10"
+          placeholder="&lt;h1&gt;Too many requests&lt;/h1&gt;"
+          class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{% if let Some(b) = rate_limit.custom_429_body.as_deref() %}{{ b }}{% endif %}</textarea>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          Raw HTML served as the body of this site's 429 responses — write the whole page, it is sent verbatim.
+          Leave it empty to use the built-in default page.
+        </p>
+      </div>
+    </div>

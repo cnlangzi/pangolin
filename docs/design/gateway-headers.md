@@ -118,9 +118,9 @@ request (User-Agent word-boundary match **and** IP ownership).
 Everything else — pending, failed, unknown — is `"0"` (fail
 closed), matching the bot-log side channel.
 
-The verifier only exists when the bot log is enabled
-(`log.bot.enabled`); with it disabled `P-Known-Bot` is `"0"` and no
-verification work is done. The header is never absent.
+The verifier is always present (the bot log is always on — issue
+#117), so `P-Known-Bot` is `"1"` for every verified crawler. The
+header is never absent.
 
 With no authoritative client IP there is nothing to verify against,
 so the value is `"0"`.

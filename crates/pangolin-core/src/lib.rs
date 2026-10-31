@@ -31,6 +31,7 @@ pub mod normalize;
 pub mod parse;
 pub mod pgl;
 pub mod proxy;
+pub mod ratelimit;
 pub mod traffic;
 pub mod tunnel;
 pub mod types;
@@ -58,6 +59,10 @@ pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_request, parse_backend_to_target,
     serve_file_target,
+};
+pub use ratelimit::{
+    IpRule, IpRules, LimitDecision, OverLimitClient, RateLimitPolicy, RateLimitSnapshot,
+    RateLimiter, RuleKind, SiteLimitConfig, SiteLimitStat,
 };
 pub use traffic::{
     TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,

@@ -54,6 +54,9 @@ dashmap.workspace = true
 # the request hot path calls `verify` synchronously and never awaits.
 knownbots = { path = "../knownbots" }
 
+# CIDR parsing / matching for the per-site IP rules (issue #117).
+ipnet.workspace = true
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `figment::Jail` lives behind the `test` feature flag — used by the
