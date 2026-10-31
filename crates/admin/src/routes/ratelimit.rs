@@ -17,13 +17,13 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use pangolin_core::ratelimit::{IpRule, IpRules, RateLimitPolicy, RuleKind};
+use pangolin_core::ratelimit::{GLOBAL_SCOPE, IpRule, RateLimitPolicy, RuleKind, normalize_cidr};
 
 use crate::App;
 use crate::ok_html_with_csrf;
-use crate::routes::helpers::{ok_html, redirect};
+use crate::routes::helpers::{ok_html, parse_form, redirect};
 use crate::templates::{
-    RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView,
+    RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
 };
 
 type Resp = Response<Full<Bytes>>;
@@ -38,17 +38,19 @@ pub const MAX_WINDOW_SECS: u64 = 86_400;
 /// unbounded table.
 pub const MAX_CAPACITY: u32 = 262_144;
 
-/// The scope that applies to every site.
-pub const GLOBAL_SCOPE: &str = "global";
-
 /// `GET /ratelimit` — the full page.
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+///
+/// `error` is the code of a rejected rule submission (see
+/// [`add_rule_errors`]); it is rendered as a banner so a typo does not
+/// silently drop the rule.
+pub async fn render(app: &Arc<App>, csrf: &str, error: Option<&str>) -> http::Result<Resp> {
     let snap = (*app.ratelimit_snapshot()).clone();
     let (rules, site_names) = load_rules_and_sites(app).await;
     let tmpl = RateLimitPageTemplate {
         snap,
-        rules,
+        rules: rules.iter().map(RuleRow::new).collect(),
         site_names,
+        error: error.map(|code| add_rule_errors(code).to_string()),
         csrf_token: csrf.to_string(),
         active_nav: "ratelimit",
     };
@@ -78,9 +80,30 @@ pub async fn api_sites(app: &Arc<App>) -> http::Result<Resp> {
 }
 
 /// `GET /api/ratelimit/rules` — the IP rules table.
-pub async fn api_rules(app: &Arc<App>) -> http::Result<Resp> {
+///
+/// The fragment carries the delete buttons, so the CSRF placeholder
+/// has to be substituted here too — the page polls this fragment
+/// every five seconds, and an unsubstituted `__CSRF__` would make
+/// every delete button fail the CSRF check.
+pub async fn api_rules(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
     let (rules, _site_names) = load_rules_and_sites(app).await;
-    let html = RateLimitRulesView { rules }.render().unwrap_or_default();
+    let html = RateLimitRulesView {
+        rules: rules.iter().map(RuleRow::new).collect(),
+    }
+    .render()
+    .unwrap_or_default();
+    ok_html_with_csrf(html, csrf)
+}
+
+/// `GET /api/ratelimit/blocked` — the live "blocked clients" list of
+/// the dashboard.
+///
+/// The fragment carries no buttons, so it needs no CSRF token.
+pub async fn api_blocked(app: &Arc<App>) -> http::Result<Resp> {
+    let rows = crate::routes::dashboard::blocked_rows(app);
+    let html = crate::templates::DashboardBlockedView { blocked: rows }
+        .render()
+        .unwrap_or_default();
     ok_html(html)
 }
 
@@ -94,9 +117,8 @@ pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::
         .get("scope")
         .cloned()
         .unwrap_or_else(|| GLOBAL_SCOPE.to_string());
-    let kind = match params.get("kind").and_then(|k| RuleKind::parse(k)) {
-        Some(k) => k,
-        None => return Ok(redirect("/ratelimit")),
+    let Some(kind) = params.get("kind").and_then(|k| RuleKind::parse(k)) else {
+        return Ok(redirect("/ratelimit?error=invalid-kind"));
     };
     let cidr = params.get("cidr").cloned().unwrap_or_default();
     let note = params.get("note").cloned().filter(|n| !n.is_empty());
@@ -104,7 +126,7 @@ pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::
     // Normalise the address / range and reject a malformed value.
     let normalized = match normalize_cidr(&cidr) {
         Ok(c) => c,
-        Err(_) => return Ok(redirect("/ratelimit")),
+        Err(_) => return Ok(redirect("/ratelimit?error=invalid-cidr")),
     };
 
     // The scope must be "global" or the name of an existing site — a
@@ -118,7 +140,7 @@ pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::
                 .any(|s| s.name == scope);
         if !known {
             log::warn!("ratelimit: ignoring ip rule for unknown scope {scope:?}");
-            return Ok(redirect("/ratelimit"));
+            return Ok(redirect("/ratelimit?error=unknown-scope"));
         }
     }
 
@@ -187,20 +209,27 @@ pub fn rule_id(scope: &str, kind: RuleKind, cidr: &str) -> String {
     format!("{}|{}|{}", scope, kind.as_str(), cidr)
 }
 
-/// Normalise an address or CIDR range to its canonical text form.
-pub fn normalize_cidr(cidr: &str) -> Result<String, String> {
-    let mut rules = IpRules::new();
-    rules.insert(cidr)
+/// The outcome of parsing the rate-limit fields of the site form.
+pub struct ParsedPolicy {
+    /// The policy. Always filled — a field that could not be parsed
+    /// falls back to its default so the operator does not have to
+    /// re-type the whole form after fixing one value.
+    pub policy: RateLimitPolicy,
+    /// The first error, if any field was malformed.
+    pub error: Option<String>,
+    /// False when the form carried no rate-limit field at all — an
+    /// API client that predates the feature must keep working, and an
+    /// update must not silently reset a policy the operator set
+    /// through the UI.
+    pub present: bool,
 }
 
 /// Parse the rate-limit fields of the site form.
 ///
-/// Returns `Ok(None)` when the form carries **no** rate-limit field
-/// at all — an API client that predates the feature must keep
-/// working, and an update must not silently reset a policy the
-/// operator set through the UI. A field that is present but
-/// malformed is an error naming the field.
-pub fn parse_policy(params: &HashMap<String, String>) -> Result<Option<RateLimitPolicy>, String> {
+/// A field that is present but malformed is reported in
+/// [`ParsedPolicy::error`]; the other fields are still parsed, so the
+/// re-rendered form keeps the operator's input.
+pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
     const FIELDS: [&str; 9] = [
         "rate_limit_enabled",
         "rate_limit_req_limit",
@@ -213,70 +242,123 @@ pub fn parse_policy(params: &HashMap<String, String>) -> Result<Option<RateLimit
         CUSTOM_429_FIELD,
     ];
     if !FIELDS.iter().any(|f| params.contains_key(*f)) {
-        return Ok(None);
+        return ParsedPolicy {
+            policy: RateLimitPolicy::default(),
+            error: None,
+            present: false,
+        };
     }
-    let enabled = params.contains_key("rate_limit_enabled");
+    let mut error: Option<String> = None;
+    let defaults = RateLimitPolicy::default();
+
+    let enabled = match parse_enabled(params) {
+        Ok(v) => v,
+        Err(e) => {
+            error = Some(e);
+            false
+        }
+    };
     let req_limit = parse_bounded(
         params,
         "rate_limit_req_limit",
-        RateLimitPolicy::default().req_limit,
+        defaults.req_limit,
         0,
         MAX_LIMIT,
-    )?;
+        &mut error,
+    );
     let req_window_secs = parse_bounded(
         params,
         "rate_limit_req_window_secs",
-        RateLimitPolicy::default().req_window_secs,
+        defaults.req_window_secs,
         1,
         MAX_WINDOW_SECS,
-    )?;
+        &mut error,
+    );
     let page_limit = parse_bounded(
         params,
         "rate_limit_page_limit",
-        RateLimitPolicy::default().page_limit,
+        defaults.page_limit,
         0,
         MAX_LIMIT,
-    )?;
+        &mut error,
+    );
     let page_window_secs = parse_bounded(
         params,
         "rate_limit_page_window_secs",
-        RateLimitPolicy::default().page_window_secs,
+        defaults.page_window_secs,
         1,
         MAX_WINDOW_SECS,
-    )?;
+        &mut error,
+    );
     let ip_capacity = parse_bounded(
         params,
         "rate_limit_ip_capacity",
-        RateLimitPolicy::default().ip_capacity,
+        defaults.ip_capacity,
         1,
         MAX_CAPACITY,
-    )?;
+        &mut error,
+    );
     let throttle_capacity = parse_bounded(
         params,
         "rate_limit_throttle_capacity",
-        RateLimitPolicy::default().throttle_capacity,
+        defaults.throttle_capacity,
         1,
         MAX_CAPACITY,
-    )?;
+        &mut error,
+    );
     let throttle_secs = parse_bounded(
         params,
         "rate_limit_throttle_secs",
-        RateLimitPolicy::default().throttle_secs,
+        defaults.throttle_secs,
         1,
         MAX_WINDOW_SECS,
-    )?;
-    let custom_429_body = parse_custom_429(params)?;
-    Ok(Some(RateLimitPolicy {
-        enabled,
-        req_limit,
-        req_window_secs,
-        page_limit,
-        page_window_secs,
-        ip_capacity,
-        throttle_capacity,
-        throttle_secs,
-        custom_429_body,
-    }))
+        &mut error,
+    );
+    let custom_429_body = match parse_custom_429(params) {
+        Ok(v) => v,
+        Err(e) => {
+            if error.is_none() {
+                error = Some(e);
+            }
+            None
+        }
+    };
+
+    ParsedPolicy {
+        policy: RateLimitPolicy {
+            enabled,
+            req_limit,
+            req_window_secs,
+            page_limit,
+            page_window_secs,
+            ip_capacity,
+            throttle_capacity,
+            throttle_secs,
+            custom_429_body,
+        },
+        error,
+        present: true,
+    }
+}
+
+/// Read the "enable the limits" flag.
+///
+/// A browser checkbox submits `on`; an API client may send `true`,
+/// `1` or `yes`. Anything else is an error — treating the mere
+/// presence of the key as "true" would silently *enable* the limits
+/// for a client that meant to disable them.
+fn parse_enabled(params: &HashMap<String, String>) -> Result<bool, String> {
+    let Some(raw) = params.get("rate_limit_enabled") else {
+        return Ok(false);
+    };
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "on" | "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "rate_limit_enabled must be a boolean, got {other:?}"
+        )),
+    }
 }
 
 /// The form field that carries the site's custom 429 page.
@@ -316,45 +398,51 @@ fn parse_custom_429(params: &HashMap<String, String>) -> Result<Option<String>, 
 /// Read a numeric form field and bound it.
 ///
 /// A missing (or empty) field falls back to `default`; a field that
-/// is present but out of range is an error.
+/// is present but out of range is reported in `error` and falls back
+/// to `default` as well.
 fn parse_bounded<T>(
     params: &HashMap<String, String>,
     key: &str,
     default: T,
     min: T,
     max: T,
-) -> Result<T, String>
+    error: &mut Option<String>,
+) -> T
 where
     T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
 {
     let Some(raw) = params.get(key) else {
-        return Ok(default);
+        return default;
     };
     let raw = raw.trim();
     if raw.is_empty() {
-        return Ok(default);
+        return default;
     }
-    let value: T = raw
-        .parse()
-        .map_err(|_| format!("{key} must be a number between {min} and {max}"))?;
+    let Ok(value) = raw.parse::<T>() else {
+        if error.is_none() {
+            *error = Some(format!("{key} must be a number between {min} and {max}"));
+        }
+        return default;
+    };
     if value < min || value > max {
-        return Err(format!("{key} must be between {min} and {max}"));
+        if error.is_none() {
+            *error = Some(format!("{key} must be between {min} and {max}"));
+        }
+        return default;
     }
-    Ok(value)
+    value
 }
 
-/// Parse a urlencoded form body.
-fn parse_form(body: &[u8]) -> HashMap<String, String> {
-    let body_str = std::str::from_utf8(body).unwrap_or("");
-    let mut params = HashMap::new();
-    for pair in body_str.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            let k = k.trim().to_string();
-            let v = urlencoding::decode(v).unwrap_or_default().to_string();
-            params.insert(k, v);
+/// The messages behind the `?error=` codes of the "add rule" form.
+fn add_rule_errors(code: &str) -> &'static str {
+    match code {
+        "invalid-cidr" => {
+            "The address or CIDR range could not be parsed — use 1.2.3.4 or 10.0.0.0/8."
         }
+        "invalid-kind" => "The rule kind must be either whitelist or blacklist.",
+        "unknown-scope" => "The scope must be \"global\" or the name of an existing site.",
+        _ => "The rule could not be added.",
     }
-    params
 }
 
 #[cfg(test)]
@@ -388,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn page_renders_the_kpis_and_the_rules() {
         let (_dir, app) = make_test_app();
-        let resp = render(&app, "csrf").await.expect("render");
+        let resp = render(&app, "csrf", None).await.expect("render");
         assert_eq!(resp.status(), 200);
         let body = resp.into_body();
         let bytes = http_body_util::BodyExt::collect(body)
@@ -469,11 +557,13 @@ mod tests {
             ("rate_limit_throttle_capacity", "65536"),
             ("rate_limit_throttle_secs", "600"),
         ]);
-        let p = parse_policy(&params).expect("policy").expect("present");
-        assert!(p.enabled);
-        assert_eq!(p.req_limit, 100);
-        assert_eq!(p.page_limit, 500);
-        assert_eq!(p.ip_capacity, 16384);
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert!(parsed.present);
+        assert!(parsed.policy.enabled);
+        assert_eq!(parsed.policy.req_limit, 100);
+        assert_eq!(parsed.policy.page_limit, 500);
+        assert_eq!(parsed.policy.ip_capacity, 16384);
     }
 
     #[test]
@@ -489,15 +579,21 @@ mod tests {
         ];
         let mut params = form(&base);
         params.insert("rate_limit_ip_capacity".into(), "999999999".into());
-        assert!(parse_policy(&params).is_err());
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_some());
+        // The fields that parsed are kept — the operator only has to
+        // fix the one that was wrong.
+        assert_eq!(parsed.policy.req_limit, 1);
 
         let mut params = form(&base);
         params.insert("rate_limit_req_window_secs".into(), "0".into());
-        assert!(parse_policy(&params).is_err());
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_some());
 
         let mut params = form(&base);
         params.insert("rate_limit_req_limit".into(), "nope".into());
-        assert!(parse_policy(&params).is_err());
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_some());
     }
 
     #[test]
@@ -506,20 +602,26 @@ mod tests {
             ("rate_limit_req_limit", "10"),
             ("rate_limit_custom_429_body", "<h1>Slow down</h1>"),
         ]);
-        let p = parse_policy(&params).expect("no error").expect("present");
-        assert_eq!(p.custom_429_body.as_deref(), Some("<h1>Slow down</h1>"));
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert_eq!(
+            parsed.policy.custom_429_body.as_deref(),
+            Some("<h1>Slow down</h1>")
+        );
 
         // An empty body means "use the built-in default page".
         params.insert("rate_limit_custom_429_body".into(), "   ".into());
-        let p = parse_policy(&params).expect("no error").expect("present");
-        assert_eq!(p.custom_429_body, None);
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert_eq!(parsed.policy.custom_429_body, None);
 
         // An oversized body is rejected.
         params.insert(
             "rate_limit_custom_429_body".into(),
             "x".repeat(MAX_CUSTOM_429_BYTES + 1),
         );
-        assert!(parse_policy(&params).is_err());
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_some());
     }
 
     #[test]
@@ -527,7 +629,9 @@ mod tests {
         // An API client that predates the feature must keep working:
         // no field → no policy → the existing one is left alone.
         let params = form(&[("name", "site")]);
-        assert!(parse_policy(&params).expect("no error").is_none());
+        let parsed = parse_policy(&params);
+        assert!(!parsed.present);
+        assert!(parsed.error.is_none());
     }
 
     #[test]
@@ -541,8 +645,9 @@ mod tests {
             ("rate_limit_throttle_capacity", "1024"),
             ("rate_limit_throttle_secs", "60"),
         ]);
-        let p = parse_policy(&params).expect("policy").expect("present");
-        assert!(!p.enabled);
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert!(!parsed.policy.enabled);
     }
 
     #[test]

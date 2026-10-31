@@ -129,8 +129,26 @@ pub fn upsert_site(conn: &Connection, site: &Site) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Delete a site and everything that belongs to it.
+///
+/// The V9 tables have no foreign key, so the cleanup is explicit:
+/// the site's rate-limit policy and the IP rules scoped to it are
+/// removed with the site. Leaving them behind would silently revive
+/// the old limits (and the old custom 429 page) when a site with the
+/// same name is created again.
+///
+/// The `domains` rows of a deleted site are *not* removed — that is
+/// pre-existing behaviour (a domain may be re-attached to a new
+/// site), and the domain cleanup lives in the domain CRUD.
 pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let n = conn.execute("DELETE FROM sites WHERE name = ?1", params![name])?;
+    if n > 0 {
+        conn.execute(
+            "DELETE FROM site_rate_limits WHERE site_name = ?1",
+            params![name],
+        )?;
+        conn.execute("DELETE FROM ip_rules WHERE scope = ?1", params![name])?;
+    }
     Ok(n > 0)
 }
 

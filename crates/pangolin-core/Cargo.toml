@@ -11,9 +11,6 @@ rusqlite.workspace = true
 refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
-# Raw-YAML inspection for the retired-key warning (issue #117):
-# `log.bot.enabled` is gone but an old config must still parse.
-serde_yaml.workspace = true
 figment.workspace = true
 log.workspace = true
 thiserror.workspace = true

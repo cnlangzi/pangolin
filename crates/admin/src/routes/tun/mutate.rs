@@ -9,8 +9,9 @@ use http_body_util::Full;
 use crate::{App, redirect_response};
 use pangolin_core::types::Tun;
 
-use super::helpers::{generate_token, parse_datetime, parse_form};
+use super::helpers::{generate_token, parse_datetime};
 use super::pages::{render_create_page_with_error, render_edit_page_with_error};
+use crate::routes::helpers::parse_form;
 
 type Resp = Response<Full<Bytes>>;
 

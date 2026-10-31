@@ -594,18 +594,11 @@ impl Config {
 /// always on (issue #117), and a disabled bot log used to silently
 /// turn the gateway's `P-Known-Bot` header into `0`.
 fn warn_retired_keys(s: &str) {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(s) else {
-        // A YAML syntax error is reported by the figment parse below;
-        // don't double-report it here.
-        return;
-    };
-    let Some(log_section) = value.get("log") else {
-        return;
-    };
-    let Some(bot_section) = log_section.get("bot") else {
-        return;
-    };
-    if bot_section.get("enabled").is_some() {
+    // `find_value` walks the parsed YAML — `Err(MissingField)` means
+    // the key is not there, `Ok(_)` means it is. A YAML syntax error
+    // is reported by the parse below; don't double-report it here.
+    let figment = Figment::new().merge(Yaml::string(s));
+    if figment.find_value("log.bot.enabled").is_ok() {
         log::warn!(
             "config: `log.bot.enabled` has been retired and is ignored — \
              the bot log and the knownbots verifier are always on. \

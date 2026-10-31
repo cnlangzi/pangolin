@@ -5,9 +5,36 @@
 //! `lib.rs`) because they are route-internal; only handlers and the dispatch
 //! should call them.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
+
+/// Parse an `application/x-www-form-urlencoded` body into a map.
+///
+/// The `+` rule of that content type is honoured: `+` in the body
+/// means a space, and a literal plus arrives percent-encoded (`%2B`)
+/// and decodes back to `+`. This matters for free-text fields (the
+/// custom 429 page, a rule note) — without it every space of an HTML
+/// document would be stored as a `+`.
+///
+/// The per-resource `parse_form` copies that predate this helper
+/// keep `+` literal; they only ever read space-free fields (names,
+/// hosts, tokens).
+pub(crate) fn parse_form(body: &[u8]) -> HashMap<String, String> {
+    let body_str = std::str::from_utf8(body).unwrap_or("");
+    let mut params = HashMap::new();
+    for pair in body_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = k.trim().to_string();
+            let v = v.replace('+', " ");
+            let v = urlencoding::decode(&v).unwrap_or_default().to_string();
+            params.insert(k, v);
+        }
+    }
+    params
+}
 
 /// Build a 200 OK HTML response with the given body. The `Content-Type` is
 /// always `text/html; charset=utf-8`.
@@ -139,4 +166,32 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_form_decodes_a_plus_as_a_space() {
+        // `application/x-www-form-urlencoded` encodes a space as `+`
+        // and a literal plus as `%2B` — both must survive the round
+        // trip, otherwise every space of a free-text field (the
+        // custom 429 page, a rule note) is stored as a `+`.
+        let body = b"note=Slow+down+%26+calm&plus=a%2Bb";
+        let params = parse_form(body);
+        assert_eq!(
+            params.get("note").map(String::as_str),
+            Some("Slow down & calm")
+        );
+        assert_eq!(params.get("plus").map(String::as_str), Some("a+b"));
+    }
+
+    #[test]
+    fn parse_form_handles_a_missing_value() {
+        let params = parse_form(b"a=1&b&c=");
+        assert_eq!(params.get("a").map(String::as_str), Some("1"));
+        assert!(!params.contains_key("b"));
+        assert_eq!(params.get("c").map(String::as_str), Some(""));
+    }
 }

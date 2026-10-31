@@ -8,7 +8,7 @@ description = "Verify search-engine / AI / social bots via UA + official IP rang
 
 [dependencies]
 anyhow.workspace = true
-ipnet = "2"
+ipnet.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 # manual-roots: no CA bundle. IP-list downloads skip certificate checks

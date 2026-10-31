@@ -66,18 +66,25 @@ const HLL_REGISTERS: usize = 64;
 /// cardinalities.
 const EXACT_PREFIX: usize = 8;
 
-/// Upper bound on the number of distinct client IPs the "top
-/// over-limit" table remembers per site.
-const MAX_OVER_IPS: usize = 1024;
+/// Upper bound on the number of rejected clients the published
+/// snapshot carries. The list is sorted by "last seen", so the most
+/// recent rejections always survive the cut.
+const MAX_BLOCKED_CLIENTS: usize = 200;
 
-/// Upper bound on the number of per-(ip, reason) log counters kept
-/// per site. Cleared wholesale when exceeded — the counters only
-/// exist to rate-limit the log output.
-const MAX_LOG_COUNTERS: usize = 4096;
+/// Upper bound on the number of distinct client IPs the "blocked
+/// clients" list remembers per site.
+///
+/// The list is a live view of what the limiter rejected, not an
+/// audit log — once the cap is reached the *new* addresses are not
+/// remembered (the ones already listed keep their counters).
+const MAX_BLOCKED_IPS: usize = 1024;
 
 /// How many identical rejection events are logged per client IP:
 /// the first one, then every 1000th.
 const LOG_EVERY: u64 = 1000;
+
+/// The scope of an IP rule that applies to every site.
+pub const GLOBAL_SCOPE: &str = "global";
 
 /// Interval between two published snapshots.
 const PUBLISH_TICK: Duration = Duration::from_secs(1);
@@ -377,7 +384,7 @@ pub fn build_limit_configs(
         .collect();
 
     for rule in rules {
-        let Ok(ip) = parse_rule_cidr(&rule.cidr) else {
+        let Ok(ip) = normalize_cidr(&rule.cidr) else {
             // A malformed row is ignored — the admin form rejects
             // those, so this only happens if the row was hand-edited.
             log::warn!(
@@ -387,7 +394,7 @@ pub fn build_limit_configs(
             );
             continue;
         };
-        if rule.scope == "global" {
+        if rule.scope == GLOBAL_SCOPE {
             for cfg in owned.values_mut() {
                 let target = match rule.kind {
                     RuleKind::Whitelist => &mut cfg.whitelist,
@@ -410,9 +417,12 @@ pub fn build_limit_configs(
         .collect()
 }
 
-/// Parse the text form of a rule (`1.2.3.4` or `10.0.0.0/8`) into
-/// the canonical form used by [`IpRules::insert`].
-fn parse_rule_cidr(cidr: &str) -> Result<String, String> {
+/// Normalise the text form of a rule (`1.2.3.4` or `10.0.0.0/8`) into
+/// its canonical form — the form the `ip_rules.cidr` column stores.
+///
+/// This is the one place the canonicalisation lives: the admin UI
+/// stores what it returns, and the rule loader parses it back.
+pub fn normalize_cidr(cidr: &str) -> Result<String, String> {
     let mut rules = IpRules::new();
     rules.insert(cidr)
 }
@@ -560,15 +570,28 @@ struct SiteState {
     rule_blocks: u64,
     exempt: u64,
     untracked: u64,
-    /// Over-limit rejections per client IP (bounded).
-    over_ips: HashMap<IpAddr, u64>,
-    /// Log rate-limit counters per (client IP, reason) (bounded).
-    log_counts: HashMap<(IpAddr, u8), u64>,
+    /// The client IPs this site rejected, with their counters.
+    /// Backs the dashboard's live "blocked clients" list and the
+    /// log rate-limit.
+    blocked_ips: HashMap<IpAddr, BlockedIpStat>,
 }
 
-/// Reason codes for the log rate-limit counters.
-const REASON_THROTTLE: u8 = 0;
-const REASON_BLOCK: u8 = 1;
+/// The rejection counters of one client IP.
+///
+/// The `total` is the log counter: the first rejection of a client is
+/// logged, then every [`LOG_EVERY`]-th one, so an attack cannot flood
+/// the log.
+#[derive(Clone, Copy, Debug)]
+struct BlockedIpStat {
+    /// 403 answers — a blacklist rule matched the client.
+    rule_blocks: u64,
+    /// 429 answers — the client was over one of the site's limits.
+    throttled: u64,
+    /// The total number of rejections (the log counter).
+    total: u64,
+    /// When the client was last rejected.
+    last_seen: Instant,
+}
 
 impl SiteState {
     fn new(policy: &RateLimitPolicy) -> Self {
@@ -588,8 +611,7 @@ impl SiteState {
             rule_blocks: 0,
             exempt: 0,
             untracked: 0,
-            over_ips: HashMap::new(),
-            log_counts: HashMap::new(),
+            blocked_ips: HashMap::new(),
         };
         st.allocate(policy);
         st
@@ -740,24 +762,31 @@ impl SiteState {
         slot.expiry = Some(now + Duration::from_secs(ttl_secs));
     }
 
-    /// Increment the log counter for a (client IP, reason) pair and
-    /// return the new value.
-    fn bump_log_count(&mut self, ip: IpAddr, reason: u8) -> u64 {
-        if self.log_counts.len() >= MAX_LOG_COUNTERS {
-            self.log_counts.clear();
+    /// Record a rejection of `ip` and return the new total — the log
+    /// counter.
+    ///
+    /// `kind` is `true` for a rule block (403) and `false` for a
+    /// throttle (429).
+    fn record_rejection(&mut self, ip: IpAddr, rule_block: bool) -> u64 {
+        if self.blocked_ips.len() >= MAX_BLOCKED_IPS && !self.blocked_ips.contains_key(&ip) {
+            // The list is full — the client is still rejected, it is
+            // just not remembered.
+            return 0;
         }
-        let counter = self.log_counts.entry((ip, reason)).or_insert(0);
-        *counter = counter.saturating_add(1);
-        *counter
-    }
-
-    /// Record an over-limit rejection for the "top clients" table.
-    fn bump_over_ips(&mut self, ip: IpAddr) {
-        if self.over_ips.len() >= MAX_OVER_IPS && !self.over_ips.contains_key(&ip) {
-            return;
+        let stat = self.blocked_ips.entry(ip).or_insert(BlockedIpStat {
+            rule_blocks: 0,
+            throttled: 0,
+            total: 0,
+            last_seen: Instant::now(),
+        });
+        if rule_block {
+            stat.rule_blocks = stat.rule_blocks.saturating_add(1);
+        } else {
+            stat.throttled = stat.throttled.saturating_add(1);
         }
-        let counter = self.over_ips.entry(ip).or_insert(0);
-        *counter = counter.saturating_add(1);
+        stat.total = stat.total.saturating_add(1);
+        stat.last_seen = Instant::now();
+        stat.total
     }
 }
 
@@ -919,6 +948,26 @@ pub struct OverLimitClient {
     pub events: u64,
 }
 
+/// A client IP the limiter rejected — the live "blocked clients"
+/// list of the admin dashboard.
+///
+/// The counters are per IP across every site: an address that is
+/// blocked on three sites shows one row with the summed counters and
+/// the site that rejected it last.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockedClient {
+    /// The client address.
+    pub ip: String,
+    /// The site that rejected the client last.
+    pub site: String,
+    /// 403 answers — a blacklist rule matched the client.
+    pub rule_blocks: u64,
+    /// 429 answers — the client was over one of the site's limits.
+    pub throttled: u64,
+    /// Seconds since the client was last rejected.
+    pub last_seen_secs: u64,
+}
+
 /// The totals shown in the KPI row.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RateLimitTotals {
@@ -941,6 +990,9 @@ pub struct RateLimitSnapshot {
     pub sites: Vec<SiteLimitStat>,
     /// The 20 clients with the most over-limit rejections.
     pub top_over: Vec<OverLimitClient>,
+    /// The clients the limiter rejected, most recent first. Backs
+    /// the dashboard's live "blocked clients" list.
+    pub blocked: Vec<BlockedClient>,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -995,7 +1047,15 @@ impl RateLimiter {
                     // Sleep until the next tick — or until the
                     // shutdown wakes us, so `Drop` never waits for
                     // the tick to elapse.
+                    //
+                    // The flag is checked *while the lock is held*:
+                    // the shutdown path takes the same lock before
+                    // it notifies, so the notification cannot be lost
+                    // between the check and the wait.
                     let mut guard = lock.lock();
+                    if shutdown_t.load(Ordering::Relaxed) {
+                        break;
+                    }
                     cvar.wait_for(&mut guard, PUBLISH_TICK);
                     drop(guard);
                 }
@@ -1081,8 +1141,15 @@ impl RateLimiter {
     }
 
     /// Stop the publisher thread.
+    ///
+    /// Wakes the publisher so it does not sleep out the rest of its
+    /// tick before it notices the flag. The lock is taken first — the
+    /// publisher checks the flag while holding it, so the
+    /// notification cannot be lost.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        let _guard = self.wake.0.lock();
+        self.wake.1.notify_all();
     }
 }
 
@@ -1090,7 +1157,11 @@ impl Drop for RateLimiter {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         // Wake the publisher so the join does not wait for the tick.
-        self.wake.1.notify_all();
+        // The lock is taken first — see `shutdown`.
+        {
+            let _guard = self.wake.0.lock();
+            self.wake.1.notify_all();
+        }
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
@@ -1103,9 +1174,13 @@ fn build_snapshot(
     started_at: Instant,
 ) -> RateLimitSnapshot {
     let sites = sites.read();
+    let now = Instant::now();
     let mut out = Vec::with_capacity(sites.len());
     let mut top: Vec<OverLimitClient> = Vec::new();
     let mut totals = RateLimitTotals::default();
+    // The rejected clients, merged across the sites. The `Instant`
+    // is the merge key for "which site rejected the client last".
+    let mut blocked: HashMap<IpAddr, (BlockedClient, Instant)> = HashMap::new();
 
     for (name, state) in sites.iter() {
         let state = state.lock();
@@ -1144,12 +1219,32 @@ fn build_snapshot(
         totals.rule_blocks += stat.rule_blocks;
         totals.exempt += stat.exempt;
 
-        for (ip, events) in state.over_ips.iter() {
+        for (ip, stat) in state.blocked_ips.iter() {
             top.push(OverLimitClient {
                 site: name.clone(),
                 ip: ip.to_string(),
-                events: *events,
+                events: stat.throttled,
             });
+            let entry = blocked.entry(*ip).or_insert_with(|| {
+                (
+                    BlockedClient {
+                        ip: ip.to_string(),
+                        site: name.clone(),
+                        rule_blocks: 0,
+                        throttled: 0,
+                        last_seen_secs: 0,
+                    },
+                    stat.last_seen,
+                )
+            });
+            entry.0.rule_blocks = entry.0.rule_blocks.saturating_add(stat.rule_blocks);
+            entry.0.throttled = entry.0.throttled.saturating_add(stat.throttled);
+            // The site that rejected the client last wins.
+            if stat.last_seen >= entry.1 {
+                entry.0.site = name.clone();
+                entry.1 = stat.last_seen;
+            }
+            entry.0.last_seen_secs = now.duration_since(stat.last_seen).as_secs();
         }
         out.push(stat);
     }
@@ -1158,11 +1253,22 @@ fn build_snapshot(
     top.sort_by_key(|row| std::cmp::Reverse(row.events));
     top.truncate(20);
 
+    // The blocked clients: the most recent first, then the most
+    // rejected.
+    let mut blocked: Vec<BlockedClient> = blocked.into_values().map(|(c, _)| c).collect();
+    blocked.sort_by(|a, b| {
+        b.last_seen_secs
+            .cmp(&a.last_seen_secs)
+            .then_with(|| (b.rule_blocks + b.throttled).cmp(&(a.rule_blocks + a.throttled)))
+    });
+    blocked.truncate(MAX_BLOCKED_CLIENTS);
+
     RateLimitSnapshot {
         uptime_secs: started_at.elapsed().as_secs(),
         totals,
         sites: out,
         top_over: top,
+        blocked,
     }
 }
 
@@ -1185,7 +1291,7 @@ impl SiteState {
             }
             Some(RuleKind::Blacklist) => {
                 self.rule_blocks += 1;
-                let n = self.bump_log_count(ip, REASON_BLOCK);
+                let n = self.record_rejection(ip, /* rule_block */ true);
                 if should_log(n) {
                     log::warn!(
                         "ratelimit: site={} ip={} reason=blacklist action=403",
@@ -1217,7 +1323,7 @@ impl SiteState {
         if let Some(remaining) = self.penalty_remaining(ip, now) {
             self.throttled += 1;
             let retry_after = remaining.as_secs().max(1);
-            let n = self.bump_log_count(ip, REASON_THROTTLE);
+            let n = self.record_rejection(ip, /* rule_block */ false);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=penalty action=429 retry_after={}",
@@ -1241,7 +1347,6 @@ impl SiteState {
             if over {
                 req_over = true;
                 self.req_over_events += 1;
-                self.bump_over_ips(ip);
             }
         }
 
@@ -1253,7 +1358,6 @@ impl SiteState {
             if over {
                 page_over = true;
                 self.page_over_events += 1;
-                self.bump_over_ips(ip);
             }
         }
         if tracked {
@@ -1273,7 +1377,7 @@ impl SiteState {
                 retry_after =
                     retry_after.max(self.page_window_remaining(now, policy.page_window_secs));
             }
-            let n = self.bump_log_count(ip, REASON_THROTTLE);
+            let n = self.record_rejection(ip, /* rule_block */ false);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=limit action=429 retry_after={}",
@@ -1791,6 +1895,45 @@ mod tests {
         }
         assert_eq!(snap.sites.len(), 1);
         assert_eq!(snap.sites[0].req_limit, 42);
+    }
+
+    #[test]
+    fn the_blocked_list_records_the_rejected_clients() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 0));
+        cfg.blacklist.insert("192.0.2.0/24").unwrap();
+
+        // A blacklisted client → 403.
+        let blocked_ip = ip(192, 0, 2, 5);
+        assert_eq!(
+            limiter.check("site", &cfg, Some(blocked_ip), false, Some("/")),
+            LimitDecision::Blocked
+        );
+
+        // A client over the limit → 429.
+        let throttled_ip = ip(198, 51, 100, 1);
+        limiter.check("site", &cfg, Some(throttled_ip), false, Some("/"));
+        assert!(matches!(
+            limiter.check("site", &cfg, Some(throttled_ip), false, Some("/")),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.blocked.len(), 2, "{:?}", snap.blocked);
+        let row = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == blocked_ip.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(row.rule_blocks, 1);
+        assert_eq!(row.throttled, 0);
+        assert_eq!(row.site, "site");
+        let row = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == throttled_ip.to_string())
+            .expect("the throttled client is listed");
+        assert_eq!(row.rule_blocks, 0);
+        assert_eq!(row.throttled, 1);
     }
 
     #[test]

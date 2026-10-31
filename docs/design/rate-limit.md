@@ -81,6 +81,12 @@ A policy row whose site no longer exists is ignored when the index is
 built, the same way a `domains` row without a matching site is ignored
 today.
 
+Deleting a site removes its policy row **and** the IP rules scoped to
+it (`db::delete_site` does both) — the V9 tables have no foreign key,
+so the cleanup is explicit. Leaving them behind would silently revive
+the old limits, the old custom 429 page and the old scoped rules when
+a site with the same name is created again.
+
 ## Runtime configuration
 
 `crates/pangolin-core/src/ratelimit.rs` holds the whole feature. It has
@@ -289,7 +295,9 @@ restarts; the configuration lives in SQLite and survives restarts.
   capacity, counted, over-limit per dimension, 429s, untracked
   requests), the top over-limit client IPs and the IP rules with their
   add and delete forms. The page refreshes through htmx from
-  `/api/ratelimit/{kpis,sites,rules}`.
+  `/api/ratelimit/{kpis,sites,rules}`. A rejected rule (malformed
+  address, unknown scope) redirects back with an `?error=` code that
+  is rendered as a banner — a dropped rule must not be silent.
 - The statistics are published by a background thread that ticks once
   per second, following the `TrafficHub` aggregator pattern: a plain OS
   thread that owns the snapshot, and the admin handler reads the

@@ -65,7 +65,3 @@ CREATE TABLE IF NOT EXISTS ip_rules (
     note       TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-
--- The hot path resolves a site's rules by scope; keep the lookup
--- index on (scope) so the reload does not scan the whole table.
-CREATE INDEX IF NOT EXISTS idx_ip_rules_scope ON ip_rules(scope);

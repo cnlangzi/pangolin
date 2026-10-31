@@ -472,6 +472,59 @@ async fn deleting_a_site_stops_its_policy() {
 }
 
 #[tokio::test]
+async fn deleting_a_site_removes_its_policy_and_scoped_rules() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    let now = Utc::now();
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(10, 0)).unwrap();
+        db::upsert_ip_rule(
+            &db,
+            &IpRule {
+                id: "a|blacklist|203.0.113.0/24".into(),
+                scope: "a".into(),
+                kind: RuleKind::Blacklist,
+                cidr: "203.0.113.0/24".into(),
+                note: None,
+                created_at: now,
+            },
+        )
+        .unwrap();
+        db::upsert_ip_rule(
+            &db,
+            &IpRule {
+                id: "global|blacklist|198.51.100.0/24".into(),
+                scope: "global".into(),
+                kind: RuleKind::Blacklist,
+                cidr: "198.51.100.0/24".into(),
+                note: None,
+                created_at: now,
+            },
+        )
+        .unwrap();
+    }
+
+    {
+        let db = app.db.lock().await;
+        assert!(db::delete_site(&db, "a").unwrap());
+    }
+
+    let db = app.db.lock().await;
+    // The site's policy and its scoped rules are gone — re-creating a
+    // site with the same name must not revive them.
+    assert!(db::get_site_rate_limit(&db, "a").unwrap().is_none());
+    let rules = db::list_ip_rules(&db).unwrap();
+    assert_eq!(
+        rules.len(),
+        1,
+        "only the global rule must survive: {rules:?}"
+    );
+    assert_eq!(rules[0].scope, "global");
+}
+
+#[tokio::test]
 async fn a_policy_row_without_a_site_is_ignored() {
     let dir = TempDir::new().unwrap();
     let app = make_test_app(&dir);

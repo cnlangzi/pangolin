@@ -10,6 +10,7 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
+use crate::routes::helpers::parse_form;
 use crate::templates::{DomainsEditTemplate, DomainsNewTemplate};
 use crate::{App, redirect_response};
 
@@ -21,19 +22,6 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
         .expect("response builder for 200 OK should not fail"))
-}
-
-fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {
-    let body_str = std::str::from_utf8(body).unwrap_or("");
-    let mut params = std::collections::HashMap::new();
-    for pair in body_str.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            let k = k.trim().to_string();
-            let v = urlencoding::decode(v).unwrap_or_default().to_string();
-            params.insert(k, v);
-        }
-    }
-    params
 }
 
 pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {

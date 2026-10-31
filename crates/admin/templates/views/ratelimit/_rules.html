@@ -19,16 +19,16 @@
         <tr>
           <td class="px-4 py-2 font-mono text-xs">{{ rule.scope }}</td>
           <td class="px-4 py-2 text-xs">
-            {% if rule.kind.as_str() == "whitelist" %}
+            {% if rule.kind == "whitelist" %}
             <span class="text-emerald-600 dark:text-emerald-400">whitelist</span>
             {% else %}
             <span class="text-red-600 dark:text-red-400">blacklist</span>
             {% endif %}
           </td>
           <td class="px-4 py-2 font-mono text-xs">{{ rule.cidr }}</td>
-          <td class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400">{{ rule.note.as_deref().unwrap_or("") }}</td>
+          <td class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400">{{ rule.note }}</td>
           <td class="px-4 py-2 text-right">
-            <button hx-delete="/api/ratelimit/rules?scope={{ rule.scope }}&kind={{ rule.kind }}&cidr={{ rule.cidr }}"
+            <button hx-delete="{{ rule.delete_url }}"
               hx-vals='{"_csrf": "__CSRF__"}'
               hx-confirm="Delete rule {{ rule.cidr }}?"
               hx-swap="delete"

@@ -86,6 +86,15 @@
     <div class="ml-auto text-sm text-accent-600 dark:text-accent-400">Traffic →</div>
   </a>
 
+  {# Live "blocked clients" list (issue #117) — the client IPs the rate
+     limiter rejected. Refreshed through htmx every 2 s. #}
+  <div id="dashboard-blocked" class="mb-8"
+       hx-get="/api/ratelimit/blocked"
+       hx-trigger="every 2s"
+       hx-swap="innerHTML">
+    {% include "views/dashboard/_blocked.html" %}
+  </div>
+
   <!-- Quick Actions Grid -->
   <div>
     <h2 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Quick Actions</h2>

@@ -3848,8 +3848,10 @@ async fn ratelimit_site_form_persists_the_policy() {
                 ("rate_limit_throttle_capacity", "2048"),
                 ("rate_limit_throttle_secs", "600"),
                 (
+                    // A body with spaces: the form encoding turns them
+                    // into `+`, and they have to arrive as spaces.
                     "rate_limit_custom_429_body",
-                    "<!DOCTYPE html><html><body><h1 id=\"custom\">Slow down</h1></body></html>",
+                    "<!DOCTYPE html><html><body><h1 id=\"custom\">Slow down please</h1></body></html>",
                 ),
                 ("_csrf", &csrf),
             ],
@@ -3892,6 +3894,14 @@ async fn ratelimit_site_form_persists_the_policy() {
         assert!(
             custom.contains(r#"id="custom""#),
             "the custom 429 page must be stored: {custom}"
+        );
+        assert!(
+            custom.contains("Slow down please"),
+            "the spaces of the custom page must survive the form encoding: {custom}"
+        );
+        assert!(
+            !custom.contains("Slow+down"),
+            "a space must not be stored as a plus: {custom}"
         );
     }
 
@@ -3978,10 +3988,16 @@ async fn ratelimit_ip_rule_add_and_delete() {
         .expect("count ip_rules");
     assert_eq!(count, 1, "the rule must be stored");
 
-    // The rules fragment renders it.
+    // The rules fragment renders it — and carries a usable CSRF
+    // token, because the page replaces the fragment every 5 s and a
+    // literal `__CSRF__` would make every delete button fail.
     let resp = client.get("/api/ratelimit/rules").await.unwrap();
     let html = resp.text().await.unwrap();
     assert!(html.contains("203.0.113.0/24"), "{html}");
+    assert!(
+        !html.contains("__CSRF__"),
+        "the polled fragment must carry a substituted CSRF token: {html}"
+    );
 
     // The HTMX delete removes it.
     let resp = client
@@ -4001,4 +4017,75 @@ async fn ratelimit_ip_rule_add_and_delete() {
         .query_row("SELECT COUNT(*) FROM ip_rules", [], |r| r.get(0))
         .expect("count ip_rules");
     assert_eq!(count, 0, "the rule must be gone");
+}
+
+// ── §20 — Dashboard: the live "blocked clients" list (issue #117) ───────────
+
+/// A client that the rate limiter rejects shows up in the dashboard's
+/// live "blocked clients" list.
+#[tokio::test]
+async fn dashboard_lists_the_blocked_clients_live() {
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+             VALUES ('blocked-site', 'http://127.0.0.1:9', 1, 'passthrough', NULL, ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert site");
+        conn.execute(
+            "INSERT INTO domains (domain, site_name, enabled, created_at) \
+             VALUES ('blocked.test', 'blocked-site', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert domain");
+        // The e2e client connects over loopback.
+        conn.execute(
+            "INSERT INTO ip_rules (id, scope, kind, cidr, note, created_at) \
+             VALUES ('global|blacklist|127.0.0.0/8', 'global', 'blacklist', '127.0.0.0/8', NULL, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert ip rule");
+    })
+    .await;
+
+    // Trigger a rejection: the client is blacklisted → 403.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _body) = crate::harness::raw_request(&addr, "blocked.test", "GET", "/", b"").await;
+    assert_eq!(status, 403, "the blacklisted client must be rejected");
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The counters are published once per second — poll for the row.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let resp = client.get("/").await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        html = resp.text().await.unwrap();
+        if html.contains("127.0.0.1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("Blocked clients"),
+        "the dashboard must show the blocked-clients panel: {html}"
+    );
+    assert!(
+        html.contains("127.0.0.1"),
+        "the blocked client must be listed: {html}"
+    );
+    assert!(
+        html.contains("blocked-site"),
+        "the site that rejected the client must be listed: {html}"
+    );
+
+    // The HTMX fragment answers too.
+    let resp = client.get("/api/ratelimit/blocked").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("127.0.0.1"), "{html}");
 }
