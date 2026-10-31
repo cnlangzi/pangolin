@@ -182,6 +182,31 @@ cargo clippy -p ngx --all-targets -- -D warnings
 This is ~10× faster than `clippy --workspace --all-targets` and
 catches the same issues for your code.
 
+### Host-side sccache (optional)
+
+The Docker release build compiles inside the image with its own
+sccache (see `build/docker/dist.dockerfile`).  Host-side builds get
+no compiler cache unless you set one up yourself:
+
+```bash
+cargo install sccache
+# then, in ~/.cargo/config.toml (NOT in this repository):
+#   [build]
+#   rustc-wrapper = "sccache"
+```
+
+The wrapper is configured in the user's own `~/.cargo/config.toml`
+because cargo fails the build when the wrapper binary is missing,
+which would break every developer who has not installed sccache.
+The repository also excludes `.cargo/` from the Docker build context
+(`.dockerignore`), so a repository-level file would not reach the
+image anyway.
+
+Host and image caches never interoperate: sccache's cache key embeds
+the compiler version, the host builds with rustc 1.96.0 and the image
+with 1.98.1, so entries written by one side are never hits on the
+other.
+
 ## Style
 
 Match the surrounding code:
