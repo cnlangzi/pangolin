@@ -69,7 +69,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let traffic = app.traffic_snapshot();
     // The live "blocked clients" list (issue #117): the client IPs
     // the rate limiter rejected, most recent first.
-    let blocked = blocked_rows(&app);
+    let blocked = blocked_rows(app);
     let dashboard = DashboardTemplate {
         site_count: sites.len(),
         domain_count: domains.len(),
