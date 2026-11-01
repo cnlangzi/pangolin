@@ -110,3 +110,6 @@ mod admin_system_config_e2e;
 
 #[cfg(feature = "integration")]
 mod admin_settings_e2e;
+
+#[cfg(feature = "integration")]
+mod provider;

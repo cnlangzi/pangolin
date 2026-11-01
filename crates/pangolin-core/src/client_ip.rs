@@ -40,16 +40,17 @@
 //!
 //! ## Resolution rules
 //!
-//! Per [`FrontendMode`]:
+//! Per the **effective provider of the site being served**
+//! ([`crate::provider::SiteProviderConfig`]):
 //!
 //! * `Direct` — the TCP peer (normalized). No header is consulted.
 //! * `Cloudflare` — the Cloudflare-derived address: the value of
 //!   `CF-Connecting-IP`, unless it is a Cloudflare *Pseudo IPv4*
 //!   address and `CF-Connecting-IPv6` carries a parseable IPv6, in
 //!   which case the IPv6 wins (see [`resolve_authoritative`]).
-//! * `CustomLb` — the value of `cfg.client_ip_header`, normalized.
-//!   An unset key, an absent header and an unparseable value all
-//!   mean "no authoritative client IP".
+//! * `CustomLb` — the value of the configured `client_ip_header`,
+//!   normalized. An unset key, an absent header and an unparseable
+//!   value all mean "no authoritative client IP".
 //!
 //! Every value is normalized ([`normalize_ip`]): an IPv4-mapped IPv6
 //! address is unwrapped to its IPv4 form and a port is stripped, so
@@ -58,7 +59,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use crate::types::{FrontendMode, SystemConfig};
+use crate::provider::{ProviderKey, SiteProviderConfig, spec};
 
 /// Final-fallback value when neither a configured header nor a
 /// peer address is available. Matches the pre-fix behaviour in
@@ -82,11 +83,15 @@ const PSEUDO_IPV4_FIRST_OCTET: u8 = 240;
 /// bot verification) and therefore calls the two functions directly
 /// so the client IP is resolved exactly once per request. Use this
 /// entry point when only the log value is wanted.
-pub fn resolve<F>(cfg: &SystemConfig, peer: Option<SocketAddr>, get_header: F) -> String
+pub fn resolve<F>(
+    provider_cfg: &SiteProviderConfig,
+    peer: Option<SocketAddr>,
+    get_header: F,
+) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
-    log_value(resolve_authoritative(cfg, peer, &get_header), peer)
+    log_value(resolve_authoritative(provider_cfg, peer, &get_header), peer)
 }
 
 /// The access-log `client_ip` value for an already-resolved
@@ -111,18 +116,21 @@ pub fn log_value(authoritative: Option<IpAddr>, peer: Option<SocketAddr>) -> Str
 /// log still falls back to the peer (see [`resolve`]) so operators
 /// can correlate with CDN logs.
 pub fn resolve_authoritative<F>(
-    cfg: &SystemConfig,
+    provider_cfg: &SiteProviderConfig,
     peer: Option<SocketAddr>,
     get_header: F,
 ) -> Option<IpAddr>
 where
     F: Fn(&str) -> Option<String>,
 {
-    match cfg.frontend_mode {
+    match provider_cfg.provider {
         // The TCP peer *is* the visitor in direct mode.
-        FrontendMode::Direct => peer.map(|a| normalize_addr(a.ip())),
-        FrontendMode::Cloudflare => cloudflare_client_ip(&get_header),
-        FrontendMode::CustomLb => match cfg.client_ip_header.as_deref() {
+        ProviderKey::Direct => peer.map(|a| normalize_addr(a.ip())),
+        ProviderKey::Cloudflare => {
+            let headers = spec(ProviderKey::Cloudflare).headers;
+            cloudflare_client_ip(&get_header, headers.client_ip, headers.client_ipv6)
+        }
+        ProviderKey::CustomLb => match provider_cfg.client_ip_header.as_deref() {
             Some(name) => get_header(name).and_then(|v| normalize_ip(&v)),
             None => None,
         },
@@ -206,12 +214,30 @@ fn peer_ip_string(peer: Option<SocketAddr>) -> String {
 ///    synthetic.
 /// 3. Otherwise `CF-Connecting-IP` wins; if it is absent,
 ///    `CF-Connecting-IPv6` is used.
-fn cloudflare_client_ip<F>(get_header: &F) -> Option<IpAddr>
+///
+/// The two header names come from the registry (see
+/// [`crate::provider::spec`]) — they are not hard-coded here.
+fn cloudflare_client_ip<F>(
+    get_header: &F,
+    v4_name: Option<&'static str>,
+    v6_name: Option<&'static str>,
+) -> Option<IpAddr>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let v4 = get_header("CF-Connecting-IP").and_then(|v| normalize_ip(&v));
-    let v6 = get_header("CF-Connecting-IPv6").and_then(|v| normalize_ip(&v));
+    // The header lookup is written out rather than chained through
+    // `and_then`: the closure is generic over the header name's
+    // lifetime, so it cannot be passed as a function pointer.
+    let v4 = match v4_name {
+        Some(name) => get_header(name),
+        None => None,
+    }
+    .and_then(|v| normalize_ip(&v));
+    let v6 = match v6_name {
+        Some(name) => get_header(name),
+        None => None,
+    }
+    .and_then(|v| normalize_ip(&v));
 
     if let Some(IpAddr::V4(v4_addr)) = v4 {
         if is_pseudo_ipv4(v4_addr) && v6.is_some() {
@@ -231,23 +257,17 @@ fn is_pseudo_ipv4(addr: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SystemConfig;
-    use chrono::Utc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn cfg(mode: FrontendMode) -> SystemConfig {
-        SystemConfig {
-            frontend_mode: mode,
-            pgl_headers_enabled: true,
-            client_ip_header: None,
-            client_country_header: None,
-            client_region_header: None,
-            updated_at: Utc::now(),
+    fn cfg(provider: ProviderKey) -> SiteProviderConfig {
+        SiteProviderConfig {
+            provider,
+            ..Default::default()
         }
     }
 
-    fn cfg_custom_lb(ip_header: Option<&str>) -> SystemConfig {
-        let mut c = cfg(FrontendMode::CustomLb);
+    fn cfg_custom_lb(ip_header: Option<&str>) -> SiteProviderConfig {
+        let mut c = cfg(ProviderKey::CustomLb);
         c.client_ip_header = ip_header.map(String::from);
         c
     }
@@ -317,7 +337,7 @@ mod tests {
         // peer `1.2.3.4:5678` → "1.2.3.4"
         let peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 5678));
         assert_eq!(
-            resolve(&cfg(FrontendMode::Direct), peer, headers(vec![])),
+            resolve(&cfg(ProviderKey::Direct), peer, headers(vec![])),
             "1.2.3.4"
         );
     }
@@ -325,7 +345,7 @@ mod tests {
     #[test]
     fn direct_missing_peer_returns_unknown() {
         assert_eq!(
-            resolve(&cfg(FrontendMode::Direct), no_peer(), headers(vec![])),
+            resolve(&cfg(ProviderKey::Direct), no_peer(), headers(vec![])),
             UNKNOWN
         );
     }
@@ -335,7 +355,7 @@ mod tests {
         // Even when the peer is set, CF-Connecting-IP takes precedence.
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "203.0.113.7")])
             ),
@@ -347,7 +367,7 @@ mod tests {
     fn cloudflare_missing_falls_back_to_peer() {
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![])
             ),
@@ -360,7 +380,7 @@ mod tests {
         // An empty header value is treated as missing.
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "")])
             ),
@@ -373,7 +393,7 @@ mod tests {
         // Whitespace-only is also treated as missing (trim).
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "   ")])
             ),
@@ -384,7 +404,7 @@ mod tests {
     #[test]
     fn cloudflare_missing_peer_returns_unknown() {
         assert_eq!(
-            resolve(&cfg(FrontendMode::Cloudflare), no_peer(), headers(vec![])),
+            resolve(&cfg(ProviderKey::Cloudflare), no_peer(), headers(vec![])),
             UNKNOWN
         );
     }
@@ -395,7 +415,7 @@ mod tests {
         // (the access log must never carry a non-IP string).
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "not-an-ip")])
             ),
@@ -407,7 +427,7 @@ mod tests {
     fn cloudflare_ipv4_mapped_value_is_unwrapped() {
         assert_eq!(
             resolve(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "::ffff:203.0.113.7")])
             ),
@@ -481,7 +501,7 @@ mod tests {
             5555,
         ));
         assert_eq!(
-            resolve(&cfg(FrontendMode::Direct), peer, headers(vec![])),
+            resolve(&cfg(ProviderKey::Direct), peer, headers(vec![])),
             "127.0.0.1"
         );
     }
@@ -491,11 +511,7 @@ mod tests {
     #[test]
     fn authoritative_direct_is_the_peer() {
         assert_eq!(
-            resolve_authoritative(
-                &cfg(FrontendMode::Direct),
-                peer(1, 2, 3, 4),
-                headers(vec![])
-            ),
+            resolve_authoritative(&cfg(ProviderKey::Direct), peer(1, 2, 3, 4), headers(vec![])),
             Some("1.2.3.4".parse::<IpAddr>().unwrap())
         );
     }
@@ -506,7 +522,7 @@ mod tests {
         // influence the client IP in direct mode.
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Direct),
+                &cfg(ProviderKey::Direct),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "203.0.113.7")])
             ),
@@ -520,7 +536,7 @@ mod tests {
         // hop, not the visitor.
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![])
             ),
@@ -534,7 +550,7 @@ mod tests {
         // the real address is in CF-Connecting-IPv6.
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![
                     ("CF-Connecting-IP", "243.201.173.220"),
@@ -549,7 +565,7 @@ mod tests {
     fn authoritative_cloudflare_keeps_normal_ipv4() {
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "203.0.113.7")])
             ),
@@ -563,7 +579,7 @@ mod tests {
         // all we have.
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IP", "243.201.173.220")])
             ),
@@ -575,7 +591,7 @@ mod tests {
     fn authoritative_cloudflare_falls_back_to_ipv6_header() {
         assert_eq!(
             resolve_authoritative(
-                &cfg(FrontendMode::Cloudflare),
+                &cfg(ProviderKey::Cloudflare),
                 peer(1, 2, 3, 4),
                 headers(vec![("CF-Connecting-IPv6", "2001:db8::1")])
             ),

@@ -12,7 +12,8 @@ use http_body_util::Full;
 
 use crate::App;
 use crate::redirect_response;
-use crate::routes::ratelimit::parse_policy;
+use crate::routes::provider::{guard_can_be_enabled, parse_site_provider};
+use crate::routes::ratelimit::{CUSTOM_403_FIELD, parse_policy};
 use pangolin_core::types::{HostMode, Site};
 
 use super::helpers::assemble_backend_from_form;
@@ -47,9 +48,28 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // leaves the site without a policy row — the default (limits off)
     // applies.
     let parsed = parse_policy(&params);
+    // Issue #122: the provider fields (provider, custom header
+    // names, the guard tri-state and the manual ranges).
+    let parsed_provider = parse_site_provider(&params);
+    // The fields that parsed are kept, so the operator only has to
+    // fix the one that was wrong.
+    if let Some(e) = &parsed_provider.error {
+        return render_create_page_with_error(
+            app,
+            Some(prefill_site(
+                &name,
+                &backend,
+                host_mode,
+                host_custom.clone(),
+            )),
+            parsed.policy,
+            e,
+            Some("provider"),
+            csrf,
+        )
+        .await;
+    }
     if let Some(e) = &parsed.error {
-        // The fields that parsed are kept, so the operator only has
-        // to fix the one that was wrong.
         return render_create_page_with_error(
             app,
             Some(prefill_site(
@@ -61,6 +81,22 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             parsed.policy,
             e,
             Some("rate_limit"),
+            csrf,
+        )
+        .await;
+    }
+    if let Err(e) = guard_check(app, &parsed_provider).await {
+        return render_create_page_with_error(
+            app,
+            Some(prefill_site(
+                &name,
+                &backend,
+                host_mode,
+                host_custom.clone(),
+            )),
+            parsed.policy,
+            &e,
+            Some("provider"),
             csrf,
         )
         .await;
@@ -119,12 +155,19 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p)),
         Err(_) => None,
     };
+    let provider_result = match &result {
+        Ok(()) => save_provider(&db, &name, &parsed_provider),
+        Err(_) => None,
+    };
     drop(db);
 
     match result {
         Ok(()) => {
             if let Some(Err(e)) = limit_result {
                 log::warn!("rate limit policy for {name} not saved: {e}");
+            }
+            if let Some(Err(e)) = provider_result {
+                log::warn!("provider configuration for {name} not saved: {e}");
             }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
@@ -175,15 +218,40 @@ pub async fn handle_update(
     // Issue #117: the per-site rate-limit policy. A form without any
     // rate-limit field leaves the existing policy (if any) untouched.
     let parsed = parse_policy(&params);
+    // Issue #122: the provider fields (provider, custom header
+    // names, the guard tri-state and the manual ranges).
+    let parsed_provider = parse_site_provider(&params);
+    // The fields that parsed are kept, so the operator only has to
+    // fix the one that was wrong.
+    if let Some(e) = &parsed_provider.error {
+        return render_edit_page_with_error(
+            app,
+            prefill_site(&name, &backend, host_mode, host_custom.clone()),
+            parsed.policy,
+            e,
+            Some("provider"),
+            csrf,
+        )
+        .await;
+    }
     if let Some(e) = &parsed.error {
-        // The fields that parsed are kept, so the operator only has
-        // to fix the one that was wrong.
         return render_edit_page_with_error(
             app,
             prefill_site(&name, &backend, host_mode, host_custom.clone()),
             parsed.policy,
             e,
             Some("rate_limit"),
+            csrf,
+        )
+        .await;
+    }
+    if let Err(e) = guard_check(app, &parsed_provider).await {
+        return render_edit_page_with_error(
+            app,
+            prefill_site(&name, &backend, host_mode, host_custom.clone()),
+            parsed.policy,
+            &e,
+            Some("provider"),
             csrf,
         )
         .await;
@@ -195,12 +263,15 @@ pub async fn handle_update(
     // not wipe the stored page.
     let rate_limit = match rate_limit {
         Some(mut policy) => {
+            let db = app.db.lock().await;
+            let stored = pangolin_core::db::get_site_rate_limit(&db, &name)
+                .ok()
+                .flatten();
             if !params.contains_key(crate::routes::ratelimit::CUSTOM_429_FIELD) {
-                let db = app.db.lock().await;
-                policy.custom_429_body = pangolin_core::db::get_site_rate_limit(&db, &name)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| p.custom_429_body);
+                policy.custom_429_body = stored.as_ref().and_then(|p| p.custom_429_body.clone());
+            }
+            if !params.contains_key(CUSTOM_403_FIELD) {
+                policy.custom_403_body = stored.as_ref().and_then(|p| p.custom_403_body.clone());
             }
             Some(policy)
         }
@@ -267,12 +338,19 @@ pub async fn handle_update(
             .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p)),
         Err(_) => None,
     };
+    let provider_result = match &result {
+        Ok(()) => save_provider(&db, &name, &parsed_provider),
+        Err(_) => None,
+    };
     drop(db);
 
     match result {
         Ok(()) => {
             if let Some(Err(e)) = limit_result {
                 log::warn!("rate limit policy for {name} not saved: {e}");
+            }
+            if let Some(Err(e)) = provider_result {
+                log::warn!("provider configuration for {name} not saved: {e}");
             }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
@@ -289,6 +367,64 @@ pub async fn handle_update(
             .await
         }
     }
+}
+
+/// Check that the submitted origin-guard setting is usable.
+///
+/// The guard needs an allowlist to work with: the provider's
+/// published ranges or the site's manual ones.
+async fn guard_check(
+    app: &Arc<App>,
+    parsed: &crate::routes::provider::ParsedProvider,
+) -> Result<(), String> {
+    if !parsed.present {
+        return Ok(());
+    }
+    let guard_on = parsed
+        .over
+        .as_ref()
+        .and_then(|o| o.origin_guard_enabled)
+        .unwrap_or(false);
+    if !guard_on {
+        return Ok(());
+    }
+    // The **effective** provider decides whether the guard has
+    // anything to work with: a site that inherits the global
+    // `cloudflare` provider inherits its published ranges too.
+    let global = app.system_config.read().await.provider;
+    let provider = parsed
+        .over
+        .as_ref()
+        .and_then(|o| o.provider)
+        .unwrap_or(global);
+    guard_can_be_enabled(provider, &parsed.manual_ranges)
+}
+
+/// Persist the provider configuration of a site.
+///
+/// A site that overrides nothing at all has its row removed, so it
+/// keeps following the global defaults. A form that carried no
+/// provider field is left alone entirely — an API client that
+/// predates the feature must not wipe the operator's configuration.
+fn save_provider(
+    db: &rusqlite::Connection,
+    site_name: &str,
+    parsed: &crate::routes::provider::ParsedProvider,
+) -> Option<rusqlite::Result<()>> {
+    if !parsed.present {
+        return None;
+    }
+    let result = match &parsed.over {
+        Some(over) => pangolin_core::db::upsert_site_provider(db, site_name, over),
+        None => pangolin_core::db::delete_site_provider(db, site_name).map(|_| ()),
+    };
+    let result = match result {
+        Ok(()) => {
+            pangolin_core::db::replace_site_origin_allow(db, site_name, &parsed.manual_ranges)
+        }
+        Err(e) => Err(e),
+    };
+    Some(result)
 }
 
 /// Rebuild the `Site` shown back to the operator when a submission is

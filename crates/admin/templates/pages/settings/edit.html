@@ -23,42 +23,42 @@
         sits behind a CDN or load balancer.
       </p>
       <div class="space-y-2">
+        {%- for p in providers %}
         <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
-          <input type="radio" name="frontend_mode" value="direct" {% if frontend_mode == "direct" %}checked{% endif %}
+          <input type="radio" name="provider" value="{{ p.key }}" {% if provider == p.key %}checked{% endif %}
             class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
           <div>
-            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Direct</div>
+            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">{{ p.label }}</div>
             <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              The TCP peer address is the visitor. No header lookup. Use when pangolin is
-              reached directly (no CDN / LB).
+              {{ p.description }}
             </div>
           </div>
         </label>
-
-        <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
-          <input type="radio" name="frontend_mode" value="cloudflare" {% if frontend_mode == "cloudflare" %}checked{% endif %}
-            class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
-          <div>
-            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Cloudflare</div>
-            <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Read the <code class="font-mono">CF-Connecting-IP</code> header. Falls back to
-              the TCP peer if the header is missing.
-            </div>
-          </div>
-        </label>
-
-        <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
-          <input type="radio" name="frontend_mode" value="custom_lb" {% if frontend_mode == "custom_lb" %}checked{% endif %}
-            class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
-          <div>
-            <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Custom LB</div>
-            <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Read the header names configured below — one per value. An unset name yields an
-              empty value.
-            </div>
-          </div>
-        </label>
+        {%- endfor %}
       </div>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-3">
+        A site may override this choice; the global value is the default for every site that
+        does not.
+      </p>
+    </div>
+
+    <div>
+      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
+           form always carries an explicit value. #}
+        <input type="hidden" name="origin_guard_enabled" value="false">
+        <input type="checkbox" name="origin_guard_enabled" value="true" {% if origin_guard_enabled %}checked{% endif %}
+          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <div>
+          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Origin guard</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Refuse a request whose <strong>TCP peer</strong> is outside the site's allowlist
+            (the provider's published source-IP ranges plus the site's manual ranges) with a
+            <code class="font-mono">403</code> and the site's own error page. This is the
+            default for every site that does not override it.
+          </div>
+        </div>
+      </label>
     </div>
 
     <div>
@@ -83,7 +83,7 @@
     <div>
       <div class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
         First-level headers
-        <span class="text-xs font-normal text-slate-400 ml-1">(only used when mode is "Custom LB")</span>
+        <span class="text-xs font-normal text-slate-400 ml-1">(only used by the "Custom LB" provider)</span>
       </div>
       <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">
         The headers your load balancer sets to describe the original visitor. Each field is
@@ -93,7 +93,7 @@
         <div>
           <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-ip-header">
             Client IP
-            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB provider)</span>
           </label>
           <input type="text" name="client_ip_header" id="client-ip-header"
             value="{{ client_ip_header }}"
@@ -104,7 +104,7 @@
         <div>
           <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-country-header">
             Client country
-            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB provider)</span>
           </label>
           <input type="text" name="client_country_header" id="client-country-header"
             value="{{ client_country_header }}"
@@ -115,7 +115,7 @@
         <div>
           <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1" for="client-region-header">
             Client region
-            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB mode)</span>
+            <span class="text-xs font-normal text-slate-400 ml-1">(Custom LB provider)</span>
           </label>
           <input type="text" name="client_region_header" id="client-region-header"
             value="{{ client_region_header }}"
@@ -124,6 +124,57 @@
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         </div>
       </div>
+    </div>
+
+    <div>
+      <div class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
+        Provider source-IP ranges
+      </div>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-3">
+        The published source-IP ranges of each provider, fetched in the background and
+        persisted. A failed fetch keeps the stored ranges in force.
+      </p>
+      <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-700">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 dark:bg-slate-800 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+            <tr>
+              <th class="px-3 py-2 text-left font-medium">Provider</th>
+              <th class="px-3 py-2 text-left font-medium">Ranges</th>
+              <th class="px-3 py-2 text-left font-medium">Last fetch</th>
+              <th class="px-3 py-2 text-left font-medium">Status</th>
+              <th class="px-3 py-2 text-left font-medium">Rejections</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
+            {%- for r in provider_ranges %}
+            <tr>
+              <td class="px-3 py-2 font-medium text-slate-900 dark:text-slate-100">{{ r.label }}</td>
+              <td class="px-3 py-2 font-mono text-slate-700 dark:text-slate-300">{{ r.range_count }}</td>
+              <td class="px-3 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">
+                {%- if let Some(t) = r.fetched_at %}{{ t }}{%- else %}never{%- endif %}
+                {%- if r.stale %} <span class="text-amber-600 dark:text-amber-400">(stale)</span>{% endif %}
+              </td>
+              <td class="px-3 py-2">
+                {%- if r.status == "error" %}
+                <span class="text-red-600 dark:text-red-400">error</span>
+                {%- if let Some(e) = r.last_error %}
+                <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 break-words">{{ e }}</div>
+                {%- endif %}
+                {%- else if r.status == "ok" %}
+                <span class="text-emerald-600 dark:text-emerald-400">ok</span>
+                {%- else %}
+                <span class="text-slate-500 dark:text-slate-400">not fetched</span>
+                {%- endif %}
+              </td>
+              <td class="px-3 py-2 font-mono text-slate-700 dark:text-slate-300">{{ r.rejections }}</td>
+            </tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
+        Total origin-guard rejections: <span class="font-mono">{{ guard_rejections }}</span>
+      </p>
     </div>
 
     {% if let Some(e) = error %}

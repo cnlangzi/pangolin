@@ -35,6 +35,7 @@ fn policy(req_limit: u32, page_limit: u32) -> RateLimitPolicy {
         throttle_capacity: 256,
         throttle_secs: 600,
         custom_429_body: None,
+        custom_403_body: None,
     }
 }
 

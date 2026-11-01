@@ -238,7 +238,19 @@ knobs land in one place.
 | ------------ | ------ | ------- | -------- | ----- |
 | `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN for **non-tunnel sites**. Tunnel sites (`site.backend = "<tun>:<url>"`) always negotiate h1 at runtime — this is the per-SNI dynamic ALPN policy in `ngx::tls::build_sni_settings` that works around the upstream `tokio-yamux 0.3.18` stream-state race (issue #66 / commit `0c35ede`). Modern browsers fall back to h1 automatically when h2 is not advertised; the per-SNI override is transparent to clients — no 4xx, no 421, no manual retry. |
 
-### `system_config` table (DB) — client IP + gateway headers
+### `[provider]` — front-CDN range refresh
+
+The provider *registry* is code, not configuration: the set of
+providers and the header names they use lives in
+`crates/pangolin-core/src/provider.rs`. What lives here is the
+operational tuning of the background fetch of the providers'
+published source-IP ranges.
+
+| Field                      | Type   | Default | Required | Notes |
+| -------------------------- | ------ | ------- | -------- | ----- |
+| `ip_refresh_interval_secs` | `u64`  | `3600`  | no       | How often the published source-IP ranges are refreshed. The fetch is conditional (`ETag` / `Last-Modified`), so a short interval costs one cheap request per provider URL. A failed fetch backs off (60 s → 1800 s) and never removes the stored ranges. |
+
+### `system_config` table (DB) — provider + gateway headers
 
 Some knobs are **not** in `ngx.yml`: they describe what sits *in
 front of* pangolin (a CDN / load balancer), they change at runtime,
@@ -248,11 +260,12 @@ binary. They live in the `system_config` singleton row.
 
 | Field                  | Type              | Default      | Notes |
 | ---------------------- | ----------------- | ------------ | ----- |
-| `frontend_mode`        | `direct` \| `cloudflare` \| `custom_lb` | `direct` | How the visitor's IP is resolved. `direct` → the TCP peer is the visitor. `cloudflare` → the `CF-Connecting-IP` / `CF-Connecting-IPv6` headers. `custom_lb` → the header names configured below. |
+| `provider`             | `direct` \| `cloudflare` \| `custom_lb` | `direct` | The front CDN / load balancer in front of the deployment. It decides both how the visitor's IP is resolved and where the published source-IP ranges come from. `direct` → the TCP peer is the visitor. `cloudflare` → the `CF-Connecting-IP` / `CF-Connecting-IPv6` headers. `custom_lb` → the header names configured below. The column was named `frontend_mode` before V10; the values are unchanged. |
 | `pgl_headers_enabled`  | `bool`            | `true`       | Master switch for the four `P-*` gateway headers (`P-Known-Bot`, `P-Client-Ip`, `P-Client-Country`, `P-Client-Region`). When off, the headers are not added — their names are still stripped from the incoming request, so a client can never impersonate them. |
 | `client_ip_header`     | `string \| null`  | `null`       | The first-level header carrying the visitor's IP. Used in `custom_lb` mode only. |
 | `client_country_header`| `string \| null`  | `null`       | The first-level header carrying the country code. Used in `custom_lb` mode only. |
 | `client_region_header` | `string \| null`  | `null`       | The first-level header carrying the region code. Used in `custom_lb` mode only. |
+| `origin_guard_enabled` | `bool`            | `false`      | The global default of the origin guard: whether a site that does not override it refuses requests whose TCP peer is outside its allowlist. |
 
 The three header keys are independent: a configured key is read, an
 unconfigured key yields an empty value. They apply to `custom_lb`
@@ -262,6 +275,60 @@ mode only — `cloudflare` mode uses the built-in `CF-*` names and
 The gateway-header contract (which headers are sent, how the client
 IP is resolved, the failure matrix) is documented in
 [design/gateway-headers.md](design/gateway-headers.md).
+
+### Per-site provider configuration (DB) — issue #122
+
+The global row above is the **default** for every site. A site may
+override it; an unset site value inherits the global one.
+
+#### `site_providers` table
+
+| Field                  | Type              | Default | Notes |
+| ---------------------- | ----------------- | ------- | ----- |
+| `site_name`            | `string`          | —       | Primary key — the `sites.name` the row belongs to. |
+| `provider`             | `string \| null`  | `NULL`  | The site's provider. `NULL` → inherit the global one. |
+| `client_ip_header`     | `string \| null`  | `NULL`  | The site's own visitor-IP header name (`custom_lb` only). `NULL` → inherit the global name. |
+| `country_header`       | `string \| null`  | `NULL`  | The site's own country header name. `NULL` → inherit. |
+| `region_header`        | `string \| null`  | `NULL`  | The site's own region header name. `NULL` → inherit. |
+| `origin_guard_enabled` | `0` \| `1` \| `NULL` | `NULL` | The site's origin-guard switch. `NULL` → inherit the global default, `0` → off, `1` → on. |
+
+#### `site_origin_allow` table
+
+| Field       | Type     | Notes |
+| ----------- | -------- | ----- |
+| `site_name` | `string` | The site the ranges belong to. |
+| `cidr`      | `string` | An address (`1.2.3.4`) or a CIDR range (`10.0.0.0/8`), in its canonical text form. |
+
+The manual ranges are **unioned** with the provider's published ones:
+the effective allowlist of a site is both.
+
+#### `provider_ip_lists` table
+
+The published ranges of every provider, one row per
+`(provider, url)` so each URL keeps its own validators.
+
+| Field          | Type             | Notes |
+| -------------- | ---------------- | ----- |
+| `provider`     | `string`         | The provider the list belongs to. |
+| `url`          | `string`         | The URL the list was fetched from. |
+| `cidrs`        | `string`         | The ranges, one per line, in their canonical text form. |
+| `fetched_at`   | `string`         | When the list was last fetched. |
+| `etag`         | `string \| null` | The `ETag` validator of the last successful response. |
+| `last_modified`| `string \| null` | The `Last-Modified` validator of the last successful response. |
+| `status`       | `string`         | `ok` after a successful fetch, `error` after a failed one. A failed fetch keeps the stored ranges in force. |
+| `last_error`   | `string \| null` | The error text of the last failed fetch. |
+
+#### `site_rate_limits.custom_403_body`
+
+The per-site custom `403` page (raw HTML), next to the existing
+`custom_429_body`. Used for every `403` the gateway itself produces
+— the origin guard and the IP-blacklist rule. A `403` produced by the
+upstream backend is passed through unchanged. A blank body means the
+built-in default page.
+
+The provider model, the origin guard, the background fetch and the
+request-path order are documented in
+[design/provider.md](design/provider.md).
 
 ## `tun.yml` — tunnel client configuration
 

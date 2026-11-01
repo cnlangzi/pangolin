@@ -20,9 +20,11 @@ use http_body_util::Full;
 use pangolin_core::{App, SystemConfig};
 
 use super::helpers::ok_html;
+use super::provider::{provider_range_statuses, total_guard_rejections};
 use super::system::{parse_system_config_form, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
+use crate::templates::settings::ProviderOption;
 
 /// Render the settings page. `error` is `None` on the initial
 /// GET and on a successful POST (which 302s back here); it's
@@ -33,18 +35,31 @@ async fn render_page(
     error: Option<&str>,
 ) -> http::Result<Response<Full<Bytes>>> {
     let cfg = app.system_config.read().await.clone();
+    // The provider radio group is generated from the registry, so a
+    // provider added to it appears without touching the template.
+    let providers = pangolin_core::ProviderKey::all()
+        .iter()
+        .map(|key| {
+            let spec = pangolin_core::provider::spec(*key);
+            ProviderOption {
+                key: spec.key.as_str(),
+                label: spec.label,
+                description: spec.description,
+            }
+        })
+        .collect();
     let template = SettingsTemplate {
-        frontend_mode: match cfg.frontend_mode {
-            pangolin_core::FrontendMode::Direct => "direct",
-            pangolin_core::FrontendMode::Cloudflare => "cloudflare",
-            pangolin_core::FrontendMode::CustomLb => "custom_lb",
-        },
+        provider: cfg.provider.as_str(),
+        providers,
         pgl_headers_enabled: cfg.pgl_headers_enabled,
         // The header keys are rendered as plain text inputs; an
         // unset key renders as an empty field ("not configured").
         client_ip_header: cfg.client_ip_header.as_deref().unwrap_or(""),
         client_country_header: cfg.client_country_header.as_deref().unwrap_or(""),
         client_region_header: cfg.client_region_header.as_deref().unwrap_or(""),
+        origin_guard_enabled: cfg.origin_guard_enabled,
+        provider_ranges: provider_range_statuses(app).await,
+        guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
         error,
         active_nav: "settings",

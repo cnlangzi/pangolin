@@ -4,6 +4,7 @@
 
 pub mod acme;
 pub mod dns;
+pub mod provider_ip;
 pub mod proxy;
 pub mod runtime;
 pub mod serve;

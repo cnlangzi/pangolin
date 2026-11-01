@@ -85,11 +85,17 @@ be unit-tested without pingora.
 
 ## Client-IP resolution
 
-| `frontend_mode` | Authoritative client IP |
-| --------------- | ----------------------- |
-| `direct`        | the TCP peer (normalized) |
-| `cloudflare`    | the Cloudflare-derived address (below) |
-| `custom_lb`     | the value of `client_ip_header` (normalized) |
+| provider | Authoritative client IP |
+| -------- | ----------------------- |
+| `direct` | the TCP peer (normalized) |
+| `cloudflare` | the Cloudflare-derived address (below) |
+| `custom_lb` | the value of `client_ip_header` (normalized) |
+
+The provider is the **effective provider of the site being served** —
+the site's own setting when it has one, the global default
+otherwise. The column was named `frontend_mode` before V10; see
+[provider.md](provider.md) for the registry and the inheritance
+chain.
 
 The **authoritative** client IP never falls back to the peer outside
 `direct` mode: behind a CDN the peer is a proxy hop, so putting it

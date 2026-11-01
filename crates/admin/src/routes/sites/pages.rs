@@ -13,6 +13,7 @@ use http::{Response, StatusCode};
 use http_body_util::Full;
 
 use crate::App;
+use crate::routes::provider::{provider_options, site_provider_view};
 use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
 use pangolin_core::ratelimit::RateLimitPolicy;
 
@@ -63,6 +64,8 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         tunnels,
         action: "create",
         rate_limit: RateLimitPolicy::default(),
+        provider_view: site_provider_view(app, None).await,
+        providers: provider_options(),
     }
     .render()
     .unwrap();
@@ -97,6 +100,8 @@ pub async fn render_edit_page(
         tunnels,
         action: "update",
         rate_limit,
+        provider_view: site_provider_view(app, Some(&name)).await,
+        providers: provider_options(),
     }
     .render()
     .unwrap();
@@ -126,6 +131,8 @@ pub(super) async fn render_create_page_with_error(
         tunnels,
         action: "create",
         rate_limit,
+        provider_view: site_provider_view(app, None).await,
+        providers: provider_options(),
     }
     .render()
     .unwrap();
@@ -146,6 +153,7 @@ pub(super) async fn render_edit_page_with_error(
         let db = app.db.lock().await;
         pangolin_core::db::list_tuns(&db).unwrap_or_default()
     };
+    let provider_view = site_provider_view(app, Some(&prefill.name)).await;
     let html = SitesEditTemplate {
         site: Some(prefill),
         error: Some(error),
@@ -154,6 +162,8 @@ pub(super) async fn render_edit_page_with_error(
         tunnels,
         action: "update",
         rate_limit,
+        provider_view,
+        providers: provider_options(),
     }
     .render()
     .unwrap();

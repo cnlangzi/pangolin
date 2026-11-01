@@ -111,10 +111,7 @@ async fn settings_post_cloudflare_round_trip() {
         .expect("csrf on /settings");
 
     let resp = client
-        .post_form(
-            "/settings",
-            &[("frontend_mode", "cloudflare"), ("_csrf", &csrf)],
-        )
+        .post_form("/settings", &[("provider", "cloudflare"), ("_csrf", &csrf)])
         .await
         .unwrap();
     assert_eq!(
@@ -147,10 +144,7 @@ async fn settings_post_custom_lb_without_headers_accepted() {
         .unwrap();
 
     let resp = client
-        .post_form(
-            "/settings",
-            &[("frontend_mode", "custom_lb"), ("_csrf", &csrf)],
-        )
+        .post_form("/settings", &[("provider", "custom_lb"), ("_csrf", &csrf)])
         .await
         .unwrap();
     assert_eq!(
@@ -183,7 +177,7 @@ async fn settings_post_invalid_header_name_rejected() {
         .post_form(
             "/settings",
             &[
-                ("frontend_mode", "custom_lb"),
+                ("provider", "custom_lb"),
                 ("client_ip_header", "bad header"),
                 ("_csrf", &csrf),
             ],
@@ -229,7 +223,7 @@ async fn settings_post_invalid_mode_rejected() {
     let resp = client
         .post_form(
             "/settings",
-            &[("frontend_mode", "not-a-real-mode"), ("_csrf", &csrf)],
+            &[("provider", "not-a-real-mode"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
@@ -259,7 +253,7 @@ async fn settings_post_no_csrf_forbidden() {
         .post_form(
             "/settings",
             &[
-                ("frontend_mode", "direct"),
+                ("provider", "direct"),
                 // no _csrf
             ],
         )

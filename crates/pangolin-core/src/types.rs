@@ -774,59 +774,12 @@ pub enum BackendKind {
 // pangolin, so the access log resolver can pick the right strategy
 // for recording the *real* client IP. See `client_ip::resolve` (the
 // log value) and `pgl::resolve_headers` (the forwarded headers) for
-// the per-mode semantics.
-
-/// What sits between the visitor and pangolin — used by the
-/// access-log resolver to decide whether to trust an upstream
-/// header for the client IP. See `pangolin_core::client_ip::resolve`
-/// for the per-mode resolution rules and
-/// `pangolin_core::pgl::resolve_headers` for the forwarded header
-/// values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-// `serde(rename_all = "lowercase")` would turn `CustomLb` into
-// `customlb`, but the DB CHECK constraint (and the row mapper's
-// FromStr) expect `custom_lb`. We default to lowercase and rename
-// just the variant that breaks the pattern. Adding new modes later
-// is intentionally a one-line edit here.
-#[serde(rename_all = "lowercase")]
-pub enum FrontendMode {
-    /// TCP peer is the visitor. The resolver returns
-    /// `session.client_addr().ip()` (port stripped). This is the
-    /// default for fresh deployments.
-    Direct,
-    /// Cloudflare (or any CDN that proxies via `CF-Connecting-IP`)
-    /// is in front. The resolver returns that header value,
-    /// falling back to the peer IP if the header is missing.
-    Cloudflare,
-    /// Operator-configured first-level header names. Each of
-    /// `client_ip_header`, `client_country_header` and
-    /// `client_region_header` names the single header the load
-    /// balancer sets; an unset key yields an empty value.
-    #[serde(rename = "custom_lb")]
-    CustomLb,
-}
-
-impl std::str::FromStr for FrontendMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "direct" => Ok(FrontendMode::Direct),
-            "cloudflare" => Ok(FrontendMode::Cloudflare),
-            "custom_lb" => Ok(FrontendMode::CustomLb),
-            other => Err(format!("unknown frontend_mode: {other}")),
-        }
-    }
-}
-
-impl std::fmt::Display for FrontendMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrontendMode::Direct => f.write_str("direct"),
-            FrontendMode::Cloudflare => f.write_str("cloudflare"),
-            FrontendMode::CustomLb => f.write_str("custom_lb"),
-        }
-    }
-}
+// the per-provider semantics.
+//
+// The provider itself lives in `provider::ProviderKey` — the registry
+// entry that owns both the first-level header names and the source of
+// the provider's published IP ranges. What sits here is only the
+// *global default* every site inherits unless it overrides it.
 
 /// Singleton system config row (system_config table, V7).
 ///
@@ -837,7 +790,9 @@ impl std::fmt::Display for FrontendMode {
 /// `Arc<RwLock<SystemConfig>>` on the shared [`App`](crate::App).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemConfig {
-    pub frontend_mode: FrontendMode,
+    /// The provider in front of every site that does not override it.
+    /// See [`crate::provider::ProviderKey`].
+    pub provider: crate::provider::ProviderKey,
     /// Master switch for the unified `P-*` gateway headers
     /// (`P-Known-Bot`, `P-Client-Ip`, `P-Client-Country`,
     /// `P-Client-Region`). When `false` the headers are not added
@@ -856,6 +811,10 @@ pub struct SystemConfig {
     /// First-level header carrying the visitor's region code.
     /// Used in `custom_lb` mode only.
     pub client_region_header: Option<String>,
+    /// The global default of the origin guard: whether a site that
+    /// does not override it refuses requests whose TCP peer is
+    /// outside its allowlist.
+    pub origin_guard_enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -1111,48 +1070,34 @@ mod tests {
 
     #[test]
     fn system_config_serde_roundtrip() {
-        // Regression (fix-client-ip): SystemConfig + FrontendMode
+        // Regression (fix-client-ip): SystemConfig + ProviderKey
         // must survive a JSON round-trip with the wire format used
         // by the admin GET/POST endpoints and the DB row mapper.
         let ts = Utc::now();
-        for mode in [
-            FrontendMode::Direct,
-            FrontendMode::Cloudflare,
-            FrontendMode::CustomLb,
+        for provider in [
+            crate::provider::ProviderKey::Direct,
+            crate::provider::ProviderKey::Cloudflare,
+            crate::provider::ProviderKey::CustomLb,
         ] {
             let cfg = SystemConfig {
-                frontend_mode: mode,
+                provider,
                 pgl_headers_enabled: true,
                 client_ip_header: Some("X-Client-IP".into()),
                 client_country_header: Some("X-Client-Country".into()),
                 client_region_header: None,
+                origin_guard_enabled: false,
                 updated_at: ts,
             };
             let json = serde_json::to_string(&cfg).unwrap();
             let back: SystemConfig = serde_json::from_str(&json).unwrap();
             assert_eq!(back, cfg);
-            // Wire form of frontend_mode is lowercase (matches the
+            // Wire form of the provider is lowercase (matches the
             // DB CHECK constraint).
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(
-                v["frontend_mode"],
-                serde_json::Value::String(mode.to_string())
+                v["provider"],
+                serde_json::Value::String(provider.to_string())
             );
         }
-    }
-
-    #[test]
-    fn frontend_mode_from_str_and_display() {
-        // Wire format must round-trip: the DB stores the
-        // Display form, and the row mapper parses with FromStr.
-        for (s, m) in [
-            ("direct", FrontendMode::Direct),
-            ("cloudflare", FrontendMode::Cloudflare),
-            ("custom_lb", FrontendMode::CustomLb),
-        ] {
-            assert_eq!(s.parse::<FrontendMode>().unwrap(), m);
-            assert_eq!(m.to_string(), s);
-        }
-        assert!("bogus".parse::<FrontendMode>().is_err());
     }
 }

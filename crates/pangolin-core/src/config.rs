@@ -71,6 +71,9 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// Front-CDN / provider settings (the background range fetch).
+    #[serde(default)]
+    pub provider: ProviderConfig,
 }
 
 /// HTTP / HTTPS listen addresses.
@@ -166,6 +169,7 @@ impl Default for Config {
             acme: AcmeConfig::default(),
             tls: TlsConfig::default(),
             log: LogConfig::default(),
+            provider: ProviderConfig::default(),
         }
     }
 }
@@ -294,6 +298,33 @@ impl Default for AcmeConfig {
             pre_renew: None,
             post_renew: None,
             deploy: None,
+        }
+    }
+}
+
+/// Front-CDN / provider configuration (issue #122).
+///
+/// The provider *registry* is code, not configuration — the set of
+/// providers and the header names they use lives in
+/// `pangolin_core::provider`. What lives here is the operational
+/// tuning of the background range fetch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// How often the published source-IP ranges are refreshed, in
+    /// seconds. The fetch is conditional (`ETag` / `Last-Modified`),
+    /// so a short interval costs one cheap request per provider URL.
+    #[serde(default = "default_ip_refresh_interval_secs")]
+    pub ip_refresh_interval_secs: u64,
+}
+
+fn default_ip_refresh_interval_secs() -> u64 {
+    3600
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            ip_refresh_interval_secs: default_ip_refresh_interval_secs(),
         }
     }
 }
