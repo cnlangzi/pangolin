@@ -333,42 +333,14 @@ impl ProxyHttp for AppProxy {
             .get("user-agent")
             .and_then(|v| v.to_str().ok().map(String::from));
 
-        // ── Client IP resolution + gateway headers (issue #115) ──
-        //
-        // The client IP is resolved **once** per request, here. The
-        // single result feeds the access log, the four `P-*` gateway
-        // headers and the knownbots verification, so the three can
-        // never disagree (R10).
-        //
-        // The first-level headers have to be snapshotted into owned
-        // strings first: the resolver borrows them immutably while
-        // we are about to mutate the request header.
+        // The TCP peer, resolved once per request.
         let peer = peer_addr_std(session);
-        let cfg = self.app.system_config.read().await.clone();
-        let first_level = snapshot_first_level_headers(&cfg, session);
-        let pgl = pangolin_core::pgl::resolve_headers(
-            &cfg,
-            peer,
-            |name: &str| first_level.get(name).cloned(),
-            ctx.user_agent.as_deref(),
-            // No verifier when the gateway headers are disabled: the
-            // result would be thrown away, so skip the verification
-            // work entirely.
-            self.app
-                .bot_verifier
-                .as_deref()
-                .filter(|_| cfg.pgl_headers_enabled),
-        );
-        ctx.client_ip = pgl.client_ip;
-        ctx.log_client_ip = pangolin_core::client_ip::log_value(pgl.client_ip, peer);
-        ctx.peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()).to_string());
-        // Strip any client-supplied copies of the four gateway
-        // headers and write pangolin's own values. The stripping is
-        // unconditional — a client must never be able to impersonate
-        // a gateway header, even when the headers are disabled.
-        apply_pgl_headers(session, cfg.pgl_headers_enabled, &pgl);
 
         // ── ACME HTTP-01 short-circuit (issue #54) ─────────────
+        //
+        // Answered before the site lookup: an ACME challenge is
+        // about a domain, not about a site, and it is exempt from
+        // the origin guard by construction.
         if let Some(token) = crate::acme::parse_http01_path(&path) {
             let cert_dir = self.app.cert_manager.cert_dir.clone();
             match crate::acme::read_http01_challenge(&cert_dir, token).await {
@@ -410,6 +382,83 @@ impl ProxyHttp for AppProxy {
                 }
             }
         }
+
+        // ── Site lookup ────────────────────────────────────────
+        //
+        // The site, its rate-limit configuration and its provider
+        // configuration are read in **one** index-lock scope: the
+        // visitor IP has to be resolved with the site's own
+        // provider, and the guard needs the same provider's range
+        // set. Reading them together keeps the number of lookups
+        // and of lock acquisitions per request unchanged.
+        let host = host_from_session(session);
+
+        let indexes = self.app.indexes.read().await;
+        let site = match pangolin_core::index::lookup_site(&indexes, &host) {
+            Some(s) => s.clone(),
+            None => {
+                debug!("No site found for host: {}", host);
+                let _ = session.respond_error(404).await;
+                return Ok(true);
+            }
+        };
+        // Issue #117: fetch the site's rate-limit configuration in
+        // the same lock scope as the routing entry, so the policy and
+        // the IP rules always come from the same revision.
+        let limit_cfg = indexes.limits.get(&site.name).cloned();
+        // Issue #122: the site's effective provider configuration
+        // (provider, custom header names, origin-guard switch,
+        // manual allow ranges). A site without an override inherits
+        // the global defaults, which the index build already
+        // applied.
+        let provider_cfg = indexes
+            .providers
+            .get(&site.name)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(pangolin_core::provider::SiteProviderConfig::default()));
+        drop(indexes);
+        // The host is known from here on — a rate-limited request is
+        // still attributed to its host in the traffic side-channel.
+        ctx.host_known = true;
+
+        // ── Client IP resolution + gateway headers (issue #115) ──
+        //
+        // The client IP is resolved **once** per request, here. The
+        // single result feeds the access log, the four `P-*` gateway
+        // headers and the knownbots verification, so the three can
+        // never disagree (R10).
+        //
+        // The resolution is **provider-driven**: the header names come
+        // from the effective provider of the site being served, so a
+        // site's header source and its range source can never
+        // disagree.
+        //
+        // The first-level headers have to be snapshotted into owned
+        // strings first: the resolver borrows them immutably while
+        // we are about to mutate the request header.
+        let cfg = self.app.system_config.read().await.clone();
+        let first_level = snapshot_first_level_headers(&provider_cfg, session);
+        let pgl = pangolin_core::pgl::resolve_headers(
+            &provider_cfg,
+            peer,
+            |name: &str| first_level.get(name).cloned(),
+            ctx.user_agent.as_deref(),
+            // No verifier when the gateway headers are disabled: the
+            // result would be thrown away, so skip the verification
+            // work entirely.
+            self.app
+                .bot_verifier
+                .as_deref()
+                .filter(|_| cfg.pgl_headers_enabled),
+        );
+        ctx.client_ip = pgl.client_ip;
+        ctx.log_client_ip = pangolin_core::client_ip::log_value(pgl.client_ip, peer);
+        ctx.peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()).to_string());
+        // Strip any client-supplied copies of the four gateway
+        // headers and write pangolin's own values. The stripping is
+        // unconditional — a client must never be able to impersonate
+        // a gateway header, even when the headers are disabled.
+        apply_pgl_headers(session, cfg.pgl_headers_enabled, &pgl);
 
         // ── SSE / streaming response detection ────────────────
         // The streaming path is a byte-relay that exists for the
@@ -455,12 +504,15 @@ impl ProxyHttp for AppProxy {
         };
 
         // ── WebSocket upgrade short-circuit ────────────────────
+        //
+        // The tunnel control channel. It reuses the site that was
+        // looked up above, so the request path still performs exactly
+        // one site lookup. Being answered here, it is also exempt
+        // from the origin guard by construction.
         if is_upgrade && path == self.app.ws_path {
-            let host = host_from_session(session);
-            let indexes = self.app.indexes.read().await;
-            let (tun_name, ws_target) = pangolin_core::index::lookup_site(&indexes, &host)
-                .and_then(|s| {
-                    let (tn, _) = pangolin_core::parse::parse_backend(&s.backend).ok()?;
+            let (tun_name, ws_target) = pangolin_core::parse::parse_backend(&site.backend)
+                .ok()
+                .and_then(|(tn, _)| {
                     if tn.is_empty() {
                         None
                     } else {
@@ -471,14 +523,13 @@ impl ProxyHttp for AppProxy {
                         // dispatcher's http/https-vs-file
                         // branch — `handle_ws_upgrade` reads
                         // `request.target` to get host:port.
-                        let target = pangolin_core::parse_backend_to_target(&s.backend)
+                        let target = pangolin_core::parse_backend_to_target(&site.backend)
                             .ok()
                             .map(|(_, t)| t);
                         Some((tn, target))
                     }
                 })
                 .unwrap_or_default();
-            drop(indexes);
 
             if !tun_name.is_empty() {
                 info!("Tunnel WS relay: {} → tun {}", host, tun_name);
@@ -520,34 +571,83 @@ impl ProxyHttp for AppProxy {
             return Ok(false);
         }
 
-        // ── Site lookup ────────────────────────────────────────
-        let host = host_from_session(session);
-
-        let indexes = self.app.indexes.read().await;
-        let site = match pangolin_core::index::lookup_site(&indexes, &host) {
-            Some(s) => s.clone(),
-            None => {
-                debug!("No site found for host: {}", host);
-                let _ = session.respond_error(404).await;
+        // ── Origin guard (issue #122) ──────────────────────────
+        //
+        // The guard refuses a request whose **TCP peer** is outside
+        // the site's effective allowlist — the provider's published
+        // ranges ∪ the site's manual ranges. The peer is compared,
+        // never the resolved visitor IP: behind a CDN / LB the
+        // visitor IP comes from a header a bypassing client can
+        // forge, so comparing it would not stop a bypass.
+        //
+        // The decision is taken after the site lookup (the guard
+        // needs the site's provider and its range set) and before the
+        // request is forwarded — a rejected request never reaches
+        // the backend. The ACME HTTP-01 challenge is answered before
+        // the site lookup, and the tunnel control channel above, so
+        // both are exempt by construction.
+        //
+        // The tunnel-path exemption is tied to the **upgrade**: the
+        // control channel is a WebSocket endpoint (the branch above
+        // answers it and returns), so a plain request to the same
+        // path is ordinary site traffic and stays guarded.
+        let is_tunnel_control = path == self.app.ws_path && is_upgrade;
+        if provider_cfg.origin_guard_enabled && !is_tunnel_control {
+            let peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()));
+            let provider_ranges = self
+                .app
+                .provider_ranges
+                .read()
+                .get(&provider_cfg.provider)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(pangolin_core::cidr::CidrSet::new()));
+            if provider_cfg.has_empty_allowlist(&provider_ranges) {
+                // The guard fails open on an empty allowlist (the
+                // provider publishes no list, or the list has never
+                // been fetched). That must not be silent — the
+                // operator has to know the guard is not protecting
+                // anything.
+                warn!(
+                    "origin guard: {} has an empty allowlist (provider {}) — \
+                     the guard is not rejecting anything",
+                    site.name, provider_cfg.provider
+                );
+            }
+            if !provider_cfg.allows_peer(peer_ip, &provider_ranges) {
+                // The rejection is counted per provider and logged at
+                // a bounded rate — a rejected request never reaches
+                // the access log, so the counter is the only place
+                // the operator sees it.
+                let provider = provider_cfg.provider;
+                if self.app.guard_rejections.record(provider) {
+                    warn!(
+                        "origin guard: rejected request to {} from peer {:?} \
+                         (provider {})",
+                        site.name,
+                        peer_ip.map(|ip| ip.to_string()),
+                        provider
+                    );
+                }
+                respond_rejection(
+                    session,
+                    403,
+                    None,
+                    "text/html; charset=utf-8",
+                    &site_custom_403_body(limit_cfg.as_deref()),
+                )
+                .await;
                 return Ok(true);
             }
-        };
-        // Issue #117: fetch the site's rate-limit configuration in
-        // the same lock scope as the routing entry, so the policy and
-        // the IP rules always come from the same revision.
-        let limit_cfg = indexes.limits.get(&site.name).cloned();
-        drop(indexes);
-        // The host is known from here on — a rate-limited request is
-        // still attributed to its host in the traffic side-channel.
-        ctx.host_known = true;
+        }
 
         // ── Per-site rate limiting + IP rules (issue #117) ────
         //
         // The decision is taken after the routing entry has been
         // resolved and before the request is forwarded: a rejected
         // request never reaches the backend. The ACME HTTP-01
-        // challenge and the tunnel control channel are answered
-        // *before* the site lookup, so they are never limited.
+        // challenge is answered before the site lookup and the
+        // tunnel control channel before this point, so neither is
+        // limited.
         //
         // The client IP is the authoritative one (the CDN / LB
         // header, or the TCP peer in direct mode); when it is
@@ -588,12 +688,14 @@ impl ProxyHttp for AppProxy {
             match decision {
                 pangolin_core::LimitDecision::Allow => {}
                 pangolin_core::LimitDecision::Blocked => {
-                    respond_rate_limited(
+                    // Issue #122: every 403 the gateway itself
+                    // produces carries the site's own page.
+                    respond_rejection(
                         session,
                         403,
                         None,
-                        "text/plain; charset=utf-8",
-                        BLOCKED_BODY,
+                        "text/html; charset=utf-8",
+                        &site_custom_403_body(Some(limit_cfg.as_ref())),
                     )
                     .await;
                     return Ok(true);
@@ -605,7 +707,7 @@ impl ProxyHttp for AppProxy {
                         Some(custom) if !custom.trim().is_empty() => custom.to_string(),
                         _ => pangolin_core::ratelimit::default_429_page(retry_after),
                     };
-                    respond_rate_limited(
+                    respond_rejection(
                         session,
                         429,
                         Some(retry_after),
@@ -1968,17 +2070,27 @@ async fn respond_streaming_unsupported_on_file(session: &mut Session) {
     }
 }
 
-/// Body of a 403 answer from the IP rules.
-const BLOCKED_BODY: &str = "Forbidden by site policy.\n";
-
-/// Answer a request the rate limiter rejected (issue #117).
+/// The body of a `403` the gateway itself produces for this site.
 ///
-/// `status` is 403 (the client's IP matches a blacklist rule) or 429
-/// (the client is over one of the site's limits). The 429 carries a
-/// `Retry-After` header with the number of seconds left in the
+/// The site's own page when it has one, the built-in default page
+/// otherwise. Used for **every** gateway-produced 403 — the origin
+/// guard and the IP-blacklist rule — while a 403 produced by the
+/// upstream backend is passed through unchanged (issue #122).
+fn site_custom_403_body(limit_cfg: Option<&pangolin_core::ratelimit::SiteLimitConfig>) -> String {
+    limit_cfg
+        .and_then(|c| c.policy.custom_403_body.as_deref())
+        .map(|body| body.to_string())
+        .unwrap_or_else(pangolin_core::ratelimit::default_403_page)
+}
+
+/// Answer a request the gateway itself rejected.
+///
+/// `status` is 403 (the origin guard or a blacklist rule matched) or
+/// 429 (the client is over one of the site's limits). The 429 carries
+/// a `Retry-After` header with the number of seconds left in the
 /// counting window that tripped, and its body is the site's custom
 /// page or the built-in default one.
-async fn respond_rate_limited(
+async fn respond_rejection(
     session: &mut Session,
     status: u16,
     retry_after: Option<u64>,
@@ -1988,7 +2100,7 @@ async fn respond_rate_limited(
     let mut hdr = match ResponseHeader::build(status, None) {
         Ok(h) => h,
         Err(e) => {
-            error!("failed to build rate-limit response: {e}");
+            error!("failed to build rejection response: {e}");
             let _ = session.respond_error(500).await;
             return;
         }
@@ -2043,11 +2155,11 @@ fn peer_addr_std(session: &Session) -> Option<std::net::SocketAddr> {
 /// after). Only the headers the configured mode actually consults
 /// are read — in `direct` mode that is none of them.
 fn snapshot_first_level_headers(
-    cfg: &pangolin_core::SystemConfig,
+    provider_cfg: &pangolin_core::provider::SiteProviderConfig,
     session: &Session,
 ) -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
-    for name in pangolin_core::pgl::first_level_headers(cfg) {
+    for name in pangolin_core::pgl::first_level_headers(provider_cfg) {
         if let Some(value) = session.get_header(name.as_str())
             && let Ok(value) = std::str::from_utf8(value.as_bytes())
         {

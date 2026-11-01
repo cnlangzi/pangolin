@@ -60,7 +60,7 @@ pub use logs::{
 pub use ratelimit::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
 };
-pub use settings::SettingsTemplate;
+pub use settings::{ProviderOption, SettingsTemplate};
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };

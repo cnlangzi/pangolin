@@ -14,6 +14,8 @@ use tokio::task::JoinHandle;
 use crate::bot::verify_bot;
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
+use crate::cidr::CidrSet;
+use crate::provider::{GlobalProviderConfig, GuardRejectionCounter, ProviderKey};
 use crate::ratelimit::RateLimiter;
 use crate::traffic::TrafficHub;
 use crate::tunnel::YamuxTunnel;
@@ -21,7 +23,7 @@ use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
     db,
-    types::{ChallengeKind, ChallengeType, DnsProviderKind, FrontendMode, SystemConfig},
+    types::{ChallengeKind, ChallengeType, DnsProviderKind, SystemConfig},
 };
 use knownbots::{Validator, ValidatorOptions};
 
@@ -286,6 +288,23 @@ pub trait CertRetrier: Send + Sync {
     async fn retry(&self, domain: &str) -> anyhow::Result<()>;
 }
 
+/// The `system_config` row's documented defaults.
+///
+/// Used when the singleton row is missing (a manual `DELETE FROM
+/// system_config` slipped through) — the same fallback `App::new`
+/// applies.
+fn default_system_config() -> SystemConfig {
+    SystemConfig {
+        provider: ProviderKey::Direct,
+        pgl_headers_enabled: true,
+        client_ip_header: None,
+        client_country_header: None,
+        client_region_header: None,
+        origin_guard_enabled: false,
+        updated_at: chrono::Utc::now(),
+    }
+}
+
 /// Shared application state. Owned by `ngx` at runtime; `admin` receives it
 /// via `Arc<App>` when handling HTTP requests.
 pub struct App {
@@ -428,6 +447,20 @@ pub struct App {
     /// routing table; the counters here are in-memory only and reset
     /// when the process restarts.
     pub rate_limiter: Arc<RateLimiter>,
+    /// The published source-IP ranges of every provider, in memory.
+    ///
+    /// Keyed by provider; the value is the union of the ranges
+    /// fetched from each of the provider's range URLs. The set is
+    /// swapped atomically by the fetch service
+    /// (`ngx::provider_ip`), so the request path never takes a
+    /// database lock to answer the origin guard.
+    pub provider_ranges: Arc<parking_lot::RwLock<HashMap<ProviderKey, Arc<CidrSet>>>>,
+    /// The origin-guard rejection counters (issue #122).
+    ///
+    /// Guard rejections are answered inside the request filter and
+    /// never reach the access log, so this counter is the only place
+    /// the operator sees them.
+    pub guard_rejections: Arc<GuardRejectionCounter>,
 }
 
 impl App {
@@ -470,15 +503,12 @@ impl App {
         // the limits together.
         let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
         let rules = db::list_ip_rules(&conn).unwrap_or_default();
-        let indexes = Indexes::build_with_limits(sites, domains.clone(), &policies, &rules);
-        let dns_index = DnsIndex::build(&providers, &domains);
-        let tunnel_set = build_tunnel_domain_set(&indexes);
-
-        // The runtime state of the rate limiter (the rings and the
-        // penalty box) is in-memory only — it starts empty on every
-        // boot.
-        let rate_limiter = RateLimiter::new();
-        rate_limiter.reconfigure(&indexes.limits);
+        // Issue #122: the per-site provider overrides and the manual
+        // allow ranges, read before the index build so a site's
+        // effective provider can be resolved against the global
+        // defaults.
+        let site_providers = db::list_site_providers(&conn).unwrap_or_default();
+        let site_ranges = db::list_site_origin_allow(&conn).unwrap_or_default();
 
         // fix-client-ip: load the singleton system config. V7
         // seeds the row in the migration, so this normally just
@@ -488,17 +518,28 @@ impl App {
         // refuses to launch on a real DB problem.
         let system_config = match db::get_system_config(&conn) {
             Ok(c) => c,
-            Err(rusqlite::Error::QueryReturnedNoRows) => SystemConfig {
-                frontend_mode: FrontendMode::Direct,
-                pgl_headers_enabled: true,
-                client_ip_header: None,
-                client_country_header: None,
-                client_region_header: None,
-                updated_at: chrono::Utc::now(),
-            },
+            Err(rusqlite::Error::QueryReturnedNoRows) => default_system_config(),
             Err(e) => return Err(e.into()),
         };
+        let global_provider = GlobalProviderConfig::from_system_config(&system_config);
         let system_config = Arc::new(RwLock::new(system_config));
+        let indexes = Indexes::build_with_providers(
+            sites,
+            domains.clone(),
+            &policies,
+            &rules,
+            &site_providers,
+            &site_ranges,
+            &global_provider,
+        );
+        let dns_index = DnsIndex::build(&providers, &domains);
+        let tunnel_set = build_tunnel_domain_set(&indexes);
+
+        // The runtime state of the rate limiter (the rings and the
+        // penalty box) is in-memory only — it starts empty on every
+        // boot.
+        let rate_limiter = RateLimiter::new();
+        rate_limiter.reconfigure(&indexes.limits);
 
         // fix/cert_www: build the domain → cert pre-computed link
         // cache. Pure derived view over `domains` and `certs`; the
@@ -583,6 +624,8 @@ impl App {
             cert_links,
             traffic: TrafficHub::new(traffic_enabled),
             rate_limiter,
+            provider_ranges: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            guard_rejections: Arc::new(GuardRejectionCounter::new()),
         })
     }
 
@@ -606,6 +649,10 @@ impl App {
     /// keep the cache warm in the normal case; this method is the
     /// recovery path.
     pub async fn reload_indexes(&self) {
+        // The current in-memory value, kept as the fallback when the
+        // database read fails. Cloned before the DB lock is taken so
+        // the two locks are never held at the same time.
+        let previous_system_config = self.system_config.read().await.clone();
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
         let domains = db::list_domains(&conn).unwrap_or_default();
@@ -614,7 +661,38 @@ impl App {
         // the routing table.
         let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
         let rules = db::list_ip_rules(&conn).unwrap_or_default();
-        let indexes = Indexes::build_with_limits(sites, domains.clone(), &policies, &rules);
+        // Issue #122: the per-site provider overrides and the manual
+        // allow ranges travel with the routing table, so a site's
+        // effective provider is always resolved against the same
+        // revision as its routing entry.
+        let site_providers = db::list_site_providers(&conn).unwrap_or_default();
+        let site_ranges = db::list_site_origin_allow(&conn).unwrap_or_default();
+        // The global defaults come from `system_config`; they are
+        // read **before** the index build so the effective provider of
+        // every site is resolved against the current global value.
+        let system_config = match db::get_system_config(&conn) {
+            Ok(c) => c,
+            Err(rusqlite::Error::QueryReturnedNoRows) => default_system_config(),
+            Err(e) => {
+                // A transient DB error: the in-memory value is left
+                // untouched — same policy as before the provider
+                // change. The operator can recover by POSTing
+                // /api/system/config (which calls
+                // update_system_config + this reload again).
+                log::warn!("system_config: reload from DB failed: {e}");
+                previous_system_config
+            }
+        };
+        let global_provider = GlobalProviderConfig::from_system_config(&system_config);
+        let indexes = Indexes::build_with_providers(
+            sites,
+            domains.clone(),
+            &policies,
+            &rules,
+            &site_providers,
+            &site_ranges,
+            &global_provider,
+        );
         let dns_index = DnsIndex::build(&providers, &domains);
         // Sync mirror: every domain that resolves to a tunnel-backed
         // site. The TLS ALPN callback consults this set on the
@@ -627,27 +705,10 @@ impl App {
         self.rate_limiter.reconfigure(&indexes.limits);
         *self.indexes.write().await = indexes;
         *self.dns_index.write().await = dns_index;
-        // fix-client-ip: reload the singleton. A missing row is
-        // treated as "use defaults" rather than a hard error —
-        // same policy as App::new. The operator can recover by
-        // POSTing /api/system/config (which calls
-        // update_system_config + this reload again). A transient
-        // DB error is logged and the in-memory value is left
-        // untouched; the next reload tick will retry.
-        match db::get_system_config(&conn) {
-            Ok(c) => *self.system_config.write().await = c,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                *self.system_config.write().await = SystemConfig {
-                    frontend_mode: FrontendMode::Direct,
-                    pgl_headers_enabled: true,
-                    client_ip_header: None,
-                    client_country_header: None,
-                    client_region_header: None,
-                    updated_at: chrono::Utc::now(),
-                };
-            }
-            Err(e) => log::warn!("system_config: reload from DB failed: {e}"),
-        }
+        // fix-client-ip: publish the singleton. It was read above
+        // (before the index build) so the effective provider of every
+        // site could be resolved against it.
+        *self.system_config.write().await = system_config;
         // Rebuild cert_links (fix/cert_www). Best-effort: if the
         // rebuild fails (e.g. a transient DB error), log and keep
         // the existing cache. The cache is a derived view and will

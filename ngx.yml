@@ -99,6 +99,14 @@ acme:
   # `domains.dns_provider` (referencing a row in the `dns_providers`
   # table). See the v2 design doc for details.
 
+provider:
+  # How often the providers' published source-IP ranges are refreshed
+  # (issue #122). The fetch is conditional (ETag / Last-Modified), so
+  # a short interval costs one cheap request per provider URL. A
+  # failed fetch backs off (60s -> 1800s) and never removes the
+  # stored ranges. Default 3600.
+  ip_refresh_interval_secs: 3600
+
 tls:
   enable_h2: true       # advertise HTTP/2 via ALPN for non-tunnel sites.
                         # Tunnel sites (backend with `tun_name:` prefix) always

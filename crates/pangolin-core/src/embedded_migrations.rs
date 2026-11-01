@@ -13,6 +13,18 @@ pub mod embedded {
     embed_migrations!("migrations");
 }
 
+/// Runs the migrations up to (and including) `version`.
+///
+/// Used by the tests to build a database that predates a migration,
+/// so the in-place upgrade path can be exercised. Production code
+/// always wants [`run_migrations`].
+pub fn run_migrations_up_to(conn: &mut rusqlite::Connection, version: i32) -> crate::Result<()> {
+    embedded::migrations::runner()
+        .set_target(refinery::Target::Version(version))
+        .run(conn)?;
+    Ok(())
+}
+
 /// Runs all pending migrations on the given connection.
 ///
 /// This is called once at application startup. Refinery will create a

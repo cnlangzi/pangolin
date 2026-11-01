@@ -32,7 +32,7 @@ use std::net::{IpAddr, SocketAddr};
 use knownbots::Validator;
 
 use crate::client_ip::resolve_authoritative;
-use crate::types::{FrontendMode, SystemConfig};
+use crate::provider::{ProviderKey, SiteProviderConfig, spec};
 
 /// `1` when knownbots verification succeeded for the request.
 pub const HEADER_KNOWN_BOT: &str = "P-Known-Bot";
@@ -58,14 +58,6 @@ pub const PGL_HEADER_NAMES: [&str; 4] = [
     HEADER_CLIENT_COUNTRY,
     HEADER_CLIENT_REGION,
 ];
-
-/// Cloudflare's first-level headers, in the order pangolin
-/// consults them.
-const CF_CLIENT_IP: &str = "CF-Connecting-IP";
-const CF_CLIENT_IPV6: &str = "CF-Connecting-IPv6";
-const CF_COUNTRY: &str = "CF-IPCountry";
-const CF_REGION_CODE: &str = "CF-Region-Code";
-const CF_REGION: &str = "CF-Region";
 
 /// The computed values of the four gateway headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -127,8 +119,13 @@ impl PglHeaders {
 /// The geo values are only read outside `direct` mode: in `direct`
 /// mode a `CF-IPCountry` header could only have been sent by the
 /// client, so trusting it would be spoofing.
+///
+/// `provider_cfg` is the **effective provider of the site being
+/// served** — the site's own setting when it has one, the global
+/// default otherwise. The header names therefore always come from
+/// the same provider whose published ranges the origin guard uses.
 pub fn resolve_headers<F>(
-    cfg: &SystemConfig,
+    provider_cfg: &SiteProviderConfig,
     peer: Option<SocketAddr>,
     get_header: F,
     user_agent: Option<&str>,
@@ -137,7 +134,7 @@ pub fn resolve_headers<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let client_ip = resolve_authoritative(cfg, peer, &get_header);
+    let client_ip = resolve_authoritative(provider_cfg, peer, &get_header);
     let known_bot = match (verifier, user_agent, client_ip) {
         (Some(v), Some(ua), Some(ip)) => v.verify(ua, ip).is_verified(),
         _ => false,
@@ -145,34 +142,45 @@ where
     PglHeaders {
         known_bot,
         client_ip,
-        country: resolve_country(cfg, &get_header),
-        region: resolve_region(cfg, &get_header),
+        country: resolve_country(provider_cfg, &get_header),
+        region: resolve_region(provider_cfg, &get_header),
     }
 }
 
-/// The first-level header names pangolin consults in the configured
-/// mode.
+/// The first-level header names pangolin consults for the site's
+/// effective provider.
 ///
 /// `ngx` uses this to decide which headers to snapshot off the
 /// request before the values are computed (the header lookup needs
 /// an owned snapshot — the session cannot be borrowed immutably
 /// while its request header is being mutated).
-pub fn first_level_headers(cfg: &SystemConfig) -> Vec<String> {
-    match cfg.frontend_mode {
-        FrontendMode::Direct => Vec::new(),
-        FrontendMode::Cloudflare => vec![
-            CF_CLIENT_IP.to_string(),
-            CF_CLIENT_IPV6.to_string(),
-            CF_COUNTRY.to_string(),
-            CF_REGION_CODE.to_string(),
-            CF_REGION.to_string(),
-        ],
-        FrontendMode::CustomLb => {
+///
+/// The fixed names come from the registry (see
+/// [`crate::provider::spec`]); only `custom_lb` uses the
+/// operator-configured names.
+pub fn first_level_headers(provider_cfg: &SiteProviderConfig) -> Vec<String> {
+    match provider_cfg.provider {
+        ProviderKey::Direct => Vec::new(),
+        ProviderKey::Cloudflare => {
+            let headers = spec(ProviderKey::Cloudflare).headers;
+            [
+                headers.client_ip,
+                headers.client_ipv6,
+                headers.country,
+                headers.region,
+                headers.region_fallback,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|n| n.to_string())
+            .collect()
+        }
+        ProviderKey::CustomLb => {
             let mut names = Vec::new();
             for key in [
-                cfg.client_ip_header.as_deref(),
-                cfg.client_country_header.as_deref(),
-                cfg.client_region_header.as_deref(),
+                provider_cfg.client_ip_header.as_deref(),
+                provider_cfg.country_header.as_deref(),
+                provider_cfg.region_header.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -187,15 +195,18 @@ pub fn first_level_headers(cfg: &SystemConfig) -> Vec<String> {
 }
 
 /// The country code, or `None` when there is none.
-fn resolve_country<F>(cfg: &SystemConfig, get_header: &F) -> Option<String>
+fn resolve_country<F>(provider_cfg: &SiteProviderConfig, get_header: &F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    match cfg.frontend_mode {
-        FrontendMode::Direct => None,
-        FrontendMode::Cloudflare => header_value(get_header, CF_COUNTRY),
-        FrontendMode::CustomLb => cfg
-            .client_country_header
+    match provider_cfg.provider {
+        ProviderKey::Direct => None,
+        ProviderKey::Cloudflare => {
+            let name = spec(ProviderKey::Cloudflare).headers.country?;
+            header_value(get_header, name)
+        }
+        ProviderKey::CustomLb => provider_cfg
+            .country_header
             .as_deref()
             .and_then(|name| header_value(get_header, name)),
     }
@@ -205,17 +216,23 @@ where
 ///
 /// Cloudflare exposes the region under two headers depending on the
 /// zone / plan; `CF-Region-Code` wins when both are present.
-fn resolve_region<F>(cfg: &SystemConfig, get_header: &F) -> Option<String>
+fn resolve_region<F>(provider_cfg: &SiteProviderConfig, get_header: &F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    match cfg.frontend_mode {
-        FrontendMode::Direct => None,
-        FrontendMode::Cloudflare => {
-            header_value(get_header, CF_REGION_CODE).or_else(|| header_value(get_header, CF_REGION))
+    match provider_cfg.provider {
+        ProviderKey::Direct => None,
+        ProviderKey::Cloudflare => {
+            let headers = spec(ProviderKey::Cloudflare).headers;
+            let primary = headers.region.and_then(|n| header_value(get_header, n));
+            primary.or_else(|| {
+                headers
+                    .region_fallback
+                    .and_then(|n| header_value(get_header, n))
+            })
         }
-        FrontendMode::CustomLb => cfg
-            .client_region_header
+        ProviderKey::CustomLb => provider_cfg
+            .region_header
             .as_deref()
             .and_then(|name| header_value(get_header, name)),
     }
@@ -239,16 +256,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
-    fn cfg(mode: FrontendMode) -> SystemConfig {
-        SystemConfig {
-            frontend_mode: mode,
-            pgl_headers_enabled: true,
-            client_ip_header: None,
-            client_country_header: None,
-            client_region_header: None,
-            updated_at: Utc::now(),
+    fn cfg(provider: ProviderKey) -> SiteProviderConfig {
+        SiteProviderConfig {
+            provider,
+            ..Default::default()
         }
     }
 
@@ -271,7 +283,7 @@ mod tests {
     #[test]
     fn direct_mode_fills_ip_and_leaves_geo_empty() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Direct),
+            &cfg(ProviderKey::Direct),
             peer(203, 0, 113, 7),
             headers(vec![]),
             None,
@@ -286,7 +298,7 @@ mod tests {
     #[test]
     fn direct_mode_ignores_client_supplied_geo_headers() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Direct),
+            &cfg(ProviderKey::Direct),
             peer(203, 0, 113, 7),
             headers(vec![("CF-IPCountry", "DE"), ("CF-Region-Code", "BE")]),
             None,
@@ -299,7 +311,7 @@ mod tests {
     #[test]
     fn cloudflare_mode_reads_geo_headers() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![
                 ("CF-Connecting-IP", "203.0.113.7"),
@@ -317,7 +329,7 @@ mod tests {
     #[test]
     fn cloudflare_region_falls_back_to_cf_region() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![("CF-Region", "BE")]),
             None,
@@ -329,7 +341,7 @@ mod tests {
     #[test]
     fn cloudflare_region_code_wins_over_region() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![("CF-Region-Code", "BE"), ("CF-Region", "XX")]),
             None,
@@ -340,9 +352,9 @@ mod tests {
 
     #[test]
     fn cloudflare_mode_ignores_the_configured_keys() {
-        let mut c = cfg(FrontendMode::Cloudflare);
+        let mut c = cfg(ProviderKey::Cloudflare);
         c.client_ip_header = Some("X-Other-IP".into());
-        c.client_country_header = Some("X-Other-Country".into());
+        c.country_header = Some("X-Other-Country".into());
         let h = resolve_headers(
             &c,
             peer(1, 2, 3, 4),
@@ -360,8 +372,8 @@ mod tests {
 
     #[test]
     fn custom_lb_keys_are_independent() {
-        let mut c = cfg(FrontendMode::CustomLb);
-        c.client_country_header = Some("X-Country".into());
+        let mut c = cfg(ProviderKey::CustomLb);
+        c.country_header = Some("X-Country".into());
         let h = resolve_headers(
             &c,
             peer(1, 2, 3, 4),
@@ -376,7 +388,7 @@ mod tests {
 
     #[test]
     fn custom_lb_reads_the_configured_ip_header() {
-        let mut c = cfg(FrontendMode::CustomLb);
+        let mut c = cfg(ProviderKey::CustomLb);
         c.client_ip_header = Some("X-Client-IP".into());
         let h = resolve_headers(
             &c,
@@ -391,7 +403,7 @@ mod tests {
     #[test]
     fn geo_values_are_trimmed() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![("CF-IPCountry", "  DE  ")]),
             None,
@@ -403,7 +415,7 @@ mod tests {
     #[test]
     fn empty_geo_values_are_reported_as_empty() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![("CF-IPCountry", "   ")]),
             None,
@@ -425,7 +437,7 @@ mod tests {
             .seed_prefix("googlebot", "203.0.113.0/24")
             .expect("seed googlebot CIDR");
         let h = resolve_headers(
-            &cfg(FrontendMode::Direct),
+            &cfg(ProviderKey::Direct),
             peer(203, 0, 113, 7),
             headers(vec![]),
             Some("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
@@ -448,7 +460,7 @@ mod tests {
             .seed_prefix("googlebot", "203.0.113.0/24")
             .expect("seed googlebot CIDR");
         let h = resolve_headers(
-            &cfg(FrontendMode::Direct),
+            &cfg(ProviderKey::Direct),
             peer(198, 51, 100, 9),
             headers(vec![]),
             Some("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
@@ -464,7 +476,7 @@ mod tests {
     #[test]
     fn no_verifier_means_not_a_known_bot() {
         let h = resolve_headers(
-            &cfg(FrontendMode::Direct),
+            &cfg(ProviderKey::Direct),
             peer(203, 0, 113, 7),
             headers(vec![]),
             Some("Mozilla/5.0 (compatible; Googlebot/2.1)"),
@@ -478,7 +490,7 @@ mod tests {
         // Cloudflare mode without CF-Connecting-IP: there is no IP
         // to verify against, so the header must be "0".
         let h = resolve_headers(
-            &cfg(FrontendMode::Cloudflare),
+            &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
             headers(vec![]),
             Some("Mozilla/5.0 (compatible; Googlebot/2.1)"),
@@ -515,14 +527,14 @@ mod tests {
 
     #[test]
     fn first_level_headers_lists_the_consulted_names() {
-        assert!(first_level_headers(&cfg(FrontendMode::Direct)).is_empty());
-        let cf = first_level_headers(&cfg(FrontendMode::Cloudflare));
+        assert!(first_level_headers(&cfg(ProviderKey::Direct)).is_empty());
+        let cf = first_level_headers(&cfg(ProviderKey::Cloudflare));
         assert!(cf.iter().any(|n| n == "CF-Connecting-IP"));
         assert!(cf.iter().any(|n| n == "CF-IPCountry"));
 
-        let mut lb = cfg(FrontendMode::CustomLb);
+        let mut lb = cfg(ProviderKey::CustomLb);
         lb.client_ip_header = Some("X-Client-IP".into());
-        lb.client_region_header = Some("X-Region".into());
+        lb.region_header = Some("X-Region".into());
         let names = first_level_headers(&lb);
         assert!(names.iter().any(|n| n == "X-Client-IP"));
         assert!(names.iter().any(|n| n == "X-Region"));

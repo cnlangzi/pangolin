@@ -775,5 +775,18 @@ async fn access_log_all_backend_types_emit_entries() {
                 _ => "file.test",
             })
         );
+        // R16 (issue #122): the site lookup moved ahead of the
+        // visitor-IP resolution, so every path — the tunnel one
+        // included — must still carry the visitor's IP. A
+        // `unknown` here would mean the resolution ran after the
+        // short-circuit.
+        let client_ip = entry
+            .get("client_ip")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assert_ne!(
+            client_ip, "unknown",
+            "path={path}: the access log must record the visitor IP"
+        );
     }
 }

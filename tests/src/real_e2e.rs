@@ -2621,11 +2621,12 @@ async fn real_e2e_gateway_headers_read_cloudflare_first_level_headers() {
             db::update_system_config(
                 &conn,
                 &pangolin_core::SystemConfig {
-                    frontend_mode: pangolin_core::FrontendMode::Cloudflare,
+                    provider: pangolin_core::ProviderKey::Cloudflare,
                     pgl_headers_enabled: true,
                     client_ip_header: None,
                     client_country_header: None,
                     client_region_header: None,
+                    origin_guard_enabled: false,
                     updated_at: Utc::now(),
                 },
             )
@@ -2671,11 +2672,12 @@ async fn real_e2e_gateway_headers_read_custom_lb_first_level_headers() {
             db::update_system_config(
                 &conn,
                 &pangolin_core::SystemConfig {
-                    frontend_mode: pangolin_core::FrontendMode::CustomLb,
+                    provider: pangolin_core::ProviderKey::CustomLb,
                     pgl_headers_enabled: true,
                     client_ip_header: Some("X-Client-IP".into()),
                     client_country_header: Some("X-Client-Country".into()),
                     client_region_header: None,
+                    origin_guard_enabled: false,
                     updated_at: Utc::now(),
                 },
             )
@@ -2869,11 +2871,12 @@ async fn real_e2e_gateway_headers_disabled_strips_client_values() {
             db::update_system_config(
                 &conn,
                 &pangolin_core::SystemConfig {
-                    frontend_mode: pangolin_core::FrontendMode::Direct,
+                    provider: pangolin_core::ProviderKey::Direct,
                     pgl_headers_enabled: false,
                     client_ip_header: None,
                     client_country_header: None,
                     client_region_header: None,
+                    origin_guard_enabled: false,
                     updated_at: Utc::now(),
                 },
             )
@@ -3987,6 +3990,42 @@ async fn open_ws_client(
     client_async(req, tcp).await.expect("WS handshake")
 }
 
+/// Open a WS connection against the proxy, returning the handshake
+/// **error** instead of panicking when the server does not upgrade.
+///
+/// The tunnel-path exemption covers the WebSocket *upgrade*; a plain
+/// request to the same path is ordinary site traffic, so the test
+/// needs to observe the non-101 answer.
+async fn try_open_ws_client(
+    port: u16,
+    public_host: &str,
+    path: &str,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::client_async;
+    use tokio_tungstenite::tungstenite::handshake::client::Request;
+    let url = format!("ws://127.0.0.1:{}{}", port, path);
+    let req = Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("Host", public_host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") // matches RFC 6455 vector
+        .body(())
+        .expect("build WS request");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    client_async(req, tcp).await
+}
+
 /// Open a `wss://` connection against the proxy's TLS listener. Uses a
 /// custom rustls ClientConfig that trusts the per-test self-signed root
 /// (so the SNI/cert presented by `pangolin-ngx` validates).
@@ -4677,6 +4716,16 @@ async fn real_e2e_rate_limit_blacklist_returns_403() {
         backend.seen().await.is_empty(),
         "a blocked request must never reach the backend"
     );
+    // R14 (issue #122): the 403 is now an HTML page — the site's own
+    // when it has one, the built-in default otherwise.
+    assert!(
+        text.contains("text/html; charset=utf-8"),
+        "the 403 must be served as HTML, got:\n{text}"
+    );
+    assert!(
+        text.contains("<h1>Forbidden</h1>"),
+        "a site without a custom page must get the built-in default, got:\n{text}"
+    );
 }
 
 /// A whitelisted client IP is exempt: it is served even while the
@@ -4824,5 +4873,326 @@ async fn real_e2e_acme_http01_challenge_is_not_rate_limited() {
         key_auth,
         "the challenge body must be served verbatim. ngx log:\n{}",
         ngx.log_string()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Origin guard + custom 403 page e2e tests (issue #122).
+//
+// The guard compares the **TCP peer** against the site's effective
+// allowlist. Over loopback the peer is always 127.0.0.1, so the two
+// cases are:
+//   - the allowlist contains 127.0.0.0/8 → the request is forwarded,
+//   - it does not → the request is answered 403 and never reaches
+//     the backend.
+// ---------------------------------------------------------------------------
+
+/// Seed the per-site provider configuration of a site.
+fn seed_site_provider(conn: &Connection, site_name: &str, provider: &str, guard: Option<bool>) {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO site_providers (
+            site_name, provider, client_ip_header, country_header,
+            region_header, origin_guard_enabled, updated_at)
+         VALUES (?1, ?2, NULL, NULL, NULL, ?3, ?4)",
+        rusqlite::params![site_name, provider, guard.map(|g| g as i64), now],
+    )
+    .expect("insert site_providers");
+}
+
+/// Seed the manual allow ranges of a site.
+fn seed_site_origin_allow(conn: &Connection, site_name: &str, cidrs: &[&str]) {
+    for cidr in cidrs {
+        conn.execute(
+            "INSERT OR IGNORE INTO site_origin_allow (site_name, cidr) VALUES (?1, ?2)",
+            rusqlite::params![site_name, cidr],
+        )
+        .expect("insert site_origin_allow");
+    }
+}
+
+/// A peer outside the site's allowlist is rejected with 403 and the
+/// request never reaches the backend.
+#[tokio::test]
+async fn real_e2e_origin_guard_rejects_a_peer_outside_the_allowlist() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "guard-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "guard.test", "guard-site");
+            // The guard is on; the allowlist holds a range the
+            // loopback peer is not part of.
+            seed_site_provider(&conn, "guard-site", "cloudflare", Some(true));
+            seed_site_origin_allow(&conn, "guard-site", &["203.0.113.0/24"]);
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, text) = raw_get_full(&addr, "guard.test", "/").await;
+    assert_eq!(
+        status,
+        403,
+        "a peer outside the allowlist must get 403, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        backend.seen().await.is_empty(),
+        "a rejected request must never reach the backend"
+    );
+}
+
+/// A peer inside the site's allowlist is forwarded unchanged.
+#[tokio::test]
+async fn real_e2e_origin_guard_forwards_a_peer_inside_the_allowlist() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "guard-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "guard.test", "guard-site");
+            seed_site_provider(&conn, "guard-site", "cloudflare", Some(true));
+            // The e2e client connects over loopback.
+            seed_site_origin_allow(&conn, "guard-site", &["127.0.0.0/8"]);
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, text) = raw_get_full(&addr, "guard.test", "/").await;
+    assert_eq!(
+        status,
+        200,
+        "a peer inside the allowlist must be forwarded, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(
+        backend.seen().await.len(),
+        1,
+        "the request must reach the backend"
+    );
+}
+
+/// The guard compares the **peer**, never the resolved visitor IP: a
+/// forged `CF-Connecting-IP` header does not widen the allowlist.
+#[tokio::test]
+async fn real_e2e_origin_guard_ignores_a_forged_cf_connecting_ip() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "guard-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "guard.test", "guard-site");
+            seed_site_provider(&conn, "guard-site", "cloudflare", Some(true));
+            seed_site_origin_allow(&conn, "guard-site", &["203.0.113.0/24"]);
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let status = raw_request_with_headers(
+        &addr,
+        "guard.test",
+        "/",
+        &[("CF-Connecting-IP", "203.0.113.7")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        403,
+        "a forged CF-Connecting-IP must not bypass the guard, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        backend.seen().await.is_empty(),
+        "a rejected request must never reach the backend"
+    );
+}
+
+/// The ACME HTTP-01 challenge and the tunnel control channel are
+/// exempt from the guard: they are answered normally even though the
+/// peer is outside the allowlist.
+#[tokio::test]
+async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "guard-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "guard.test", "guard-site");
+            seed_site_provider(&conn, "guard-site", "cloudflare", Some(true));
+            seed_site_origin_allow(&conn, "guard-site", &["203.0.113.0/24"]);
+        }
+    })
+    .await;
+
+    // The ACME challenge file lives under the proxy's cert_dir.
+    let token = "guardtesttoken";
+    let key_auth = format!("{}.thumbprint-def456", token);
+    let ch_dir = ngx.cert_dir.join(".well-known").join("acme-challenge");
+    std::fs::create_dir_all(&ch_dir).expect("mkdir .well-known/acme-challenge");
+    std::fs::write(ch_dir.join(token), &key_auth).expect("write challenge file");
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // The ACME challenge is answered normally.
+    let path = format!("/.well-known/acme-challenge/{}", token);
+    let (status, body) = raw_get(&addr, "guard.test", &path).await;
+    assert_eq!(
+        status,
+        200,
+        "the ACME challenge must be exempt from the guard, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(body, key_auth);
+
+    // The tunnel control channel — a WebSocket **upgrade** — is
+    // answered normally too. The exemption is tied to the upgrade:
+    // the ws_path branch answers it before the guard runs.
+    let handshake = try_open_ws_client(ngx.http_port, "guard.test", "/tunnel").await;
+    let status = match &handshake {
+        Ok((_ws, resp)) => resp.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("unexpected handshake error: {e}"),
+    };
+    assert_ne!(
+        status,
+        403,
+        "the tunnel control channel must be exempt from the guard, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // A **plain** request to the same path is ordinary site traffic
+    // and stays guarded — the exemption is not a hole in the guard.
+    let (status, _) = raw_get_full(&addr, "guard.test", "/tunnel").await;
+    assert_eq!(
+        status,
+        403,
+        "a plain request to the tunnel path must still be guarded, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // An ordinary request from the same peer is still rejected.
+    let (status, _) = raw_get_full(&addr, "guard.test", "/").await;
+    assert_eq!(
+        status,
+        403,
+        "an ordinary request must still be rejected, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// The gateway's own 403 carries the site's custom page.
+#[tokio::test]
+async fn real_e2e_blacklisted_client_gets_the_site_custom_403_page() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "rl-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "rl.test", "rl-site");
+            // The e2e client connects over loopback.
+            seed_ip_rule(&conn, "blacklist", "127.0.0.0/8");
+            // The site's own 403 page.
+            conn.execute(
+                "INSERT OR REPLACE INTO site_rate_limits (
+                    site_name, enabled, req_limit, req_window_secs,
+                    page_limit, page_window_secs, ip_capacity,
+                    throttle_capacity, throttle_secs, custom_429_body,
+                    custom_403_body, updated_at)
+                 VALUES ('rl-site', 0, 0, 60, 0, 3600, 1024, 1024, 600,
+                         NULL, '<h1>Site says no</h1>', ?1)",
+                rusqlite::params![Utc::now().to_rfc3339()],
+            )
+            .expect("insert site_rate_limits");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, text) = raw_get_full(&addr, "rl.test", "/").await;
+    assert_eq!(
+        status,
+        403,
+        "a blacklisted client must get 403, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        text.contains("text/html; charset=utf-8"),
+        "the 403 must be served as HTML, got:\n{text}"
+    );
+    assert!(
+        text.contains("<h1>Site says no</h1>"),
+        "the 403 must carry the site's own page, got:\n{text}"
+    );
+    assert!(
+        backend.seen().await.is_empty(),
+        "a blocked request must never reach the backend"
+    );
+}
+
+/// A 403 produced by the upstream backend is passed through unchanged
+/// — the site's page is the gateway's answer to its own policy, not a
+/// rewrite of the backend's.
+#[tokio::test]
+async fn real_e2e_upstream_403_body_reaches_the_client_untouched() {
+    let backend =
+        InspectingBackend::start_with(403, "text/plain; charset=utf-8", b"upstream says no").await;
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "up-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "up.test", "up-site");
+            // The site has its own 403 page — it must NOT replace the
+            // upstream's answer.
+            conn.execute(
+                "INSERT OR REPLACE INTO site_rate_limits (
+                    site_name, enabled, req_limit, req_window_secs,
+                    page_limit, page_window_secs, ip_capacity,
+                    throttle_capacity, throttle_secs, custom_429_body,
+                    custom_403_body, updated_at)
+                 VALUES ('up-site', 0, 0, 60, 0, 3600, 1024, 1024, 600,
+                         NULL, '<h1>Site says no</h1>', ?1)",
+                rusqlite::params![Utc::now().to_rfc3339()],
+            )
+            .expect("insert site_rate_limits");
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, text) = raw_get_full(&addr, "up.test", "/").await;
+    assert_eq!(
+        status,
+        403,
+        "got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        text.contains("upstream says no"),
+        "the upstream body must reach the client untouched, got:\n{text}"
+    );
+    assert!(
+        !text.contains("Site says no"),
+        "the site's page must not replace the upstream's answer, got:\n{text}"
     );
 }

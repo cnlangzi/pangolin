@@ -39,10 +39,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::embedded_migrations::run_migrations;
+use crate::provider::{ProviderIpList, ProviderKey, SiteProviderOverride};
 use crate::ratelimit::{IpRule, RateLimitPolicy, RuleKind};
 use crate::types::{
-    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, FrontendMode, Site,
-    SystemConfig, Tun,
+    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, Site, SystemConfig, Tun,
 };
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
@@ -148,6 +148,18 @@ pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
             params![name],
         )?;
         conn.execute("DELETE FROM ip_rules WHERE scope = ?1", params![name])?;
+        // The per-site provider configuration and the manual allow
+        // ranges belong to the site: leaving them behind would
+        // resurrect a stale origin guard (and its stale ranges) when
+        // a site with the same name is created again.
+        conn.execute(
+            "DELETE FROM site_providers WHERE site_name = ?1",
+            params![name],
+        )?;
+        conn.execute(
+            "DELETE FROM site_origin_allow WHERE site_name = ?1",
+            params![name],
+        )?;
     }
     Ok(n > 0)
 }
@@ -820,8 +832,9 @@ pub fn delete_dns_provider(conn: &Connection, name: &str) -> rusqlite::Result<bo
 /// + `reload_indexes`).
 pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
     let mut stmt = conn.prepare(
-        "SELECT frontend_mode, pgl_headers_enabled, client_ip_header,
-                client_country_header, client_region_header, updated_at
+        "SELECT provider, pgl_headers_enabled, client_ip_header,
+                client_country_header, client_region_header,
+                origin_guard_enabled, updated_at
          FROM system_config WHERE id = 1",
     )?;
     stmt.query_row([], row_to_system_config)
@@ -835,19 +848,21 @@ pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
 pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE system_config
-            SET frontend_mode = ?1,
+            SET provider = ?1,
                 pgl_headers_enabled = ?2,
                 client_ip_header = ?3,
                 client_country_header = ?4,
                 client_region_header = ?5,
-                updated_at = ?6
+                origin_guard_enabled = ?6,
+                updated_at = ?7
           WHERE id = 1",
         params![
-            cfg.frontend_mode.to_string(),
+            cfg.provider.to_string(),
             cfg.pgl_headers_enabled as i64,
             cfg.client_ip_header,
             cfg.client_country_header,
             cfg.client_region_header,
+            cfg.origin_guard_enabled as i64,
             cfg.updated_at.to_rfc3339(),
         ],
     )?;
@@ -866,7 +881,8 @@ pub fn list_site_rate_limits(
     let mut stmt = conn.prepare(
         "SELECT site_name, enabled, req_limit, req_window_secs,
                 page_limit, page_window_secs, ip_capacity,
-                throttle_capacity, throttle_secs, custom_429_body
+                throttle_capacity, throttle_secs, custom_429_body,
+                custom_403_body
          FROM site_rate_limits",
     )?;
     let rows = stmt.query_map([], row_to_rate_limit_policy)?;
@@ -886,7 +902,8 @@ pub fn get_site_rate_limit(
     let mut stmt = conn.prepare(
         "SELECT site_name, enabled, req_limit, req_window_secs,
                 page_limit, page_window_secs, ip_capacity,
-                throttle_capacity, throttle_secs, custom_429_body
+                throttle_capacity, throttle_secs, custom_429_body,
+                custom_403_body
          FROM site_rate_limits WHERE site_name = ?1",
     )?;
     stmt.query_row(params![site_name], |row| {
@@ -910,8 +927,9 @@ pub fn upsert_site_rate_limit(
         "INSERT INTO site_rate_limits (
             site_name, enabled, req_limit, req_window_secs,
             page_limit, page_window_secs, ip_capacity,
-            throttle_capacity, throttle_secs, custom_429_body, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            throttle_capacity, throttle_secs, custom_429_body,
+            custom_403_body, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(site_name) DO UPDATE SET
             enabled = excluded.enabled,
             req_limit = excluded.req_limit,
@@ -922,6 +940,7 @@ pub fn upsert_site_rate_limit(
             throttle_capacity = excluded.throttle_capacity,
             throttle_secs = excluded.throttle_secs,
             custom_429_body = excluded.custom_429_body,
+            custom_403_body = excluded.custom_403_body,
             updated_at = excluded.updated_at",
         params![
             site_name,
@@ -934,6 +953,7 @@ pub fn upsert_site_rate_limit(
             policy.throttle_capacity as i64,
             policy.throttle_secs as i64,
             policy.custom_429_body,
+            policy.custom_403_body,
             Utc::now().to_rfc3339(),
         ],
     )?;
@@ -986,6 +1006,179 @@ pub fn upsert_ip_rule(conn: &Connection, rule: &IpRule) -> rusqlite::Result<()> 
 pub fn delete_ip_rule(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     let n = conn.execute("DELETE FROM ip_rules WHERE id = ?1", params![id])?;
     Ok(n > 0)
+}
+
+// ---- Per-site provider configuration (V10) ----
+
+/// Read the per-site provider override of every site that has one.
+///
+/// Sites without a row are simply absent from the map — the caller
+/// gives them the global defaults.
+pub fn list_site_providers(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, SiteProviderOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT site_name, provider, client_ip_header, country_header,
+                region_header, origin_guard_enabled
+         FROM site_providers",
+    )?;
+    let rows = stmt.query_map([], row_to_site_provider)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (site_name, over) = row?;
+        out.insert(site_name, over);
+    }
+    Ok(out)
+}
+
+/// Read the per-site provider override of one site.
+pub fn get_site_provider(
+    conn: &Connection,
+    site_name: &str,
+) -> rusqlite::Result<Option<SiteProviderOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT site_name, provider, client_ip_header, country_header,
+                region_header, origin_guard_enabled
+         FROM site_providers WHERE site_name = ?1",
+    )?;
+    stmt.query_row(params![site_name], |row| {
+        let (name, over) = row_to_site_provider(row)?;
+        Ok((name, over))
+    })
+    .optional()
+    .map(|v| v.map(|(_, over)| over))
+}
+
+/// Insert or update the per-site provider override of a site.
+///
+/// The row is keyed by the site name, so re-submitting the form
+/// overwrites the previous override instead of adding a second row.
+pub fn upsert_site_provider(
+    conn: &Connection,
+    site_name: &str,
+    over: &SiteProviderOverride,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO site_providers (
+            site_name, provider, client_ip_header, country_header,
+            region_header, origin_guard_enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(site_name) DO UPDATE SET
+            provider = excluded.provider,
+            client_ip_header = excluded.client_ip_header,
+            country_header = excluded.country_header,
+            region_header = excluded.region_header,
+            origin_guard_enabled = excluded.origin_guard_enabled,
+            updated_at = excluded.updated_at",
+        params![
+            site_name,
+            over.provider.map(|p| p.to_string()),
+            over.client_ip_header,
+            over.country_header,
+            over.region_header,
+            over.origin_guard_enabled.map(|b| b as i64),
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete the per-site provider override of a site. Returns whether a
+/// row was removed.
+///
+/// The site then inherits every global default again.
+pub fn delete_site_provider(conn: &Connection, site_name: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM site_providers WHERE site_name = ?1",
+        params![site_name],
+    )?;
+    Ok(n > 0)
+}
+
+/// Read the manual allow ranges of every site that has some.
+///
+/// The values are the canonical text form of an address or a CIDR
+/// range, one entry per row.
+pub fn list_site_origin_allow(conn: &Connection) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+    let mut stmt =
+        conn.prepare("SELECT site_name, cidr FROM site_origin_allow ORDER BY site_name, cidr")?;
+    let rows = stmt.query_map([], |row| {
+        let site_name: String = row.get(0)?;
+        let cidr: String = row.get(1)?;
+        Ok((site_name, cidr))
+    })?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (site_name, cidr) = row?;
+        out.entry(site_name).or_default().push(cidr);
+    }
+    Ok(out)
+}
+
+/// Replace the manual allow ranges of a site.
+///
+/// The ranges are the whole set of the site — the previous rows are
+/// dropped and the new ones inserted, so removing a range from the
+/// form actually removes it.
+pub fn replace_site_origin_allow(
+    conn: &Connection,
+    site_name: &str,
+    cidrs: &[String],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM site_origin_allow WHERE site_name = ?1",
+        params![site_name],
+    )?;
+    for cidr in cidrs {
+        conn.execute(
+            "INSERT OR IGNORE INTO site_origin_allow (site_name, cidr) VALUES (?1, ?2)",
+            params![site_name, cidr],
+        )?;
+    }
+    Ok(())
+}
+
+/// Read every stored provider range list.
+pub fn list_provider_ip_lists(conn: &Connection) -> rusqlite::Result<Vec<ProviderIpList>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider, url, cidrs, fetched_at, etag, last_modified,
+                status, last_error
+         FROM provider_ip_lists ORDER BY provider, url",
+    )?;
+    let rows = stmt.query_map([], row_to_provider_ip_list)?;
+    rows.collect()
+}
+
+/// Insert or update the stored range list of one `(provider, url)`
+/// pair.
+///
+/// Each URL keeps its own validators, so a `304 Not Modified` for one
+/// URL never disturbs the ranges of another.
+pub fn upsert_provider_ip_list(conn: &Connection, row: &ProviderIpList) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO provider_ip_lists (
+            provider, url, cidrs, fetched_at, etag, last_modified,
+            status, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(provider, url) DO UPDATE SET
+            cidrs = excluded.cidrs,
+            fetched_at = excluded.fetched_at,
+            etag = excluded.etag,
+            last_modified = excluded.last_modified,
+            status = excluded.status,
+            last_error = excluded.last_error",
+        params![
+            row.provider.as_str(),
+            row.url,
+            row.cidrs,
+            row.fetched_at.to_rfc3339(),
+            row.etag,
+            row.last_modified,
+            row.status,
+            row.last_error,
+        ],
+    )?;
+    Ok(())
 }
 
 // ---- Row mappers ----
@@ -1083,21 +1276,23 @@ fn row_to_dns_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<DnsProvider>
 }
 
 fn row_to_system_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<SystemConfig> {
-    let mode_raw: String = row.get(0)?;
+    let provider_raw: String = row.get(0)?;
     let pgl_enabled: i64 = row.get(1)?;
     let client_ip_header: Option<String> = row.get(2)?;
     let client_country_header: Option<String> = row.get(3)?;
     let client_region_header: Option<String> = row.get(4)?;
-    let updated_at: String = row.get(5)?;
-    let frontend_mode: FrontendMode = mode_raw.parse().map_err(|e: String| {
-        rusqlite::Error::InvalidParameterName(format!("invalid frontend_mode: {e}"))
+    let origin_guard_enabled: i64 = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    let provider: ProviderKey = provider_raw.parse().map_err(|e: String| {
+        rusqlite::Error::InvalidParameterName(format!("invalid provider: {e}"))
     })?;
     Ok(SystemConfig {
-        frontend_mode,
+        provider,
         pgl_headers_enabled: pgl_enabled != 0,
         client_ip_header,
         client_country_header,
         client_region_header,
+        origin_guard_enabled: origin_guard_enabled != 0,
         updated_at: parse_dt(&updated_at)?,
     })
 }
@@ -1187,6 +1382,7 @@ fn row_to_rate_limit_policy(
     let throttle_capacity: i64 = row.get(7)?;
     let throttle_secs: i64 = row.get(8)?;
     let custom_429_body: Option<String> = row.get(9)?;
+    let custom_403_body: Option<String> = row.get(10)?;
     Ok((
         site_name,
         RateLimitPolicy {
@@ -1201,6 +1397,7 @@ fn row_to_rate_limit_policy(
             // An empty body means "no custom page" — the built-in
             // default is served instead.
             custom_429_body: custom_429_body.filter(|b| !b.trim().is_empty()),
+            custom_403_body: custom_403_body.filter(|b| !b.trim().is_empty()),
         },
     ))
 }
@@ -1226,6 +1423,59 @@ fn row_to_ip_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<IpRule> {
     })
 }
 
+/// Map a `site_providers` row to a [`SiteProviderOverride`].
+fn row_to_site_provider(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, SiteProviderOverride)> {
+    let site_name: String = row.get(0)?;
+    let provider_raw: Option<String> = row.get(1)?;
+    let client_ip_header: Option<String> = row.get(2)?;
+    let country_header: Option<String> = row.get(3)?;
+    let region_header: Option<String> = row.get(4)?;
+    let origin_guard_enabled: Option<i64> = row.get(5)?;
+    let provider = match provider_raw {
+        None => None,
+        Some(raw) => Some(raw.parse::<ProviderKey>().map_err(|e: String| {
+            rusqlite::Error::InvalidParameterName(format!("invalid site_providers.provider: {e}"))
+        })?),
+    };
+    Ok((
+        site_name,
+        SiteProviderOverride {
+            provider,
+            client_ip_header: client_ip_header.filter(|h| !h.trim().is_empty()),
+            country_header: country_header.filter(|h| !h.trim().is_empty()),
+            region_header: region_header.filter(|h| !h.trim().is_empty()),
+            origin_guard_enabled: origin_guard_enabled.map(|v| v != 0),
+        },
+    ))
+}
+
+/// Map a `provider_ip_lists` row to a [`ProviderIpList`].
+fn row_to_provider_ip_list(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderIpList> {
+    let provider_raw: String = row.get(0)?;
+    let url: String = row.get(1)?;
+    let cidrs: String = row.get(2)?;
+    let fetched_at: String = row.get(3)?;
+    let etag: Option<String> = row.get(4)?;
+    let last_modified: Option<String> = row.get(5)?;
+    let status: String = row.get(6)?;
+    let last_error: Option<String> = row.get(7)?;
+    let provider = provider_raw.parse::<ProviderKey>().map_err(|e: String| {
+        rusqlite::Error::InvalidParameterName(format!("invalid provider_ip_lists.provider: {e}"))
+    })?;
+    Ok(ProviderIpList {
+        provider,
+        url,
+        cidrs,
+        fetched_at: parse_dt(&fetched_at)?,
+        etag: etag.filter(|v| !v.is_empty()),
+        last_modified: last_modified.filter(|v| !v.is_empty()),
+        status,
+        last_error: last_error.filter(|v| !v.is_empty()),
+    })
+}
+
 fn parse_dt(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::from_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1239,9 +1489,7 @@ fn parse_dt_opt(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        DnsProvider, DnsProviderKind, Domain, FrontendMode, HostMode, Site, SystemConfig, Tun,
-    };
+    use crate::types::{DnsProvider, DnsProviderKind, Domain, HostMode, Site, SystemConfig, Tun};
 
     fn make_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1269,22 +1517,23 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V9 as applied. (V2 merges
+        // it's there and lists V1..V10 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
         // the per-row backoff schedule; V6 adds per-domain challenge_kind
         // for issue #55; V7 adds the system_config singleton; V8 adds
         // the gateway-header configuration for issue #115; V9 adds the
-        // per-site rate limits + IP rules for issue #117.)
+        // per-site rate limits + IP rules for issue #117; V10 adds the
+        // per-site provider configuration + origin guard for issue #122.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 9,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 to be applied"
+            count, 10,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -2154,14 +2403,18 @@ mod tests {
         // path exists for defensive coverage but should not fire
         // in practice).
         //
-        // The default row carries frontend_mode='direct' and the
+        // The default row carries provider='direct' and the
         // gateway-header knobs keep their documented defaults: the
         // `P-*` headers are enabled, `client_ip_header` holds the
         // value V8 migrated over from the old `trusted_headers`
         // list, and the two geo keys are unset.
         let conn = make_conn();
         let cfg = get_system_config(&conn).expect("system_config row exists post-V7");
-        assert_eq!(cfg.frontend_mode, FrontendMode::Direct);
+        assert_eq!(cfg.provider, ProviderKey::Direct);
+        assert!(
+            !cfg.origin_guard_enabled,
+            "the origin guard must be off by default"
+        );
         assert!(
             cfg.pgl_headers_enabled,
             "the P-* gateway headers must be enabled by default"
@@ -2188,20 +2441,21 @@ mod tests {
 
     #[test]
     fn system_config_update_round_trip() {
-        // Each FrontendMode variant must survive
+        // Each ProviderKey variant must survive
         // update → get round-trip through the DB.
         let conn = make_conn();
-        for mode in [
-            FrontendMode::Direct,
-            FrontendMode::Cloudflare,
-            FrontendMode::CustomLb,
+        for provider in [
+            ProviderKey::Direct,
+            ProviderKey::Cloudflare,
+            ProviderKey::CustomLb,
         ] {
             let updated = SystemConfig {
-                frontend_mode: mode,
-                pgl_headers_enabled: mode == FrontendMode::Direct,
+                provider,
+                pgl_headers_enabled: provider == ProviderKey::Direct,
                 client_ip_header: Some("X-Client-IP".into()),
                 client_country_header: Some("X-Client-Country".into()),
                 client_region_header: None,
+                origin_guard_enabled: true,
                 updated_at: dt("2026-03-15T12:34:56+00:00"),
             };
             update_system_config(&conn, &updated).unwrap();
@@ -2231,6 +2485,8 @@ mod tests {
             "client_ip_header",
             "client_country_header",
             "client_region_header",
+            "provider",
+            "origin_guard_enabled",
         ] {
             assert!(
                 cols.iter().any(|c| c == expected),
@@ -2242,14 +2498,14 @@ mod tests {
     #[test]
     fn system_config_check_constraint_blocks_bogus_mode() {
         // The DB CHECK constraint is the primary defence against an
-        // invalid frontend_mode — the FromStr parse in
+        // invalid provider — the FromStr parse in
         // `row_to_system_config` is the second line of defence if a
         // future migration accidentally drops it. We assert that
         // the constraint fires, so a reviewer who weakens the
         // schema must also remove this test.
         let conn = make_conn();
         let res = conn.execute(
-            "UPDATE system_config SET frontend_mode = 'bogus' WHERE id = 1",
+            "UPDATE system_config SET provider = 'bogus' WHERE id = 1",
             [],
         );
         let err = res.expect_err("CHECK constraint must reject 'bogus'");

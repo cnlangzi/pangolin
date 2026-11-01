@@ -19,6 +19,7 @@
 
 mod acme;
 mod dns;
+mod provider_ip;
 mod proxy;
 mod runtime;
 mod serve;
@@ -174,6 +175,12 @@ fn main() -> anyhow::Result<()> {
         let services: Vec<Box<dyn runtime::Service>> = vec![
             Box::new(acme::AcmeService::new(acme_for_service)),
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
+            // Issue #122: keep the providers' published source-IP
+            // ranges fresh — the origin guard compares the TCP peer
+            // against them.
+            Box::new(crate::provider_ip::ProviderIpService::new(
+                std::time::Duration::from_secs(app.config.provider.ip_refresh_interval_secs),
+            )?),
         ];
 
         // `ServiceContext` takes ownership of the `App`; keep a

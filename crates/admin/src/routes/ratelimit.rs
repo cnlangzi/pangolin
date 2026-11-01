@@ -31,7 +31,11 @@ type Resp = Response<Full<Bytes>>;
 /// Upper bound of a request / page limit.
 pub const MAX_LIMIT: u32 = 1_000_000;
 /// Upper bound of the custom 429 page (raw HTML), in bytes.
-pub const MAX_CUSTOM_429_BYTES: usize = 64 * 1024;
+pub const MAX_CUSTOM_429_BYTES: usize = pangolin_core::ratelimit::MAX_CUSTOM_PAGE_BYTES;
+/// Upper bound of the custom 403 page (raw HTML), in bytes.
+///
+/// The same limit as the 429 page — the two are siblings.
+pub const MAX_CUSTOM_403_BYTES: usize = pangolin_core::ratelimit::MAX_CUSTOM_PAGE_BYTES;
 /// Upper bound of a counting window or the block window, in seconds.
 pub const MAX_WINDOW_SECS: u64 = 86_400;
 /// Upper bound of a ring capacity. Keeps a typo from allocating an
@@ -230,7 +234,7 @@ pub struct ParsedPolicy {
 /// [`ParsedPolicy::error`]; the other fields are still parsed, so the
 /// re-rendered form keeps the operator's input.
 pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
-    const FIELDS: [&str; 9] = [
+    const FIELDS: [&str; 10] = [
         "rate_limit_enabled",
         "rate_limit_req_limit",
         "rate_limit_req_window_secs",
@@ -240,6 +244,7 @@ pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
         "rate_limit_throttle_capacity",
         "rate_limit_throttle_secs",
         CUSTOM_429_FIELD,
+        CUSTOM_403_FIELD,
     ];
     if !FIELDS.iter().any(|f| params.contains_key(*f)) {
         return ParsedPolicy {
@@ -323,6 +328,15 @@ pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
             None
         }
     };
+    let custom_403_body = match parse_custom_403(params) {
+        Ok(v) => v,
+        Err(e) => {
+            if error.is_none() {
+                error = Some(e);
+            }
+            None
+        }
+    };
 
     ParsedPolicy {
         policy: RateLimitPolicy {
@@ -335,6 +349,7 @@ pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
             throttle_capacity,
             throttle_secs,
             custom_429_body,
+            custom_403_body,
         },
         error,
         present: true,
@@ -364,6 +379,9 @@ fn parse_enabled(params: &HashMap<String, String>) -> Result<bool, String> {
 /// The form field that carries the site's custom 429 page.
 pub const CUSTOM_429_FIELD: &str = "rate_limit_custom_429_body";
 
+/// The form field that carries the site's custom 403 page.
+pub const CUSTOM_403_FIELD: &str = "custom_403_body";
+
 /// The custom page exactly as the operator typed it — used to refill
 /// the textarea when the submission is rejected for another reason.
 pub fn submitted_custom_429(params: &HashMap<String, String>) -> Option<String> {
@@ -390,6 +408,28 @@ fn parse_custom_429(params: &HashMap<String, String>) -> Result<Option<String>, 
     if body.len() > MAX_CUSTOM_429_BYTES {
         return Err(format!(
             "{CUSTOM_429_FIELD} must be at most {MAX_CUSTOM_429_BYTES} bytes"
+        ));
+    }
+    Ok(Some(body.to_string()))
+}
+
+/// Read the custom 403 page out of the form.
+///
+/// The body is raw HTML written by the operator — it is served
+/// verbatim for every `403` the gateway itself produces (the origin
+/// guard and the IP-blacklist rule). An empty (or whitespace-only)
+/// body means "use the built-in default page".
+fn parse_custom_403(params: &HashMap<String, String>) -> Result<Option<String>, String> {
+    let Some(raw) = params.get(CUSTOM_403_FIELD) else {
+        return Ok(None);
+    };
+    let body = raw.trim();
+    if body.is_empty() {
+        return Ok(None);
+    }
+    if body.len() > MAX_CUSTOM_403_BYTES {
+        return Err(format!(
+            "{CUSTOM_403_FIELD} must be at most {MAX_CUSTOM_403_BYTES} bytes"
         ));
     }
     Ok(Some(body.to_string()))
@@ -619,6 +659,34 @@ mod tests {
         params.insert(
             "rate_limit_custom_429_body".into(),
             "x".repeat(MAX_CUSTOM_429_BYTES + 1),
+        );
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_some());
+    }
+
+    #[test]
+    fn the_custom_403_page_is_read_from_the_form() {
+        let mut params = form(&[
+            ("rate_limit_req_limit", "10"),
+            ("custom_403_body", "<h1>Blocked</h1>"),
+        ]);
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert_eq!(
+            parsed.policy.custom_403_body.as_deref(),
+            Some("<h1>Blocked</h1>")
+        );
+
+        // An empty body means "use the built-in default page".
+        params.insert("custom_403_body".into(), "   ".into());
+        let parsed = parse_policy(&params);
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert_eq!(parsed.policy.custom_403_body, None);
+
+        // An oversized body is rejected.
+        params.insert(
+            "custom_403_body".into(),
+            "x".repeat(MAX_CUSTOM_403_BYTES + 1),
         );
         let parsed = parse_policy(&params);
         assert!(parsed.error.is_some());

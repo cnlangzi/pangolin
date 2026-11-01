@@ -165,6 +165,7 @@ If the database has fewer rows than files, those migrations are pending and will
 | V7      | `add_system_config`       | —    | The `system_config` singleton (`frontend_mode`, `trusted_headers`) |
 | V8      | `add_gateway_header_config` | #115 | The `P-*` gateway header configuration (`pgl_headers_enabled`, `client_ip_header`, `client_country_header`, `client_region_header`); drops `trusted_headers` after copying its first entry into `client_ip_header` |
 | V9      | `add_site_rate_limits` | #117 | The per-site rate-limit policy (`site_rate_limits`) and the IP allow / block rules (`ip_rules`) |
+| V10     | `add_provider_config` | #122 | Renames `system_config.frontend_mode` to `provider` and adds `system_config.origin_guard_enabled`; adds the per-site provider configuration (`site_providers`), the manual allow ranges (`site_origin_allow`), the provider range lists (`provider_ip_lists`) and `site_rate_limits.custom_403_body` |
 
 ## Troubleshooting
 

@@ -38,14 +38,13 @@
 //!
 //! See `docs/design/rate-limit.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ipnet::IpNet;
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 
@@ -125,6 +124,16 @@ pub struct RateLimitPolicy {
     /// page on a plain reverse proxy.
     #[serde(default)]
     pub custom_429_body: Option<String>,
+    /// Raw HTML served as the body of this site's `403` responses.
+    ///
+    /// Used for every `403` the gateway itself produces — the origin
+    /// guard and the IP-blacklist rule. A `403` produced by the
+    /// upstream backend is passed through unchanged.
+    ///
+    /// `None` (or an empty body) → the built-in default page
+    /// ([`default_403_page`]).
+    #[serde(default)]
+    pub custom_403_body: Option<String>,
 }
 
 impl Default for RateLimitPolicy {
@@ -139,9 +148,17 @@ impl Default for RateLimitPolicy {
             throttle_capacity: 65_536,
             throttle_secs: 600,
             custom_429_body: None,
+            custom_403_body: None,
         }
     }
 }
+
+/// Upper bound of a custom error page (raw HTML), in bytes.
+///
+/// The same limit applies to the custom `429` and the custom `403`
+/// pages — they are siblings, and a page bigger than this is almost
+/// certainly a paste accident.
+pub const MAX_CUSTOM_PAGE_BYTES: usize = 64 * 1024;
 
 /// The default `429` page — a self-contained HTML document (no
 /// external assets, no JavaScript) served when a site has no custom
@@ -195,6 +212,58 @@ pub fn default_429_page(retry_after: u64) -> String {
 </html>
 "#
     )
+}
+
+/// The default `403` page — a self-contained HTML document (no
+/// external assets, no JavaScript) served when a site has no custom
+/// body.
+///
+/// The wording is deliberately generic: it must not tell the client
+/// that the site sits behind a CDN or that its address was rejected,
+/// because that leaks the deployment's topology to a scanner.
+pub fn default_403_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>403 Forbidden</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; padding: 2rem;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #f8fafc; color: #0f172a;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0f172a; color: #e2e8f0; }
+    .card { background: #1e293b !important; border-color: #334155 !important; }
+    .muted { color: #94a3b8; }
+  }
+  .card {
+    max-width: 34rem; width: 100%; background: #fff; border: 1px solid #e2e8f0;
+    border-radius: 1rem; padding: 2.5rem; box-shadow: 0 10px 30px rgba(15,23,42,.08);
+  }
+  .code { font-size: 3rem; font-weight: 700; letter-spacing: -.02em; margin: 0; }
+  h1 { font-size: 1.25rem; margin: .5rem 0 1rem; }
+  p { line-height: 1.6; margin: .75rem 0; }
+  .muted { color: #64748b; font-size: .875rem; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <p class="code">403</p>
+    <h1>Forbidden</h1>
+    <p>The request was rejected by this site's access policy.</p>
+    <p class="muted">If you believe this is a mistake, please contact the site's owner.</p>
+  </main>
+</body>
+</html>
+"#
+    .to_string()
 }
 
 /// Whether an IP rule lets traffic through or blocks it.
@@ -252,72 +321,10 @@ pub struct IpRule {
 ///
 /// The set is matched by longest prefix: a `/32` beats a `/8`. A bare
 /// address counts as a `/32` (or `/128`).
-#[derive(Debug, Clone, Default)]
-pub struct IpRules {
-    exact: HashSet<IpAddr>,
-    nets: Vec<IpNet>,
-}
-
-impl IpRules {
-    /// An empty rule set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add an address or CIDR range.
-    ///
-    /// `"1.2.3.4"` is stored as an exact address, `"10.0.0.0/8"` as a
-    /// range. Returns the normalised text form on success, or a
-    /// human-readable error for a malformed value.
-    pub fn insert(&mut self, cidr: &str) -> Result<String, String> {
-        let trimmed = cidr.trim();
-        if trimmed.is_empty() {
-            return Err("empty CIDR".to_string());
-        }
-        if trimmed.contains('/') {
-            let net: IpNet = trimmed
-                .parse()
-                .map_err(|e| format!("invalid CIDR '{trimmed}': {e}"))?;
-            let text = net.to_string();
-            if !self.nets.contains(&net) {
-                self.nets.push(net);
-            }
-            Ok(text)
-        } else {
-            let ip: IpAddr = trimmed
-                .parse()
-                .map_err(|e| format!("invalid IP address '{trimmed}': {e}"))?;
-            self.exact.insert(ip);
-            Ok(ip.to_string())
-        }
-    }
-
-    /// True when the set holds no rules at all.
-    pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.nets.is_empty()
-    }
-
-    /// Number of rules in the set.
-    pub fn len(&self) -> usize {
-        self.exact.len() + self.nets.len()
-    }
-
-    /// The length of the longest prefix in the set that contains
-    /// `ip`, or `None` when the set does not match.
-    ///
-    /// An exact address matches with a prefix length of 32 (IPv4) or
-    /// 128 (IPv6).
-    pub fn longest_prefix(&self, ip: IpAddr) -> Option<u8> {
-        if self.exact.contains(&ip) {
-            return Some(if ip.is_ipv4() { 32 } else { 128 });
-        }
-        self.nets
-            .iter()
-            .filter(|n| n.contains(&ip))
-            .map(|n| n.prefix_len())
-            .max()
-    }
-}
+///
+/// The implementation is shared with the origin guard's allowlist —
+/// see [`crate::cidr::CidrSet`].
+pub use crate::cidr::CidrSet as IpRules;
 
 /// The effective rate-limit configuration of one site: its policy
 /// plus the rules that apply to it.
@@ -423,8 +430,7 @@ pub fn build_limit_configs(
 /// This is the one place the canonicalisation lives: the admin UI
 /// stores what it returns, and the rule loader parses it back.
 pub fn normalize_cidr(cidr: &str) -> Result<String, String> {
-    let mut rules = IpRules::new();
-    rules.insert(cidr)
+    crate::cidr::normalize_cidr(cidr)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1489,6 +1495,41 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
+    #[test]
+    fn the_default_403_page_is_a_self_contained_document() {
+        // R12: the built-in 403 page must be a complete HTML
+        // document with no external references — the page is served
+        // by the gateway, so it cannot depend on anything the client
+        // may not be able to reach.
+        let page = default_403_page();
+        assert!(page.starts_with("<!DOCTYPE html>"), "{page}");
+        assert!(page.contains("<html lang=\"en\">"), "{page}");
+        assert!(page.trim_end().ends_with("</html>"), "{page}");
+        assert!(page.contains("403"), "{page}");
+        // No external references: no scripts, no stylesheets, no
+        // images, no absolute URLs.
+        for forbidden in ["<script", "src=", "href=", "http://", "https://"] {
+            assert!(
+                !page.contains(forbidden),
+                "the default 403 page must not reference {forbidden}: {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_403_page_does_not_leak_the_deployment_topology() {
+        // R12: the wording must not tell the client that the site
+        // sits behind a CDN or that its address was rejected — that
+        // would leak the deployment's topology to a scanner.
+        let page = default_403_page().to_lowercase();
+        for forbidden in ["cdn", "cloudflare", "origin", "allowlist", "ip range"] {
+            assert!(
+                !page.contains(forbidden),
+                "the default 403 page must not mention {forbidden}: {page}"
+            );
+        }
+    }
+
     fn policy(req_limit: u32, page_limit: u32) -> RateLimitPolicy {
         RateLimitPolicy {
             enabled: true,
@@ -1500,6 +1541,7 @@ mod tests {
             throttle_capacity: 64,
             throttle_secs: 600,
             custom_429_body: None,
+            custom_403_body: None,
         }
     }
 

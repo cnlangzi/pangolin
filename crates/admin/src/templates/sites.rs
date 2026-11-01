@@ -11,6 +11,46 @@ use askama::Template;
 use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{Site, Tun};
 
+use crate::templates::ProviderOption;
+
+/// The provider configuration of one site, as the site form shows it.
+///
+/// The site form edits the **override** (the site's own values); the
+/// `effective_*` fields show what those values resolve to once the
+/// global defaults are applied.
+#[derive(Debug, Clone, Default)]
+pub struct SiteProviderView {
+    /// The selected provider key. Empty means "inherit the global
+    /// default".
+    pub provider: String,
+    /// The global provider key — what the "inherit" option resolves
+    /// to.
+    pub global_provider: String,
+    /// The site's own custom header names. Empty means "inherit the
+    /// global name".
+    pub client_ip_header: String,
+    pub country_header: String,
+    pub region_header: String,
+    /// The guard tri-state: `inherit` / `off` / `on`.
+    pub origin_guard: String,
+    /// The manual allow ranges, one per line.
+    pub origin_allow: String,
+    /// The provider key that is actually in force for the site.
+    pub effective_provider: String,
+    /// The number of ranges in the effective provider's range set.
+    pub effective_range_count: usize,
+    /// When the effective provider's range list was last fetched.
+    pub effective_last_fetch: String,
+    /// Whether the origin guard is effectively on for the site (its
+    /// own setting, or the global default when it inherits).
+    pub effective_guard_enabled: bool,
+    /// Whether the effective allowlist is empty. The guard fails open
+    /// on an empty allowlist, so the form has to say so.
+    pub allowlist_empty: bool,
+    /// The number of manual allow ranges the site has.
+    pub manual_range_count: usize,
+}
+
 // ─── List page (GET /sites) ────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -37,6 +77,11 @@ pub struct SitesNewTemplate<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// The provider configuration of the site (issue #122).
+    pub provider_view: SiteProviderView,
+    /// Every provider of the registry — the dropdown is built from
+    /// this list.
+    pub providers: Vec<ProviderOption>,
 }
 
 impl<'a> SitesNewTemplate<'a> {
@@ -107,6 +152,11 @@ pub struct SitesEditTemplate<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// The provider configuration of the site (issue #122).
+    pub provider_view: SiteProviderView,
+    /// Every provider of the registry — the dropdown is built from
+    /// this list.
+    pub providers: Vec<ProviderOption>,
 }
 
 impl<'a> SitesEditTemplate<'a> {
@@ -186,6 +236,11 @@ pub struct SitesFormFieldsView<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// The provider configuration of the site (issue #122).
+    pub provider_view: SiteProviderView,
+    /// Every provider of the registry — the dropdown is built from
+    /// this list.
+    pub providers: Vec<ProviderOption>,
 }
 
 impl<'a> SitesFormFieldsView<'a> {

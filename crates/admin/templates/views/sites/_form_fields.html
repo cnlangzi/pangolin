@@ -296,4 +296,107 @@
           Leave it empty to use the built-in default page.
         </p>
       </div>
+
+      <div class="mt-4">
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="custom-403">Custom 403 page (HTML)</label>
+        <textarea name="custom_403_body" id="custom-403" rows="10"
+          placeholder="&lt;h1&gt;Forbidden&lt;/h1&gt;"
+          class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{% if let Some(b) = rate_limit.custom_403_body.as_deref() %}{{ b }}{% endif %}</textarea>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          Raw HTML served as the body of every 403 this gateway produces for this site — the
+          origin guard and the IP blacklist. Leave it empty to use the built-in default page.
+        </p>
+      </div>
+    </div>
+
+    {# ── Front CDN / origin guard (issue #122) ────────────────────────── #}
+    <div class="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
+        Front CDN
+      </label>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mb-4">
+        Which CDN or load balancer forwards the visitor's request to pangolin. The provider
+        decides both where the visitor's IP is read from and where the published source-IP
+        ranges come from, so the two can never disagree.
+      </p>
+
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-provider">Provider</label>
+        <select name="provider" id="site-provider"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <option value="" {% if provider_view.provider.is_empty() %}selected{% endif %}>
+            Inherit the global default ({{ provider_view.global_provider }})
+          </option>
+          {%- for p in providers %}
+          <option value="{{ p.key }}" {% if provider_view.provider == p.key %}selected{% endif %}>{{ p.label }}</option>
+          {%- endfor %}
+        </select>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          Effective provider: <span class="font-mono">{{ provider_view.effective_provider }}</span> —
+          {{ provider_view.effective_range_count }} published range(s) in force,
+          last fetched {% if provider_view.effective_last_fetch.is_empty() %}never{% else %}{{ provider_view.effective_last_fetch }}{% endif %};
+          {{ provider_view.manual_range_count }} manual range(s).
+        </p>
+        {%- if provider_view.effective_guard_enabled && provider_view.allowlist_empty %}
+        <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
+          The origin guard is on but the allowlist is empty, so it is not rejecting anything.
+          Add the provider's source ranges or the site's manual ranges below.
+        </p>
+        {%- endif %}
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-client-ip-header">Client IP header</label>
+          <input type="text" name="client_ip_header" id="site-client-ip-header"
+            value="{{ provider_view.client_ip_header }}"
+            placeholder="X-Client-IP"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-country-header">Country header</label>
+          <input type="text" name="country_header" id="site-country-header"
+            value="{{ provider_view.country_header }}"
+            placeholder="X-Client-Country"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-region-header">Region header</label>
+          <input type="text" name="region_header" id="site-region-header"
+            value="{{ provider_view.region_header }}"
+            placeholder="X-Client-Region"
+            spellcheck="false"
+            class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+        </div>
+      </div>
+
+      <div class="mt-4">
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-guard">Origin guard</label>
+        <select name="origin_guard" id="origin-guard"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          <option value="inherit" {% if provider_view.origin_guard == "inherit" %}selected{% endif %}>Inherit the global default</option>
+          <option value="off" {% if provider_view.origin_guard == "off" %}selected{% endif %}>Off</option>
+          <option value="on" {% if provider_view.origin_guard == "on" %}selected{% endif %}>On</option>
+        </select>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          When the guard is on, a request whose <strong>TCP peer</strong> is outside the
+          allowlist is answered <code>403</code> and never reaches the backend.
+        </p>
+      </div>
+
+      <div class="mt-4">
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-allow">Manual source ranges (one CIDR per line)</label>
+        <textarea name="origin_allow" id="origin-allow" rows="4"
+          placeholder="203.0.113.0/24"
+          class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{{ provider_view.origin_allow }}</textarea>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          Unioned with the provider's published ranges — the allowlist is both. A provider that
+          publishes no list (a customer-owned load balancer) uses these ranges only.
+        </p>
+      </div>
     </div>

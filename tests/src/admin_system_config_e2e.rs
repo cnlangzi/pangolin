@@ -58,11 +58,11 @@ async fn system_config_get_returns_defaults() {
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // V7 seeds the row with frontend_mode='direct'. The gateway
+    // V7 seeds the row with provider='direct'. The gateway
     // header knobs keep their documented defaults: the `P-*`
     // headers are enabled, the three first-level header keys are
     // unset (they are irrelevant in direct mode).
-    assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
+    assert_eq!(body["provider"], serde_json::json!("direct"));
     assert_eq!(body["pgl_headers_enabled"], serde_json::json!(true));
     // V8 seeds `client_ip_header` from the first entry of the old
     // `trusted_headers` list — `X-Real-IP` when the list was empty
@@ -94,7 +94,7 @@ async fn system_config_post_updates_and_reloads() {
     let resp = client
         .post_form(
             "/api/system/config",
-            &[("frontend_mode", "cloudflare"), ("_csrf", &csrf)],
+            &[("provider", "cloudflare"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
@@ -112,7 +112,7 @@ async fn system_config_post_updates_and_reloads() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["frontend_mode"], serde_json::json!("cloudflare"));
+    assert_eq!(body["provider"], serde_json::json!("cloudflare"));
 }
 
 // ── §4 — POST custom_lb with a configured header key updates ─────────────────
@@ -130,7 +130,7 @@ async fn system_config_post_custom_lb_with_headers() {
         .post_form(
             "/api/system/config",
             &[
-                ("frontend_mode", "custom_lb"),
+                ("provider", "custom_lb"),
                 ("client_ip_header", "X-Client-IP"),
                 ("client_country_header", "X-Client-Country"),
                 ("_csrf", &csrf),
@@ -147,7 +147,7 @@ async fn system_config_post_custom_lb_with_headers() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["frontend_mode"], serde_json::json!("custom_lb"));
+    assert_eq!(body["provider"], serde_json::json!("custom_lb"));
     assert_eq!(body["client_ip_header"], serde_json::json!("X-Client-IP"));
     assert_eq!(
         body["client_country_header"],
@@ -174,7 +174,7 @@ async fn system_config_post_custom_lb_without_headers_accepted() {
     let resp = client
         .post_form(
             "/api/system/config",
-            &[("frontend_mode", "custom_lb"), ("_csrf", &csrf)],
+            &[("provider", "custom_lb"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
@@ -191,7 +191,7 @@ async fn system_config_post_custom_lb_without_headers_accepted() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["frontend_mode"], serde_json::json!("custom_lb"));
+    assert_eq!(body["provider"], serde_json::json!("custom_lb"));
     assert_eq!(body["client_ip_header"], serde_json::json!(null));
 }
 
@@ -210,7 +210,7 @@ async fn system_config_post_invalid_header_name_rejected() {
         .post_form(
             "/api/system/config",
             &[
-                ("frontend_mode", "custom_lb"),
+                ("provider", "custom_lb"),
                 ("client_ip_header", "bad header"),
                 ("_csrf", &csrf),
             ],
@@ -238,7 +238,7 @@ async fn system_config_post_invalid_header_name_rejected() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
+    assert_eq!(body["provider"], serde_json::json!("direct"));
     // The row is untouched — still the V8-seeded default.
     assert_eq!(body["client_ip_header"], serde_json::json!("X-Real-IP"));
 }
@@ -258,7 +258,7 @@ async fn system_config_post_disables_gateway_headers() {
         .post_form(
             "/api/system/config",
             &[
-                ("frontend_mode", "direct"),
+                ("provider", "direct"),
                 ("pgl_headers_enabled", "false"),
                 ("_csrf", &csrf),
             ],
@@ -292,7 +292,7 @@ async fn system_config_post_invalid_mode_rejected() {
     let resp = client
         .post_form(
             "/api/system/config",
-            &[("frontend_mode", "not-a-real-mode"), ("_csrf", &csrf)],
+            &[("provider", "not-a-real-mode"), ("_csrf", &csrf)],
         )
         .await
         .unwrap();
@@ -310,7 +310,7 @@ async fn system_config_post_invalid_mode_rejected() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["frontend_mode"], serde_json::json!("direct"));
+    assert_eq!(body["provider"], serde_json::json!("direct"));
 }
 
 // ── §7 — POST without CSRF is forbidden ─────────────────────────────────────
@@ -325,7 +325,7 @@ async fn system_config_post_no_csrf_forbidden() {
         .post_form(
             "/api/system/config",
             &[
-                ("frontend_mode", "direct"),
+                ("provider", "direct"),
                 // no _csrf
             ],
         )

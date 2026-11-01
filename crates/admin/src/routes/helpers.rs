@@ -142,6 +142,20 @@ pub fn param_bool(body: &[u8], key: &str, default: bool) -> bool {
     if present { truthy } else { default }
 }
 
+/// Whether a form field is present at all, regardless of its value.
+///
+/// [`param_bool`] falls back to a default for an absent key; this
+/// tells the caller whether the key was there at all, so a handler
+/// can keep the stored value instead of writing the default over it.
+pub fn form_has_param(body: &[u8], key: &str) -> bool {
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        return false;
+    };
+    body_str
+        .split('&')
+        .any(|pair| pair.split_once('=').map(|(k, _)| k == key).unwrap_or(false))
+}
+
 /// Render a small "flash error" page used to bounce back to the form with
 /// an error message. Kept as HTML for symmetry with the rest of the admin
 /// UI, but the body is plain enough that it can be lifted into a

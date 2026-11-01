@@ -21,9 +21,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
-use pangolin_core::{App, FrontendMode, SystemConfig};
+use pangolin_core::{App, ProviderKey, SystemConfig};
 
-use super::helpers::{flash_error, param_bool, redirect, require_form_param, require_param};
+use super::helpers::{
+    flash_error, form_has_param, param_bool, redirect, require_form_param, require_param,
+};
 
 /// Handle `POST /api/reload` — reload indexes from database.
 ///
@@ -51,22 +53,24 @@ pub async fn handle_reload(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>
 /// Response body (JSON):
 /// ```json
 /// {
-///   "frontend_mode": "direct|cloudflare|custom_lb",
+///   "provider": "direct|cloudflare|custom_lb",
 ///   "pgl_headers_enabled": true,
 ///   "client_ip_header": null,
 ///   "client_country_header": null,
 ///   "client_region_header": null,
+///   "origin_guard_enabled": false,
 ///   "updated_at": "2026-…Z"
 /// }
 /// ```
 pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
     let cfg = app.system_config.read().await.clone();
     let body = serde_json::json!({
-        "frontend_mode": cfg.frontend_mode.to_string(),
+        "provider": cfg.provider.to_string(),
         "pgl_headers_enabled": cfg.pgl_headers_enabled,
         "client_ip_header": cfg.client_ip_header,
         "client_country_header": cfg.client_country_header,
         "client_region_header": cfg.client_region_header,
+        "origin_guard_enabled": cfg.origin_guard_enabled,
         "updated_at": cfg.updated_at.to_rfc3339(),
     });
     Response::builder()
@@ -78,14 +82,16 @@ pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<F
 /// Handle `POST /api/system/config` — update the singleton config.
 ///
 /// Form body:
-/// * `frontend_mode` — one of `direct`, `cloudflare`, `custom_lb`
-///   (required).
+/// * `provider` — one of the registry's provider keys (`direct`,
+///   `cloudflare`, `custom_lb`) (required).
 /// * `pgl_headers_enabled` — `true` / `false`; master switch for
 ///   the four `P-*` gateway headers. Absent means the default
 ///   (`true`).
 /// * `client_ip_header`, `client_country_header`,
 ///   `client_region_header` — the first-level header names used in
 ///   `custom_lb` mode. An empty value means "not configured".
+/// * `origin_guard_enabled` — `true` / `false`; the global default of
+///   the origin guard. Absent means the default (`false`).
 ///
 /// On success: 302 redirect to `/` so the operator sees the
 /// dashboard. On validation failure: 400 with a plain-text reason.
@@ -98,7 +104,7 @@ pub async fn handle_update_system_config(
     app: &Arc<App>,
     body: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
-    let parsed = match parse_system_config_form(body) {
+    let parsed = match parse_system_config_form_merged(app, body).await {
         Ok(c) => c,
         Err(msg) => return flash_error(&msg),
     };
@@ -115,11 +121,11 @@ pub async fn handle_update_system_config(
 /// on failure. Shared between the JSON API handler and the HTML
 /// `/settings` page so both endpoints enforce identical validation.
 pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
-    let mode_str = require_param(body, "frontend_mode").unwrap_or_default();
-    let mode: FrontendMode = mode_str.parse().map_err(|e: String| {
+    let provider_str = require_param(body, "provider").unwrap_or_default();
+    let provider: ProviderKey = provider_str.parse().map_err(|e: String| {
         format!(
-            "Invalid frontend_mode '{mode_str}': {e}. \
-             Expected one of: direct, cloudflare, custom_lb."
+            "Invalid provider '{provider_str}': {e}. Expected one of: {}.",
+            super::provider::expected_providers()
         )
     })?;
 
@@ -132,15 +138,53 @@ pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
     let client_region_header = header_key(body, "client_region_header")?;
 
     Ok(SystemConfig {
-        frontend_mode: mode,
+        provider,
         // Absent → the documented default (`true`); the settings
         // form always sends it explicitly.
         pgl_headers_enabled: param_bool(body, "pgl_headers_enabled", true),
         client_ip_header,
         client_country_header,
         client_region_header,
+        // Absent → the documented default (`false`); the settings
+        // form always sends it explicitly.
+        origin_guard_enabled: param_bool(body, "origin_guard_enabled", false),
         updated_at: chrono::Utc::now(),
     })
+}
+
+/// Parse the system-config form and merge it with the stored
+/// configuration.
+///
+/// Two rules the raw parser cannot apply on its own:
+///
+/// * a field the form does not carry **keeps its stored value** — an
+///   API client that predates the origin guard must not silently
+///   switch the global guard off;
+/// * the global origin guard cannot be *switched on* for a provider
+///   that publishes no source-IP ranges: the guard fails open on an
+///   empty allowlist, so the operator would get a false sense of
+///   protection. A site that protects itself with manual ranges
+///   turns the guard on at the site level instead.
+pub async fn parse_system_config_form_merged(
+    app: &Arc<App>,
+    body: &[u8],
+) -> Result<SystemConfig, String> {
+    let mut cfg = parse_system_config_form(body)?;
+    let current = app.system_config.read().await.clone();
+    if !form_has_param(body, "origin_guard_enabled") {
+        cfg.origin_guard_enabled = current.origin_guard_enabled;
+    } else if cfg.origin_guard_enabled
+        && !current.origin_guard_enabled
+        && pangolin_core::provider::spec(cfg.provider).ranges.is_none()
+    {
+        return Err(format!(
+            "The global origin guard cannot be enabled: the provider '{}' publishes no \
+             source-IP ranges, so the guard would not reject anything. Protect the \
+             individual sites with their manual ranges instead.",
+            cfg.provider
+        ));
+    }
+    Ok(cfg)
 }
 
 /// Read + validate one first-level header name from the form body.

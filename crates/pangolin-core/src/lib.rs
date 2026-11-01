@@ -20,16 +20,18 @@ pub mod bot;
 pub mod bot_log;
 pub mod bot_stats;
 pub mod cert_link;
+pub mod cidr;
 pub mod client_ip;
 pub mod config;
 pub mod db;
-pub(crate) mod embedded_migrations;
+pub mod embedded_migrations;
 pub mod error;
 pub mod events;
 pub mod index;
 pub mod normalize;
 pub mod parse;
 pub mod pgl;
+pub mod provider;
 pub mod proxy;
 pub mod ratelimit;
 pub mod traffic;
@@ -43,6 +45,7 @@ pub use bot::{BotCategory, BotIdentity, verify_bot};
 pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
+pub use cidr::CidrSet;
 pub use config::{BotLogConfig, Config, LogConfig, TrafficConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
@@ -54,6 +57,10 @@ pub use parse::{
 pub use pgl::{
     HEADER_CLIENT_COUNTRY, HEADER_CLIENT_IP, HEADER_CLIENT_REGION, HEADER_KNOWN_BOT,
     PGL_HEADER_NAMES, PglHeaders, resolve_headers,
+};
+pub use provider::{
+    GlobalProviderConfig, ProviderHeaders, ProviderKey, ProviderSpec, RangeParser, RangeSource,
+    RangeUrl, SiteProviderConfig, SiteProviderOverride, spec,
 };
 pub use proxy::{
     BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
@@ -73,7 +80,7 @@ pub use tunnel::{
 };
 pub use types::{
     BackendKind, Cert, CertErrorClass, CertStatus, ChallengeKind, ChallengeType, DnsProvider,
-    DnsProviderKind, Domain, FrontendMode, HostMode, Site, SystemConfig, Tun, next_backoff,
+    DnsProviderKind, Domain, HostMode, Site, SystemConfig, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

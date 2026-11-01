@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
+use crate::provider::{GlobalProviderConfig, SiteProviderConfig, SiteProviderOverride};
 use crate::ratelimit::{IpRule, RateLimitPolicy, SiteLimitConfig, build_limit_configs};
 use crate::types::{Domain, Site};
 
@@ -45,6 +46,15 @@ pub struct Indexes {
     /// another. One entry per site; a site without a policy row gets
     /// the default (limits off) policy.
     pub limits: HashMap<String, Arc<SiteLimitConfig>>,
+    /// site name → effective provider configuration (which provider
+    /// is in front of the site, the custom header names, the
+    /// origin-guard switch and the site's manual allow ranges).
+    ///
+    /// Built in the same pass as `limits` and `domain`, so a reload
+    /// swaps the routing table, the limits and the provider
+    /// configuration together. One entry per site; a site without an
+    /// override inherits the global defaults.
+    pub providers: HashMap<String, Arc<SiteProviderConfig>>,
 }
 
 impl Indexes {
@@ -73,6 +83,39 @@ impl Indexes {
         domains: Vec<Domain>,
         policies: &HashMap<String, RateLimitPolicy>,
         rules: &[IpRule],
+    ) -> Self {
+        Self::build_with_providers(
+            sites,
+            domains,
+            policies,
+            rules,
+            &HashMap::new(),
+            &HashMap::new(),
+            &GlobalProviderConfig::default(),
+        )
+    }
+
+    /// Build the indexes together with the per-site rate-limit
+    /// configuration **and** the per-site provider configuration.
+    ///
+    /// `site_providers` holds the persisted per-site overrides (a site
+    /// without one inherits the global defaults) and `site_ranges`
+    /// holds the manual allow ranges of every site. `global` carries
+    /// the global defaults — the provider, the custom header names
+    /// and the origin-guard default.
+    ///
+    /// Everything is assembled in one pass so a reload swaps the
+    /// routing table, the limits and the provider configuration
+    /// together: a request never sees the site of one revision and
+    /// the provider of another.
+    pub fn build_with_providers(
+        sites: Vec<Site>,
+        domains: Vec<Domain>,
+        policies: &HashMap<String, RateLimitPolicy>,
+        rules: &[IpRule],
+        site_providers: &HashMap<String, SiteProviderOverride>,
+        site_ranges: &HashMap<String, Vec<String>>,
+        global: &GlobalProviderConfig,
     ) -> Self {
         // 1. Wrap sites in Arc and group domains by site_name.
         let mut sites_arc: Vec<Arc<Site>> = sites.into_iter().map(Arc::new).collect();
@@ -118,12 +161,48 @@ impl Indexes {
         let site_names: Vec<String> = sites_arc.iter().map(|s| s.name.clone()).collect();
         let limits = build_limit_configs(&site_names, policies, rules);
 
+        // 6. providers: one entry per site, the site's own override
+        //    with the global defaults filled in.
+        let providers = build_provider_configs(&site_names, site_providers, site_ranges, global);
+
         Self {
             domain: domain_idx,
             tun: tun_idx,
             limits,
+            providers,
         }
     }
+}
+
+/// Build the effective provider configuration of every site.
+///
+/// A site without an override inherits every global default; a site
+/// with one overrides the fields it sets and inherits the rest.
+fn build_provider_configs(
+    site_names: &[String],
+    site_providers: &HashMap<String, SiteProviderOverride>,
+    site_ranges: &HashMap<String, Vec<String>>,
+    global: &GlobalProviderConfig,
+) -> HashMap<String, Arc<SiteProviderConfig>> {
+    site_names
+        .iter()
+        .map(|name| {
+            let over = site_providers.get(name).cloned().unwrap_or_default();
+            let mut cfg = global.resolve(&over);
+            if let Some(cidrs) = site_ranges.get(name) {
+                for cidr in cidrs {
+                    // The stored ranges are canonical, so this cannot
+                    // fail in practice; a malformed one (a hand-edited
+                    // row) is skipped rather than taking the whole
+                    // site down.
+                    if let Err(e) = cfg.manual_ranges.insert(cidr) {
+                        log::warn!("site {name}: ignoring invalid manual range: {e}");
+                    }
+                }
+            }
+            (name.clone(), Arc::new(cfg))
+        })
+        .collect()
 }
 
 /// Build the `tunIndex` map: tun_name → list of domains that route

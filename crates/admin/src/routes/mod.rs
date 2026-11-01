@@ -23,6 +23,7 @@ pub mod dns;
 pub mod domains;
 pub mod helpers;
 pub mod logs;
+pub mod provider;
 pub mod ratelimit;
 pub mod settings;
 pub mod sites;
