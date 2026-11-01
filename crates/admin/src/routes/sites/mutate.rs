@@ -66,6 +66,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             e,
             Some("provider"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -82,6 +83,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             e,
             Some("rate_limit"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -98,6 +100,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             &e,
             Some("provider"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -117,6 +120,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             "Site name is required",
             Some("name"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -128,6 +132,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -139,6 +144,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -180,6 +186,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                 &format!("Database error: {}", e),
                 None,
                 csrf,
+                Some(&parsed_provider),
             )
             .await
         }
@@ -231,6 +238,7 @@ pub async fn handle_update(
             e,
             Some("provider"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -242,6 +250,7 @@ pub async fn handle_update(
             e,
             Some("rate_limit"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -253,6 +262,7 @@ pub async fn handle_update(
             &e,
             Some("provider"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -311,6 +321,7 @@ pub async fn handle_update(
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -322,6 +333,7 @@ pub async fn handle_update(
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
+            Some(&parsed_provider),
         )
         .await;
     }
@@ -363,6 +375,7 @@ pub async fn handle_update(
                 &format!("Database error: {}", e),
                 None,
                 csrf,
+                Some(&parsed_provider),
             )
             .await
         }
@@ -420,7 +433,17 @@ fn save_provider(
     };
     let result = match result {
         Ok(()) => {
-            pangolin_core::db::replace_site_origin_allow(db, site_name, &parsed.manual_ranges)
+            // The manual ranges are the whole set of the site, so
+            // replacing them is right — but only when the form
+            // actually carried the field. An API client that posts
+            // only the provider must not wipe the saved ranges (for
+            // a `custom_lb` site they are the only thing the guard
+            // has).
+            if parsed.origin_allow_present {
+                pangolin_core::db::replace_site_origin_allow(db, site_name, &parsed.manual_ranges)
+            } else {
+                Ok(())
+            }
         }
         Err(e) => Err(e),
     };

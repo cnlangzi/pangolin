@@ -586,7 +586,13 @@ impl ProxyHttp for AppProxy {
         // the backend. The ACME HTTP-01 challenge is answered before
         // the site lookup, and the tunnel control channel above, so
         // both are exempt by construction.
-        if provider_cfg.origin_guard_enabled && path != self.app.ws_path {
+        //
+        // The tunnel-path exemption is tied to the **upgrade**: the
+        // control channel is a WebSocket endpoint (the branch above
+        // answers it and returns), so a plain request to the same
+        // path is ordinary site traffic and stays guarded.
+        let is_tunnel_control = path == self.app.ws_path && is_upgrade;
+        if provider_cfg.origin_guard_enabled && !is_tunnel_control {
             let peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()));
             let provider_ranges = self
                 .app
@@ -595,6 +601,18 @@ impl ProxyHttp for AppProxy {
                 .get(&provider_cfg.provider)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(pangolin_core::cidr::CidrSet::new()));
+            if provider_cfg.has_empty_allowlist(&provider_ranges) {
+                // The guard fails open on an empty allowlist (the
+                // provider publishes no list, or the list has never
+                // been fetched). That must not be silent — the
+                // operator has to know the guard is not protecting
+                // anything.
+                warn!(
+                    "origin guard: {} has an empty allowlist (provider {}) — \
+                     the guard is not rejecting anything",
+                    site.name, provider_cfg.provider
+                );
+            }
             if !provider_cfg.allows_peer(peer_ip, &provider_ranges) {
                 // The rejection is counted per provider and logged at
                 // a bounded rate — a rejected request never reaches
@@ -2082,7 +2100,7 @@ async fn respond_rejection(
     let mut hdr = match ResponseHeader::build(status, None) {
         Ok(h) => h,
         Err(e) => {
-            error!("failed to build rate-limit response: {e}");
+            error!("failed to build rejection response: {e}");
             let _ = session.respond_error(500).await;
             return;
         }

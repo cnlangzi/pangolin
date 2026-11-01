@@ -41,6 +41,14 @@ pub struct SiteProviderView {
     pub effective_range_count: usize,
     /// When the effective provider's range list was last fetched.
     pub effective_last_fetch: String,
+    /// Whether the origin guard is effectively on for the site (its
+    /// own setting, or the global default when it inherits).
+    pub effective_guard_enabled: bool,
+    /// Whether the effective allowlist is empty. The guard fails open
+    /// on an empty allowlist, so the form has to say so.
+    pub allowlist_empty: bool,
+    /// The number of manual allow ranges the site has.
+    pub manual_range_count: usize,
 }
 
 // ─── List page (GET /sites) ────────────────────────────────────────────────────

@@ -289,6 +289,38 @@ fn the_migration_applies_to_an_existing_database() {
     }
 }
 
+#[test]
+fn deleting_a_site_removes_its_provider_configuration() {
+    // A leftover row would resurrect a stale origin guard (and its
+    // stale ranges) when a site with the same name is created again.
+    let (_dir, conn) = temp_conn();
+    db::upsert_site_provider(
+        &conn,
+        "site-a",
+        &SiteProviderOverride {
+            provider: Some(ProviderKey::CustomLb),
+            origin_guard_enabled: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db::replace_site_origin_allow(&conn, "site-a", &["203.0.113.0/24".to_string()]).unwrap();
+
+    // The site itself.
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO sites (name, backend, enabled, host_mode, created_at, updated_at)
+         VALUES ('site-a', 'http://127.0.0.1:8080', 1, 'passthrough', ?1, ?1)",
+        rusqlite::params![now],
+    )
+    .unwrap();
+
+    assert!(db::delete_site(&conn, "site-a").unwrap());
+
+    assert!(db::get_site_provider(&conn, "site-a").unwrap().is_none());
+    assert!(db::list_site_origin_allow(&conn).unwrap().is_empty());
+}
+
 // ── Index build ────────────────────────────────────────────────────
 
 #[test]
@@ -591,6 +623,51 @@ async fn a_malformed_body_keeps_the_stored_ranges() {
 }
 
 #[tokio::test]
+async fn an_empty_body_keeps_the_stored_ranges() {
+    // A truncated response (an empty body) must not empty the
+    // allowlist — that would silently switch the guard off.
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+
+    let stub = StubServer::start("HTTP/1.1 200 OK", "173.245.48.0/20\n").await;
+    let url = stub.url("/ips-v4");
+    ngx::provider_ip::fetch_range_list(&app, &stub_client(), ProviderKey::Cloudflare, &url)
+        .await
+        .expect("the first fetch must succeed");
+
+    stub.set_response("HTTP/1.1 200 OK", "");
+    let err =
+        ngx::provider_ip::fetch_range_list(&app, &stub_client(), ProviderKey::Cloudflare, &url)
+            .await
+            .expect_err("an empty body must fail the fetch");
+    assert!(err.contains("empty"), "{err}");
+
+    // The stored ranges are still in force…
+    let in_force = app.provider_ranges.read();
+    let set = in_force
+        .get(&ProviderKey::Cloudflare)
+        .expect("the provider has a range set");
+    assert_eq!(set.len(), 1, "the stored ranges must stay in force");
+    assert!(set.contains("173.245.48.5".parse().unwrap()));
+
+    // …and the failure is recorded.
+    let db = app.db.lock().await;
+    let rows = db::list_provider_ip_lists(&db).unwrap();
+    assert_eq!(rows[0].status, "error");
+    assert!(rows[0].cidrs.contains("173.245.48.0/20"));
+}
+
+#[tokio::test]
+async fn the_refresh_interval_is_clamped_to_at_least_one_second() {
+    // A zero interval would make the refresh loop spin at full
+    // speed.
+    let service = ngx::provider_ip::ProviderIpService::new(Duration::from_secs(0)).unwrap();
+    assert_eq!(service.refresh_interval(), Duration::from_secs(1));
+    let service = ngx::provider_ip::ProviderIpService::new(Duration::from_secs(3600)).unwrap();
+    assert_eq!(service.refresh_interval(), Duration::from_secs(3600));
+}
+
+#[tokio::test]
 async fn the_persisted_ranges_are_loaded_into_memory_on_start() {
     // The guard has to work before the first fetch completes.
     let dir = TempDir::new().unwrap();
@@ -625,6 +702,35 @@ async fn the_persisted_ranges_are_loaded_into_memory_on_start() {
 }
 
 // ── The guard's allowlist ──────────────────────────────────────────
+
+#[test]
+fn the_allowlist_is_the_union_of_the_provider_ranges_and_the_manual_ones() {
+    // The union is checked by membership, not by materialising it —
+    // the guard runs on the request hot path.
+    use pangolin_core::provider::SiteProviderConfig;
+    let mut cfg = SiteProviderConfig {
+        provider: ProviderKey::Cloudflare,
+        origin_guard_enabled: true,
+        ..Default::default()
+    };
+    cfg.manual_ranges.insert("198.51.100.0/24").unwrap();
+
+    let mut provider_ranges = CidrSet::new();
+    provider_ranges.insert("203.0.113.0/24").unwrap();
+
+    // A peer inside the provider's ranges is allowed…
+    assert!(cfg.allows_peer(Some("203.0.113.7".parse().unwrap()), &provider_ranges));
+    // …and so is one inside the site's manual ranges.
+    assert!(cfg.allows_peer(Some("198.51.100.7".parse().unwrap()), &provider_ranges));
+    // Everything else is rejected.
+    assert!(!cfg.allows_peer(Some("192.0.2.7".parse().unwrap()), &provider_ranges));
+    // An empty allowlist fails open.
+    assert!(cfg.has_empty_allowlist(&CidrSet::new()) == false);
+    let mut empty = SiteProviderConfig::default();
+    empty.manual_ranges = CidrSet::new();
+    assert!(empty.has_empty_allowlist(&CidrSet::new()));
+    assert!(empty.allows_peer(Some("192.0.2.7".parse().unwrap()), &CidrSet::new()));
+}
 
 #[test]
 fn the_effective_allowlist_is_the_provider_ranges_plus_the_manual_ones() {
@@ -748,6 +854,226 @@ async fn the_site_form_stores_the_provider_configuration() {
     assert!(
         body.contains(r#"value="X-Site-IP""#),
         "the site form must show the site's own header name; got:\n{body}"
+    );
+}
+
+/// An update that does not carry the manual ranges must not wipe the
+/// saved ones: for a `custom_lb` site they are the only thing the
+/// origin guard has.
+#[tokio::test]
+async fn an_update_without_the_manual_ranges_keeps_the_saved_ones() {
+    let ngx = crate::harness::NgxProcess::start(crate::harness::init_pangolin_db).await;
+    let client = crate::admin_harness::AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(
+            &client
+                .get("/sites/new")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .expect("csrf on /sites/new");
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("name", "guarded"),
+                ("backend", "http://127.0.0.1:8080"),
+                ("provider", "custom_lb"),
+                ("origin_guard", "on"),
+                ("origin_allow", "203.0.113.0/24"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // An update that carries the provider but not the ranges.
+    let csrf = client
+        .csrf_token(
+            &client
+                .get("/sites/edit?name=guarded")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .expect("csrf on /sites/edit");
+    let resp = client
+        .post_form(
+            "/sites/edit?name=guarded",
+            &[
+                ("name", "guarded"),
+                ("backend", "http://127.0.0.1:8080"),
+                ("provider", "custom_lb"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let conn = Connection::open(ngx.db_path()).unwrap();
+    let ranges = db::list_site_origin_allow(&conn).unwrap();
+    assert_eq!(
+        ranges["guarded"],
+        vec!["203.0.113.0/24".to_string()],
+        "the saved manual ranges must survive an update that omits the field"
+    );
+}
+
+/// A rejected submission keeps the operator's typed provider fields,
+/// exactly like the rate-limit fields.
+#[tokio::test]
+async fn a_rejected_submission_keeps_the_typed_provider_fields() {
+    let ngx = crate::harness::NgxProcess::start(crate::harness::init_pangolin_db).await;
+    let client = crate::admin_harness::AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(
+            &client
+                .get("/sites/new")
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+        )
+        .expect("csrf on /sites/new");
+
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("name", "guarded"),
+                ("backend", "http://127.0.0.1:8080"),
+                ("provider", "custom_lb"),
+                ("client_ip_header", "X-Site-IP"),
+                ("origin_guard", "on"),
+                ("origin_allow", "not-a-cidr"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a malformed range must re-render the form, not redirect"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("not-a-cidr"),
+        "the error must name the offending value; got:\n{body}"
+    );
+    // The typed values are still in the form…
+    assert!(
+        body.contains(r#"value="custom_lb" selected>"#),
+        "the provider select must keep the typed value; got:\n{body}"
+    );
+    assert!(
+        body.contains(r#"value="X-Site-IP""#),
+        "the header name must keep the typed value; got:\n{body}"
+    );
+    assert!(
+        body.contains(r#"<option value="on" selected>"#),
+        "the guard tri-state must keep the typed value; got:\n{body}"
+    );
+    assert!(
+        body.contains("not-a-cidr"),
+        "the manual ranges must keep the typed value; got:\n{body}"
+    );
+}
+
+/// The global origin guard cannot be switched on for a provider that
+/// publishes no source-IP ranges: it would fail open.
+#[tokio::test]
+async fn the_global_guard_cannot_be_enabled_without_published_ranges() {
+    let ngx = crate::harness::NgxProcess::start(crate::harness::init_pangolin_db).await;
+    let client = crate::admin_harness::AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    // `custom_lb` publishes no ranges.
+    let resp = client
+        .post_form(
+            "/settings",
+            &[
+                ("provider", "custom_lb"),
+                ("origin_guard_enabled", "true"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the guard must be refused for a provider with no ranges"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("publishes no"),
+        "the error must explain why; got:\n{body}"
+    );
+
+    // The stored config is unchanged.
+    let resp = client.get("/api/system/config").await.unwrap();
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["origin_guard_enabled"], serde_json::json!(false));
+}
+
+/// A settings POST that does not carry the guard switch keeps the
+/// stored value — an API client must not switch the global guard off
+/// by omission.
+#[tokio::test]
+async fn a_settings_post_without_the_guard_switch_keeps_the_stored_value() {
+    let ngx = crate::harness::NgxProcess::start(crate::harness::init_pangolin_db).await;
+    let client = crate::admin_harness::AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    let resp = client
+        .post_form(
+            "/settings",
+            &[
+                ("provider", "cloudflare"),
+                ("origin_guard_enabled", "true"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // Now a POST without the field.
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    let resp = client
+        .post_form("/settings", &[("provider", "cloudflare"), ("_csrf", &csrf)])
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let resp = client.get("/api/system/config").await.unwrap();
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        json["origin_guard_enabled"],
+        serde_json::json!(true),
+        "an absent field must not switch the global guard off"
     );
 }
 

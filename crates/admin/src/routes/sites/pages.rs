@@ -13,7 +13,9 @@ use http::{Response, StatusCode};
 use http_body_util::Full;
 
 use crate::App;
-use crate::routes::provider::{provider_options, site_provider_view};
+use crate::routes::provider::{
+    ParsedProvider, provider_options, provider_view_from_submitted, site_provider_view,
+};
 use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
 use pangolin_core::ratelimit::RateLimitPolicy;
 
@@ -118,10 +120,18 @@ pub(super) async fn render_create_page_with_error(
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
+    provider: Option<&ParsedProvider>,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
         pangolin_core::db::list_tuns(&db).unwrap_or_default()
+    };
+    // The operator's typed provider fields are kept, exactly like the
+    // rate-limit fields: they only have to fix the one that was
+    // wrong.
+    let provider_view = match provider {
+        Some(parsed) => provider_view_from_submitted(app, None, parsed).await,
+        None => site_provider_view(app, None).await,
     };
     let html = SitesNewTemplate {
         site: prefill,
@@ -131,7 +141,7 @@ pub(super) async fn render_create_page_with_error(
         tunnels,
         action: "create",
         rate_limit,
-        provider_view: site_provider_view(app, None).await,
+        provider_view,
         providers: provider_options(),
     }
     .render()
@@ -148,12 +158,20 @@ pub(super) async fn render_edit_page_with_error(
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
+    provider: Option<&ParsedProvider>,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
         pangolin_core::db::list_tuns(&db).unwrap_or_default()
     };
-    let provider_view = site_provider_view(app, Some(&prefill.name)).await;
+    let site_name = prefill.name.clone();
+    // The operator's typed provider fields are kept, exactly like the
+    // rate-limit fields: they only have to fix the one that was
+    // wrong.
+    let provider_view = match provider {
+        Some(parsed) => provider_view_from_submitted(app, Some(&site_name), parsed).await,
+        None => site_provider_view(app, Some(&site_name)).await,
+    };
     let html = SitesEditTemplate {
         site: Some(prefill),
         error: Some(error),

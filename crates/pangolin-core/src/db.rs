@@ -148,6 +148,18 @@ pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
             params![name],
         )?;
         conn.execute("DELETE FROM ip_rules WHERE scope = ?1", params![name])?;
+        // The per-site provider configuration and the manual allow
+        // ranges belong to the site: leaving them behind would
+        // resurrect a stale origin guard (and its stale ranges) when
+        // a site with the same name is created again.
+        conn.execute(
+            "DELETE FROM site_providers WHERE site_name = ?1",
+            params![name],
+        )?;
+        conn.execute(
+            "DELETE FROM site_origin_allow WHERE site_name = ?1",
+            params![name],
+        )?;
     }
     Ok(n > 0)
 }

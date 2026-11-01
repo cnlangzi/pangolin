@@ -21,7 +21,7 @@ use pangolin_core::{App, SystemConfig};
 
 use super::helpers::ok_html;
 use super::provider::{provider_range_statuses, total_guard_rejections};
-use super::system::{parse_system_config_form, save_system_config};
+use super::system::{parse_system_config_form_merged, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
 use crate::templates::settings::ProviderOption;
@@ -85,7 +85,7 @@ pub async fn handle_update_settings(
     csrf: &str,
     body: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
-    match parse_system_config_form(body) {
+    match parse_system_config_form_merged(app, body).await {
         Ok(parsed) => {
             // Take ownership so we can move into save_system_config
             // without re-cloning the SystemConfig.

@@ -108,10 +108,10 @@ address is unwrapped to its IPv4 form).
 
 | Situation | Behaviour |
 | --------- | --------- |
-| The effective allowlist is empty (the provider publishes none and the site has no manual ranges) | The guard does **not** reject — it fails open. An empty list would otherwise reject every request, including the first one after a fresh install. |
+| The effective allowlist is empty (the provider publishes none and the site has no manual ranges) | The guard does **not** reject — it fails open. An empty list would otherwise reject every request, including the first one after a fresh install. A warning is logged and the site form says so. |
 | The peer address is unknown | The guard does not reject. |
 | The provider's list is stale | The stale list stays in force. The guard never fails open on staleness — a false `403` window (the provider adds a range) is worse than a stale list. The admin UI marks the list as stale. |
-| The admin UI turns the guard on for a provider that publishes no ranges and a site with no manual ranges | The submission is rejected with a message. |
+| The admin UI turns the guard on for a provider that publishes no ranges and a site with no manual ranges | The submission is rejected with a message. The same rule applies to the global switch: the global guard can only be switched on for a provider that publishes ranges — a site that protects itself with manual ranges turns the guard on at the site level instead. |
 
 ### Exemptions
 
@@ -120,17 +120,18 @@ Two paths are exempt from the guard:
 * the **ACME HTTP-01 challenge** — it is answered before the site
   lookup, so it never reaches the guard;
 * the **tunnel control channel** (`config.tunnel.ws_path`, default
-  `/tunnel`) — it is answered before the guard.
+  `/tunnel`) — the WebSocket **upgrade** on that path is answered
+  before the guard runs.
 
 A WebSocket upgrade to a tun-backed site on an *ordinary* path is
 ordinary site traffic: it **is** subject to the guard.
 
-The tunnel-path exemption covers the whole path, not just the
-WebSocket upgrade: a plain `GET /tunnel` on a guarded site is
-forwarded like any other request on that path. The exposure is
-narrow — only the literal `/tunnel` path reaches the origin, so a
-bypassing client can make the origin answer *that* path and nothing
-else.
+The tunnel-path exemption is tied to the **upgrade**, not to the
+path: the control channel is a WebSocket endpoint (the `ws_path`
+branch answers it and returns), so a plain `GET /tunnel` on a
+guarded site is ordinary site traffic and stays guarded. Exempting
+the whole path would leave a bypass — a client reaching the origin
+through the tunnel path with no peer check.
 
 The admin UI is served on its own listener (`config.admin.addr`), so
 the guard never locks the operator out.
@@ -186,6 +187,9 @@ The loop:
   validator is stored.
   * `304 Not Modified` — the stored ranges stay, the timestamp moves.
   * `200` — the row's ranges, validators and timestamp are replaced.
+    An **empty** body counts as a failure: a truncated response must
+    not empty the allowlist, because that would silently switch the
+    guard off.
   * a transport or status error — the stored ranges stay, the status
     becomes `error` and the error text is recorded.
   * a malformed line fails the **whole** fetch: a truncated or

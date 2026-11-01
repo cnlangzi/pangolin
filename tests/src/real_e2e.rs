@@ -3990,6 +3990,42 @@ async fn open_ws_client(
     client_async(req, tcp).await.expect("WS handshake")
 }
 
+/// Open a WS connection against the proxy, returning the handshake
+/// **error** instead of panicking when the server does not upgrade.
+///
+/// The tunnel-path exemption covers the WebSocket *upgrade*; a plain
+/// request to the same path is ordinary site traffic, so the test
+/// needs to observe the non-101 answer.
+async fn try_open_ws_client(
+    port: u16,
+    public_host: &str,
+    path: &str,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::client_async;
+    use tokio_tungstenite::tungstenite::handshake::client::Request;
+    let url = format!("ws://127.0.0.1:{}{}", port, path);
+    let req = Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("Host", public_host)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") // matches RFC 6455 vector
+        .body(())
+        .expect("build WS request");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp connect");
+    client_async(req, tcp).await
+}
+
 /// Open a `wss://` connection against the proxy's TLS listener. Uses a
 /// custom rustls ClientConfig that trusts the per-test self-signed root
 /// (so the SNI/cert presented by `pangolin-ngx` validates).
@@ -5023,12 +5059,29 @@ async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() 
     );
     assert_eq!(body, key_auth);
 
-    // The tunnel control channel is answered normally too.
-    let (status, text) = raw_get_full(&addr, "guard.test", "/tunnel").await;
+    // The tunnel control channel — a WebSocket **upgrade** — is
+    // answered normally too. The exemption is tied to the upgrade:
+    // the ws_path branch answers it before the guard runs.
+    let handshake = try_open_ws_client(ngx.http_port, "guard.test", "/tunnel").await;
+    let status = match &handshake {
+        Ok((_ws, resp)) => resp.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("unexpected handshake error: {e}"),
+    };
     assert_ne!(
         status,
         403,
-        "the tunnel path must be exempt from the guard, got {status}\n{text}\nngx log:\n{}",
+        "the tunnel control channel must be exempt from the guard, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // A **plain** request to the same path is ordinary site traffic
+    // and stays guarded — the exemption is not a hole in the guard.
+    let (status, _) = raw_get_full(&addr, "guard.test", "/tunnel").await;
+    assert_eq!(
+        status,
+        403,
+        "a plain request to the tunnel path must still be guarded, got {status}\nngx log:\n{}",
         ngx.log_string()
     );
 

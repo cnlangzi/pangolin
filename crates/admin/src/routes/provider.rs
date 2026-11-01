@@ -141,6 +141,35 @@ pub struct ParsedProvider {
     /// update must not silently reset the provider configuration the
     /// operator set through the UI.
     pub present: bool,
+    /// Whether the form carried the `origin_allow` field.
+    ///
+    /// A form that omits it must not wipe the site's saved manual
+    /// ranges: for a `custom_lb` site they are the only thing the
+    /// origin guard has.
+    pub origin_allow_present: bool,
+    /// The raw submitted values, for the error re-render.
+    pub submitted: SubmittedProvider,
+}
+
+/// The raw provider fields of the site form.
+///
+/// Kept verbatim (not parsed) so the error re-render can show the
+/// operator exactly what they typed — even when a field failed to
+/// parse.
+#[derive(Debug, Clone, Default)]
+pub struct SubmittedProvider {
+    /// The selected provider key (empty = inherit).
+    pub provider: String,
+    /// The visitor-IP header name.
+    pub client_ip_header: String,
+    /// The country header name.
+    pub country_header: String,
+    /// The region header name.
+    pub region_header: String,
+    /// The guard tri-state (`inherit` / `off` / `on`).
+    pub origin_guard: String,
+    /// The manual allow ranges, one per line.
+    pub origin_allow: String,
 }
 
 /// Parse the provider fields of the site form.
@@ -165,6 +194,7 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
         "origin_allow",
     ];
     let present = FIELDS.iter().any(|f| params.contains_key(*f));
+    let origin_allow_present = params.contains_key("origin_allow");
 
     let provider = match params.get("provider").map(|v| v.trim()) {
         None | Some("") => None,
@@ -179,6 +209,8 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
                         expected_providers()
                     )),
                     present,
+                    origin_allow_present,
+                    submitted: SubmittedProvider::default(),
                 };
             }
         },
@@ -196,6 +228,8 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
                     "Invalid origin_guard '{other}'. Expected inherit, off or on."
                 )),
                 present,
+                origin_allow_present,
+                submitted: SubmittedProvider::default(),
             };
         }
     };
@@ -248,6 +282,18 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
         manual_ranges,
         error,
         present,
+        origin_allow_present,
+        submitted: SubmittedProvider {
+            provider: params
+                .get("provider")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
+            client_ip_header: params.get("client_ip_header").cloned().unwrap_or_default(),
+            country_header: params.get("country_header").cloned().unwrap_or_default(),
+            region_header: params.get("region_header").cloned().unwrap_or_default(),
+            origin_guard: params.get("origin_guard").cloned().unwrap_or_default(),
+            origin_allow: params.get("origin_allow").cloned().unwrap_or_default(),
+        },
     }
 }
 
@@ -346,8 +392,28 @@ pub async fn site_provider_view(
         }
     };
 
+    provider_view_for(app, global, over, ranges).await
+}
+
+/// The provider view of a site, built from an explicit override and
+/// the manual ranges.
+///
+/// The submitted values are used as-is, so the error re-render can
+/// show the operator what they typed instead of the stored state.
+async fn provider_view_for(
+    app: &Arc<App>,
+    global: GlobalProviderConfig,
+    over: SiteProviderOverride,
+    ranges: Vec<String>,
+) -> crate::templates::sites::SiteProviderView {
     let effective = global.resolve(&over);
     let (range_count, last_fetch) = provider_range_state(app, effective.provider).await;
+    let provider_ranges = app
+        .provider_ranges
+        .read()
+        .get(&effective.provider)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(CidrSet::new()));
 
     crate::templates::sites::SiteProviderView {
         provider: over
@@ -367,7 +433,61 @@ pub async fn site_provider_view(
         effective_provider: effective.provider.as_str().to_string(),
         effective_range_count: range_count,
         effective_last_fetch: last_fetch.unwrap_or_default(),
+        // The effective guard state and whether the effective
+        // allowlist has anything in it — the guard fails open on an
+        // empty allowlist, so the operator has to see that.
+        effective_guard_enabled: effective.origin_guard_enabled,
+        allowlist_empty: effective.has_empty_allowlist(&provider_ranges),
+        manual_range_count: ranges.len(),
     }
+}
+
+/// The provider view of a site, built from the **submitted** form.
+///
+/// Used by the error re-render: the operator's typed values must
+/// survive a validation error, exactly like the rate-limit fields.
+///
+/// The raw submitted strings are used verbatim — even when the parse
+/// failed, so the operator sees what they typed rather than a blank
+/// field.
+pub async fn provider_view_from_submitted(
+    app: &Arc<App>,
+    site_name: Option<&str>,
+    parsed: &ParsedProvider,
+) -> crate::templates::sites::SiteProviderView {
+    if !parsed.present {
+        return site_provider_view(app, site_name).await;
+    }
+    let mut view = site_provider_view(app, site_name).await;
+    view.provider = parsed.submitted.provider.clone();
+    view.client_ip_header = parsed.submitted.client_ip_header.clone();
+    view.country_header = parsed.submitted.country_header.clone();
+    view.region_header = parsed.submitted.region_header.clone();
+    view.origin_guard = parsed.submitted.origin_guard.clone();
+    view.origin_allow = parsed.submitted.origin_allow.clone();
+
+    // The effective state is recomputed from the parsed override —
+    // but only when the parse succeeded. Otherwise the stored view's
+    // effective state is the honest answer.
+    if let Some(over) = &parsed.over {
+        let global_cfg = app.system_config.read().await.clone();
+        let global = GlobalProviderConfig::from_system_config(&global_cfg);
+        let effective = global.resolve(over);
+        let (range_count, last_fetch) = provider_range_state(app, effective.provider).await;
+        let provider_ranges = app
+            .provider_ranges
+            .read()
+            .get(&effective.provider)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(CidrSet::new()));
+        view.effective_provider = effective.provider.as_str().to_string();
+        view.effective_range_count = range_count;
+        view.effective_last_fetch = last_fetch.unwrap_or_default();
+        view.effective_guard_enabled = effective.origin_guard_enabled;
+        view.allowlist_empty = effective.has_empty_allowlist(&provider_ranges);
+        view.manual_range_count = parsed.manual_ranges.len();
+    }
+    view
 }
 
 /// The state of one provider's published range list: the number of

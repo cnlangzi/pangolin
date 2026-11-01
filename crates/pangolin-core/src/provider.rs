@@ -363,21 +363,17 @@ impl SiteProviderConfig {
         spec(self.provider)
     }
 
-    /// The site's effective allowlist: the provider's published ranges
-    /// ∪ the site's manual ranges.
+    /// Whether the site's effective allowlist is empty.
     ///
-    /// `provider_ranges` is the in-memory range set of the site's
-    /// provider (empty when the provider publishes none, or when the
-    /// list has never been fetched).
-    pub fn effective_allowlist(&self, provider_ranges: &CidrSet) -> CidrSet {
-        let mut out = provider_ranges.clone();
-        for cidr in self.manual_ranges.to_cidrs() {
-            // The manual ranges are already normalised, so this
-            // cannot fail — but a silent skip would hide a bug, so the
-            // error is logged by the caller of `effective_allowlist`.
-            let _ = out.insert(&cidr);
-        }
-        out
+    /// The effective allowlist is the provider's published ranges ∪ the
+    /// site's manual ranges. An empty one means the guard has nothing
+    /// to work with — either the provider publishes no list, or the
+    /// list has never been fetched.
+    ///
+    /// The guard fails **open** in that case (see [`Self::allows_peer`]),
+    /// so the caller is expected to warn the operator.
+    pub fn has_empty_allowlist(&self, provider_ranges: &CidrSet) -> bool {
+        provider_ranges.is_empty() && self.manual_ranges.is_empty()
     }
 
     /// Whether `peer` is inside the site's effective allowlist.
@@ -389,17 +385,23 @@ impl SiteProviderConfig {
     /// An empty allowlist fails **open** (the request is not
     /// rejected): an empty list would otherwise reject every request,
     /// including the first one after a fresh install.
+    ///
+    /// The effective allowlist is the **union** of the provider's
+    /// published ranges and the site's manual ones, so membership is
+    /// checked against both sets — no union is materialised. This
+    /// runs on the request hot path, where cloning the provider's
+    /// range set (hundreds of entries) per request would be a
+    /// needless allocation.
     pub fn allows_peer(&self, peer: Option<IpAddr>, provider_ranges: &CidrSet) -> bool {
         let Some(peer) = peer else {
             // No peer address at all — there is nothing to compare
             // against, so the request is not rejected.
             return true;
         };
-        let allowlist = self.effective_allowlist(provider_ranges);
-        if allowlist.is_empty() {
+        if self.has_empty_allowlist(provider_ranges) {
             return true;
         }
-        allowlist.contains(peer)
+        provider_ranges.contains(peer) || self.manual_ranges.contains(peer)
     }
 }
 

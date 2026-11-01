@@ -70,13 +70,24 @@ pub struct ProviderIpService {
 
 impl ProviderIpService {
     /// Build the service with the configured refresh interval.
+    ///
+    /// The interval is clamped to at least one second: a zero would
+    /// make the refresh loop spin at full speed, hammering the
+    /// provider's URL without pause.
     pub fn new(interval: Duration) -> anyhow::Result<Self> {
         Ok(Self {
             client: build_http_client()?,
-            interval,
+            interval: interval.max(Duration::from_secs(1)),
             base_backoff: BASE_BACKOFF,
             max_backoff: MAX_BACKOFF,
         })
+    }
+
+    /// The interval between two refreshes.
+    ///
+    /// Clamped to at least one second — see [`Self::new`].
+    pub fn refresh_interval(&self) -> Duration {
+        self.interval
     }
 
     /// Load the persisted lists into memory.
@@ -148,6 +159,10 @@ impl Service for ProviderIpService {
     }
 
     async fn run(&self, ctx: ServiceContext) -> anyhow::Result<()> {
+        info!(
+            "provider ranges: refreshing every {}s",
+            self.refresh_interval().as_secs()
+        );
         // The persisted lists first: the guard must work before the
         // first fetch completes.
         self.load_persisted(&ctx.app).await;
@@ -271,6 +286,12 @@ async fn fetch_range_list_inner(
         .map(|r| r.parser)
         .unwrap_or(RangeParser::TextLines);
     let set = parse_ranges(parser, &body)?;
+    if set.is_empty() {
+        // An empty body is the same failure mode as a malformed one:
+        // a truncated response would empty the allowlist and the
+        // guard would fail open. The stored ranges stay in force.
+        return Err("the fetched range list is empty".to_string());
+    }
 
     let cidrs = set.to_cidrs().join("\n");
     write_list(
@@ -306,7 +327,14 @@ async fn record_error(app: &Arc<App>, provider: ProviderKey, url: &str, message:
         provider,
         url: url.to_string(),
         cidrs: stored.as_ref().map(|r| r.cidrs.clone()).unwrap_or_default(),
-        fetched_at: chrono::Utc::now(),
+        // The list was **not** refreshed, so the timestamp of the
+        // last successful fetch is kept: the admin UI's "stale"
+        // marker must fire during a persistent outage instead of
+        // being reset by every failed attempt.
+        fetched_at: stored
+            .as_ref()
+            .map(|r| r.fetched_at)
+            .unwrap_or_else(chrono::Utc::now),
         etag: stored.as_ref().and_then(|r| r.etag.clone()),
         last_modified: stored.as_ref().and_then(|r| r.last_modified.clone()),
         status: pangolin_core::provider::STATUS_ERROR.to_string(),

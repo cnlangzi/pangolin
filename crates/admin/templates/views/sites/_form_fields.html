@@ -325,7 +325,7 @@
         <select name="provider" id="site-provider"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
           <option value="" {% if provider_view.provider.is_empty() %}selected{% endif %}>
-            Inherit the global default{% if !provider_view.global_provider.is_empty() %} ({{ provider_view.global_provider }}){% endif %}
+            Inherit the global default ({{ provider_view.global_provider }})
           </option>
           {%- for p in providers %}
           <option value="{{ p.key }}" {% if provider_view.provider == p.key %}selected{% endif %}>{{ p.label }}</option>
@@ -334,8 +334,15 @@
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
           Effective provider: <span class="font-mono">{{ provider_view.effective_provider }}</span> —
           {{ provider_view.effective_range_count }} published range(s) in force,
-          last fetched {% if provider_view.effective_last_fetch.is_empty() %}never{% else %}{{ provider_view.effective_last_fetch }}{% endif %}.
+          last fetched {% if provider_view.effective_last_fetch.is_empty() %}never{% else %}{{ provider_view.effective_last_fetch }}{% endif %};
+          {{ provider_view.manual_range_count }} manual range(s).
         </p>
+        {%- if provider_view.effective_guard_enabled && provider_view.allowlist_empty %}
+        <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
+          The origin guard is on but the allowlist is empty, so it is not rejecting anything.
+          Add the provider's source ranges or the site's manual ranges below.
+        </p>
+        {%- endif %}
       </div>
 
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
