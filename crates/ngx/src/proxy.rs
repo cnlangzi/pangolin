@@ -677,12 +677,21 @@ impl ProxyHttp for AppProxy {
         if let Some(limit_cfg) = limit_cfg {
             let decision = {
                 let pq = session.req_header().uri.path_and_query();
+                // The geo is the one the gateway already resolved for
+                // the `P-Client-Country` / `P-Client-Region` headers
+                // — the limiter records it for a rejected client, so
+                // no second header read is needed.
+                let geo = pangolin_core::ratelimit::ClientGeo {
+                    country: pgl.country.as_deref(),
+                    region: pgl.region.as_deref(),
+                };
                 self.app.rate_limiter.check(
                     &site.name,
                     &limit_cfg,
                     limit_ip,
                     known_bot,
                     pq.map(|p| p.as_str()),
+                    geo,
                 )
             };
             match decision {

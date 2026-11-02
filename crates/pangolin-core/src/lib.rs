@@ -68,7 +68,7 @@ pub use proxy::{
     serve_file_target,
 };
 pub use ratelimit::{
-    IpRule, IpRules, LimitDecision, OverLimitClient, RateLimitPolicy, RateLimitSnapshot,
+    ClientGeo, IpRule, IpRules, LimitDecision, OverLimitClient, RateLimitPolicy, RateLimitSnapshot,
     RateLimiter, RuleKind, SiteLimitConfig, SiteLimitStat,
 };
 pub use traffic::{

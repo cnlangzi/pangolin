@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use pangolin_core::db;
-use pangolin_core::ratelimit::{IpRule, LimitDecision, RateLimitPolicy, RuleKind};
+use pangolin_core::ratelimit::{ClientGeo, IpRule, LimitDecision, RateLimitPolicy, RuleKind};
 use pangolin_core::types::{Domain, HostMode, Site};
 use pangolin_core::{App, CertManager};
 
@@ -245,19 +245,35 @@ async fn limiter_throttles_over_the_request_limit() {
     let client = ip(198, 51, 100, 10);
 
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
-    match app
-        .rate_limiter
-        .check("a", &cfg, Some(client), false, Some("/"))
-    {
+    match app.rate_limiter.check(
+        "a",
+        &cfg,
+        Some(client),
+        false,
+        Some("/"),
+        ClientGeo::default(),
+    ) {
         LimitDecision::Throttled { retry_after } => {
             assert!(
                 (1..=60).contains(&retry_after),
@@ -286,8 +302,14 @@ async fn limiter_counts_distinct_pages() {
     for i in 0..5 {
         let key = format!("/p{i}");
         assert_eq!(
-            app.rate_limiter
-                .check("a", &cfg, Some(client), false, Some(&key)),
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some(&key),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow,
             "page {i} must be within the limit"
         );
@@ -295,8 +317,14 @@ async fn limiter_counts_distinct_pages() {
     // The same URL again does not grow the distinct-page count.
     for _ in 0..20 {
         assert_eq!(
-            app.rate_limiter
-                .check("a", &cfg, Some(client), false, Some("/p0")),
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some("/p0"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
     }
@@ -304,9 +332,14 @@ async fn limiter_counts_distinct_pages() {
     let mut decision = LimitDecision::Allow;
     for i in 5..20 {
         let key = format!("/p{i}");
-        decision = app
-            .rate_limiter
-            .check("a", &cfg, Some(client), false, Some(&key));
+        decision = app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some(&key),
+            ClientGeo::default(),
+        );
     }
     assert!(
         matches!(decision, LimitDecision::Throttled { .. }),
@@ -337,9 +370,14 @@ async fn limiter_exempts_a_verified_known_bot() {
     // The same request from an ordinary client is rejected…
     let mut decision = LimitDecision::Allow;
     for _ in 0..5 {
-        decision = app
-            .rate_limiter
-            .check("a", &cfg, Some(ip(198, 51, 100, 12)), false, Some("/"));
+        decision = app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(ip(198, 51, 100, 12)),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
     }
     assert!(
         matches!(decision, LimitDecision::Throttled { .. }),
@@ -351,8 +389,14 @@ async fn limiter_exempts_a_verified_known_bot() {
     assert!(verified, "the seeded Googlebot CIDR must verify");
     for _ in 0..5 {
         assert_eq!(
-            app.rate_limiter
-                .check("a", &cfg, Some(bot), verified, Some("/")),
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(bot),
+                verified,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
     }
@@ -384,14 +428,26 @@ async fn limiter_blocks_a_blacklisted_ip() {
 
     let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(ip(203, 0, 113, 9)), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(ip(203, 0, 113, 9)),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Blocked
     );
     // The rule applies even though the site's limits are off.
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(ip(198, 51, 100, 13)), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(ip(198, 51, 100, 13)),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
 }
@@ -410,13 +466,25 @@ async fn reload_indexes_picks_up_a_changed_policy() {
     let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
     let client = ip(198, 51, 100, 14);
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
     assert!(matches!(
-        app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Throttled { .. }
     ));
 
@@ -429,8 +497,14 @@ async fn reload_indexes_picks_up_a_changed_policy() {
     let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
     assert_eq!(cfg.policy.req_limit, 100);
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
 }
@@ -554,7 +628,8 @@ async fn unknown_client_ip_is_neither_counted_nor_limited() {
     let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
     for _ in 0..10 {
         assert_eq!(
-            app.rate_limiter.check("a", &cfg, None, false, Some("/")),
+            app.rate_limiter
+                .check("a", &cfg, None, false, Some("/"), ClientGeo::default()),
             LimitDecision::Allow
         );
     }
@@ -582,19 +657,37 @@ async fn two_sites_have_independent_counters() {
 
     let client = ip(198, 51, 100, 15);
     assert_eq!(
-        app.rate_limiter
-            .check("a", &cfg_a, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg_a,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
     // Site "b" has its own counter.
     assert_eq!(
-        app.rate_limiter
-            .check("b", &cfg_b, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "b",
+            &cfg_b,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Allow
     );
     assert!(matches!(
-        app.rate_limiter
-            .check("a", &cfg_a, Some(client), false, Some("/")),
+        app.rate_limiter.check(
+            "a",
+            &cfg_a,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default()
+        ),
         LimitDecision::Throttled { .. }
     ));
 }
@@ -609,4 +702,47 @@ fn policy_map_is_built_for_every_site() {
     assert_eq!(configs.len(), 2);
     assert!(!configs["a"].policy.enabled);
     assert!(!configs["b"].policy.enabled);
+}
+
+#[tokio::test]
+async fn a_rejected_client_reaches_the_snapshot_with_its_geo() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(1, 0)).unwrap();
+    }
+    app.reload_indexes().await;
+
+    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let client = ip(198, 51, 100, 20);
+    let geo = ClientGeo {
+        country: Some("JP"),
+        region: Some("13"),
+    };
+    assert_eq!(
+        app.rate_limiter
+            .check("a", &cfg, Some(client), false, Some("/"), geo),
+        LimitDecision::Allow
+    );
+    assert!(matches!(
+        app.rate_limiter
+            .check("a", &cfg, Some(client), false, Some("/"), geo),
+        LimitDecision::Throttled { .. }
+    ));
+
+    // The *published* snapshot is rebuilt by the publisher thread once
+    // per second, so read the runtime state directly.
+    let snap = app.rate_limiter.snapshot_now();
+    let row = snap
+        .top_over
+        .iter()
+        .find(|c| c.ip == client.to_string())
+        .expect("the rejected client is listed");
+    assert_eq!(row.country.as_deref(), Some("JP"));
+    assert_eq!(row.region.as_deref(), Some("13"));
+    assert_eq!(row.rule_blocks, 0);
+    assert_eq!(row.throttled, 1);
+    assert_eq!(row.first_seen_secs, 0);
 }

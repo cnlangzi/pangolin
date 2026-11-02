@@ -15,6 +15,9 @@
 //!   effective configuration for one site.
 //! * [`RateLimiter`] — the owner of the in-memory runtime state
 //!   (rings, penalty box, counters) plus the snapshot publisher.
+//! * [`ClientGeo`] — the client's geo, borrowed from the values the
+//!   gateway already resolved for the `P-Client-Country` /
+//!   `P-Client-Region` headers.
 //!
 //! ## Runtime state
 //!
@@ -87,6 +90,29 @@ pub const GLOBAL_SCOPE: &str = "global";
 
 /// Interval between two published snapshots.
 const PUBLISH_TICK: Duration = Duration::from_secs(1);
+
+// ─────────────────────────────────────────────────────────────────
+//  Client geo
+// ─────────────────────────────────────────────────────────────────
+
+/// The geo of a client, as reported by the provider's first-level
+/// headers.
+///
+/// A borrowed, `Copy` view of the values the gateway has already
+/// resolved for the `P-Client-Country` / `P-Client-Region` headers
+/// (see [`crate::pgl`]), so the hot path hands them to the limiter
+/// without a second header read and without allocating.
+///
+/// Both fields are `None` when the provider reported nothing — in
+/// `direct` mode they are *always* `None`, because there a
+/// `CF-IPCountry` header could only have been sent by the client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientGeo<'a> {
+    /// The country code, e.g. `JP`.
+    pub country: Option<&'a str>,
+    /// The region code, e.g. `13`.
+    pub region: Option<&'a str>,
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  Configuration
@@ -587,7 +613,7 @@ struct SiteState {
 /// The `total` is the log counter: the first rejection of a client is
 /// logged, then every [`LOG_EVERY`]-th one, so an attack cannot flood
 /// the log.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct BlockedIpStat {
     /// 403 answers — a blacklist rule matched the client.
     rule_blocks: u64,
@@ -595,6 +621,14 @@ struct BlockedIpStat {
     throttled: u64,
     /// The total number of rejections (the log counter).
     total: u64,
+    /// When the client was first rejected on this site.
+    first_seen: Instant,
+    /// Wall clock of that first rejection (for the operator).
+    first_seen_at: chrono::DateTime<chrono::Utc>,
+    /// The country of the first rejection that carried one.
+    country: Option<String>,
+    /// The region of the first rejection that carried one.
+    region: Option<String>,
     /// When the client was last rejected.
     last_seen: Instant,
 }
@@ -773,17 +807,34 @@ impl SiteState {
     ///
     /// `kind` is `true` for a rule block (403) and `false` for a
     /// throttle (429).
-    fn record_rejection(&mut self, ip: IpAddr, rule_block: bool) -> u64 {
+    ///
+    /// `geo` is the geo of the rejected client. The **first** value
+    /// wins: a client that rotates through exit nodes keeps the geo
+    /// of its first rejection, so the column does not jump around. A
+    /// rejection that carries a geo fills an empty one — a client that
+    /// was first rejected while the provider reported nothing gets
+    /// its geo on a later rejection. The country and the region are
+    /// one observation: a region is only filled in from a rejection
+    /// of the *same* country, so the row never shows a country and a
+    /// region that no request reported together.
+    fn record_rejection(&mut self, ip: IpAddr, rule_block: bool, geo: ClientGeo<'_>) -> u64 {
         if self.blocked_ips.len() >= MAX_BLOCKED_IPS && !self.blocked_ips.contains_key(&ip) {
             // The list is full — the client is still rejected, it is
             // just not remembered.
             return 0;
         }
-        let stat = self.blocked_ips.entry(ip).or_insert(BlockedIpStat {
+        let now = Instant::now();
+        // `or_insert_with`, not `or_insert`: the wall clock is only
+        // read when the record is created.
+        let stat = self.blocked_ips.entry(ip).or_insert_with(|| BlockedIpStat {
             rule_blocks: 0,
             throttled: 0,
             total: 0,
-            last_seen: Instant::now(),
+            first_seen: now,
+            first_seen_at: chrono::Utc::now(),
+            country: None,
+            region: None,
+            last_seen: now,
         });
         if rule_block {
             stat.rule_blocks = stat.rule_blocks.saturating_add(1);
@@ -791,7 +842,22 @@ impl SiteState {
             stat.throttled = stat.throttled.saturating_add(1);
         }
         stat.total = stat.total.saturating_add(1);
-        stat.last_seen = Instant::now();
+        stat.last_seen = now;
+        // The country and the region are **one observation** of the
+        // client. A later rejection may fill an empty field, but the
+        // region is only taken from an observation of the *same*
+        // country — otherwise the row would show a country and a
+        // region that no request ever reported (a client that rotates
+        // through exit nodes, first seen without a region and later
+        // seen in another country).
+        if stat.country.is_none() {
+            stat.country = geo.country.map(str::to_string);
+        }
+        if stat.region.is_none()
+            && (geo.country.is_none() || geo.country == stat.country.as_deref())
+        {
+            stat.region = geo.region.map(str::to_string);
+        }
         stat.total
     }
 }
@@ -951,7 +1017,18 @@ pub struct SiteLimitStat {
 pub struct OverLimitClient {
     pub site: String,
     pub ip: String,
-    pub events: u64,
+    /// The country code of the first rejection that carried one.
+    pub country: Option<String>,
+    /// The region code of the first rejection that carried one.
+    pub region: Option<String>,
+    /// 403 answers — a blacklist rule matched the client.
+    pub rule_blocks: u64,
+    /// 429 answers — the client was over one of the site's limits.
+    pub throttled: u64,
+    /// Seconds since the client was first rejected on this site.
+    pub first_seen_secs: u64,
+    /// RFC3339 UTC timestamp of the first rejection on this site.
+    pub first_seen_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A client IP the limiter rejected — the live "blocked clients"
@@ -1109,6 +1186,10 @@ impl RateLimiter {
     ///
     /// `page_key` is the request target (path + query) used by the
     /// distinct-page dimension.
+    ///
+    /// `geo` is the client's geo, as reported by the provider. It is
+    /// recorded when the client is rejected — it never influences the
+    /// verdict.
     pub fn check(
         &self,
         site: &str,
@@ -1116,6 +1197,7 @@ impl RateLimiter {
         ip: Option<IpAddr>,
         known_bot: bool,
         page_key: Option<&str>,
+        geo: ClientGeo<'_>,
     ) -> LimitDecision {
         let Some(ip) = ip else {
             // No client IP at all: the request is neither counted nor
@@ -1130,7 +1212,7 @@ impl RateLimiter {
                 _ => LimitDecision::Allow,
             };
         };
-        state.lock().check(site, cfg, ip, known_bot, page_key)
+        state.lock().check(site, cfg, ip, known_bot, page_key, geo)
     }
 
     /// The latest published snapshot.
@@ -1229,7 +1311,12 @@ fn build_snapshot(
             top.push(OverLimitClient {
                 site: name.clone(),
                 ip: ip.to_string(),
-                events: stat.throttled,
+                country: stat.country.clone(),
+                region: stat.region.clone(),
+                rule_blocks: stat.rule_blocks,
+                throttled: stat.throttled,
+                first_seen_secs: now.duration_since(stat.first_seen).as_secs(),
+                first_seen_at: stat.first_seen_at,
             });
             let entry = blocked.entry(*ip).or_insert_with(|| {
                 (
@@ -1256,7 +1343,10 @@ fn build_snapshot(
     }
 
     out.sort_by(|a, b| a.site.cmp(&b.site));
-    top.sort_by_key(|row| std::cmp::Reverse(row.events));
+    // The rows are ordered by the total number of rejections — the
+    // number the table displays — so a client with more rejections can
+    // never sit below one with fewer.
+    top.sort_by_key(|row| std::cmp::Reverse(row.rule_blocks + row.throttled));
     top.truncate(20);
 
     // The blocked clients: the most recent first, then the most
@@ -1287,6 +1377,7 @@ impl SiteState {
         ip: IpAddr,
         known_bot: bool,
         page_key: Option<&str>,
+        geo: ClientGeo<'_>,
     ) -> LimitDecision {
         // 1. The operator's rules come first: an explicit block is
         //    stronger than the implicit crawler exemption.
@@ -1297,7 +1388,7 @@ impl SiteState {
             }
             Some(RuleKind::Blacklist) => {
                 self.rule_blocks += 1;
-                let n = self.record_rejection(ip, /* rule_block */ true);
+                let n = self.record_rejection(ip, /* rule_block */ true, geo);
                 if should_log(n) {
                     log::warn!(
                         "ratelimit: site={} ip={} reason=blacklist action=403",
@@ -1329,7 +1420,7 @@ impl SiteState {
         if let Some(remaining) = self.penalty_remaining(ip, now) {
             self.throttled += 1;
             let retry_after = remaining.as_secs().max(1);
-            let n = self.record_rejection(ip, /* rule_block */ false);
+            let n = self.record_rejection(ip, /* rule_block */ false, geo);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=penalty action=429 retry_after={}",
@@ -1383,7 +1474,7 @@ impl SiteState {
                 retry_after =
                     retry_after.max(self.page_window_remaining(now, policy.page_window_secs));
             }
-            let n = self.record_rejection(ip, /* rule_block */ false);
+            let n = self.record_rejection(ip, /* rule_block */ false, geo);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=limit action=429 retry_after={}",
@@ -1622,14 +1713,35 @@ mod tests {
         let (limiter, cfg) = limiter_with(policy(2, 0));
         let client = ip(203, 0, 113, 5);
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
-        match limiter.check("site", &cfg, Some(client), false, Some("/")) {
+        match limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        ) {
             LimitDecision::Throttled { retry_after } => {
                 assert!((1..=60).contains(&retry_after));
             }
@@ -1643,7 +1755,14 @@ mod tests {
         let client = ip(203, 0, 113, 6);
         for _ in 0..100 {
             assert_eq!(
-                limiter.check("site", &cfg, Some(client), false, Some("/")),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow
             );
         }
@@ -1657,7 +1776,14 @@ mod tests {
         for i in 0..5 {
             let key = format!("/page-{i}");
             assert_eq!(
-                limiter.check("site", &cfg, Some(client), false, Some(&key)),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some(&key),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow,
                 "page {i} should be within the limit"
             );
@@ -1665,7 +1791,14 @@ mod tests {
         // The same page again does not grow the count.
         for _ in 0..20 {
             assert_eq!(
-                limiter.check("site", &cfg, Some(client), false, Some("/page-0")),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some("/page-0"),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow
             );
         }
@@ -1673,7 +1806,14 @@ mod tests {
         let mut decision = LimitDecision::Allow;
         for i in 5..20 {
             let key = format!("/page-{i}");
-            decision = limiter.check("site", &cfg, Some(client), false, Some(&key));
+            decision = limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some(&key),
+                ClientGeo::default(),
+            );
         }
         assert!(
             matches!(decision, LimitDecision::Throttled { .. }),
@@ -1686,16 +1826,37 @@ mod tests {
         let (limiter, cfg) = limiter_with(policy(0, 2));
         let client = ip(203, 0, 113, 8);
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/a?id=1")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/a?id=1"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/a?id=2")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/a?id=2"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         // Third distinct page → over the limit of 2.
         assert!(matches!(
-            limiter.check("site", &cfg, Some(client), false, Some("/a?id=3")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/a?id=3"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -1706,7 +1867,14 @@ mod tests {
         let client = ip(66, 249, 66, 1);
         for _ in 0..50 {
             assert_eq!(
-                limiter.check("site", &cfg, Some(client), true, Some("/")),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    true,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow
             );
         }
@@ -1721,13 +1889,27 @@ mod tests {
         // Whitelisted → never limited.
         for _ in 0..20 {
             assert_eq!(
-                limiter.check("site", &cfg, Some(ip(10, 1, 1, 1)), false, Some("/")),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(ip(10, 1, 1, 1)),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow
             );
         }
         // Blacklisted → 403, even before the limits are reached.
         assert_eq!(
-            limiter.check("site", &cfg, Some(ip(192, 0, 2, 7)), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(ip(192, 0, 2, 7)),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Blocked
         );
     }
@@ -1737,7 +1919,14 @@ mod tests {
         let (limiter, mut cfg) = limiter_with(policy(10, 10));
         cfg.blacklist.insert("66.249.64.0/19").unwrap();
         assert_eq!(
-            limiter.check("site", &cfg, Some(ip(66, 249, 66, 1)), true, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(ip(66, 249, 66, 1)),
+                true,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Blocked
         );
     }
@@ -1747,7 +1936,7 @@ mod tests {
         let (limiter, cfg) = limiter_with(policy(1, 1));
         for _ in 0..10 {
             assert_eq!(
-                limiter.check("site", &cfg, None, false, Some("/")),
+                limiter.check("site", &cfg, None, false, Some("/"), ClientGeo::default()),
                 LimitDecision::Allow
             );
         }
@@ -1761,12 +1950,26 @@ mod tests {
         let client = ip(203, 0, 113, 20);
         for _ in 0..20 {
             assert_eq!(
-                limiter.check("site", &cfg, Some(client), false, Some("/")),
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
                 LimitDecision::Allow
             );
         }
         assert_eq!(
-            limiter.check("site", &cfg, Some(ip(192, 0, 2, 9)), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(ip(192, 0, 2, 9)),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Blocked
         );
     }
@@ -1775,14 +1978,35 @@ mod tests {
     fn penalty_box_keeps_rejecting_after_the_first_trip() {
         let (limiter, cfg) = limiter_with(policy(1, 0));
         let client = ip(203, 0, 113, 30);
-        limiter.check("site", &cfg, Some(client), false, Some("/"));
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
         assert!(matches!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
         // Still throttled — the penalty box remembers the client.
         assert!(matches!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -1799,16 +2023,37 @@ mod tests {
 
         let client = ip(203, 0, 113, 40);
         assert_eq!(
-            limiter.check("a", &cfg_a, Some(client), false, Some("/")),
+            limiter.check(
+                "a",
+                &cfg_a,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         // Site b has its own counter — the client is fresh there.
         assert_eq!(
-            limiter.check("b", &cfg_b, Some(client), false, Some("/")),
+            limiter.check(
+                "b",
+                &cfg_b,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         assert!(matches!(
-            limiter.check("a", &cfg_a, Some(client), false, Some("/")),
+            limiter.check(
+                "a",
+                &cfg_a,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -1840,7 +2085,14 @@ mod tests {
         let mut st = SiteState::new(&policy(1, 0));
         let client = ip(203, 0, 113, 50);
         assert_eq!(
-            st.check("site", &SiteLimitConfig::default(), client, false, None),
+            st.check(
+                "site",
+                &SiteLimitConfig::default(),
+                client,
+                false,
+                None,
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         // Move the epoch start far into the past — the window elapsed.
@@ -1952,17 +2204,38 @@ mod tests {
         let client = ip(198, 51, 100, 20);
 
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow
         );
         assert!(matches!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
 
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Allow,
             "the client must be served again once the block window elapsed"
         );
@@ -1976,15 +2249,36 @@ mod tests {
         // A blacklisted client → 403.
         let blocked_ip = ip(192, 0, 2, 5);
         assert_eq!(
-            limiter.check("site", &cfg, Some(blocked_ip), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(blocked_ip),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Blocked
         );
 
         // A client over the limit → 429.
         let throttled_ip = ip(198, 51, 100, 1);
-        limiter.check("site", &cfg, Some(throttled_ip), false, Some("/"));
+        limiter.check(
+            "site",
+            &cfg,
+            Some(throttled_ip),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
         assert!(matches!(
-            limiter.check("site", &cfg, Some(throttled_ip), false, Some("/")),
+            limiter.check(
+                "site",
+                &cfg,
+                Some(throttled_ip),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
             LimitDecision::Throttled { .. }
         ));
 
@@ -2011,8 +2305,22 @@ mod tests {
     fn snapshot_reports_the_counters() {
         let (limiter, cfg) = limiter_with(policy(1, 0));
         let client = ip(203, 0, 113, 60);
-        limiter.check("site", &cfg, Some(client), false, Some("/"));
-        limiter.check("site", &cfg, Some(client), false, Some("/"));
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
         let snap = limiter.snapshot_now();
         assert_eq!(snap.sites.len(), 1);
         assert_eq!(snap.sites[0].counted, 2);
@@ -2021,5 +2329,322 @@ mod tests {
         assert_eq!(snap.totals.enabled_sites, 1);
         assert_eq!(snap.top_over.len(), 1);
         assert_eq!(snap.top_over[0].ip, client.to_string());
+    }
+
+    #[test]
+    fn a_rejected_client_records_its_geo_and_the_first_rejection() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(203, 0, 113, 77);
+        let geo = ClientGeo {
+            country: Some("JP"),
+            region: Some("13"),
+        };
+        // The first request is within the limit — nothing is recorded.
+        assert_eq!(
+            limiter.check("site", &cfg, Some(client), false, Some("/"), geo),
+            LimitDecision::Allow
+        );
+        let before = chrono::Utc::now();
+        assert!(matches!(
+            limiter.check("site", &cfg, Some(client), false, Some("/"), geo),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("JP"));
+        assert_eq!(row.region.as_deref(), Some("13"));
+        assert_eq!(row.rule_blocks, 0);
+        assert_eq!(row.throttled, 1);
+        assert_eq!(row.first_seen_secs, 0);
+        let delta = (row.first_seen_at - before).num_seconds();
+        assert!(
+            (-1..=1).contains(&delta),
+            "the first rejection must be within a second of the check, got {delta}s"
+        );
+    }
+
+    #[test]
+    fn the_first_geo_wins_and_a_missing_one_is_filled_in() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+
+        // A client whose first rejection carried no geo: the next
+        // rejection fills the empty one in.
+        let client = ip(203, 0, 113, 78);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("DE"),
+                    region: Some("BE"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("DE"));
+        assert_eq!(row.region.as_deref(), Some("BE"));
+
+        // A client whose first rejection carried a geo: the later one
+        // does not overwrite it.
+        let client = ip(203, 0, 113, 79);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("FR"),
+                    region: Some("IDF"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("US"),
+                    region: Some("CA"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("FR"));
+        assert_eq!(row.region.as_deref(), Some("IDF"));
+    }
+
+    #[test]
+    fn a_region_is_never_taken_from_another_country() {
+        // The provider reported a country but no region on the first
+        // rejection — the client then rotated to another exit node.
+        // The row must not end up with the first country and the
+        // second country's region: no request ever reported them
+        // together.
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(203, 0, 113, 80);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: None,
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("US"),
+                    region: Some("CA"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("JP"));
+        assert_eq!(
+            row.region, None,
+            "the region belongs to another country and must not be recorded"
+        );
+
+        // The same country, though, does complete the row.
+        let client = ip(203, 0, 113, 81);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: None,
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: Some("13"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("JP"));
+        assert_eq!(row.region.as_deref(), Some("13"));
+    }
+
+    #[test]
+    fn the_top_over_rows_are_ordered_by_the_total_rejections() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 0));
+        cfg.blacklist.insert("192.0.2.7").unwrap();
+
+        // The throttled client: five 429 answers.
+        let throttled = ip(198, 51, 100, 20);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(throttled),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        for _ in 0..5 {
+            assert!(matches!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(throttled),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ));
+        }
+        // The blacklisted client: three 403 answers.
+        let blocked = ip(192, 0, 2, 7);
+        for _ in 0..3 {
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(blocked),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Blocked
+            );
+        }
+
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.top_over.len(), 2, "{:?}", snap.top_over);
+        // The 429 client is listed first — the rows are ordered by the
+        // total number of rejections, not by the 429 count alone.
+        assert_eq!(snap.top_over[0].ip, throttled.to_string());
+        assert_eq!(snap.top_over[0].throttled, 5);
+        assert_eq!(snap.top_over[0].rule_blocks, 0);
+        assert_eq!(snap.top_over[1].ip, blocked.to_string());
+        assert_eq!(snap.top_over[1].rule_blocks, 3);
+        assert_eq!(snap.top_over[1].throttled, 0);
+    }
+
+    #[test]
+    fn the_top_over_table_shows_at_most_twenty_rows() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 0));
+        cfg.blacklist.insert("192.0.2.0/24").unwrap();
+        for i in 0..25u8 {
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(ip(192, 0, 2, i)),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Blocked
+            );
+        }
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.top_over.len(), 20);
     }
 }

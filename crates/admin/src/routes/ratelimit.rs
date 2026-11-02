@@ -17,13 +17,16 @@ use bytes::Bytes;
 use http::Response;
 use http_body_util::Full;
 
-use pangolin_core::ratelimit::{GLOBAL_SCOPE, IpRule, RateLimitPolicy, RuleKind, normalize_cidr};
+use pangolin_core::ratelimit::{
+    GLOBAL_SCOPE, IpRule, RateLimitPolicy, RateLimitSnapshot, RuleKind, normalize_cidr,
+};
 
 use crate::App;
 use crate::ok_html_with_csrf;
 use crate::routes::helpers::{ok_html, parse_form, redirect};
 use crate::templates::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
+    TopOverRow,
 };
 
 type Resp = Response<Full<Bytes>>;
@@ -51,6 +54,7 @@ pub async fn render(app: &Arc<App>, csrf: &str, error: Option<&str>) -> http::Re
     let snap = (*app.ratelimit_snapshot()).clone();
     let (rules, site_names) = load_rules_and_sites(app).await;
     let tmpl = RateLimitPageTemplate {
+        top_over: top_over_rows(&snap),
         snap,
         rules: rules.iter().map(RuleRow::new).collect(),
         site_names,
@@ -79,8 +83,26 @@ pub async fn api_kpis(app: &Arc<App>) -> http::Result<Resp> {
 /// over-limit clients.
 pub async fn api_sites(app: &Arc<App>) -> http::Result<Resp> {
     let snap = (*app.ratelimit_snapshot()).clone();
-    let html = RateLimitSitesView { snap }.render().unwrap_or_default();
+    let html = RateLimitSitesView {
+        top_over: top_over_rows(&snap),
+        snap,
+    }
+    .render()
+    .unwrap_or_default();
     ok_html(html)
+}
+
+/// The rows of the "top over-limit clients" table.
+///
+/// Shared by the page and the HTMX fragment, so both render the same
+/// rows. The relative times are taken against one `now`, so every row
+/// of a render carries the same clock.
+fn top_over_rows(snap: &RateLimitSnapshot) -> Vec<TopOverRow> {
+    let now = chrono::Utc::now();
+    snap.top_over
+        .iter()
+        .map(|client| TopOverRow::new(client, now))
+        .collect()
 }
 
 /// `GET /api/ratelimit/rules` — the IP rules table.
@@ -490,6 +512,8 @@ mod tests {
     use super::*;
     use pangolin_core::CertManager;
     use pangolin_core::config::Config;
+    use pangolin_core::ratelimit::{ClientGeo, LimitDecision};
+    use pangolin_core::types::{HostMode, Site};
     use tempfile::TempDir;
 
     fn form(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -511,6 +535,231 @@ mod tests {
             .expect("App::new"),
         );
         (dir, app)
+    }
+
+    /// A site whose request limit is 1, so the second request of a
+    /// client is throttled.
+    async fn seed_limited_site(app: &Arc<App>) {
+        let site = Site {
+            name: "a".into(),
+            backend: "http://127.0.0.1:8080".into(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            host_mode: HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        };
+        let policy = RateLimitPolicy {
+            enabled: true,
+            req_limit: 1,
+            req_window_secs: 60,
+            page_limit: 0,
+            page_window_secs: 3600,
+            ip_capacity: 256,
+            throttle_capacity: 256,
+            throttle_secs: 600,
+            custom_429_body: None,
+            custom_403_body: None,
+        };
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::upsert_site(&db, &site).unwrap();
+            pangolin_core::db::upsert_site_rate_limit(&db, "a", &policy).unwrap();
+        }
+        app.reload_indexes().await;
+    }
+
+    /// Drive a client over the request limit of the seeded site.
+    async fn throttle(app: &Arc<App>, client: std::net::IpAddr, geo: ClientGeo<'_>) {
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter
+                .check("a", &cfg, Some(client), false, Some("/"), geo),
+            LimitDecision::Allow
+        );
+        assert!(
+            matches!(
+                app.rate_limiter
+                    .check("a", &cfg, Some(client), false, Some("/"), geo),
+                LimitDecision::Throttled { .. }
+            ),
+            "the client must be throttled"
+        );
+    }
+
+    /// Wait until the *published* snapshot carries the rejected client
+    /// with the expected number of rejections.
+    ///
+    /// The publisher thread rebuilds the snapshot once per second, so
+    /// a render right after the rejection can still miss it.
+    async fn wait_for_published(app: &Arc<App>, ip: &str, rejections: u64) {
+        for _ in 0..50 {
+            let snap = app.ratelimit_snapshot();
+            let row = snap.top_over.iter().find(|c| c.ip == ip);
+            if let Some(row) = row
+                && row.rule_blocks + row.throttled == rejections
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the rejected client never reached the published snapshot");
+    }
+
+    /// The body of a response, as a string.
+    async fn html_of(resp: Response<Full<Bytes>>) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_over_limit_table_shows_the_geo_the_status_and_the_first_block_time() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        throttle(
+            &app,
+            client,
+            ClientGeo {
+                country: Some("JP"),
+                region: Some("13"),
+            },
+        )
+        .await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        assert!(html.contains("data-ip=\"198.51.100.9\""), "{html}");
+        assert!(html.contains("data-country=\"JP\""), "{html}");
+        assert!(html.contains("data-region=\"13\""), "{html}");
+        // The status badge — the client was rejected with 429.
+        assert!(html.contains(">429</span>"), "{html}");
+        // The total number of rejections. The attribute is checked,
+        // not the cell text: the per-site table renders its 429 cell
+        // with the very same classes, so the text alone would also
+        // match that cell.
+        assert!(html.contains("data-rejections=\"1\""), "{html}");
+        // The relative time of the first rejection ("0s ago", "1s ago", …).
+        assert!(html.contains("s ago"), "{html}");
+        // The absolute timestamp stays available in the cell's title.
+        let at = html
+            .find("title=\"")
+            .expect("the first-blocked cell has a title");
+        let stamp = &html[at + "title=\"".len()..];
+        let end = stamp.find('"').expect("the title attribute is closed");
+        let stamp = &stamp[..end];
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamp)
+            .expect("the title carries an RFC3339 timestamp");
+        let drift = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+        assert!(
+            drift.abs() <= 60,
+            "the title must be the moment of the first rejection: {stamp}"
+        );
+
+        // The full page carries the same table — it includes the
+        // fragment, so the columns are there on the first paint too.
+        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        for column in ["Country", "Region", "Status", "Rejections", "First blocked"] {
+            assert!(
+                page.contains(column),
+                "the page must have a {column} column: {page}"
+            );
+        }
+        assert!(page.contains(">429</span>"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_geo_renders_an_em_dash() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.10".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        assert!(html.contains("data-country=\"\""), "{html}");
+        assert!(html.contains("data-region=\"\""), "{html}");
+        // Both geo cells render an em dash.
+        assert_eq!(html.matches('—').count(), 2, "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_status_and_the_rejections_count_both_kinds_of_rejection() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+
+        // A blacklisted client is rejected with 403.
+        let cidr = client.to_string();
+        let rule = IpRule {
+            id: rule_id(GLOBAL_SCOPE, RuleKind::Blacklist, &cidr),
+            scope: GLOBAL_SCOPE.into(),
+            kind: RuleKind::Blacklist,
+            cidr: cidr.clone(),
+            note: None,
+            created_at: chrono::Utc::now(),
+        };
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::upsert_ip_rule(&db, &rule).unwrap();
+        }
+        app.reload_indexes().await;
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Blocked
+        );
+
+        // The rule is removed — the client is now only over the limit.
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::delete_ip_rule(&db, &rule.id).unwrap();
+        }
+        app.reload_indexes().await;
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(
+            matches!(
+                app.rate_limiter.check(
+                    "a",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "the client must be throttled"
+        );
+
+        wait_for_published(&app, &client.to_string(), 2).await;
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        // Both kinds of rejection are counted and shown.
+        assert!(html.contains("data-status=\"403+429\""), "{html}");
+        assert!(html.contains("data-rejections=\"2\""), "{html}");
+        assert!(html.contains(">403+429</span>"), "{html}");
     }
 
     #[tokio::test]

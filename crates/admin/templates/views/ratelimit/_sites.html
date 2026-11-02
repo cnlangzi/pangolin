@@ -66,18 +66,42 @@
         <tr>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Site</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Client IP</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Country</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Region</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Status</th>
           <th class="px-4 py-2 text-right font-medium text-slate-500">Rejections</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">First blocked</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
-        {% if snap.top_over.is_empty() %}
-        <tr><td colspan="3" class="px-4 py-6 text-center text-slate-400">No client has been throttled yet.</td></tr>
+        {% if top_over.is_empty() %}
+        <tr><td colspan="7" class="px-4 py-6 text-center text-slate-400">No client has been throttled yet.</td></tr>
         {% else %}
-        {% for row in snap.top_over %}
-        <tr>
+        {% for row in top_over %}
+        {# The `data-*` attributes carry the raw values, so a test can #}
+        {# assert on them without scraping the rendered cells.         #}
+        <tr data-ip="{{ row.ip }}" data-country="{% if let Some(c) = row.country %}{{ c }}{% endif %}" data-region="{% if let Some(r) = row.region %}{{ r }}{% endif %}" data-rejections="{{ row.rejections }}">
           <td class="px-4 py-2 font-mono text-xs">{{ row.site }}</td>
           <td class="px-4 py-2 font-mono text-xs">{{ row.ip }}</td>
-          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.events }}</td>
+          <td class="px-4 py-2 text-xs">{% if let Some(c) = row.country %}{{ c }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
+          <td class="px-4 py-2 text-xs">{% if let Some(r) = row.region %}{{ r }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
+          <td class="px-4 py-2 text-xs">
+            {# The badge colour is keyed off the status string; the    #}
+            {# Tailwind classes must appear literally here or the     #}
+            {# badge ships unstyled (the Tailwind content glob only  #}
+            {# scans the HTML templates).                              #}
+            {% if row.status == "403" %}
+            <span data-status="403" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">403</span>
+            {% else if row.status == "429" %}
+            <span data-status="429" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">429</span>
+            {% else if row.status == "403+429" %}
+            <span data-status="403+429" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">403+429</span>
+            {% else %}
+            <span class="text-slate-400">—</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 tabular-nums text-xs text-right">{{ row.rejections }}</td>
+          <td class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400" title="{{ row.first_seen_at }}">{{ row.first_seen_rel }}</td>
         </tr>
         {% endfor %}
         {% endif %}

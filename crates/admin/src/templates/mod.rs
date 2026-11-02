@@ -59,6 +59,7 @@ pub use logs::{
 };
 pub use ratelimit::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
+    TopOverRow,
 };
 pub use settings::{ProviderOption, SettingsTemplate};
 pub use sites::{
