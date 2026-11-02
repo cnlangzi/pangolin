@@ -588,14 +588,18 @@ mod tests {
         );
     }
 
-    /// Wait until the *published* snapshot carries the rejected
-    /// client.
+    /// Wait until the *published* snapshot carries the rejected client
+    /// with the expected number of rejections.
     ///
     /// The publisher thread rebuilds the snapshot once per second, so
     /// a render right after the rejection can still miss it.
-    async fn wait_for_published(app: &Arc<App>, ip: &str) {
+    async fn wait_for_published(app: &Arc<App>, ip: &str, rejections: u64) {
         for _ in 0..50 {
-            if app.ratelimit_snapshot().top_over.iter().any(|c| c.ip == ip) {
+            let snap = app.ratelimit_snapshot();
+            let row = snap.top_over.iter().find(|c| c.ip == ip);
+            if let Some(row) = row
+                && row.rule_blocks + row.throttled == rejections
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -626,7 +630,7 @@ mod tests {
             },
         )
         .await;
-        wait_for_published(&app, &client.to_string()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
 
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
         assert!(html.contains("data-ip=\"198.51.100.9\""), "{html}");
@@ -634,11 +638,11 @@ mod tests {
         assert!(html.contains("data-region=\"13\""), "{html}");
         // The status badge — the client was rejected with 429.
         assert!(html.contains(">429</span>"), "{html}");
-        // The total number of rejections.
-        assert!(
-            html.contains("<td class=\"px-4 py-2 tabular-nums text-xs text-right\">1</td>"),
-            "{html}"
-        );
+        // The total number of rejections. The attribute is checked,
+        // not the cell text: the per-site table renders its 429 cell
+        // with the very same classes, so the text alone would also
+        // match that cell.
+        assert!(html.contains("data-rejections=\"1\""), "{html}");
         // The relative time of the first rejection ("0s ago", "1s ago", …).
         assert!(html.contains("s ago"), "{html}");
         // The absolute timestamp stays available in the cell's title.
@@ -674,13 +678,88 @@ mod tests {
         seed_limited_site(&app).await;
         let client: std::net::IpAddr = "198.51.100.10".parse().unwrap();
         throttle(&app, client, ClientGeo::default()).await;
-        wait_for_published(&app, &client.to_string()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
 
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
         assert!(html.contains("data-country=\"\""), "{html}");
         assert!(html.contains("data-region=\"\""), "{html}");
         // Both geo cells render an em dash.
         assert_eq!(html.matches('—').count(), 2, "{html}");
+    }
+
+    #[tokio::test]
+    async fn the_status_and_the_rejections_count_both_kinds_of_rejection() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.20".parse().unwrap();
+
+        // A blacklisted client is rejected with 403.
+        let cidr = client.to_string();
+        let rule = IpRule {
+            id: rule_id(GLOBAL_SCOPE, RuleKind::Blacklist, &cidr),
+            scope: GLOBAL_SCOPE.into(),
+            kind: RuleKind::Blacklist,
+            cidr: cidr.clone(),
+            note: None,
+            created_at: chrono::Utc::now(),
+        };
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::upsert_ip_rule(&db, &rule).unwrap();
+        }
+        app.reload_indexes().await;
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Blocked
+        );
+
+        // The rule is removed — the client is now only over the limit.
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::delete_ip_rule(&db, &rule.id).unwrap();
+        }
+        app.reload_indexes().await;
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(
+            matches!(
+                app.rate_limiter.check(
+                    "a",
+                    &cfg,
+                    Some(client),
+                    false,
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "the client must be throttled"
+        );
+
+        wait_for_published(&app, &client.to_string(), 2).await;
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        // Both kinds of rejection are counted and shown.
+        assert!(html.contains("data-status=\"403+429\""), "{html}");
+        assert!(html.contains("data-rejections=\"2\""), "{html}");
+        assert!(html.contains(">403+429</span>"), "{html}");
     }
 
     #[tokio::test]

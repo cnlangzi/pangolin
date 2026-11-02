@@ -280,6 +280,12 @@ around. A rejection that carries a geo fills an empty one — a client
 that was first rejected while the provider reported nothing gets its
 geo on a later rejection.
 
+The country and the region are **one observation**: a region is only
+filled in from a rejection of the *same* country. Otherwise the row
+would show a country and a region that no request ever reported
+together — a client first seen in `JP` without a region and later seen
+in `US`/`CA` would be listed as `JP`/`CA`.
+
 In `direct` mode the geo is always empty: there a `CF-IPCountry`
 header could only have been sent by the client, so trusting it would be
 spoofing.
@@ -382,7 +388,7 @@ successfully and logs a warning naming the retired key.
 | A whitelisted IP is also over the site's limit | It is served, and it is not counted, so it never affects the limit for other clients. |
 | The site's policy has `enabled = 0` | The limits are inert; whitelist and blacklist rules still apply. |
 | The provider reported no country / region | The cells render an em dash. In `direct` mode they always do — there a `CF-IPCountry` header could only have been sent by the client. |
-| The client's geo differs between two requests | The first recorded value is kept — the column does not jump around when the client rotates through exit nodes. |
+| The client's geo differs between two requests | The first recorded value is kept — the column does not jump around when the client rotates through exit nodes. A region is only filled in from a rejection of the *same* country, so the row never shows a country and a region that no request reported together. |
 | An ACME HTTP-01 challenge or the tunnel control channel is used | Served before the site is resolved; never counted, limited, or rule-checked. |
 | The admin UI is used | Served by a separate service on its own port; never counted or limited. |
 | A malformed CIDR is submitted in the admin form | Rejected; the rule is not stored. |

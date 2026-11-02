@@ -813,7 +813,10 @@ impl SiteState {
     /// of its first rejection, so the column does not jump around. A
     /// rejection that carries a geo fills an empty one — a client that
     /// was first rejected while the provider reported nothing gets
-    /// its geo on a later rejection.
+    /// its geo on a later rejection. The country and the region are
+    /// one observation: a region is only filled in from a rejection
+    /// of the *same* country, so the row never shows a country and a
+    /// region that no request reported together.
     fn record_rejection(&mut self, ip: IpAddr, rule_block: bool, geo: ClientGeo<'_>) -> u64 {
         if self.blocked_ips.len() >= MAX_BLOCKED_IPS && !self.blocked_ips.contains_key(&ip) {
             // The list is full — the client is still rejected, it is
@@ -840,10 +843,19 @@ impl SiteState {
         }
         stat.total = stat.total.saturating_add(1);
         stat.last_seen = now;
+        // The country and the region are **one observation** of the
+        // client. A later rejection may fill an empty field, but the
+        // region is only taken from an observation of the *same*
+        // country — otherwise the row would show a country and a
+        // region that no request ever reported (a client that rotates
+        // through exit nodes, first seen without a region and later
+        // seen in another country).
         if stat.country.is_none() {
             stat.country = geo.country.map(str::to_string);
         }
-        if stat.region.is_none() {
+        if stat.region.is_none()
+            && (geo.country.is_none() || geo.country == stat.country.as_deref())
+        {
             stat.region = geo.region.map(str::to_string);
         }
         stat.total
@@ -2452,6 +2464,111 @@ mod tests {
             .expect("the rejected client is listed");
         assert_eq!(row.country.as_deref(), Some("FR"));
         assert_eq!(row.region.as_deref(), Some("IDF"));
+    }
+
+    #[test]
+    fn a_region_is_never_taken_from_another_country() {
+        // The provider reported a country but no region on the first
+        // rejection — the client then rotated to another exit node.
+        // The row must not end up with the first country and the
+        // second country's region: no request ever reported them
+        // together.
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(203, 0, 113, 80);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: None,
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("US"),
+                    region: Some("CA"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("JP"));
+        assert_eq!(
+            row.region, None,
+            "the region belongs to another country and must not be recorded"
+        );
+
+        // The same country, though, does complete the row.
+        let client = ip(203, 0, 113, 81);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            false,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: None,
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                false,
+                Some("/"),
+                ClientGeo {
+                    country: Some("JP"),
+                    region: Some("13"),
+                }
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(row.country.as_deref(), Some("JP"));
+        assert_eq!(row.region.as_deref(), Some("13"));
     }
 
     #[test]

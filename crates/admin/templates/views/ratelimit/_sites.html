@@ -80,7 +80,7 @@
         {% for row in top_over %}
         {# The `data-*` attributes carry the raw values, so a test can #}
         {# assert on them without scraping the rendered cells.         #}
-        <tr data-ip="{{ row.ip }}" data-country="{% if let Some(c) = row.country %}{{ c }}{% endif %}" data-region="{% if let Some(r) = row.region %}{{ r }}{% endif %}">
+        <tr data-ip="{{ row.ip }}" data-country="{% if let Some(c) = row.country %}{{ c }}{% endif %}" data-region="{% if let Some(r) = row.region %}{{ r }}{% endif %}" data-rejections="{{ row.rejections }}">
           <td class="px-4 py-2 font-mono text-xs">{{ row.site }}</td>
           <td class="px-4 py-2 font-mono text-xs">{{ row.ip }}</td>
           <td class="px-4 py-2 text-xs">{% if let Some(c) = row.country %}{{ c }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
