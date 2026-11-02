@@ -1,0 +1,40 @@
+# The crates.io mirror used by BOTH the Docker build and the host.
+#
+# Cargo's source replacement lives in the `[source]` tables.  The
+# `[registries]` tables are for *additional* registries (publish
+# targets, tokens) — a `replace-with` key there is ignored by the
+# resolver, silently, and every build then resolves against the real
+# crates.io.  That mistake is what this file exists to fix (issue
+# #126): the mirror was configured in the `[registries]` form and was
+# therefore never in effect.
+#
+# Measured on the build machine (a ~400 KB crate, direct connection):
+#
+#   rsproxy   ~1.2 MB/s   <- the default
+#   sjtu      ~0.85 MB/s
+#   crates.io ~0.07 MB/s
+#
+# `ustc` and `tuna` are listed as alternates and were not measured
+# here.  Switching the default is a one-line edit of `replace-with`
+# below.
+#
+# This file is injected VERBATIM into the host's cargo config by
+# build/cargo-mirror.sh, so it must contain only `[source.*]` tables:
+# anything else could collide with a table the host already defines,
+# and a duplicate table makes cargo fail to parse the whole file —
+# which breaks every cargo command on the machine.
+
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[source.sjtu]
+registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

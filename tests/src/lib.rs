@@ -20,6 +20,13 @@
 #[cfg(feature = "integration")]
 mod routing;
 
+// Build-system regression tests (crates.io mirror configuration,
+// issue #126).  These need neither the `integration` feature nor a
+// real binary: they parse the cargo config files and drive
+// build/cargo-mirror.sh against a throwaway CARGO_HOME, so they run in
+// the day-to-day `cargo test --workspace` / `make lint` cycle.
+mod cargo_mirror;
+
 #[cfg(feature = "integration")]
 mod backend;
 

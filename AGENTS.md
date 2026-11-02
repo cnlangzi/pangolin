@@ -207,6 +207,51 @@ the compiler version, the host builds with rustc 1.96.0 and the image
 with 1.98.1, so entries written by one side are never hits on the
 other.
 
+### The crates.io mirror lives in `build/cargo-mirror.toml`
+
+`build/cargo-mirror.toml` is the **single canonical mirror block**.
+Two consumers read it:
+
+- the Docker image concatenates it with `build/docker/cargo-config.toml`
+  into `/usr/local/cargo/config.toml` (`build/docker/dist.dockerfile`);
+- `build/cargo-mirror.sh` injects the same file into the host's
+  `${CARGO_HOME:-$HOME/.cargo}/config.toml` — `make cargo-mirror`
+  installs the block, `make cargo-mirror-off` removes it.
+
+One file, two consumers, so the host and the image resolve the same
+crates from the same source.  The two files are complementary, not
+duplicates: `build/cargo-mirror.toml` holds the mirror, and
+`build/docker/cargo-config.toml` holds the Docker-only settings (the
+clang/mold linker and the network tuning).
+
+**The mirror must be configured through cargo's `[source]` tables.**
+`replace-with` under `[registries.crates-io]` is *ignored* by the
+resolver — silently, with no warning — so every build resolves against
+the real crates.io.  That is exactly what happened here until issue
+#126: the mirror had been configured in the `[registries]` form and was
+therefore never in effect.  The `[registries]` tables are for
+*additional* registries (publish targets, tokens); source replacement
+is `[source.crates-io] replace-with` plus `[source.<name>] registry`.
+
+`build/cargo-mirror.toml` therefore contains **only** `[source.*]`
+tables.  That is what makes it safe to inject into a host config the
+user also edits by hand: the block cannot collide with the host's own
+`[net]` / `[url.*]` tables, and TOML forbids defining the same table
+twice — a duplicate would make cargo fail to parse the whole file and
+break every cargo command on the machine.  For the same reason the
+installer refuses to touch a host config that already defines a
+`[source.*]` table it does not manage.
+
+The managed block is delimited by `# >>> pangolin cargo mirror >>>`
+and `# <<< pangolin cargo mirror <<<` marker lines and is written at
+the **top** of the file, so removing it is a pure prefix deletion:
+every byte the user wrote comes back verbatim, including whether the
+file ended with a newline.  Installing twice leaves exactly one block.
+
+Switching the default mirror is a one-line edit of `replace-with` in
+`build/cargo-mirror.toml`; `rsproxy`, `sjtu`, `ustc` and `tuna` are
+all defined there.
+
 ### The Docker build context is an allow-list, not a deny-list
 
 `build/docker/dist.dockerfile` copies the *whole* repo into the `builder`
@@ -230,7 +275,8 @@ The build needs exactly this much:
 | `tests/` | workspace member `tests` |
 | `assets/tailwindcss.css`, `assets/app.js` | `rust-embed` snapshot (`#[folder = "../../assets/"]`) |
 | `tailwind.config.js` | Tailwind CLI — **without it the build still succeeds but the admin UI ships unstyled**, because Tailwind scans no content globs |
-| `build/docker/cargo-config.toml` | copied to `/usr/local/cargo/config.toml` (registry mirror + mold linker) |
+| `build/cargo-mirror.toml` | the shared crates.io mirror block — concatenated into `/usr/local/cargo/config.toml` and injected into the host cargo config by `build/cargo-mirror.sh` |
+| `build/docker/cargo-config.toml` | Docker-only cargo settings (mold linker, network tuning) |
 
 The `Makefile`, `ngx.yml`, `tun.yml` and `rustfmt.toml` ride along too,
 although nothing in the image reads them — they are tiny, low-churn,
@@ -272,6 +318,25 @@ allow-list above: the top-level entries must match, every row of the
 table must be present, and nothing hidden, generated, or secret may
 appear.  Then re-run `make build-dist` — the builder stage is the real
 end-to-end check.
+
+### BuildKit cache mounts survive across builds — until `docker builder prune`
+
+Three cache mounts carry the build's expensive state between runs:
+
+| Mount | Holds |
+| --- | --- |
+| `/usr/local/cargo/registry` | the downloaded crate sources and the registry index |
+| `/pangolin/target` | the cargo target dir — the bulk of the compilation reuse |
+| `/root/.cache/sccache` | the sccache compiler cache |
+
+They survive across `docker build` runs on the same machine, and they
+are **cleared by `docker builder prune`** — which also empties the
+builder's cargo cache mount, so the next build re-downloads and
+recompiles everything.  Editing either cargo config file
+(`build/cargo-mirror.toml` or `build/docker/cargo-config.toml`)
+invalidates the `COPY` layer that assembles
+`/usr/local/cargo/config.toml`, so the two `cargo install` steps
+(`cargo-chef`, `sccache`) re-run once.
 
 ## Style
 

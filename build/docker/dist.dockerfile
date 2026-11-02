@@ -17,7 +17,7 @@
 #
 #   pangolin-chef  → + project-specific build tools (cmake, libssl-dev,
 #                    pkg-config, clang, mold) + cargo-chef + sccache
-#                    + cargo config (registry mirrors, linker)
+#                    + cargo config (crates.io mirror + linker)
 #   planner        → recipe.json
 #   cooker         → compile third-party dependencies
 #   builder        → build UI + compile project
@@ -67,17 +67,32 @@ RUN apt-get update -y && \
     apt-get purge -y sccache && \
     rm -rf /var/lib/apt/lists/*
 
-# cargo config — registry mirrors + clang/mold linker.
-# Placed AFTER the apt layer so editing `cargo-config.toml` invalidates
-# only this layer; the heavier apt-install layer above is preserved.
+# cargo config — crates.io mirror + clang/mold linker + network tuning.
+#
+# The image's cargo config is the concatenation of TWO files:
+#
+#   build/cargo-mirror.toml       the shared crates.io mirror block
+#                                 (cargo source replacement).  The host
+#                                 consumes the same file via
+#                                 build/cargo-mirror.sh, so the image
+#                                 and the host resolve the same crates
+#                                 from the same source.
+#   build/docker/cargo-config.toml the Docker-only settings: the
+#                                 clang/mold linker and the network
+#                                 tuning.
+#
+# Placed AFTER the apt layer so editing either file invalidates only
+# this layer; the heavier apt-install layer above is preserved.
 # It also has to come BEFORE the `cargo install` steps below, so those
-# resolve their dependencies through the configured crates.io mirror
-# instead of crates.io itself.
+# resolve their dependencies through the mirror instead of crates.io
+# itself.  Editing either file invalidates this COPY layer, so the two
+# `cargo install` steps re-run once.
 #
 # The sccache compiler wrapper is NOT configured here: it lives in the
 # ENV block further down, because a wrapper pointing at a binary that
 # does not exist yet breaks `cargo install sccache` itself.
-COPY build/docker/cargo-config.toml /usr/local/cargo/config.toml
+COPY build/cargo-mirror.toml build/docker/cargo-config.toml /tmp/
+RUN cat /tmp/cargo-mirror.toml /tmp/cargo-config.toml > /usr/local/cargo/config.toml
 
 # cargo-chef — installed binary, versioned so the layer survives until
 # someone deliberately bumps the version.

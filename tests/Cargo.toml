@@ -40,6 +40,9 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
+# Parse the cargo config files in the build-system regression tests
+# (already in the lockfile via figment's toml feature).
+toml = "0.8"
 # Signal delivery to the spawned `pangolin-ngx` child — used by the
 # SSE-shutdown-latency e2e test to send SIGINT (not SIGKILL, which
 # `Child::start_kill` provides) so the test can observe the
