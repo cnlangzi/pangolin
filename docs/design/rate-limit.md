@@ -45,6 +45,8 @@ limiter *acts* on it.
 | Distinct page | The request target path plus its query string (`path?query`), treated as one unit. |
 | Rule | An IP blacklist or whitelist entry — a single IP or a CIDR range — scoped globally or to one site. |
 | Whitelist / blacklist | A whitelist match exempts a client from all counting and limiting; a blacklist match rejects the request outright. |
+| Geo | The visitor's country and region, as reported by the provider's first-level headers. |
+| First blocked | The moment of the first rejection of a client on a site. |
 
 ## Storage
 
@@ -80,6 +82,11 @@ CREATE TABLE IF NOT EXISTS ip_rules (
 A policy row whose site no longer exists is ignored when the index is
 built, the same way a `domains` row without a matching site is ignored
 today.
+
+The rejected-client list — the clients the limiter rejected, with their
+counters, their geo and the moment of their first rejection — is **not
+persisted** either: it lives in the process's memory and is cleared on
+restart, exactly like the counters it sits next to.
 
 Deleting a site removes its policy row **and** the IP rules scoped to
 it (`db::delete_site` does both) — the V9 tables have no foreign key,
@@ -254,6 +261,29 @@ The client IP is the authoritative one
 unavailable the TCP peer is used instead. When neither is available the
 request is neither counted nor limited.
 
+### The client's geo
+
+The gateway already resolves the visitor's country and region from the
+provider's first-level headers (`CF-IPCountry` and `CF-Region-Code`,
+with `CF-Region` as the fallback, for `cloudflare`; the
+operator-configured `client_country_header` / `client_region_header`
+names for `custom_lb`) to build the `P-Client-Country` /
+`P-Client-Region` gateway headers. The limiter reuses those values —
+it never reads a header a second time, and it never resolves a geo of
+its own.
+
+The geo is recorded when the limiter **rejects** a client, so the
+"top over-limit clients" table can show where the rejected traffic came
+from. The first recorded value wins: a client that rotates through exit
+nodes keeps the geo of its first rejection, so the column does not jump
+around. A rejection that carries a geo fills an empty one — a client
+that was first rejected while the provider reported nothing gets its
+geo on a later rejection.
+
+In `direct` mode the geo is always empty: there a `CF-IPCountry`
+header could only have been sent by the client, so trusting it would be
+spoofing.
+
 ### Logging
 
 A rate-limited request and a rule-blocked request are logged with the
@@ -293,11 +323,21 @@ restarts; the configuration lives in SQLite and survives restarts.
   counted, over-limit events, 429s sent, rule blocks, exempt
   requests), a per-site table (policy summary, tracked clients against
   capacity, counted, over-limit per dimension, 429s, untracked
-  requests), the top over-limit client IPs and the IP rules with their
-  add and delete forms. The page refreshes through htmx from
+  requests), the "top over-limit clients" table and the IP rules with
+  their add and delete forms. The page refreshes through htmx from
   `/api/ratelimit/{kpis,sites,rules}`. A rejected rule (malformed
   address, unknown scope) redirects back with an `?error=` code that
   is rendered as a banner — a dropped rule must not be silent.
+- The "top over-limit clients" table lists one row per rejected
+  client, the most rejections first, at most 20 rows. A row carries the
+  site, the client IP, the country and the region (an em dash when the
+  provider reported none), the **status** the client was rejected with
+  (`403` — a blacklist rule matched it, `429` — it was over one of the
+  site's limits, or `403+429` when it was rejected both ways), the
+  **total** number of rejections (403 + 429) and the moment of the
+  **first blocked** — a relative time ("12m ago"), with the absolute
+  RFC3339 timestamp in the cell's `title`. The rows are ordered by the
+  total, which is the number the table displays.
 - The statistics are published by a background thread that ticks once
   per second, following the `TrafficHub` aggregator pattern: a plain OS
   thread that owns the snapshot, and the admin handler reads the
@@ -341,6 +381,8 @@ successfully and logs a warning naming the retired key.
 | A blacklisted IP is also a verified known bot | The request is rejected with 403 — rules take precedence over the exemption. |
 | A whitelisted IP is also over the site's limit | It is served, and it is not counted, so it never affects the limit for other clients. |
 | The site's policy has `enabled = 0` | The limits are inert; whitelist and blacklist rules still apply. |
+| The provider reported no country / region | The cells render an em dash. In `direct` mode they always do — there a `CF-IPCountry` header could only have been sent by the client. |
+| The client's geo differs between two requests | The first recorded value is kept — the column does not jump around when the client rotates through exit nodes. |
 | An ACME HTTP-01 challenge or the tunnel control channel is used | Served before the site is resolved; never counted, limited, or rule-checked. |
 | The admin UI is used | Served by a separate service on its own port; never counted or limited. |
 | A malformed CIDR is submitted in the admin form | Rejected; the rule is not stored. |

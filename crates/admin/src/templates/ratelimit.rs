@@ -1,7 +1,7 @@
 //! Templates for `/ratelimit` and its HTMX fragments.
 
 use askama::Template;
-use pangolin_core::ratelimit::{IpRule, RateLimitSnapshot};
+use pangolin_core::ratelimit::{IpRule, OverLimitClient, RateLimitSnapshot};
 
 /// One row of the IP rules table.
 ///
@@ -34,12 +34,69 @@ impl RuleRow {
     }
 }
 
+/// One row of the "top over-limit clients" table.
+///
+/// The display strings are computed here, not in the template (the
+/// same pattern as [`RuleRow`]): Askama's expression parser cannot
+/// follow `crate::templates::relative_time(...)`, and the status
+/// badge colour is keyed off the `status` string in the template —
+/// the Tailwind classes have to appear literally in the HTML, or
+/// the badge ships unstyled.
+#[derive(Clone, Debug)]
+pub struct TopOverRow {
+    pub site: String,
+    pub ip: String,
+    /// The country code, `None` when the provider reported none.
+    pub country: Option<String>,
+    /// The region code, `None` when the provider reported none.
+    pub region: Option<String>,
+    /// "403", "429" or "403+429" — the status the client was rejected
+    /// with.
+    pub status: String,
+    /// The total number of rejections (403 + 429).
+    pub rejections: u64,
+    /// "12m ago" — the relative time of the first rejection.
+    pub first_seen_rel: String,
+    /// The RFC3339 UTC timestamp of the first rejection.
+    pub first_seen_at: String,
+}
+
+impl TopOverRow {
+    /// Build the row of a rejected client.
+    ///
+    /// `now` is the reference point of the relative time — the caller
+    /// reads the whole table at one instant, so every row of a render
+    /// carries the same clock.
+    pub fn new(client: &OverLimitClient, now: chrono::DateTime<chrono::Utc>) -> Self {
+        let status = match (client.rule_blocks > 0, client.throttled > 0) {
+            (true, true) => "403+429",
+            (true, false) => "403",
+            (false, true) => "429",
+            // Unreachable: a row only exists because a rejection was
+            // recorded, so one of the two counters is non-zero.
+            (false, false) => "",
+        };
+        Self {
+            site: client.site.clone(),
+            ip: client.ip.clone(),
+            country: client.country.clone(),
+            region: client.region.clone(),
+            status: status.to_string(),
+            rejections: client.rule_blocks.saturating_add(client.throttled),
+            first_seen_rel: super::relative_time(client.first_seen_at, now),
+            first_seen_at: client.first_seen_at.to_rfc3339(),
+        }
+    }
+}
+
 /// Full page — KPI cards, per-site table, top over-limit clients and
 /// the IP rules, HTMX-refreshed after first paint.
 #[derive(Template)]
 #[template(path = "pages/ratelimit.html")]
 pub struct RateLimitPageTemplate<'a> {
     pub snap: RateLimitSnapshot,
+    /// The rows of the "top over-limit clients" table.
+    pub top_over: Vec<TopOverRow>,
     pub rules: Vec<RuleRow>,
     /// Site names — the scope picker of the "add rule" form.
     pub site_names: Vec<String>,
@@ -61,6 +118,8 @@ pub struct RateLimitKpisView {
 #[template(path = "views/ratelimit/_sites.html")]
 pub struct RateLimitSitesView {
     pub snap: RateLimitSnapshot,
+    /// The rows of the "top over-limit clients" table.
+    pub top_over: Vec<TopOverRow>,
 }
 
 /// IP rules table (`GET /api/ratelimit/rules`).
@@ -68,4 +127,49 @@ pub struct RateLimitSitesView {
 #[template(path = "views/ratelimit/_rules.html")]
 pub struct RateLimitRulesView {
     pub rules: Vec<RuleRow>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn client(rule_blocks: u64, throttled: u64) -> OverLimitClient {
+        OverLimitClient {
+            site: "site".into(),
+            ip: "198.51.100.9".into(),
+            country: Some("JP".into()),
+            region: Some("13".into()),
+            rule_blocks,
+            throttled,
+            first_seen_secs: 42,
+            first_seen_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_status_is_derived_from_the_two_counters() {
+        let now = Utc::now();
+        assert_eq!(TopOverRow::new(&client(3, 0), now).status, "403");
+        assert_eq!(TopOverRow::new(&client(0, 7), now).status, "429");
+        assert_eq!(TopOverRow::new(&client(3, 7), now).status, "403+429");
+    }
+
+    #[test]
+    fn the_rejections_are_the_total_of_the_two_counters() {
+        let now = Utc::now();
+        assert_eq!(TopOverRow::new(&client(3, 7), now).rejections, 10);
+        assert_eq!(TopOverRow::new(&client(3, 0), now).rejections, 3);
+        assert_eq!(TopOverRow::new(&client(0, 7), now).rejections, 7);
+    }
+
+    #[test]
+    fn the_first_block_time_is_relative_with_an_absolute_timestamp() {
+        let now = Utc::now();
+        let mut c = client(0, 7);
+        c.first_seen_at = now - Duration::minutes(12);
+        let row = TopOverRow::new(&c, now);
+        assert_eq!(row.first_seen_rel, "12m ago");
+        assert_eq!(row.first_seen_at, c.first_seen_at.to_rfc3339());
+    }
 }
