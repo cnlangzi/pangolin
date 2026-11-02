@@ -27,8 +27,8 @@ const MARK_END: &str = "# <<< pangolin cargo mirror <<<";
 /// A host cargo config shaped like the ones developers actually have:
 /// a `[net]` table and two `[url.*] insteadOf` rules.
 ///
-/// The trailing-newline variant matters: the managed block is written
-/// at the top of the file precisely so that removing it restores the
+/// The trailing-newline variant matters: the managed block is appended
+/// at the end of the file precisely so that removing it restores the
 /// original bytes — including the absence of a final newline, which
 /// is how the file on this very machine looks.
 const HOST_CONFIG_BODY: &str = concat!(
@@ -75,6 +75,34 @@ fn str_field<'a>(value: &'a toml::Value, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("expected string field `{key}` in {value:?}"))
 }
 
+/// The mirror `replace-with` selects, as `<name>` and the registry
+/// host cargo keys its cache directories by — e.g. `("rsproxy",
+/// "rsproxy.cn")`.  Read from the canonical file so the tests follow
+/// the mirror when it is switched.
+fn active_mirror() -> (String, String) {
+    let cfg = parse_toml("build/cargo-mirror.toml");
+    let source = cfg.get("source").expect("[source.*] tables");
+    let name = source
+        .get("crates-io")
+        .and_then(|c| c.get("replace-with"))
+        .and_then(|v| v.as_str())
+        .expect("[source.crates-io].replace-with")
+        .to_string();
+    let registry = str_field(
+        source
+            .get(&name)
+            .unwrap_or_else(|| panic!("[source.{name}] must be defined")),
+        "registry",
+    );
+    let host = registry
+        .trim_start_matches("sparse+https://")
+        .split('/')
+        .next()
+        .expect("registry host")
+        .to_string();
+    (name, host)
+}
+
 // ── the canonical mirror block ─────────────────────────────────────────────
 
 /// The mirror must be configured through `[source]` tables.  The
@@ -116,16 +144,25 @@ fn mirror_config_uses_source_replacement_not_registries() {
 }
 
 /// The managed block is injected as-is into the host's cargo config,
-/// so it must contain nothing but `[source.*]` tables — anything else
-/// could collide with a table the host already defines and make cargo
-/// fail to parse the whole file.
+/// so the file must contain *nothing* but `[source.*]` tables.  A
+/// stray `[net]` would be written into the host config, where it
+/// collides with the host's own `[net]` — TOML forbids defining the
+/// same table twice, and cargo then fails to parse the whole file.
 #[test]
 fn mirror_config_only_defines_source_tables() {
     let cfg = parse_toml("build/cargo-mirror.toml");
-    let source = cfg.get("source").expect("[source.*] tables");
-    let table = source.as_table().expect("[source.*] is a table");
 
-    for (name, value) in table {
+    let top_level: Vec<&String> = cfg.as_table().expect("a table").keys().collect();
+    assert_eq!(
+        top_level,
+        vec!["source"],
+        "build/cargo-mirror.toml must define exactly one top-level table, [source] — \
+         anything else is injected into the host's cargo config and can collide with \
+         a table the host already defines"
+    );
+
+    let source = cfg.get("source").expect("[source.*] tables");
+    for (name, value) in source.as_table().expect("[source.*] is a table") {
         assert!(
             value.is_table(),
             "[source.{name}] must be a table, got {value:?}"
@@ -136,8 +173,9 @@ fn mirror_config_only_defines_source_tables() {
                     key.as_str(),
                     "registry" | "replace-with" | "branch" | "tag" | "rev"
                 ),
-                "[source.{name}] has an unexpected key `{key}` — the block is injected into the \
-                 host cargo config, where an unknown key could collide with the host's own tables"
+                "[source.{name}] has an unexpected key `{key}` — the block is injected into \
+                 the host cargo config, where an unknown key could collide with the \
+                 host's own tables"
             );
         }
     }
@@ -232,6 +270,19 @@ fn dockerfile_assembles_the_cargo_config_before_the_cargo_install_steps() {
         write < chef && write < sccache,
         "the cargo config must be written before the cargo install steps, so those resolve \
          through the mirror"
+    );
+
+    // The write must actually use BOTH files.  Ordering alone would
+    // happily pass a `cat` that drops the mirror — which is the #126
+    // bug itself.
+    let write_line = lines[write];
+    assert!(
+        write_line.contains("cargo-mirror.toml"),
+        "the cargo config must be assembled from build/cargo-mirror.toml: {write_line}"
+    );
+    assert!(
+        write_line.contains("cargo-config.toml"),
+        "the cargo config must be assembled from build/docker/cargo-config.toml: {write_line}"
     );
 }
 
@@ -328,41 +379,115 @@ fn installer_install_is_idempotent_and_preserves_the_host_config() {
     }
 }
 
+/// The managed block goes at the END of the host config.  TOML binds a
+/// table-less key to the most recent table header, so a block in front
+/// of the host's own tables would swallow the host's root-level keys
+/// (`credential-provider` and friends) and silently drop them.
+#[test]
+fn installer_appends_the_block_so_root_level_keys_survive() {
+    let host = Host::new();
+    let original = "credential-provider = \"cargo:token\"\n\n[net]\ngit-fetch-with-cli = true\n";
+    host.write_config(original);
+
+    host.run_ok("install");
+    let after = host.read_config();
+
+    assert!(
+        after.starts_with("credential-provider = \"cargo:token\""),
+        "the host's table-less keys must stay at the root of the file, ahead of any table \
+         header:\n{after}"
+    );
+    let block_at = after.find(MARK_START).expect("managed block");
+    let net_at = after.find("[net]").expect("[net]");
+    assert!(
+        net_at < block_at,
+        "the managed block must be appended after the host's own tables:\n{after}"
+    );
+
+    // …and the root-level key must still parse as a root-level key,
+    // not as a member of the block's last table.
+    let parsed: toml::Value =
+        toml::from_str(&after).unwrap_or_else(|e| panic!("the written config must parse: {e}"));
+    assert_eq!(
+        parsed.get("credential-provider").and_then(|v| v.as_str()),
+        Some("cargo:token"),
+        "the root-level key must survive the install:\n{after}"
+    );
+}
+
 /// A host config that already defines a `[source.*]` table must be
 /// refused, with the offending table named — and nothing may be
 /// written.  A second `[source.crates-io]` would make cargo fail to
 /// parse the whole file, breaking every cargo command on the machine.
+///
+/// TOML allows whitespace inside the brackets, so `[ source.x ]` is
+/// the same table as `[source.x]`.
 #[test]
 fn installer_refuses_a_host_config_that_already_defines_a_source_table() {
-    let host = Host::new();
-    let original = format!(
-        "{}\n[source.other]\nregistry = \"sparse+https://example.com/index/\"\n",
-        host_config(true)
-    );
-    host.write_config(&original);
+    for table in ["[source.other]", "[ source.crates-io ]", "[source]"] {
+        let host = Host::new();
+        let original = format!(
+            "{}\n{table}\nregistry = \"sparse+https://example.com/index/\"\n",
+            host_config(true)
+        );
+        host.write_config(&original);
 
-    let out = host.run("install");
-    assert!(
-        !out.status.success(),
-        "the installer must refuse a host config that already defines a [source.*] table"
-    );
+        let out = host.run("install");
+        assert!(
+            !out.status.success(),
+            "the installer must refuse a host config that already defines {table}"
+        );
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("[source.other]"),
-        "the message must name the offending table:\n{stderr}"
-    );
-    assert_eq!(
-        host.read_config(),
-        original,
-        "nothing may be written when the installer refuses"
-    );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(table),
+            "the message must name the offending table {table}:\n{stderr}"
+        );
+        assert_eq!(
+            host.read_config(),
+            original,
+            "nothing may be written when the installer refuses"
+        );
+    }
+}
+
+/// A config whose markers are malformed must be refused, not
+/// half-rewritten.  An end marker without a start marker — or a start
+/// marker without an end marker — leaves the real content of the file
+/// unknown, and guessing it would delete the user's cargo config.
+#[test]
+fn installer_refuses_a_config_with_malformed_markers() {
+    for broken in [
+        // A start marker with no end marker: everything after it would
+        // look like part of the block.
+        format!(
+            "{}\n{MARK_START}\n\n[http]\ntimeout = 30\n",
+            host_config(true)
+        ),
+        // An end marker with no start marker.
+        format!("{}\n{MARK_END}\n", host_config(true)),
+    ] {
+        let host = Host::new();
+        host.write_config(&broken);
+
+        for mode in ["install", "off"] {
+            let out = host.run(mode);
+            assert!(
+                !out.status.success(),
+                "`{mode}` must refuse a config with malformed markers:\n{broken}"
+            );
+            assert_eq!(
+                host.read_config(),
+                broken,
+                "`{mode}` must not write anything when it refuses"
+            );
+        }
+    }
 }
 
 /// Installing and then removing the block must give back the host
 /// config byte-for-byte — including a file that did not end with a
-/// newline, which is the case the block's top-of-file placement
-/// exists for.
+/// newline, which is the case the block's placement exists for.
 #[test]
 fn installer_off_restores_the_host_config_byte_for_byte() {
     for original in [host_config(true), host_config(false)] {
@@ -385,40 +510,82 @@ fn installer_off_restores_the_host_config_byte_for_byte() {
     }
 }
 
-/// Switching mirrors leaves the previous source's registry cache
-/// directories behind.  The installer reports them and deletes
-/// nothing — removing hundreds of megabytes of the user's cache
-/// unasked would be destructive.
+/// Switching mirrors leaves the previous source's registry directories
+/// behind — under `registry/cache`, `registry/index` and
+/// `registry/src`.  The installer reports them and deletes nothing —
+/// removing hundreds of megabytes of the user's cache unasked would be
+/// destructive.
 #[test]
-fn installer_reports_the_stale_registry_cache_and_deletes_nothing() {
+fn installer_reports_the_stale_registry_directories_and_deletes_nothing() {
     let host = Host::new();
-    let cache = host.dir.path().join("registry/cache");
+    let (_, host_name) = active_mirror();
+
     let stale = [
-        "index.crates.io-1949cf8c6b5b557f",
-        "mirrors.sjtug.sjtu.edu.cn-a0dcbb55c5c70240",
+        ("cache", "index.crates.io-1949cf8c6b5b557f"),
+        ("index", "index.crates.io-6f17d22bba15001f"),
+        ("src", "index.crates.io-1949cf8c6b5b557f"),
     ];
-    for name in stale {
-        fs::create_dir_all(cache.join(name)).expect("create cache dir");
+    for (kind, name) in stale {
+        fs::create_dir_all(host.dir.path().join("registry").join(kind).join(name))
+            .expect("create registry dir");
     }
-    // The active mirror's own cache directory is not stale.
-    let active = "rsproxy.cn-e3de039b2554c837";
-    fs::create_dir_all(cache.join(active)).expect("create cache dir");
+    // The active mirror's own directories are not stale.
+    for kind in ["cache", "index", "src"] {
+        fs::create_dir_all(
+            host.dir
+                .path()
+                .join("registry")
+                .join(kind)
+                .join(format!("{host_name}-e3de039b2554c837")),
+        )
+        .expect("create registry dir");
+    }
 
     let stdout = host.run_ok("install");
 
-    for name in stale {
+    for (kind, name) in stale {
         assert!(
             stdout.contains(name),
-            "the installer must report the stale cache directory `{name}`:\n{stdout}"
+            "the installer must report the stale registry/{kind} directory `{name}`:\n{stdout}"
         );
         assert!(
-            cache.join(name).is_dir(),
-            "the installer must not delete `{name}`"
+            host.dir
+                .path()
+                .join("registry")
+                .join(kind)
+                .join(name)
+                .is_dir(),
+            "the installer must not delete registry/{kind}/{name}"
         );
     }
     assert!(
-        !stdout.contains(active),
-        "the active mirror's own cache directory is not stale:\n{stdout}"
+        !stdout.contains(&format!("{host_name}-e3de039b2554c837")),
+        "the active mirror's own directories are not stale:\n{stdout}"
+    );
+}
+
+/// A symlinked config must stay a symlink.  The installer writes
+/// through a temp file and renames it into place, which would replace
+/// the link with a regular file and silently disconnect a
+/// dotfiles-managed config.
+#[test]
+fn installer_follows_a_symlinked_config_instead_of_replacing_it() {
+    let host = Host::new();
+    let target = host.dir.path().join("dotfiles-cargo.toml");
+    fs::write(&target, host_config(true)).expect("write target");
+    std::os::unix::fs::symlink(&target, host.config_path()).expect("symlink");
+
+    host.run_ok("install");
+
+    assert!(
+        fs::symlink_metadata(host.config_path())
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "the config must still be a symlink after install"
+    );
+    assert!(
+        fs::read_to_string(&target).unwrap().contains(MARK_START),
+        "the block must be written to the symlink's target"
     );
 }
 
@@ -426,14 +593,19 @@ fn installer_reports_the_stale_registry_cache_and_deletes_nothing() {
 /// anything.
 #[test]
 fn installer_status_reports_the_active_mirror() {
+    let (name, host_name) = active_mirror();
     let host = Host::new();
     let original = host_config(true);
     host.write_config(&original);
 
     let before = host.run_ok("status");
     assert!(
-        before.contains("rsproxy"),
+        before.contains(&format!("active mirror : {name} ({host_name})")),
         "status must name the active mirror:\n{before}"
+    );
+    assert!(
+        before.contains("managed block : no"),
+        "status must report that the block is not installed yet:\n{before}"
     );
     assert_eq!(
         host.read_config(),
@@ -444,8 +616,12 @@ fn installer_status_reports_the_active_mirror() {
     host.run_ok("install");
     let after = host.run_ok("status");
     assert!(
-        after.contains("rsproxy"),
+        after.contains(&format!("active mirror : {name} ({host_name})")),
         "status must name the active mirror:\n{after}"
+    );
+    assert!(
+        after.contains("managed block : yes"),
+        "status must report that the block is installed:\n{after}"
     );
 }
 

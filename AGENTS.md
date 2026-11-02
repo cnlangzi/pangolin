@@ -243,10 +243,21 @@ installer refuses to touch a host config that already defines a
 `[source.*]` table it does not manage.
 
 The managed block is delimited by `# >>> pangolin cargo mirror >>>`
-and `# <<< pangolin cargo mirror <<<` marker lines and is written at
-the **top** of the file, so removing it is a pure prefix deletion:
-every byte the user wrote comes back verbatim, including whether the
-file ended with a newline.  Installing twice leaves exactly one block.
+and `# <<< pangolin cargo mirror <<<` marker lines and is **appended
+at the end** of the host config.  The end, not the beginning: TOML
+binds a table-less key to the most recent table header, so a block in
+front of the host's own tables would swallow the host's root-level
+keys (`credential-provider` and friends) and silently drop them.
+Appending keeps every host key where it was, and makes removing the
+block the exact inverse — the host config comes back byte-for-byte,
+including whether it ended with a newline.  Installing twice leaves
+exactly one block.
+
+The installer refuses to touch a host config whose markers are
+malformed (an end marker without a start marker, a start marker
+without an end marker, or content after the block): a half-understood
+block means the file's real content is unknown, and guessing it would
+delete the user's cargo config.
 
 Switching the default mirror is a one-line edit of `replace-with` in
 `build/cargo-mirror.toml`; `rsproxy`, `sjtu`, `ustc` and `tuna` are

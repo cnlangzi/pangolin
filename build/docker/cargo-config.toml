@@ -58,8 +58,14 @@ retry = 10
 #                     combined with `retry = 10` meant one stalled
 #                     transfer burned 648 s before cargo retried and a
 #                     build could sit there for hours.  At mirror
-#                     speeds (~1 MB/s) a 10 MB crate takes about ten
-#                     seconds, so 120 s is generous.
+#                     speeds (~1 MB/s) the largest crate in this tree
+#                     (aws-lc-sys, 9 MB) takes about ten seconds, so
+#                     120 s leaves room for a ~10× slowdown.
+#                     Note that mirror throughput varies — rsproxy
+#                     has been seen dropping to KB/s — and a download
+#                     that cannot sustain ~76 KB/s will hit this
+#                     ceiling and be retried.  Raise it if a build
+#                     ever fails on a large crate.
 #   low-speed-limit  — don't abort a download that trickles along.
 multiplexing = false
 timeout = 120

@@ -40,9 +40,6 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
-# Parse the cargo config files in the build-system regression tests
-# (already in the lockfile via figment's toml feature).
-toml = "0.8"
 # Signal delivery to the spawned `pangolin-ngx` child — used by the
 # SSE-shutdown-latency e2e test to send SIGINT (not SIGKILL, which
 # `Child::start_kill` provides) so the test can observe the
@@ -62,3 +59,13 @@ rcgen = "0.14"
 
 [features]
 integration = []
+
+# Build-system regression tests (crates.io mirror configuration,
+# issue #126).  Test-only: the module is `#[cfg(test)]`-gated, so this
+# dependency never reaches the normal build of this crate.
+#
+# Keep the version in lockstep with figment's optional `toml` (the
+# workspace enables figment's "toml" feature): both must resolve to the
+# same `toml` release, or the tree grows a second copy of the crate.
+[dev-dependencies]
+toml = "0.8"
