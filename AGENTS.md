@@ -207,6 +207,62 @@ the compiler version, the host builds with rustc 1.96.0 and the image
 with 1.98.1, so entries written by one side are never hits on the
 other.
 
+### The crates.io mirror lives in `build/cargo-mirror.toml`
+
+`build/cargo-mirror.toml` is the **single canonical mirror block**.
+Two consumers read it:
+
+- the Docker image concatenates it with `build/docker/cargo-config.toml`
+  into `/usr/local/cargo/config.toml` (`build/docker/dist.dockerfile`);
+- `build/cargo-mirror.sh` injects the same file into the host's
+  `${CARGO_HOME:-$HOME/.cargo}/config.toml` — `make cargo-mirror`
+  installs the block, `make cargo-mirror-off` removes it.
+
+One file, two consumers, so the host and the image resolve the same
+crates from the same source.  The two files are complementary, not
+duplicates: `build/cargo-mirror.toml` holds the mirror, and
+`build/docker/cargo-config.toml` holds the Docker-only settings (the
+clang/mold linker and the network tuning).
+
+**The mirror must be configured through cargo's `[source]` tables.**
+`replace-with` under `[registries.crates-io]` is *ignored* by the
+resolver — silently, with no warning — so every build resolves against
+the real crates.io.  That is exactly what happened here until issue
+#126: the mirror had been configured in the `[registries]` form and was
+therefore never in effect.  The `[registries]` tables are for
+*additional* registries (publish targets, tokens); source replacement
+is `[source.crates-io] replace-with` plus `[source.<name>] registry`.
+
+`build/cargo-mirror.toml` therefore contains **only** `[source.*]`
+tables.  That is what makes it safe to inject into a host config the
+user also edits by hand: the block cannot collide with the host's own
+`[net]` / `[url.*]` tables, and TOML forbids defining the same table
+twice — a duplicate would make cargo fail to parse the whole file and
+break every cargo command on the machine.  For the same reason the
+installer refuses to touch a host config that already defines a
+`[source.*]` table it does not manage.
+
+The managed block is delimited by `# >>> pangolin cargo mirror >>>`
+and `# <<< pangolin cargo mirror <<<` marker lines and is **appended
+at the end** of the host config.  The end, not the beginning: TOML
+binds a table-less key to the most recent table header, so a block in
+front of the host's own tables would swallow the host's root-level
+keys (`credential-provider` and friends) and silently drop them.
+Appending keeps every host key where it was, and makes removing the
+block the exact inverse — the host config comes back byte-for-byte,
+including whether it ended with a newline.  Installing twice leaves
+exactly one block.
+
+The installer refuses to touch a host config whose markers are
+malformed (an end marker without a start marker, a start marker
+without an end marker, or content after the block): a half-understood
+block means the file's real content is unknown, and guessing it would
+delete the user's cargo config.
+
+Switching the default mirror is a one-line edit of `replace-with` in
+`build/cargo-mirror.toml`; `rsproxy`, `sjtu`, `ustc` and `tuna` are
+all defined there.
+
 ### The Docker build context is an allow-list, not a deny-list
 
 `build/docker/dist.dockerfile` copies the *whole* repo into the `builder`
@@ -230,7 +286,8 @@ The build needs exactly this much:
 | `tests/` | workspace member `tests` |
 | `assets/tailwindcss.css`, `assets/app.js` | `rust-embed` snapshot (`#[folder = "../../assets/"]`) |
 | `tailwind.config.js` | Tailwind CLI — **without it the build still succeeds but the admin UI ships unstyled**, because Tailwind scans no content globs |
-| `build/docker/cargo-config.toml` | copied to `/usr/local/cargo/config.toml` (registry mirror + mold linker) |
+| `build/cargo-mirror.toml` | the shared crates.io mirror block — concatenated into `/usr/local/cargo/config.toml` and injected into the host cargo config by `build/cargo-mirror.sh` |
+| `build/docker/cargo-config.toml` | Docker-only cargo settings (mold linker, network tuning) |
 
 The `Makefile`, `ngx.yml`, `tun.yml` and `rustfmt.toml` ride along too,
 although nothing in the image reads them — they are tiny, low-churn,
@@ -273,6 +330,25 @@ table must be present, and nothing hidden, generated, or secret may
 appear.  Then re-run `make build-dist` — the builder stage is the real
 end-to-end check.
 
+### BuildKit cache mounts survive across builds — until `docker builder prune`
+
+Three cache mounts carry the build's expensive state between runs:
+
+| Mount | Holds |
+| --- | --- |
+| `/usr/local/cargo/registry` | the downloaded crate sources and the registry index |
+| `/pangolin/target` | the cargo target dir — the bulk of the compilation reuse |
+| `/root/.cache/sccache` | the sccache compiler cache |
+
+They survive across `docker build` runs on the same machine, and they
+are **cleared by `docker builder prune`** — which also empties the
+builder's cargo cache mount, so the next build re-downloads and
+recompiles everything.  Editing either cargo config file
+(`build/cargo-mirror.toml` or `build/docker/cargo-config.toml`)
+invalidates the `COPY` layer that assembles
+`/usr/local/cargo/config.toml`, so the two `cargo install` steps
+(`cargo-chef`, `sccache`) re-run once.
+
 ## Style
 
 Match the surrounding code:
@@ -310,9 +386,45 @@ podman run --rm -d --name pebble \
   -e PEBBLE_VA_NOSLEEP=1 \
   -e PEBBLE_VA_ALWAYS_VALID=0 \
   -e PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1 \
+  -e PEBBLE_WFE_NONCEREJECT=0 \
   ghcr.io/letsencrypt/pebble:latest
 cargo test --features integration -p pangolin-integration-tests \
     real_e2e_acme_http01_full_pebble_flow -- --ignored --nocapture
+```
+
+### `PEBBLE_WFE_NONCEREJECT=0` is mandatory, not optional
+
+**Pebble rejects 5 % of otherwise-valid anti-replay nonces by default**
+(`defaultNonceReject = 5` in `wfe/wfe.go`). It is a deliberate fault
+injector: it exists so ACME *clients* can be tested against a hostile
+server.  Every rejected request comes back as
+`urn:ietf:params:acme:error:badNonce` — "JWS has an invalid anti-replay
+nonce".
+
+`instant-acme` retries a `badNonce` three times (each retry picks up
+the fresh `Replay-Nonce` that Pebble attaches to the error response),
+so the residual failure rate is `(5 %)³ ≈ 1 in 8000` **per ACME
+request**.  A CI run makes ~30 such requests, which is roughly a
+**1-in-250 chance of a red build** — and it lands on a random one of
+the ACME tests (`acme_issue_multi_san_blob_copy`,
+`acme_issue_rsa_variant_filename`, `acme_account_persistence_across_restart`,
+…).
+
+Set `PEBBLE_WFE_NONCEREJECT=0` on the Pebble container — the CI
+service does this in `.github/workflows/ci.yml`, and any local Pebble
+you start for `crates/ngx/tests/acme.rs` must do the same.  With the
+injector off, the ACME tests are deterministic; with it on, expect a
+handful of failures per hundred runs and do **not** chase them as
+regressions in the ACME code.
+
+To reproduce the flake deliberately:
+
+```bash
+# 30 % rejection → most runs fail with badNonce
+docker run --rm -d --name pebble -p 14000:14000 -p 15000:15000 \
+  -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_VA_ALWAYS_VALID=1 \
+  -e PEBBLE_WFE_NONCEREJECT=30 \
+  ghcr.io/letsencrypt/pebble:latest
 ```
 
 ## Memory

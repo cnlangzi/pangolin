@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa cargo-mirror cargo-mirror-off
 
 help:
 	@echo "=== Config ==="
@@ -73,6 +73,10 @@ help:
 	@echo "  make build-dist    # Docker build (UI minified in-container), export to build/output/"
 	@echo "  make dist          # Same as build-dist"
 	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
+	@echo ""
+	@echo "=== Cargo ==="
+	@echo "  make cargo-mirror      # Route crates.io through the shared mirror (host cargo config)"
+	@echo "  make cargo-mirror-off  # Remove the mirror block from the host cargo config"
 	@echo ""
 	@echo "=== Local Run ==="
 	@echo "  make init-data     # Write 7 days of bot JSONL under ./logs/bots (History / Stats)"
@@ -367,6 +371,24 @@ build-dist: dist
 
 dist:
 	./build/dist.sh
+
+# ── Host-side crates.io mirror ─────────────────────────────────────────────
+#
+# `build/cargo-mirror.toml` is the single canonical mirror block: the
+# Docker image concatenates it with `build/docker/cargo-config.toml`,
+# and `build/cargo-mirror.sh` injects the same file into the host's
+# ${CARGO_HOME:-$HOME/.cargo}/config.toml.  Host and image therefore
+# resolve the same crates from the same source.
+#
+# The managed block is delimited by marker lines and contains only
+# `[source.*]` tables, so it cannot collide with the host's own
+# `[net]` / `[url.*]` tables — a duplicate table would make cargo fail
+# to parse the whole file and break every cargo command on the machine.
+cargo-mirror:
+	@./build/cargo-mirror.sh install
+
+cargo-mirror-off:
+	@./build/cargo-mirror.sh off
 
 # Keep downloaded CLIs (./bin/tailwindcss, ./bin/esbuild); restored by
 # download-ui-tools. Only strip locally-built outputs (cargo + generated

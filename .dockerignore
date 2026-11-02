@@ -13,7 +13,8 @@
 #   tests/                      workspace member "tests"
 #   assets/                     tailwindcss.css + app.js (rust-embed snapshot)
 #   tailwind.config.js          tailwind CLI config (content globs)
-#   build/docker/               cargo-config.toml
+#   build/cargo-mirror.toml     shared crates.io mirror block
+#   build/docker/               cargo-config.toml (Docker-only settings)
 #
 # Source-level files are NEVER excluded — not even ones that look like
 # junk.  A template that askama embeds, a YAML that include_str! reads, a
