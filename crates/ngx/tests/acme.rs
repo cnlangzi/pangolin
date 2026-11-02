@@ -5,8 +5,15 @@
 //!   podman run -d --rm --name pebble-acme \
 //!     -p 14000:14000 -p 15000:15000 \
 //!     -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_VA_ALWAYS_VALID=1 \
+//!     -e PEBBLE_WFE_NONCEREJECT=0 \
 //!     ghcr.io/letsencrypt/pebble:latest
 //!   echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
+//!
+//! `PEBBLE_WFE_NONCEREJECT=0` is required: Pebble rejects 5% of
+//! otherwise-valid anti-replay nonces by default, and instant-acme
+//! only retries a badNonce three times — so without it these tests
+//! flake roughly 1 run in 250 with "JWS has an invalid anti-replay
+//! nonce".  See the Pebble section in AGENTS.md.
 //!
 //! Run with: cargo test --features integration -p ngx
 

@@ -3571,6 +3571,7 @@ async fn real_e2e_acme_http01_missing_returns_404() {
 ///   -e PEBBLE_VA_NOSLEEP=1 \
 ///   -e PEBBLE_VA_ALWAYS_VALID=0 \
 ///   -e PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1 \
+///   -e PEBBLE_WFE_NONCEREJECT=0 \
 ///   ghcr.io/letsencrypt/pebble:latest
 /// echo '127.0.0.1 localhost.test' | sudo tee -a /etc/hosts
 /// cargo test --features integration -p pangolin-integration-tests \

@@ -135,6 +135,12 @@ jobs:
   # mode for the *client*-side tests (acme.rs::tests::acme_*), which
   # only need an ACME server that will sign certificates — they
   # don't care about challenge validation.
+  #
+  # `PEBBLE_WFE_NONCEREJECT=0` below is NOT optional: Pebble rejects
+  # 5% of otherwise-valid anti-replay nonces by default, and
+  # instant-acme retries a badNonce only 3 times, so the residual
+  # failure rate is (5%)^3 per ACME request — about 1 in 250 CI runs,
+  # landing on a random ACME test.  See the Pebble section of AGENTS.md.
   # ----------------------------------------------------------------
   e2e:
     name: E2E tests (Pebble)
@@ -151,6 +157,17 @@ jobs:
           PEBBLE_VA_ALWAYS_VALID: "1"
           PEBBLE_LISTEN: "0.0.0.0:14000"
           PEBBLE_WFE_OVERRIDE_DNS: "127.0.0.1"
+          # Pebble rejects 5% of otherwise-VALID anti-replay nonces by
+          # default (`defaultNonceReject = 5` in wfe/wfe.go) — a fault
+          # injector that exists to test clients against a hostile
+          # server.  instant-acme retries a badNonce 3 times, so the
+          # residual failure rate is (5%)^3 per ACME request ≈ 1 in
+          # 8000, which is ~1 in 250 CI runs across the ~30 requests a
+          # run makes.  That is a coin-flip flake on the ACME tests
+          # (they fail with "JWS has an invalid anti-replay nonce"), so
+          # turn the injector off: our tests assert the client's
+          # behaviour, not the server's hostility.
+          PEBBLE_WFE_NONCEREJECT: "0"
     steps:
       - uses: actions/checkout@v4
 

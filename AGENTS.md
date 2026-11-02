@@ -386,9 +386,45 @@ podman run --rm -d --name pebble \
   -e PEBBLE_VA_NOSLEEP=1 \
   -e PEBBLE_VA_ALWAYS_VALID=0 \
   -e PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1 \
+  -e PEBBLE_WFE_NONCEREJECT=0 \
   ghcr.io/letsencrypt/pebble:latest
 cargo test --features integration -p pangolin-integration-tests \
     real_e2e_acme_http01_full_pebble_flow -- --ignored --nocapture
+```
+
+### `PEBBLE_WFE_NONCEREJECT=0` is mandatory, not optional
+
+**Pebble rejects 5 % of otherwise-valid anti-replay nonces by default**
+(`defaultNonceReject = 5` in `wfe/wfe.go`). It is a deliberate fault
+injector: it exists so ACME *clients* can be tested against a hostile
+server.  Every rejected request comes back as
+`urn:ietf:params:acme:error:badNonce` — "JWS has an invalid anti-replay
+nonce".
+
+`instant-acme` retries a `badNonce` three times (each retry picks up
+the fresh `Replay-Nonce` that Pebble attaches to the error response),
+so the residual failure rate is `(5 %)³ ≈ 1 in 8000` **per ACME
+request**.  A CI run makes ~30 such requests, which is roughly a
+**1-in-250 chance of a red build** — and it lands on a random one of
+the ACME tests (`acme_issue_multi_san_blob_copy`,
+`acme_issue_rsa_variant_filename`, `acme_account_persistence_across_restart`,
+…).
+
+Set `PEBBLE_WFE_NONCEREJECT=0` on the Pebble container — the CI
+service does this in `.github/workflows/ci.yml`, and any local Pebble
+you start for `crates/ngx/tests/acme.rs` must do the same.  With the
+injector off, the ACME tests are deterministic; with it on, expect a
+handful of failures per hundred runs and do **not** chase them as
+regressions in the ACME code.
+
+To reproduce the flake deliberately:
+
+```bash
+# 30 % rejection → most runs fail with badNonce
+docker run --rm -d --name pebble -p 14000:14000 -p 15000:15000 \
+  -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_VA_ALWAYS_VALID=1 \
+  -e PEBBLE_WFE_NONCEREJECT=30 \
+  ghcr.io/letsencrypt/pebble:latest
 ```
 
 ## Memory
