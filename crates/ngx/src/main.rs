@@ -329,4 +329,34 @@ mod tests {
             Some(concat!("v", env!("CARGO_PKG_VERSION")))
         );
     }
+
+    /// The workflow matches the pushed tag against
+    /// `^v(\d+\.\d+\.\d+…)$` and then asserts the binary reports
+    /// `v<tag version>` — so the reported version has to be a
+    /// `v`-prefixed semver, not merely a string containing a `v`.
+    #[test]
+    fn cli_version_is_a_v_prefixed_semver() {
+        let cmd = Args::command();
+        let version = cmd
+            .get_version()
+            .expect("the clap command declares a version");
+        let core = version
+            .strip_prefix('v')
+            .expect("the version starts with 'v'")
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default();
+        let parts: Vec<&str> = core.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "version '{version}' is not major.minor.patch"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "version '{version}' has a non-numeric component"
+        );
+    }
 }

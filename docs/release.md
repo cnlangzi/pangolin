@@ -19,9 +19,13 @@ that tag.
    ```
 
 2. **Merge to `main`.** The release workflow runs no lint and no tests
-   of its own, so the tag must point at a commit whose CI run on
-   `main` was green. Cutting the tag anywhere else — a branch, a
-   commit that never went through CI — publishes an untested binary.
+   of its own, so the tag must point at a commit whose CI run was
+   green. It enforces the "on `main`" half of that: the job fails
+   before it compiles anything if the tagged commit is not an ancestor
+   of `origin/main`. The "CI was green" half is the operator's — CI
+   runs on pull requests, so a commit that reached `main` through a
+   merged PR has a green run for its head, while a commit pushed
+   straight to `main` has none.
 
 3. **Tag.** The tag is `v` + the workspace version, e.g. `v0.3.0`:
 
@@ -87,6 +91,15 @@ The `openssl-sys` dependency is cgo, so those symbol versions are
 really recorded in the binary. Ubuntu 22.04 has glibc 2.35, which
 starts on a glibc 2.36 host.
 
+GitHub retires runner images, so `ubuntu-22.04` will not last
+forever. When it goes, the replacement has to keep a glibc no newer
+than the production hosts' 2.36 — the project's own
+`imlangzi/yaitoo:rust-npm` base image (Debian 12, glibc 2.36, see
+`build/docker/dist.dockerfile`) is the natural one to move to, with
+Rust 1.96 installed inside it. Moving to `ubuntu-latest` instead
+would silently raise the floor to glibc 2.39 and break the hosts
+again.
+
 The same reason keeps the release build native (cargo on the runner)
 instead of going through the Docker pipeline in
 `build/docker/dist.dockerfile`: that pipeline compiles with rustc
@@ -101,9 +114,13 @@ the Docker image's.
 | Stage | Detail |
 | --- | --- |
 | Assert | The tag must match `v<semver>` **and** its version must equal `[workspace.package].version` in `Cargo.toml`. A mismatch fails the job before anything is compiled — the workflow never rewrites `Cargo.toml`. |
+| Assert | The tagged commit must be an ancestor of `origin/main`. |
 | Build | `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `make build` also regenerates the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled. |
 | Assert | `./bin/pangolin-ngx --version` and `./bin/pangolin-tun --version` must report the tagged version. A mismatched binary fails the job and is never uploaded. |
 | Publish | The archive and `SHA256SUMS.txt` are attached to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
+
+The build job runs read-only; only the publishing job holds a
+write-scoped token.
 
 Adding a build target later is one new entry in the workflow's
 `matrix.include:` list.

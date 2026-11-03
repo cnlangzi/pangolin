@@ -5,10 +5,19 @@ on:
     tags:
       - 'v*'
 
-# The release job uploads assets to the GitHub Release of the pushed
-# tag, which needs write access to the repository contents.
+# Default to read-only. Only the publishing job needs to write, and
+# the build job runs third-party code (the workspace's build scripts,
+# the vendored OpenSSL, the tailwindcss/esbuild CLIs that
+# `make build` downloads and executes) — a write-scoped token in that
+# job would let a compromised dependency push commits or tags.
 permissions:
-  contents: write
+  contents: read
+
+# One release per tag. `cancel-in-progress: false` on purpose:
+# cancelling mid-publish can leave a half-uploaded release behind.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,6 +57,12 @@ jobs:
             runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history: the ancestry check below needs origin/main.
+          # `persist-credentials: false` keeps the (read-only) token
+          # out of .git/config — this job never pushes.
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install native build dependencies
         # libz-ng-sys compiles C through cmake, openssl-sys is cgo and
@@ -68,15 +83,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # The runner label is part of the key: `runner.os` is
+          # `Linux` for every ubuntu image, so a target/ tree built
+          # on ubuntu-latest (glibc 2.39) would otherwise be restored
+          # here and shipped as a binary that refuses to start on the
+          # glibc 2.36 production hosts.
+          key: ${{ runner.os }}-${{ matrix.runs-on }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-1.96-
+            ${{ runner.os }}-${{ matrix.runs-on }}-cargo-1.96-
 
       - name: Assert the tag matches the workspace version
         id: version
+        # The tag comes in through the environment, never spliced
+        # into the script: a ref name may contain `"`, `;` or `$(…)`,
+        # and this job holds a token.
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
+          tag="$TAG"
           if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
             echo "::error::tag '$tag' does not match v<semver>"
             exit 1
@@ -113,10 +138,25 @@ jobs:
           echo "release_version=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_version=$tag_version" >> "$GITHUB_OUTPUT"
 
+      - name: Assert the tagged commit is on main
+        run: |
+          set -euo pipefail
+          # The release procedure is "merge to main, then tag". This
+          # workflow runs no tests, so the tag is the operator's
+          # promise that the commit was through CI — enforce the
+          # "on main" half of it before spending a build on it.
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the tagged commit $(git rev-parse --short HEAD) is not on origin/main — merge to main before tagging"
+            exit 1
+          fi
+          echo "tagged commit $(git rev-parse --short HEAD) is on main"
+
       - name: make build
         run: make build
 
       - name: Assert the binaries exist and report the release version
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.tag_version }}
         run: |
           set -euo pipefail
           for bin in bin/pangolin-ngx bin/pangolin-tun; do
@@ -126,17 +166,19 @@ jobs:
             fi
             version="$("$bin" --version)"
             echo "$bin --version → $version"
-            if [[ "$version" != *"v${{ steps.version.outputs.tag_version }}"* ]]; then
-              echo "::error::$bin reports '$version', expected it to contain 'v${{ steps.version.outputs.tag_version }}'"
+            if [[ "$version" != *"v$TAG_VERSION"* ]]; then
+              echo "::error::$bin reports '$version', expected it to contain 'v$TAG_VERSION'"
               exit 1
             fi
           done
 
       - name: Stage and archive
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          release_version="${{ steps.version.outputs.release_version }}"
-          suffix="${{ matrix.target }}"
+          suffix="$TARGET"
           suffix="${suffix//\//_}"
           # Absolute paths: `tar -C` switches the directory it reads
           # the member names from, and the archive itself must not
@@ -148,9 +190,9 @@ jobs:
           cp README.md "$stage/README.md"
           # The three files sit at the archive root — no wrapping
           # directory, no path prefix.
-          tar -C "$stage" -czf "$PWD/dist/pangolin_${release_version}_${suffix}.tar.gz" \
+          tar -C "$stage" -czf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" \
             pangolin-ngx pangolin-tun README.md
-          tar -tzf "$PWD/dist/pangolin_${release_version}_${suffix}.tar.gz"
+          tar -tzf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v6
@@ -168,6 +210,10 @@ jobs:
     name: Publish GitHub Release
     needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only this job publishes, so only this job needs to write.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v7
         with:
