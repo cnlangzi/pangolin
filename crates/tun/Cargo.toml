@@ -38,7 +38,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 chrono.workspace = true
-pangolin-core = { version = "0.2.0", path = "../pangolin-core" }
+pangolin-core = { path = "../pangolin-core" }
 http = "1.4.1"
 
 [dev-dependencies]

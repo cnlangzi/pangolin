@@ -56,6 +56,11 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug)]
 #[command(name = "ngx")]
 #[command(about = "Pangolin gateway — public-facing HTTP/WebSocket proxy")]
+// The release workflow asserts that `--version` reports the tag the
+// binary was built from (see docs/release.md), so the string is the
+// workspace version behind a `v` — the same shape as the release tag
+// and the published archive name.
+#[command(version = concat!("v", env!("CARGO_PKG_VERSION")))]
 struct Args {
     /// Path to config file (default: ./ngx.yml)
     #[arg(short, long, default_value = "ngx.yml")]
@@ -304,4 +309,54 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     server.run(run_args);
     log::info!("pingora exited cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The release workflow gates the upload on `--version` printing
+    /// the tagged version (issue #128), so the `v` prefix and the
+    /// workspace version must stay in lockstep. See
+    /// `cli_version_is_workspace_version_with_v_prefix` in
+    /// crates/tun/src/main.rs — both binaries answer the same way.
+    #[test]
+    fn cli_version_is_workspace_version_with_v_prefix() {
+        let cmd = Args::command();
+        assert_eq!(
+            cmd.get_version(),
+            Some(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    /// The workflow matches the pushed tag against
+    /// `^v(\d+\.\d+\.\d+…)$` and then asserts the binary reports
+    /// `v<tag version>` — so the reported version has to be a
+    /// `v`-prefixed semver, not merely a string containing a `v`.
+    #[test]
+    fn cli_version_is_a_v_prefixed_semver() {
+        let cmd = Args::command();
+        let version = cmd
+            .get_version()
+            .expect("the clap command declares a version");
+        let core = version
+            .strip_prefix('v')
+            .expect("the version starts with 'v'")
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default();
+        let parts: Vec<&str> = core.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "version '{version}' is not major.minor.patch"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "version '{version}' has a non-numeric component"
+        );
+    }
 }

@@ -1,0 +1,241 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default to read-only. Only the publishing job needs to write, and
+# the build job runs third-party code (the workspace's build scripts,
+# the vendored OpenSSL, the tailwindcss/esbuild CLIs that
+# `make build` downloads and executes) — a write-scoped token in that
+# job would let a compromised dependency push commits or tags.
+permissions:
+  contents: read
+
+# One release per tag. `cancel-in-progress: false` on purpose:
+# cancelling mid-publish can leave a half-uploaded release behind.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ----------------------------------------------------------------
+  # Build: native compile of the release binaries
+  #
+  # Native — not the Docker pipeline in build/docker/dist.dockerfile —
+  # for two reasons:
+  #
+  #   - the published binary is compiled by the same Rust 1.96 that
+  #     .github/workflows/ci.yml tests, while the Docker pipeline
+  #     compiles with rustc 1.98.1, a version no CI job ever runs;
+  #   - ubuntu-22.04 ships glibc 2.35, which starts on the Debian 12
+  #     (glibc 2.36) production hosts, while ubuntu-latest (24.04,
+  #     glibc 2.39) produces binaries that die there with
+  #     `GLIBC_2.38 not found`. The openssl-sys dependency is cgo, so
+  #     those symbol versions are really recorded in the binary.
+  #
+  # `make build` (not a bare `cargo build`) is what ships the admin
+  # UI: it depends on `build-css`, which regenerates the minified
+  # `assets/app.css` that rust-embed snapshots into the binary.
+  # ----------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # `include:` only — adding a target later is one new entry.
+        include:
+          - target: linux/amd64
+            slug: linux-amd64
+            runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history: the ancestry check below needs origin/main.
+          # `persist-credentials: false` keeps the (read-only) token
+          # out of .git/config — this job never pushes.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        # libz-ng-sys compiles C through cmake, openssl-sys is cgo and
+        # needs the OpenSSL headers pkg-config points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # The runner label is part of the key: `runner.os` is
+          # `Linux` for every ubuntu image, so a target/ tree built
+          # on ubuntu-latest (glibc 2.39) would otherwise be restored
+          # here and shipped as a binary that refuses to start on the
+          # glibc 2.36 production hosts.
+          key: ${{ runner.os }}-${{ matrix.runs-on }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.runs-on }}-cargo-1.96-
+
+      - name: Assert the tag matches the workspace version
+        id: version
+        # The tag comes in through the environment, never spliced
+        # into the script: a ref name may contain `"`, `;` or `$(…)`,
+        # and this job holds a token.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::tag '$tag' does not match v<semver>"
+            exit 1
+          fi
+          tag_version="${BASH_REMATCH[1]}"
+
+          # `cargo metadata` exposes the workspace version as
+          # `workspace_version` on newer cargo releases; cargo 1.96
+          # does not, so the fallback reads [workspace.package].version
+          # straight out of Cargo.toml. The workflow never rewrites
+          # Cargo.toml — a mismatch is the operator's to fix.
+          workspace_version="$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.workspace_version // empty' || true)"
+          if [ -z "$workspace_version" ]; then
+            workspace_version="$(awk '
+              /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; next }
+              /^\[/ { inpkg = 0 }
+              inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+                if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+              }
+            ' Cargo.toml)"
+          fi
+          if [ -z "$workspace_version" ]; then
+            echo "::error::could not read [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "::error::tag '$tag' (version $tag_version) does not match the workspace version '$workspace_version' in Cargo.toml — bump [workspace.package].version before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches the workspace version $workspace_version"
+          # The release version is the tag verbatim — the leading `v`
+          # stays, so tag, archive name and `--version` all read the
+          # same way.
+          echo "release_version=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag_version=$tag_version" >> "$GITHUB_OUTPUT"
+
+      - name: Assert the tagged commit is on main
+        run: |
+          set -euo pipefail
+          # The release procedure is "merge to main, then tag". This
+          # workflow runs no tests, so the tag is the operator's
+          # promise that the commit was through CI — enforce the
+          # "on main" half of it before spending a build on it.
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the tagged commit $(git rev-parse --short HEAD) is not on origin/main — merge to main before tagging"
+            exit 1
+          fi
+          echo "tagged commit $(git rev-parse --short HEAD) is on main"
+
+      - name: make build
+        run: make build
+
+      - name: Assert the binaries exist and report the release version
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.tag_version }}
+        run: |
+          set -euo pipefail
+          for bin in bin/pangolin-ngx bin/pangolin-tun; do
+            if [ ! -x "$bin" ]; then
+              echo "::error::$bin is missing or not executable after 'make build'"
+              exit 1
+            fi
+            version="$("$bin" --version)"
+            echo "$bin --version → $version"
+            if [[ "$version" != *"v$TAG_VERSION"* ]]; then
+              echo "::error::$bin reports '$version', expected it to contain 'v$TAG_VERSION'"
+              exit 1
+            fi
+          done
+
+      - name: Stage and archive
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          suffix="$TARGET"
+          suffix="${suffix//\//_}"
+          # Absolute paths: `tar -C` switches the directory it reads
+          # the member names from, and the archive itself must not
+          # follow it.
+          stage="$PWD/dist/stage"
+          mkdir -p "$stage"
+          install -m 0755 bin/pangolin-ngx "$stage/pangolin-ngx"
+          install -m 0755 bin/pangolin-tun "$stage/pangolin-tun"
+          cp README.md "$stage/README.md"
+          # The three files sit at the archive root — no wrapping
+          # directory, no path prefix.
+          tar -C "$stage" -czf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" \
+            pangolin-ngx pangolin-tun README.md
+          tar -tzf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pangolin-${{ matrix.slug }}
+          path: dist/pangolin_*.tar.gz
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Release: publish the archives + checksums to the GitHub Release
+  # of the pushed tag. No tests run here — the operator tags a commit
+  # whose CI run on `main` was already green.
+  # ----------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only this job publishes, so only this job needs to write.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Running inside dist/ is what keeps the recorded paths
+          # relative, so `sha256sum -c SHA256SUMS.txt` works from the
+          # directory holding the archives.
+          sha256sum pangolin_*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
