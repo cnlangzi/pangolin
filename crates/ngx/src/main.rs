@@ -56,6 +56,11 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug)]
 #[command(name = "ngx")]
 #[command(about = "Pangolin gateway — public-facing HTTP/WebSocket proxy")]
+// The release workflow asserts that `--version` reports the tag the
+// binary was built from (see docs/release.md), so the string is the
+// workspace version behind a `v` — the same shape as the release tag
+// and the published archive name.
+#[command(version = concat!("v", env!("CARGO_PKG_VERSION")))]
 struct Args {
     /// Path to config file (default: ./ngx.yml)
     #[arg(short, long, default_value = "ngx.yml")]
@@ -304,4 +309,24 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     server.run(run_args);
     log::info!("pingora exited cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The release workflow gates the upload on `--version` printing
+    /// the tagged version (issue #128), so the `v` prefix and the
+    /// workspace version must stay in lockstep. See
+    /// `cli_version_is_workspace_version_with_v_prefix` in
+    /// crates/tun/src/main.rs — both binaries answer the same way.
+    #[test]
+    fn cli_version_is_workspace_version_with_v_prefix() {
+        let cmd = Args::command();
+        assert_eq!(
+            cmd.get_version(),
+            Some(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
+    }
 }

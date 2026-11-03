@@ -20,6 +20,11 @@ use pangolin_core::init_logger;
 #[derive(Debug, clap::Parser)]
 #[command(name = "tun")]
 #[command(about = "Pangolin tunnel node — connects to ngx, proxies customer traffic")]
+// The release workflow asserts that `--version` reports the tag the
+// binary was built from (see docs/release.md), so the string is the
+// workspace version behind a `v` — the same shape as the release tag
+// and the published archive name.
+#[command(version = concat!("v", env!("CARGO_PKG_VERSION")))]
 struct Args {
     /// Path to config file (default: ./tun.yml)
     #[arg(short, long, default_value = "tun.yml")]
@@ -42,4 +47,24 @@ async fn main() -> Result<()> {
     client.run().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The release workflow gates the upload on `--version` printing
+    /// the tagged version (issue #128), so the `v` prefix and the
+    /// workspace version must stay in lockstep. See
+    /// `cli_version_is_workspace_version_with_v_prefix` in
+    /// crates/ngx/src/main.rs — both binaries answer the same way.
+    #[test]
+    fn cli_version_is_workspace_version_with_v_prefix() {
+        let cmd = Args::command();
+        assert_eq!(
+            cmd.get_version(),
+            Some(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
+    }
 }

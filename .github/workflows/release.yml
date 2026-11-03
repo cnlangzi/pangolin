@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The release job uploads assets to the GitHub Release of the pushed
+# tag, which needs write access to the repository contents.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ----------------------------------------------------------------
+  # Build: native compile of the release binaries
+  #
+  # Native — not the Docker pipeline in build/docker/dist.dockerfile —
+  # for two reasons:
+  #
+  #   - the published binary is compiled by the same Rust 1.96 that
+  #     .github/workflows/ci.yml tests, while the Docker pipeline
+  #     compiles with rustc 1.98.1, a version no CI job ever runs;
+  #   - ubuntu-22.04 ships glibc 2.35, which starts on the Debian 12
+  #     (glibc 2.36) production hosts, while ubuntu-latest (24.04,
+  #     glibc 2.39) produces binaries that die there with
+  #     `GLIBC_2.38 not found`. The openssl-sys dependency is cgo, so
+  #     those symbol versions are really recorded in the binary.
+  #
+  # `make build` (not a bare `cargo build`) is what ships the admin
+  # UI: it depends on `build-css`, which regenerates the minified
+  # `assets/app.css` that rust-embed snapshots into the binary.
+  # ----------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # `include:` only — adding a target later is one new entry.
+        include:
+          - target: linux/amd64
+            slug: linux-amd64
+            runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install native build dependencies
+        # libz-ng-sys compiles C through cmake, openssl-sys is cgo and
+        # needs the OpenSSL headers pkg-config points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.96-
+
+      - name: Assert the tag matches the workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+            echo "::error::tag '$tag' does not match v<semver>"
+            exit 1
+          fi
+          tag_version="${BASH_REMATCH[1]}"
+
+          # `cargo metadata` exposes the workspace version as
+          # `workspace_version` on newer cargo releases; cargo 1.96
+          # does not, so the fallback reads [workspace.package].version
+          # straight out of Cargo.toml. The workflow never rewrites
+          # Cargo.toml — a mismatch is the operator's to fix.
+          workspace_version="$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.workspace_version // empty' || true)"
+          if [ -z "$workspace_version" ]; then
+            workspace_version="$(awk '
+              /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; next }
+              /^\[/ { inpkg = 0 }
+              inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+                if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+              }
+            ' Cargo.toml)"
+          fi
+          if [ -z "$workspace_version" ]; then
+            echo "::error::could not read [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "::error::tag '$tag' (version $tag_version) does not match the workspace version '$workspace_version' in Cargo.toml — bump [workspace.package].version before tagging"
+            exit 1
+          fi
+          echo "tag $tag matches the workspace version $workspace_version"
+          # The release version is the tag verbatim — the leading `v`
+          # stays, so tag, archive name and `--version` all read the
+          # same way.
+          echo "release_version=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag_version=$tag_version" >> "$GITHUB_OUTPUT"
+
+      - name: make build
+        run: make build
+
+      - name: Assert the binaries exist and report the release version
+        run: |
+          set -euo pipefail
+          for bin in bin/pangolin-ngx bin/pangolin-tun; do
+            if [ ! -x "$bin" ]; then
+              echo "::error::$bin is missing or not executable after 'make build'"
+              exit 1
+            fi
+            version="$("$bin" --version)"
+            echo "$bin --version → $version"
+            if [[ "$version" != *"v${{ steps.version.outputs.tag_version }}"* ]]; then
+              echo "::error::$bin reports '$version', expected it to contain 'v${{ steps.version.outputs.tag_version }}'"
+              exit 1
+            fi
+          done
+
+      - name: Stage and archive
+        run: |
+          set -euo pipefail
+          release_version="${{ steps.version.outputs.release_version }}"
+          suffix="${{ matrix.target }}"
+          suffix="${suffix//\//_}"
+          # Absolute paths: `tar -C` switches the directory it reads
+          # the member names from, and the archive itself must not
+          # follow it.
+          stage="$PWD/dist/stage"
+          mkdir -p "$stage"
+          install -m 0755 bin/pangolin-ngx "$stage/pangolin-ngx"
+          install -m 0755 bin/pangolin-tun "$stage/pangolin-tun"
+          cp README.md "$stage/README.md"
+          # The three files sit at the archive root — no wrapping
+          # directory, no path prefix.
+          tar -C "$stage" -czf "$PWD/dist/pangolin_${release_version}_${suffix}.tar.gz" \
+            pangolin-ngx pangolin-tun README.md
+          tar -tzf "$PWD/dist/pangolin_${release_version}_${suffix}.tar.gz"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pangolin-${{ matrix.slug }}
+          path: dist/pangolin_*.tar.gz
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Release: publish the archives + checksums to the GitHub Release
+  # of the pushed tag. No tests run here — the operator tags a commit
+  # whose CI run on `main` was already green.
+  # ----------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Running inside dist/ is what keeps the recorded paths
+          # relative, so `sha256sum -c SHA256SUMS.txt` works from the
+          # directory holding the archives.
+          sha256sum pangolin_*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt

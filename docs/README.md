@@ -13,6 +13,7 @@ New to Pangolin? Start here:
 
 - [Configuration](configuration.md) — `ngx.yml` / `tun.yml` field reference, env-var overrides, file lookup, real-world examples
 - [Database migrations](migrations.md) — how the SQLite schema is versioned and applied (refinery)
+- [Release procedure](release.md) — how a `v*` tag becomes a GitHub Release with `pangolin-ngx` / `pangolin-tun`
 - [Reload API](admin/reload-api.md) — `POST /api/reload` for refreshing the in-memory config after out-of-band DB edits
 
 ## Design
