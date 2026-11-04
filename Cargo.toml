@@ -9,8 +9,12 @@ members = [
     "tests",
 ]
 
+# The workspace version is a placeholder, not a released version: the
+# release workflow writes the pushed tag's version into the
+# `[workspace.package]` line below before the build, so the tag is the
+# single source of truth for a release's version. See docs/release.md.
 [workspace.package]
-version = "0.2.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"

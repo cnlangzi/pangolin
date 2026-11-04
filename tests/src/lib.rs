@@ -31,6 +31,14 @@ mod routing;
 #[cfg(test)]
 mod cargo_mirror;
 
+// Release-pipeline regression tests (the tag is the version, issue
+// #130).  Like the mirror tests above, these need neither the
+// `integration` feature nor a real binary: they parse the manifest
+// and the lockfile, and drive the release workflow's own shell steps
+// against a throwaway manifest.
+#[cfg(test)]
+mod release_version;
+
 #[cfg(feature = "integration")]
 mod backend;
 

@@ -92,7 +92,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.runs-on }}-cargo-1.96-
 
-      - name: Assert the tag matches the workspace version
+      - name: Validate the tag
         id: version
         # The tag comes in through the environment, never spliced
         # into the script: a ref name may contain `"`, `;` or `$(…)`,
@@ -107,31 +107,7 @@ jobs:
             exit 1
           fi
           tag_version="${BASH_REMATCH[1]}"
-
-          # `cargo metadata` exposes the workspace version as
-          # `workspace_version` on newer cargo releases; cargo 1.96
-          # does not, so the fallback reads [workspace.package].version
-          # straight out of Cargo.toml. The workflow never rewrites
-          # Cargo.toml — a mismatch is the operator's to fix.
-          workspace_version="$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.workspace_version // empty' || true)"
-          if [ -z "$workspace_version" ]; then
-            workspace_version="$(awk '
-              /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; next }
-              /^\[/ { inpkg = 0 }
-              inpkg && /^[[:space:]]*version[[:space:]]*=/ {
-                if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
-              }
-            ' Cargo.toml)"
-          fi
-          if [ -z "$workspace_version" ]; then
-            echo "::error::could not read [workspace.package].version from Cargo.toml"
-            exit 1
-          fi
-          if [ "$tag_version" != "$workspace_version" ]; then
-            echo "::error::tag '$tag' (version $tag_version) does not match the workspace version '$workspace_version' in Cargo.toml — bump [workspace.package].version before tagging"
-            exit 1
-          fi
-          echo "tag $tag matches the workspace version $workspace_version"
+          echo "tag $tag is a valid release tag (version $tag_version)"
           # The release version is the tag verbatim — the leading `v`
           # stays, so tag, archive name and `--version` all read the
           # same way.
@@ -150,6 +126,65 @@ jobs:
             exit 1
           fi
           echo "tagged commit $(git rev-parse --short HEAD) is on main"
+
+      - name: Set the workspace version from the tag
+        # The tag is the single source of truth for the release
+        # version. The repository carries the placeholder 0.0.0 in
+        # `[workspace.package]`, and this step writes the tag's
+        # version into it before the build — so the operator never has
+        # to bump a version by hand before tagging.
+        #
+        # One manifest line moves every version string in the binaries:
+        # `--version`, `/healthz`, the startup log and both User-Agent
+        # strings all read CARGO_PKG_VERSION, which every workspace
+        # member inherits from this line.
+        #
+        # The write happens *after* the cargo cache step on purpose:
+        # the cache key hashes `**/Cargo.toml`, so rewriting the
+        # manifest first would give every release a unique key and
+        # force a cold build (a cold `make build` of this tree —
+        # vendored OpenSSL included — takes ~26 min on 4 cores).
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.tag_version }}
+        run: |
+          set -euo pipefail
+          # The tag version has already passed the semver regex, so it
+          # holds only digits, letters, `.`, `+` and `-` — safe to
+          # splice into the awk program below.
+          #
+          # The rewrite is scoped to the [workspace.package] table: a
+          # global substitution would also hit the `version = "…"`
+          # keys under [workspace.dependencies] and break the build.
+          awk -v ver="$TAG_VERSION" '
+            /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; print; next }
+            /^\[/ { inpkg = 0 }
+            inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+              print "version = \"" ver "\""
+              next
+            }
+            { print }
+          ' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+
+          # Read the value back with the same table-scoped lookup and
+          # compare it: a rewrite that silently did not take effect
+          # must fail the job before the build, not after it.
+          workspace_version="$(awk '
+            /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; next }
+            /^\[/ { inpkg = 0 }
+            inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+            }
+          ' Cargo.toml)"
+          if [ -z "$workspace_version" ]; then
+            echo "::error::could not read [workspace.package].version from Cargo.toml — expected $TAG_VERSION"
+            exit 1
+          fi
+          if [ "$workspace_version" != "$TAG_VERSION" ]; then
+            echo "::error::could not set [workspace.package].version in Cargo.toml to $TAG_VERSION (found '$workspace_version')"
+            exit 1
+          fi
+          echo "[workspace.package].version is now $workspace_version"
 
       - name: make build
         run: make build
