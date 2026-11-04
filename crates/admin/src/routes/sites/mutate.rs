@@ -200,15 +200,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         Ok(()) => save_provider(&db, &name, &parsed_provider),
         Err(_) => None,
     };
-    // The bot list is written only after the site row itself was
-    // written — a failed site write must not leave an orphaned list.
-    let bots_result = match &result {
-        Ok(()) => parsed_bots.as_ref().map(|submitted| {
-            let bots = merge_bot_list(submitted, &stored_bots, &renderable_bot_ids(app));
-            pangolin_core::db::set_site_rate_limit_bots(&db, &name, &bots)
-        }),
-        Err(_) => None,
-    };
+    let bots_result = save_bot_list(&db, app, &name, &result, parsed_bots.as_ref(), &stored_bots);
     drop(db);
 
     match result {
@@ -452,15 +444,7 @@ pub async fn handle_update(
         Ok(()) => save_provider(&db, &name, &parsed_provider),
         Err(_) => None,
     };
-    // The bot list is written only after the site row itself was
-    // written — a failed site write must not leave an orphaned list.
-    let bots_result = match &result {
-        Ok(()) => parsed_bots.as_ref().map(|submitted| {
-            let bots = merge_bot_list(submitted, &stored_bots, &renderable_bot_ids(app));
-            pangolin_core::db::set_site_rate_limit_bots(&db, &name, &bots)
-        }),
-        Err(_) => None,
-    };
+    let bots_result = save_bot_list(&db, app, &name, &result, parsed_bots.as_ref(), &stored_bots);
     drop(db);
 
     match result {
@@ -561,6 +545,34 @@ fn save_provider(
         Err(e) => Err(e),
     };
     Some(result)
+}
+
+/// Persist the site's bot-limited list (issue #131).
+///
+/// The list is written only after the site row itself was written —
+/// a failed site write must not leave an orphaned list. A submission
+/// that carried no list at all leaves the stored list untouched.
+///
+/// The stored ids the form cannot show survive the save (see
+/// [`merge_bot_list`]): the operator has no way to manage them
+/// through the form, so an unrelated save must not silently drop
+/// them.
+fn save_bot_list(
+    db: &rusqlite::Connection,
+    app: &Arc<App>,
+    site_name: &str,
+    site_result: &rusqlite::Result<()>,
+    submitted: Option<&BTreeSet<String>>,
+    stored: &BTreeSet<String>,
+) -> Option<rusqlite::Result<()>> {
+    if site_result.is_err() {
+        return None;
+    }
+    let submitted = submitted?;
+    let bots = merge_bot_list(submitted, stored, &renderable_bot_ids(app));
+    Some(pangolin_core::db::set_site_rate_limit_bots(
+        db, site_name, &bots,
+    ))
 }
 
 /// Rebuild the `Site` shown back to the operator when a submission is
@@ -836,6 +848,13 @@ mod tests {
         assert!(
             checkbox_is_checked(&body, "gptbot"),
             "the site's stored list must be pre-checked"
+        );
+        // Every bot carries its category badge — the same one the
+        // bot log shows, so the operator recognises an AI scraper at a
+        // glance.
+        assert!(
+            body.contains("bg-purple-100") && body.contains("ai_bot"),
+            "the form must badge each bot with its category"
         );
         assert!(
             !checkbox_is_checked(&body, "googlebot"),

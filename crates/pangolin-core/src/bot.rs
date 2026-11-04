@@ -67,6 +67,31 @@ impl std::fmt::Display for BotCategory {
 }
 
 impl BotCategory {
+    /// The Tailwind class token of the category badge.
+    ///
+    /// The admin UI colours a bot's category the same way everywhere:
+    /// the badge on the bot-log rows, the badge on the site's
+    /// bot-limited list. One mapping, so the two never drift.
+    pub fn class(&self) -> &'static str {
+        match self {
+            BotCategory::SearchEngine => {
+                "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
+            }
+            BotCategory::AiBot => {
+                "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200"
+            }
+            BotCategory::Social => {
+                "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200"
+            }
+            BotCategory::Monitoring => {
+                "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200"
+            }
+            BotCategory::AdsBot => {
+                "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200"
+            }
+        }
+    }
+
     /// Parse the wire label produced by knownbots `BotKind::to_category_label`.
     pub fn from_label(label: &str) -> Self {
         match label {
@@ -285,6 +310,22 @@ mod tests {
         assert!(!is_safe_bot_id("bot.name"));
         assert!(!is_safe_bot_id("bot/name"));
         assert!(!is_safe_bot_id("bot\"onmouseover"));
+    }
+
+    /// Every category has a badge class — the admin UI colours the
+    /// category the same way on the bot log and on the site's
+    /// bot-limited list.
+    #[test]
+    fn every_category_has_a_badge_class() {
+        for cat in [
+            BotCategory::SearchEngine,
+            BotCategory::AiBot,
+            BotCategory::Social,
+            BotCategory::Monitoring,
+            BotCategory::AdsBot,
+        ] {
+            assert!(!cat.class().is_empty(), "category {cat:?} → empty class");
+        }
     }
 
     #[test]

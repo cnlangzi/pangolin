@@ -22,7 +22,9 @@
 //! is identical on every delivery path.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -2211,6 +2213,13 @@ fn apply_pgl_headers(session: &mut Session, enabled: bool, pgl: &pangolin_core::
     }
 }
 
+/// The header values already warned about.
+///
+/// A value that cannot be written is *config* state — the operator's
+/// own bot registry — not per-request data. Warning on every request
+/// would flood the log, so one line per distinct value is enough.
+static WARNED_VALUES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
 /// The value to write for a gateway header.
 ///
 /// An empty value is legal — the header must be present even when the
@@ -2221,17 +2230,32 @@ fn apply_pgl_headers(session: &mut Session, enabled: bool, pgl: &pangolin_core::
 /// cannot tell an absent header from an empty one. Only the bot's
 /// registry id can be illegal — it comes from the operator's own YAML
 /// — so this is a misconfigured registry, and the operator has to hear
-/// about it.
+/// about it (once).
 fn legal_header_value(name: &str, value: &str) -> HeaderValue {
     match HeaderValue::from_str(value) {
         Ok(v) => v,
         Err(_) => {
-            warn!(
-                "pgl: {name} carries a value that is not a legal header value \
-                 — writing an empty one; check the bot registry"
-            );
+            warn_once_per_value(name, value);
             HeaderValue::from_static("")
         }
+    }
+}
+
+/// Warn about a header value that cannot be written — once per
+/// distinct value.
+fn warn_once_per_value(name: &str, value: &str) {
+    let seen = WARNED_VALUES.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = match seen.lock() {
+        Ok(mut seen) => seen.insert(value.to_string()),
+        // A poisoned lock must not take the request down — warn and
+        // carry on.
+        Err(_) => true,
+    };
+    if first {
+        warn!(
+            "pgl: {name} carries a value that is not a legal header value \
+             — writing an empty one; check the bot registry"
+        );
     }
 }
 
