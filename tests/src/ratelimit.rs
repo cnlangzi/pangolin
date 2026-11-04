@@ -249,7 +249,7 @@ async fn limiter_throttles_over_the_request_limit() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -260,7 +260,7 @@ async fn limiter_throttles_over_the_request_limit() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -270,7 +270,7 @@ async fn limiter_throttles_over_the_request_limit() {
         "a",
         &cfg,
         Some(client),
-        false,
+        None,
         Some("/"),
         ClientGeo::default(),
     ) {
@@ -306,7 +306,7 @@ async fn limiter_counts_distinct_pages() {
                 "a",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some(&key),
                 ClientGeo::default()
             ),
@@ -321,7 +321,7 @@ async fn limiter_counts_distinct_pages() {
                 "a",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/p0"),
                 ClientGeo::default()
             ),
@@ -336,7 +336,7 @@ async fn limiter_counts_distinct_pages() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some(&key),
             ClientGeo::default(),
         );
@@ -374,7 +374,7 @@ async fn limiter_exempts_a_verified_known_bot() {
             "a",
             &cfg,
             Some(ip(198, 51, 100, 12)),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -385,21 +385,155 @@ async fn limiter_exempts_a_verified_known_bot() {
     );
 
     // …while the verified bot is served normally.
-    let verified = pangolin_core::verify_bot(verifier, ua, bot).is_some();
-    assert!(verified, "the seeded Googlebot CIDR must verify");
+    let identity = pangolin_core::verify_bot(verifier, ua, bot).expect("the seeded CIDR verifies");
+    assert_eq!(identity.name, "googlebot");
     for _ in 0..5 {
         assert_eq!(
             app.rate_limiter.check(
                 "a",
                 &cfg,
                 Some(bot),
-                verified,
+                Some(&identity.name),
                 Some("/"),
                 ClientGeo::default()
             ),
             LimitDecision::Allow
         );
     }
+}
+
+/// A site that lists a bot in its bot-limited list counts that bot
+/// against its limits; a bot that is not listed stays exempt
+/// (issue #131, R5).
+#[tokio::test]
+async fn a_listed_bot_is_counted_against_the_sites_limits() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(1, 0)).unwrap();
+        db::set_site_rate_limit_bots(&db, "a", &["googlebot".to_string()].into_iter().collect())
+            .unwrap();
+    }
+    app.reload_indexes().await;
+
+    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let bot = ip(66, 249, 66, 1);
+
+    // The listed bot: the first request fits the limit of 1 per
+    // window, the second one is over it.
+    assert_eq!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(bot),
+            Some("googlebot"),
+            Some("/"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Allow
+    );
+    assert!(
+        matches!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(bot),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ),
+        "a listed bot must be counted against the site's limits"
+    );
+
+    // A bot that is not listed is still exempt — the site only listed
+    // `googlebot`.
+    let other = ip(66, 249, 66, 2);
+    for _ in 0..5 {
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(other),
+                Some("gptbot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+    }
+}
+
+/// The list is applied without a restart: saving it and reloading the
+/// indexes changes the behaviour of the next request (issue #131,
+/// R11).
+#[tokio::test]
+async fn the_bot_list_takes_effect_through_the_reload_path() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(1, 0)).unwrap();
+    }
+    app.reload_indexes().await;
+
+    let bot = ip(66, 249, 66, 1);
+    // Before the site lists the bot it is exempt.
+    {
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        for _ in 0..5 {
+            assert_eq!(
+                app.rate_limiter.check(
+                    "a",
+                    &cfg,
+                    Some(bot),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow
+            );
+        }
+    }
+
+    // The operator lists the bot — no restart, just a reload.
+    {
+        let db = app.db.lock().await;
+        db::set_site_rate_limit_bots(&db, "a", &["googlebot".to_string()].into_iter().collect())
+            .unwrap();
+    }
+    app.reload_indexes().await;
+
+    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    assert_eq!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(bot),
+            Some("googlebot"),
+            Some("/"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Allow
+    );
+    assert!(
+        matches!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(bot),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ),
+        "the newly listed bot must be limited right after the reload"
+    );
 }
 
 #[tokio::test]
@@ -432,7 +566,7 @@ async fn limiter_blocks_a_blacklisted_ip() {
             "a",
             &cfg,
             Some(ip(203, 0, 113, 9)),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -444,7 +578,7 @@ async fn limiter_blocks_a_blacklisted_ip() {
             "a",
             &cfg,
             Some(ip(198, 51, 100, 13)),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -470,7 +604,7 @@ async fn reload_indexes_picks_up_a_changed_policy() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -481,7 +615,7 @@ async fn reload_indexes_picks_up_a_changed_policy() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -501,7 +635,7 @@ async fn reload_indexes_picks_up_a_changed_policy() {
             "a",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -629,7 +763,7 @@ async fn unknown_client_ip_is_neither_counted_nor_limited() {
     for _ in 0..10 {
         assert_eq!(
             app.rate_limiter
-                .check("a", &cfg, None, false, Some("/"), ClientGeo::default()),
+                .check("a", &cfg, None, None, Some("/"), ClientGeo::default()),
             LimitDecision::Allow
         );
     }
@@ -661,7 +795,7 @@ async fn two_sites_have_independent_counters() {
             "a",
             &cfg_a,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -673,7 +807,7 @@ async fn two_sites_have_independent_counters() {
             "b",
             &cfg_b,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -684,7 +818,7 @@ async fn two_sites_have_independent_counters() {
             "a",
             &cfg_a,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default()
         ),
@@ -698,7 +832,8 @@ fn policy_map_is_built_for_every_site() {
     // default policy (limits off).
     let names = vec!["a".to_string(), "b".to_string()];
     let policies: HashMap<String, RateLimitPolicy> = HashMap::new();
-    let configs = pangolin_core::ratelimit::build_limit_configs(&names, &policies, &[]);
+    let configs =
+        pangolin_core::ratelimit::build_limit_configs(&names, &policies, &[], &HashMap::new());
     assert_eq!(configs.len(), 2);
     assert!(!configs["a"].policy.enabled);
     assert!(!configs["b"].policy.enabled);
@@ -723,12 +858,12 @@ async fn a_rejected_client_reaches_the_snapshot_with_its_geo() {
     };
     assert_eq!(
         app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/"), geo),
+            .check("a", &cfg, Some(client), None, Some("/"), geo),
         LimitDecision::Allow
     );
     assert!(matches!(
         app.rate_limiter
-            .check("a", &cfg, Some(client), false, Some("/"), geo),
+            .check("a", &cfg, Some(client), None, Some("/"), geo),
         LimitDecision::Throttled { .. }
     ));
 

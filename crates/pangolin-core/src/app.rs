@@ -503,6 +503,11 @@ impl App {
         // the limits together.
         let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
         let rules = db::list_ip_rules(&conn).unwrap_or_default();
+        // Issue #131: the per-site list of known bots that are **not**
+        // exempt on that site. It travels with the routing table, so a
+        // site's list is always resolved against the same revision as
+        // its routing entry.
+        let bot_limits = db::list_site_rate_limit_bots(&conn).unwrap_or_default();
         // Issue #122: the per-site provider overrides and the manual
         // allow ranges, read before the index build so a site's
         // effective provider can be resolved against the global
@@ -528,6 +533,7 @@ impl App {
             domains.clone(),
             &policies,
             &rules,
+            &bot_limits,
             &site_providers,
             &site_ranges,
             &global_provider,
@@ -563,9 +569,9 @@ impl App {
         // The bot log and the knownbots verifier are **always on**
         // (issue #117): the rate limiter's known-bot exemption must
         // be unconditional, and a disabled bot log silently turned
-        // the gateway's `P-Known-Bot` header into `0`. The retired
-        // `log.bot.enabled` key is ignored — `Config::from_str`
-        // warns about it.
+        // the gateway's `P-Known-Bot` header into an empty value.
+        // The retired `log.bot.enabled` key is ignored —
+        // `Config::from_str` warns about it.
         //
         // The writer *object* is built here, but the task that
         // drains its queue is NOT spawned here. `App::new` runs
@@ -661,6 +667,10 @@ impl App {
         // the routing table.
         let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
         let rules = db::list_ip_rules(&conn).unwrap_or_default();
+        // Issue #131: the per-site bot lists travel with the routing
+        // table, so a site's list is always resolved against the same
+        // revision as its routing entry.
+        let bot_limits = db::list_site_rate_limit_bots(&conn).unwrap_or_default();
         // Issue #122: the per-site provider overrides and the manual
         // allow ranges travel with the routing table, so a site's
         // effective provider is always resolved against the same
@@ -689,6 +699,7 @@ impl App {
             domains.clone(),
             &policies,
             &rules,
+            &bot_limits,
             &site_providers,
             &site_ranges,
             &global_provider,

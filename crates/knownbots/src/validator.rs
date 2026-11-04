@@ -502,6 +502,16 @@ impl Validator {
         self.bots.len()
     }
 
+    /// The registry this verifier knows.
+    ///
+    /// The embedded YAML plus whatever the operator dropped into
+    /// `<root>/conf.d/` — the same bots a request is checked against,
+    /// so a caller that offers the bots to an operator is offering the
+    /// ones that can actually verify.
+    pub fn bots(&self) -> &[Bot] {
+        &self.bots
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

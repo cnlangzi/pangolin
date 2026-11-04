@@ -174,7 +174,7 @@ fn the_migration_applies_to_a_fresh_database() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(count, 10, "V1..V10 must be applied");
+    assert_eq!(count, 11, "V1..V11 must be applied");
 
     // The renamed column and the new tables are there.
     let cols: Vec<String> = conn
@@ -188,7 +188,12 @@ fn the_migration_applies_to_a_fresh_database() {
     assert!(!cols.iter().any(|c| c == "frontend_mode"), "{cols:?}");
     assert!(cols.iter().any(|c| c == "origin_guard_enabled"), "{cols:?}");
 
-    for table in ["site_providers", "site_origin_allow", "provider_ip_lists"] {
+    for table in [
+        "site_providers",
+        "site_origin_allow",
+        "provider_ip_lists",
+        "site_rate_limit_bots",
+    ] {
         let n: i64 = conn
             .query_row(
                 &format!(
@@ -354,6 +359,7 @@ fn a_site_without_a_provider_row_inherits_the_global_provider() {
         &[],
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
         &global,
     );
     let cfg = indexes
@@ -393,6 +399,7 @@ fn a_site_with_a_provider_row_overrides_the_global_provider() {
         vec![],
         &HashMap::new(),
         &[],
+        &HashMap::new(),
         &overrides,
         &ranges,
         &global,

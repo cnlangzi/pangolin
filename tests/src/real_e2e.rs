@@ -11,6 +11,7 @@
 //! Prerequisite: `make build` (or `cargo build --release -p ngx -p tun`)
 //! so the binaries exist at `target/release/{ngx,tun}`.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2448,8 +2449,8 @@ async fn real_e2e_proxy_injects_x_forwarded_headers_all_paths() {
         );
         assert_eq!(
             h("P-Known-Bot"),
-            "0",
-            "{host}: P-Known-Bot must be 0 without a verified bot"
+            "",
+            "{host}: P-Known-Bot must be empty without a verified bot"
         );
         assert_eq!(
             h("P-Client-Country"),
@@ -2590,7 +2591,7 @@ async fn real_e2e_gateway_headers_replace_client_supplied_values() {
     );
     assert_eq!(
         header_value(last, "P-Known-Bot"),
-        "0",
+        "",
         "the forged P-Known-Bot must be replaced by pangolin's value"
     );
     assert_eq!(
@@ -4579,6 +4580,36 @@ fn seed_rate_limit_with_body(
     .expect("insert site_rate_limits");
 }
 
+/// Seed the per-site list of known bots that are **not** exempt from
+/// that site's rate limits (the `site_rate_limit_bots` table added by
+/// the V11 migration).
+fn seed_rate_limit_bots(conn: &Connection, site_name: &str, bot_name: &str) {
+    conn.execute(
+        "INSERT INTO site_rate_limit_bots (site_name, bot_name) VALUES (?1, ?2)",
+        rusqlite::params![site_name, bot_name],
+    )
+    .expect("insert site_rate_limit_bots");
+}
+
+/// Override the `googlebot` registry entry so the e2e can present a
+/// verified bot from the loopback address.
+///
+/// The override **replaces** the embedded entry, so it carries no
+/// `urls`: the bot is never refreshed from the vendor, and its
+/// `custom` CIDR is always in force. The registry is read from
+/// `<cache root>/conf.d/` — the cache root defaults to
+/// `./logs/bots/cache` relative to the process's working directory,
+/// which is the tempdir the harness spawns the binary in.
+fn seed_googlebot_registry(cache_root: &Path) {
+    let conf_d = cache_root.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("mkdir conf.d");
+    std::fs::write(
+        conf_d.join("googlebot.yaml"),
+        "kind: SearchEngine\nname: googlebot\nvendor: \"Google\"\nua: \"Googlebot\"\ncustom:\n  - \"127.0.0.1/32\"\n",
+    )
+    .expect("write googlebot.yaml");
+}
+
 /// Seed a global IP rule (the `ip_rules` table added by V9).
 fn seed_ip_rule(conn: &Connection, kind: &str, cidr: &str) {
     conn.execute(
@@ -4751,6 +4782,112 @@ async fn real_e2e_rate_limit_whitelist_is_exempt() {
         assert_eq!(
             status, 200,
             "request {i} must be served — the client is whitelisted, got {status} ({body})"
+        );
+    }
+    assert_eq!(backend.seen().await.len(), 5);
+}
+
+/// A verified known bot that the site lists is counted against the
+/// site's limits (issue #131): the second request is answered 429,
+/// while a bot the site does not list stays exempt.
+///
+/// The request that is served also carries the bot's registry id in
+/// `P-Known-Bot` — the value the site's list matches against.
+#[tokio::test]
+async fn real_e2e_a_listed_known_bot_is_rate_limited() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "rl-bot-site", &format!("http://{addr}"));
+            seed_domain(&conn, "rl-bot.test", "rl-bot-site");
+            seed_rate_limit(&conn, "rl-bot-site", 1, 60);
+            // The site subjects `googlebot` to its limits.
+            seed_rate_limit_bots(&conn, "rl-bot-site", "googlebot");
+            // The registry the verifier reads lives in the cache root.
+            let cache_root = db_path
+                .parent()
+                .expect("the db lives in the tempdir")
+                .join("logs/bots/cache");
+            seed_googlebot_registry(&cache_root);
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+    // The first request fits the limit of 1 per window and is served.
+    let status = raw_request_with_headers(&addr, "rl-bot.test", "/", &[("User-Agent", ua)]).await;
+    assert_eq!(
+        status,
+        200,
+        "the first request must be served, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // The served request carries the bot's registry id.
+    let seen = backend.seen().await;
+    let last = seen.last().expect("the backend saw the request");
+    assert_eq!(
+        header_value(last, "P-Known-Bot"),
+        "googlebot",
+        "P-Known-Bot must carry the verified bot's registry id"
+    );
+
+    // The second request is over the limit — the bot is counted.
+    let status = raw_request_with_headers(&addr, "rl-bot.test", "/", &[("User-Agent", ua)]).await;
+    assert_eq!(
+        status,
+        429,
+        "the second request of a listed bot must be throttled, got {status}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(
+        backend.seen().await.len(),
+        1,
+        "the throttled request must never reach the backend"
+    );
+}
+
+/// A verified known bot the site does **not** list stays exempt — the
+/// exemption is per site, not global (issue #131).
+#[tokio::test]
+async fn real_e2e_an_unlisted_known_bot_stays_exempt() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "rl-bot-site", &format!("http://{addr}"));
+            seed_domain(&conn, "rl-bot.test", "rl-bot-site");
+            seed_rate_limit(&conn, "rl-bot-site", 1, 60);
+            // The site subjects some *other* bot to its limits.
+            seed_rate_limit_bots(&conn, "rl-bot-site", "gptbot");
+            let cache_root = db_path
+                .parent()
+                .expect("the db lives in the tempdir")
+                .join("logs/bots/cache");
+            seed_googlebot_registry(&cache_root);
+        }
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    for i in 0..5 {
+        let status =
+            raw_request_with_headers(&addr, "rl-bot.test", "/", &[("User-Agent", ua)]).await;
+        assert_eq!(
+            status,
+            200,
+            "request {i} must be served — the bot is not listed, got {status}\nngx log:\n{}",
+            ngx.log_string()
         );
     }
     assert_eq!(backend.seen().await.len(), 5);

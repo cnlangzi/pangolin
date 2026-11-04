@@ -13,11 +13,11 @@ use http_body_util::Full;
 use crate::App;
 use crate::redirect_response;
 use crate::routes::provider::{guard_can_be_enabled, parse_site_provider};
-use crate::routes::ratelimit::{CUSTOM_403_FIELD, parse_policy};
+use crate::routes::ratelimit::{CUSTOM_403_FIELD, parse_bot_limits, parse_policy};
 use pangolin_core::types::{HostMode, Site};
 
 use super::helpers::assemble_backend_from_form;
-use super::pages::{render_create_page_with_error, render_edit_page_with_error};
+use super::pages::{FormContext, render_create_page_with_error, render_edit_page_with_error};
 use crate::routes::helpers::parse_form;
 
 type Resp = Response<Full<Bytes>>;
@@ -48,6 +48,14 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // leaves the site without a policy row — the default (limits off)
     // applies.
     let parsed = parse_policy(&params);
+    // Issue #131: the per-site list of known bots that are NOT exempt
+    // from this site's rate limits. `None` means the submission did
+    // not carry the list at all, so no list is written.
+    let parsed_bots = parse_bot_limits(&params);
+    // The bot ids the re-rendered form shows as checked — the ones the
+    // operator submitted, so they do not have to tick the boxes again
+    // after fixing the field that was wrong.
+    let submitted_bots = parsed_bots.clone().unwrap_or_default();
     // Issue #122: the provider fields (provider, custom header
     // names, the guard tri-state and the manual ranges).
     let parsed_provider = parse_site_provider(&params);
@@ -56,51 +64,60 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     if let Some(e) = &parsed_provider.error {
         return render_create_page_with_error(
             app,
-            Some(prefill_site(
-                &name,
-                &backend,
-                host_mode,
-                host_custom.clone(),
-            )),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             e,
             Some("provider"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Some(e) = &parsed.error {
         return render_create_page_with_error(
             app,
-            Some(prefill_site(
-                &name,
-                &backend,
-                host_mode,
-                host_custom.clone(),
-            )),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             e,
             Some("rate_limit"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Err(e) = guard_check(app, &parsed_provider).await {
         return render_create_page_with_error(
             app,
-            Some(prefill_site(
-                &name,
-                &backend,
-                host_mode,
-                host_custom.clone(),
-            )),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             &e,
             Some("provider"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
@@ -115,36 +132,45 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     if name.is_empty() {
         return render_create_page_with_error(
             app,
-            Some(prefill()),
-            rate_limit.unwrap_or_default(),
+            FormContext {
+                site: Some(prefill()),
+                rate_limit: rate_limit.unwrap_or_default(),
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             "Site name is required",
             Some("name"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if backend.is_empty() {
         return render_create_page_with_error(
             app,
-            Some(prefill()),
-            rate_limit.unwrap_or_default(),
+            FormContext {
+                site: Some(prefill()),
+                rate_limit: rate_limit.unwrap_or_default(),
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
         return render_create_page_with_error(
             app,
-            Some(prefill()),
-            rate_limit.unwrap_or_default(),
+            FormContext {
+                site: Some(prefill()),
+                rate_limit: rate_limit.unwrap_or_default(),
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
@@ -165,6 +191,14 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         Ok(()) => save_provider(&db, &name, &parsed_provider),
         Err(_) => None,
     };
+    // The bot list is written only after the site row itself was
+    // written — a failed site write must not leave an orphaned list.
+    let bots_result = match &result {
+        Ok(()) => parsed_bots
+            .as_ref()
+            .map(|bots| pangolin_core::db::set_site_rate_limit_bots(&db, &name, bots)),
+        Err(_) => None,
+    };
     drop(db);
 
     match result {
@@ -175,18 +209,24 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             if let Some(Err(e)) = provider_result {
                 log::warn!("provider configuration for {name} not saved: {e}");
             }
+            if let Some(Err(e)) = bots_result {
+                log::warn!("rate limit bot list for {name} not saved: {e}");
+            }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
         }
         Err(e) => {
             render_create_page_with_error(
                 app,
-                Some(prefill()),
-                rate_limit.unwrap_or_default(),
+                FormContext {
+                    site: Some(prefill()),
+                    rate_limit: rate_limit.unwrap_or_default(),
+                    rate_limit_bots: submitted_bots.clone(),
+                    provider: Some(&parsed_provider),
+                },
                 &format!("Database error: {}", e),
                 None,
                 csrf,
-                Some(&parsed_provider),
             )
             .await
         }
@@ -225,6 +265,19 @@ pub async fn handle_update(
     // Issue #117: the per-site rate-limit policy. A form without any
     // rate-limit field leaves the existing policy (if any) untouched.
     let parsed = parse_policy(&params);
+    // Issue #131: the per-site list of known bots that are NOT exempt
+    // from this site's rate limits. `None` means the submission did
+    // not carry the list at all, so the stored list is kept.
+    let parsed_bots = parse_bot_limits(&params);
+    // The bot ids the re-rendered form shows as checked: the submitted
+    // ones, or the stored ones when the submission carried no list.
+    let submitted_bots = match &parsed_bots {
+        Some(bots) => bots.clone(),
+        None => {
+            let db = app.db.lock().await;
+            pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default()
+        }
+    };
     // Issue #122: the provider fields (provider, custom header
     // names, the guard tri-state and the manual ranges).
     let parsed_provider = parse_site_provider(&params);
@@ -233,36 +286,60 @@ pub async fn handle_update(
     if let Some(e) = &parsed_provider.error {
         return render_edit_page_with_error(
             app,
-            prefill_site(&name, &backend, host_mode, host_custom.clone()),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             e,
             Some("provider"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Some(e) = &parsed.error {
         return render_edit_page_with_error(
             app,
-            prefill_site(&name, &backend, host_mode, host_custom.clone()),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             e,
             Some("rate_limit"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Err(e) = guard_check(app, &parsed_provider).await {
         return render_edit_page_with_error(
             app,
-            prefill_site(&name, &backend, host_mode, host_custom.clone()),
-            parsed.policy,
+            FormContext {
+                site: Some(prefill_site(
+                    &name,
+                    &backend,
+                    host_mode,
+                    host_custom.clone(),
+                )),
+                rate_limit: parsed.policy,
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             &e,
             Some("provider"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
@@ -316,24 +393,30 @@ pub async fn handle_update(
     if backend.is_empty() {
         return render_edit_page_with_error(
             app,
-            prefill_with_fallback(),
-            rate_limit.unwrap_or_default(),
+            FormContext {
+                site: Some(prefill_with_fallback()),
+                rate_limit: rate_limit.unwrap_or_default(),
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             "Backend is required — fill in the host:port (or file path) field",
             Some("backend"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
     if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
         return render_edit_page_with_error(
             app,
-            prefill(),
-            rate_limit.unwrap_or_default(),
+            FormContext {
+                site: Some(prefill()),
+                rate_limit: rate_limit.unwrap_or_default(),
+                rate_limit_bots: submitted_bots.clone(),
+                provider: Some(&parsed_provider),
+            },
             &format!("Invalid backend: {}", e),
             Some("backend"),
             csrf,
-            Some(&parsed_provider),
         )
         .await;
     }
@@ -354,6 +437,14 @@ pub async fn handle_update(
         Ok(()) => save_provider(&db, &name, &parsed_provider),
         Err(_) => None,
     };
+    // The bot list is written only after the site row itself was
+    // written — a failed site write must not leave an orphaned list.
+    let bots_result = match &result {
+        Ok(()) => parsed_bots
+            .as_ref()
+            .map(|bots| pangolin_core::db::set_site_rate_limit_bots(&db, &name, bots)),
+        Err(_) => None,
+    };
     drop(db);
 
     match result {
@@ -364,18 +455,24 @@ pub async fn handle_update(
             if let Some(Err(e)) = provider_result {
                 log::warn!("provider configuration for {name} not saved: {e}");
             }
+            if let Some(Err(e)) = bots_result {
+                log::warn!("rate limit bot list for {name} not saved: {e}");
+            }
             app.reload_indexes().await;
             Ok(redirect_response("/sites"))
         }
         Err(e) => {
             render_edit_page_with_error(
                 app,
-                prefill(),
-                rate_limit.unwrap_or_default(),
+                FormContext {
+                    site: Some(prefill()),
+                    rate_limit: rate_limit.unwrap_or_default(),
+                    rate_limit_bots: submitted_bots.clone(),
+                    provider: Some(&parsed_provider),
+                },
                 &format!("Database error: {}", e),
                 None,
                 csrf,
-                Some(&parsed_provider),
             )
             .await
         }
@@ -509,4 +606,173 @@ pub async fn api_handle_delete(app: &Arc<App>, name: String, _csrf: &str) -> htt
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::new()))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pangolin_core::CertManager;
+    use pangolin_core::config::Config;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    fn make_test_app() -> (TempDir, Arc<App>) {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let app = Arc::new(
+            App::new(
+                db_path.to_str().expect("utf8"),
+                Config::default(),
+                CertManager::default(),
+            )
+            .expect("App::new"),
+        );
+        (dir, app)
+    }
+
+    async fn html_of(resp: Response<Full<Bytes>>) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn bots(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The site's list is written next to the policy — the form's
+    /// checked boxes become the site's list (issue #131).
+    #[tokio::test]
+    async fn the_checked_boxes_are_saved_as_the_site_list() {
+        let (_dir, app) = make_test_app();
+        let resp = handle_create(
+            &app,
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on&rate_limit_bot_ccbot=on",
+            "csrf",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+
+        let db = app.db.lock().await;
+        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        assert_eq!(stored, bots(&["gptbot", "ccbot"]));
+    }
+
+    /// A submission that carries no list at all leaves the stored list
+    /// untouched — an API client that predates the feature must not
+    /// wipe it.
+    #[tokio::test]
+    async fn a_submission_without_the_list_keeps_the_stored_list() {
+        let (_dir, app) = make_test_app();
+        handle_create(
+            &app,
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
+            "csrf",
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_update(
+            &app,
+            Some("a".to_string()),
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_req_limit=10",
+            "csrf",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+
+        let db = app.db.lock().await;
+        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        assert_eq!(stored, bots(&["gptbot"]));
+    }
+
+    /// Un-checking every box empties the list — every verified bot is
+    /// exempt on that site again.
+    #[tokio::test]
+    async fn unchecking_every_box_empties_the_list() {
+        let (_dir, app) = make_test_app();
+        handle_create(
+            &app,
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
+            "csrf",
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_update(
+            &app,
+            Some("a".to_string()),
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1",
+            "csrf",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+
+        let db = app.db.lock().await;
+        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        assert!(stored.is_empty());
+    }
+
+    /// Whether the checkbox of `bot` is checked in the rendered HTML.
+    ///
+    /// The checkbox is rendered as one `<input>` tag; the `checked`
+    /// attribute sits inside it, so the tag is what has to be looked
+    /// at — the page carries many other checkboxes.
+    fn checkbox_is_checked(body: &str, bot: &str) -> bool {
+        let needle = format!("name=\"rate_limit_bot_{bot}\"");
+        let Some(start) = body.find(&needle) else {
+            return false;
+        };
+        let rest = &body[start..];
+        let end = rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
+        rest[..end].contains("checked")
+    }
+
+    /// The site form renders one checkbox per known bot, with the
+    /// site's stored list pre-checked (issue #131, R8).
+    #[tokio::test]
+    async fn the_edit_page_renders_a_checkbox_per_known_bot() {
+        let (_dir, app) = make_test_app();
+        handle_create(
+            &app,
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
+            "csrf",
+        )
+        .await
+        .unwrap();
+
+        let body = html_of(
+            super::super::pages::render_edit_page(&app, Some("a".to_string()), "csrf")
+                .await
+                .unwrap(),
+        )
+        .await;
+        // The marker that tells the server the submission carries the
+        // list at all.
+        assert!(
+            body.contains("name=\"rate_limit_bots_applied\""),
+            "the form must carry the marker field"
+        );
+        // One checkbox per known bot.
+        for bot in ["googlebot", "gptbot", "ccbot"] {
+            assert!(
+                body.contains(&format!("name=\"rate_limit_bot_{bot}\"")),
+                "the form must offer a checkbox for {bot}"
+            );
+        }
+        // The stored list is pre-checked.
+        assert!(
+            checkbox_is_checked(&body, "gptbot"),
+            "the site's stored list must be pre-checked"
+        );
+        assert!(
+            !checkbox_is_checked(&body, "googlebot"),
+            "a bot that is not in the site's list must not be pre-checked"
+        );
+    }
 }

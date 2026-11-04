@@ -231,7 +231,7 @@
       </label>
       <p class="text-xs text-slate-500 dark:text-slate-400 mb-4">
         Counters are per client IP and live in memory only — they are cleared when the process restarts.
-        Verified known bots are always exempt. A limit of <code>0</code> turns that dimension off.
+        Verified known bots are exempt unless they are listed below. A limit of <code>0</code> turns that dimension off.
       </p>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -283,6 +283,32 @@
             value="{{ rate_limit.throttle_secs }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">how long a throttled client stays blocked</p>
+        </div>
+      </div>
+
+      <div class="mt-4">
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
+          Bots subject to this site's limits
+        </label>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
+          A verified known bot is exempt from every limit by default. Tick the bots that must be
+          counted against this site's limits instead — an AI scraper that walks the whole site,
+          for example. The bot keeps its identity everywhere else (the
+          <code class="font-mono">P-Known-Bot</code> header and the bot log).
+        </p>
+        {# The marker tells the server that this submission carries the list at
+           all, so un-checking every box empties the list instead of being
+           mistaken for "the submission said nothing". #}
+        <input type="hidden" name="rate_limit_bots_applied" value="1">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-1 max-h-64 overflow-y-auto border border-slate-200 dark:border-slate-700 rounded-lg p-3">
+          {% for bot in known_bots %}
+          <label class="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+            <input type="checkbox" name="rate_limit_bot_{{ bot.name }}" value="1" {% if rate_limit_bots.contains(bot.name.as_str()) %}checked{% endif %}
+              class="w-3.5 h-3.5 rounded border-slate-300 dark:border-slate-600 text-accent-500 focus:ring-accent-500">
+            <span class="font-mono">{{ bot.name }}</span>
+            <span class="text-slate-400 dark:text-slate-500">{{ bot.vendor }}</span>
+          </label>
+          {% endfor %}
         </div>
       </div>
 

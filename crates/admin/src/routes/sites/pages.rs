@@ -6,6 +6,7 @@
 //! registered in the dispatch table.
 
 use askama::Template;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -16,6 +17,7 @@ use crate::App;
 use crate::routes::provider::{
     ParsedProvider, provider_options, provider_view_from_submitted, site_provider_view,
 };
+use crate::routes::ratelimit::known_bot_options;
 use crate::templates::{SitesEditTemplate, SitesListTemplate, SitesNewTemplate};
 use pangolin_core::ratelimit::RateLimitPolicy;
 
@@ -66,6 +68,8 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         tunnels,
         action: "create",
         rate_limit: RateLimitPolicy::default(),
+        known_bots: known_bot_options(app),
+        rate_limit_bots: BTreeSet::new(),
         provider_view: site_provider_view(app, None).await,
         providers: provider_options(),
     }
@@ -93,6 +97,10 @@ pub async fn render_edit_page(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Issue #131: the site's bot-limited list — the boxes that are
+    // pre-checked on the form.
+    let rate_limit_bots =
+        pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default();
     drop(db);
     let html = SitesEditTemplate {
         site,
@@ -102,6 +110,8 @@ pub async fn render_edit_page(
         tunnels,
         action: "update",
         rate_limit,
+        known_bots: known_bot_options(app),
+        rate_limit_bots,
         provider_view: site_provider_view(app, Some(&name)).await,
         providers: provider_options(),
     }
@@ -110,17 +120,32 @@ pub async fn render_edit_page(
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
+/// The site-form values a re-render shows.
+///
+/// Grouped into one value because the form carries four independent
+/// pieces of state (the site, the policy, the bot list and the
+/// provider fields) that always travel together.
+pub(super) struct FormContext<'a> {
+    /// The prefill site — the operator's submitted input.
+    pub site: Option<pangolin_core::types::Site>,
+    /// The rate-limit policy to show.
+    pub rate_limit: RateLimitPolicy,
+    /// The site's bot-limited list — the boxes that are pre-checked
+    /// (issue #131).
+    pub rate_limit_bots: BTreeSet<String>,
+    /// The provider fields the operator submitted, if any.
+    pub provider: Option<&'a ParsedProvider>,
+}
+
 /// Re-render the New site page with an inline error and prefilled user
 /// input. Called from `mutate::handle_create` on validation failure so
 /// the user doesn't lose their input.
 pub(super) async fn render_create_page_with_error(
     app: &Arc<App>,
-    prefill: Option<pangolin_core::types::Site>,
-    rate_limit: RateLimitPolicy,
+    ctx: FormContext<'_>,
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
-    provider: Option<&ParsedProvider>,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
@@ -129,18 +154,20 @@ pub(super) async fn render_create_page_with_error(
     // The operator's typed provider fields are kept, exactly like the
     // rate-limit fields: they only have to fix the one that was
     // wrong.
-    let provider_view = match provider {
+    let provider_view = match ctx.provider {
         Some(parsed) => provider_view_from_submitted(app, None, parsed).await,
         None => site_provider_view(app, None).await,
     };
     let html = SitesNewTemplate {
-        site: prefill,
+        site: ctx.site,
         error: Some(error),
         field_error,
         active_nav: "sites",
         tunnels,
         action: "create",
-        rate_limit,
+        rate_limit: ctx.rate_limit,
+        known_bots: known_bot_options(app),
+        rate_limit_bots: ctx.rate_limit_bots,
         provider_view,
         providers: provider_options(),
     }
@@ -153,33 +180,37 @@ pub(super) async fn render_create_page_with_error(
 /// input. Called from `mutate::handle_update` on validation failure.
 pub(super) async fn render_edit_page_with_error(
     app: &Arc<App>,
-    prefill: pangolin_core::types::Site,
-    rate_limit: RateLimitPolicy,
+    ctx: FormContext<'_>,
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
-    provider: Option<&ParsedProvider>,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
         pangolin_core::db::list_tuns(&db).unwrap_or_default()
     };
-    let site_name = prefill.name.clone();
+    let site_name = ctx
+        .site
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
     // The operator's typed provider fields are kept, exactly like the
     // rate-limit fields: they only have to fix the one that was
     // wrong.
-    let provider_view = match provider {
+    let provider_view = match ctx.provider {
         Some(parsed) => provider_view_from_submitted(app, Some(&site_name), parsed).await,
         None => site_provider_view(app, Some(&site_name)).await,
     };
     let html = SitesEditTemplate {
-        site: Some(prefill),
+        site: ctx.site,
         error: Some(error),
         field_error,
         active_nav: "sites",
         tunnels,
         action: "update",
-        rate_limit,
+        rate_limit: ctx.rate_limit,
+        known_bots: known_bot_options(app),
+        rate_limit_bots: ctx.rate_limit_bots,
         provider_view,
         providers: provider_options(),
     }

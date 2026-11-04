@@ -22,6 +22,10 @@
 //!   site_rate_limits (site_name PK, enabled, req_limit, ...)
 //!   ip_rules         (id PK = "<scope>|<kind>|<cidr>", scope, kind, cidr, note, ...)
 //!
+//! v11 (V11 migration): the per-site list of known bots that are
+//! **not** exempt from that site's rate limits:
+//!   site_rate_limit_bots (site_name + bot_name PK, ...)
+//!
 //! No intermediate tables. No `tun_domains` (we removed it; site.backend
 //! prefix is the single source of routing truth).
 //!
@@ -30,7 +34,7 @@
 //! keeping the link consistent — in particular, deleting a provider is done
 //! transactionally with a `SET NULL` on the referencing domains.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -145,6 +149,10 @@ pub fn delete_site(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     if n > 0 {
         conn.execute(
             "DELETE FROM site_rate_limits WHERE site_name = ?1",
+            params![name],
+        )?;
+        conn.execute(
+            "DELETE FROM site_rate_limit_bots WHERE site_name = ?1",
             params![name],
         )?;
         conn.execute("DELETE FROM ip_rules WHERE scope = ?1", params![name])?;
@@ -970,6 +978,73 @@ pub fn delete_site_rate_limit(conn: &Connection, site_name: &str) -> rusqlite::R
     Ok(n > 0)
 }
 
+// ---- Per-site known-bot rate-limit list (V11) ----
+
+/// Read the bot-limited list of every site that has one.
+///
+/// A site without a row is simply absent from the map — the caller
+/// treats it as an empty list, which exempts every verified bot.
+pub fn list_site_rate_limit_bots(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, BTreeSet<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT site_name, bot_name FROM site_rate_limit_bots ORDER BY site_name, bot_name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for row in rows {
+        let (site_name, bot_name) = row?;
+        out.entry(site_name).or_default().insert(bot_name);
+    }
+    Ok(out)
+}
+
+/// Read the bot-limited list of one site.
+///
+/// An empty set means "every verified bot is exempt on this site" —
+/// the same behaviour as a site that was never listed.
+pub fn get_site_rate_limit_bots(
+    conn: &Connection,
+    site_name: &str,
+) -> rusqlite::Result<BTreeSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT bot_name FROM site_rate_limit_bots WHERE site_name = ?1")?;
+    let rows = stmt.query_map(params![site_name], |row| row.get::<_, String>(0))?;
+    let mut out = BTreeSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// Replace the bot-limited list of a site.
+///
+/// The site's rows are deleted and the new ones inserted inside one
+/// transaction, so a site's list is replaced atomically — a reader
+/// never sees the old list half-replaced by the new one.
+pub fn set_site_rate_limit_bots(
+    conn: &Connection,
+    site_name: &str,
+    bots: &BTreeSet<String>,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM site_rate_limit_bots WHERE site_name = ?1",
+        params![site_name],
+    )?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO site_rate_limit_bots (site_name, bot_name) VALUES (?1, ?2)")?;
+        for bot in bots {
+            stmt.execute(params![site_name, bot])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Read every IP rule.
 pub fn list_ip_rules(conn: &Connection) -> rusqlite::Result<Vec<IpRule>> {
     let mut stmt = conn.prepare(
@@ -1505,6 +1580,67 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    /// The per-site bot list round trips: what was written is what
+    /// comes back (issue #131).
+    #[test]
+    fn site_rate_limit_bots_round_trip() {
+        let conn = make_conn();
+        let bots: BTreeSet<String> = ["gptbot".to_string(), "ccbot".to_string()]
+            .into_iter()
+            .collect();
+        set_site_rate_limit_bots(&conn, "a", &bots).unwrap();
+
+        assert_eq!(get_site_rate_limit_bots(&conn, "a").unwrap(), bots);
+        let all = list_site_rate_limit_bots(&conn).unwrap();
+        assert_eq!(all.get("a"), Some(&bots));
+        // A site without a row has an empty list.
+        assert_eq!(
+            get_site_rate_limit_bots(&conn, "b").unwrap(),
+            BTreeSet::new()
+        );
+        assert!(!all.contains_key("b"));
+    }
+
+    /// Saving the list replaces it — the old ids are gone, not merged.
+    #[test]
+    fn setting_the_bot_list_replaces_it() {
+        let conn = make_conn();
+        let first: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        set_site_rate_limit_bots(&conn, "a", &first).unwrap();
+        let second: BTreeSet<String> = ["ccbot".to_string()].into_iter().collect();
+        set_site_rate_limit_bots(&conn, "a", &second).unwrap();
+        assert_eq!(get_site_rate_limit_bots(&conn, "a").unwrap(), second);
+
+        // An empty list empties the site's list.
+        set_site_rate_limit_bots(&conn, "a", &BTreeSet::new()).unwrap();
+        assert!(get_site_rate_limit_bots(&conn, "a").unwrap().is_empty());
+    }
+
+    /// Deleting a site removes its bot list — a site recreated under
+    /// the same name must not inherit the old list.
+    #[test]
+    fn deleting_a_site_removes_its_bot_list() {
+        let conn = make_conn();
+        upsert_site(
+            &conn,
+            &Site {
+                name: "a".into(),
+                backend: "http://127.0.0.1:8080".into(),
+                enabled: true,
+                created_at: dt("2026-01-01T00:00:00+00:00"),
+                updated_at: dt("2026-01-01T00:00:00+00:00"),
+                host_mode: HostMode::Passthrough,
+                host_custom: None,
+                domain_count: 0,
+            },
+        )
+        .unwrap();
+        let bots: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        set_site_rate_limit_bots(&conn, "a", &bots).unwrap();
+        assert!(delete_site(&conn, "a").unwrap());
+        assert!(get_site_rate_limit_bots(&conn, "a").unwrap().is_empty());
+    }
+
     #[test]
     fn schema_applies_idempotently() {
         let mut conn = make_conn();
@@ -1517,7 +1653,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V10 as applied. (V2 merges
+        // it's there and lists V1..V11 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
@@ -1525,15 +1661,16 @@ mod tests {
         // for issue #55; V7 adds the system_config singleton; V8 adds
         // the gateway-header configuration for issue #115; V9 adds the
         // per-site rate limits + IP rules for issue #117; V10 adds the
-        // per-site provider configuration + origin guard for issue #122.)
+        // per-site provider configuration + origin guard for issue #122;
+        // V11 adds the per-site known-bot rate-limit list for issue #131.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 10,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 to be applied"
+            count, 11,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 to be applied"
         );
 
         // Verify V2 is recorded.

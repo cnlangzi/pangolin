@@ -5,7 +5,7 @@
 //!
 //! | Header              | Value                                    |
 //! | ------------------- | ---------------------------------------- |
-//! | `P-Known-Bot`       | `1` / `0` — knownbots verification result  |
+//! | `P-Known-Bot`       | the verified bot's registry id (or empty) |
 //! | `P-Client-Ip`       | the authoritative visitor IP (or empty)    |
 //! | `P-Client-Country`  | country code (or empty)                   |
 //! | `P-Client-Region`   | region code (or empty)                    |
@@ -34,7 +34,8 @@ use knownbots::Validator;
 use crate::client_ip::resolve_authoritative;
 use crate::provider::{ProviderKey, SiteProviderConfig, spec};
 
-/// `1` when knownbots verification succeeded for the request.
+/// The registry id of the verified bot, empty when the request did
+/// not come from one.
 pub const HEADER_KNOWN_BOT: &str = "P-Known-Bot";
 
 /// The authoritative visitor IP (normalized), empty when unknown.
@@ -62,8 +63,10 @@ pub const PGL_HEADER_NAMES: [&str; 4] = [
 /// The computed values of the four gateway headers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PglHeaders {
-    /// True only for a knownbots-**verified** crawler.
-    pub known_bot: bool,
+    /// The registry id of the knownbots-**verified** crawler
+    /// (`googlebot`, `gptbot`, …); `None` when the request did not
+    /// come from one.
+    pub bot_name: Option<String>,
     /// The authoritative client IP; `None` when there is none.
     pub client_ip: Option<IpAddr>,
     /// Country code; `None` when unknown.
@@ -73,9 +76,13 @@ pub struct PglHeaders {
 }
 
 impl PglHeaders {
-    /// The `P-Known-Bot` value: `"1"` / `"0"`.
-    pub fn known_bot_value(&self) -> &'static str {
-        if self.known_bot { "1" } else { "0" }
+    /// The `P-Known-Bot` value: the verified bot's registry id, or an
+    /// empty string when there is no verified bot.
+    ///
+    /// The value is the same string the JSONL bot log writes as
+    /// `bot_name` — never the raw User-Agent.
+    pub fn known_bot_value(&self) -> &str {
+        self.bot_name.as_deref().unwrap_or("")
     }
 
     /// The `P-Client-Ip` value: the normalized IP, empty when unknown.
@@ -108,13 +115,13 @@ impl PglHeaders {
 
 /// Compute the four gateway header values.
 ///
-/// Pure: no I/O, no async. `verifier` is `None` when the bot log is
-/// disabled — that is how `P-Known-Bot` becomes `0` without any
-/// verification work being done. When a verifier is present,
-/// `P-Known-Bot` is `"1"` only for
+/// Pure: no I/O, no async. `verifier` is `None` when the gateway
+/// headers are disabled — that is how `P-Known-Bot` becomes empty
+/// without any verification work being done. When a verifier is
+/// present, `P-Known-Bot` carries the registry id of the bot only for
 /// [`knownbots::VerifyStatus::Verified`]; pending / failed / unknown
-/// all yield `0` (fail closed), matching the existing bot-log side
-/// channel.
+/// all yield an empty value (fail closed), matching the existing
+/// bot-log side channel.
 ///
 /// The geo values are only read outside `direct` mode: in `direct`
 /// mode a `CF-IPCountry` header could only have been sent by the
@@ -135,12 +142,19 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let client_ip = resolve_authoritative(provider_cfg, peer, &get_header);
-    let known_bot = match (verifier, user_agent, client_ip) {
-        (Some(v), Some(ua), Some(ip)) => v.verify(ua, ip).is_verified(),
-        _ => false,
+    let bot_name = match (verifier, user_agent, client_ip) {
+        (Some(v), Some(ua), Some(ip)) => {
+            let result = v.verify(ua, ip);
+            if result.is_verified() {
+                Some(result.name)
+            } else {
+                None
+            }
+        }
+        _ => None,
     };
     PglHeaders {
-        known_bot,
+        bot_name,
         client_ip,
         country: resolve_country(provider_cfg, &get_header),
         region: resolve_region(provider_cfg, &get_header),
@@ -292,7 +306,7 @@ mod tests {
         assert_eq!(h.client_ip_value(), "203.0.113.7");
         assert_eq!(h.country_value(), "");
         assert_eq!(h.region_value(), "");
-        assert_eq!(h.known_bot_value(), "0");
+        assert_eq!(h.known_bot_value(), "");
     }
 
     #[test]
@@ -424,7 +438,9 @@ mod tests {
         assert_eq!(h.country_value(), "");
     }
 
-    /// A knownbots-verified crawler must produce `P-Known-Bot: 1`.
+    /// A knownbots-verified crawler must produce `P-Known-Bot:
+    /// googlebot` — the registry id, not a boolean and not the raw
+    /// User-Agent.
     ///
     /// The verifier is built without background workers
     /// (`new_sync_only`) so the test never touches the network: the
@@ -445,8 +461,8 @@ mod tests {
         );
         assert_eq!(
             h.known_bot_value(),
-            "1",
-            "a verified crawler must be reported as a known bot"
+            "googlebot",
+            "a verified crawler must be reported under its registry id"
         );
     }
 
@@ -468,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             h.known_bot_value(),
-            "0",
+            "",
             "a forged User-Agent from an unrelated IP must not verify"
         );
     }
@@ -482,13 +498,13 @@ mod tests {
             Some("Mozilla/5.0 (compatible; Googlebot/2.1)"),
             None,
         );
-        assert_eq!(h.known_bot_value(), "0");
+        assert_eq!(h.known_bot_value(), "");
     }
 
     #[test]
     fn no_client_ip_means_not_a_known_bot() {
         // Cloudflare mode without CF-Connecting-IP: there is no IP
-        // to verify against, so the header must be "0".
+        // to verify against, so the header must be empty.
         let h = resolve_headers(
             &cfg(ProviderKey::Cloudflare),
             peer(1, 2, 3, 4),
@@ -496,14 +512,14 @@ mod tests {
             Some("Mozilla/5.0 (compatible; Googlebot/2.1)"),
             None,
         );
-        assert_eq!(h.known_bot_value(), "0");
+        assert_eq!(h.known_bot_value(), "");
         assert_eq!(h.client_ip_value(), "");
     }
 
     #[test]
     fn pairs_carry_the_canonical_names() {
         let h = PglHeaders {
-            known_bot: true,
+            bot_name: Some("googlebot".into()),
             client_ip: Some("203.0.113.7".parse().unwrap()),
             country: Some("DE".into()),
             region: Some("BE".into()),
@@ -519,10 +535,49 @@ mod tests {
                 "P-Client-Region"
             ]
         );
-        assert_eq!(pairs[0].1, "1");
+        assert_eq!(pairs[0].1, "googlebot");
         assert_eq!(pairs[1].1, "203.0.113.7");
         assert_eq!(pairs[2].1, "DE");
         assert_eq!(pairs[3].1, "BE");
+    }
+
+    /// The `P-Known-Bot` header is always written, even when there is
+    /// no verified bot — the value is empty, not absent. A consumer
+    /// therefore asks "is the value non-empty?", and the gateway's
+    /// write path never has to branch.
+    #[test]
+    fn the_known_bot_header_is_always_present() {
+        let h = PglHeaders::default();
+        let pairs = h.to_pairs();
+        let known = pairs
+            .iter()
+            .find(|(n, _)| *n == HEADER_KNOWN_BOT)
+            .expect("the P-Known-Bot pair is always there");
+        assert_eq!(known.1, "", "no verified bot → an empty value");
+        assert_eq!(h.known_bot_value(), "");
+    }
+
+    /// A pending / failed verification is **not** a verified bot, so
+    /// the header stays empty — the value is the registry id of a
+    /// bot that actually verified.
+    #[test]
+    fn a_failed_verification_carries_no_bot_name() {
+        let root = std::env::temp_dir().join("pangolin-pgl-knownbot-test");
+        let validator = knownbots::Validator::new_sync_only(&root).expect("validator");
+        validator
+            .seed_prefix("googlebot", "203.0.113.0/24")
+            .expect("seed googlebot CIDR");
+        // The UA claims Googlebot but the IP is outside the seeded
+        // range → the verification fails closed.
+        let h = resolve_headers(
+            &cfg(ProviderKey::Direct),
+            peer(198, 51, 100, 9),
+            headers(vec![]),
+            Some("Mozilla/5.0 (compatible; Googlebot/2.1)"),
+            Some(&validator),
+        );
+        assert_eq!(h.known_bot_value(), "");
+        assert_eq!(h.bot_name, None);
     }
 
     #[test]
