@@ -15,10 +15,12 @@
 //! day-to-day `cargo test --workspace` / `make lint` cycle.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
+
+use crate::common::{parse_toml, read_repo_file, repo_root};
 
 /// The marker lines the installer uses to delimit its managed block.
 const MARK_START: &str = "# >>> pangolin cargo mirror >>>";
@@ -48,24 +50,6 @@ fn host_config(trailing_newline: bool) -> String {
         out.push('\n');
     }
     out
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("tests/ lives directly under the repo root")
-        .to_path_buf()
-}
-
-fn read_repo_file(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-fn parse_toml(relative: &str) -> toml::Value {
-    let path = repo_root().join(relative);
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 fn str_field<'a>(value: &'a toml::Value, key: &str) -> &'a str {

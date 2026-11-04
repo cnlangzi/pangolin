@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "admin"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "knownbots"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "dns-lookup",
@@ -2077,7 +2077,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ngx"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "admin",
  "anyhow",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "pangolin-core"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "pangolin-integration-tests"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4214,7 +4214,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tun"
-version = "0.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

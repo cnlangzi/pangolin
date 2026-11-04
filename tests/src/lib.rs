@@ -20,6 +20,10 @@
 #[cfg(feature = "integration")]
 mod routing;
 
+// Shared helpers for the hermetic build-system tests below.
+#[cfg(test)]
+mod common;
+
 // Build-system regression tests (crates.io mirror configuration,
 // issue #126).  These need neither the `integration` feature nor a
 // real binary: they parse the cargo config files and drive
@@ -30,6 +34,14 @@ mod routing;
 // the normal build of this crate.
 #[cfg(test)]
 mod cargo_mirror;
+
+// Release-pipeline regression tests (the tag is the version, issue
+// #130).  Like the mirror tests above, these need neither the
+// `integration` feature nor a real binary: they parse the manifest
+// and the lockfile, and drive the release workflow's own shell steps
+// against a throwaway manifest.
+#[cfg(test)]
+mod release_version;
 
 #[cfg(feature = "integration")]
 mod backend;
