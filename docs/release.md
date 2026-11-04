@@ -112,7 +112,7 @@ the Docker image's.
 
 | Stage | Detail |
 | --- | --- |
-| Assert | The tag must match `v<semver>`. A tag that does not fails the job before anything is compiled. |
+| Assert | The tag must match `v<semver>`, and the version must be one cargo can parse — `v1.2.3-01` (a numeric pre-release identifier with a leading zero) is rejected here rather than in the build. A tag that does not fails the job before anything is compiled. |
 | Assert | The tagged commit must be an ancestor of `origin/main`. |
 | Set | The tag's version is written into `[workspace.package].version` in `Cargo.toml` — the table-scoped rewrite touches that one line and nothing else. The workflow reads the value back and fails if it is not the tag's version. This happens *after* the cargo cache step, so the cache key is computed from the unmodified manifest and stays identical across releases. |
 | Build | `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `make build` also regenerates the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled. |

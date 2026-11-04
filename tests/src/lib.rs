@@ -20,6 +20,10 @@
 #[cfg(feature = "integration")]
 mod routing;
 
+// Shared helpers for the hermetic build-system tests below.
+#[cfg(test)]
+mod common;
+
 // Build-system regression tests (crates.io mirror configuration,
 // issue #126).  These need neither the `integration` feature nor a
 // real binary: they parse the cargo config files and drive

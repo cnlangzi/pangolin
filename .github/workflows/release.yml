@@ -107,6 +107,25 @@ jobs:
             exit 1
           fi
           tag_version="${BASH_REMATCH[1]}"
+
+          # The shape check above is looser than semver: it accepts
+          # `v1.2.3-01`, `v1.2.3-.` and `v1.2.3-a..b`, all of which
+          # cargo rejects ("invalid leading zero in pre-release
+          # identifier", "empty identifier segment in pre-release
+          # identifier"). The version is written into Cargo.toml and
+          # parsed by cargo, so a tag cargo cannot parse has to fail
+          # here — before the build — and not three steps later.
+          #
+          # This is the semver.org pattern in the POSIX ERE that
+          # bash's `=~` speaks: no non-capturing groups, and a
+          # pre-release identifier is either a number without a
+          # leading zero or something carrying a letter or a hyphen.
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$tag_version" =~ $semver ]]; then
+            echo "::error::tag '$tag' is not a version cargo can parse"
+            exit 1
+          fi
+
           echo "tag $tag is a valid release tag (version $tag_version)"
           # The release version is the tag verbatim — the leading `v`
           # stays, so tag, archive name and `--version` all read the
@@ -152,30 +171,37 @@ jobs:
           # holds only digits, letters, `.`, `+` and `-` — safe to
           # splice into the awk program below.
           #
-          # The rewrite is scoped to the [workspace.package] table: a
-          # global substitution would also hit the `version = "…"`
-          # keys under [workspace.dependencies] and break the build.
-          awk -v ver="$TAG_VERSION" '
-            /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; print; next }
-            /^\[/ { inpkg = 0 }
-            inpkg && /^[[:space:]]*version[[:space:]]*=/ {
-              print "version = \"" ver "\""
-              next
-            }
-            { print }
-          ' Cargo.toml > Cargo.toml.tmp
+          # One lookup, two jobs: `write` replaces the version,
+          # `read` prints it. Two separate programs would have to
+          # agree on what `[workspace.package]` means; one cannot
+          # drift from itself.
+          #
+          # The lookup is scoped to the table — a global substitution
+          # would also hit the `version = "…"` keys under
+          # [workspace.dependencies] and break the build — and it
+          # replaces the *quoted value* only, so a comment trailing
+          # the version survives the rewrite.
+          workspace_package_version() {
+            awk -v mode="$1" -v ver="$TAG_VERSION" '
+              /^\[/ { inpkg = 0 }
+              /^\[workspace\.package\][[:space:]]*(#.*)?$/ { inpkg = 1 }
+              inpkg && /^[[:space:]]*version[[:space:]]*=/ {
+                if (!match($0, /"[^"]*"/)) { if (mode == "write") print; next }
+                if (mode == "read") { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+                print substr($0, 1, RSTART - 1) "\"" ver "\"" substr($0, RSTART + RLENGTH)
+                next
+              }
+              mode == "write" { print }
+            ' Cargo.toml
+          }
+
+          workspace_package_version write > Cargo.toml.tmp
           mv Cargo.toml.tmp Cargo.toml
 
-          # Read the value back with the same table-scoped lookup and
-          # compare it: a rewrite that silently did not take effect
-          # must fail the job before the build, not after it.
-          workspace_version="$(awk '
-            /^\[workspace\.package\][[:space:]]*$/ { inpkg = 1; next }
-            /^\[/ { inpkg = 0 }
-            inpkg && /^[[:space:]]*version[[:space:]]*=/ {
-              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
-            }
-          ' Cargo.toml)"
+          # Read the value back with the same lookup and compare it:
+          # a rewrite that silently did not take effect must fail the
+          # job before the build, not after it.
+          workspace_version="$(workspace_package_version read)"
           if [ -z "$workspace_version" ]; then
             echo "::error::could not read [workspace.package].version from Cargo.toml — expected $TAG_VERSION"
             exit 1
