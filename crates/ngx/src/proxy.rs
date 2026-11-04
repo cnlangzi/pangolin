@@ -2206,11 +2206,31 @@ fn apply_pgl_headers(session: &mut Session, enabled: bool, pgl: &pangolin_core::
         return;
     }
     for (name, value) in pgl.to_pairs() {
-        // An empty value is legal (the header must be present even
-        // when the value is unknown) — `HeaderValue::from_str`
-        // accepts it.
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            req.insert_header(name, value).ok();
+        req.insert_header(name, legal_header_value(name, &value))
+            .ok();
+    }
+}
+
+/// The value to write for a gateway header.
+///
+/// An empty value is legal — the header must be present even when the
+/// value is unknown — and `HeaderValue::from_str` accepts it.
+///
+/// A value that is *not* legal must not make the header disappear:
+/// the contract is "the header is always present", and a backend
+/// cannot tell an absent header from an empty one. Only the bot's
+/// registry id can be illegal — it comes from the operator's own YAML
+/// — so this is a misconfigured registry, and the operator has to hear
+/// about it.
+fn legal_header_value(name: &str, value: &str) -> HeaderValue {
+    match HeaderValue::from_str(value) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                "pgl: {name} carries a value that is not a legal header value \
+                 — writing an empty one; check the bot registry"
+            );
+            HeaderValue::from_static("")
         }
     }
 }
@@ -2313,3 +2333,31 @@ fn host_from_session(session: &Session) -> String {
 
 // (pump_ws_relay is no longer used here — WS upgrade goes
 //  through the tunnel frame and the tun-side executor.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four gateway headers are always written — an illegal value
+    /// must not make the header disappear, because a backend cannot
+    /// tell an absent header from an empty one (issue #131).
+    #[test]
+    fn an_illegal_header_value_still_yields_a_present_header() {
+        // A bot id the operator wrote by hand can carry characters a
+        // header value may not.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", "gpt\nbot"),
+            HeaderValue::from_static("")
+        );
+        // An ordinary value is written as-is.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", "googlebot"),
+            HeaderValue::from_static("googlebot")
+        );
+        // An empty value is legal and stays empty.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", ""),
+            HeaderValue::from_static("")
+        );
+    }
+}

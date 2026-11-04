@@ -412,25 +412,84 @@ pub fn known_bot_options(app: &Arc<App>) -> Vec<pangolin_core::bot::BotInfo> {
         .collect()
 }
 
+/// The registry ids the site form offers as checkboxes.
+///
+/// The set the form can show — and therefore the set the operator can
+/// manage through it. A stored id outside it survives a save (see
+/// [`merge_bot_list`]): the operator cannot tick or untick it, so
+/// saving must not silently drop it.
+pub fn renderable_bot_ids(app: &Arc<App>) -> BTreeSet<String> {
+    known_bot_options(app).into_iter().map(|b| b.name).collect()
+}
+
+/// Merge a submitted bot list with the stored one.
+///
+/// The submitted ids replace the stored list — except for the stored
+/// ids the form could not show: a bot whose registry id is not safe
+/// as a form field name is never rendered, so the operator has no way
+/// to manage it through the form, and an unrelated save (changing the
+/// request limit, say) must not silently drop it.
+///
+/// The stored ids the form *can* show follow the form: unticking a
+/// box removes the bot.
+pub fn merge_bot_list(
+    submitted: &BTreeSet<String>,
+    stored: &BTreeSet<String>,
+    renderable: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = submitted.clone();
+    for id in stored {
+        if !renderable.contains(id) {
+            out.insert(id.clone());
+        }
+    }
+    out
+}
+
+/// Whether a form value means "on".
+///
+/// The same table the "enable the limits" checkbox uses: a browser
+/// sends `on`, an API client may send `true`, `1` or `yes`, and an
+/// empty value counts as "the field was there" (a checkbox that
+/// carries no value is still a checked checkbox).
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "on" | "true" | "1" | "yes"
+    )
+}
+
 /// Parse the site's bot-limited list out of the submitted form.
 ///
 /// `None` means the form carried no list at all — the stored list is
 /// then left untouched. `Some(set)` means the submitted ids replace
 /// the site's list; an empty set empties it.
 ///
+/// The marker field's **value** decides, not its mere presence: a
+/// client that sends `rate_limit_bots_applied=0` meant "not applied",
+/// and reading it as "applied" would empty the site's list. The same
+/// goes for a per-bot field — `rate_limit_bot_gptbot=0` means "not
+/// checked", not "checked".
+///
 /// An id that is not safe as a form field name is dropped: only
 /// `A-Z`, `a-z`, `0-9`, `-` and `_` are accepted. An id the registry
 /// does not know is kept — it can never match a request, because only
 /// a bot the verifier knows can produce a verified bot.
 pub fn parse_bot_limits(params: &HashMap<String, String>) -> Option<BTreeSet<String>> {
-    if !params.contains_key(BOT_LIMIT_APPLIED_FIELD) {
+    if !params
+        .get(BOT_LIMIT_APPLIED_FIELD)
+        .is_some_and(|v| is_truthy(v))
+    {
         return None;
     }
     let mut bots = BTreeSet::new();
-    for key in params.keys() {
+    for (key, value) in params {
         let Some(id) = key.strip_prefix(BOT_LIMIT_FIELD_PREFIX) else {
             continue;
         };
+        if !is_truthy(value) {
+            continue;
+        }
         if !pangolin_core::bot::is_safe_bot_id(id) {
             continue;
         }
@@ -450,8 +509,10 @@ fn parse_enabled(params: &HashMap<String, String>) -> Result<bool, String> {
         return Ok(false);
     };
     let value = raw.trim().to_ascii_lowercase();
+    if is_truthy(&value) {
+        return Ok(true);
+    }
     match value.as_str() {
-        "" | "on" | "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
         other => Err(format!(
             "rate_limit_enabled must be a boolean, got {other:?}"
@@ -965,6 +1026,64 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeSet<String>>()
         );
+    }
+
+    /// The marker's **value** decides, not its mere presence: a client
+    /// that sends `rate_limit_bots_applied=0` meant "not applied", and
+    /// reading it as "applied" would empty the site's list.
+    #[test]
+    fn a_falsy_marker_does_not_apply_the_list() {
+        let params = form(&[(BOT_LIMIT_APPLIED_FIELD, "0")]);
+        assert_eq!(parse_bot_limits(&params), None);
+    }
+
+    /// The same goes for a per-bot field: `rate_limit_bot_gptbot=0`
+    /// means "not checked", not "checked".
+    #[test]
+    fn a_falsy_bot_field_is_not_checked() {
+        let params = form(&[
+            (BOT_LIMIT_APPLIED_FIELD, "1"),
+            ("rate_limit_bot_gptbot", "0"),
+            ("rate_limit_bot_ccbot", "on"),
+        ]);
+        let bots = parse_bot_limits(&params).expect("the form carried the list");
+        assert_eq!(
+            bots,
+            ["ccbot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// The stored ids the form cannot show survive a save: the
+    /// operator has no way to manage them through the form, so an
+    /// unrelated save must not silently drop them.
+    #[test]
+    fn the_stored_ids_the_form_cannot_show_survive_a_save() {
+        let submitted: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let stored: BTreeSet<String> = ["gptbot".to_string(), "my.bot".to_string()]
+            .into_iter()
+            .collect();
+        // The form shows `gptbot` (it is in the registry and its id is
+        // safe) but not `my.bot`.
+        let renderable: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let merged = merge_bot_list(&submitted, &stored, &renderable);
+        assert_eq!(
+            merged,
+            ["gptbot".to_string(), "my.bot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// A stored id the form *can* show follows the form: unticking the
+    /// box removes the bot.
+    #[test]
+    fn an_unticked_renderable_bot_is_removed() {
+        let submitted: BTreeSet<String> = BTreeSet::new();
+        let stored: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let renderable: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        assert!(merge_bot_list(&submitted, &stored, &renderable).is_empty());
     }
 
     /// The marker is never mistaken for a bot id — its name does not

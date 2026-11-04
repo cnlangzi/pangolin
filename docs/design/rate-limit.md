@@ -388,10 +388,17 @@ restarts; the configuration lives in SQLite and survives restarts.
   value. A hidden marker field (`rate_limit_bots_applied`) tells the
   server that the submission carried the list at all, so un-checking
   every box empties the list while a submission without the marker
-  leaves the stored list untouched. Only the bots whose registry id is
-  safe as a form field name (`A-Z`, `a-z`, `0-9`, `-`, `_`) are
-  offered, so an id from a hand-written YAML cannot produce an
-  invalid field name.
+  leaves the stored list untouched. The marker's **value** decides,
+  not its mere presence — `rate_limit_bots_applied=0` means "not
+  applied", and the same goes for a per-bot field. Only the bots whose
+  registry id is safe as a form field name (`A-Z`, `a-z`, `0-9`, `-`,
+  `_`) are offered, so an id from a hand-written YAML cannot produce
+  an invalid field name.
+- A stored id the form **cannot** show — a bot whose registry id is
+  not safe as a form field name — survives a save: the operator has no
+  way to tick or untick it, so an unrelated save must not silently
+  drop it. The ids the form *can* show follow the form: unticking a
+  box removes the bot.
 - `/ratelimit` renders a KPI row (sites with limits enabled, requests
   counted, over-limit events, 429s sent, rule blocks, exempt
   requests), a per-site table (policy summary, tracked clients against
@@ -454,7 +461,7 @@ successfully and logs a warning naming the retired key.
 | A blacklisted IP is also a verified known bot | The request is rejected with 403 — rules take precedence over the exemption. |
 | The site lists the bot in its bot-limited list | The bot is counted against the site's limits and rejected with 429 when it is over them. |
 | The site does not list the bot | The bot stays exempt, exactly as before. |
-| The site's list names a bot the registry does not know | The id stays in the table and never matches — no request is affected. |
+| The site's list names a bot the registry does not know | The id stays in the table and never matches — no request is affected. It also survives a save: the form cannot show it, so it cannot manage it either. |
 | The site has no row in `site_rate_limit_bots` | Every verified bot is exempt — the behaviour before issue #131. |
 | A whitelisted IP is also over the site's limit | It is served, and it is not counted, so it never affects the limit for other clients. |
 | The site's policy has `enabled = 0` | The limits are inert; whitelist and blacklist rules still apply. |

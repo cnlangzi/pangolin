@@ -4,6 +4,22 @@
 > **Code:** `crates/pangolin-core/src/pgl.rs`, `crates/pangolin-core/src/client_ip.rs`,
 > `crates/ngx/src/proxy.rs`, `crates/tun/src/client.rs`
 
+> **⚠ Breaking change (issue #131):** `P-Known-Bot` no longer carries
+> `1` / `0`. It carries the verified bot's **registry id**
+> (`googlebot`, `gptbot`, …) and is empty when the request did not
+> come from a verified bot. A backend that compared the header to
+> `"1"` must now test for a **non-empty** value:
+>
+> ```
+> # before
+> if ($http_p_known_bot = "1") { … }
+> # after
+> if ($http_p_known_bot != "") { … }
+> ```
+>
+> The header is still always present, so "the header is there" is not
+> a usable test — it is there for every request.
+
 Every request pangolin forwards to a backend carries the same four
 gateway-computed headers:
 
@@ -136,6 +152,12 @@ has to distinguish an absent header from an empty one.
 
 With no authoritative client IP there is nothing to verify against,
 so the value is empty.
+
+The registry id comes from the operator's own YAML, so it can be
+anything — including a string that is not a legal HTTP header value.
+The header is still written in that case, with an **empty** value and
+a warning in the log: the contract is "the header is always present",
+and a backend cannot tell an absent header from an empty one.
 
 The value is **never** the raw User-Agent and **never** a boolean
 literal. It is the registry id, so a backend can tell a search

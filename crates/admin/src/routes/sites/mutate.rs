@@ -4,6 +4,7 @@
 //! submitted form and re-renders the page with an inline error via the
 //! helpers in `pages.rs`. On success the response is a 302 to `/sites`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -13,7 +14,9 @@ use http_body_util::Full;
 use crate::App;
 use crate::redirect_response;
 use crate::routes::provider::{guard_can_be_enabled, parse_site_provider};
-use crate::routes::ratelimit::{CUSTOM_403_FIELD, parse_bot_limits, parse_policy};
+use crate::routes::ratelimit::{
+    CUSTOM_403_FIELD, merge_bot_list, parse_bot_limits, parse_policy, renderable_bot_ids,
+};
 use pangolin_core::types::{HostMode, Site};
 
 use super::helpers::assemble_backend_from_form;
@@ -56,6 +59,12 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // operator submitted, so they do not have to tick the boxes again
     // after fixing the field that was wrong.
     let submitted_bots = parsed_bots.clone().unwrap_or_default();
+    // The site's stored list, read before the write: the ids the form
+    // cannot show have to survive the save (see `merge_bot_list`).
+    let stored_bots: BTreeSet<String> = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default()
+    };
     // Issue #122: the provider fields (provider, custom header
     // names, the guard tri-state and the manual ranges).
     let parsed_provider = parse_site_provider(&params);
@@ -194,9 +203,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // The bot list is written only after the site row itself was
     // written — a failed site write must not leave an orphaned list.
     let bots_result = match &result {
-        Ok(()) => parsed_bots
-            .as_ref()
-            .map(|bots| pangolin_core::db::set_site_rate_limit_bots(&db, &name, bots)),
+        Ok(()) => parsed_bots.as_ref().map(|submitted| {
+            let bots = merge_bot_list(submitted, &stored_bots, &renderable_bot_ids(app));
+            pangolin_core::db::set_site_rate_limit_bots(&db, &name, &bots)
+        }),
         Err(_) => None,
     };
     drop(db);
@@ -269,14 +279,19 @@ pub async fn handle_update(
     // from this site's rate limits. `None` means the submission did
     // not carry the list at all, so the stored list is kept.
     let parsed_bots = parse_bot_limits(&params);
+    // The site's stored list. It is read before the write for two
+    // reasons: the re-render shows it when the submission carried no
+    // list, and the save keeps the ids the form cannot show (see
+    // `merge_bot_list`).
+    let stored_bots: BTreeSet<String> = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default()
+    };
     // The bot ids the re-rendered form shows as checked: the submitted
     // ones, or the stored ones when the submission carried no list.
     let submitted_bots = match &parsed_bots {
         Some(bots) => bots.clone(),
-        None => {
-            let db = app.db.lock().await;
-            pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default()
-        }
+        None => stored_bots.clone(),
     };
     // Issue #122: the provider fields (provider, custom header
     // names, the guard tri-state and the manual ranges).
@@ -440,9 +455,10 @@ pub async fn handle_update(
     // The bot list is written only after the site row itself was
     // written — a failed site write must not leave an orphaned list.
     let bots_result = match &result {
-        Ok(()) => parsed_bots
-            .as_ref()
-            .map(|bots| pangolin_core::db::set_site_rate_limit_bots(&db, &name, bots)),
+        Ok(()) => parsed_bots.as_ref().map(|submitted| {
+            let bots = merge_bot_list(submitted, &stored_bots, &renderable_bot_ids(app));
+            pangolin_core::db::set_site_rate_limit_bots(&db, &name, &bots)
+        }),
         Err(_) => None,
     };
     drop(db);
@@ -731,6 +747,57 @@ mod tests {
         let rest = &body[start..];
         let end = rest.find('>').map(|i| i + 1).unwrap_or(rest.len());
         rest[..end].contains("checked")
+    }
+
+    /// A stored id the form cannot show survives a save: the operator
+    /// has no way to manage it through the form, so an unrelated save
+    /// must not silently drop it (issue #131).
+    #[tokio::test]
+    async fn a_stored_id_the_form_cannot_show_survives_a_save() {
+        let (_dir, app) = make_test_app();
+        handle_create(
+            &app,
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
+            "csrf",
+        )
+        .await
+        .unwrap();
+
+        // A bot whose registry id is not safe as a form field name is
+        // never rendered as a checkbox — it can only be in the table
+        // through the API or by hand.
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::set_site_rate_limit_bots(
+                &db,
+                "a",
+                &["gptbot".to_string(), "my.bot".to_string()]
+                    .into_iter()
+                    .collect(),
+            )
+            .unwrap();
+        }
+
+        // The operator saves the site with no box checked.
+        let resp = handle_update(
+            &app,
+            Some("a".to_string()),
+            b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1",
+            "csrf",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+
+        let db = app.db.lock().await;
+        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        assert_eq!(
+            stored,
+            ["my.bot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "the renderable bot follows the form, the un-renderable one survives"
+        );
     }
 
     /// The site form renders one checkbox per known bot, with the

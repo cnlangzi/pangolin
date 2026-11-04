@@ -8,6 +8,7 @@
 //! "not a bot" for the side-channel (fail closed).
 
 use std::net::IpAddr;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +117,13 @@ pub struct BotInfo {
     pub category: BotCategory,
 }
 
+/// The embedded registry, parsed once.
+///
+/// The YAML is compiled into the binary, so the result is a constant:
+/// parsing it per call would cost 45 YAML documents and 45+ CIDR
+/// parses for nothing.
+static EMBEDDED_REGISTRY: OnceLock<Vec<BotInfo>> = OnceLock::new();
+
 /// Every bot of the knownbots registry.
 ///
 /// `verifier` is the **runtime** registry: the bots the verifier
@@ -125,9 +133,13 @@ pub struct BotInfo {
 pub fn registry(verifier: Option<&Validator>) -> Vec<BotInfo> {
     match verifier {
         Some(v) => v.bots().iter().map(bot_info).collect(),
-        None => knownbots::load_bots(None)
-            .map(|bots| bots.iter().map(bot_info).collect())
-            .unwrap_or_default(),
+        None => EMBEDDED_REGISTRY
+            .get_or_init(|| {
+                knownbots::load_bots(None)
+                    .map(|bots| bots.iter().map(bot_info).collect())
+                    .unwrap_or_default()
+            })
+            .clone(),
     }
 }
 
