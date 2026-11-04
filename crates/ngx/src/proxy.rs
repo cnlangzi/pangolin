@@ -21,7 +21,10 @@
 //! runs `apply_proxy_policy` (pangolin-core) so that Host rewriting
 //! is identical on every delivery path.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -656,22 +659,31 @@ impl ProxyHttp for AppProxy {
         let limit_ip = ctx
             .client_ip
             .or_else(|| peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip())));
-        // The known-bot verdict is reused from the `P-Known-Bot`
+        // The bot identity is reused from the `P-Known-Bot`
         // computation — but only when the gateway headers are on:
         // `resolve_headers` skips the verification when they are
         // off, so its verdict would be unusable. In that case the
         // limiter verifies the bot itself (the verifier is always
         // present — the bot log is always on).
-        let known_bot = if cfg.pgl_headers_enabled {
-            pgl.known_bot
+        //
+        // The identity is the bot's **registry id** (`googlebot`), the
+        // same string the `P-Known-Bot` header carries — the limiter
+        // needs the name to match the site's bot-limited list.
+        //
+        // The gateway headers already carry the name, so that path
+        // borrows it; only the fallback path has to own one.
+        let bot_name: Option<Cow<'_, str>> = if cfg.pgl_headers_enabled {
+            pgl.bot_name.as_deref().map(Cow::Borrowed)
         } else {
             match (
                 self.app.bot_verifier.as_deref(),
                 ctx.user_agent.as_deref(),
                 limit_ip,
             ) {
-                (Some(v), Some(ua), Some(ip)) => pangolin_core::verify_bot(v, ua, ip).is_some(),
-                _ => false,
+                (Some(v), Some(ua), Some(ip)) => {
+                    pangolin_core::verify_bot(v, ua, ip).map(|b| Cow::Owned(b.name))
+                }
+                _ => None,
             }
         };
         if let Some(limit_cfg) = limit_cfg {
@@ -689,7 +701,7 @@ impl ProxyHttp for AppProxy {
                     &site.name,
                     &limit_cfg,
                     limit_ip,
-                    known_bot,
+                    bot_name.as_deref(),
                     pq.map(|p| p.as_str()),
                     geo,
                 )
@@ -2196,12 +2208,54 @@ fn apply_pgl_headers(session: &mut Session, enabled: bool, pgl: &pangolin_core::
         return;
     }
     for (name, value) in pgl.to_pairs() {
-        // An empty value is legal (the header must be present even
-        // when the value is unknown) — `HeaderValue::from_str`
-        // accepts it.
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            req.insert_header(name, value).ok();
+        req.insert_header(name, legal_header_value(name, &value))
+            .ok();
+    }
+}
+
+/// The header values already warned about.
+///
+/// A value that cannot be written is *config* state — the operator's
+/// own bot registry — not per-request data. Warning on every request
+/// would flood the log, so one line per distinct value is enough.
+static WARNED_VALUES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// The value to write for a gateway header.
+///
+/// An empty value is legal — the header must be present even when the
+/// value is unknown — and `HeaderValue::from_str` accepts it.
+///
+/// A value that is *not* legal must not make the header disappear:
+/// the contract is "the header is always present", and a backend
+/// cannot tell an absent header from an empty one. Only the bot's
+/// registry id can be illegal — it comes from the operator's own YAML
+/// — so this is a misconfigured registry, and the operator has to hear
+/// about it (once).
+fn legal_header_value(name: &str, value: &str) -> HeaderValue {
+    match HeaderValue::from_str(value) {
+        Ok(v) => v,
+        Err(_) => {
+            warn_once_per_value(name, value);
+            HeaderValue::from_static("")
         }
+    }
+}
+
+/// Warn about a header value that cannot be written — once per
+/// distinct value.
+fn warn_once_per_value(name: &str, value: &str) {
+    let seen = WARNED_VALUES.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = match seen.lock() {
+        Ok(mut seen) => seen.insert(value.to_string()),
+        // A poisoned lock must not take the request down — warn and
+        // carry on.
+        Err(_) => true,
+    };
+    if first {
+        warn!(
+            "pgl: {name} carries a value that is not a legal header value \
+             — writing an empty one; check the bot registry"
+        );
     }
 }
 
@@ -2303,3 +2357,31 @@ fn host_from_session(session: &Session) -> String {
 
 // (pump_ws_relay is no longer used here — WS upgrade goes
 //  through the tunnel frame and the tun-side executor.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four gateway headers are always written — an illegal value
+    /// must not make the header disappear, because a backend cannot
+    /// tell an absent header from an empty one (issue #131).
+    #[test]
+    fn an_illegal_header_value_still_yields_a_present_header() {
+        // A bot id the operator wrote by hand can carry characters a
+        // header value may not.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", "gpt\nbot"),
+            HeaderValue::from_static("")
+        );
+        // An ordinary value is written as-is.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", "googlebot"),
+            HeaderValue::from_static("googlebot")
+        );
+        // An empty value is legal and stays empty.
+        assert_eq!(
+            legal_header_value("P-Known-Bot", ""),
+            HeaderValue::from_static("")
+        );
+    }
+}

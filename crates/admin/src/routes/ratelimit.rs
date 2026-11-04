@@ -9,7 +9,7 @@
 //! restarts. The configuration (the per-site policy and the rules)
 //! lives in SQLite and survives restarts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use askama::Template;
@@ -378,6 +378,126 @@ pub fn parse_policy(params: &HashMap<String, String>) -> ParsedPolicy {
     }
 }
 
+/// The prefix of the per-bot form fields of the site's bot-limited
+/// list (issue #131).
+///
+/// One field per bot, because the admin's form parser keeps a single
+/// value per key — a group of checkboxes sharing one name would lose
+/// all but the last value.
+pub const BOT_LIMIT_FIELD_PREFIX: &str = "rate_limit_bot_";
+
+/// The hidden marker that says "this submission carries the bot list".
+///
+/// An unchecked checkbox sends nothing, so "no bot field at all" would
+/// be ambiguous between "the operator un-checked everything" and "the
+/// submission did not carry the list". The marker resolves it: when it
+/// is present the submitted ids replace the site's list — an empty set
+/// included; when it is absent the stored list is kept, exactly like
+/// the custom 429 / 403 page bodies behave today.
+///
+/// The name deliberately does **not** start with
+/// [`BOT_LIMIT_FIELD_PREFIX`], so the marker is never mistaken for a
+/// bot id.
+pub const BOT_LIMIT_APPLIED_FIELD: &str = "rate_limit_bots_applied";
+
+/// The known bots the site form offers as checkboxes (issue #131).
+///
+/// Only the bots whose registry id is safe as a form field name are
+/// offered: an id from a hand-written YAML could otherwise produce a
+/// field name the browser would not submit back under the same key.
+pub fn known_bot_options(app: &Arc<App>) -> Vec<pangolin_core::bot::BotInfo> {
+    pangolin_core::bot::registry(app.bot_verifier.as_deref())
+        .into_iter()
+        .filter(|b| pangolin_core::bot::is_safe_bot_id(&b.name))
+        .collect()
+}
+
+/// The registry ids the site form offers as checkboxes.
+///
+/// The set the form can show — and therefore the set the operator can
+/// manage through it. A stored id outside it survives a save (see
+/// [`merge_bot_list`]): the operator cannot tick or untick it, so
+/// saving must not silently drop it.
+pub fn renderable_bot_ids(app: &Arc<App>) -> BTreeSet<String> {
+    known_bot_options(app).into_iter().map(|b| b.name).collect()
+}
+
+/// Merge a submitted bot list with the stored one.
+///
+/// The submitted ids replace the stored list — except for the stored
+/// ids the form could not show: a bot whose registry id is not safe
+/// as a form field name is never rendered, so the operator has no way
+/// to manage it through the form, and an unrelated save (changing the
+/// request limit, say) must not silently drop it.
+///
+/// The stored ids the form *can* show follow the form: unticking a
+/// box removes the bot.
+pub fn merge_bot_list(
+    submitted: &BTreeSet<String>,
+    stored: &BTreeSet<String>,
+    renderable: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = submitted.clone();
+    for id in stored {
+        if !renderable.contains(id) {
+            out.insert(id.clone());
+        }
+    }
+    out
+}
+
+/// Whether a form value means "on".
+///
+/// The same table the "enable the limits" checkbox uses: a browser
+/// sends `on`, an API client may send `true`, `1` or `yes`, and an
+/// empty value counts as "the field was there" (a checkbox that
+/// carries no value is still a checked checkbox).
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "on" | "true" | "1" | "yes"
+    )
+}
+
+/// Parse the site's bot-limited list out of the submitted form.
+///
+/// `None` means the form carried no list at all — the stored list is
+/// then left untouched. `Some(set)` means the submitted ids replace
+/// the site's list; an empty set empties it.
+///
+/// The marker field's **value** decides, not its mere presence: a
+/// client that sends `rate_limit_bots_applied=0` meant "not applied",
+/// and reading it as "applied" would empty the site's list. The same
+/// goes for a per-bot field — `rate_limit_bot_gptbot=0` means "not
+/// checked", not "checked".
+///
+/// An id that is not safe as a form field name is dropped: only
+/// `A-Z`, `a-z`, `0-9`, `-` and `_` are accepted. An id the registry
+/// does not know is kept — it can never match a request, because only
+/// a bot the verifier knows can produce a verified bot.
+pub fn parse_bot_limits(params: &HashMap<String, String>) -> Option<BTreeSet<String>> {
+    if !params
+        .get(BOT_LIMIT_APPLIED_FIELD)
+        .is_some_and(|v| is_truthy(v))
+    {
+        return None;
+    }
+    let mut bots = BTreeSet::new();
+    for (key, value) in params {
+        let Some(id) = key.strip_prefix(BOT_LIMIT_FIELD_PREFIX) else {
+            continue;
+        };
+        if !is_truthy(value) {
+            continue;
+        }
+        if !pangolin_core::bot::is_safe_bot_id(id) {
+            continue;
+        }
+        bots.insert(id.to_string());
+    }
+    Some(bots)
+}
+
 /// Read the "enable the limits" flag.
 ///
 /// A browser checkbox submits `on`; an API client may send `true`,
@@ -389,8 +509,10 @@ fn parse_enabled(params: &HashMap<String, String>) -> Result<bool, String> {
         return Ok(false);
     };
     let value = raw.trim().to_ascii_lowercase();
+    if is_truthy(&value) {
+        return Ok(true);
+    }
     match value.as_str() {
-        "" | "on" | "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
         other => Err(format!(
             "rate_limit_enabled must be a boolean, got {other:?}"
@@ -575,13 +697,13 @@ mod tests {
         let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
         assert_eq!(
             app.rate_limiter
-                .check("a", &cfg, Some(client), false, Some("/"), geo),
+                .check("a", &cfg, Some(client), None, Some("/"), geo),
             LimitDecision::Allow
         );
         assert!(
             matches!(
                 app.rate_limiter
-                    .check("a", &cfg, Some(client), false, Some("/"), geo),
+                    .check("a", &cfg, Some(client), None, Some("/"), geo),
                 LimitDecision::Throttled { .. }
             ),
             "the client must be throttled"
@@ -714,7 +836,7 @@ mod tests {
                 "a",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -733,7 +855,7 @@ mod tests {
                 "a",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -745,7 +867,7 @@ mod tests {
                     "a",
                     &cfg,
                     Some(client),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -853,6 +975,125 @@ mod tests {
         assert_eq!(parsed.policy.req_limit, 100);
         assert_eq!(parsed.policy.page_limit, 500);
         assert_eq!(parsed.policy.ip_capacity, 16384);
+    }
+
+    /// A form that carries no bot field at all leaves the stored list
+    /// untouched — an API client that predates the feature must not
+    /// wipe it (issue #131).
+    #[test]
+    fn a_form_without_the_bot_list_keeps_the_stored_list() {
+        let params = form(&[("rate_limit_req_limit", "10")]);
+        assert_eq!(parse_bot_limits(&params), None);
+    }
+
+    /// The marker field is what distinguishes "the operator un-checked
+    /// everything" from "the submission said nothing about the list".
+    #[test]
+    fn the_marker_field_empties_the_list() {
+        let params = form(&[(BOT_LIMIT_APPLIED_FIELD, "1")]);
+        assert_eq!(parse_bot_limits(&params), Some(BTreeSet::new()));
+    }
+
+    /// The checked boxes are the site's list.
+    #[test]
+    fn the_checked_boxes_are_the_bot_list() {
+        let params = form(&[
+            (BOT_LIMIT_APPLIED_FIELD, "1"),
+            ("rate_limit_bot_gptbot", "on"),
+            ("rate_limit_bot_ccbot", "on"),
+        ]);
+        let bots = parse_bot_limits(&params).expect("the form carried the list");
+        assert_eq!(
+            bots,
+            ["ccbot".to_string(), "gptbot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// An id that is not safe as a form field name is dropped — it
+    /// could never have been submitted by the rendered form.
+    #[test]
+    fn an_unsafe_bot_id_is_dropped() {
+        let mut params = form(&[(BOT_LIMIT_APPLIED_FIELD, "1")]);
+        params.insert("rate_limit_bot_good".into(), "on".into());
+        params.insert("rate_limit_bot_bad id".into(), "on".into());
+        params.insert("rate_limit_bot_bad\"id".into(), "on".into());
+        let bots = parse_bot_limits(&params).expect("the form carried the list");
+        assert_eq!(
+            bots,
+            ["good".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// The marker's **value** decides, not its mere presence: a client
+    /// that sends `rate_limit_bots_applied=0` meant "not applied", and
+    /// reading it as "applied" would empty the site's list.
+    #[test]
+    fn a_falsy_marker_does_not_apply_the_list() {
+        let params = form(&[(BOT_LIMIT_APPLIED_FIELD, "0")]);
+        assert_eq!(parse_bot_limits(&params), None);
+    }
+
+    /// The same goes for a per-bot field: `rate_limit_bot_gptbot=0`
+    /// means "not checked", not "checked".
+    #[test]
+    fn a_falsy_bot_field_is_not_checked() {
+        let params = form(&[
+            (BOT_LIMIT_APPLIED_FIELD, "1"),
+            ("rate_limit_bot_gptbot", "0"),
+            ("rate_limit_bot_ccbot", "on"),
+        ]);
+        let bots = parse_bot_limits(&params).expect("the form carried the list");
+        assert_eq!(
+            bots,
+            ["ccbot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// The stored ids the form cannot show survive a save: the
+    /// operator has no way to manage them through the form, so an
+    /// unrelated save must not silently drop them.
+    #[test]
+    fn the_stored_ids_the_form_cannot_show_survive_a_save() {
+        let submitted: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let stored: BTreeSet<String> = ["gptbot".to_string(), "my.bot".to_string()]
+            .into_iter()
+            .collect();
+        // The form shows `gptbot` (it is in the registry and its id is
+        // safe) but not `my.bot`.
+        let renderable: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let merged = merge_bot_list(&submitted, &stored, &renderable);
+        assert_eq!(
+            merged,
+            ["gptbot".to_string(), "my.bot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+    }
+
+    /// A stored id the form *can* show follows the form: unticking the
+    /// box removes the bot.
+    #[test]
+    fn an_unticked_renderable_bot_is_removed() {
+        let submitted: BTreeSet<String> = BTreeSet::new();
+        let stored: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        let renderable: BTreeSet<String> = ["gptbot".to_string()].into_iter().collect();
+        assert!(merge_bot_list(&submitted, &stored, &renderable).is_empty());
+    }
+
+    /// The marker is never mistaken for a bot id — its name does not
+    /// start with the per-bot prefix.
+    #[test]
+    fn the_marker_is_not_a_bot_id() {
+        assert!(!BOT_LIMIT_APPLIED_FIELD.starts_with(BOT_LIMIT_FIELD_PREFIX));
+        let params = form(&[(BOT_LIMIT_APPLIED_FIELD, "1")]);
+        let bots = parse_bot_limits(&params).expect("the form carried the list");
+        assert!(bots.is_empty());
     }
 
     #[test]

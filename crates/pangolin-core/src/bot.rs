@@ -8,6 +8,7 @@
 //! "not a bot" for the side-channel (fail closed).
 
 use std::net::IpAddr;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,31 @@ impl std::fmt::Display for BotCategory {
 }
 
 impl BotCategory {
+    /// The Tailwind class token of the category badge.
+    ///
+    /// The admin UI colours a bot's category the same way everywhere:
+    /// the badge on the bot-log rows, the badge on the site's
+    /// bot-limited list. One mapping, so the two never drift.
+    pub fn class(&self) -> &'static str {
+        match self {
+            BotCategory::SearchEngine => {
+                "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
+            }
+            BotCategory::AiBot => {
+                "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200"
+            }
+            BotCategory::Social => {
+                "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200"
+            }
+            BotCategory::Monitoring => {
+                "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200"
+            }
+            BotCategory::AdsBot => {
+                "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200"
+            }
+        }
+    }
+
     /// Parse the wire label produced by knownbots `BotKind::to_category_label`.
     pub fn from_label(label: &str) -> Self {
         match label {
@@ -101,6 +127,68 @@ pub fn verify_bot(validator: &Validator, ua: &str, ip: IpAddr) -> Option<BotIden
     } else {
         None
     }
+}
+
+/// One entry of the knownbots registry, as the admin UI shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotInfo {
+    /// Registry id — the same string the JSONL bot log writes as
+    /// `bot_name` and the same string the `P-Known-Bot` header
+    /// carries.
+    pub name: String,
+    /// Owning organisation, e.g. `"Google"`.
+    pub vendor: String,
+    /// Coarse bucket for filtering / colouring in the UI.
+    pub category: BotCategory,
+}
+
+/// The embedded registry, parsed once.
+///
+/// The YAML is compiled into the binary, so the result is a constant:
+/// parsing it per call would cost 45 YAML documents and 45+ CIDR
+/// parses for nothing.
+static EMBEDDED_REGISTRY: OnceLock<Vec<BotInfo>> = OnceLock::new();
+
+/// Every bot of the knownbots registry.
+///
+/// `verifier` is the **runtime** registry: the bots the verifier
+/// knows, which include the YAML an operator dropped into
+/// `<cache root>/conf.d/`. `None` falls back to the embedded
+/// registry — what a deployment without a verifier sees.
+pub fn registry(verifier: Option<&Validator>) -> Vec<BotInfo> {
+    match verifier {
+        Some(v) => v.bots().iter().map(bot_info).collect(),
+        None => EMBEDDED_REGISTRY
+            .get_or_init(|| {
+                knownbots::load_bots(None)
+                    .map(|bots| bots.iter().map(bot_info).collect())
+                    .unwrap_or_default()
+            })
+            .clone(),
+    }
+}
+
+/// Map one registry entry to its admin-facing shape.
+fn bot_info(bot: &knownbots::Bot) -> BotInfo {
+    BotInfo {
+        name: bot.name.clone(),
+        vendor: bot.vendor.clone(),
+        category: BotCategory::from_label(bot.kind.to_category_label(&bot.name)),
+    }
+}
+
+/// Whether `id` is safe to use as a form field name.
+///
+/// The per-site bot list is edited as one checkbox per bot, and the
+/// field name is `rate_limit_bot_<id>`. An id carrying anything but
+/// `A-Z`, `a-z`, `0-9`, `-` and `_` would produce a field name the
+/// browser would not submit back under the same key, so such a bot
+/// is not offered as a checkbox.
+pub fn is_safe_bot_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -174,6 +262,70 @@ mod tests {
             serde_json::to_string(&BotCategory::AdsBot).unwrap(),
             "\"ads_bot\""
         );
+    }
+
+    /// The registry the admin UI offers as checkboxes — the embedded
+    /// bots when there is no verifier.
+    #[test]
+    fn registry_falls_back_to_the_embedded_bots() {
+        let bots = registry(None);
+        assert!(bots.iter().any(|b| b.name == "googlebot"));
+        assert!(bots.iter().any(|b| b.name == "gptbot"));
+        let google = bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.vendor, "Google");
+        assert_eq!(google.category, BotCategory::SearchEngine);
+    }
+
+    /// The runtime registry — the bots the verifier knows, including
+    /// the YAML an operator dropped into the cache root.
+    #[test]
+    fn registry_follows_the_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(
+            conf.join("custombot.yaml"),
+            "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\nkind: AITraining\n",
+        )
+        .unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let bots = registry(Some(&v));
+        assert!(bots.iter().any(|b| b.name == "custombot"));
+        assert!(
+            !bots.iter().any(|b| b.name == "not-in-the-registry"),
+            "only the bots the verifier knows are offered"
+        );
+    }
+
+    /// Only ids that are safe as a form field name are offered as a
+    /// checkbox — the field name is `rate_limit_bot_<id>`.
+    #[test]
+    fn safe_bot_ids_are_the_form_field_safe_ones() {
+        assert!(is_safe_bot_id("googlebot"));
+        assert!(is_safe_bot_id("applebot-extended"));
+        assert!(is_safe_bot_id("chatgpt_user"));
+        assert!(is_safe_bot_id("bot2"));
+        assert!(!is_safe_bot_id(""));
+        assert!(!is_safe_bot_id("bot name"));
+        assert!(!is_safe_bot_id("bot.name"));
+        assert!(!is_safe_bot_id("bot/name"));
+        assert!(!is_safe_bot_id("bot\"onmouseover"));
+    }
+
+    /// Every category has a badge class — the admin UI colours the
+    /// category the same way on the bot log and on the site's
+    /// bot-limited list.
+    #[test]
+    fn every_category_has_a_badge_class() {
+        for cat in [
+            BotCategory::SearchEngine,
+            BotCategory::AiBot,
+            BotCategory::Social,
+            BotCategory::Monitoring,
+            BotCategory::AdsBot,
+        ] {
+            assert!(!cat.class().is_empty(), "category {cat:?} → empty class");
+        }
     }
 
     #[test]

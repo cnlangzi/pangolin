@@ -13,7 +13,7 @@
 //! `auth_tun(name, token)` SQL query against the `tun` table, so there
 //! is no need to mirror tokens into memory on startup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
@@ -68,27 +68,31 @@ impl Indexes {
     /// domains). The relationship is logical: `domains[i].site_name`
     /// must match a `sites[j].name`, otherwise the domain is dropped.
     pub fn build(sites: Vec<Site>, domains: Vec<Domain>) -> Self {
-        Self::build_with_limits(sites, domains, &HashMap::new(), &[])
+        Self::build_with_limits(sites, domains, &HashMap::new(), &[], &HashMap::new())
     }
 
     /// Build the indexes together with the per-site rate-limit
     /// configuration.
     ///
     /// `policies` holds the persisted policy of the sites that have
-    /// one; `rules` holds the global and site-scoped IP rules. A
-    /// policy row whose site no longer exists is ignored, the same way
-    /// a `domains` row without a matching site is ignored.
+    /// one; `rules` holds the global and site-scoped IP rules;
+    /// `bot_limits` holds the per-site list of known bots that are
+    /// **not** exempt on that site (issue #131). A policy row whose
+    /// site no longer exists is ignored, the same way a `domains` row
+    /// without a matching site is ignored.
     pub fn build_with_limits(
         sites: Vec<Site>,
         domains: Vec<Domain>,
         policies: &HashMap<String, RateLimitPolicy>,
         rules: &[IpRule],
+        bot_limits: &HashMap<String, BTreeSet<String>>,
     ) -> Self {
         Self::build_with_providers(
             sites,
             domains,
             policies,
             rules,
+            bot_limits,
             &HashMap::new(),
             &HashMap::new(),
             &GlobalProviderConfig::default(),
@@ -108,11 +112,17 @@ impl Indexes {
     /// routing table, the limits and the provider configuration
     /// together: a request never sees the site of one revision and
     /// the provider of another.
+    // The index build takes every per-site input at once — the site
+    // list, the rate-limit inputs, the provider inputs and the global
+    // defaults. Grouping them into structs would only move the same
+    // values one level down.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_with_providers(
         sites: Vec<Site>,
         domains: Vec<Domain>,
         policies: &HashMap<String, RateLimitPolicy>,
         rules: &[IpRule],
+        bot_limits: &HashMap<String, BTreeSet<String>>,
         site_providers: &HashMap<String, SiteProviderOverride>,
         site_ranges: &HashMap<String, Vec<String>>,
         global: &GlobalProviderConfig,
@@ -159,7 +169,7 @@ impl Indexes {
 
         // 5. limits: one entry per site, merged with the global rules.
         let site_names: Vec<String> = sites_arc.iter().map(|s| s.name.clone()).collect();
-        let limits = build_limit_configs(&site_names, policies, rules);
+        let limits = build_limit_configs(&site_names, policies, rules, bot_limits);
 
         // 6. providers: one entry per site, the site's own override
         //    with the global defaults filled in.

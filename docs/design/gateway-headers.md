@@ -4,12 +4,28 @@
 > **Code:** `crates/pangolin-core/src/pgl.rs`, `crates/pangolin-core/src/client_ip.rs`,
 > `crates/ngx/src/proxy.rs`, `crates/tun/src/client.rs`
 
+> **⚠ Breaking change (issue #131):** `P-Known-Bot` no longer carries
+> `1` / `0`. It carries the verified bot's **registry id**
+> (`googlebot`, `gptbot`, …) and is empty when the request did not
+> come from a verified bot. A backend that compared the header to
+> `"1"` must now test for a **non-empty** value:
+>
+> ```
+> # before
+> if ($http_p_known_bot = "1") { … }
+> # after
+> if ($http_p_known_bot != "") { … }
+> ```
+>
+> The header is still always present, so "the header is there" is not
+> a usable test — it is there for every request.
+
 Every request pangolin forwards to a backend carries the same four
 gateway-computed headers:
 
 | Header              | Value                                    | Source |
 | ------------------- | ---------------------------------------- | ------ |
-| `P-Known-Bot`       | `1` / `0`                                | knownbots verification (User-Agent + IP ownership) |
+| `P-Known-Bot`       | the verified bot's registry id, or empty | knownbots verification (User-Agent + IP ownership) |
 | `P-Client-Ip`       | the visitor's IP (normalized), or empty   | the authoritative client IP |
 | `P-Client-Country`  | country code, or empty                    | `CF-IPCountry` / the configured key |
 | `P-Client-Region`   | region code, or empty                     | `CF-Region-Code` / `CF-Region` / the configured key |
@@ -119,17 +135,35 @@ A first-level header whose value is not a parseable IP is treated as
 
 ## `P-Known-Bot`
 
-`"1"` if and only if knownbots verification succeeds for the
-request (User-Agent word-boundary match **and** IP ownership).
-Everything else — pending, failed, unknown — is `"0"` (fail
-closed), matching the bot-log side channel.
+The **registry id** of the verified bot (`googlebot`, `gptbot`,
+`ccbot`) — the same string the JSONL bot log writes as `bot_name`.
+It is empty when the request did not come from a verified bot.
+
+The value is only set for
+[`knownbots::VerifyStatus::Verified`] — a User-Agent word-boundary
+match **and** IP ownership. Everything else — pending, failed,
+unknown — is empty (fail closed), matching the bot-log side channel.
 
 The verifier is always present (the bot log is always on — issue
-#117), so `P-Known-Bot` is `"1"` for every verified crawler. The
-header is never absent.
+#117), so a verified crawler always carries its id. The header is
+never absent: it is written with an empty value when there is no
+verified bot, so a consumer asks "is the value non-empty?" and never
+has to distinguish an absent header from an empty one.
 
 With no authoritative client IP there is nothing to verify against,
-so the value is `"0"`.
+so the value is empty.
+
+The registry id comes from the operator's own YAML, so it can be
+anything — including a string that is not a legal HTTP header value.
+The header is still written in that case, with an **empty** value and
+a warning in the log: the contract is "the header is always present",
+and a backend cannot tell an absent header from an empty one.
+
+The value is **never** the raw User-Agent and **never** a boolean
+literal. It is the registry id, so a backend can tell a search
+crawler from an AI scraper — and the per-site bot-limited list of
+the rate limiter matches against the very same string (see
+[rate-limit.md](rate-limit.md)).
 
 ## Configuration
 
@@ -176,13 +210,14 @@ decodable by existing peers).
 
 | Scenario | `P-Client-Ip` | `P-Known-Bot` | geo |
 | --------- | ------------- | ------------- | --- |
-| `direct`, client `203.0.113.7` | `203.0.113.7` | `0` | empty |
-| `cloudflare`, no `CF-Connecting-IP` | empty (log shows the peer) | `0` | empty |
-| `cloudflare`, `CF-Connecting-IP: 243.201.173.220` + `CF-Connecting-IPv6: 2001:db8::1` | `2001:db8::1` (pseudo IPv4 discarded) | `0` | empty |
-| `cloudflare`, `CF-Connecting-IP: 203.0.113.7` | `203.0.113.7` | `0` | empty |
-| `custom_lb`, key unset / header absent / value not an IP | empty (log shows the peer) | `0` | empty |
-| bot UA + bot IP, RDNS cache cold | visitor IP | `0` (fail closed) | — |
-| bot log disabled | visitor IP | `0` | — |
+| `direct`, client `203.0.113.7` | `203.0.113.7` | empty | empty |
+| `cloudflare`, no `CF-Connecting-IP` | empty (log shows the peer) | empty | empty |
+| `cloudflare`, `CF-Connecting-IP: 243.201.173.220` + `CF-Connecting-IPv6: 2001:db8::1` | `2001:db8::1` (pseudo IPv4 discarded) | empty | empty |
+| `cloudflare`, `CF-Connecting-IP: 203.0.113.7` | `203.0.113.7` | empty | empty |
+| `custom_lb`, key unset / header absent / value not an IP | empty (log shows the peer) | empty | empty |
+| bot UA + bot IP, RDNS cache cold | visitor IP | empty (fail closed) | — |
+| bot UA + bot IP, verified | visitor IP | the registry id (`googlebot`) | — |
+| bot log disabled | visitor IP | empty | — |
 | `pgl_headers_enabled=false` | header absent (name still stripped) | absent | absent |
 | client sends `P-Client-Ip: 9.9.9.9` | the resolved value | the verified value | the resolved value |
 | `file://` backend | — (pangolin serves the file) | — | — |
@@ -194,7 +229,9 @@ decodable by existing peers).
   `CF-Region-Code`, `CF-Region`) are **not** stripped — backends
   that read them today keep working. The spoofing surface they
   represent is pre-existing.
-* A `P-Bot-Name` header carrying the verified bot's registry id.
+* A separate `P-Bot-Name` header — the registry id travels in
+  `P-Known-Bot` itself, so there is no second header to keep in
+  sync (issue #131).
 * Geo resolution from a local MaxMind / GeoIP database — geo comes
   from the CDN's headers only.
 * `file://` backends — pangolin serves them itself, so there is no

@@ -20,11 +20,15 @@ limiter *acts* on it.
 - IP allow / block rules, scoped globally or to one site, matching
   single addresses and CIDR ranges.
 - Hard enforcement (429 / 403), no artificial delay.
-- Verified known bots are exempt from every limit.
+- Verified known bots are exempt from every limit, unless the site
+  lists them as subject to its limits.
 
 ## Non-goals
 
-- Per-bot-category exemption (every verified known bot is exempt).
+- Per-bot-category rules ("all AI bots on this site"). The list holds
+  registry ids only.
+- A global list of bots that never bypass anywhere. The list is per
+  site.
 - Per-site aggregate quotas across all client IPs, and /24 bucketing.
 - Sharing counters between instances — the counters are per process.
 - Request / response body size limits.
@@ -42,6 +46,7 @@ limiter *acts* on it.
 | Penalty box | Per-site, fixed-size table of throttled client IPs with their expiry. |
 | Slot | One entry in a ring, owned by at most one client IP at a time. |
 | Known bot | A client whose User-Agent *and* client IP pass the `knownbots` verification (`knownbots::VerifyStatus::Verified`). Pending / failed / unknown claims are not known bots. |
+| Bot-limited list | The per-site set of registry ids whose bots are **not** exempt on that site. An empty list means every verified bot is exempt. |
 | Distinct page | The request target path plus its query string (`path?query`), treated as one unit. |
 | Rule | An IP blacklist or whitelist entry — a single IP or a CIDR range — scoped globally or to one site. |
 | Whitelist / blacklist | A whitelist match exempts a client from all counting and limiting; a blacklist match rejects the request outright. |
@@ -94,6 +99,27 @@ so the cleanup is explicit. Leaving them behind would silently revive
 the old limits, the old custom 429 page and the old scoped rules when
 a site with the same name is created again.
 
+Migration `crates/pangolin-core/migrations/V11__add_site_rate_limit_bots.sql`
+adds the per-site bot-limited list (issue #131):
+
+```sql
+CREATE TABLE IF NOT EXISTS site_rate_limit_bots (
+    site_name TEXT NOT NULL,   -- logical reference to sites.name
+    bot_name  TEXT NOT NULL,   -- a knownbots registry id
+    PRIMARY KEY (site_name, bot_name)
+);
+```
+
+It is a table of its own — not a column on `site_rate_limits` —
+because the list is list-shaped per-site data, the same shape as
+`site_origin_allow(site_name, cidr)`. A site with no row exempts
+every verified bot, so the default needs no row at all.
+
+`bot_name` is the same string the JSONL bot log writes as `bot_name`
+and the same string the `P-Known-Bot` header carries. An id that is
+not in the knownbots registry never matches a request: only a bot the
+verifier knows can produce a verified bot.
+
 ## Runtime configuration
 
 `crates/pangolin-core/src/ratelimit.rs` holds the whole feature. It has
@@ -102,7 +128,12 @@ a site with the same name is created again.
 ```rust
 pub struct RateLimitPolicy { /* enabled, req_limit, req_window_secs, … */ }
 pub struct IpRules { /* exact: HashSet<IpAddr>, nets: Vec<IpNet> */ }
-pub struct SiteLimitConfig { pub policy: RateLimitPolicy, pub whitelist: IpRules, pub blacklist: IpRules }
+pub struct SiteLimitConfig {
+    pub policy: RateLimitPolicy,
+    pub whitelist: IpRules,
+    pub blacklist: IpRules,
+    pub bot_limited: BTreeSet<String>,   // registry ids NOT exempt here
+}
 ```
 
 `IpRules` resolves a client IP to the longest matching prefix. A
@@ -203,8 +234,8 @@ ip  = authoritative client IP, else TCP peer // already resolved for P-Client-Ip
 if cfg.whitelist.longest_match(ip) == Whitelist { pass }
 // 2. blacklist -> 403
 if cfg.blacklist.longest_match(ip) == Blacklist { respond 403 }
-// 3. known bot -> exempt
-if known_bot_verified { pass }
+// 3. known bot -> exempt, unless the site lists it
+if let Some(bot) = bot_name && !cfg.bot_limited.contains(bot) { pass }
 // 4. limits disabled -> pass
 if !cfg.policy.enabled { pass }
 // 5. penalty box -> 429, without counting and without touching a slot
@@ -247,14 +278,32 @@ sees the limits of one revision and the page of another.
 
 ### Known-bot verdict
 
-The gateway already computes a known-bot verdict for every request in
+The gateway already computes a known-bot identity for every request in
 `pangolin_core::pgl::resolve_headers` (the `P-Known-Bot` header), so
-the limiter reuses it rather than verifying twice. When the `P-*`
+the limiter reuses it rather than verifying twice. The identity is the
+bot's **registry id** — the limiter needs the name to match the
+site's bot-limited list, not just a yes/no answer. When the `P-*`
 headers are disabled, `resolve_headers` is called without a verifier
 and its verdict is unusable — in that case the limiter calls
 `pangolin_core::bot::verify_bot` itself. Only
 `VerifyStatus::Verified` counts as a known bot; pending, failed and
 unknown claims are treated as ordinary clients (fail closed).
+
+### The bot-limited list
+
+A site may list the known bots that are **not** exempt on it. A
+verified bot whose registry id is in the list is counted against the
+site's limits like any other client and is answered `429` when it is
+over them; every other verified bot stays exempt.
+
+The list only removes the exemption step — it does not change the
+bot's identity anywhere else: the request still carries
+`P-Known-Bot: <registry id>` and still produces its JSONL bot-log
+entry with the same `bot_name`.
+
+The IP rules keep their precedence over the bot exemption: a listed
+bot whose IP matches a blacklist rule is still answered `403`, and a
+bot whose IP matches a whitelist rule is still exempt.
 
 The client IP is the authoritative one
 (`pangolin_core::client_ip::resolve_authoritative`); when it is
@@ -304,12 +353,18 @@ index and calls `RateLimiter::reconfigure`:
 
 - a site that disappeared (or whose limits were turned off) loses its
   runtime state,
-- a site whose policy is **unchanged** keeps its counters — a reload
-  triggered by an unrelated admin write must not hand every client a
-  fresh window,
-- a site whose policy **changed** releases its state: the counters,
-  the sticky over-limit flags and the penalty box are reset, so the new
-  limits take effect on the very next request.
+- a site whose configuration is **unchanged** keeps its counters — a
+  reload triggered by an unrelated admin write must not hand every
+  client a fresh window,
+- a site whose configuration **changed** releases its state: the
+  counters, the sticky over-limit flags and the penalty box are reset,
+  so the new limits take effect on the very next request.
+
+The site's **bot-limited list** is part of that configuration: adding
+or removing a bot releases the site's state too. A bot that is
+removed from the list must not stay in the penalty box, and a bot that
+is re-added must not be over the limit on the strength of the counters
+it collected before it was listed.
 
 The configuration is rebuilt *before* the index swap, so the runtime
 state always exists by the time a request sees the new policy.
@@ -325,6 +380,25 @@ restarts; the configuration lives in SQLite and survives restarts.
   windows `1..=86_400`, capacities `1..=262_144`, the custom page
   `0..=65_536` bytes. The capacity ceiling keeps a typo from
   allocating an unbounded table.
+- The same section carries the **bot-limited list**: one checkbox per
+  known bot of the registry, the checked ones being the site's list.
+  The form posts one field per bot (`rate_limit_bot_<registry id>`),
+  because the admin's form parser keeps a single value per key — a
+  group of checkboxes sharing one name would lose all but the last
+  value. A hidden marker field (`rate_limit_bots_applied`) tells the
+  server that the submission carried the list at all, so un-checking
+  every box empties the list while a submission without the marker
+  leaves the stored list untouched. The marker's **value** decides,
+  not its mere presence — `rate_limit_bots_applied=0` means "not
+  applied", and the same goes for a per-bot field. Only the bots whose
+  registry id is safe as a form field name (`A-Z`, `a-z`, `0-9`, `-`,
+  `_`) are offered, so an id from a hand-written YAML cannot produce
+  an invalid field name.
+- A stored id the form **cannot** show — a bot whose registry id is
+  not safe as a form field name — survives a save: the operator has no
+  way to tick or untick it, so an unrelated save must not silently
+  drop it. The ids the form *can* show follow the form: unticking a
+  box removes the bot.
 - `/ratelimit` renders a KPI row (sites with limits enabled, requests
   counted, over-limit events, 429s sent, rule blocks, exempt
   requests), a per-site table (policy summary, tracked clients against
@@ -385,6 +459,10 @@ successfully and logs a warning naming the retired key.
 | Both dimensions trip | `Retry-After` is the greater of the two remaining window times. |
 | A whitelist rule and a blacklist rule match with the same prefix length | The whitelist wins; the client is served. |
 | A blacklisted IP is also a verified known bot | The request is rejected with 403 — rules take precedence over the exemption. |
+| The site lists the bot in its bot-limited list | The bot is counted against the site's limits and rejected with 429 when it is over them. |
+| The site does not list the bot | The bot stays exempt, exactly as before. |
+| The site's list names a bot the registry does not know | The id stays in the table and never matches — no request is affected. It also survives a save: the form cannot show it, so it cannot manage it either. |
+| The site has no row in `site_rate_limit_bots` | Every verified bot is exempt — the behaviour before issue #131. |
 | A whitelisted IP is also over the site's limit | It is served, and it is not counted, so it never affects the limit for other clients. |
 | The site's policy has `enabled = 0` | The limits are inert; whitelist and blacklist rules still apply. |
 | The provider reported no country / region | The cells render an em dash. In `direct` mode they always do — there a `CF-IPCountry` header could only have been sent by the client. |

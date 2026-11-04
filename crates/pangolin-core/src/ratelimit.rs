@@ -41,7 +41,7 @@
 //!
 //! See `docs/design/rate-limit.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -365,6 +365,14 @@ pub struct SiteLimitConfig {
     pub whitelist: IpRules,
     /// Clients that are rejected with 403.
     pub blacklist: IpRules,
+    /// Registry ids of the known bots that are **not** exempt on this
+    /// site (issue #131).
+    ///
+    /// A verified bot whose id is in this set is counted against the
+    /// site's limits and answered `429` when it is over them. Every
+    /// other verified bot stays exempt. An empty set — the default —
+    /// exempts every verified bot.
+    pub bot_limited: BTreeSet<String>,
 }
 
 impl SiteLimitConfig {
@@ -397,19 +405,25 @@ impl SiteLimitConfig {
 /// a site without a row gets the default (limits off) policy.
 /// `rules` holds the global and site-scoped rules — the global ones
 /// are merged into every site.
+/// `bot_limits` holds the per-site list of known bots that are **not**
+/// exempt on that site (issue #131); a site without an entry exempts
+/// every verified bot.
 pub fn build_limit_configs(
     site_names: &[String],
     policies: &HashMap<String, RateLimitPolicy>,
     rules: &[IpRule],
+    bot_limits: &HashMap<String, BTreeSet<String>>,
 ) -> HashMap<String, Arc<SiteLimitConfig>> {
     let mut owned: HashMap<String, SiteLimitConfig> = site_names
         .iter()
         .map(|name| {
             let policy = policies.get(name).cloned().unwrap_or_default();
+            let bot_limited = bot_limits.get(name).cloned().unwrap_or_default();
             (
                 name.clone(),
                 SiteLimitConfig {
                     policy,
+                    bot_limited,
                     ..Default::default()
                 },
             )
@@ -588,6 +602,10 @@ struct PenaltySlot {
 /// The mutable per-site runtime state.
 struct SiteState {
     policy: RateLimitPolicy,
+    /// The site's bot-limited list, as of the last configuration this
+    /// state was built from. A change releases the state (see
+    /// [`SiteState::apply_config`]).
+    bot_limited: BTreeSet<String>,
     req_epoch: u32,
     req_epoch_start: Instant,
     page_epoch: u32,
@@ -634,9 +652,10 @@ struct BlockedIpStat {
 }
 
 impl SiteState {
-    fn new(policy: &RateLimitPolicy) -> Self {
+    fn new(policy: &RateLimitPolicy, bot_limited: &BTreeSet<String>) -> Self {
         let mut st = Self {
             policy: policy.clone(),
+            bot_limited: bot_limited.clone(),
             req_epoch: 0,
             req_epoch_start: Instant::now(),
             page_epoch: 0,
@@ -681,18 +700,25 @@ impl SiteState {
         }
     }
 
-    /// Apply a new policy.
+    /// Apply a new configuration.
     ///
-    /// A policy change releases the site's runtime state: the counters,
-    /// the sticky over-limit flags and the penalty box are all reset,
-    /// so the new limits take effect on the very next request (an
-    /// operator who raises a limit must not have to wait out the block
-    /// window of the clients that tripped the old one).
+    /// A configuration change releases the site's runtime state: the
+    /// counters, the sticky over-limit flags and the penalty box are
+    /// all reset, so the new limits take effect on the very next
+    /// request (an operator who raises a limit must not have to wait
+    /// out the block window of the clients that tripped the old one).
     ///
-    /// An *unchanged* policy keeps the state — a reload triggered by an
-    /// unrelated admin write must not hand every client a fresh window.
-    fn apply_policy(&mut self, policy: &RateLimitPolicy) {
-        if *policy == self.policy {
+    /// The site's **bot-limited list** is part of that configuration
+    /// (issue #131): removing a bot from the list must not leave it in
+    /// the penalty box, and re-adding it must not make it over the
+    /// limit on the strength of counters it collected before it was
+    /// listed.
+    ///
+    /// An *unchanged* configuration keeps the state — a reload
+    /// triggered by an unrelated admin write must not hand every
+    /// client a fresh window.
+    fn apply_config(&mut self, policy: &RateLimitPolicy, bot_limited: &BTreeSet<String>) {
+        if *policy == self.policy && *bot_limited == self.bot_limited {
             return;
         }
         let structure_changed = policy.enabled != self.policy.enabled
@@ -702,10 +728,11 @@ impl SiteState {
         if structure_changed {
             self.allocate(policy);
         }
-        // Any policy change releases the current windows.
+        // Any configuration change releases the current windows.
         self.bump_epochs();
         self.clear_penalty();
         self.policy = policy.clone();
+        self.bot_limited = bot_limited.clone();
     }
 
     /// Release every slot by moving to a fresh epoch.
@@ -1167,22 +1194,24 @@ impl RateLimiter {
             let Some(cfg) = configs.get(name) else {
                 return false;
             };
-            state.lock().apply_policy(&cfg.policy);
+            state.lock().apply_config(&cfg.policy, &cfg.bot_limited);
             true
         });
         for (name, cfg) in configs {
-            sites
-                .entry(name.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(SiteState::new(&cfg.policy))));
+            sites.entry(name.clone()).or_insert_with(|| {
+                Arc::new(Mutex::new(SiteState::new(&cfg.policy, &cfg.bot_limited)))
+            });
         }
     }
 
     /// Evaluate the limits for one request.
     ///
     /// `ip` is the client IP the counters and the rules are keyed on.
-    /// `known_bot` must be `true` only for a **verified** known bot —
-    /// the caller reuses the verdict the gateway already computed for
-    /// the `P-Known-Bot` header.
+    /// `bot_name` is the registry id of the request's bot — `Some`
+    /// only for a **verified** known bot, because the caller reuses
+    /// the verdict the gateway already computed for the `P-Known-Bot`
+    /// header. A bot whose id is in the site's `bot_limited` list is
+    /// not exempt: it is counted and limited like any other client.
     ///
     /// `page_key` is the request target (path + query) used by the
     /// distinct-page dimension.
@@ -1195,7 +1224,7 @@ impl RateLimiter {
         site: &str,
         cfg: &SiteLimitConfig,
         ip: Option<IpAddr>,
-        known_bot: bool,
+        bot_name: Option<&str>,
         page_key: Option<&str>,
         geo: ClientGeo<'_>,
     ) -> LimitDecision {
@@ -1212,7 +1241,7 @@ impl RateLimiter {
                 _ => LimitDecision::Allow,
             };
         };
-        state.lock().check(site, cfg, ip, known_bot, page_key, geo)
+        state.lock().check(site, cfg, ip, bot_name, page_key, geo)
     }
 
     /// The latest published snapshot.
@@ -1375,7 +1404,7 @@ impl SiteState {
         site: &str,
         cfg: &SiteLimitConfig,
         ip: IpAddr,
-        known_bot: bool,
+        bot_name: Option<&str>,
         page_key: Option<&str>,
         geo: ClientGeo<'_>,
     ) -> LimitDecision {
@@ -1401,8 +1430,11 @@ impl SiteState {
             None => {}
         }
 
-        // 2. A verified known bot is exempt from every limit.
-        if known_bot {
+        // 2. A verified known bot is exempt from every limit — unless
+        //    the site lists it as subject to the limits (issue #131).
+        if let Some(name) = bot_name
+            && !cfg.bot_limited.contains(name)
+        {
             self.exempt += 1;
             return LimitDecision::Allow;
         }
@@ -1677,6 +1709,7 @@ mod tests {
             policy: RateLimitPolicy::default(),
             whitelist: wl,
             blacklist: bl,
+            ..Default::default()
         };
         // The /32 is the longer prefix → blacklist wins.
         assert_eq!(cfg.rule_match(ip(10, 1, 2, 3)), Some(RuleKind::Blacklist));
@@ -1694,6 +1727,7 @@ mod tests {
             policy: RateLimitPolicy::default(),
             whitelist: wl,
             blacklist: bl,
+            ..Default::default()
         };
         assert_eq!(cfg.rule_match(ip(10, 1, 2, 3)), Some(RuleKind::Whitelist));
         assert_eq!(cfg.rule_match(ip(10, 1, 2, 4)), Some(RuleKind::Blacklist));
@@ -1717,7 +1751,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -1728,7 +1762,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -1738,7 +1772,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         ) {
@@ -1759,7 +1793,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(client),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -1780,7 +1814,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(client),
-                    false,
+                    None,
                     Some(&key),
                     ClientGeo::default()
                 ),
@@ -1795,7 +1829,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(client),
-                    false,
+                    None,
                     Some("/page-0"),
                     ClientGeo::default()
                 ),
@@ -1810,7 +1844,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some(&key),
                 ClientGeo::default(),
             );
@@ -1830,7 +1864,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/a?id=1"),
                 ClientGeo::default()
             ),
@@ -1841,7 +1875,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/a?id=2"),
                 ClientGeo::default()
             ),
@@ -1853,7 +1887,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/a?id=3"),
                 ClientGeo::default()
             ),
@@ -1871,13 +1905,259 @@ mod tests {
                     "site",
                     &cfg,
                     Some(client),
-                    true,
+                    Some("googlebot"),
                     Some("/"),
                     ClientGeo::default()
                 ),
                 LimitDecision::Allow
             );
         }
+    }
+
+    /// A bot the site lists is **not** exempt: it is counted against
+    /// the site's limits and answered 429 when it is over them
+    /// (issue #131).
+    #[test]
+    fn a_listed_bot_is_not_exempt() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 1));
+        cfg.bot_limited.insert("googlebot".to_string());
+        let client = ip(66, 249, 66, 1);
+
+        // The first request fits the limit of 1 per window…
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        // …the second one is over it.
+        assert!(
+            matches!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "a listed bot must be counted against the site's limits"
+        );
+    }
+
+    /// A bot the site does **not** list stays exempt, even on a site
+    /// that limits another bot.
+    #[test]
+    fn an_unlisted_bot_stays_exempt() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 1));
+        cfg.bot_limited.insert("gptbot".to_string());
+        let client = ip(66, 249, 66, 1);
+        for _ in 0..50 {
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow
+            );
+        }
+    }
+
+    /// The IP rules keep their precedence over the bot list: a listed
+    /// bot whose IP is blacklisted is still rejected with 403, and a
+    /// whitelisted IP is still exempt.
+    #[test]
+    fn the_ip_rules_keep_their_precedence_over_the_bot_list() {
+        let (limiter, mut cfg) = limiter_with(policy(10, 10));
+        cfg.bot_limited.insert("googlebot".to_string());
+        cfg.blacklist.insert("66.249.64.0/19").unwrap();
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(ip(66, 249, 66, 1)),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Blocked
+        );
+
+        let (limiter, mut cfg) = limiter_with(policy(1, 1));
+        cfg.bot_limited.insert("googlebot".to_string());
+        cfg.whitelist.insert("10.0.0.0/8").unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(ip(10, 1, 1, 1)),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow
+            );
+        }
+    }
+
+    /// A bot id the site lists but the registry does not know never
+    /// matches a request — only a bot the verifier knows can produce
+    /// a verified bot.
+    #[test]
+    fn an_unknown_bot_id_never_matches() {
+        let (limiter, mut cfg) = limiter_with(policy(1, 1));
+        cfg.bot_limited.insert("not-a-real-bot".to_string());
+        let client = ip(66, 249, 66, 1);
+        for _ in 0..50 {
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow
+            );
+        }
+    }
+
+    /// Changing the site's bot-limited list releases the site's
+    /// runtime state, exactly like a policy change (issue #131).
+    ///
+    /// Without it a bot that is removed from the list stays in the
+    /// penalty box, and a bot that is re-added is immediately over
+    /// the limit on the strength of the counters it collected before
+    /// it was listed.
+    #[test]
+    fn a_bot_list_change_releases_the_sites_state() {
+        let limiter = RateLimiter::new();
+        let client = ip(66, 249, 66, 1);
+        let mut cfg = config(policy(1, 1));
+
+        // The bot is listed and trips the limit.
+        cfg.bot_limited.insert("googlebot".to_string());
+        let mut configs = HashMap::new();
+        configs.insert("site".to_string(), Arc::new(cfg.clone()));
+        limiter.reconfigure(&configs);
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(
+            matches!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "the listed bot trips the limit"
+        );
+
+        // The operator removes the bot from the list — the state is
+        // released, so the bot is served again right away.
+        cfg.bot_limited.clear();
+        let mut configs = HashMap::new();
+        configs.insert("site".to_string(), Arc::new(cfg.clone()));
+        limiter.reconfigure(&configs);
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+
+        // And listing it again starts it from a fresh window.
+        cfg.bot_limited.insert("googlebot".to_string());
+        let mut configs = HashMap::new();
+        configs.insert("site".to_string(), Arc::new(cfg.clone()));
+        limiter.reconfigure(&configs);
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+    }
+
+    /// An *unchanged* configuration keeps the counters — a reload
+    /// triggered by an unrelated admin write must not hand every
+    /// client a fresh window.
+    #[test]
+    fn an_unchanged_bot_list_keeps_the_counters() {
+        let limiter = RateLimiter::new();
+        let client = ip(66, 249, 66, 1);
+        let mut cfg = config(policy(1, 1));
+        cfg.bot_limited.insert("googlebot".to_string());
+        let mut configs = HashMap::new();
+        configs.insert("site".to_string(), Arc::new(cfg.clone()));
+        limiter.reconfigure(&configs);
+
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        // The same configuration again — the counter survives, so the
+        // bot is still over the limit.
+        let mut configs = HashMap::new();
+        configs.insert("site".to_string(), Arc::new(cfg.clone()));
+        limiter.reconfigure(&configs);
+        assert!(
+            matches!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    Some("googlebot"),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "an unchanged configuration must not reset the counters"
+        );
     }
 
     #[test]
@@ -1893,7 +2173,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(ip(10, 1, 1, 1)),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -1906,7 +2186,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(ip(192, 0, 2, 7)),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -1923,7 +2203,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(ip(66, 249, 66, 1)),
-                true,
+                Some("googlebot"),
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -1936,7 +2216,7 @@ mod tests {
         let (limiter, cfg) = limiter_with(policy(1, 1));
         for _ in 0..10 {
             assert_eq!(
-                limiter.check("site", &cfg, None, false, Some("/"), ClientGeo::default()),
+                limiter.check("site", &cfg, None, None, Some("/"), ClientGeo::default()),
                 LimitDecision::Allow
             );
         }
@@ -1954,7 +2234,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(client),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -1966,7 +2246,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(ip(192, 0, 2, 9)),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -1982,7 +2262,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -1991,7 +2271,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2003,7 +2283,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2027,7 +2307,7 @@ mod tests {
                 "a",
                 &cfg_a,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2039,7 +2319,7 @@ mod tests {
                 "b",
                 &cfg_b,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2050,7 +2330,7 @@ mod tests {
                 "a",
                 &cfg_a,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2082,14 +2362,14 @@ mod tests {
 
     #[test]
     fn window_advance_releases_the_slots() {
-        let mut st = SiteState::new(&policy(1, 0));
+        let mut st = SiteState::new(&policy(1, 0), &BTreeSet::new());
         let client = ip(203, 0, 113, 50);
         assert_eq!(
             st.check(
                 "site",
                 &SiteLimitConfig::default(),
                 client,
-                false,
+                None,
                 None,
                 ClientGeo::default()
             ),
@@ -2129,6 +2409,29 @@ mod tests {
         assert_eq!(logged, 3);
     }
 
+    /// The per-site bot list travels into the site's configuration; a
+    /// site without an entry keeps an empty list (every verified bot
+    /// exempt).
+    #[test]
+    fn the_bot_list_is_filled_per_site() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let mut bot_limits: HashMap<String, BTreeSet<String>> = HashMap::new();
+        bot_limits.insert(
+            "a".to_string(),
+            ["gptbot".to_string(), "ccbot".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let configs = build_limit_configs(&names, &HashMap::new(), &[], &bot_limits);
+        assert_eq!(
+            configs["a"].bot_limited,
+            ["gptbot".to_string(), "ccbot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>()
+        );
+        assert!(configs["b"].bot_limited.is_empty());
+    }
+
     #[test]
     fn global_rules_apply_to_every_site() {
         let rules = vec![IpRule {
@@ -2140,7 +2443,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         }];
         let names = vec!["a".to_string(), "b".to_string()];
-        let configs = build_limit_configs(&names, &HashMap::new(), &rules);
+        let configs = build_limit_configs(&names, &HashMap::new(), &rules, &HashMap::new());
         assert_eq!(
             configs["a"].rule_match(ip(192, 0, 2, 1)),
             Some(RuleKind::Blacklist)
@@ -2162,7 +2465,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         }];
         let names = vec!["a".to_string(), "b".to_string()];
-        let configs = build_limit_configs(&names, &HashMap::new(), &rules);
+        let configs = build_limit_configs(&names, &HashMap::new(), &rules, &HashMap::new());
         assert_eq!(
             configs["a"].rule_match(ip(192, 0, 2, 1)),
             Some(RuleKind::Blacklist)
@@ -2208,7 +2511,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2219,7 +2522,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2232,7 +2535,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2253,7 +2556,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(blocked_ip),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2266,7 +2569,7 @@ mod tests {
             "site",
             &cfg,
             Some(throttled_ip),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2275,7 +2578,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(throttled_ip),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2309,7 +2612,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2317,7 +2620,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2341,12 +2644,12 @@ mod tests {
         };
         // The first request is within the limit — nothing is recorded.
         assert_eq!(
-            limiter.check("site", &cfg, Some(client), false, Some("/"), geo),
+            limiter.check("site", &cfg, Some(client), None, Some("/"), geo),
             LimitDecision::Allow
         );
         let before = chrono::Utc::now();
         assert!(matches!(
-            limiter.check("site", &cfg, Some(client), false, Some("/"), geo),
+            limiter.check("site", &cfg, Some(client), None, Some("/"), geo),
             LimitDecision::Throttled { .. }
         ));
 
@@ -2379,7 +2682,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2388,7 +2691,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo::default()
             ),
@@ -2399,7 +2702,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("DE"),
@@ -2424,7 +2727,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2433,7 +2736,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("FR"),
@@ -2447,7 +2750,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("US"),
@@ -2479,7 +2782,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2488,7 +2791,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("JP"),
@@ -2502,7 +2805,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("US"),
@@ -2529,7 +2832,7 @@ mod tests {
             "site",
             &cfg,
             Some(client),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2538,7 +2841,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("JP"),
@@ -2552,7 +2855,7 @@ mod tests {
                 "site",
                 &cfg,
                 Some(client),
-                false,
+                None,
                 Some("/"),
                 ClientGeo {
                     country: Some("JP"),
@@ -2582,7 +2885,7 @@ mod tests {
             "site",
             &cfg,
             Some(throttled),
-            false,
+            None,
             Some("/"),
             ClientGeo::default(),
         );
@@ -2592,7 +2895,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(throttled),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -2607,7 +2910,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(blocked),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),
@@ -2637,7 +2940,7 @@ mod tests {
                     "site",
                     &cfg,
                     Some(ip(192, 0, 2, i)),
-                    false,
+                    None,
                     Some("/"),
                     ClientGeo::default()
                 ),

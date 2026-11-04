@@ -7,7 +7,10 @@
 //! `SitesFormFieldsView` for this reason; the duplication is intentional
 //! and localised to the form-context shape.
 
+use std::collections::BTreeSet;
+
 use askama::Template;
+use pangolin_core::bot::BotInfo;
 use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{Site, Tun};
 
@@ -77,6 +80,12 @@ pub struct SitesNewTemplate<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// Every known bot of the registry — one checkbox per bot in the
+    /// site's bot-limited list (issue #131).
+    pub known_bots: Vec<BotInfo>,
+    /// The registry ids that are currently in the site's bot-limited
+    /// list — the boxes that are pre-checked.
+    pub rate_limit_bots: BTreeSet<String>,
     /// The provider configuration of the site (issue #122).
     pub provider_view: SiteProviderView,
     /// Every provider of the registry — the dropdown is built from
@@ -152,6 +161,12 @@ pub struct SitesEditTemplate<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// Every known bot of the registry — one checkbox per bot in the
+    /// site's bot-limited list (issue #131).
+    pub known_bots: Vec<BotInfo>,
+    /// The registry ids that are currently in the site's bot-limited
+    /// list — the boxes that are pre-checked.
+    pub rate_limit_bots: BTreeSet<String>,
     /// The provider configuration of the site (issue #122).
     pub provider_view: SiteProviderView,
     /// Every provider of the registry — the dropdown is built from
@@ -236,6 +251,12 @@ pub struct SitesFormFieldsView<'a> {
     pub tunnels: Vec<Tun>,
     /// The per-site rate-limit policy (issue #117).
     pub rate_limit: RateLimitPolicy,
+    /// Every known bot of the registry — one checkbox per bot in the
+    /// site's bot-limited list (issue #131).
+    pub known_bots: Vec<BotInfo>,
+    /// The registry ids that are currently in the site's bot-limited
+    /// list — the boxes that are pre-checked.
+    pub rate_limit_bots: BTreeSet<String>,
     /// The provider configuration of the site (issue #122).
     pub provider_view: SiteProviderView,
     /// Every provider of the registry — the dropdown is built from

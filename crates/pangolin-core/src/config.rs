@@ -623,7 +623,7 @@ impl Config {
 /// the operator just learns that the knob is gone. Today that is
 /// `log.bot.enabled`: the bot log and the knownbots verifier are
 /// always on (issue #117), and a disabled bot log used to silently
-/// turn the gateway's `P-Known-Bot` header into `0`.
+/// turn the gateway's `P-Known-Bot` header into an empty value.
 fn warn_retired_keys(s: &str) {
     // `find_value` walks the parsed YAML — `Err(MissingField)` means
     // the key is not there, `Ok(_)` means it is. A YAML syntax error
