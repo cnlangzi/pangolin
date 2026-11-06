@@ -34,6 +34,10 @@ pub struct BlockedRow {
     pub ip: String,
     /// The site that rejected the client last.
     pub site: String,
+    /// The registry id of the verified known bot the client was
+    /// identified as — `None` for a client that is not one (issue
+    /// #134).
+    pub bot_name: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.

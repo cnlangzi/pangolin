@@ -710,6 +710,55 @@ mod tests {
         );
     }
 
+    /// A site whose request limit is 1 **and** whose bot-limited list
+    /// holds `googlebot` — so a request that carries that bot
+    /// identity is counted like any other client and is throttled
+    /// (issue #131).
+    async fn seed_bot_limited_site(app: &Arc<App>) {
+        seed_limited_site(app).await;
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::set_site_rate_limit_bots(
+                &db,
+                "a",
+                &BTreeSet::from(["googlebot".to_string()]),
+            )
+            .unwrap();
+        }
+        app.reload_indexes().await;
+    }
+
+    /// Drive a client that claims a bot identity over the request
+    /// limit of the seeded site.
+    async fn throttle_as_bot(app: &Arc<App>, client: std::net::IpAddr, bot: &str) {
+        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                Some(bot),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(
+            matches!(
+                app.rate_limiter.check(
+                    "a",
+                    &cfg,
+                    Some(client),
+                    Some(bot),
+                    Some("/"),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Throttled { .. }
+            ),
+            "the bot must be throttled"
+        );
+    }
+
     /// Wait until the *published* snapshot carries the rejected client
     /// with the expected number of rejections.
     ///
@@ -736,6 +785,54 @@ mod tests {
             .expect("body")
             .to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The column labels of the table that follows `marker`, in order.
+    ///
+    /// `marker` is a heading of the table — the head of the table is
+    /// the first `<thead` *after* it.
+    fn table_headers(html: &str, marker: &str) -> Vec<String> {
+        let at = html
+            .find(marker)
+            .unwrap_or_else(|| panic!("no {marker} in the fragment"));
+        let thead = html[at..]
+            .find("<thead")
+            .map(|i| at + i)
+            .expect("the table has a head");
+        let head = &html[thead..];
+        let end = head.find("</thead>").expect("a closed table head");
+        head[..end]
+            .split("<th ")
+            .skip(1)
+            .map(|cell| {
+                let open = cell.find('>').expect("a closed header cell");
+                let close = cell[open..].find("</th>").expect("a closed header cell");
+                cell[open + 1..open + close].trim().to_string()
+            })
+            .collect()
+    }
+
+    /// The markup of the `<tr>` that carries `marker`.
+    fn row_with<'a>(html: &'a str, marker: &str) -> &'a str {
+        let at = html
+            .find(marker)
+            .unwrap_or_else(|| panic!("no row with {marker} in the fragment"));
+        let start = html[..at].rfind("<tr").expect("the row opens with a <tr>");
+        let end = html[at..].find("</tr>").expect("the row is closed") + at;
+        &html[start..end]
+    }
+
+    /// The cells of a row, in order.
+    fn cells_of(row: &str) -> Vec<&str> {
+        let mut cells = Vec::new();
+        let mut rest = row;
+        while let Some(open) = rest.find("<td") {
+            let after = &rest[open..];
+            let close = after.find("</td>").expect("the cell is closed");
+            cells.push(&after[..close]);
+            rest = &after[close..];
+        }
+        cells
     }
 
     #[tokio::test]
@@ -768,10 +865,15 @@ mod tests {
         // The relative time of the first rejection ("0s ago", "1s ago", …).
         assert!(html.contains("s ago"), "{html}");
         // The absolute timestamp stays available in the cell's title.
-        let at = html
-            .find("title=\"")
+        // The search is scoped to the row under test, and the *last*
+        // title of that row is the one of the first-blocked cell — the
+        // lookup button of the client-IP cell carries a title of its
+        // own, and it comes first.
+        let row = row_with(&html, "data-ip=\"198.51.100.9\"");
+        let at = row
+            .rfind("title=\"")
             .expect("the first-blocked cell has a title");
-        let stamp = &html[at + "title=\"".len()..];
+        let stamp = &row[at + "title=\"".len()..];
         let end = stamp.find('"').expect("the title attribute is closed");
         let stamp = &stamp[..end];
         let parsed = chrono::DateTime::parse_from_rfc3339(stamp)
@@ -805,8 +907,121 @@ mod tests {
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
         assert!(html.contains("data-country=\"\""), "{html}");
         assert!(html.contains("data-region=\"\""), "{html}");
-        // Both geo cells render an em dash.
-        assert_eq!(html.matches('—').count(), 2, "{html}");
+        // The country and the region cells render an em dash. The
+        // cells are checked one by one — the Bot column renders an em
+        // dash too, so a plain count over the whole fragment would
+        // not say *which* cells are empty.
+        let row = row_with(&html, "data-ip=\"198.51.100.10\"");
+        let cells = cells_of(row);
+        // Site, Client IP, Bot, Country, Region, …
+        assert!(cells[3].contains('—'), "{row}");
+        assert!(cells[4].contains('—'), "{row}");
+    }
+
+    /// A throttled known bot is shown with its name, and its client-IP
+    /// cell carries the lookup hooks (issue #134, R3–R6, R13).
+    #[tokio::test]
+    async fn the_over_limit_table_shows_the_bot_name_and_the_lookup_hooks() {
+        let (_dir, app) = make_test_app();
+        seed_bot_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.40".parse().unwrap();
+        throttle_as_bot(&app, client, "googlebot").await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        // The column order — the Bot column sits right after the
+        // client IP (R3).
+        assert_eq!(
+            table_headers(&html, "Top over-limit clients"),
+            vec![
+                "Site",
+                "Client IP",
+                "Bot",
+                "Country",
+                "Region",
+                "Status",
+                "Rejections",
+                "First blocked"
+            ]
+        );
+
+        // The row carries the name (R5) and renders it as a blue chip
+        // (R4).
+        let row = row_with(&html, "data-bot=\"googlebot\"");
+        assert!(row.contains("bg-blue-100"), "{row}");
+        assert!(row.contains(">googlebot</span>"), "{row}");
+
+        // The client-IP cell carries the lookup hooks and the two
+        // result placeholders (R6, R13).
+        let cell = cells_of(row)[1];
+        assert!(cell.contains("data-asn-ip=\"198.51.100.40\""), "{cell}");
+        assert_eq!(cell.matches("data-asn-trigger").count(), 1, "{cell}");
+        assert!(cell.contains("data-asn-geo"), "{cell}");
+        assert!(cell.contains("data-asn-asn"), "{cell}");
+        // The tooltip says that the address leaves the operator's
+        // browser (R11).
+        assert!(
+            cell.contains("sends this address to ipwhois.app / ipinfo.io"),
+            "{cell}"
+        );
+    }
+
+    /// A client that is not a verified known bot has no name — the Bot
+    /// column renders a muted em dash and no chip (issue #134, R4).
+    #[tokio::test]
+    async fn a_client_without_a_bot_renders_an_em_dash_in_the_bot_column() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.41".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let row = row_with(&html, "data-bot=\"\"");
+        assert!(!row.contains("bg-blue-100"), "{row}");
+        // Site, Client IP, Bot, …
+        let cells = cells_of(row);
+        assert!(cells[2].contains('—'), "{row}");
+        assert!(!cells[2].contains("bg-blue-100"), "{row}");
+    }
+
+    /// The dashboard's live "blocked clients" table shows the bot name
+    /// and the lookup hooks too (issue #134, R3–R6).
+    #[tokio::test]
+    async fn the_dashboard_blocked_table_shows_the_bot_column() {
+        let (_dir, app) = make_test_app();
+        seed_bot_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.42".parse().unwrap();
+        throttle_as_bot(&app, client, "googlebot").await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_blocked(&app).await.expect("api_blocked")).await;
+        // The column order — the Bot column sits right after the
+        // client IP (R3).
+        assert_eq!(
+            table_headers(&html, "Blocked clients"),
+            vec!["Client IP", "Bot", "Site", "403", "429", "Last seen"]
+        );
+
+        let row = row_with(&html, "data-bot=\"googlebot\"");
+        assert!(row.contains("bg-blue-100"), "{row}");
+        assert!(row.contains(">googlebot</span>"), "{row}");
+
+        // The client-IP cell carries the lookup hooks (R6).
+        let cell = cells_of(row)[0];
+        assert!(cell.contains("data-asn-ip=\"198.51.100.42\""), "{cell}");
+        assert_eq!(cell.matches("data-asn-trigger").count(), 1, "{cell}");
+        assert!(cell.contains("data-asn-geo"), "{cell}");
+        assert!(cell.contains("data-asn-asn"), "{cell}");
+    }
+
+    /// The empty state of the "top over-limit clients" table spans the
+    /// eight columns of the table (issue #134, R3).
+    #[tokio::test]
+    async fn the_empty_over_limit_table_spans_eight_columns() {
+        let (_dir, app) = make_test_app();
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        assert!(html.contains("colspan=\"8\""), "{html}");
     }
 
     #[tokio::test]

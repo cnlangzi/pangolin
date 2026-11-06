@@ -4089,3 +4089,125 @@ async fn dashboard_lists_the_blocked_clients_live() {
     let html = resp.text().await.unwrap();
     assert!(html.contains("127.0.0.1"), "{html}");
 }
+
+// ── §21 — Rate limit tables: the bot identity and the IP lookup (issue #134) ─
+
+/// A throttled known bot shows up in the rate-limit tables with its
+/// name.
+///
+/// The bot is a **custom** one: the knownbots registry is read from
+/// `<cache_dir>/conf.d/*.yaml` on top of the embedded configs, and a
+/// custom bot without `urls:` is never refreshed from the network — so
+/// its prefix set stays exactly what the test seeded. A real bot
+/// (e.g. `googlebot`) would be overwritten by the first refresh of
+/// its published IP list, which needs the network and would make the
+/// test flaky.
+#[tokio::test]
+async fn a_throttled_known_bot_shows_up_in_the_tables_with_its_name() {
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+             VALUES ('bot-site', 'http://127.0.0.1:9', 1, 'passthrough', NULL, ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert site");
+        conn.execute(
+            "INSERT INTO domains (domain, site_name, enabled, created_at) \
+             VALUES ('bot.test', 'bot-site', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert domain");
+        // One request per window — the second request of the bot is
+        // over the limit.
+        conn.execute(
+            "INSERT INTO site_rate_limits \
+             (site_name, enabled, req_limit, req_window_secs, page_limit, page_window_secs) \
+             VALUES ('bot-site', 1, 1, 60, 0, 3600)",
+            rusqlite::params![],
+        )
+        .expect("insert site rate limit");
+        // The site counts the bot against its limits instead of
+        // exempting it (issue #131).
+        conn.execute(
+            "INSERT INTO site_rate_limit_bots (site_name, bot_name) VALUES ('bot-site', 'testbot')",
+            rusqlite::params![],
+        )
+        .expect("insert site rate limit bots");
+
+        // The knownbots cache directory defaults to `./logs/bots/cache`
+        // relative to the working directory of the process — the
+        // harness runs the binary in the tempdir the database lives
+        // in. A bot config there joins the registry, and the e2e
+        // client (which connects over loopback) is inside its prefix
+        // set, so the gateway verifies it.
+        let tmpdir = db_path.parent().expect("the db lives in the tempdir");
+        let conf_d = tmpdir.join("logs/bots/cache/conf.d");
+        std::fs::create_dir_all(&conf_d).expect("mkdir the bot conf.d");
+        std::fs::write(
+            conf_d.join("testbot.yaml"),
+            "kind: SearchEngine\nname: testbot\nvendor: \"Test\"\nua: \"Testbot\"\n\
+             custom:\n  - \"127.0.0.1/32\"\n",
+        )
+        .expect("write the bot config");
+    })
+    .await;
+
+    // The client claims to be the bot — the gateway verifies the
+    // marker against the seeded prefix set.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let ua = "Testbot/1.0";
+    let (status, _body) =
+        crate::harness::raw_request_with_user_agent(&addr, "bot.test", "GET", "/", b"", ua).await;
+    assert!(
+        status != 429,
+        "the first request is within the limit of 1, got {status}"
+    );
+    let (status, _body) =
+        crate::harness::raw_request_with_user_agent(&addr, "bot.test", "GET", "/", b"", ua).await;
+    assert_eq!(status, 429, "the bot must be over the site's limit");
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The counters are published once per second — poll for the row.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let resp = client.get("/api/ratelimit/sites").await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        html = resp.text().await.unwrap();
+        if html.contains("data-bot=\"testbot\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("data-bot=\"testbot\""),
+        "the throttled bot must be listed with its name: {html}"
+    );
+    // The name is rendered as a chip.
+    assert!(html.contains("bg-blue-100"), "{html}");
+    assert!(html.contains(">testbot</span>"), "{html}");
+    // The client-IP cell carries the lookup hooks.
+    assert!(html.contains("data-asn-ip=\"127.0.0.1\""), "{html}");
+    assert!(html.contains("data-asn-trigger"), "{html}");
+
+    // The dashboard's live list carries the name too.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let resp = client.get("/api/ratelimit/blocked").await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        html = resp.text().await.unwrap();
+        if html.contains("data-bot=\"testbot\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("data-bot=\"testbot\""),
+        "the throttled bot must be listed with its name: {html}"
+    );
+    assert!(html.contains("data-asn-ip=\"127.0.0.1\""), "{html}");
+}

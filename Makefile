@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa cargo-mirror cargo-mirror-off
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-js test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa cargo-mirror cargo-mirror-off
 
 help:
 	@echo "=== Config ==="
@@ -102,6 +102,7 @@ help:
 	@echo "  make fmt-check     # Check formatting"
 	@echo "  make clippy        # Lint"
 	@echo "  make test          # Unit tests"
+	@echo "  make test-js       # Client-side tests for assets/app.js (node)"
 	@echo "  make test-e2e      # E2E tests (Pebble ACME)"
 	@echo "  make lint          # fmt + clippy + test"
 	@echo "  make ci            # full local CI"
@@ -412,6 +413,18 @@ clippy:
 test:
 	$(CARGO) test --workspace --lib --bins
 
+# The client-side tests for `assets/app.js` (issue #134). They use
+# node's built-in test runner — no dependencies, no package.json.
+#
+# Skipped when node is missing, so a machine without node can still
+# run `make lint`; CI installs node, so the tests are enforced there.
+test-js:
+	@if ! command -v node >/dev/null 2>&1; then \
+		echo "node not found — skipping the JS tests"; \
+		exit 0; \
+	fi; \
+	node --test tests/js/*.test.js
+
 # Real-binary e2e tests require the ngx + tun binaries at
 # target/release/{ngx,tun}, so depend on `build` to ensure they exist.
 # The 65 lib-level tests under tests/src/* still run (and dominate the
@@ -423,7 +436,7 @@ test-e2e: build
 test-admin-e2e: build
 	$(CARGO) test -p pangolin-integration-tests --features integration admin_ui_e2e
 
-lint: fmt-check clippy test
+lint: fmt-check clippy test test-js
 	@echo "✓ all checks passed"
 
 ci: fmt-check clippy test build

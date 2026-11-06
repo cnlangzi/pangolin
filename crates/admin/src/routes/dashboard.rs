@@ -104,6 +104,7 @@ pub fn blocked_rows(app: &Arc<App>) -> Vec<BlockedRow> {
         .map(|c| BlockedRow {
             ip: c.ip.clone(),
             site: c.site.clone(),
+            bot_name: c.bot_name.clone(),
             rule_blocks: c.rule_blocks,
             throttled: c.throttled,
             last_seen: format!("{}s ago", c.last_seen_secs),

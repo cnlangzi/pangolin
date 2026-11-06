@@ -29,6 +29,14 @@ jobs:
           toolchain: 1.96
           components: rustfmt, clippy
 
+      # The client-side tests for `assets/app.js` run on node's built-in
+      # test runner — no dependencies. `make lint` skips them when node
+      # is missing, so CI installs node explicitly to enforce them.
+      - name: Install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:

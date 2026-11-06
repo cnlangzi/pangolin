@@ -50,6 +50,10 @@ pub struct TopOverRow {
     pub country: Option<String>,
     /// The region code, `None` when the provider reported none.
     pub region: Option<String>,
+    /// The registry id of the verified known bot the client was
+    /// identified as — `None` for a client that is not one (issue
+    /// #134).
+    pub bot_name: Option<String>,
     /// "403", "429" or "403+429" — the status the client was rejected
     /// with.
     pub status: String,
@@ -81,6 +85,7 @@ impl TopOverRow {
             ip: client.ip.clone(),
             country: client.country.clone(),
             region: client.region.clone(),
+            bot_name: client.bot_name.clone(),
             status: status.to_string(),
             rejections: client.rule_blocks.saturating_add(client.throttled),
             first_seen_rel: super::relative_time(client.first_seen_at, now),
@@ -140,6 +145,7 @@ mod tests {
             ip: "198.51.100.9".into(),
             country: Some("JP".into()),
             region: Some("13".into()),
+            bot_name: None,
             rule_blocks,
             throttled,
             first_seen_secs: 42,
@@ -171,5 +177,20 @@ mod tests {
         let row = TopOverRow::new(&c, now);
         assert_eq!(row.first_seen_rel, "12m ago");
         assert_eq!(row.first_seen_at, c.first_seen_at.to_rfc3339());
+    }
+
+    /// The bot name of the client is carried into the row (issue
+    /// #134).
+    #[test]
+    fn the_bot_name_is_carried_into_the_row() {
+        let now = Utc::now();
+        let mut c = client(0, 7);
+        c.bot_name = Some("googlebot".into());
+        assert_eq!(
+            TopOverRow::new(&c, now).bot_name.as_deref(),
+            Some("googlebot")
+        );
+        // A client that is not a verified known bot has no name.
+        assert_eq!(TopOverRow::new(&client(0, 7), now).bot_name, None);
     }
 }
