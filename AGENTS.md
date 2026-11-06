@@ -42,6 +42,13 @@ right tier for the change:
   real ACME, real filesystem, or a real signal. Gate behind
   `--features integration` so day-to-day `cargo test --lib` skips
   them.
+- **Client-side test** (`tests/js/*.test.js`): behaviour of
+  `assets/app.js`. The admin UI has no browser automation, so the
+  test drives the script itself in a `vm` context with a DOM stub —
+  that way it exercises the file that is served to the operator
+  instead of a copy of its logic. Run with `make test-js` (node's
+  built-in test runner, no dependencies; skipped when node is
+  missing).
 
 The test should be named so the regression it pins is obvious from
 the function name — `real_e2e_direct_sse_streams_through` is better

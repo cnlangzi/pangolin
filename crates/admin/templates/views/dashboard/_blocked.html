@@ -1,6 +1,7 @@
 {# Live "blocked clients" list (issue #117) — the client IPs the rate
    limiter rejected, most recent first. Refreshed through htmx from
    GET /api/ratelimit/blocked. #}
+{% import "components/_ip_lookup.html" as lookup %}
 <div class="card overflow-hidden">
   <div class="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
     <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Blocked clients</h2>
@@ -26,32 +27,8 @@
         {# The `data-bot` attribute carries the raw value, so a test can #}
         {# assert on it without scraping the rendered cell.             #}
         <tr data-bot="{% if let Some(b) = row.bot_name %}{{ b }}{% endif %}">
-          {# The magnifier button and the two result lines are rendered #
-             here, not built by JavaScript: the Tailwind content glob  #
-             does not scan `assets/app.js`, so a class that only appears #
-             there is purged from the stylesheet and the element ships  #
-             unstyled. The client-side code only writes text into the  #
-             placeholders and toggles their visibility.               #}
-          <td class="px-4 py-2 font-mono text-xs" data-asn-ip="{{ row.ip }}">
-            <span class="font-mono text-xs">{{ row.ip }}</span>
-            <button type="button" data-asn-trigger
-                    title="lookup IP info — sends this address to ipwhois.app / ipinfo.io"
-                    class="ml-1 inline-flex items-center justify-center align-middle text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300">
-              <svg data-asn-icon class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"/></svg>
-              <svg data-asn-spinner class="hidden w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4Z"></path></svg>
-            </button>
-            <span data-asn-geo class="hidden block mt-0.5 font-sans text-[11px] text-slate-500 dark:text-slate-400"></span>
-            <span data-asn-asn class="hidden block font-sans text-[11px] text-slate-500 dark:text-slate-400"></span>
-          </td>
-          <td class="px-4 py-2 text-xs">
-            {# The bot chip is blue on purpose: red, yellow and purple  #
-               are taken by the 403 / 429 status badges (issue #134).  #}
-            {% if let Some(b) = row.bot_name %}
-            <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">{{ b }}</span>
-            {% else %}
-            <span class="text-slate-300 dark:text-slate-600">—</span>
-            {% endif %}
-          </td>
+          {% call lookup::ip_cell(ip=row.ip.as_str()) %}
+          {% call lookup::bot_cell(name=row.bot_name.as_deref(), dash_class="text-slate-300 dark:text-slate-600") %}
           <td class="px-4 py-2 font-mono text-xs">{{ row.site }}</td>
           <td class="px-4 py-2 tabular-nums text-xs text-right">{% if row.rule_blocks > 0 %}{{ row.rule_blocks }}{% else %}<span class="text-slate-300 dark:text-slate-600">—</span>{% endif %}</td>
           <td class="px-4 py-2 tabular-nums text-xs text-right">{% if row.throttled > 0 %}{{ row.throttled }}{% else %}<span class="text-slate-300 dark:text-slate-600">—</span>{% endif %}</td>

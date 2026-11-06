@@ -865,13 +865,15 @@ mod tests {
         // The relative time of the first rejection ("0s ago", "1s ago", …).
         assert!(html.contains("s ago"), "{html}");
         // The absolute timestamp stays available in the cell's title.
-        // The *last* title of the fragment is the one of the
-        // first-blocked cell — the lookup button of the client-IP
-        // cell carries a title of its own, and it comes first.
-        let at = html
+        // The search is scoped to the row under test, and the *last*
+        // title of that row is the one of the first-blocked cell — the
+        // lookup button of the client-IP cell carries a title of its
+        // own, and it comes first.
+        let row = row_with(&html, "data-ip=\"198.51.100.9\"");
+        let at = row
             .rfind("title=\"")
             .expect("the first-blocked cell has a title");
-        let stamp = &html[at + "title=\"".len()..];
+        let stamp = &row[at + "title=\"".len()..];
         let end = stamp.find('"').expect("the title attribute is closed");
         let stamp = &stamp[..end];
         let parsed = chrono::DateTime::parse_from_rfc3339(stamp)

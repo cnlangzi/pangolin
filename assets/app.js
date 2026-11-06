@@ -333,8 +333,11 @@
   var ASN_CACHE_KEY = 'pangolin-asn-cache-v1';
   // A successful answer is reused for a day.
   var ASN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-  // A failure is remembered for five minutes, so a provider that has
-  // nothing to say about an address is not asked again and again.
+  // A failure is remembered for five minutes. The entry is *not* a
+  // block: the button promises "click to retry", so a click always
+  // looks the address up again. The window only decides how long the
+  // failed state is remembered — after it, the button is back to its
+  // default self.
   var ASN_FAIL_TTL_MS = 5 * 60 * 1000;
   // Every provider gets its own budget: a hanging provider must not
   // eat the next one's.
@@ -368,8 +371,10 @@
     var s = value == null ? '' : String(value).trim();
     if (!s) return '';
     // The ASN is shown as "AS15169" — the provider may leave the "AS"
-    // prefix out.
-    return /^as/i.test(s) ? s.toUpperCase() : 'AS' + s;
+    // prefix out. A value that is neither a number nor an "AS<number>"
+    // is not an ASN at all, and must not be turned into one.
+    if (/^as\d+$/i.test(s)) return s.toUpperCase();
+    return /^\d+$/.test(s) ? 'AS' + s : '';
   }
 
   // ipwhois.app answers { success, asn, org, city, region, country,
@@ -396,10 +401,13 @@
     var asn = '';
     var name = '';
     var cut = org.indexOf(' ');
-    if (cut > 0) {
+    // The organisation is split on its first space — but only when
+    // the first token really is an ASN. An organisation without one
+    // ("Google LLC") must not be read as the ASN "ASGoogle".
+    if (cut > 0 && /^as\d+/i.test(org.slice(0, cut))) {
       asn = asnText(org.slice(0, cut));
       name = org.slice(cut + 1).trim();
-    } else if (/^as/i.test(org)) {
+    } else if (/^as\d+/i.test(org)) {
       asn = asnText(org);
     } else {
       name = org;
@@ -470,7 +478,12 @@
   // The cached entry of an address, or null when there is none or the
   // one that is there has expired.
   function cacheEntry(ip) {
-    var entry = readCache()[ip];
+    return liveEntry(readCache()[ip]);
+  }
+
+  // The same check against an entry that has already been read out of
+  // the cache — so a pass over many rows parses the cache only once.
+  function liveEntry(entry) {
     if (!entry || typeof entry !== 'object') return null;
     var age = Date.now() - (entry.ts || 0);
     var ttl = entry.failed ? ASN_FAIL_TTL_MS : ASN_CACHE_TTL_MS;
@@ -518,6 +531,9 @@
     if (asnEl) {
       asnEl.textContent = asn;
       asnEl.classList.toggle('hidden', !asn);
+      // The answer comes from a third party — the operator can see
+      // which one answered.
+      asnEl.title = data.provider ? 'answered by ' + data.provider : '';
     }
     var btn = cell.querySelector('[data-asn-trigger]');
     if (btn) btn.classList.add('hidden');
@@ -579,11 +595,15 @@
   // another lookup.
   function rehydrateAsnCells() {
     var cells = document.querySelectorAll('[data-asn-ip]');
+    if (!cells.length) return;
+    // The cache is read once for the whole pass — every row looks at
+    // the same map, and the table is re-rendered every two seconds.
+    var cache = readCache();
     for (var i = 0; i < cells.length; i++) {
       var cell = cells[i];
       var ip = cell.dataset.asnIp;
       if (!ip) continue;
-      var cached = cacheEntry(ip);
+      var cached = liveEntry(cache[ip]);
       // A cached failure leaves the button in place — the operator can
       // click it again.
       if (!cached || cached.failed) continue;

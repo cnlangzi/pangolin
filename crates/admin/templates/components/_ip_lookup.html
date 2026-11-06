@@ -1,0 +1,59 @@
+{# components/_ip_lookup.html — the shared cells of the rate-limit tables. #}
+{#                                                                          #}
+{# Two macros, imported by the templates that render a client-IP cell   #}
+{# and a bot cell:                                                         #}
+{#                                                                          #}
+{#   {% import "components/_ip_lookup.html" as lookup %}                  #}
+{#   {{ lookup::ip_cell(ip=row.ip) }}                                     #}
+{#   {{ lookup::bot_cell(name=row.bot_name, dash_class="text-slate-400") }} #}
+{#                                                                          #}
+{# Why a macro and not an `{% include %}`: an include takes a path only, #}
+{# so the two tables could not pass their own address and their own     #}
+{# empty-dash colour. A macro takes parameters, so the markup — and     #}
+{# with it the contract the client-side lookup in `assets/app.js`       #}
+{# relies on — is defined once.                                            #}
+{#                                                                          #}
+{# Parameters:                                                             #}
+{#   ip         (required) — the client address of the row.              #}
+{#   name       (required) — the registry id of the known bot, or None.   #}
+{#   dash_class (required) — the muted em dash of the table the cell     #}
+{#                          belongs to.                                   #}
+{#                                                                          #}
+{# The Tailwind classes below must appear literally here: the Tailwind   #}
+{# content glob does not scan `assets/app.js`, so a class that only      #}
+{# appears there is purged from the stylesheet and the element ships     #}
+{# unstyled. The client-side code only writes text into the placeholders #}
+{# and toggles their visibility.                                          #}
+
+{# The client-IP cell: the address, the magnifier button that looks the  #}
+{# address up, and the two lines the answer is rendered into.             #}
+{% macro ip_cell(ip) %}
+<td class="px-4 py-2 font-mono text-xs" data-asn-ip="{{ ip }}">
+  <span class="font-mono text-xs">{{ ip }}</span>
+  <button type="button" data-asn-trigger
+          title="lookup IP info — sends this address to ipwhois.app / ipinfo.io"
+          aria-label="Look up IP info (sends this address to ipwhois.app / ipinfo.io)"
+          class="ml-1 align-middle text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300">
+    <span class="inline-flex items-center justify-center">
+      <svg data-asn-icon class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"/></svg>
+      <svg data-asn-spinner class="hidden w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4Z"></path></svg>
+    </span>
+  </button>
+  <div data-asn-geo class="hidden mt-0.5 font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
+  <div data-asn-asn class="hidden font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
+</td>
+{% endmacro ip_cell %}
+
+{# The bot cell: the registry id of the verified known bot as a blue     #}
+{# chip — red, yellow and purple are taken by the 403 / 429 status       #}
+{# badges (issue #134) — or a muted em dash for a client that is not a  #}
+{# verified known bot.                                                     #}
+{% macro bot_cell(name, dash_class) %}
+<td class="px-4 py-2 text-xs">
+  {% if let Some(b) = name %}
+  <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">{{ b }}</span>
+  {% else %}
+  <span class="{{ dash_class }}">—</span>
+  {% endif %}
+</td>
+{% endmacro bot_cell %}
