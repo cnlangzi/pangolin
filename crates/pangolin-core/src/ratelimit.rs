@@ -647,6 +647,16 @@ struct BlockedIpStat {
     country: Option<String>,
     /// The region of the first rejection that carried one.
     region: Option<String>,
+    /// The registry id of the verified known bot the client was
+    /// identified as — `None` for every client that is not one.
+    ///
+    /// The **most recent** observation wins (issue #134): a rejection
+    /// that names a bot replaces the name, a rejection that names none
+    /// leaves the recorded name alone — an unidentified request never
+    /// clears a known identity.
+    bot_name: Option<String>,
+    /// When the bot name above was observed.
+    bot_name_at: Option<Instant>,
     /// When the client was last rejected.
     last_seen: Instant,
 }
@@ -832,7 +842,7 @@ impl SiteState {
     /// Record a rejection of `ip` and return the new total — the log
     /// counter.
     ///
-    /// `kind` is `true` for a rule block (403) and `false` for a
+    /// `rule_block` is `true` for a rule block (403) and `false` for a
     /// throttle (429).
     ///
     /// `geo` is the geo of the rejected client. The **first** value
@@ -844,7 +854,20 @@ impl SiteState {
     /// one observation: a region is only filled in from a rejection
     /// of the *same* country, so the row never shows a country and a
     /// region that no request reported together.
-    fn record_rejection(&mut self, ip: IpAddr, rule_block: bool, geo: ClientGeo<'_>) -> u64 {
+    ///
+    /// `bot_name` is the registry id of the request's bot — `Some`
+    /// only for a **verified** known bot. Unlike the geo, the most
+    /// recent observation wins: a rejection that names a bot replaces
+    /// the recorded name, while a rejection that names none leaves it
+    /// alone — an unidentified request never clears a known identity
+    /// (issue #134).
+    fn record_rejection(
+        &mut self,
+        ip: IpAddr,
+        rule_block: bool,
+        geo: ClientGeo<'_>,
+        bot_name: Option<&str>,
+    ) -> u64 {
         if self.blocked_ips.len() >= MAX_BLOCKED_IPS && !self.blocked_ips.contains_key(&ip) {
             // The list is full — the client is still rejected, it is
             // just not remembered.
@@ -861,6 +884,8 @@ impl SiteState {
             first_seen_at: chrono::Utc::now(),
             country: None,
             region: None,
+            bot_name: None,
+            bot_name_at: None,
             last_seen: now,
         });
         if rule_block {
@@ -884,6 +909,15 @@ impl SiteState {
             && (geo.country.is_none() || geo.country == stat.country.as_deref())
         {
             stat.region = geo.region.map(str::to_string);
+        }
+        // The bot name: the most recent observation that named a bot
+        // wins. A rejection without a bot identity leaves the recorded
+        // name alone.
+        if let Some(name) = bot_name
+            && !name.is_empty()
+        {
+            stat.bot_name = Some(name.to_string());
+            stat.bot_name_at = Some(now);
         }
         stat.total
     }
@@ -1048,6 +1082,10 @@ pub struct OverLimitClient {
     pub country: Option<String>,
     /// The region code of the first rejection that carried one.
     pub region: Option<String>,
+    /// The registry id of the verified known bot the client was
+    /// identified as — `None` for a client that is not one (issue
+    /// #134).
+    pub bot_name: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1070,6 +1108,14 @@ pub struct BlockedClient {
     pub ip: String,
     /// The site that rejected the client last.
     pub site: String,
+    /// The registry id of the verified known bot the client was
+    /// identified as — `None` for a client that is not one.
+    ///
+    /// The address is merged across the sites, so this is the **most
+    /// recent** observation that named a bot: a rejection without a
+    /// bot identity never clears a name that was already recorded
+    /// (issue #134).
+    pub bot_name: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1285,6 +1331,19 @@ impl Drop for RateLimiter {
     }
 }
 
+/// The merge state of one blocked client, across the sites.
+///
+/// The `Instant`s are the merge keys: `site_at` picks the site that
+/// rejected the client last, `bot_at` picks the bot name of the most
+/// recent observation that named one.
+struct MergedBlocked {
+    client: BlockedClient,
+    /// When the site that rejected the client last did it.
+    site_at: Instant,
+    /// When the recorded bot name was observed.
+    bot_at: Option<Instant>,
+}
+
 /// Build the snapshot from the current runtime state.
 fn build_snapshot(
     sites: &RwLock<HashMap<String, Arc<Mutex<SiteState>>>>,
@@ -1295,9 +1354,8 @@ fn build_snapshot(
     let mut out = Vec::with_capacity(sites.len());
     let mut top: Vec<OverLimitClient> = Vec::new();
     let mut totals = RateLimitTotals::default();
-    // The rejected clients, merged across the sites. The `Instant`
-    // is the merge key for "which site rejected the client last".
-    let mut blocked: HashMap<IpAddr, (BlockedClient, Instant)> = HashMap::new();
+    // The rejected clients, merged across the sites.
+    let mut blocked: HashMap<IpAddr, MergedBlocked> = HashMap::new();
 
     for (name, state) in sites.iter() {
         let state = state.lock();
@@ -1342,31 +1400,43 @@ fn build_snapshot(
                 ip: ip.to_string(),
                 country: stat.country.clone(),
                 region: stat.region.clone(),
+                bot_name: stat.bot_name.clone(),
                 rule_blocks: stat.rule_blocks,
                 throttled: stat.throttled,
                 first_seen_secs: now.duration_since(stat.first_seen).as_secs(),
                 first_seen_at: stat.first_seen_at,
             });
-            let entry = blocked.entry(*ip).or_insert_with(|| {
-                (
-                    BlockedClient {
-                        ip: ip.to_string(),
-                        site: name.clone(),
-                        rule_blocks: 0,
-                        throttled: 0,
-                        last_seen_secs: 0,
-                    },
-                    stat.last_seen,
-                )
+            let entry = blocked.entry(*ip).or_insert_with(|| MergedBlocked {
+                client: BlockedClient {
+                    ip: ip.to_string(),
+                    site: name.clone(),
+                    bot_name: None,
+                    rule_blocks: 0,
+                    throttled: 0,
+                    last_seen_secs: 0,
+                },
+                site_at: stat.last_seen,
+                bot_at: None,
             });
-            entry.0.rule_blocks = entry.0.rule_blocks.saturating_add(stat.rule_blocks);
-            entry.0.throttled = entry.0.throttled.saturating_add(stat.throttled);
+            entry.client.rule_blocks = entry.client.rule_blocks.saturating_add(stat.rule_blocks);
+            entry.client.throttled = entry.client.throttled.saturating_add(stat.throttled);
             // The site that rejected the client last wins.
-            if stat.last_seen >= entry.1 {
-                entry.0.site = name.clone();
-                entry.1 = stat.last_seen;
+            if stat.last_seen >= entry.site_at {
+                entry.client.site = name.clone();
+                entry.site_at = stat.last_seen;
             }
-            entry.0.last_seen_secs = now.duration_since(stat.last_seen).as_secs();
+            // The bot name of the most recent observation that named
+            // one wins (issue #134). A site that did not name a bot
+            // never clears the name another site recorded — the merge
+            // iterates a `HashMap`, so "first one wins" would let the
+            // column change between two renders of the same state.
+            if let (Some(name), Some(at)) = (&stat.bot_name, stat.bot_name_at)
+                && entry.bot_at.is_none_or(|seen| at >= seen)
+            {
+                entry.client.bot_name = Some(name.clone());
+                entry.bot_at = Some(at);
+            }
+            entry.client.last_seen_secs = now.duration_since(stat.last_seen).as_secs();
         }
         out.push(stat);
     }
@@ -1380,7 +1450,7 @@ fn build_snapshot(
 
     // The blocked clients: the most recent first, then the most
     // rejected.
-    let mut blocked: Vec<BlockedClient> = blocked.into_values().map(|(c, _)| c).collect();
+    let mut blocked: Vec<BlockedClient> = blocked.into_values().map(|m| m.client).collect();
     blocked.sort_by(|a, b| {
         b.last_seen_secs
             .cmp(&a.last_seen_secs)
@@ -1417,7 +1487,7 @@ impl SiteState {
             }
             Some(RuleKind::Blacklist) => {
                 self.rule_blocks += 1;
-                let n = self.record_rejection(ip, /* rule_block */ true, geo);
+                let n = self.record_rejection(ip, /* rule_block */ true, geo, bot_name);
                 if should_log(n) {
                     log::warn!(
                         "ratelimit: site={} ip={} reason=blacklist action=403",
@@ -1452,7 +1522,7 @@ impl SiteState {
         if let Some(remaining) = self.penalty_remaining(ip, now) {
             self.throttled += 1;
             let retry_after = remaining.as_secs().max(1);
-            let n = self.record_rejection(ip, /* rule_block */ false, geo);
+            let n = self.record_rejection(ip, /* rule_block */ false, geo, bot_name);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=penalty action=429 retry_after={}",
@@ -1506,7 +1576,7 @@ impl SiteState {
                 retry_after =
                     retry_after.max(self.page_window_remaining(now, policy.page_window_secs));
             }
-            let n = self.record_rejection(ip, /* rule_block */ false, geo);
+            let n = self.record_rejection(ip, /* rule_block */ false, geo, bot_name);
             if should_log(n) {
                 log::warn!(
                     "ratelimit: site={} ip={} reason=limit action=429 retry_after={}",
@@ -1682,6 +1752,37 @@ mod tests {
         configs.insert("site".to_string(), Arc::new(cfg.clone()));
         limiter.reconfigure(&configs);
         (limiter, cfg)
+    }
+
+    /// A limiter with one site per name. Every site lists `bots` in
+    /// its bot-limited set, so a request that carries one of those
+    /// bot identities is counted and limited like any other client
+    /// (issue #131) — and the limiter records the name.
+    fn limiter_with_bot_limited_sites(
+        p: RateLimitPolicy,
+        names: &[&str],
+        bots: &[&str],
+    ) -> (Arc<RateLimiter>, HashMap<String, SiteLimitConfig>) {
+        let limiter = RateLimiter::new();
+        let mut configs = HashMap::new();
+        for name in names {
+            configs.insert(
+                name.to_string(),
+                Arc::new(SiteLimitConfig {
+                    policy: p.clone(),
+                    bot_limited: bots.iter().map(|b| b.to_string()).collect(),
+                    ..Default::default()
+                }),
+            );
+        }
+        limiter.reconfigure(&configs);
+        (
+            limiter,
+            configs
+                .into_iter()
+                .map(|(name, cfg)| (name, (*cfg).clone()))
+                .collect(),
+        )
     }
 
     #[test]
@@ -2949,5 +3050,239 @@ mod tests {
         }
         let snap = limiter.snapshot_now();
         assert_eq!(snap.top_over.len(), 20);
+    }
+
+    /// The bot name of a rejected client reaches the snapshot
+    /// (issue #134, R1).
+    #[test]
+    fn a_rejected_bot_reaches_the_snapshot_with_its_name() {
+        let (limiter, cfgs) =
+            limiter_with_bot_limited_sites(policy(1, 0), &["site"], &["googlebot"]);
+        let cfg = &cfgs["site"];
+        let client = ip(203, 0, 113, 40);
+        // The first request fits the limit of 1, the second one is
+        // over it.
+        assert_eq!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        let over = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(over.bot_name.as_deref(), Some("googlebot"));
+        let blocked = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(blocked.bot_name.as_deref(), Some("googlebot"));
+    }
+
+    /// A rejected client that is not a verified known bot carries no
+    /// name (issue #134, R1).
+    #[test]
+    fn a_rejected_client_without_a_bot_carries_no_name() {
+        let (limiter, cfgs) =
+            limiter_with_bot_limited_sites(policy(1, 0), &["site"], &["googlebot"]);
+        let cfg = &cfgs["site"];
+        let client = ip(203, 0, 113, 41);
+        assert_eq!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        let over = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(over.bot_name, None);
+        let blocked = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(blocked.bot_name, None);
+    }
+
+    /// A rejection without a bot identity never clears the name
+    /// another site recorded (issue #134, R2).
+    #[test]
+    fn the_merged_row_keeps_a_bot_name_a_later_rejection_did_not_name() {
+        let (limiter, cfgs) =
+            limiter_with_bot_limited_sites(policy(1, 0), &["a", "b"], &["googlebot"]);
+        let client = ip(203, 0, 113, 42);
+        // Site "a" rejects the client as a known bot…
+        let cfg_a = &cfgs["a"];
+        assert_eq!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        // …and site "b" rejects the very same address without naming
+        // a bot.
+        let cfg_b = &cfgs["b"];
+        assert_eq!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(
+            row.bot_name.as_deref(),
+            Some("googlebot"),
+            "a rejection that named no bot must not clear the recorded name"
+        );
+    }
+
+    /// The merged row shows the bot name of the most recent
+    /// observation (issue #134, R2).
+    #[test]
+    fn the_merged_row_shows_the_most_recent_bot_name() {
+        let (limiter, cfgs) =
+            limiter_with_bot_limited_sites(policy(1, 0), &["a", "b"], &["googlebot", "bingbot"]);
+        let client = ip(203, 0, 113, 43);
+        // Site "a" rejects the client as googlebot…
+        let cfg_a = &cfgs["a"];
+        assert_eq!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        // The two rejections must not share a timestamp — the merge
+        // picks the more recent observation, so an identical clock
+        // reading would make the result depend on the iteration order
+        // of the site map.
+        std::thread::sleep(Duration::from_millis(2));
+        // …and site "b" rejects it later, as bingbot.
+        let cfg_b = &cfgs["b"];
+        assert_eq!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                Some("bingbot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                Some("bingbot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(row.bot_name.as_deref(), Some("bingbot"));
     }
 }

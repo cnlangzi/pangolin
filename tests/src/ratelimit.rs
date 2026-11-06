@@ -467,6 +467,97 @@ async fn a_listed_bot_is_counted_against_the_sites_limits() {
     }
 }
 
+/// A throttled known bot reaches the snapshot with its name — the
+/// admin tables show it (issue #134).
+#[tokio::test]
+async fn a_throttled_known_bot_reaches_the_snapshot_with_its_name() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(1, 0)).unwrap();
+        db::set_site_rate_limit_bots(&db, "a", &["googlebot".to_string()].into_iter().collect())
+            .unwrap();
+    }
+    app.reload_indexes().await;
+
+    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let bot = ip(66, 249, 66, 1);
+    // The first request fits the limit of 1, the second one is over it.
+    assert_eq!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(bot),
+            Some("googlebot"),
+            Some("/"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Allow
+    );
+    assert!(
+        matches!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(bot),
+                Some("googlebot"),
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ),
+        "a listed bot must be counted against the site's limits"
+    );
+
+    let snap = app.rate_limiter.snapshot_now();
+    let over = snap
+        .top_over
+        .iter()
+        .find(|c| c.ip == bot.to_string())
+        .expect("the rejected bot is listed");
+    assert_eq!(over.bot_name.as_deref(), Some("googlebot"));
+    let blocked = snap
+        .blocked
+        .iter()
+        .find(|c| c.ip == bot.to_string())
+        .expect("the blocked bot is listed");
+    assert_eq!(blocked.bot_name.as_deref(), Some("googlebot"));
+
+    // A client that is not a verified known bot carries no name.
+    let other = ip(198, 51, 100, 30);
+    assert_eq!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(other),
+            None,
+            Some("/"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Allow
+    );
+    assert!(matches!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(other),
+            None,
+            Some("/"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Throttled { .. }
+    ));
+    let snap = app.rate_limiter.snapshot_now();
+    let over = snap
+        .top_over
+        .iter()
+        .find(|c| c.ip == other.to_string())
+        .expect("the rejected client is listed");
+    assert_eq!(over.bot_name, None);
+}
+
 /// The list is applied without a restart: saving it and reloading the
 /// indexes changes the behaviour of the next request (issue #131,
 /// R11).

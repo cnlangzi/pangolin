@@ -11,6 +11,7 @@
 //   - htmx modal lifecycle (#modal + #modal-body swap)
 //   - htmx toast auto-clear (#toast swap, 4s timeout)
 //   - site form backend mode toggle (data-backend-form)
+//   - client-IP lookup (data-asn-trigger → data-asn-ip cell)
 //
 // htmx is loaded separately via script tag in base.html
 
@@ -313,5 +314,290 @@
     document.addEventListener('DOMContentLoaded', initBackendForm);
   } else {
     initBackendForm();
+  }
+
+  // ── Client-IP lookup (issue #134) ──────────────────────────────────────
+  //
+  // The magnifier button next to a client IP asks a third-party service
+  // for the geo and the ASN of that address and renders the answer
+  // under it. The lookup only runs when the operator clicks — nothing
+  // is requested on page load.
+  //
+  // The markup (the button, the magnifier, the spinner and the two
+  // result lines) is rendered by the templates: the Tailwind content
+  // glob does not scan this file, so a class that only appears here
+  // is purged from the stylesheet and the element ships unstyled. The
+  // code below only writes text into the placeholders and toggles
+  // their visibility.
+
+  var ASN_CACHE_KEY = 'pangolin-asn-cache-v1';
+  // A successful answer is reused for a day.
+  var ASN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  // A failure is remembered for five minutes, so a provider that has
+  // nothing to say about an address is not asked again and again.
+  var ASN_FAIL_TTL_MS = 5 * 60 * 1000;
+  // Every provider gets its own budget: a hanging provider must not
+  // eat the next one's.
+  var ASN_TIMEOUT_MS = 6000;
+
+  var ASN_PROVIDERS = [
+    {
+      name: 'ipwhois.app',
+      url: function (ip) {
+        return 'https://ipwhois.app/json/' + ipPath(ip);
+      },
+      normalize: normalizeIpwhois,
+    },
+    {
+      name: 'ipinfo.io',
+      url: function (ip) {
+        return 'https://ipinfo.io/' + ipPath(ip) + '/json';
+      },
+      normalize: normalizeIpinfo,
+    },
+  ];
+
+  // The address goes into the path of the URL. A colon is legal in a
+  // path segment — and not every provider decodes a percent-encoded
+  // IPv6 address — so it is restored after the encoding.
+  function ipPath(ip) {
+    return encodeURIComponent(ip).replace(/%3A/gi, ':');
+  }
+
+  function asnText(value) {
+    var s = value == null ? '' : String(value).trim();
+    if (!s) return '';
+    // The ASN is shown as "AS15169" — the provider may leave the "AS"
+    // prefix out.
+    return /^as/i.test(s) ? s.toUpperCase() : 'AS' + s;
+  }
+
+  // ipwhois.app answers { success, asn, org, city, region, country,
+  // country_code } — `asn` is a bare number and `country` is the
+  // country *name*.
+  function normalizeIpwhois(body) {
+    if (!body || body.success === false) return null;
+    return {
+      asn: asnText(body.asn),
+      org: body.org == null ? '' : String(body.org).trim(),
+      city: body.city == null ? '' : String(body.city).trim(),
+      region: body.region == null ? '' : String(body.region).trim(),
+      countryName: body.country == null ? '' : String(body.country).trim(),
+      countryCode:
+        body.country_code == null ? '' : String(body.country_code).trim(),
+    };
+  }
+
+  // ipinfo.io answers { city, region, country, org } — `country` is the
+  // country *code* and `org` is "AS15169 Google LLC".
+  function normalizeIpinfo(body) {
+    if (!body) return null;
+    var org = body.org == null ? '' : String(body.org).trim();
+    var asn = '';
+    var name = '';
+    var cut = org.indexOf(' ');
+    if (cut > 0) {
+      asn = asnText(org.slice(0, cut));
+      name = org.slice(cut + 1).trim();
+    } else if (/^as/i.test(org)) {
+      asn = asnText(org);
+    } else {
+      name = org;
+    }
+    return {
+      asn: asn,
+      org: name,
+      city: body.city == null ? '' : String(body.city).trim(),
+      region: body.region == null ? '' : String(body.region).trim(),
+      countryName: '',
+      countryCode: body.country == null ? '' : String(body.country).trim(),
+    };
+  }
+
+  // An answer without a single field carries nothing — the provider
+  // declined (a bogon address, a private range).
+  function isUsable(data) {
+    return !!(
+      data.asn ||
+      data.org ||
+      data.city ||
+      data.region ||
+      data.countryName ||
+      data.countryCode
+    );
+  }
+
+  function fetchJson(url) {
+    var controller =
+      typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = controller
+      ? window.setTimeout(function () {
+          controller.abort();
+        }, ASN_TIMEOUT_MS)
+      : null;
+    return fetch(url, controller ? { signal: controller.signal } : undefined)
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      })
+      .finally(function () {
+        if (timer) window.clearTimeout(timer);
+      });
+  }
+
+  // The cache is read and written defensively: a browser that denies
+  // localStorage access still gets a working lookup, just without
+  // caching.
+  function readCache() {
+    try {
+      var raw = window.localStorage.getItem(ASN_CACHE_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeCache(cache) {
+    try {
+      window.localStorage.setItem(ASN_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) {
+      /* the cache is an optimisation, not a requirement */
+    }
+  }
+
+  // The cached entry of an address, or null when there is none or the
+  // one that is there has expired.
+  function cacheEntry(ip) {
+    var entry = readCache()[ip];
+    if (!entry || typeof entry !== 'object') return null;
+    var age = Date.now() - (entry.ts || 0);
+    var ttl = entry.failed ? ASN_FAIL_TTL_MS : ASN_CACHE_TTL_MS;
+    return age < ttl ? entry : null;
+  }
+
+  // The providers are tried in order; the first usable answer wins.
+  function lookupAsn(ip) {
+    var providers = ASN_PROVIDERS.slice();
+    function attempt() {
+      if (!providers.length) {
+        return Promise.reject(new Error('no provider answered'));
+      }
+      var provider = providers.shift();
+      return fetchJson(provider.url(ip))
+        .then(function (body) {
+          var data = provider.normalize(body);
+          if (!data || !isUsable(data)) {
+            throw new Error('no usable answer');
+          }
+          data.provider = provider.name;
+          data.ts = Date.now();
+          return data;
+        })
+        .catch(function () {
+          // This provider declined or hung — the next one gets a turn.
+          return attempt();
+        });
+    }
+    return attempt();
+  }
+
+  // Fill the two result lines and hide the button.
+  function renderAsnResult(cell, data) {
+    var geo = [data.city, data.region, data.countryName || data.countryCode]
+      .filter(Boolean)
+      .join(', ');
+    var asn = [data.asn, data.org].filter(Boolean).join(' ');
+    var geoEl = cell.querySelector('[data-asn-geo]');
+    var asnEl = cell.querySelector('[data-asn-asn]');
+    if (geoEl) {
+      geoEl.textContent = geo;
+      geoEl.classList.toggle('hidden', !geo);
+    }
+    if (asnEl) {
+      asnEl.textContent = asn;
+      asnEl.classList.toggle('hidden', !asn);
+    }
+    var btn = cell.querySelector('[data-asn-trigger]');
+    if (btn) btn.classList.add('hidden');
+  }
+
+  // Swap the magnifier for the spinner while the lookup runs.
+  function setAsnBusy(cell, busy) {
+    var btn = cell.querySelector('[data-asn-trigger]');
+    if (!btn) return;
+    btn.disabled = busy;
+    var icon = btn.querySelector('[data-asn-icon]');
+    var spinner = btn.querySelector('[data-asn-spinner]');
+    if (icon) icon.classList.toggle('hidden', busy);
+    if (spinner) spinner.classList.toggle('hidden', !busy);
+  }
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('[data-asn-trigger]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    if (btn.disabled) return;
+    var cell = btn.closest('[data-asn-ip]');
+    if (!cell) return;
+    var ip = cell.dataset.asnIp;
+    if (!ip) return;
+
+    // A cached answer is rendered right away — no network request.
+    var cached = cacheEntry(ip);
+    if (cached && !cached.failed) {
+      renderAsnResult(cell, cached);
+      return;
+    }
+
+    setAsnBusy(cell, true);
+    lookupAsn(ip)
+      .then(function (data) {
+        var cache = readCache();
+        cache[ip] = data;
+        writeCache(cache);
+        renderAsnResult(cell, data);
+      })
+      .catch(function () {
+        // Every provider failed: no result lines are rendered, the
+        // button stays and the operator can try again.
+        var cache = readCache();
+        cache[ip] = { failed: true, ts: Date.now() };
+        writeCache(cache);
+        btn.title = 'lookup failed — click to retry';
+      })
+      .then(function () {
+        setAsnBusy(cell, false);
+      });
+  });
+
+  // Both tables live in regions that htmx replaces wholesale every two
+  // seconds, so the lines written into a cell are discarded on the
+  // next refresh. Re-render the cached results after every swap — and
+  // on the first paint — so the answer survives the refresh without
+  // another lookup.
+  function rehydrateAsnCells() {
+    var cells = document.querySelectorAll('[data-asn-ip]');
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i];
+      var ip = cell.dataset.asnIp;
+      if (!ip) continue;
+      var cached = cacheEntry(ip);
+      // A cached failure leaves the button in place — the operator can
+      // click it again.
+      if (!cached || cached.failed) continue;
+      renderAsnResult(cell, cached);
+    }
+  }
+
+  document.addEventListener('htmx:afterSwap', function () {
+    rehydrateAsnCells();
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', rehydrateAsnCells);
+  } else {
+    rehydrateAsnCells();
   }
 })();

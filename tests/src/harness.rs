@@ -135,10 +135,39 @@ pub async fn raw_request(
     body: &[u8],
 ) -> (u16, String) {
     raw_request_inner(
-        addr, host, method, path, body, /* send_content_length */ true,
+        addr,
+        host,
+        method,
+        path,
+        body,
+        /* send_content_length */ true,
+        DEFAULT_USER_AGENT,
     )
     .await
 }
+
+/// Issue a raw HTTP/1.1 request with a custom `User-Agent`.
+///
+/// The bot verifier matches the User-Agent against the knownbots
+/// registry, so a test that needs a *verified* bot has to send the
+/// bot's own marker (issue #134).
+pub async fn raw_request_with_user_agent(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    user_agent: &str,
+) -> (u16, String) {
+    raw_request_inner(
+        addr, host, method, path, body, /* send_content_length */ true, user_agent,
+    )
+    .await
+}
+
+/// The `User-Agent` the raw request helpers send unless the test asks
+/// for another one.
+const DEFAULT_USER_AGENT: &str = "pangolin-e2e";
 
 /// Issue a raw HTTP/1.1 request **without** a `Content-Length` header.
 ///
@@ -154,15 +183,21 @@ pub async fn raw_request_no_content_length(
     path: &str,
 ) -> (u16, String) {
     raw_request_inner(
-        addr, host, method, path, b"", /* send_content_length */ false,
+        addr,
+        host,
+        method,
+        path,
+        b"",
+        /* send_content_length */ false,
+        DEFAULT_USER_AGENT,
     )
     .await
 }
 
-/// Shared low-level path for the two `raw_request*` helpers. The only
+/// Shared low-level path for the `raw_request*` helpers. The only
 /// thing they vary on is whether the `Content-Length` framing header
-/// is emitted; everything else (timeout, headers, response parsing)
-/// is the same.
+/// is emitted and which `User-Agent` is sent; everything else
+/// (timeout, headers, response parsing) is the same.
 async fn raw_request_inner(
     addr: &str,
     host: &str,
@@ -170,6 +205,7 @@ async fn raw_request_inner(
     path: &str,
     body: &[u8],
     send_content_length: bool,
+    user_agent: &str,
 ) -> (u16, String) {
     let timeout = Duration::from_secs(5);
 
@@ -179,7 +215,7 @@ async fn raw_request_inner(
         .expect("connect to addr");
 
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\nAccept: */*\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: {user_agent}\r\nAccept: */*\r\n",
     );
     if send_content_length {
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
