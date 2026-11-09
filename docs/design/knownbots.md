@@ -70,7 +70,7 @@ independent: a bot may use one, two, or all three.
 | Source | Config | Where it comes from |
 | ------ | ------ | ------------------- |
 | **Downloaded prefix list** | `urls:` (+ `parser:`) | the CIDRs the vendor publishes, fetched by the background scheduler and cached in `<log.bot.cache_dir>/<bot>/ips.txt` |
-| **PTR record** | `rdns: true` + `domains:` | the reverse-DNS hostname of the client IP, accepted when it equals one of the `domains:` entries or is a subdomain of one |
+| **PTR record** | `rdns: true` + `domains:` | the reverse-DNS hostname of the client IP, accepted when it equals one of the `domains:` entries or is a subdomain of one (both sides are lower-cased and stripped of their trailing dots) |
 | **`custom:` CIDRs** | `custom:` | static ranges written by hand — a vendor range the crate does not download, or a private range |
 
 The `custom:` CIDRs are merged into the same prefix set as the downloaded
@@ -151,7 +151,7 @@ reads:
 | `parser` | string | no | **defaults to `txt`** — the list is read as plain CIDR / IP lines |
 | `urls` | list of strings | no | the bot is not URL-backed; its address space comes from `custom:` and / or `domains:` |
 | `custom` | list of CIDR strings | no | no static address space |
-| `domains` | list of strings | no | an RDNS bot with no domain list can never match a PTR record |
+| `domains` | list of strings | no | an RDNS bot with no usable domain list can never match a PTR record |
 | `rdns` | bool | no | `false` — the bot has no PTR path |
 
 Notes:
@@ -184,9 +184,13 @@ over the embedded set:
    of the parsers the crate implements** — `google`, `openai`, `uptimerobot`,
    `ahrefs`, `amazon`, `txt`. The crate-internal `parser::is_known` is the
    single source of that list.
-4. **If `rdns` is `true`, `domains` contains at least one entry.** An RDNS
-   bot without a domain list can never match a PTR record: it is
-   permanently unverified and its traffic never reaches the bot log.
+4. **If `rdns` is `true`, `domains` contains at least one entry that can
+   still match a PTR record.** An RDNS bot without a domain list can never
+   match a PTR record: it is permanently unverified and its traffic never
+   reaches the bot log. An entry that is empty, only dots (`"."`) or
+   carrying whitespace is as good as no entry at all — the comparison
+   strips the trailing dots and compares the rest literally, so such an
+   entry matches nothing.
 5. **Every `custom` entry parses as a CIDR.** The loader skips a bad one
    with a warning, so the bot would silently cover less address space than
    the config claims.
@@ -194,10 +198,22 @@ over the embedded set:
    in `EMBEDDED_CONFIGS`.** A file that is not compiled into the binary is
    never parsed, so it does nothing at all.
 
-Rules 3, 4 and 5 are exactly the failures that are invisible today: the
-loader only warns, and the bot then never verifies a request — a failure
-nothing reports. Rule 6 catches the inverse mistake: a config written into
-`conf.d/` but never added to `EMBEDDED_CONFIGS`.
+Which of these failures are **silent** — the loader accepts the config and
+the bot simply never verifies anything:
+
+| Rule | Failure | Loud or silent |
+| ---- | ------- | -------------- |
+| 1 | empty `name` | **loud** — `load_embedded` treats an incomplete embedded config as fatal and the gateway refuses to start |
+| 1 | duplicate `name` | silent — the loader keeps the *last* bot of that name, so one bot replaces the other |
+| 2 | empty `ua` | **loud** — same fatal path |
+| 3 | unknown parser | silent — the loader only warns; the list is then parsed as plain text and the refresh ends as "broken" |
+| 4 | no usable domain | silent — the bot is permanently unverified |
+| 5 | invalid `custom:` CIDR | silent — the loader skips it with a warning |
+| 6 | file not embedded | silent — the file is never read at all |
+
+The silent rows are the ones this contract test exists for: rules 3, 4, 5
+and 6 are exactly the failures that are invisible today, and so is the
+duplicate half of rule 1.
 
 ```bash
 # The contract test — offline, no network access.
