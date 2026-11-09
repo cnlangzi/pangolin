@@ -746,4 +746,174 @@ mod tests {
         assert!(bots.len() >= 40, "loaded {} bots", bots.len());
         assert!(bots.iter().any(|b| b.name == "googlebot"));
     }
+
+    /// True when a `domains:` entry can still match a PTR record.
+    ///
+    /// [`crate::rdns::match_domain`] normalises every entry by
+    /// stripping its trailing dots and lower-casing it, then compares
+    /// it against the hostname the same way. An entry that is empty
+    /// after that (the empty string, or nothing but dots) can never
+    /// equal a hostname, and one carrying whitespace can never be a
+    /// suffix of one — so a bot whose `domains:` holds only such
+    /// entries is as unmatchable as a bot with no list at all.
+    fn domain_is_usable(domain: &str) -> bool {
+        let d = domain.trim_end_matches('.');
+        !d.is_empty() && !d.contains(char::is_whitespace)
+    }
+
+    /// [`domain_is_usable`] must agree with the comparison it stands in
+    /// for: a domain it calls unusable has to be one that no PTR record
+    /// can ever match.
+    #[test]
+    fn domain_usability_mirrors_the_ptr_comparison() {
+        // A normal domain, with and without a trailing dot — and it
+        // does match a PTR record.
+        assert!(domain_is_usable("example.com"));
+        assert!(domain_is_usable("example.com."));
+        assert!(crate::rdns::match_domain(
+            "crawl-66-249-66-1.example.com",
+            &["example.com".to_string()]
+        ));
+
+        // Nothing left after the trailing dots are stripped — and no PTR
+        // record can match such an entry.
+        for unusable in ["", ".", "..."] {
+            assert!(!domain_is_usable(unusable), "{unusable:?}");
+            assert!(
+                !crate::rdns::match_domain("crawl.example.com", &[unusable.to_string()]),
+                "{unusable:?} must not match a hostname"
+            );
+        }
+
+        // Whitespace can never be part of a hostname.
+        assert!(!domain_is_usable(" example.com"));
+        assert!(!domain_is_usable("example .com"));
+    }
+
+    /// The contract every embedded bot config must satisfy.
+    ///
+    /// Rules 3 to 6 can be broken **silently**: the loader only warns
+    /// (or never reads the file at all), the bot then never verifies a
+    /// request, its traffic never reaches the bot log, and nothing on
+    /// the running gateway reports an error. Rule 1 is silent in its
+    /// *duplicate* half — the loader keeps the last bot of a duplicated
+    /// name — and loud in its *empty* half, like rule 2: `load_embedded`
+    /// treats an incomplete embedded config as fatal and the gateway
+    /// refuses to start.
+    ///
+    /// The contract itself is written down in `docs/design/knownbots.md`
+    /// — the two must agree.
+    ///
+    /// Every violation is collected, so one run reports every problem
+    /// instead of only the first.
+    #[test]
+    fn embedded_bot_configs_satisfy_the_contract() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut violations: Vec<String> = Vec::new();
+        // Registry id → the file that declared it, so a duplicate names both.
+        let mut seen_names: HashMap<String, &str> = HashMap::new();
+
+        for &(filename, data) in EMBEDDED_CONFIGS {
+            // The document as the crate's own config struct sees it. A
+            // document that does not even fit the struct is broken in a
+            // way the loader reports loudly (it refuses to start), so
+            // say what serde says — the field it names is the defect.
+            let cfg: BotConfigFile = match serde_yaml::from_str(data) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    violations.push(format!("{filename}: not a valid bot config: {e:#}"));
+                    continue;
+                }
+            };
+
+            // Rule 1 — `name` is non-empty and unique across the
+            // registry. The loader keeps the *last* bot of a duplicated
+            // name, so without this rule one bot silently replaces the
+            // other.
+            if cfg.name.is_empty() {
+                violations.push(format!("{filename}: missing name"));
+            } else if let Some(first) = seen_names.insert(cfg.name.clone(), filename) {
+                violations.push(format!(
+                    "{filename}: duplicate bot name {:?} (already declared by {first})",
+                    cfg.name
+                ));
+            }
+
+            // Rule 2 — `ua` is non-empty. An empty marker matches no
+            // User-Agent, so the bot would never verify.
+            if cfg.ua.is_empty() {
+                violations.push(format!("{filename}: missing ua"));
+            }
+
+            // Rule 4 — an RDNS bot needs a domain list it can actually
+            // match. Without one no PTR record can ever match, so the
+            // bot is permanently unverified.
+            if cfg.rdns {
+                if cfg.domains.is_empty() {
+                    violations.push(format!("{filename}: rdns bot without domains"));
+                } else if !cfg.domains.iter().any(|d| domain_is_usable(d)) {
+                    violations.push(format!(
+                        "{filename}: rdns bot with no usable domain — every entry matches no PTR record"
+                    ));
+                }
+            }
+
+            // Rule 5 — every `custom:` entry must be a CIDR. The loader
+            // skips a bad one with a warning, so the bot would silently
+            // cover less address space than the config claims.
+            for cidr in &cfg.custom {
+                if let Err(e) = cidr.parse::<IpNet>() {
+                    violations.push(format!("{filename}: invalid custom CIDR {cidr:?}: {e}"));
+                }
+            }
+
+            // Rule 3 — the parser the loader will use for the download
+            // is the *effective* one: an absent `parser:` means `txt`.
+            // An unknown parser only warns at load time; the list is
+            // then parsed as plain text and the refresh ends as
+            // "broken".
+            let bot = match Bot::from_config(cfg) {
+                Ok(bot) => bot,
+                Err(e) => {
+                    violations.push(format!("{filename}: the loader rejects it: {e:#}"));
+                    continue;
+                }
+            };
+            if !bot.urls.is_empty() && !crate::parser::is_known(&bot.parser) {
+                violations.push(format!(
+                    "{filename}: unknown parser {:?} for a URL-backed bot",
+                    bot.parser
+                ));
+            }
+        }
+
+        // Rule 6 — every config file in `conf.d/` must be compiled into
+        // the binary. A file that is not listed in `EMBEDDED_CONFIGS` is
+        // never parsed, so it does nothing at all.
+        let conf_d = Path::new(env!("CARGO_MANIFEST_DIR")).join("conf.d");
+        let embedded: HashSet<&str> = EMBEDDED_CONFIGS.iter().map(|(name, _)| *name).collect();
+        let mut files: Vec<String> = std::fs::read_dir(&conf_d)
+            .expect("conf.d/ must be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".yaml") || name.ends_with(".yml"))
+            .collect();
+        files.sort();
+        for file in files {
+            if !embedded.contains(file.as_str()) {
+                violations.push(format!(
+                    "{file}: config file not embedded — list it in EMBEDDED_CONFIGS \
+                     (crates/knownbots/src/bot.rs)"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "the embedded bot configs break the contract ({} problem(s)):\n  - {}",
+            violations.len(),
+            violations.join("\n  - "),
+        );
+    }
 }
