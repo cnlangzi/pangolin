@@ -323,31 +323,101 @@ pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
     ("yandexbot.yaml", include_str!("../conf.d/yandexbot.yaml")),
 ];
 
-fn parse_yaml(data: &str, filename: &str) -> Result<Option<Bot>> {
+/// A bot config file that was skipped at load time.
+///
+/// The operator dropped a file into `<root>/conf.d/` that the
+/// loader could not turn into a bot — a YAML syntax error, or a
+/// document without the required `name` / `ua` fields. The file is
+/// skipped (the gateway keeps running) and reported here so the
+/// admin UI can tell the operator *why* the bot they configured is
+/// missing.
+///
+/// A malformed **embedded** config is not an error entry but a hard
+/// failure: it is a regression in this repository, not an operator
+/// mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotConfigError {
+    /// Path of the offending file. For an embedded config this is
+    /// the compiled-in file name (e.g. `"googlebot.yaml"`).
+    pub path: String,
+    /// Why the file was skipped.
+    pub message: String,
+}
+
+/// Outcome of parsing one bot YAML document.
+enum ParsedBot {
+    /// The document described a bot.
+    Loaded(Box<Bot>),
+    /// The document was skipped; the payload says why.
+    Skipped(String),
+}
+
+/// Parse one bot YAML document.
+///
+/// A syntax error is an `Err` — the caller decides whether that is
+/// fatal (embedded config) or skippable (operator override). A
+/// document that parses but lacks `name` / `ua` is a `Skipped` with
+/// the reason, so the operator learns why their bot is missing.
+fn parse_yaml(data: &str, filename: &str) -> Result<ParsedBot> {
     let cfg: BotConfigFile =
         serde_yaml::from_str(data).with_context(|| format!("parse bot config {filename}"))?;
     if cfg.name.is_empty() {
-        log::warn!("skip {filename}: missing required 'name' field");
-        return Ok(None);
+        return Ok(ParsedBot::Skipped(
+            "missing required 'name' field".to_string(),
+        ));
     }
     if cfg.ua.is_empty() {
-        log::warn!("skip {filename}: missing required 'ua' field");
-        return Ok(None);
+        return Ok(ParsedBot::Skipped(
+            "missing required 'ua' field".to_string(),
+        ));
     }
-    Ok(Some(Bot::from_config(cfg)?))
+    Ok(ParsedBot::Loaded(Box::new(Bot::from_config(cfg)?)))
+}
+
+/// Load the embedded (compiled-in) bot configs.
+///
+/// A malformed embedded config is **fatal**: it is a regression in
+/// this repository, not an operator error, and must never reach
+/// production silently.
+fn load_embedded(configs: &[(&str, &str)]) -> Result<(Vec<Bot>, Vec<BotConfigError>)> {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<String, Bot> = HashMap::new();
+    let mut errors = Vec::new();
+    for (filename, data) in configs {
+        match parse_yaml(data, filename)? {
+            ParsedBot::Loaded(bot) => {
+                by_name.insert(bot.name.clone(), *bot);
+            }
+            ParsedBot::Skipped(reason) => {
+                log::warn!("knownbots: skip embedded bot config {filename}: {reason}");
+                errors.push(BotConfigError {
+                    path: (*filename).to_string(),
+                    message: reason,
+                });
+            }
+        }
+    }
+    Ok((by_name.into_values().collect(), errors))
 }
 
 /// Load embedded configs, then overlay any `*.yaml` / `*.yml` from
 /// `override_dir/conf.d` (same-name wins).
-pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
+///
+/// Operator files that cannot be turned into a bot are **skipped**,
+/// logged as a warning, and returned in the error list — a typo in
+/// an override file must not take the gateway down. A malformed
+/// *embedded* config stays fatal (see [`load_embedded`]).
+pub fn load_bots_with_errors(
+    override_dir: Option<&Path>,
+) -> Result<(Vec<Bot>, Vec<BotConfigError>)> {
     use std::collections::HashMap;
 
-    let mut by_name: HashMap<String, Bot> = HashMap::new();
-    for (filename, data) in EMBEDDED_CONFIGS {
-        if let Some(bot) = parse_yaml(data, filename)? {
-            by_name.insert(bot.name.clone(), bot);
-        }
-    }
+    let (embedded, mut errors) = load_embedded(EMBEDDED_CONFIGS)?;
+    let mut by_name: HashMap<String, Bot> = embedded
+        .into_iter()
+        .map(|bot| (bot.name.clone(), bot))
+        .collect();
 
     if let Some(root) = override_dir {
         let conf_d = root.join("conf.d");
@@ -365,15 +435,46 @@ pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
                 if ext != "yaml" && ext != "yml" {
                     continue;
                 }
-                let data = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?;
+                let label = path.display().to_string();
+                let data = match std::fs::read_to_string(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // An unreadable file is as much an operator
+                        // error as an unparsable one — skip it
+                        // instead of refusing to start.
+                        let reason = format!("read {label}: {e}");
+                        log::warn!("knownbots: skip bot config {label}: {e}");
+                        errors.push(BotConfigError {
+                            path: label,
+                            message: reason,
+                        });
+                        continue;
+                    }
+                };
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("custom.yaml");
-                if let Some(bot) = parse_yaml(&data, name)? {
-                    log::info!("knownbots: custom config overrides bot {}", bot.name);
-                    by_name.insert(bot.name.clone(), bot);
+                match parse_yaml(&data, name) {
+                    Ok(ParsedBot::Loaded(bot)) => {
+                        log::info!("knownbots: custom config overrides bot {}", bot.name);
+                        by_name.insert(bot.name.clone(), *bot);
+                    }
+                    Ok(ParsedBot::Skipped(reason)) => {
+                        log::warn!("knownbots: skip bot config {label}: {reason}");
+                        errors.push(BotConfigError {
+                            path: label,
+                            message: reason,
+                        });
+                    }
+                    Err(e) => {
+                        let reason = format!("{e:#}");
+                        log::warn!("knownbots: skip bot config {label}: {reason}");
+                        errors.push(BotConfigError {
+                            path: label,
+                            message: reason,
+                        });
+                    }
                 }
             }
         }
@@ -382,6 +483,16 @@ pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
     let mut bots: Vec<Bot> = by_name.into_values().collect();
     // Stable order for tests / debugging.
     bots.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((bots, errors))
+}
+
+/// Load embedded configs, then overlay any `*.yaml` / `*.yml` from
+/// `override_dir/conf.d` (same-name wins).
+///
+/// Skipped operator files are logged as warnings. Use
+/// [`load_bots_with_errors`] to also get them back.
+pub fn load_bots(override_dir: Option<&Path>) -> Result<Vec<Bot>> {
+    let (bots, _errors) = load_bots_with_errors(override_dir)?;
     Ok(bots)
 }
 
@@ -518,5 +629,98 @@ mod tests {
         let bot = bots.iter().find(|b| b.name == "typobot").unwrap();
         assert_eq!(bot.parser, "googel");
         assert!(!crate::parser::is_known(&bot.parser));
+    }
+
+    /// A typo in an operator override file must not take the
+    /// gateway down: the file is skipped, the rest of the registry
+    /// loads, and the file is reported so the admin UI can show
+    /// *why* the bot the operator configured is missing.
+    #[test]
+    fn malformed_override_file_is_skipped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        let broken = conf.join("broken.yaml");
+        std::fs::write(&broken, "name: brokenbot\n  ua: [unclosed\n").unwrap();
+        std::fs::write(
+            conf.join("goodbot.yaml"),
+            "name: goodbot\nua: \"GoodBot\"\nvendor: \"Example\"\n",
+        )
+        .unwrap();
+
+        let (bots, errors) = load_bots_with_errors(Some(dir.path())).unwrap();
+        // The malformed file is absent from the registry …
+        assert!(!bots.iter().any(|b| b.name == "brokenbot"));
+        // … the well-formed one is not.
+        assert!(bots.iter().any(|b| b.name == "goodbot"));
+        // … and the embedded registry still loaded.
+        assert!(bots.iter().any(|b| b.name == "googlebot"));
+        // One config error, naming the file and the parse failure.
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].path, broken.display().to_string());
+        assert!(
+            errors[0].message.contains("parse bot config"),
+            "message must name the parse failure: {}",
+            errors[0].message
+        );
+    }
+
+    /// A file that parses but lacks `name` / `ua` is skipped too —
+    /// and reported, so the operator learns why their bot is
+    /// missing instead of just not seeing it.
+    #[test]
+    fn incomplete_override_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        let path = conf.join("nameless.yaml");
+        // An empty `name` parses but carries no identity.
+        std::fs::write(&path, "name: \"\"\nua: \"Nameless\"\n").unwrap();
+
+        let (bots, errors) = load_bots_with_errors(Some(dir.path())).unwrap();
+        assert!(!bots.iter().any(|b| b.ua == "Nameless"));
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].path, path.display().to_string());
+        assert!(
+            errors[0].message.contains("name"),
+            "message must name the missing field: {}",
+            errors[0].message
+        );
+    }
+
+    /// A YAML that omits a required field entirely is a parse
+    /// failure — reported the same way, not fatal.
+    #[test]
+    fn override_file_without_a_name_field_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        let path = conf.join("nameless.yaml");
+        std::fs::write(&path, "ua: \"Nameless\"\n").unwrap();
+
+        let (bots, errors) = load_bots_with_errors(Some(dir.path())).unwrap();
+        assert!(!bots.iter().any(|b| b.ua == "Nameless"));
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].path, path.display().to_string());
+        assert!(
+            errors[0].message.contains("name"),
+            "message must name the missing field: {}",
+            errors[0].message
+        );
+    }
+
+    /// A malformed **embedded** config is a regression in this
+    /// repository, not an operator error — it stays fatal so a
+    /// broken build cannot reach production silently.
+    #[test]
+    fn malformed_embedded_config_is_fatal() {
+        let Err(err) = load_embedded(&[("broken.yaml", "name: brokenbot\n  ua: [unclosed\n")])
+        else {
+            panic!("a broken embedded config must fail the loader");
+        };
+        assert!(
+            format!("{err:#}").contains("parse bot config broken.yaml"),
+            "error must name the file: {err:#}"
+        );
     }
 }

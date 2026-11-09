@@ -23,6 +23,70 @@
 
   {% include "views/bots/_subnav.html" %}
 
+  {# ── Verification status panel (server-rendered) ─────────────────────── #}
+  {# Bot traffic only reaches this page when the bot could be verified: #}
+  {# the UA marker must match *and* the client IP must belong to the #}
+  {# bot's published address space. A bot whose IP list was never #}
+  {# downloaded fails closed — silently, which is exactly the #}
+  {# "where are my crawlers?" dead end this panel closes. The counts #}
+  {# cover every bot in the registry; the table lists only the ones #}
+  {# that need attention (45 bots would bury the two that matter). #}
+  <div class="card overflow-hidden mb-6">
+    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Verification status</h2>
+    </div>
+    <div class="p-4">
+      {% if !health.available %}
+        <p class="text-sm text-slate-600 dark:text-gray-300">Verification status unavailable</p>
+      {% else %}
+        <p class="text-sm text-slate-600 dark:text-gray-300">
+          <span class="font-semibold tabular-nums">{{ health.ready_count() }}</span> ready ·
+          <span class="font-semibold tabular-nums">{{ health.cold_count() }}</span> cold ·
+          <span class="font-semibold tabular-nums">{{ health.failed_count() }}</span> failed
+        </p>
+        {% if !health.needs_attention() %}
+          <p class="mt-2 text-sm text-green-700 dark:text-green-300">All IP lists loaded</p>
+        {% else %}
+          <div class="mt-3 overflow-x-auto scrollbar-thin">
+            <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+              <thead class="bg-slate-50 dark:bg-slate-800/50">
+                <tr>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot / file</th>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">State</th>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Detail</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
+                {% for bot in health.problem_bots() %}
+                <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                  <td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100">{{ bot.name }}</td>
+                  <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ bot.state }}</td>
+                  <td class="px-4 py-2 text-slate-600 dark:text-slate-300">
+                    {% if bot.error_kind_label() != "" %}<span class="font-mono">{{ bot.error_kind_label() }}</span> {% endif %}
+                    {{ bot.detail_text() }}
+                  </td>
+                </tr>
+                {% endfor %}
+                {% for err in health.config_errors %}
+                <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                  <td class="px-4 py-2 whitespace-nowrap font-mono text-slate-900 dark:text-slate-100">{{ err.path }}</td>
+                  <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">config error</td>
+                  <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ err.message }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+        {% if health.rdns_overflow > 0 %}
+          <p class="mt-3 text-xs text-amber-700 dark:text-amber-300">
+            RDNS lookups dropped: <span class="font-semibold tabular-nums">{{ health.rdns_overflow }}</span> — verification stays fail-closed until the queue drains.
+          </p>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
   {# ── Summary card (server-rendered) ─────────────────────────────────── #}
   {# On first paint the dashboard should show useful state, not a #}
   {# "no bots detected yet" skeleton. The top-N table + summary #}

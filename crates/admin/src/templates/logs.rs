@@ -33,6 +33,7 @@
 
 use askama::Template;
 use chrono::NaiveDate;
+use pangolin_core::bot::BotVerificationHealth;
 use pangolin_core::bot_log::BotLogEntry;
 use pangolin_core::bot_stats::{BotStatsRow, BotStatsSummary};
 
@@ -100,6 +101,12 @@ pub struct BotLogsTemplate<'a> {
     /// Top-N rows by hit count, already sorted by
     /// `BotStats::top_n`.
     pub top_rows: Vec<BotStatsRow>,
+    /// Health of the knownbots verification layer (issue #136).
+    ///
+    /// A bot whose IP list was never downloaded fails closed, so its
+    /// traffic never reaches this page — the panel is what tells the
+    /// operator "the crawler is real, our list is not".
+    pub health: BotVerificationHealth,
 }
 
 /// Echo of the current filter form values, so the page can

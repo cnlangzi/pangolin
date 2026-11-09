@@ -177,6 +177,226 @@ fn bot_info(bot: &knownbots::Bot) -> BotInfo {
     }
 }
 
+/// The state of one bot's IP list.
+///
+/// Plain data so the admin crate can render it without depending on
+/// `knownbots`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BotVerificationState {
+    /// The bot can be verified against a loaded address space.
+    Ready,
+    /// URL-backed bot whose IP list has never been downloaded.
+    Cold,
+    /// The last refresh failed.
+    Failed,
+}
+
+impl std::fmt::Display for BotVerificationState {
+    /// Lower-case wire label (`ready`, `cold`, `failed`) — the same
+    /// shape as [`BotCategory`]'s labels.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            BotVerificationState::Ready => "ready",
+            BotVerificationState::Cold => "cold",
+            BotVerificationState::Failed => "failed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Why a bot's IP list could not be refreshed.
+///
+/// The split matters: `Unreachable` is an *environment* signal (the
+/// vendor's endpoint refused us, the network was down) while
+/// `Broken` points at this codebase (the list did not parse, our own
+/// TLS handshake failed). It decides whether the operator waits or
+/// files a bug.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BotRefreshErrorKind {
+    /// The vendor's endpoint could not be reached or refused the
+    /// request.
+    Unreachable,
+    /// The list arrived but is unusable, or our own client failed.
+    Broken,
+}
+
+impl BotRefreshErrorKind {
+    /// The wire label (`unreachable` / `broken`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BotRefreshErrorKind::Unreachable => "unreachable",
+            BotRefreshErrorKind::Broken => "broken",
+        }
+    }
+}
+
+impl std::fmt::Display for BotRefreshErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Health of one bot's IP list, as plain data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotVerificationStatus {
+    /// Registry id (e.g. `googlebot`).
+    pub name: String,
+    /// Owning organisation (e.g. `Google`).
+    pub vendor: String,
+    /// Coarse bucket for filtering / colouring in the UI.
+    pub category: BotCategory,
+    /// The derived state.
+    pub state: BotVerificationState,
+    /// Prefixes currently loaded (downloaded + custom).
+    pub prefixes: usize,
+    /// The failure kind, when `state == Failed`.
+    pub error_kind: Option<BotRefreshErrorKind>,
+    /// The failure message, when `state == Failed`.
+    pub error_message: Option<String>,
+}
+
+impl BotVerificationStatus {
+    /// The failure kind as a word (`unreachable` / `broken`), or an
+    /// empty string when the bot is not failed.
+    pub fn error_kind_label(&self) -> &'static str {
+        match self.error_kind {
+            Some(kind) => kind.as_str(),
+            None => "",
+        }
+    }
+
+    /// The failure message, or an empty string when there is none.
+    pub fn error_message_text(&self) -> &str {
+        self.error_message.as_deref().unwrap_or("")
+    }
+
+    /// The panel row's detail cell: the failure message for a
+    /// failed bot, a short explanation for a cold one.
+    pub fn detail_text(&self) -> &str {
+        match self.state {
+            BotVerificationState::Failed => self.error_message_text(),
+            BotVerificationState::Cold => "IP list never downloaded",
+            BotVerificationState::Ready => "",
+        }
+    }
+}
+
+/// A bot config file that was skipped at load time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotConfigError {
+    /// Path of the offending file.
+    pub path: String,
+    /// Why the file was skipped.
+    pub message: String,
+}
+
+/// Health of the knownbots verification layer.
+///
+/// `crates/admin` does not depend on `knownbots`, so the state
+/// crosses that boundary as these plain types.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BotVerificationHealth {
+    /// One entry per registry bot.
+    pub bots: Vec<BotVerificationStatus>,
+    /// Operator config files that were skipped at load time.
+    pub config_errors: Vec<BotConfigError>,
+    /// Reverse-DNS lookups dropped because the work queue was full.
+    pub rdns_overflow: u64,
+    /// `false` when no verifier is attached — the panel then says
+    /// the status is unavailable instead of claiming health.
+    pub available: bool,
+}
+
+impl BotVerificationHealth {
+    /// Bots whose address space is loaded and usable.
+    pub fn ready_count(&self) -> usize {
+        self.count(BotVerificationState::Ready)
+    }
+
+    /// URL-backed bots whose IP list has never been downloaded.
+    pub fn cold_count(&self) -> usize {
+        self.count(BotVerificationState::Cold)
+    }
+
+    /// Bots whose last refresh failed.
+    pub fn failed_count(&self) -> usize {
+        self.count(BotVerificationState::Failed)
+    }
+
+    /// The bots that need the operator's attention — everything that
+    /// is not `Ready`.
+    pub fn problem_bots(&self) -> Vec<&BotVerificationStatus> {
+        self.bots
+            .iter()
+            .filter(|b| b.state != BotVerificationState::Ready)
+            .collect()
+    }
+
+    /// True when something needs the operator's attention.
+    pub fn needs_attention(&self) -> bool {
+        !self.problem_bots().is_empty() || !self.config_errors.is_empty()
+    }
+
+    fn count(&self, state: BotVerificationState) -> usize {
+        self.bots.iter().filter(|b| b.state == state).count()
+    }
+}
+
+/// The health of the knownbots verification layer.
+///
+/// `None` (no verifier attached) yields an empty — and
+/// *unavailable* — health value, never a panic and never a
+/// "everything is fine" claim.
+pub fn verification_health(verifier: Option<&Validator>) -> BotVerificationHealth {
+    let Some(v) = verifier else {
+        return BotVerificationHealth::default();
+    };
+
+    let bots = v
+        .refresh_status()
+        .into_iter()
+        .map(|s| {
+            let category = BotCategory::from_label(s.kind.to_category_label(&s.name));
+            let (error_kind, error_message) = match &s.error {
+                Some(knownbots::RefreshFailure::Unreachable(m)) => {
+                    (Some(BotRefreshErrorKind::Unreachable), Some(m.clone()))
+                }
+                Some(knownbots::RefreshFailure::Broken(m)) => {
+                    (Some(BotRefreshErrorKind::Broken), Some(m.clone()))
+                }
+                None => (None, None),
+            };
+            BotVerificationStatus {
+                name: s.name,
+                vendor: s.vendor,
+                category,
+                state: match s.state {
+                    knownbots::BotRefreshState::Ready => BotVerificationState::Ready,
+                    knownbots::BotRefreshState::Cold => BotVerificationState::Cold,
+                    knownbots::BotRefreshState::Failed => BotVerificationState::Failed,
+                },
+                prefixes: s.prefixes,
+                error_kind,
+                error_message,
+            }
+        })
+        .collect();
+
+    BotVerificationHealth {
+        bots,
+        config_errors: v
+            .config_errors()
+            .into_iter()
+            .map(|e| BotConfigError {
+                path: e.path,
+                message: e.message,
+            })
+            .collect(),
+        rdns_overflow: v.rdns_overflow(),
+        available: true,
+    }
+}
+
 /// Whether `id` is safe to use as a form field name.
 ///
 /// The per-site bot list is edited as one checkbox per bot, and the
@@ -333,5 +553,81 @@ mod tests {
         for label in ["search_engine", "ai_bot", "social", "monitoring", "ads_bot"] {
             assert_eq!(BotCategory::from_label(label).to_string(), label);
         }
+    }
+
+    /// No validator → an empty, *unavailable* health value. Not a
+    /// panic, and not a "everything is fine" claim.
+    #[test]
+    fn verification_health_without_a_validator_is_empty() {
+        let health = verification_health(None);
+        assert!(health.bots.is_empty());
+        assert!(health.config_errors.is_empty());
+        assert_eq!(health.rdns_overflow, 0);
+        assert!(!health.available);
+        assert!(!health.needs_attention());
+    }
+
+    /// The health view maps the validator's state onto plain data:
+    /// a URL-backed bot with no list is `cold`, an RDNS bot is
+    /// `ready`, and a recorded refresh failure is `failed` with the
+    /// failure kind.
+    #[test]
+    fn verification_health_maps_the_validator_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+
+        let health = verification_health(Some(&v));
+        assert!(health.available);
+        let google = health.bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.state, BotVerificationState::Cold);
+        assert_eq!(google.vendor, "Google");
+        assert_eq!(google.category, BotCategory::SearchEngine);
+        assert_eq!(google.error_kind, None);
+        // An RDNS bot has no list to download — it is ready.
+        let baidu = health
+            .bots
+            .iter()
+            .find(|b| b.name == "baiduspider")
+            .unwrap();
+        assert_eq!(baidu.state, BotVerificationState::Ready);
+        // Every URL-backed bot is cold until its list arrives.
+        assert_eq!(health.cold_count(), health.problem_bots().len());
+        assert!(health.cold_count() >= 1);
+        assert_eq!(health.failed_count(), 0);
+        assert!(health.ready_count() >= 1);
+
+        // A seeded refresh failure becomes `failed` + a kind.
+        v.seed_refresh_error(
+            "googlebot",
+            knownbots::RefreshFailure::Unreachable("vendor refused us".into()),
+        )
+        .unwrap();
+        let health = verification_health(Some(&v));
+        let google = health.bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.state, BotVerificationState::Failed);
+        assert_eq!(google.error_kind, Some(BotRefreshErrorKind::Unreachable));
+        assert_eq!(google.error_message.as_deref(), Some("vendor refused us"));
+        assert_eq!(health.failed_count(), 1);
+        assert!(health.problem_bots().iter().any(|b| b.name == "googlebot"));
+        assert!(health.needs_attention());
+    }
+
+    /// A malformed operator file reaches the health view as a
+    /// config error — path and reason — so the admin panel can show
+    /// it.
+    #[test]
+    fn verification_health_carries_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        let broken = conf.join("broken.yaml");
+        std::fs::write(&broken, "name: brokenbot\n  ua: [unclosed\n").unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+
+        let health = verification_health(Some(&v));
+        assert_eq!(health.config_errors.len(), 1);
+        assert_eq!(health.config_errors[0].path, broken.display().to_string());
+        assert!(!health.config_errors[0].message.is_empty());
+        assert!(health.needs_attention());
     }
 }

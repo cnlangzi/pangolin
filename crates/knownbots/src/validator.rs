@@ -10,7 +10,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::bot::{Bot, BotKind, count_cold_url_bots, load_bots};
+use crate::bot::{Bot, BotConfigError, BotKind, count_cold_url_bots, load_bots_with_errors};
 use crate::lru::FailLru;
 use crate::parser;
 use crate::rdns::{RdnsCache, match_domain};
@@ -124,6 +124,45 @@ pub struct Validator {
     /// TLS handshake failed). That distinction is what lets a caller
     /// tell an environment problem from a code regression.
     refresh_errors: Mutex<std::collections::HashMap<String, RefreshFailure>>,
+    /// Operator config files that were skipped at load time.
+    ///
+    /// A broken override file is an operator error, not a reason to
+    /// refuse to start: the file is skipped, logged, and reported
+    /// here so the admin UI can show it.
+    config_errors: Vec<BotConfigError>,
+}
+
+/// The state of one bot's IP list.
+///
+/// Derived from the state the validator already keeps — no extra
+/// bookkeeping. A bot is `Ready` when its address space can be
+/// checked, `Cold` when a URL-backed list has never been
+/// downloaded, `Failed` when the last refresh failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotRefreshState {
+    /// The bot can be verified against a loaded address space.
+    Ready,
+    /// URL-backed bot whose list has never been downloaded.
+    Cold,
+    /// The last refresh failed.
+    Failed,
+}
+
+/// Health of one bot's IP list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotRefreshStatus {
+    /// Registry id (e.g. `googlebot`).
+    pub name: String,
+    /// Owning organisation (e.g. `Google`).
+    pub vendor: String,
+    /// Coarse category from the YAML `kind` field.
+    pub kind: BotKind,
+    /// Prefixes currently loaded (downloaded + custom).
+    pub prefixes: usize,
+    /// The derived state.
+    pub state: BotRefreshState,
+    /// The failure of the last refresh, when `state == Failed`.
+    pub error: Option<RefreshFailure>,
 }
 
 pub struct ValidatorOptions {
@@ -151,7 +190,7 @@ impl Validator {
     /// (production: from `App::start_bot_writer`).
     pub fn new(opts: ValidatorOptions) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&opts.root)?;
-        let mut bots = load_bots(Some(&opts.root))?;
+        let (mut bots, config_errors) = load_bots_with_errors(Some(&opts.root))?;
 
         for bot in &mut bots {
             let bot_dir = opts.root.join(&bot.name);
@@ -187,6 +226,7 @@ impl Validator {
             http,
             refresh_interval: opts.refresh_interval,
             refresh_errors: Mutex::new(std::collections::HashMap::new()),
+            config_errors,
         }))
     }
 
@@ -245,6 +285,22 @@ impl Validator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("bot {bot_name} has no rdns cache"))?;
         cache.set(ip, hostname);
+        Ok(())
+    }
+
+    /// Seed a refresh failure (tests / offline fixtures).
+    ///
+    /// The sibling of [`Self::seed_prefix`] / [`Self::seed_rdns`]:
+    /// the failure the scheduler would record after a failed
+    /// download can be injected without network access, so the
+    /// admin UI's verification panel can be exercised offline.
+    pub fn seed_refresh_error(&self, bot_name: &str, failure: RefreshFailure) -> Result<()> {
+        let bot = self
+            .bots
+            .iter()
+            .find(|b| b.name == bot_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown bot {bot_name}"))?;
+        self.refresh_errors.lock().insert(bot.name.clone(), failure);
         Ok(())
     }
 
@@ -486,6 +542,57 @@ impl Validator {
     /// (the list did not parse, the TLS handshake failed).
     pub fn last_refresh_error(&self, bot_name: &str) -> Option<RefreshFailure> {
         self.refresh_errors.lock().get(bot_name).cloned()
+    }
+
+    /// Health of every registry bot's IP list.
+    ///
+    /// One entry per bot in the registry, in registry order. The
+    /// state is derived from what the validator already knows:
+    /// a recorded refresh error means `Failed`; a URL-backed bot
+    /// with an empty prefix set means `Cold`; everything else is
+    /// `Ready` (RDNS bots, and bots whose only prefixes are the
+    /// `custom` CIDRs from their YAML).
+    pub fn refresh_status(&self) -> Vec<BotRefreshStatus> {
+        self.bots
+            .iter()
+            .map(|bot| {
+                let prefixes = bot.prefixes.read().len();
+                let error = self.refresh_errors.lock().get(&bot.name).cloned();
+                let state = if error.is_some() {
+                    BotRefreshState::Failed
+                } else if !bot.urls.is_empty() && prefixes == 0 {
+                    BotRefreshState::Cold
+                } else {
+                    BotRefreshState::Ready
+                };
+                BotRefreshStatus {
+                    name: bot.name.clone(),
+                    vendor: bot.vendor.clone(),
+                    kind: bot.kind,
+                    prefixes,
+                    state,
+                    error,
+                }
+            })
+            .collect()
+    }
+
+    /// Operator config files that were skipped at load time.
+    ///
+    /// Empty when every file under `<root>/conf.d/` parsed. A
+    /// malformed **embedded** config never reaches this list — it
+    /// fails the constructor instead.
+    pub fn config_errors(&self) -> Vec<BotConfigError> {
+        self.config_errors.clone()
+    }
+
+    /// Reverse-DNS lookups dropped because the work queue was full.
+    ///
+    /// Verification stays fail-closed for the affected requests
+    /// until the queue drains; the count tells the operator that
+    /// the RDNS path is not keeping up.
+    pub fn rdns_overflow(&self) -> u64 {
+        self.rdns_overflow.load(Ordering::Relaxed)
     }
 
     /// An address inside the bot's current prefix set, if one exists.
@@ -890,5 +997,122 @@ mod tests {
         assert_eq!(r.name, "bingbot");
         assert_ne!(r.name, header);
         assert_eq!(r.vendor, "Microsoft");
+    }
+
+    /// The three states of the IP-list layer, derived from the state
+    /// the validator already keeps:
+    ///
+    /// - `Ready` — a loaded prefix set (downloaded or `custom`) or
+    ///   no list to download at all (RDNS bots).
+    /// - `Cold` — URL-backed, list never downloaded.
+    /// - `Failed` — the last refresh failed.
+    #[test]
+    fn refresh_status_reports_ready_cold_and_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+
+        let status = |name: &str| {
+            v.refresh_status()
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no status for {name}"))
+        };
+
+        // RDNS bot — no list to download, so it is ready.
+        assert_eq!(status("baiduspider").state, BotRefreshState::Ready);
+        // URL-backed, never downloaded.
+        assert_eq!(status("bingbot").state, BotRefreshState::Cold);
+        assert_eq!(status("bingbot").prefixes, 0);
+
+        // A downloaded list makes it ready.
+        v.seed_prefix("bingbot", "40.77.0.0/16").unwrap();
+        assert_eq!(status("bingbot").state, BotRefreshState::Ready);
+        assert_eq!(status("bingbot").prefixes, 1);
+
+        // A recorded refresh failure outranks everything.
+        v.seed_refresh_error(
+            "bingbot",
+            RefreshFailure::Unreachable("https://example.invalid refused".into()),
+        )
+        .unwrap();
+        let bing = status("bingbot");
+        assert_eq!(bing.state, BotRefreshState::Failed);
+        assert!(matches!(bing.error, Some(RefreshFailure::Unreachable(_))));
+        // Unknown bots are rejected by the seam, not silently ignored.
+        assert!(
+            v.seed_refresh_error("no-such-bot", RefreshFailure::Broken("x".into()))
+                .is_err()
+        );
+    }
+
+    /// A bot with only `custom` CIDRs is `Ready` — the custom
+    /// prefixes *are* its address space.
+    #[test]
+    fn custom_cidr_bot_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(
+            conf.join("custombot.yaml"),
+            "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\ncustom:\n  - \"31.13.24.0/24\"\n",
+        )
+        .unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let status = v
+            .refresh_status()
+            .into_iter()
+            .find(|s| s.name == "custombot")
+            .expect("custombot in the registry");
+        assert_eq!(status.state, BotRefreshState::Ready);
+        assert_eq!(status.prefixes, 1);
+    }
+
+    /// A malformed operator override file is skipped and reported —
+    /// it does not stop the process from starting, and it does not
+    /// take the rest of the registry with it.
+    #[test]
+    fn malformed_override_file_does_not_stop_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        let broken = conf.join("broken.yaml");
+        std::fs::write(&broken, "name: brokenbot\n  ua: [unclosed\n").unwrap();
+        std::fs::write(
+            conf.join("goodbot.yaml"),
+            "name: goodbot\nua: \"GoodBot\"\nvendor: \"Example\"\n",
+        )
+        .unwrap();
+
+        let v = Validator::new_sync_only(dir.path())
+            .expect("a malformed override file must not stop startup");
+        assert!(!v.bots().iter().any(|b| b.name == "brokenbot"));
+        assert!(v.bots().iter().any(|b| b.name == "goodbot"));
+        assert!(v.bots().iter().any(|b| b.name == "googlebot"));
+
+        let errors = v.config_errors();
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].path, broken.display().to_string());
+        assert!(
+            errors[0].message.contains("parse bot config"),
+            "message must name the parse failure: {}",
+            errors[0].message
+        );
+    }
+
+    /// The dropped-lookup counter is what tells the operator that
+    /// the RDNS path is not keeping up.
+    #[test]
+    fn rdns_overflow_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        assert_eq!(v.rdns_overflow(), 0);
+
+        // Workers are not started, so the channel stays full.
+        let ua = "Mozilla/5.0 (compatible; Baiduspider/2.0)";
+        for i in 0..(RDNS_QUEUE + 3) {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0B00_0000 + i as u32));
+            assert_eq!(v.verify(ua, ip).status, VerifyStatus::Pending);
+        }
+        assert_eq!(v.rdns_overflow(), 3);
     }
 }
