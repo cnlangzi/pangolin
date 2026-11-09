@@ -14,7 +14,10 @@ mod rdns;
 mod ua;
 mod validator;
 
-pub use bot::{Bot, BotKind, load_bots, vendor_for};
+pub use bot::{Bot, BotConfigError, BotKind, load_bots, load_bots_with_errors, vendor_for};
 pub use rdns::match_domain;
 pub use ua::{contains_word, find_bot_by_ua};
-pub use validator::{RefreshFailure, Validator, ValidatorOptions, VerifyResult, VerifyStatus};
+pub use validator::{
+    BotRefreshState, BotRefreshStatus, RefreshFailure, Validator, ValidatorOptions, VerifyResult,
+    VerifyStatus,
+};

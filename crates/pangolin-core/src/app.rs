@@ -2186,4 +2186,37 @@ mod tests {
             "second call must be a silent no-op (return false)"
         );
     }
+
+    /// A typo in an operator-supplied bot override file must not
+    /// take the gateway down: the file is skipped and reported, and
+    /// `App::new` still succeeds (issue #136).
+    #[test]
+    fn app_new_survives_a_malformed_bot_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("bot-cache");
+        let conf_d = cache_dir.join("conf.d");
+        fs::create_dir_all(&conf_d).unwrap();
+        let broken = conf_d.join("broken.yaml");
+        fs::write(&broken, "name: brokenbot\n  ua: [unclosed\n").unwrap();
+
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = Config {
+            log: LogConfig {
+                bot: crate::BotLogConfig {
+                    cache_dir: cache_dir.clone(),
+                    ..crate::BotLogConfig::default()
+                },
+                ..LogConfig::default()
+            },
+            ..Config::default()
+        };
+        let app = App::new(&db_path, cfg, CertManager::default())
+            .expect("App::new must survive a malformed bot override");
+
+        let verifier = app.bot_verifier.as_ref().expect("bot verifier enabled");
+        assert!(!verifier.bots().iter().any(|b| b.name == "brokenbot"));
+        let errors = verifier.config_errors();
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].path, broken.display().to_string());
+    }
 }
