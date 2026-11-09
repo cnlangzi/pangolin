@@ -115,12 +115,19 @@ pub async fn render_bots(app: &Arc<App>, csrf: &str) -> http::Result<Response<Fu
     let (top_rows, summary) = app.bot_stats_snapshot();
     let top_rows = top_rows.into_iter().take(BOT_TOP_N).collect();
 
+    // The verification panel reads in-memory state only — no DNS or
+    // HTTP request happens on the page path. A bot whose IP list was
+    // never downloaded fails closed, so its traffic never reaches
+    // this page; the panel is what makes that visible.
+    let health = pangolin_core::bot::verification_health(app.bot_verifier.as_deref());
+
     let tmpl = BotLogsTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-bots",
         active_subnav: subnav::LIVE,
         summary,
         top_rows,
+        health,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -929,7 +936,10 @@ mod tests {
     use chrono::Utc;
     use pangolin_core::BotLogConfig;
     use pangolin_core::CertManager;
-    use pangolin_core::bot::{BotCategory, BotIdentity};
+    use pangolin_core::bot::{
+        BotCategory, BotConfigError, BotIdentity, BotRefreshErrorKind, BotVerificationHealth,
+        BotVerificationState, BotVerificationStatus,
+    };
     use pangolin_core::bot_log::BotLogEntry;
     use pangolin_core::config::{Config, LogConfig};
     use pangolin_core::events::AccessLogEntry;
@@ -944,7 +954,13 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let cfg = Config {
             log: LogConfig {
-                bot: BotLogConfig::default(),
+                bot: BotLogConfig {
+                    // Keep the knownbots cache inside the temp dir:
+                    // the verifier's IP lists must not leak between
+                    // tests (nor into the repo).
+                    cache_dir: dir.path().join("bot-cache"),
+                    ..BotLogConfig::default()
+                },
                 ..LogConfig::default()
             },
             ..Config::default()
@@ -1073,12 +1089,192 @@ mod tests {
             active_subnav: subnav::LIVE,
             summary: pangolin_core::bot_stats::BotStatsSummary::default(),
             top_rows: vec![],
+            health: BotVerificationHealth::default(),
         };
         let html = tmpl.render().expect("BotLogsTemplate render");
         assert!(html.contains("Bot Logs"));
         assert!(html.contains("EventSource"));
         assert!(html.contains("href=\"/logs/bots/history\""));
         assert!(html.contains("href=\"/logs/bots/stats\""));
+    }
+
+    // ── Verification status panel (issue #136) ────────────────────────
+
+    /// Render the bot page with a hand-built health snapshot. The
+    /// admin crate cannot depend on `knownbots`, so the panel is
+    /// exercised through the pangolin-core plain-data view.
+    fn render_bots_with_health(health: BotVerificationHealth) -> String {
+        let tmpl = BotLogsTemplate {
+            csrf_token: "csrf".into(),
+            active_nav: "logs-bots",
+            active_subnav: subnav::LIVE,
+            summary: pangolin_core::bot_stats::BotStatsSummary::default(),
+            top_rows: vec![],
+            health,
+        };
+        tmpl.render().expect("BotLogsTemplate render")
+    }
+
+    /// A failed bot, a healthy bot, and a skipped operator file.
+    fn health_with_problems() -> BotVerificationHealth {
+        BotVerificationHealth {
+            bots: vec![
+                BotVerificationStatus {
+                    name: "googlebot".into(),
+                    vendor: "Google".into(),
+                    category: BotCategory::SearchEngine,
+                    state: BotVerificationState::Failed,
+                    prefixes: 0,
+                    error_kind: Some(BotRefreshErrorKind::Unreachable),
+                    error_message: Some("https://example.invalid returned 403 Forbidden".into()),
+                },
+                BotVerificationStatus {
+                    name: "healthybot".into(),
+                    vendor: "Example".into(),
+                    category: BotCategory::Monitoring,
+                    state: BotVerificationState::Ready,
+                    prefixes: 12,
+                    error_kind: None,
+                    error_message: None,
+                },
+            ],
+            config_errors: vec![BotConfigError {
+                path: "/var/lib/pangolin/cache/conf.d/broken.yaml".into(),
+                message: "parse bot config broken.yaml: did not find expected key".into(),
+            }],
+            rdns_overflow: 0,
+            available: true,
+        }
+    }
+
+    /// The panel reports the health of the knownbots layer: a bot
+    /// that cannot be verified is invisible in the traffic log, so
+    /// the page has to say so.
+    #[tokio::test]
+    async fn render_bots_shows_the_verification_status_panel() {
+        let (_dir, app) = make_test_app();
+        let resp = render_bots(&app, "csrf-token")
+            .await
+            .expect("render_bots should succeed");
+        let html = response_html(resp).await;
+
+        assert!(
+            html.contains("Verification status"),
+            "verification panel missing: {html}"
+        );
+        // The three counts, each labelled.
+        assert!(html.contains("ready"), "ready count missing: {html}");
+        assert!(html.contains("cold"), "cold count missing: {html}");
+        assert!(html.contains("failed"), "failed count missing: {html}");
+        // No list was ever downloaded in a test process, so the
+        // URL-backed bots are cold — and cold means "this bot's
+        // traffic would never reach this page".
+        assert!(html.contains("googlebot"), "cold bot missing: {html}");
+        assert!(
+            html.contains(">cold</td>"),
+            "cold state not rendered: {html}"
+        );
+    }
+
+    /// A failed bot shows its failure kind and message; a config
+    /// error shows its path and message; a healthy bot is not
+    /// listed at all.
+    #[test]
+    fn verification_panel_lists_failures_and_config_errors_only() {
+        let html = render_bots_with_health(health_with_problems());
+
+        assert!(html.contains("Verification status"));
+        // The failed bot, its kind and its message.
+        assert!(html.contains("googlebot"), "failed bot missing: {html}");
+        assert!(html.contains("unreachable"), "failure kind missing: {html}");
+        assert!(
+            html.contains("https://example.invalid returned 403 Forbidden"),
+            "failure message missing: {html}"
+        );
+        assert!(
+            html.contains(">failed</td>"),
+            "failed state missing: {html}"
+        );
+        // The skipped operator file.
+        assert!(
+            html.contains("/var/lib/pangolin/cache/conf.d/broken.yaml"),
+            "config error path missing: {html}"
+        );
+        assert!(
+            html.contains("did not find expected key"),
+            "config error message missing: {html}"
+        );
+        // A healthy bot is represented by the counts, not by a row.
+        assert!(
+            !html.contains("healthybot"),
+            "healthy bot must not be listed: {html}"
+        );
+        // No overflow → no overflow line.
+        assert!(
+            !html.contains("RDNS lookups dropped"),
+            "overflow line must be hidden at zero: {html}"
+        );
+    }
+
+    /// Nothing to report → the panel says so instead of showing an
+    /// empty table.
+    #[test]
+    fn verification_panel_says_all_lists_loaded_when_healthy() {
+        let health = BotVerificationHealth {
+            bots: vec![BotVerificationStatus {
+                name: "googlebot".into(),
+                vendor: "Google".into(),
+                category: BotCategory::SearchEngine,
+                state: BotVerificationState::Ready,
+                prefixes: 42,
+                error_kind: None,
+                error_message: None,
+            }],
+            config_errors: vec![],
+            rdns_overflow: 0,
+            available: true,
+        };
+        let html = render_bots_with_health(health);
+
+        assert!(html.contains("Verification status"));
+        assert!(
+            html.contains("All IP lists loaded"),
+            "healthy panel must say so: {html}"
+        );
+        assert!(
+            !html.contains(">failed</td>"),
+            "no failure row expected: {html}"
+        );
+    }
+
+    /// The dropped-lookup count is only worth the operator's
+    /// attention when it is non-zero.
+    #[test]
+    fn verification_panel_shows_the_rdns_overflow_only_when_non_zero() {
+        let mut health = health_with_problems();
+        health.rdns_overflow = 7;
+        let html = render_bots_with_health(health);
+
+        assert!(
+            html.contains("RDNS lookups dropped"),
+            "overflow line missing: {html}"
+        );
+        assert!(html.contains(">7<"), "overflow count missing: {html}");
+    }
+
+    /// No verifier attached → the panel says the status is
+    /// unavailable instead of claiming everything is fine.
+    #[test]
+    fn verification_panel_reports_an_unavailable_status() {
+        let html = render_bots_with_health(BotVerificationHealth::default());
+        assert!(
+            html.contains("Verification status unavailable"),
+            "unavailable status missing: {html}"
+        );
+        assert!(
+            !html.contains("All IP lists loaded"),
+            "must not claim health: {html}"
+        );
     }
 
     // ── /logs/bots/history (stage-3) ─────────────────────────────────
