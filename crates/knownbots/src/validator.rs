@@ -580,8 +580,8 @@ impl Validator {
     /// Operator config files that were skipped at load time.
     ///
     /// Empty when every file under `<root>/conf.d/` parsed. A
-    /// malformed **embedded** config never reaches this list — it
-    /// fails the constructor instead.
+    /// malformed or incomplete **embedded** config never reaches this
+    /// list — it fails the constructor instead.
     pub fn config_errors(&self) -> Vec<BotConfigError> {
         self.config_errors.clone()
     }

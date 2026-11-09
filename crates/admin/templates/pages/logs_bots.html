@@ -79,8 +79,12 @@
           </div>
         {% endif %}
         {% if health.rdns_overflow > 0 %}
+          {# The counter is monotonic for the life of the process: it #}
+          {# counts the lookups the full work queue dropped, not a #}
+          {# live outage. Later requests are verified normally once #}
+          {# the queue drains — only the dropped ones failed closed. #}
           <p class="mt-3 text-xs text-amber-700 dark:text-amber-300">
-            RDNS lookups dropped: <span class="font-semibold tabular-nums">{{ health.rdns_overflow }}</span> — verification stays fail-closed until the queue drains.
+            RDNS lookups dropped: <span class="font-semibold tabular-nums">{{ health.rdns_overflow }}</span> since startup — the reverse-DNS work queue was full; those requests failed closed.
           </p>
         {% endif %}
       {% endif %}

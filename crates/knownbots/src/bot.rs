@@ -332,9 +332,9 @@ pub const EMBEDDED_CONFIGS: &[(&str, &str)] = &[
 /// admin UI can tell the operator *why* the bot they configured is
 /// missing.
 ///
-/// A malformed **embedded** config is not an error entry but a hard
-/// failure: it is a regression in this repository, not an operator
-/// mistake.
+/// A malformed **or incomplete** **embedded** config is not an error
+/// entry but a hard failure: it is a regression in this repository,
+/// not an operator mistake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotConfigError {
     /// Path of the offending file. For an embedded config this is
@@ -376,29 +376,26 @@ fn parse_yaml(data: &str, filename: &str) -> Result<ParsedBot> {
 
 /// Load the embedded (compiled-in) bot configs.
 ///
-/// A malformed embedded config is **fatal**: it is a regression in
-/// this repository, not an operator error, and must never reach
-/// production silently.
-fn load_embedded(configs: &[(&str, &str)]) -> Result<(Vec<Bot>, Vec<BotConfigError>)> {
+/// A malformed **or incomplete** embedded config is **fatal**: it is
+/// a regression in this repository, not an operator error, and must
+/// never reach production silently. Skipping it would drop the bot
+/// from the registry — its traffic would stop being logged, and
+/// nothing on the running gateway would say so.
+fn load_embedded(configs: &[(&str, &str)]) -> Result<Vec<Bot>> {
     use std::collections::HashMap;
 
     let mut by_name: HashMap<String, Bot> = HashMap::new();
-    let mut errors = Vec::new();
     for (filename, data) in configs {
         match parse_yaml(data, filename)? {
             ParsedBot::Loaded(bot) => {
                 by_name.insert(bot.name.clone(), *bot);
             }
             ParsedBot::Skipped(reason) => {
-                log::warn!("knownbots: skip embedded bot config {filename}: {reason}");
-                errors.push(BotConfigError {
-                    path: (*filename).to_string(),
-                    message: reason,
-                });
+                anyhow::bail!("embedded bot config {filename} is incomplete: {reason}");
             }
         }
     }
-    Ok((by_name.into_values().collect(), errors))
+    Ok(by_name.into_values().collect())
 }
 
 /// Load embedded configs, then overlay any `*.yaml` / `*.yml` from
@@ -406,15 +403,15 @@ fn load_embedded(configs: &[(&str, &str)]) -> Result<(Vec<Bot>, Vec<BotConfigErr
 ///
 /// Operator files that cannot be turned into a bot are **skipped**,
 /// logged as a warning, and returned in the error list — a typo in
-/// an override file must not take the gateway down. A malformed
-/// *embedded* config stays fatal (see [`load_embedded`]).
+/// an override file must not take the gateway down. A malformed or
+/// incomplete *embedded* config stays fatal (see [`load_embedded`]).
 pub fn load_bots_with_errors(
     override_dir: Option<&Path>,
 ) -> Result<(Vec<Bot>, Vec<BotConfigError>)> {
     use std::collections::HashMap;
 
-    let (embedded, mut errors) = load_embedded(EMBEDDED_CONFIGS)?;
-    let mut by_name: HashMap<String, Bot> = embedded
+    let mut errors = Vec::new();
+    let mut by_name: HashMap<String, Bot> = load_embedded(EMBEDDED_CONFIGS)?
         .into_iter()
         .map(|bot| (bot.name.clone(), bot))
         .collect();
@@ -722,5 +719,31 @@ mod tests {
             format!("{err:#}").contains("parse bot config broken.yaml"),
             "error must name the file: {err:#}"
         );
+    }
+
+    /// An embedded config that parses but lacks `name` / `ua` is
+    /// just as much a repository regression: skipping it would drop
+    /// the bot from the registry and stop its traffic from being
+    /// logged, with nothing on the running gateway to say so.
+    #[test]
+    fn incomplete_embedded_config_is_fatal() {
+        let Err(err) = load_embedded(&[("googlebot.yaml", "name: \"\"\nua: \"Googlebot\"\n")])
+        else {
+            panic!("an incomplete embedded config must fail the loader");
+        };
+        assert!(
+            format!("{err:#}").contains("googlebot.yaml"),
+            "error must name the file: {err:#}"
+        );
+    }
+
+    /// Every config this crate ships must be complete — the check
+    /// that keeps the fatal path above from firing in production.
+    #[test]
+    fn every_shipped_embedded_config_is_complete() {
+        let bots = load_embedded(EMBEDDED_CONFIGS)
+            .expect("every shipped embedded config must be complete");
+        assert!(bots.len() >= 40, "loaded {} bots", bots.len());
+        assert!(bots.iter().any(|b| b.name == "googlebot"));
     }
 }
