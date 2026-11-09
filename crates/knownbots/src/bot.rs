@@ -746,4 +746,135 @@ mod tests {
         assert!(bots.len() >= 40, "loaded {} bots", bots.len());
         assert!(bots.iter().any(|b| b.name == "googlebot"));
     }
+
+    /// Name the reason the strict parse of `data` failed.
+    ///
+    /// [`BotConfigFile`] requires `name`; `serde` reports a missing one
+    /// as ``missing field `name` ``. Report it with the same wording the
+    /// emptiness check in the contract test uses, so one broken file is
+    /// reported once.
+    fn explain_config_error(data: &str, err: &serde_yaml::Error) -> String {
+        #[derive(Deserialize)]
+        struct Loose {
+            name: Option<String>,
+        }
+        match serde_yaml::from_str::<Loose>(data) {
+            Ok(loose) if loose.name.as_deref().unwrap_or_default().is_empty() => {
+                "missing name".to_string()
+            }
+            _ => format!("not a valid bot config: {err}"),
+        }
+    }
+
+    /// The contract every embedded bot config must satisfy.
+    ///
+    /// Each rule can be broken **silently**: the loader only warns, the
+    /// bot then never verifies a request, its traffic never reaches the
+    /// bot log, and nothing on the running gateway reports an error. The
+    /// contract itself is written down in `docs/design/knownbots.md` —
+    /// the two must agree.
+    ///
+    /// Every violation is collected, so one run reports every problem
+    /// instead of only the first.
+    #[test]
+    fn embedded_bot_configs_satisfy_the_contract() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut violations: Vec<String> = Vec::new();
+        // Registry id → the file that declared it, so a duplicate names both.
+        let mut seen_names: HashMap<String, &str> = HashMap::new();
+
+        for &(filename, data) in EMBEDDED_CONFIGS {
+            // The document as the crate's own config struct sees it.
+            let cfg: BotConfigFile = match serde_yaml::from_str(data) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    violations.push(format!("{filename}: {}", explain_config_error(data, &e)));
+                    continue;
+                }
+            };
+
+            // Rule 1 — `name` is non-empty and unique across the
+            // registry. The loader keeps the *last* bot of a duplicated
+            // name, so without this rule one bot silently replaces the
+            // other.
+            if cfg.name.is_empty() {
+                violations.push(format!("{filename}: missing name"));
+            } else if let Some(first) = seen_names.insert(cfg.name.clone(), filename) {
+                violations.push(format!(
+                    "{filename}: duplicate bot name {:?} (already declared by {first})",
+                    cfg.name
+                ));
+            }
+
+            // Rule 2 — `ua` is non-empty. An empty marker matches no
+            // User-Agent, so the bot would never verify.
+            if cfg.ua.is_empty() {
+                violations.push(format!("{filename}: missing ua"));
+            }
+
+            // Rule 4 — an RDNS bot needs a domain list. Without one no
+            // PTR record can ever match, so the bot is permanently
+            // unverified.
+            if cfg.rdns && cfg.domains.is_empty() {
+                violations.push(format!("{filename}: rdns bot without domains"));
+            }
+
+            // Rule 5 — every `custom:` entry must be a CIDR. The loader
+            // skips a bad one with a warning, so the bot would silently
+            // cover less address space than the config claims.
+            for cidr in &cfg.custom {
+                if let Err(e) = cidr.parse::<IpNet>() {
+                    violations.push(format!("{filename}: invalid custom CIDR {cidr:?}: {e}"));
+                }
+            }
+
+            // Rule 3 — the parser the loader will use for the download
+            // is the *effective* one: an absent `parser:` means `txt`.
+            // An unknown parser only warns at load time; the list is
+            // then parsed as plain text and the refresh ends as
+            // "broken".
+            let bot = match Bot::from_config(cfg) {
+                Ok(bot) => bot,
+                Err(e) => {
+                    violations.push(format!("{filename}: the loader rejects it: {e:#}"));
+                    continue;
+                }
+            };
+            if !bot.urls.is_empty() && !crate::parser::is_known(&bot.parser) {
+                violations.push(format!(
+                    "{filename}: unknown parser {:?} for a URL-backed bot",
+                    bot.parser
+                ));
+            }
+        }
+
+        // Rule 6 — every config file in `conf.d/` must be compiled into
+        // the binary. A file that is not listed in `EMBEDDED_CONFIGS` is
+        // never parsed, so it does nothing at all.
+        let conf_d = Path::new(env!("CARGO_MANIFEST_DIR")).join("conf.d");
+        let embedded: HashSet<&str> = EMBEDDED_CONFIGS.iter().map(|(name, _)| *name).collect();
+        let mut files: Vec<String> = std::fs::read_dir(&conf_d)
+            .expect("conf.d/ must be readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".yaml") || name.ends_with(".yml"))
+            .collect();
+        files.sort();
+        for file in files {
+            if !embedded.contains(file.as_str()) {
+                violations.push(format!(
+                    "{file}: config file not embedded — list it in EMBEDDED_CONFIGS \
+                     (crates/knownbots/src/bot.rs)"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "the embedded bot configs break the contract ({} problem(s)):\n  - {}",
+            violations.len(),
+            violations.join("\n  - "),
+        );
+    }
 }
