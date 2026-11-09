@@ -270,13 +270,30 @@ impl BotVerificationStatus {
         self.error_message.as_deref().unwrap_or("")
     }
 
-    /// The panel row's detail cell: the failure message for a
-    /// failed bot, a short explanation for a cold one.
-    pub fn detail_text(&self) -> &str {
+    /// The panel row's detail cell.
+    ///
+    /// A failed bot whose prefix set is still loaded is **not**
+    /// fail-closed — the cached list keeps verifying — so the row
+    /// says how many prefixes are still in use instead of implying
+    /// the bot stopped verifying.
+    pub fn detail_text(&self) -> String {
         match self.state {
-            BotVerificationState::Failed => self.error_message_text(),
-            BotVerificationState::Cold => "IP list never downloaded",
-            BotVerificationState::Ready => "",
+            BotVerificationState::Failed => {
+                let cached = match self.prefixes {
+                    0 => String::new(),
+                    1 => "1 prefix still loaded".to_string(),
+                    n => format!("{n} prefixes still loaded"),
+                };
+                let msg = self.error_message_text();
+                match (msg.is_empty(), cached.is_empty()) {
+                    (true, true) => String::new(),
+                    (true, false) => cached,
+                    (false, true) => msg.to_string(),
+                    (false, false) => format!("{msg} ({cached})"),
+                }
+            }
+            BotVerificationState::Cold => "IP list never downloaded".to_string(),
+            BotVerificationState::Ready => String::new(),
         }
     }
 }
@@ -610,6 +627,66 @@ mod tests {
         assert_eq!(health.failed_count(), 1);
         assert!(health.problem_bots().iter().any(|b| b.name == "googlebot"));
         assert!(health.needs_attention());
+    }
+
+    /// A bot whose refresh failed but whose prefix set is still
+    /// loaded keeps verifying from the cached list — it is *not*
+    /// fail-closed. The panel must say so instead of implying the
+    /// bot stopped verifying.
+    #[test]
+    fn a_failed_bot_with_a_loaded_prefix_set_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        v.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
+        v.seed_refresh_error(
+            "googlebot",
+            knownbots::RefreshFailure::Unreachable("vendor refused us".into()),
+        )
+        .unwrap();
+
+        // The bot still verifies from the cached prefixes …
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
+        assert!(verify_bot(&v, ua, ip).is_some(), "still verifies");
+
+        // … and the panel says the cached prefixes are still in use.
+        let health = verification_health(Some(&v));
+        let google = health.bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.state, BotVerificationState::Failed);
+        assert_eq!(google.prefixes, 1);
+        let detail = google.detail_text();
+        assert!(
+            detail.contains("vendor refused us"),
+            "the failure message must survive: {detail}"
+        );
+        assert!(
+            detail.contains("1 prefix still loaded"),
+            "the row must say the cached prefixes are still in use: {detail}"
+        );
+    }
+
+    /// A failed bot with **no** loaded prefixes is fail-closed — the
+    /// row must not claim a cached list is still there.
+    #[test]
+    fn a_failed_bot_without_a_loaded_prefix_set_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::new_sync_only(dir.path()).unwrap();
+        v.seed_refresh_error(
+            "googlebot",
+            knownbots::RefreshFailure::Broken("list did not parse".into()),
+        )
+        .unwrap();
+
+        let health = verification_health(Some(&v));
+        let google = health.bots.iter().find(|b| b.name == "googlebot").unwrap();
+        assert_eq!(google.state, BotVerificationState::Failed);
+        assert_eq!(google.prefixes, 0);
+        let detail = google.detail_text();
+        assert!(detail.contains("list did not parse"), "{detail}");
+        assert!(
+            !detail.contains("prefixes still loaded"),
+            "no cached list to report: {detail}"
+        );
     }
 
     /// A malformed operator file reaches the health view as a

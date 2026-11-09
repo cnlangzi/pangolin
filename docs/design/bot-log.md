@@ -192,21 +192,30 @@ states:
 | `Cold` | A URL-backed bot whose IP list has never been downloaded successfully. Its prefix set is empty, so every claim against it fails closed. | Check the host's route to the vendor endpoint; the scheduler retries with a 5 s → 5 min backoff. |
 | `Failed` | The last refresh failed. The panel shows the failure **kind** and the message. | `unreachable` = the vendor refused us or the network is down (environment). `broken` = the list arrived but did not parse, or our own client failed (a regression — file a bug). |
 
+A failed refresh does **not** wipe the prefix set that is already
+loaded, so a `Failed` bot with a non-empty prefix set keeps verifying
+from that cache — it is not fail-closed. The panel says so: the row
+carries the number of prefixes still in use next to the failure
+message. A `Failed` bot with **no** prefixes loaded is the fail-closed
+case, and its traffic stops reaching the log.
+
 Only `Cold` and `Failed` bots are listed in the panel's table; the rest
 are covered by the `ready` / `cold` / `failed` counts (the registry has
 ~45 bots, and listing them all would bury the two that matter). When
 nothing needs attention the panel says `All IP lists loaded`. The
 `RDNS lookups dropped` line appears only when the reverse-DNS work queue
-overflowed — verification stays fail-closed for the affected requests
-until the queue drains.
+overflowed; the count is a since-startup total, and only the lookups
+that were dropped failed closed — once the queue drains, later requests
+are verified normally.
 
 A bot config file under `<log.bot.cache_dir>/conf.d/` that cannot be
 turned into a bot — a YAML syntax error, or a document without the
 required `name` / `ua` — is **skipped and reported** rather than fatal:
 a typo in an override file must not take the gateway down. The panel
-lists the file path and the reason. A malformed **embedded** config
-stays fatal — that is a regression in this repository, not an operator
-error, and must never reach production silently.
+lists the file path and the reason. A malformed **or incomplete**
+**embedded** config stays fatal — that is a regression in this
+repository, not an operator error, and must never reach production
+silently.
 
 The health crosses the crate boundary as plain data
 (`pangolin_core::bot::BotVerificationHealth`), because `crates/admin`
@@ -229,7 +238,7 @@ itself does not auto-clean up.
 
 | Failure | Behaviour |
 | ------- | --------- |
-| The knownbots verifier cannot be built | `App::new` fails with a configuration error — the verifier is mandatory (issue #117). Only a malformed **embedded** config gets here; a malformed operator override is skipped and reported (see [Knownbots verification health](#knownbots-verification-health)). |
+| The knownbots verifier cannot be built | `App::new` fails with a configuration error — the verifier is mandatory (issue #117). Only a malformed or incomplete **embedded** config gets here; a malformed operator override is skipped and reported (see [Knownbots verification health](#knownbots-verification-health)). |
 | `verify_bot` returns `None` (unknown / forged / pending RDNS) | Skip the bot fan-out. The generic access log still fires. |
 | `BotLogWriter::enqueue` queue full (10 000 entries backlogged) | Drop oldest entry, `log::warn!` once. The ring buffer + stats still receive the current entry; only the JSONL write is best-effort. |
 | `tokio::fs::OpenOptions::open` fails on first write | `log::warn!` and drop the batch. The generic access log keeps working. Retry on the next batch. |
@@ -326,6 +335,6 @@ duckdb -c "
 | Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
-| Unit | `knownbots::bot::tests::*` / `knownbots::validator::tests::*` (issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **embedded** config stays fatal; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
-| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None` |
+| Unit | `knownbots::bot::tests::*` / `knownbots::validator::tests::*` (issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **or incomplete** **embedded** config stays fatal, and every shipped embedded config is complete; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
+| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None`; a failed bot with a loaded prefix set still verifies and the panel row says how many prefixes are still in use |
 | Unit | `admin::routes::logs::tests::*` (issue #136) | The `/logs/bots` page renders the verification panel with its three counts; a failed bot shows its kind + message; a config error shows its path + reason; a healthy bot is not listed; `All IP lists loaded` when nothing needs attention; the `RDNS lookups dropped` line only when the count is non-zero |

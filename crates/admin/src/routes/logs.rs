@@ -1176,6 +1176,25 @@ mod tests {
         );
     }
 
+    /// A failed bot whose IP list is still loaded keeps verifying
+    /// from the cache. The row says so — otherwise the operator reads
+    /// "failed" as "this bot's traffic is not being logged".
+    #[test]
+    fn verification_panel_reports_the_prefixes_still_in_use() {
+        let mut health = health_with_problems();
+        health.bots[0].prefixes = 42;
+        let html = render_bots_with_health(health);
+
+        assert!(
+            html.contains("42 prefixes still loaded"),
+            "the cached prefix count missing: {html}"
+        );
+        assert!(
+            html.contains("https://example.invalid returned 403 Forbidden"),
+            "the failure message must survive: {html}"
+        );
+    }
+
     /// A failed bot shows its failure kind and message; a config
     /// error shows its path and message; a healthy bot is not
     /// listed at all.
