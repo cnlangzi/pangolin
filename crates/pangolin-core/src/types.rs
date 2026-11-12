@@ -818,6 +818,101 @@ pub struct SystemConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Singleton IP-reputation configuration (badbots_config table, V12).
+///
+/// The reputation check of the gateway (issue #141). Unlike every
+/// other knob of the gateway, this one is **not** read from
+/// `ngx.yml`: the only credential it needs is a provider API key, and
+/// a key in the configuration file ends up in backups and in shell
+/// history. The row is edited from the admin dashboard and read at
+/// startup; a change takes effect when the library is rebuilt, which
+/// the admin POST does immediately.
+///
+/// The row is a singleton — `db::get_badbots_config` always finds
+/// one, because the migration seeds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BadbotsSettings {
+    /// Whether the reputation check runs at all.
+    ///
+    /// `true` by default: the feature is on out of the box and needs
+    /// no configuration.
+    pub enabled: bool,
+    /// How strict the evidence bar of a verdict is.
+    ///
+    /// `lenient` (the default) convicts on any report of doubt about
+    /// the address; `strict` needs either a conviction-strength
+    /// single observation or two corroborating families. The gateway
+    /// asks the library for a second opinion about a client it has
+    /// already decided to reject, so `lenient` is the default.
+    pub evidence_policy: BadbotsEvidencePolicy,
+    /// How often the gateway asks the library to refresh the
+    /// publishers' lists, in seconds.
+    ///
+    /// The library issues no request for a publisher whose own
+    /// interval has not elapsed, so this tick may be far more
+    /// frequent than the shortest publisher interval.
+    pub feed_refresh_interval_secs: u64,
+    /// The AbuseIPDB key. `None` = the provider is not queried.
+    pub abuseipdb_api_key: Option<String>,
+    /// The CrowdSec key. `None` = the provider is not queried.
+    pub crowdsec_api_key: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The evidence bar of a reputation verdict.
+///
+/// The two variants are the library's own (`badbots::EvidencePolicy`);
+/// this type is the database-facing spelling of them, so the row can
+/// be read and written without the library's types leaking into the
+/// schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadbotsEvidencePolicy {
+    /// One conviction-strength observation, or two corroborating
+    /// families, are needed for a conviction.
+    Strict,
+    /// Any valid observation is enough for a conviction.
+    #[default]
+    Lenient,
+}
+
+impl BadbotsEvidencePolicy {
+    /// The policy's name as the database spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BadbotsEvidencePolicy::Strict => "strict",
+            BadbotsEvidencePolicy::Lenient => "lenient",
+        }
+    }
+
+    /// Parse a policy name. Returns `None` for an unknown name — the
+    /// caller keeps the stored value and reports the error.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(BadbotsEvidencePolicy::Strict),
+            "lenient" => Some(BadbotsEvidencePolicy::Lenient),
+            _ => None,
+        }
+    }
+}
+
+impl Default for BadbotsSettings {
+    /// The documented defaults of a deployment that has never opened
+    /// the dashboard: the check is on, the bar is lenient, the lists
+    /// are refreshed every five minutes and neither keyed provider is
+    /// queried.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            evidence_policy: BadbotsEvidencePolicy::Lenient,
+            feed_refresh_interval_secs: 300,
+            abuseipdb_api_key: None,
+            crowdsec_api_key: None,
+            updated_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+}
+
 // ---- Tunnel messages (used by both ngx and tun) ----
 //
 // As of issue #39, the tunnel carries raw HTTP/1.1 bytes inside

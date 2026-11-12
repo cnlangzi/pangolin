@@ -54,6 +54,21 @@ pub struct TopOverRow {
     /// identified as — `None` for a client that is not one (issue
     /// #134).
     pub bot_name: Option<String>,
+    /// What the IP reputation library said about the client (issue
+    /// #141) — `None` when the library was never asked about it.
+    ///
+    /// The verdict is rendered as a badge: the badge colour is keyed
+    /// off [`Self::badbot_code`], so the Tailwind classes have to
+    /// appear literally in the HTML template, or the badge ships
+    /// unstyled.
+    pub badbot: Option<pangolin_core::BadbotVerdict>,
+    /// The verdict's stable code — `bad_address`, `bot_user_agent`,
+    /// `bad_address_bot_user_agent` or `unknown`.
+    ///
+    /// Owned rather than borrowed: the template compares it against a
+    /// string literal, and Askama binds a `&str` out of an `Option`
+    /// as a `&&str`, which does not compare with a `&str`.
+    pub badbot_code: Option<String>,
     /// "403", "429" or "403+429" — the status the client was rejected
     /// with.
     pub status: String,
@@ -86,6 +101,8 @@ impl TopOverRow {
             country: client.country.clone(),
             region: client.region.clone(),
             bot_name: client.bot_name.clone(),
+            badbot: client.badbot,
+            badbot_code: client.badbot.map(|v| v.code().to_string()),
             status: status.to_string(),
             rejections: client.rule_blocks.saturating_add(client.throttled),
             first_seen_rel: super::relative_time(client.first_seen_at, now),
@@ -146,6 +163,7 @@ mod tests {
             country: Some("JP".into()),
             region: Some("13".into()),
             bot_name: None,
+            badbot: None,
             rule_blocks,
             throttled,
             first_seen_secs: 42,

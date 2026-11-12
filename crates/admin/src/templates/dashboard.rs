@@ -38,6 +38,10 @@ pub struct BlockedRow {
     /// identified as — `None` for a client that is not one (issue
     /// #134).
     pub bot_name: Option<String>,
+    /// What the IP reputation library said about the client (issue
+    /// #141) — the stable code, `None` when the library was never
+    /// asked about it.
+    pub badbot_code: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.

@@ -46,7 +46,8 @@ use crate::embedded_migrations::run_migrations;
 use crate::provider::{ProviderIpList, ProviderKey, SiteProviderOverride};
 use crate::ratelimit::{IpRule, RateLimitPolicy, RuleKind};
 use crate::types::{
-    Cert, CertErrorClass, CertStatus, ChallengeKind, DnsProvider, Domain, Site, SystemConfig, Tun,
+    BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus, ChallengeKind,
+    DnsProvider, Domain, Site, SystemConfig, Tun,
 };
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
@@ -877,6 +878,73 @@ pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::
     Ok(())
 }
 
+// ---- IP reputation configuration (V12) ----
+
+/// Read the singleton IP-reputation configuration row.
+///
+/// The row is seeded by the V12 migration, so it always exists. A
+/// missing row is reported as an error rather than silently replaced
+/// by the defaults: the operator's keys must never disappear because
+/// a read went wrong.
+pub fn get_badbots_config(conn: &Connection) -> rusqlite::Result<BadbotsSettings> {
+    let mut stmt = conn.prepare(
+        "SELECT enabled, evidence_policy, feed_refresh_interval_secs,
+                abuseipdb_api_key, crowdsec_api_key, updated_at
+         FROM badbots_config WHERE id = 1",
+    )?;
+    stmt.query_row([], row_to_badbots_config)
+}
+
+/// Update the singleton IP-reputation configuration row in place.
+///
+/// Caller is responsible for holding the DB write lock if used
+/// concurrently. The admin route handler takes `app.db.lock()`
+/// around this call.
+pub fn update_badbots_config(conn: &Connection, cfg: &BadbotsSettings) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE badbots_config
+            SET enabled = ?1,
+                evidence_policy = ?2,
+                feed_refresh_interval_secs = ?3,
+                abuseipdb_api_key = ?4,
+                crowdsec_api_key = ?5,
+                updated_at = ?6
+          WHERE id = 1",
+        params![
+            cfg.enabled as i64,
+            cfg.evidence_policy.as_str(),
+            cfg.feed_refresh_interval_secs as i64,
+            cfg.abuseipdb_api_key,
+            cfg.crowdsec_api_key,
+            cfg.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_badbots_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<BadbotsSettings> {
+    let enabled: i64 = row.get(0)?;
+    let policy_raw: String = row.get(1)?;
+    let interval: i64 = row.get(2)?;
+    let abuseipdb_api_key: Option<String> = row.get(3)?;
+    let crowdsec_api_key: Option<String> = row.get(4)?;
+    let updated_at: String = row.get(5)?;
+    let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
+        rusqlite::Error::InvalidParameterName(format!("invalid evidence policy: {policy_raw}"))
+    })?;
+    Ok(BadbotsSettings {
+        enabled: enabled != 0,
+        evidence_policy,
+        // A zero interval would make the refresh loop spin at full
+        // speed. The gateway clamps it to at least one second; the
+        // value read here is the operator's raw request.
+        feed_refresh_interval_secs: interval.max(0) as u64,
+        abuseipdb_api_key,
+        crowdsec_api_key,
+        updated_at: parse_dt(&updated_at)?,
+    })
+}
+
 // ---- Site rate limits + IP rules (V9) ----
 
 /// Read the rate-limit policy of every site that has one.
@@ -1653,7 +1721,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V11 as applied. (V2 merges
+        // it's there and lists V1..V12 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
@@ -1662,15 +1730,16 @@ mod tests {
         // the gateway-header configuration for issue #115; V9 adds the
         // per-site rate limits + IP rules for issue #117; V10 adds the
         // per-site provider configuration + origin guard for issue #122;
-        // V11 adds the per-site known-bot rate-limit list for issue #131.)
+        // V11 adds the per-site known-bot rate-limit list for issue #131;
+        // V12 adds the badbots_config singleton for issue #141.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 11,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 to be applied"
+            count, 12,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -2573,6 +2642,65 @@ mod tests {
         assert_eq!(
             cfg.client_region_header, None,
             "default client_region_header must be unset"
+        );
+    }
+
+    #[test]
+    fn badbots_config_seeded_after_migrate() {
+        // V12 must INSERT the default row as part of the migration, so
+        // a fresh DB never sees `QueryReturnedNoRows` from
+        // `get_badbots_config` — the reputation check is on out of the
+        // box and needs no configuration.
+        let conn = make_conn();
+        let cfg = get_badbots_config(&conn).expect("badbots_config row exists post-V12");
+        assert!(
+            cfg.enabled,
+            "the reputation check must be on by default — the feature needs no configuration"
+        );
+        assert_eq!(
+            cfg.evidence_policy,
+            BadbotsEvidencePolicy::Lenient,
+            "the gateway asks for a second opinion about a client it already rejected, \
+             so the lenient bar is the default"
+        );
+        assert_eq!(cfg.feed_refresh_interval_secs, 300);
+        assert_eq!(cfg.abuseipdb_api_key, None);
+        assert_eq!(cfg.crowdsec_api_key, None);
+    }
+
+    #[test]
+    fn badbots_config_update_round_trip() {
+        let conn = make_conn();
+        let mut cfg = get_badbots_config(&conn).unwrap();
+        cfg.enabled = false;
+        cfg.evidence_policy = BadbotsEvidencePolicy::Strict;
+        cfg.feed_refresh_interval_secs = 900;
+        cfg.abuseipdb_api_key = Some("key-a".into());
+        cfg.crowdsec_api_key = Some("key-c".into());
+        cfg.updated_at = dt("2026-01-02T03:04:05Z");
+        update_badbots_config(&conn, &cfg).unwrap();
+
+        let read = get_badbots_config(&conn).unwrap();
+        assert!(!read.enabled);
+        assert_eq!(read.evidence_policy, BadbotsEvidencePolicy::Strict);
+        assert_eq!(read.feed_refresh_interval_secs, 900);
+        assert_eq!(read.abuseipdb_api_key.as_deref(), Some("key-a"));
+        assert_eq!(read.crowdsec_api_key.as_deref(), Some("key-c"));
+        assert_eq!(read.updated_at, dt("2026-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn badbots_config_check_constraint_blocks_a_bogus_policy() {
+        let conn = make_conn();
+        let err = conn
+            .execute(
+                "UPDATE badbots_config SET evidence_policy = 'bogus' WHERE id = 1",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "the policy column must refuse an unknown value, got: {err}"
         );
     }
 

@@ -20,6 +20,7 @@ use crate::ratelimit::RateLimiter;
 use crate::referer::RefererHit;
 use crate::referer_log::{RefererLogBuffer, RefererLogEntry, RefererLogWriter};
 use crate::referer_stats::RefererStats;
+use crate::reputation::build_library;
 use crate::traffic::TrafficHub;
 use crate::tunnel::YamuxTunnel;
 use crate::{
@@ -424,6 +425,23 @@ pub struct App {
     /// Built in [`App::new`] (sync, loads disk caches); background
     /// RDNS / IP-refresh workers start in [`App::start_bot_writer`].
     pub bot_verifier: Option<Arc<Validator>>,
+    /// The IP reputation library (issue #141).
+    ///
+    /// `None` when the operator turned the check off, or when the
+    /// library failed to build — a failure is logged and the gateway
+    /// starts without the check, because refusing to start would turn
+    /// a misconfiguration into an outage.
+    ///
+    /// The handle is behind a **sync** lock because the operator can
+    /// change the provider credentials from the admin dashboard, and a
+    /// new credential needs a new library instance: the key is baked
+    /// into the instance when it is built, so it cannot be changed in
+    /// place. [`App::rebuild_badbots`] swaps the instance after the
+    /// dashboard write.
+    ///
+    /// The lock is only taken on the throttle path, never on a request
+    /// that passed the rate limiter.
+    pub badbots: Arc<parking_lot::RwLock<Option<Arc<badbots::BadBots>>>>,
     /// `JoinHandle` for the background writer task. Populated by
     /// [`App::start_bot_writer`], consumed by
     /// [`App::shutdown_bot_writer`] so the await on shutdown can
@@ -507,6 +525,34 @@ pub struct App {
     /// never reach the access log, so this counter is the only place
     /// the operator sees them.
     pub guard_rejections: Arc<GuardRejectionCounter>,
+}
+
+/// Build the IP reputation library from the operator's settings
+/// (issue #141).
+///
+/// `None` when the check is off, and `None` when the library fails to
+/// build — the failure is logged and the gateway starts without the
+/// reputation check. Refusing to start would turn a misconfiguration
+/// into an outage, and the gateway serves traffic whether or not an
+/// optional reputation check is available.
+fn build_badbots(conn: &Connection) -> Option<Arc<badbots::BadBots>> {
+    let settings = match crate::db::get_badbots_config(conn) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("badbots: reading the configuration failed: {e}");
+            return None;
+        }
+    };
+    if !settings.enabled {
+        return None;
+    }
+    match build_library(&settings) {
+        Ok(lib) => Some(lib),
+        Err(e) => {
+            log::error!("badbots: the reputation library could not be built: {e}");
+            None
+        }
+    }
 }
 
 impl App {
@@ -650,6 +696,13 @@ impl App {
         let bot_writer = Some(BotLogWriter::new(bot_cfg.dir.clone()));
         let bot_verifier = Some(verifier);
 
+        // IP reputation (issue #141). The configuration lives in the
+        // database, not in `ngx.yml` — see `badbots_config` (V12).
+        // A library that fails to build is logged and dropped: the
+        // gateway serves traffic whether or not an optional reputation
+        // check is available.
+        let badbots = build_badbots(&conn);
+
         // Referer log side-channel (inbound external referrals).
         //
         // The channel, the ring buffer and the counters exist even
@@ -687,6 +740,7 @@ impl App {
             bot_stats,
             bot_writer,
             bot_verifier,
+            badbots: Arc::new(parking_lot::RwLock::new(badbots)),
             bot_writer_task: parking_lot::Mutex::new(None),
             referer_log_tx,
             referer_log_recent,
@@ -708,6 +762,33 @@ impl App {
     /// fake during one process lifetime).
     pub async fn set_cert_retrier(&self, retrier: Arc<dyn CertRetrier>) {
         *self.cert_retrier.write().await = Some(retrier);
+    }
+
+    /// Rebuild the IP reputation library from the operator's settings
+    /// (issue #141).
+    ///
+    /// Called after the dashboard wrote new settings. A provider key is
+    /// baked into the library instance when it is built, so a new key
+    /// needs a new instance — there is no way to change one in place.
+    ///
+    /// The old instance is replaced atomically: the request path reads
+    /// the handle under a read lock, so a request that is in flight
+    /// keeps the instance it started with.
+    pub async fn rebuild_badbots(&self) {
+        let library = {
+            let conn = self.db.lock().await;
+            build_badbots(&conn)
+        };
+        *self.badbots.write() = library;
+    }
+
+    /// The operator's IP reputation settings (issue #141).
+    ///
+    /// Read from the `badbots_config` singleton row — the settings
+    /// live in the database, not in `ngx.yml`.
+    pub async fn badbots_settings(&self) -> crate::Result<crate::BadbotsSettings> {
+        let conn = self.db.lock().await;
+        crate::db::get_badbots_config(&conn).map_err(Into::into)
     }
 
     /// Reload indexes from DB. Called after every admin write operation.
@@ -794,7 +875,14 @@ impl App {
             log::warn!("cert_links: reload from DB failed: {}", e);
         }
         *self.tunnel_domains.write() = Arc::new(tunnel_set);
+        // Issue #141: rebuild the reputation library. The admin POST
+        // rebuilds it right after it writes the row; this is the
+        // out-of-band recovery path — an operator who edited the
+        // `badbots_config` row with `sqlite3` gets the change with a
+        // `POST /api/reload`, like every other index-derived state.
+        let badbots = build_badbots(&conn);
         drop(conn);
+        *self.badbots.write() = badbots;
         // Wake the AcmeState loop (if any) so it re-reads dns_providers.
         self.dns_change_notify.notify_one();
     }

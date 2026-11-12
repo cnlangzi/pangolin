@@ -64,10 +64,36 @@ pub struct SettingsTemplate<'a> {
     /// a small "Last updated" line under the form so operators can
     /// tell at a glance how stale the config is.
     pub updated_at: String,
+    /// The IP reputation settings (issue #141).
+    ///
+    /// The settings live in the database, not in `ngx.yml` — the only
+    /// credential they carry is a provider API key.
+    pub badbots: BadbotsSettingsView,
     /// `Some(msg)` when the page is re-rendered after a failed POST;
     /// `None` on the initial GET and on successful POST (which 302s
     /// back to this URL).
     pub error: Option<&'a str>,
     /// Active-nav tag, always `"settings"`.
     pub active_nav: &'a str,
+}
+
+/// The IP reputation settings as the settings page renders them.
+///
+/// The API keys are **not** part of this view: the form shows whether
+/// a key is configured and takes a new one to replace it. The stored
+/// key never leaves the database.
+#[derive(Clone, Debug)]
+pub struct BadbotsSettingsView {
+    /// Whether the reputation check runs.
+    pub enabled: bool,
+    /// The evidence policy — `"strict"` or `"lenient"`.
+    pub evidence_policy: &'static str,
+    /// How often the publishers' lists are refreshed, in seconds.
+    pub feed_refresh_interval_secs: u64,
+    /// Whether an AbuseIPDB key is configured.
+    pub abuseipdb_key_configured: bool,
+    /// Whether a CrowdSec key is configured.
+    pub crowdsec_key_configured: bool,
+    /// RFC-3339 timestamp of the last successful update.
+    pub updated_at: String,
 }

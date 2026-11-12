@@ -813,6 +813,66 @@ impl ProxyHttp for AppProxy {
                     return Ok(true);
                 }
                 pangolin_core::LimitDecision::Throttled { retry_after } => {
+                    // Issue #141: a second opinion on the client. The
+                    // gateway has already decided to reject it; the
+                    // reputation library says whether the address is
+                    // hostile and whether the user agent declares
+                    // itself a bot.
+                    //
+                    // The library is consulted **here** and nowhere
+                    // else: a request that passed the limiter never
+                    // reaches it, so the upstream quota is spent on
+                    // clients that already tripped a limit and on
+                    // nobody else. The call is synchronous and reads
+                    // the library's local state — the upstream
+                    // verification it schedules runs in the library's
+                    // own worker thread, so the answer never waits.
+                    let verdict = {
+                        let library = self.app.badbots.read().clone();
+                        pangolin_core::reputation::assess(
+                            library.as_deref(),
+                            ctx.client_ip,
+                            ctx.user_agent.as_deref(),
+                            bot_name.as_deref(),
+                        )
+                    };
+                    if let Some(verdict) = verdict
+                        && let Some(ip) = ctx.client_ip
+                    {
+                        // The verdict is recorded for the operator even
+                        // when it does not escalate — the rate-limit
+                        // page shows what the library said about every
+                        // throttled client.
+                        self.app
+                            .rate_limiter
+                            .record_badbot_verdict(&site.name, ip, verdict);
+                        if verdict.escalates() {
+                            // The line follows the limiter's own
+                            // cadence: the first rejection of a client
+                            // and then every LOG_EVERY-th one, so an
+                            // attack cannot flood the log.
+                            if self.app.rate_limiter.should_log_rejection(&site.name, ip) {
+                                warn!(
+                                    "ratelimit: site={} ip={} reason=badbot action=403 verdict={}",
+                                    site.name, ip, verdict,
+                                );
+                            }
+                            // The same 403 the gateway produces for a
+                            // blocked client: the site's own page, and
+                            // no `Retry-After` — a rejected address is
+                            // not expected to become acceptable by
+                            // waiting.
+                            respond_rejection(
+                                session,
+                                403,
+                                None,
+                                "text/html; charset=utf-8",
+                                &site_custom_403_body(Some(limit_cfg.as_ref())),
+                            )
+                            .await;
+                            return Ok(true);
+                        }
+                    }
                     // The site's own page wins; otherwise the
                     // built-in default page is served.
                     let body = match limit_cfg.policy.custom_429_body.as_deref() {

@@ -37,6 +37,7 @@ pub mod ratelimit;
 pub mod referer;
 pub mod referer_log;
 pub mod referer_stats;
+pub mod reputation;
 pub mod traffic;
 pub mod tunnel;
 pub mod types;
@@ -81,6 +82,7 @@ pub use referer_log::{
     RefererStatsQuery,
 };
 pub use referer_stats::{RefererStats, RefererStatsRow, RefererStatsSummary};
+pub use reputation::{BadbotVerdict, build_library, library_config};
 pub use traffic::{
     TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,
     classify_route, normalize_path,
@@ -89,8 +91,9 @@ pub use tunnel::{
     TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,
 };
 pub use types::{
-    BackendKind, Cert, CertErrorClass, CertStatus, ChallengeKind, ChallengeType, DnsProvider,
-    DnsProviderKind, Domain, HostMode, Site, SystemConfig, Tun, next_backoff,
+    BackendKind, BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus,
+    ChallengeKind, ChallengeType, DnsProvider, DnsProviderKind, Domain, HostMode, Site,
+    SystemConfig, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

@@ -17,6 +17,7 @@
 //! duplicated across every resource before the xun split.
 
 pub mod auth;
+pub mod badbots;
 pub mod certs;
 pub mod dashboard;
 pub mod dns;
