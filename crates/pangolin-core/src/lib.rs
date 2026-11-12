@@ -52,7 +52,7 @@ pub use cidr::CidrSet;
 pub use config::{BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
-pub use index::{Indexes, lookup_site, site_of_host};
+pub use index::{Indexes, host_matches_domains, lookup_site, site_of_host};
 pub use parse::{
     BackendScheme, ParseError, TUN_NAME_MAX, detect_scheme, file_url_to_path, is_valid_domain,
     is_valid_tun_name, matches_tun_name_charset, parse_backend,

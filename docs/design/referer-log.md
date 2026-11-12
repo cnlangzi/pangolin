@@ -220,6 +220,13 @@ All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
 same site are aggregated together rather than split per host.
 
+The history page and the stats page apply the same filters (`referer_host`,
+`host`, `path`, `status`, `method`, `client_ip`) to the same day's file, and
+the links between them — plus the date sidebar's links — carry every current
+filter over, site scope included. A page number past the last page is
+clamped to the last page, so the "Page X of Y" header always sits above the
+rows it describes.
+
 ## Failure modes
 
 | Scenario | Behaviour |

@@ -89,7 +89,7 @@
       <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
         Sourced from <code>{{ filter.date }}</code>'s JSONL file. Dates and rotation are <strong>UTC</strong>
         (a request at 2026-11-12 23:59 UTC lands in 2026-11-12 even if your local clock says 2026-11-13).
-        Per-referrer rollups are on <a href="/logs/referers/stats?date={{ filter.date }}" class="underline hover:text-accent-600">Stats</a>.
+        Per-referrer rollups are on <a href="{{ stats_url }}" class="underline hover:text-accent-600">Stats</a>.
       </p>
     </div>
   </div>

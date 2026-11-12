@@ -974,6 +974,14 @@ pub async fn render_referers(
     let enabled = app.config.log.referer.enabled;
     let filter = parse_referer_params(merged_params).filter;
     let sites = site_options(app, &filter.site).await;
+    // "A site is selected" is a separate fact from "the selected site
+    // has domains": a `?site=` naming a site that does not exist (or
+    // one whose domains are all disabled) resolves to an empty domain
+    // list. Treating that as "no scope" would show the operator
+    // *every* site's traffic while the history/stats pages — which
+    // scope through `RefererSiteFilter` — show none. So the scope is
+    // driven by the presence of the filter, not by the domain list.
+    let site_scoped = !filter.site.is_empty();
     let site_domains = sites
         .iter()
         .find(|s| s.selected)
@@ -988,10 +996,10 @@ pub async fn render_referers(
     let (rows, global_summary) = app.referer_stats_snapshot();
     let scoped: Vec<pangolin_core::referer_stats::RefererStatsRow> = rows
         .into_iter()
-        // An empty domain set means "All sites" — no scope, every
-        // row is in. This mirrors the live tail's client-side
-        // filter, which treats an empty list the same way.
-        .filter(|r| site_domains.is_empty() || site_matches(&site_domains, &r.host))
+        // No site selected ⇒ no scope, every row is in. This mirrors
+        // the live tail's client-side filter, which treats the
+        // unscoped case the same way.
+        .filter(|r| !site_scoped || pangolin_core::host_matches_domains(&site_domains, &r.host))
         .collect();
     let scoped_hits: u64 = scoped.iter().map(|r| r.hits).sum();
     let summary = pangolin_core::referer_stats::RefererStatsSummary {
@@ -1015,6 +1023,7 @@ pub async fn render_referers(
         sites,
         filter,
         site_domains,
+        site_scoped,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1042,6 +1051,11 @@ pub async fn render_referers_history(
     let dir = app.config.log.referer.dir.clone();
     let page = build_referer_history_page(app, dir.as_path(), merged_params).await;
 
+    // The cross-link to the stats page keeps every current filter —
+    // the site scope above all, so clicking it does not silently
+    // widen the view to "All sites".
+    let stats_url = build_referer_stats_url(&page.filter);
+
     let tmpl = RefererLogsHistoryTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-referers",
@@ -1052,6 +1066,7 @@ pub async fn render_referers_history(
         filter: page.filter,
         summary: page.summary,
         entries: page.entries,
+        stats_url,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1078,6 +1093,10 @@ pub async fn render_referers_stats(
     let dir = app.config.log.referer.dir.clone();
     let page = build_referer_stats_page(app, dir.as_path(), merged_params).await;
 
+    // The cross-link to the history page keeps every current filter —
+    // the site scope above all.
+    let history_url = build_referer_history_url(&page.filter, 1);
+
     let tmpl = RefererLogsStatsTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-referers",
@@ -1087,6 +1106,7 @@ pub async fn render_referers_stats(
         sites: page.sites,
         filter: page.filter,
         stats: page.stats,
+        history_url,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1183,34 +1203,6 @@ async fn site_options(app: &Arc<App>, selected: &str) -> Vec<RefererSiteOption> 
     out
 }
 
-/// Does `host` belong to the site whose domain set is `domains`?
-///
-/// The same exact-plus-wildcard rule the router uses: an exact
-/// domain matches literally, a `*.suffix` domain matches any host
-/// with that suffix and at least one more label.
-fn site_matches(domains: &[String], host: &str) -> bool {
-    if domains.is_empty() {
-        return false;
-    }
-    let host = host.split(':').next().unwrap_or(host).to_lowercase();
-    for domain in domains {
-        let domain = domain.to_lowercase();
-        if let Some(suffix) = domain.strip_prefix("*.") {
-            // `*.example.com` matches `foo.example.com` but not
-            // `example.com` and not `notexample.com`.
-            if host.len() > suffix.len() + 1
-                && host.ends_with(suffix)
-                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            {
-                return true;
-            }
-        } else if host == domain {
-            return true;
-        }
-    }
-    false
-}
-
 /// Build the scoped domain index for the selected site.
 ///
 /// The scope is a *restricted* copy of the router's domain map: only
@@ -1266,11 +1258,14 @@ async fn build_referer_history_page(
     let page_unsafe = p.page;
     let page_size = REFERRER_HISTORY_PAGE_SIZE;
 
-    // The scope travels into the blocking read: the domain map is
-    // cloned (a handful of small `Arc<Site>` clones) so the reader
-    // never has to take the index lock.
-    let domain = app.indexes.read().await.domain.clone();
-    let scope = site_scope(&domain, &filter.site);
+    // The scope travels into the blocking read: only the selected
+    // site's own domain entries are copied (a handful of small
+    // `Arc<Site>` clones), so the reader never has to take the index
+    // lock — and the *whole* index is not cloned for it.
+    let scope = {
+        let indexes = app.indexes.read().await;
+        site_scope(&indexes.domain, &filter.site)
+    };
 
     let query = pangolin_core::referer_log::RefererHistoryQuery {
         date,
@@ -1378,8 +1373,10 @@ async fn build_referer_stats_page(
     let mut filter = p.filter;
     filter.date = date.to_string();
 
-    let domain = app.indexes.read().await.domain.clone();
-    let scope = site_scope(&domain, &filter.site);
+    let scope = {
+        let indexes = app.indexes.read().await;
+        site_scope(&indexes.domain, &filter.site)
+    };
 
     let query = pangolin_core::referer_log::RefererStatsQuery {
         date,
@@ -1387,6 +1384,9 @@ async fn build_referer_stats_page(
         referer_host: (!filter.referer_host.is_empty()).then(|| filter.referer_host.clone()),
         host: (!filter.host.is_empty()).then(|| filter.host.clone()),
         path: (!filter.path.is_empty()).then(|| filter.path.clone()),
+        status: filter.status.parse::<u16>().ok(),
+        method: (!filter.method.is_empty()).then(|| filter.method.clone()),
+        client_ip: (!filter.client_ip.is_empty()).then(|| filter.client_ip.clone()),
         path_limit: REFERRER_STATS_PATH_LIMIT,
     };
 
@@ -3299,21 +3299,126 @@ mod tests {
         assert_eq!(p.page, 1);
     }
 
-    #[test]
-    fn site_matches_uses_the_router_wildcard_rules() {
-        let domains = vec!["example.com".to_string(), "*.example.org".to_string()];
-        assert!(site_matches(&domains, "example.com"));
-        assert!(site_matches(&domains, "EXAMPLE.COM:8443"));
-        assert!(site_matches(&domains, "foo.example.org"));
-        // `*.example.org` does not cover the bare suffix.
-        assert!(!site_matches(&domains, "example.org"));
-        // A lookalike host is not a match.
-        assert!(!site_matches(&domains, "notexample.com"));
-        assert!(!site_matches(&domains, "other.example.net"));
+    /// A `?site=` that names no site must NOT widen the live page to
+    /// "All sites": the history/stats pages scope such a value to an
+    /// empty domain set and show nothing, so the live page has to
+    /// agree. Otherwise the operator sees every site's traffic on one
+    /// page and no traffic on the others.
+    #[tokio::test]
+    async fn referer_live_page_shows_no_rows_for_an_unknown_site() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        let entry = pangolin_core::events::AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: "GET".into(),
+            path: "/a".into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "1.1.1.1".into(),
+            user_agent: None,
+        };
+        let hit = pangolin_core::RefererHit {
+            referer: "https://news.example.org/a".into(),
+            referer_host: "news.example.org".into(),
+        };
+        app.push_referer_log(&entry, &hit);
+
+        // No site selected → every row is in scope.
+        let resp = render_referers(&app, "csrf-token", b"")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "without a site every row must show: {html}"
+        );
+
+        // An unknown site → no row is in scope.
+        let resp = render_referers(&app, "csrf-token", b"site=nosuchsite")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            !html.contains("news.example.org"),
+            "an unknown site must not widen the view to all sites: {html}"
+        );
     }
 
-    #[test]
-    fn site_matches_with_no_domains_matches_nothing() {
-        assert!(!site_matches(&[], "example.com"));
+    /// The cross-links between the history and stats pages carry the
+    /// current filters — the site scope above all. Dropping them
+    /// silently widens the operator's view to every site.
+    #[tokio::test]
+    async fn referer_pages_cross_link_with_the_site_scope_intact() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        let resp = render_referers_history(&app, "csrf-token", b"site=web&referer_host=news")
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("/logs/referers/stats?date=") && html.contains("site=web"),
+            "the history→stats link must keep the site scope: {html}"
+        );
+        assert!(
+            html.contains("referer_host=news"),
+            "the history→stats link must keep the other filters: {html}"
+        );
+
+        let resp = render_referers_stats(&app, "csrf-token", b"site=web&referer_host=news")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("/logs/referers/history?date=") && html.contains("site=web"),
+            "the stats→history link must keep the site scope: {html}"
+        );
+    }
+
+    /// The stats page applies the `status` / `method` / `client_ip`
+    /// filters it keeps in its URL — and its "Apply" button must not
+    /// drop them.
+    #[tokio::test]
+    async fn referer_stats_page_applies_and_keeps_the_status_filter() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir.clone());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let ts = chrono::Utc::now();
+        let mut not_found = referer_entry("news.example.org", "example.com", "/a", "1.1.1.1", ts);
+        not_found.status = 404;
+        seed_referer_file(
+            &referer_dir,
+            day,
+            &[
+                not_found,
+                referer_entry("blog.example.org", "example.com", "/b", "1.1.1.2", ts),
+            ],
+        );
+
+        let resp = render_referers_stats(&app, "csrf-token", b"date=2026-10-01&status=404")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "the matching referrer must show: {html}"
+        );
+        assert!(
+            !html.contains("blog.example.org"),
+            "a referrer the status filter excludes must not show: {html}"
+        );
+        // The form's Apply button carries the filter forward.
+        assert!(
+            html.contains("name=\"status\" value=\"404\""),
+            "the stats form must carry the status filter: {html}"
+        );
     }
 }

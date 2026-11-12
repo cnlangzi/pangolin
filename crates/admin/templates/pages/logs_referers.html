@@ -118,8 +118,11 @@
   {# `data-site-domains` carries the selected site's domain literals so #}
   {# the client can scope the live tail the same way the server scopes #}
   {# the summary card. Domain literals never contain a space, so a #}
-  {# space-separated list is unambiguous. #}
-  <div id="referers-table" class="card overflow-hidden" data-site-domains="{{ self.site_domains_attr() }}">
+  {# space-separated list is unambiguous. `data-site-scoped` says whether #}
+  {# a site is selected at all — an empty domain list with a scope on #}
+  {# means "a site was named that has no domains", which must show no #}
+  {# rows rather than every site's rows. #}
+  <div id="referers-table" class="card overflow-hidden" data-site-domains="{{ self.site_domains_attr() }}" data-site-scoped="{{ site_scoped }}">
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
       <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Live tail</h2>
       <span class="text-xs text-slate-500 dark:text-slate-400">Bounded ring buffer; live SSE channel</span>
@@ -225,15 +228,22 @@
   }
 
   // ── Site scope (client-side twin of the server's site_of_host) ─────
-  // The selected site's domain literals. An empty list means "all
-  // sites" — no filtering. A `*.suffix` literal matches any host with
-  // that suffix and at least one more label, exactly like the router.
+  // The selected site's domain literals. `data-site-scoped` says
+  // whether a site is selected at all: "All sites" (no scope) shows
+  // every row, while a scope with an empty domain list (a site that
+  // was named but has no domains) shows none.
+  //
+  // A `*.suffix` literal matches any host with that suffix and at
+  // least one more label, exactly like the router.
   const table = document.getElementById("referers-table");
+  const siteScoped = table
+    ? table.getAttribute("data-site-scoped") === "true"
+    : false;
   const siteDomains = table
     ? (table.getAttribute("data-site-domains") || "").split(" ").filter(function(s) { return s !== ""; })
     : [];
   function hostInSite(host) {
-    if (siteDomains.length === 0) return true;
+    if (!siteScoped) return true;
     const h = String(host || "").split(":")[0].toLowerCase();
     for (let i = 0; i < siteDomains.length; i++) {
       const d = siteDomains[i].toLowerCase();

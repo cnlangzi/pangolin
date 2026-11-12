@@ -575,6 +575,14 @@ pub struct RefererLogsTemplate<'a> {
     /// The selected site's domain literals — handed to the live
     /// tail's client-side filter.
     pub site_domains: Vec<String>,
+    /// `true` when a site is selected, so the live tail's
+    /// client-side filter scopes its rows. `false` ⇒ "All sites".
+    ///
+    /// Separate from `site_domains.is_empty()`: a `?site=` naming a
+    /// site that does not exist resolves to an empty domain list,
+    /// but the scope is still *on* — the page then shows no rows
+    /// rather than every site's rows.
+    pub site_scoped: bool,
 }
 
 impl RefererLogsTemplate<'_> {
@@ -614,6 +622,9 @@ pub struct RefererLogsHistoryTemplate<'a> {
     pub summary: RefererHistorySummary,
     /// Entries for the current page, newest-first.
     pub entries: Vec<RefererLogEntry>,
+    /// Link to the same day's rollup on the stats page, with every
+    /// current filter (including the site scope) carried over.
+    pub stats_url: String,
 }
 
 /// Full-page template for `GET /logs/referers/stats`.
@@ -636,4 +647,26 @@ pub struct RefererLogsStatsTemplate<'a> {
     pub sites: Vec<RefererSiteOption>,
     pub filter: RefererHistoryFilter,
     pub stats: RefererHistoryStatsPage,
+    /// Link to the same day's raw rows on the history page, with every
+    /// current filter (including the site scope) carried over.
+    pub history_url: String,
+}
+
+impl RefererLogsStatsTemplate<'_> {
+    /// The filters the stats rollup applies but the stats form does
+    /// not expose as visible inputs, as `(name, value)` pairs.
+    ///
+    /// The form carries them as hidden inputs so its "Apply" button
+    /// does not silently drop a filter the operator set through the
+    /// URL (or through the date sidebar, which keeps them).
+    pub fn carried_filters(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("referer_host", &self.filter.referer_host),
+            ("host", &self.filter.host),
+            ("path", &self.filter.path),
+            ("status", &self.filter.status),
+            ("method", &self.filter.method),
+            ("client_ip", &self.filter.client_ip),
+        ]
+    }
 }

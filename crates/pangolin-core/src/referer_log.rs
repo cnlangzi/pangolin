@@ -176,13 +176,6 @@ impl RefererLogBuffer {
         let entries = self.entries.lock();
         entries.iter().cloned().collect()
     }
-
-    /// Current capacity. Exposed so the SSE handler can decide
-    /// whether to emit a `replay: empty` hint without consulting
-    /// `App.config` separately.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 /// Hard upper bound on the in-memory ring buffer capacity. Keeps
@@ -233,8 +226,6 @@ pub struct RefererLogWriter {
     dir: PathBuf,
     /// Currently-open file's UTC date. `None` ⇒ no file open yet.
     current_date: parking_lot::Mutex<Option<NaiveDate>>,
-    /// Size in bytes of the currently-open file.
-    current_size: parking_lot::Mutex<u64>,
     /// Tokio file handle for the currently-open file.
     file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     /// Process-lifetime count of entries the hot path had to drop
@@ -254,7 +245,6 @@ impl RefererLogWriter {
             shutdown: Arc::new(Notify::new()),
             dir,
             current_date: parking_lot::Mutex::new(None),
-            current_size: parking_lot::Mutex::new(0),
             file: tokio::sync::Mutex::new(None),
             dropped_total: std::sync::atomic::AtomicU64::new(0),
         })
@@ -371,8 +361,7 @@ impl RefererLogWriter {
         }
 
         // 4) Append. The async-aware lock is held across the
-        //    `write_all().await` and released before updating
-        //    `current_size`.
+        //    `write_all().await`.
         let write_result = {
             let mut guard = self.file.lock().await;
             match guard.as_mut() {
@@ -393,13 +382,8 @@ impl RefererLogWriter {
                 }
             }
         };
-        match write_result {
-            Ok(()) => {
-                *self.current_size.lock() += bytes.len() as u64;
-            }
-            Err(e) => {
-                log::warn!("referer_log: write failed: {e}");
-            }
+        if let Err(e) = write_result {
+            log::warn!("referer_log: write failed: {e}");
         }
     }
 
@@ -450,7 +434,6 @@ impl RefererLogWriter {
 
         *self.file.lock().await = Some(f);
         *self.current_date.lock() = Some(today);
-        *self.current_size.lock() = size;
         log::info!(
             "referer_log: opened {} (existing size {} bytes)",
             path.display(),
@@ -563,8 +546,9 @@ pub struct RefererHistoryQuery {
     pub method: Option<String>,
     /// Case-sensitive substring match on the client IP.
     pub client_ip: Option<String>,
-    /// 1-based page number. Pages outside the valid range return an
-    /// empty `entries` vector with the correct `total_after_filter`.
+    /// 1-based page number. A page past the last one is clamped to
+    /// the last page, so the returned `entries` are that page's rows
+    /// and the caller's page counter cannot disagree with them.
     pub page: usize,
     /// Page size. The caller (the admin route) clamps this to a sane
     /// upper bound before calling — the reader trusts the input.
@@ -727,9 +711,19 @@ pub fn query_history(dir: &Path, q: &RefererHistoryQuery) -> std::io::Result<Ref
 
     let total_after_filter = all.len();
     // Saturating math so `page = 0` (defensive — the UI starts at 1)
-    // doesn't underflow. `skip` past the end returns an empty Vec.
-    let page = q.page.max(1);
+    // doesn't underflow.
     let page_size = q.page_size.max(1);
+    // Clamp the page to the last one that has rows. The caller
+    // computes the same `total_pages` for its "Page X of Y" label, so
+    // clamping here keeps the label and the table in agreement — a
+    // URL with `page=999` on a 3-page day shows page 3's rows, not
+    // an empty table under a "Page 3 of 3" header.
+    let total_pages = total_after_filter.div_ceil(page_size);
+    let page = if total_pages == 0 {
+        1
+    } else {
+        q.page.max(1).min(total_pages)
+    };
     let start = (page - 1).saturating_mul(page_size);
     let entries: Vec<RefererLogEntry> = all.into_iter().skip(start).take(page_size).collect();
 
@@ -776,6 +770,12 @@ pub struct RefererStatsQuery {
     pub host: Option<String>,
     /// Substring match on the request path.
     pub path: Option<String>,
+    /// Exact-match on HTTP status code.
+    pub status: Option<u16>,
+    /// Exact-match on HTTP method (case-insensitive).
+    pub method: Option<String>,
+    /// Substring match on the client IP.
+    pub client_ip: Option<String>,
     /// Max landing-path rows returned per referrer host, after
     /// sorting by hits descending.
     pub path_limit: usize,
@@ -852,6 +852,7 @@ pub fn query_history_stats(
 ) -> std::io::Result<RefererHistoryStats> {
     let body = read_jsonl(dir, q.date)?;
     let file_bytes = body.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+    let method_upper = q.method.as_deref().map(|m| m.to_ascii_uppercase());
     let mut stats = summarize_lines(
         body.as_deref().unwrap_or(""),
         &SummarizeOpts {
@@ -859,6 +860,9 @@ pub fn query_history_stats(
             referer_host: q.referer_host.as_deref().filter(|s| !s.is_empty()),
             host: q.host.as_deref().filter(|s| !s.is_empty()),
             path: q.path.as_deref().filter(|s| !s.is_empty()),
+            status: q.status,
+            method: method_upper.as_deref(),
+            client_ip: q.client_ip.as_deref().filter(|s| !s.is_empty()),
             path_limit: q.path_limit,
         },
     );
@@ -884,6 +888,11 @@ struct SummarizeOpts<'a> {
     referer_host: Option<&'a str>,
     host: Option<&'a str>,
     path: Option<&'a str>,
+    status: Option<u16>,
+    /// Already upper-cased by the caller so the comparison is a
+    /// plain equality.
+    method: Option<&'a str>,
+    client_ip: Option<&'a str>,
     path_limit: usize,
 }
 
@@ -935,6 +944,21 @@ fn summarize_lines(body: &str, opts: &SummarizeOpts<'_>) -> RefererHistoryStats 
         }
         if let Some(want) = opts.path
             && !entry.path.contains(want)
+        {
+            continue;
+        }
+        if let Some(status) = opts.status
+            && entry.status != status
+        {
+            continue;
+        }
+        if let Some(method) = opts.method
+            && entry.method.to_ascii_uppercase() != method
+        {
+            continue;
+        }
+        if let Some(want) = opts.client_ip
+            && !entry.client_ip.contains(want)
         {
             continue;
         }
@@ -1580,6 +1604,40 @@ mod tests {
         assert_eq!(page2.entries[0].path, "/0");
     }
 
+    /// A page number past the end is clamped to the last page that has
+    /// rows. The admin page labels the result "Page X of Y" with the
+    /// same clamp, so the reader must return *that* page's rows —
+    /// otherwise the label says "Page 3 of 3" over an empty table.
+    #[test]
+    fn query_history_clamps_a_page_past_the_end_to_the_last_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let entries: Vec<RefererLogEntry> = (0..5)
+            .map(|i| {
+                entry_at(
+                    "a.example",
+                    "example.com",
+                    &format!("/{i}"),
+                    "1.1.1.1",
+                    ts(i),
+                )
+            })
+            .collect();
+        seed_file(dir.path(), day, &entries);
+
+        let q = RefererHistoryQuery {
+            date: day,
+            page: 999,
+            page_size: 2,
+            ..Default::default()
+        };
+        let page = query_history(dir.path(), &q).unwrap();
+        assert_eq!(page.total_after_filter, 5);
+        // 5 rows / 2 per page = 3 pages; page 999 clamps to page 3.
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].path, "/0", "the last page's oldest row");
+    }
+
     #[test]
     fn query_history_skips_corrupt_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -1716,6 +1774,64 @@ mod tests {
         assert_eq!(stats.total_hits, 5, "the hit counts stay complete");
         // The per-referrer path list is bounded by the same limit.
         assert_eq!(stats.hosts[0].paths.len(), 2);
+    }
+
+    /// The stats rollup applies the same `status` / `method` /
+    /// `client_ip` filters the history reader applies. The stats page
+    /// keeps them in its URL (and in the date-sidebar links), so a
+    /// rollup that ignored them would show data the URL says is
+    /// filtered out.
+    #[test]
+    fn stats_apply_the_status_method_and_client_ip_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let mut not_found = entry_at("a.example", "example.com", "/x", "1.1.1.1", ts(0));
+        not_found.status = 404;
+        not_found.method = "POST".into();
+        let entries = vec![
+            not_found,
+            entry_at("a.example", "example.com", "/xyz", "2.2.2.2", ts(1)),
+        ];
+        seed_file(dir.path(), day, &entries);
+
+        let by_status = query_history_stats(
+            dir.path(),
+            &RefererStatsQuery {
+                date: day,
+                status: Some(404),
+                path_limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_status.total_hits, 1);
+        assert_eq!(by_status.hosts[0].hits, 1);
+
+        // The method comparison is case-insensitive.
+        let by_method = query_history_stats(
+            dir.path(),
+            &RefererStatsQuery {
+                date: day,
+                method: Some("post".into()),
+                path_limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_method.total_hits, 1);
+
+        let by_ip = query_history_stats(
+            dir.path(),
+            &RefererStatsQuery {
+                date: day,
+                client_ip: Some("2.2.2".into()),
+                path_limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_ip.total_hits, 1);
+        assert_eq!(by_ip.hosts[0].hits, 1);
     }
 
     #[test]

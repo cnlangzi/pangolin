@@ -297,16 +297,46 @@ pub fn site_of_host<'a>(
     //    Iteration 1: strip first label, prepend `*`.
     //    Iteration 2: strip first label of *that*, prepend `*`.
     //    ... until no more dots.
-    let mut rest: &str = &normalized;
-    while let Some(dot) = rest.find('.') {
+    wildcard_candidates(&normalized).find_map(|candidate| domain.get(&candidate))
+}
+
+/// The wildcard candidates for a normalized host, longest suffix first.
+///
+/// `foo.bar.example.com` → `*.bar.example.com`, `*.example.com`, `*.com`.
+///
+/// Shared by [`site_of_host`] and [`host_matches_domains`] so the two
+/// cannot drift: the map lookup and the plain-list lookup must agree
+/// on what "this host belongs to that domain" means.
+fn wildcard_candidates(normalized: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest: &str = normalized;
+    std::iter::from_fn(move || {
+        let dot = rest.find('.')?;
         rest = &rest[dot + 1..];
-        let candidate = format!("*.{}", rest);
-        if let Some(site) = domain.get(&candidate) {
-            return Some(site);
-        }
+        Some(format!("*.{rest}"))
+    })
+}
+
+/// Does `host` match one of the given domain literals?
+///
+/// The same exact-plus-wildcard rule as [`site_of_host`], but over a
+/// plain list of domain literals (exact FQDNs and `*.wildcard`
+/// wildcards) instead of a `domain → site` map. Use it when the
+/// caller holds the domain *strings* of one site — e.g. the admin
+/// UI's site selector, which needs to scope a set of hosts to the
+/// selected site's domains.
+///
+/// Sharing the walk with [`site_of_host`] is the point: a hand-rolled
+/// suffix comparison would classify `notexample.com` as internal for
+/// `example.com`, and the admin pages would then disagree with the
+/// history/stats rollup (which resolves through `site_of_host`).
+pub fn host_matches_domains(domains: &[String], host: &str) -> bool {
+    let normalized = normalize_host(host);
+
+    if domains.contains(&normalized) {
+        return true;
     }
 
-    None
+    wildcard_candidates(&normalized).any(|candidate| domains.contains(&candidate))
 }
 
 /// Check whether a host matches any entry in `set`, with the same
@@ -393,6 +423,55 @@ mod tests {
         let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "app.example.com").unwrap();
         assert_eq!(s.name, "app");
+    }
+
+    /// `host_matches_domains` is the plain-list twin of
+    /// `site_of_host` — the admin UI's site selector scopes a set of
+    /// hosts through it, so the two must agree on every shape.
+    #[test]
+    fn host_matches_domains_agrees_with_site_of_host() {
+        let sites = vec![make_site("web", "http://127.0.0.1:8080")];
+        let domains = vec![
+            make_domain("example.com", "web"),
+            make_domain("*.example.org", "web"),
+        ];
+        let idx = Indexes::build(sites, domains);
+        let literals: Vec<String> = idx.domain.keys().cloned().collect();
+
+        for host in [
+            "example.com",
+            "EXAMPLE.COM",
+            "example.com:8443",
+            "foo.example.org",
+            "a.b.example.org",
+            "notexample.com",
+            "example.org",
+            "other.example.net",
+        ] {
+            assert_eq!(
+                host_matches_domains(&literals, host),
+                site_of_host(&idx.domain, host).is_some(),
+                "the two host rules disagree on {host}"
+            );
+        }
+    }
+
+    /// The exact-plus-wildcard rule the router uses: a `*.suffix`
+    /// literal covers any host with that suffix and at least one more
+    /// label, and a lookalike host is not covered.
+    #[test]
+    fn host_matches_domains_uses_the_router_wildcard_rules() {
+        let domains = vec!["example.com".to_string(), "*.example.org".to_string()];
+        assert!(host_matches_domains(&domains, "example.com"));
+        assert!(host_matches_domains(&domains, "EXAMPLE.COM:8443"));
+        assert!(host_matches_domains(&domains, "foo.example.org"));
+        // `*.example.org` does not cover the bare suffix.
+        assert!(!host_matches_domains(&domains, "example.org"));
+        // A lookalike host is not a match.
+        assert!(!host_matches_domains(&domains, "notexample.com"));
+        assert!(!host_matches_domains(&domains, "other.example.net"));
+        // An empty list matches nothing.
+        assert!(!host_matches_domains(&[], "example.com"));
     }
 
     #[test]

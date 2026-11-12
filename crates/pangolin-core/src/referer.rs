@@ -123,18 +123,23 @@ fn is_valid_scheme(scheme: &str) -> bool {
 /// Strip the port from an authority's host portion.
 ///
 /// Handles the bracketed IPv6 literal form (`[::1]:8443`) and a
-/// trailing `:port`. A colon that is not followed by digits is kept
-/// as part of the host — it is not a port, and dropping it would
-/// silently merge two different authorities.
+/// trailing `:port`.
+///
+/// The cut is at the **first** colon, exactly like
+/// [`crate::normalize::normalize_host`] — the function the router
+/// uses to resolve a host against the domain index. The two must
+/// agree: `referer_host` is both the grouping key of the statistics
+/// rollup *and* the key the internal/external decision runs on, so a
+/// host that normalizes one way for the decision and another way for
+/// the rollup would split one referrer across two rows.
 fn strip_port(host_port: &str) -> &str {
     if let Some(bracket_end) = host_port.find(']') {
         // IPv6 literal: keep `[...]` and drop whatever follows.
         return &host_port[..=bracket_end];
     }
-    match host_port.rsplit_once(':') {
-        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => host_port,
-    }
+    host_port
+        .split_once(':')
+        .map_or(host_port, |(host, _port)| host)
 }
 
 /// Decide whether a request is a top-level document navigation.
@@ -294,6 +299,27 @@ mod tests {
         // The scheme and path keep their original text; only the
         // host is lowercased for the grouping key.
         assert_eq!(hit.referer, "HTTPS://EXAMPLE.COM/Path");
+    }
+
+    /// `referer_host` is both the statistics grouping key and the key
+    /// the internal/external decision runs on. The decision resolves
+    /// the host through `site_of_host`, which normalizes with
+    /// `normalize_host` (cut at the *first* colon) — so the grouping
+    /// key must cut at the same place, or one referrer splits across
+    /// two rows depending on how its port was spelled.
+    #[test]
+    fn parse_referer_strips_the_port_the_same_way_the_router_normalizes() {
+        // A numeric port.
+        let hit = parse_referer("https://news.example.org:8443/a").unwrap();
+        assert_eq!(hit.referer_host, "news.example.org");
+        // A non-numeric "port" is not a port either — the router
+        // would resolve `news.example.org:abc` to `news.example.org`,
+        // so the grouping key must agree.
+        let hit = parse_referer("https://news.example.org:abc/a").unwrap();
+        assert_eq!(hit.referer_host, "news.example.org");
+        // The stored URL keeps the original authority text.
+        let hit = parse_referer("https://news.example.org:abc/a").unwrap();
+        assert_eq!(hit.referer, "https://news.example.org:abc/a");
     }
 
     // ── is_document_request ─────────────────────────────────────
