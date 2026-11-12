@@ -36,6 +36,8 @@ use chrono::NaiveDate;
 use pangolin_core::bot::BotVerificationHealth;
 use pangolin_core::bot_log::BotLogEntry;
 use pangolin_core::bot_stats::{BotStatsRow, BotStatsSummary};
+use pangolin_core::referer_log::RefererLogEntry;
+use pangolin_core::referer_stats::{RefererStatsRow, RefererStatsSummary};
 
 /// Sub-nav slot for the bot-log pages. The shared sub-nav
 /// partial lights up the matching tab.
@@ -389,5 +391,282 @@ impl BotHistoryStatsPage {
     /// Same byte buckets as [`BotHistorySummary::file_size_human`].
     pub fn file_size_human(&self) -> String {
         format_bytes(self.file_bytes)
+    }
+}
+
+// ── Referer log pages (inbound external referrals) ───────────────
+
+/// Sub-nav slot for the referer-log pages. The shared sub-nav
+/// partial lights up the matching tab.
+///
+/// Values: `"live"` for `/logs/referers`, `"history"` for
+/// `/logs/referers/history`, `"stats"` for `/logs/referers/stats`.
+pub mod referer_subnav {
+    pub const LIVE: &str = "live";
+    pub const HISTORY: &str = "history";
+    pub const STATS: &str = "stats";
+}
+
+/// One site in the site selector.
+///
+/// The site — not the hostname — is the unit of the analysis: a
+/// referral from `www.example.com` to `example.com` is internal to
+/// the site that owns both domains. The selector therefore scopes
+/// the view to a *set* of domains, not to one host.
+#[derive(Clone, Debug)]
+pub struct RefererSiteOption {
+    /// The site's name (the `sites.name` column).
+    pub name: String,
+    /// `true` when this site is the selected one.
+    pub selected: bool,
+    /// The site's configured domains — exact FQDNs and wildcard
+    /// literals. Rendered as a hint under the selector and used by
+    /// the live page's client-side filter.
+    pub domains: Vec<String>,
+}
+
+/// Echo of the current referer filter form values.
+#[derive(Clone, Debug, Default)]
+pub struct RefererHistoryFilter {
+    pub date: String,
+    /// The selected site. Empty means "every site".
+    pub site: String,
+    pub referer_host: String,
+    pub host: String,
+    pub path: String,
+    pub status: String,
+    pub method: String,
+    pub client_ip: String,
+}
+
+/// Pagination metadata for the referer history page — same shape as
+/// [`BotHistorySummary`], kept separate so the two pages can evolve
+/// independently.
+#[derive(Clone, Debug, Default)]
+pub struct RefererHistorySummary {
+    pub total_after_filter: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_pages: usize,
+    pub file_bytes: u64,
+    pub prev_url: Option<String>,
+    pub next_url: Option<String>,
+    pub error: Option<String>,
+}
+
+impl RefererHistorySummary {
+    /// 1-based start row of the current page (clamped to 0 when the
+    /// page is past the end or there are no matches).
+    pub fn start_row(&self) -> usize {
+        if self.total_after_filter == 0 {
+            return 0;
+        }
+        (self.page - 1) * self.page_size + 1
+    }
+
+    /// 1-based end row of the current page.
+    pub fn end_row(&self) -> usize {
+        if self.total_after_filter == 0 {
+            return 0;
+        }
+        let end = self.page * self.page_size;
+        end.min(self.total_after_filter)
+    }
+
+    /// Human-readable file size, e.g. `"3.2 MB"`.
+    pub fn file_size_human(&self) -> String {
+        format_bytes(self.file_bytes)
+    }
+}
+
+/// One UTC log file in the referer history date sidebar.
+#[derive(Clone, Debug)]
+pub struct RefererHistoryDateLink {
+    pub date: NaiveDate,
+    /// Full-page URL for this file on the page that owns the sidebar.
+    pub href: String,
+    /// `true` when this file is the one the page is showing.
+    pub active: bool,
+}
+
+/// One referrer host in the selected day, with its landing paths.
+#[derive(Clone, Debug)]
+pub struct RefererStatsHostRow {
+    /// Lowercased hostname of the external referrer.
+    pub referer_host: String,
+    /// Number of referral hits.
+    pub hits: u64,
+    /// Number of distinct visitor IPs behind this referrer.
+    pub distinct_client_ips: usize,
+    /// Landing paths this referrer delivered, hits descending.
+    pub paths: Vec<RefererStatsPathRow>,
+    /// Most-recent hit for this referrer.
+    pub last_seen: String,
+}
+
+/// One landing path in the selected day.
+#[derive(Clone, Debug)]
+pub struct RefererStatsPathRow {
+    pub path: String,
+    pub hits: u64,
+    pub last_seen: String,
+}
+
+/// Stats panel for one UTC referer-log file.
+///
+/// One row per referrer host: hit count, distinct visitor IPs, the
+/// landing paths it delivered and the last time it was seen.
+#[derive(Clone, Debug, Default)]
+pub struct RefererHistoryStatsPage {
+    /// Referrer hosts, hits descending.
+    pub hosts: Vec<RefererStatsHostRow>,
+    /// Landing paths across all referrers, hits descending. Truncated
+    /// to the display limit.
+    pub paths: Vec<RefererStatsPathRow>,
+    /// Distinct landing paths before the display limit.
+    pub path_total: usize,
+    pub total_hits: u64,
+    pub distinct_referer_hosts: usize,
+    pub distinct_client_ips: usize,
+    /// `true` when new paths were dropped past the internal cap.
+    pub paths_capped: bool,
+    pub file_bytes: u64,
+    pub error: Option<String>,
+}
+
+impl RefererHistoryStatsPage {
+    /// Same byte buckets as [`RefererHistorySummary::file_size_human`].
+    pub fn file_size_human(&self) -> String {
+        format_bytes(self.file_bytes)
+    }
+}
+
+/// Full-page template for `GET /logs/referers` (live view).
+///
+/// Server-renders the top-N `(referer_host, host)` summary so the
+/// page shows useful state on first paint, before the SSE
+/// client-side tail delivers recent rows.
+#[derive(Template)]
+#[template(path = "pages/logs_referers.html")]
+pub struct RefererLogsTemplate<'a> {
+    /// CSRF token for the current session. Same convention as
+    /// [`LogsTemplate`]: not used in the rendered HTML (no forms).
+    #[allow(dead_code)]
+    pub csrf_token: String,
+    /// Active-nav token. `"logs-referers"` highlights the Referers
+    /// nav link.
+    pub active_nav: &'a str,
+    /// Sub-nav token. Always [`referer_subnav::LIVE`].
+    pub active_subnav: &'a str,
+    /// `false` when `log.referer.enabled` is false — the page then
+    /// says the feature is disabled instead of showing an empty
+    /// table.
+    pub enabled: bool,
+    /// Pre-rendered summary numbers.
+    pub summary: RefererStatsSummary,
+    /// Top-N rows by hit count, already scoped to the selected site.
+    pub top_rows: Vec<RefererStatsRow>,
+    /// The site selector.
+    pub sites: Vec<RefererSiteOption>,
+    /// Current filter values — the live page only uses `site`, but
+    /// the shared site-selector partial reads `filter.site`, so the
+    /// struct is the same one the history / stats pages use.
+    pub filter: RefererHistoryFilter,
+    /// The selected site's domain literals — handed to the live
+    /// tail's client-side filter.
+    pub site_domains: Vec<String>,
+    /// `true` when a site is selected, so the live tail's
+    /// client-side filter scopes its rows. `false` ⇒ "All sites".
+    ///
+    /// Separate from `site_domains.is_empty()`: a `?site=` naming a
+    /// site that does not exist resolves to an empty domain list,
+    /// but the scope is still *on* — the page then shows no rows
+    /// rather than every site's rows.
+    pub site_scoped: bool,
+}
+
+impl RefererLogsTemplate<'_> {
+    /// The selected site's domain literals as a space-separated
+    /// list, for the live table's `data-site-domains` attribute.
+    ///
+    /// A domain literal never contains a space, so the separator is
+    /// unambiguous. An empty list means "all sites" — no filtering.
+    pub fn site_domains_attr(&self) -> String {
+        self.site_domains.join(" ")
+    }
+}
+
+/// Full-page template for `GET /logs/referers/history`.
+///
+/// The page handler reads the day's JSONL, applies the filters,
+/// paginates, and ships the result inline — the page renders in
+/// one round-trip with no client-side SSE / JS dependency.
+#[derive(Template)]
+#[template(path = "pages/logs_referers_history.html")]
+pub struct RefererLogsHistoryTemplate<'a> {
+    #[allow(dead_code)]
+    pub csrf_token: String,
+    /// Top-level nav. Same `"logs-referers"` token as the live page.
+    pub active_nav: &'a str,
+    /// Sub-nav token. [`referer_subnav::HISTORY`].
+    pub active_subnav: &'a str,
+    /// `false` when `log.referer.enabled` is false.
+    pub enabled: bool,
+    /// One link per JSONL file, newest first.
+    pub date_links: Vec<RefererHistoryDateLink>,
+    /// The site selector.
+    pub sites: Vec<RefererSiteOption>,
+    /// Current filter values (echoed back into the form inputs).
+    pub filter: RefererHistoryFilter,
+    /// Pagination summary.
+    pub summary: RefererHistorySummary,
+    /// Entries for the current page, newest-first.
+    pub entries: Vec<RefererLogEntry>,
+    /// Link to the same day's rollup on the stats page, with every
+    /// current filter (including the site scope) carried over.
+    pub stats_url: String,
+}
+
+/// Full-page template for `GET /logs/referers/stats`.
+///
+/// The sidebar picks one UTC file; the page then breaks that file
+/// into referrer hosts and their landing paths.
+#[derive(Template)]
+#[template(path = "pages/logs_referers_stats.html")]
+pub struct RefererLogsStatsTemplate<'a> {
+    #[allow(dead_code)]
+    pub csrf_token: String,
+    pub active_nav: &'a str,
+    /// Sub-nav token. [`referer_subnav::STATS`].
+    pub active_subnav: &'a str,
+    /// `false` when `log.referer.enabled` is false.
+    pub enabled: bool,
+    /// One link per JSONL file.
+    pub date_links: Vec<RefererHistoryDateLink>,
+    /// The site selector.
+    pub sites: Vec<RefererSiteOption>,
+    pub filter: RefererHistoryFilter,
+    pub stats: RefererHistoryStatsPage,
+    /// Link to the same day's raw rows on the history page, with every
+    /// current filter (including the site scope) carried over.
+    pub history_url: String,
+}
+
+impl RefererLogsStatsTemplate<'_> {
+    /// The filters the stats rollup applies but the stats form does
+    /// not expose as visible inputs, as `(name, value)` pairs.
+    ///
+    /// The form carries them as hidden inputs so its "Apply" button
+    /// does not silently drop a filter the operator set through the
+    /// URL (or through the date sidebar, which keeps them).
+    pub fn carried_filters(&self) -> Vec<(&'static str, &str)> {
+        vec![
+            ("referer_host", &self.filter.referer_host),
+            ("host", &self.filter.host),
+            ("path", &self.filter.path),
+            ("status", &self.filter.status),
+            ("method", &self.filter.method),
+            ("client_ip", &self.filter.client_ip),
+        ]
     }
 }

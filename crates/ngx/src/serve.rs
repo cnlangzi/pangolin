@@ -35,7 +35,7 @@ use pingora::protocols::http::ServerSession;
 use pingora::server::ShutdownWatch;
 
 use crate::App;
-use crate::sse::{handle_access_log_stream, handle_bot_log_stream};
+use crate::sse::{handle_access_log_stream, handle_bot_log_stream, handle_referer_log_stream};
 
 /// Thin pingora-app wrapper for the admin UI.
 ///
@@ -142,6 +142,27 @@ impl HttpServerApp for AdminApp {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             return handle_bot_log_stream(
+                session,
+                self.app.clone(),
+                self.sessions.clone(),
+                cookie.as_deref(),
+                shutdown.clone(),
+            )
+            .await;
+        }
+
+        // 4c) SSE referer log stream — inbound external referrals.
+        //     Mirrors the bot-log stream but subscribes to
+        //     `App::referer_log_tx`. Auth + replay + live broadcast
+        //     shape are identical; see `handle_referer_log_stream`
+        //     for details.
+        if method == "GET" && path == "/api/logs/referers/stream" {
+            let cookie = req
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            return handle_referer_log_stream(
                 session,
                 self.app.clone(),
                 self.sessions.clone(),

@@ -34,6 +34,9 @@ pub mod pgl;
 pub mod provider;
 pub mod proxy;
 pub mod ratelimit;
+pub mod referer;
+pub mod referer_log;
+pub mod referer_stats;
 pub mod traffic;
 pub mod tunnel;
 pub mod types;
@@ -46,10 +49,10 @@ pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
-pub use config::{BotLogConfig, Config, LogConfig, TrafficConfig, init_logger};
+pub use config::{BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
-pub use index::{Indexes, lookup_site};
+pub use index::{Indexes, host_matches_domains, lookup_site, site_of_host};
 pub use parse::{
     BackendScheme, ParseError, TUN_NAME_MAX, detect_scheme, file_url_to_path, is_valid_domain,
     is_valid_tun_name, matches_tun_name_charset, parse_backend,
@@ -71,6 +74,13 @@ pub use ratelimit::{
     ClientGeo, IpRule, IpRules, LimitDecision, OverLimitClient, RateLimitPolicy, RateLimitSnapshot,
     RateLimiter, RuleKind, SiteLimitConfig, SiteLimitStat,
 };
+pub use referer::{RefererHit, is_document_request, is_external_referer, parse_referer};
+pub use referer_log::{
+    MAX_REFERER_LOG_BUFFER, RefererDayHostRow, RefererHistoryPage, RefererHistoryStats,
+    RefererLogBuffer, RefererLogEntry, RefererLogWriter, RefererPathRow, RefererSiteFilter,
+    RefererStatsQuery,
+};
+pub use referer_stats::{RefererStats, RefererStatsRow, RefererStatsSummary};
 pub use traffic::{
     TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,
     classify_route, normalize_path,

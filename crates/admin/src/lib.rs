@@ -242,6 +242,16 @@ pub async fn handle(
         ("logs/bots/stats", "GET") => {
             routes::logs::render_bots_stats(&app, &csrf_token, &merged_params).await?
         }
+        // Referer log — inbound external referrals.
+        ("logs/referers", "GET") => {
+            routes::logs::render_referers(&app, &csrf_token, &merged_params).await?
+        }
+        ("logs/referers/history", "GET") => {
+            routes::logs::render_referers_history(&app, &csrf_token, &merged_params).await?
+        }
+        ("logs/referers/stats", "GET") => {
+            routes::logs::render_referers_stats(&app, &csrf_token, &merged_params).await?
+        }
         ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
         ("certs/new", "POST") => {
             routes::certs::handle_create(&app, &merged_params, &csrf_token).await?

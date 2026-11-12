@@ -52,10 +52,16 @@ use http_body_util::Full;
 
 use crate::App;
 use crate::ok_html_with_csrf;
+use crate::templates::logs::referer_subnav;
 use crate::templates::logs::subnav;
-use crate::templates::logs::{BotHistoryDateLink, BotHistoryStatsPage};
+use crate::templates::logs::{
+    BotHistoryDateLink, BotHistoryStatsPage, RefererHistoryDateLink, RefererHistoryFilter,
+    RefererHistoryStatsPage, RefererHistorySummary, RefererSiteOption, RefererStatsHostRow,
+    RefererStatsPathRow,
+};
 use crate::templates::{
     BotLogsHistoryTemplate, BotLogsStatsTemplate, BotLogsTemplate, LogsTemplate,
+    RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsTemplate,
 };
 use pangolin_core::bot_log::list_dates;
 
@@ -927,6 +933,653 @@ struct HistoryPageView {
     summary: crate::templates::logs::BotHistorySummary,
     entries: Vec<pangolin_core::bot_log::BotLogEntry>,
     date_links: Vec<BotHistoryDateLink>,
+}
+
+// ── `/logs/referers` (inbound external referrals) ─────────────────
+//
+// Third side-channel, modelled on the bot log: a live view, a
+// per-day row browser and a per-day statistics rollup.
+//
+// The site selector is the scoping unit. A site may own several
+// domains (`example.com` + `www.example.com`); a referral from one
+// of them to another is *internal* to the site and never recorded.
+// The rows therefore carry the host, and the site attribution is
+// resolved at query time from the live index.
+
+/// How many top referrer rows to render server-side on the live
+/// page. Matches the bot page's `BOT_TOP_N`.
+const REFERRER_TOP_N: usize = 10;
+
+/// Default page size for the referer history table.
+const REFERRER_HISTORY_PAGE_SIZE: usize = 50;
+
+/// Maximum `page` value the route accepts (defensive clamp).
+const REFERRER_HISTORY_MAX_PAGE: usize = 10_000;
+
+/// Landing paths kept per referrer host on the stats panel.
+const REFERRER_STATS_PATH_LIMIT: usize = 50;
+
+/// Build the `/logs/referers` HTML page (live view).
+///
+/// Server-renders the top-N `(referer_host, host)` summary so the
+/// page shows useful state on first paint (before the SSE
+/// client-side tail delivers recent rows). The live tail table is
+/// populated by the browser's `EventSource('/api/logs/referers/stream')`
+/// connection.
+pub async fn render_referers(
+    app: &Arc<App>,
+    csrf: &str,
+    merged_params: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let enabled = app.config.log.referer.enabled;
+    let filter = parse_referer_params(merged_params).filter;
+    let sites = site_options(app, &filter.site).await;
+    // "A site is selected" is a separate fact from "the selected site
+    // has domains": a `?site=` naming a site that does not exist (or
+    // one whose domains are all disabled) resolves to an empty domain
+    // list. Treating that as "no scope" would show the operator
+    // *every* site's traffic while the history/stats pages — which
+    // scope through `RefererSiteFilter` — show none. So the scope is
+    // driven by the presence of the filter, not by the domain list.
+    let site_scoped = !filter.site.is_empty();
+    let site_domains = sites
+        .iter()
+        .find(|s| s.selected)
+        .map(|s| s.domains.clone())
+        .unwrap_or_default();
+
+    // The in-memory counters are keyed by `(referer_host, host)`;
+    // scoping them to the selected site means keeping the rows whose
+    // host belongs to one of the site's domains. The summary cards
+    // are scoped the same way, so the numbers on the page and the
+    // table below them always describe the same slice.
+    let (rows, global_summary) = app.referer_stats_snapshot();
+    let scoped: Vec<pangolin_core::referer_stats::RefererStatsRow> = rows
+        .into_iter()
+        // No site selected ⇒ no scope, every row is in. This mirrors
+        // the live tail's client-side filter, which treats the
+        // unscoped case the same way.
+        .filter(|r| !site_scoped || pangolin_core::host_matches_domains(&site_domains, &r.host))
+        .collect();
+    let scoped_hits: u64 = scoped.iter().map(|r| r.hits).sum();
+    let summary = pangolin_core::referer_stats::RefererStatsSummary {
+        unique_pairs: scoped.len(),
+        total_records: scoped_hits,
+        total_hits: scoped_hits,
+        // The saturation counter is process-wide, so it is reported
+        // as-is: it tells the operator that the pair table dropped
+        // rows, whatever the current scope.
+        dropped_unique_pairs: global_summary.dropped_unique_pairs,
+    };
+    let top_rows = scoped.into_iter().take(REFERRER_TOP_N).collect();
+
+    let tmpl = RefererLogsTemplate {
+        csrf_token: csrf.to_string(),
+        active_nav: "logs-referers",
+        active_subnav: referer_subnav::LIVE,
+        enabled,
+        summary,
+        top_rows,
+        sites,
+        filter,
+        site_domains,
+        site_scoped,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("referer logs template error: {e}");
+            String::new()
+        }
+    };
+
+    ok_html_with_csrf(html, csrf)
+}
+
+/// Build the `/logs/referers/history` HTML page.
+///
+/// Reads the day's `referer-YYYY-MM-DD.jsonl` under
+/// `log.referer.dir`, applies the filter form (`date`, `site`,
+/// `referer_host`, `host`, `path`, `status`, `method`,
+/// `client_ip`), paginates, and renders a full page.
+pub async fn render_referers_history(
+    app: &Arc<App>,
+    csrf: &str,
+    merged_params: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let enabled = app.config.log.referer.enabled;
+    let dir = app.config.log.referer.dir.clone();
+    let page = build_referer_history_page(app, dir.as_path(), merged_params).await;
+
+    // The cross-link to the stats page keeps every current filter —
+    // the site scope above all, so clicking it does not silently
+    // widen the view to "All sites".
+    let stats_url = build_referer_stats_url(&page.filter);
+
+    let tmpl = RefererLogsHistoryTemplate {
+        csrf_token: csrf.to_string(),
+        active_nav: "logs-referers",
+        active_subnav: referer_subnav::HISTORY,
+        enabled,
+        date_links: page.date_links,
+        sites: page.sites,
+        filter: page.filter,
+        summary: page.summary,
+        entries: page.entries,
+        stats_url,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("referer history template error: {e}");
+            String::new()
+        }
+    };
+
+    ok_html_with_csrf(html, csrf)
+}
+
+/// Build the `/logs/referers/stats` HTML page.
+///
+/// The date sidebar picks one UTC file; the page breaks it into
+/// referrer hosts with their landing paths, distinct visitor IPs and
+/// last-seen timestamps.
+pub async fn render_referers_stats(
+    app: &Arc<App>,
+    csrf: &str,
+    merged_params: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let enabled = app.config.log.referer.enabled;
+    let dir = app.config.log.referer.dir.clone();
+    let page = build_referer_stats_page(app, dir.as_path(), merged_params).await;
+
+    // The cross-link to the history page keeps every current filter —
+    // the site scope above all.
+    let history_url = build_referer_history_url(&page.filter, 1);
+
+    let tmpl = RefererLogsStatsTemplate {
+        csrf_token: csrf.to_string(),
+        active_nav: "logs-referers",
+        active_subnav: referer_subnav::STATS,
+        enabled,
+        date_links: page.date_links,
+        sites: page.sites,
+        filter: page.filter,
+        stats: page.stats,
+        history_url,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("referer stats template error: {e}");
+            String::new()
+        }
+    };
+
+    ok_html_with_csrf(html, csrf)
+}
+
+/// Internal state assembled by [`parse_referer_params`]. Kept
+/// separate from the template struct so the wire-level form parsing
+/// isn't tied to the askama-render-time view.
+#[derive(Default)]
+struct RefererHistoryParams {
+    /// Echo values for the form inputs.
+    filter: RefererHistoryFilter,
+    /// 1-based page number, clamped to a sane range.
+    page: usize,
+}
+
+/// Parse a `application/x-www-form-urlencoded` blob into the
+/// referer filter + page state. History and stats share the parser
+/// so the field names can't drift.
+///
+/// Missing / unparseable values fall back to "no filter" — an
+/// operator typo should show "no results", not a 400.
+fn parse_referer_params(merged_params: &[u8]) -> RefererHistoryParams {
+    let mut p = RefererHistoryParams::default();
+    for pair in std::str::from_utf8(merged_params).unwrap_or("").split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let val = match urlencoding::decode(v) {
+            Ok(c) => c.into_owned(),
+            Err(_) => continue,
+        };
+        match k {
+            "date" => p.filter.date = val,
+            "site" => p.filter.site = val,
+            "referer_host" => p.filter.referer_host = val,
+            "host" => p.filter.host = val,
+            "path" => p.filter.path = val,
+            "status" => p.filter.status = val,
+            "method" => p.filter.method = val,
+            "client_ip" => p.filter.client_ip = val,
+            "page" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    p.page = n;
+                }
+            }
+            _ => {}
+        }
+    }
+    p.page = p.page.clamp(1, REFERRER_HISTORY_MAX_PAGE);
+    p
+}
+
+/// The site selector's options, derived from the live index.
+///
+/// The index maps a domain literal (exact FQDN or `*.wildcard`) to
+/// its owning site; grouping the keys by site name yields the
+/// site → domains mapping the selector needs.
+async fn site_options(app: &Arc<App>, selected: &str) -> Vec<RefererSiteOption> {
+    // The read guard is scoped to the collection loop so it is
+    // released before the (synchronous) sort below.
+    let by_site: std::collections::HashMap<String, Vec<String>> = {
+        let indexes = app.indexes.read().await;
+        let mut by_site: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (domain, site) in indexes.domain.iter() {
+            by_site
+                .entry(site.name.clone())
+                .or_default()
+                .push(domain.clone());
+        }
+        by_site
+    };
+    let mut out: Vec<RefererSiteOption> = by_site
+        .into_iter()
+        .map(|(name, mut domains)| {
+            domains.sort();
+            RefererSiteOption {
+                selected: name == selected,
+                name,
+                domains,
+            }
+        })
+        .collect();
+    // Stable, alphabetical order — the selector must not reshuffle
+    // between renders.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Build the scoped domain index for the selected site.
+///
+/// The scope is a *restricted* copy of the router's domain map: only
+/// the selected site's own domains, each pointing at that site. The
+/// core reader then resolves a row's host through the same
+/// `site_of_host` rule the router uses — one resolution rule for
+/// detection and for grouping, so the two cannot drift.
+fn site_scope(
+    domain: &std::collections::HashMap<String, Arc<pangolin_core::Site>>,
+    site: &str,
+) -> Option<pangolin_core::RefererSiteFilter> {
+    if site.is_empty() {
+        return None;
+    }
+    Some(pangolin_core::RefererSiteFilter::from_index(site, domain))
+}
+
+/// Internal result of [`build_referer_history_page`].
+struct RefererHistoryPageView {
+    filter: RefererHistoryFilter,
+    summary: RefererHistorySummary,
+    entries: Vec<pangolin_core::RefererLogEntry>,
+    date_links: Vec<RefererHistoryDateLink>,
+    sites: Vec<RefererSiteOption>,
+}
+
+/// Shared query logic for [`render_referers_history`].
+///
+/// The JSONL read is blocking, so it runs on `spawn_blocking` — the
+/// same reason as [`build_history_page`].
+async fn build_referer_history_page(
+    app: &Arc<App>,
+    dir: &std::path::Path,
+    merged_params: &[u8],
+) -> RefererHistoryPageView {
+    let p = parse_referer_params(merged_params);
+    let sites = site_options(app, &p.filter.site).await;
+
+    let available = referer_list_dates(dir);
+    let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {
+        d
+    } else if let Some(&first) = available.first() {
+        first
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    // Sync the resolved date back into the form so the input shows
+    // the value the page is actually showing.
+    let mut filter = p.filter;
+    filter.date = date.to_string();
+
+    let page_unsafe = p.page;
+    let page_size = REFERRER_HISTORY_PAGE_SIZE;
+
+    // The scope travels into the blocking read: only the selected
+    // site's own domain entries are copied (a handful of small
+    // `Arc<Site>` clones), so the reader never has to take the index
+    // lock — and the *whole* index is not cloned for it.
+    let scope = {
+        let indexes = app.indexes.read().await;
+        site_scope(&indexes.domain, &filter.site)
+    };
+
+    let query = pangolin_core::referer_log::RefererHistoryQuery {
+        date,
+        site: scope,
+        referer_host: (!filter.referer_host.is_empty()).then(|| filter.referer_host.clone()),
+        host: (!filter.host.is_empty()).then(|| filter.host.clone()),
+        path: (!filter.path.is_empty()).then(|| filter.path.clone()),
+        status: filter.status.parse::<u16>().ok(),
+        method: (!filter.method.is_empty()).then(|| filter.method.clone()),
+        client_ip: (!filter.client_ip.is_empty()).then(|| filter.client_ip.clone()),
+        page: page_unsafe,
+        page_size,
+    };
+
+    let dir_owned = dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        pangolin_core::referer_log::query_history(&dir_owned, &query)
+    })
+    .await;
+
+    let (entries, total_after_filter, file_bytes, error) = match result {
+        Ok(Ok(page)) => (page.entries, page.total_after_filter, page.file_bytes, None),
+        Ok(Err(e)) => {
+            log::warn!("referer_history: query failed: {e}");
+            (Vec::new(), 0, 0, Some(format!("Failed to read JSONL: {e}")))
+        }
+        Err(e) => {
+            log::warn!("referer_history: blocking task panicked: {e}");
+            (
+                Vec::new(),
+                0,
+                0,
+                Some("Internal error while reading JSONL (see server log).".into()),
+            )
+        }
+    };
+
+    let total_pages = total_after_filter
+        .div_ceil(page_size)
+        .max(if total_after_filter == 0 { 0 } else { 1 });
+    let page = if total_pages == 0 {
+        1
+    } else {
+        page_unsafe.min(total_pages)
+    };
+
+    let prev_url = if page > 1 && total_pages > 1 {
+        Some(build_referer_history_url(&filter, page - 1))
+    } else {
+        None
+    };
+    let next_url = if page < total_pages {
+        Some(build_referer_history_url(&filter, page + 1))
+    } else {
+        None
+    };
+    let summary = RefererHistorySummary {
+        total_after_filter,
+        page,
+        page_size,
+        total_pages,
+        file_bytes,
+        prev_url,
+        next_url,
+        error,
+    };
+
+    let date_links = referer_date_links(&available, &filter, RefererPage::History);
+
+    RefererHistoryPageView {
+        filter,
+        summary,
+        entries,
+        date_links,
+        sites,
+    }
+}
+
+/// Internal result of [`build_referer_stats_page`].
+struct RefererStatsPageView {
+    filter: RefererHistoryFilter,
+    stats: RefererHistoryStatsPage,
+    date_links: Vec<RefererHistoryDateLink>,
+    sites: Vec<RefererSiteOption>,
+}
+
+/// Read one UTC file and roll it up per referrer host.
+async fn build_referer_stats_page(
+    app: &Arc<App>,
+    dir: &std::path::Path,
+    merged_params: &[u8],
+) -> RefererStatsPageView {
+    let p = parse_referer_params(merged_params);
+    let sites = site_options(app, &p.filter.site).await;
+
+    let available = referer_list_dates(dir);
+    let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {
+        d
+    } else if let Some(&first) = available.first() {
+        first
+    } else {
+        chrono::Utc::now().date_naive()
+    };
+
+    let mut filter = p.filter;
+    filter.date = date.to_string();
+
+    let scope = {
+        let indexes = app.indexes.read().await;
+        site_scope(&indexes.domain, &filter.site)
+    };
+
+    let query = pangolin_core::referer_log::RefererStatsQuery {
+        date,
+        site: scope,
+        referer_host: (!filter.referer_host.is_empty()).then(|| filter.referer_host.clone()),
+        host: (!filter.host.is_empty()).then(|| filter.host.clone()),
+        path: (!filter.path.is_empty()).then(|| filter.path.clone()),
+        status: filter.status.parse::<u16>().ok(),
+        method: (!filter.method.is_empty()).then(|| filter.method.clone()),
+        client_ip: (!filter.client_ip.is_empty()).then(|| filter.client_ip.clone()),
+        path_limit: REFERRER_STATS_PATH_LIMIT,
+    };
+
+    let dir_owned = dir.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        pangolin_core::referer_log::query_history_stats(&dir_owned, &query)
+    })
+    .await;
+
+    let (raw, error) = match result {
+        Ok(Ok(stats)) => (stats, None),
+        Ok(Err(e)) => {
+            log::warn!("referer_history stats: query failed: {e}");
+            (
+                empty_referer_history_stats(),
+                Some(format!("Failed to read JSONL: {e}")),
+            )
+        }
+        Err(e) => {
+            log::warn!("referer_history stats: blocking task panicked: {e}");
+            (
+                empty_referer_history_stats(),
+                Some("Internal error while reading JSONL (see server log).".into()),
+            )
+        }
+    };
+
+    let stats = present_referer_stats(raw, error);
+    let date_links = referer_date_links(&available, &filter, RefererPage::Stats);
+
+    RefererStatsPageView {
+        filter,
+        stats,
+        date_links,
+        sites,
+    }
+}
+
+/// An empty stats rollup — used when the query failed, so the page
+/// still renders its shell with an error banner.
+fn empty_referer_history_stats() -> pangolin_core::referer_log::RefererHistoryStats {
+    pangolin_core::referer_log::RefererHistoryStats {
+        hosts: Vec::new(),
+        paths: Vec::new(),
+        path_total: 0,
+        total_hits: 0,
+        distinct_referer_hosts: 0,
+        distinct_client_ips: 0,
+        paths_capped: false,
+        file_bytes: 0,
+    }
+}
+
+/// Convert the core rollup into the template's row structs.
+fn present_referer_stats(
+    raw: pangolin_core::referer_log::RefererHistoryStats,
+    error: Option<String>,
+) -> RefererHistoryStatsPage {
+    let hosts = raw
+        .hosts
+        .iter()
+        .map(|h| RefererStatsHostRow {
+            referer_host: h.referer_host.clone(),
+            hits: h.hits,
+            distinct_client_ips: h.distinct_client_ips,
+            paths: h
+                .paths
+                .iter()
+                .map(|p| RefererStatsPathRow {
+                    path: p.path.clone(),
+                    hits: p.hits,
+                    last_seen: p.last_seen_local(),
+                })
+                .collect(),
+            last_seen: h.last_seen_local(),
+        })
+        .collect();
+    let paths = raw
+        .paths
+        .iter()
+        .map(|p| RefererStatsPathRow {
+            path: p.path.clone(),
+            hits: p.hits,
+            last_seen: p.last_seen_local(),
+        })
+        .collect();
+    RefererHistoryStatsPage {
+        hosts,
+        paths,
+        path_total: raw.path_total,
+        total_hits: raw.total_hits,
+        distinct_referer_hosts: raw.distinct_referer_hosts,
+        distinct_client_ips: raw.distinct_client_ips,
+        paths_capped: raw.paths_capped,
+        file_bytes: raw.file_bytes,
+        error,
+    }
+}
+
+/// The UTC dates that have a `referer-YYYY-MM-DD.jsonl` file.
+fn referer_list_dates(dir: &std::path::Path) -> Vec<chrono::NaiveDate> {
+    pangolin_core::referer_log::list_dates(dir).unwrap_or_default()
+}
+
+/// Which page a date-sidebar link belongs to.
+///
+/// The two referer pages have their own URLs, and a date click must
+/// stay on the page the operator is looking at — the stats sidebar
+/// keeps the rollup, the history sidebar keeps the raw rows.
+#[derive(Clone, Copy)]
+enum RefererPage {
+    History,
+    Stats,
+}
+
+/// Sidebar links for the referer pages. Each href keeps the current
+/// filters and lands on page 1 of that file.
+fn referer_date_links(
+    dates: &[chrono::NaiveDate],
+    filter: &RefererHistoryFilter,
+    page: RefererPage,
+) -> Vec<RefererHistoryDateLink> {
+    dates
+        .iter()
+        .copied()
+        .map(|date| {
+            let mut day = filter.clone();
+            day.date = date.to_string();
+            let href = match page {
+                RefererPage::History => build_referer_history_url(&day, 1),
+                RefererPage::Stats => build_referer_stats_url(&day),
+            };
+            RefererHistoryDateLink {
+                active: day.date == filter.date,
+                href,
+                date,
+            }
+        })
+        .collect()
+}
+
+/// Build a `/logs/referers/history?<query>` URL with all filter
+/// values preserved plus the supplied `page`.
+fn build_referer_history_url(filter: &RefererHistoryFilter, page: usize) -> String {
+    format!(
+        "/logs/referers/history?{}",
+        referer_query(filter, Some(page))
+    )
+}
+
+/// Build a `/logs/referers/stats?<query>` URL with all filter values
+/// preserved. The stats page has no pagination — it rolls up a whole
+/// day.
+fn build_referer_stats_url(filter: &RefererHistoryFilter) -> String {
+    format!("/logs/referers/stats?{}", referer_query(filter, None))
+}
+
+/// The query string both referer pages share: every filter value,
+/// plus `page` when the caller wants one.
+fn referer_query(filter: &RefererHistoryFilter, page: Option<usize>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(9);
+    parts.push(format!("date={}", urlencoding::encode(&filter.date)));
+    if !filter.site.is_empty() {
+        parts.push(format!("site={}", urlencoding::encode(&filter.site)));
+    }
+    if !filter.referer_host.is_empty() {
+        parts.push(format!(
+            "referer_host={}",
+            urlencoding::encode(&filter.referer_host)
+        ));
+    }
+    if !filter.host.is_empty() {
+        parts.push(format!("host={}", urlencoding::encode(&filter.host)));
+    }
+    if !filter.path.is_empty() {
+        parts.push(format!("path={}", urlencoding::encode(&filter.path)));
+    }
+    if !filter.status.is_empty() {
+        parts.push(format!("status={}", urlencoding::encode(&filter.status)));
+    }
+    if !filter.method.is_empty() {
+        parts.push(format!("method={}", urlencoding::encode(&filter.method)));
+    }
+    if !filter.client_ip.is_empty() {
+        parts.push(format!(
+            "client_ip={}",
+            urlencoding::encode(&filter.client_ip)
+        ));
+    }
+    if let Some(page) = page {
+        parts.push(format!("page={page}"));
+    }
+    parts.join("&")
 }
 
 #[cfg(test)]
@@ -2178,5 +2831,594 @@ mod tests {
             .expect("collect body")
             .to_bytes();
         String::from_utf8(body.to_vec()).expect("utf-8")
+    }
+
+    // ---- Referer log page tests ----
+
+    /// Build an `App` whose `log.referer.dir` points at `referer_dir`.
+    /// Same skeleton as `make_test_app_with_bot_dir` — the writer
+    /// creates the directory lazily, so swapping the config field is
+    /// enough for the history reader to see the seeded files.
+    fn make_test_app_with_referer_dir(referer_dir: std::path::PathBuf) -> (TempDir, Arc<App>) {
+        make_test_app_with_referer_config(referer_dir, true)
+    }
+
+    /// Same as [`make_test_app_with_referer_dir`] but with the
+    /// feature's master switch in the given state.
+    fn make_test_app_with_referer_config(
+        referer_dir: std::path::PathBuf,
+        enabled: bool,
+    ) -> (TempDir, Arc<App>) {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let cfg = Config {
+            log: LogConfig {
+                referer: pangolin_core::RefererLogConfig {
+                    enabled,
+                    dir: referer_dir,
+                    ..pangolin_core::RefererLogConfig::default()
+                },
+                ..LogConfig::default()
+            },
+            ..Config::default()
+        };
+        let app = Arc::new(
+            App::new(
+                db_path.to_str().expect("db path utf8"),
+                cfg,
+                CertManager::default(),
+            )
+            .expect("App::new"),
+        );
+        (dir, app)
+    }
+
+    /// Seed a site with the given domains and reload the index so
+    /// the site selector and the site scoping see it.
+    async fn seed_site_with_domains(app: &Arc<App>, name: &str, domains: &[&str]) {
+        let now = chrono::Utc::now();
+        let site = pangolin_core::types::Site {
+            name: name.into(),
+            backend: "http://127.0.0.1:8080".into(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            host_mode: pangolin_core::types::HostMode::Passthrough,
+            host_custom: None,
+            domain_count: 0,
+        };
+        {
+            let db = app.db.lock().await;
+            pangolin_core::db::upsert_site(&db, &site).unwrap();
+            for d in domains {
+                let domain = pangolin_core::types::Domain {
+                    domain: (*d).into(),
+                    site_name: name.into(),
+                    enabled: true,
+                    auto_issue: false,
+                    dns_provider: None,
+                    challenge_kind: None,
+                    created_at: now,
+                };
+                pangolin_core::db::upsert_domain(&db, &domain).unwrap();
+            }
+        }
+        app.reload_indexes().await;
+    }
+
+    /// Build a referer row for the tests.
+    fn referer_entry(
+        referer_host: &str,
+        host: &str,
+        path: &str,
+        ip: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> pangolin_core::referer_log::RefererLogEntry {
+        pangolin_core::referer_log::RefererLogEntry::from_access_log(
+            &pangolin_core::events::AccessLogEntry {
+                timestamp: ts,
+                method: "GET".into(),
+                path: path.into(),
+                host: host.into(),
+                status: 200,
+                duration_ms: 12,
+                backend: "direct:127.0.0.1:8080".into(),
+                client_ip: ip.into(),
+                user_agent: Some("Mozilla/5.0".into()),
+            },
+            &pangolin_core::RefererHit {
+                referer: format!("https://{referer_host}{path}"),
+                referer_host: referer_host.into(),
+            },
+        )
+    }
+
+    /// Write `entries` into `referer_dir` as the JSONL file for `date`.
+    fn seed_referer_file(
+        referer_dir: &std::path::Path,
+        date: chrono::NaiveDate,
+        entries: &[pangolin_core::referer_log::RefererLogEntry],
+    ) {
+        std::fs::create_dir_all(referer_dir).unwrap();
+        let path = pangolin_core::referer_log::file_path_for(referer_dir, date);
+        let mut body = String::new();
+        for e in entries {
+            body.push_str(&serde_json::to_string(e).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn render_referers_with_empty_stats_returns_valid_html() {
+        let (_dir, app) = make_test_app();
+        let resp = render_referers(&app, "csrf-token", b"")
+            .await
+            .expect("render_referers should succeed");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let html = response_html(resp).await;
+        assert!(html.contains("Referer Logs"), "page title missing: {html}");
+        assert!(
+            html.contains("<title>Referer Logs"),
+            "base.html layout not applied: {html}"
+        );
+        assert!(
+            html.contains("Referers</a>"),
+            "nav Referers link missing: {html}"
+        );
+        assert!(!html.contains("__CSRF__"), "csrf placeholder leaked");
+        assert!(
+            html.contains("Waiting for external referral traffic"),
+            "empty placeholder missing: {html}"
+        );
+        // The live page opens the referer SSE stream.
+        assert!(
+            html.contains("/api/logs/referers/stream"),
+            "referer SSE endpoint not wired: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_referers_history_with_empty_dir_renders_empty_state() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        let resp = render_referers_history(&app, "csrf-token", b"")
+            .await
+            .expect("history render");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let html = response_html(resp).await;
+        assert!(html.contains("Referer Logs"), "page title missing: {html}");
+        assert!(
+            html.contains("No JSONL files yet"),
+            "empty date sidebar missing: {html}"
+        );
+        assert!(
+            html.contains("No entries match the current filter"),
+            "empty result placeholder missing: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_referers_history_renders_filtered_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir.clone());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let ts = chrono::Utc::now();
+        seed_referer_file(
+            &referer_dir,
+            day,
+            &[
+                referer_entry("news.example.org", "example.com", "/a", "1.1.1.1", ts),
+                referer_entry("blog.example.org", "example.com", "/b", "1.1.1.2", ts),
+            ],
+        );
+
+        let resp = render_referers_history(&app, "csrf-token", b"referer_host=news.example.org")
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        assert!(html.contains("news.example.org"), "row missing: {html}");
+        assert!(
+            !html.contains("blog.example.org"),
+            "unmatched row leaked into the page: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_referers_stats_rolls_up_the_selected_referrer() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir.clone());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let ts = chrono::Utc::now();
+        seed_referer_file(
+            &referer_dir,
+            day,
+            &[
+                referer_entry("news.example.org", "example.com", "/a", "1.1.1.1", ts),
+                referer_entry("news.example.org", "example.com", "/a", "1.1.1.2", ts),
+                referer_entry("news.example.org", "example.com", "/b", "1.1.1.3", ts),
+                referer_entry("blog.example.org", "example.com", "/c", "1.1.1.4", ts),
+            ],
+        );
+
+        let resp = render_referers_stats(&app, "csrf-token", b"")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "referrer row missing: {html}"
+        );
+        assert!(
+            html.contains("blog.example.org"),
+            "referrer row missing: {html}"
+        );
+        // 3 hits from news.example.org, 2 distinct visitors.
+        assert!(html.contains(">3</td>"), "hit count missing: {html}");
+        assert!(
+            html.contains(">2</td>"),
+            "distinct visitor count missing: {html}"
+        );
+    }
+
+    /// R10: a site owning two domains aggregates its rows into one
+    /// entry per referrer host, and the history page lists rows for
+    /// either domain.
+    #[tokio::test]
+    async fn referer_pages_scope_to_one_site_and_aggregate_its_domains() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir.clone());
+        seed_site_with_domains(&app, "web", &["example.com", "www.example.com"]).await;
+        seed_site_with_domains(&app, "shop", &["shop.example.net"]).await;
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let ts = chrono::Utc::now();
+        seed_referer_file(
+            &referer_dir,
+            day,
+            &[
+                referer_entry("news.example.org", "example.com", "/a", "1.1.1.1", ts),
+                referer_entry("news.example.org", "www.example.com", "/b", "1.1.1.2", ts),
+                referer_entry(
+                    "news.example.org",
+                    "shop.example.net",
+                    "/shop-only",
+                    "1.1.1.3",
+                    ts,
+                ),
+            ],
+        );
+
+        // Stats: the site scope keeps the two rows that belong to
+        // `web` and drops the `shop` one — and the two remaining
+        // rows land in ONE referrer row (2 hits), not two.
+        let resp = render_referers_stats(&app, "csrf-token", b"site=web")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains(">2</td>"),
+            "the two domains of the site must aggregate into one row: {html}"
+        );
+        assert!(
+            !html.contains("/shop-only"),
+            "a row of another site leaked into the scoped stats: {html}"
+        );
+        // The site selector offers both sites.
+        assert!(
+            html.contains("<option value=\"web\""),
+            "site option missing"
+        );
+        assert!(
+            html.contains("<option value=\"shop\""),
+            "site option missing: {html}"
+        );
+
+        // History: the site scope keeps the rows of either domain.
+        let resp = render_referers_history(&app, "csrf-token", b"site=web")
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        assert!(html.contains(">example.com<"), "row missing: {html}");
+        assert!(html.contains(">www.example.com<"), "row missing: {html}");
+        assert!(
+            !html.contains(">shop.example.net<"),
+            "a row of another site leaked into the scoped history: {html}"
+        );
+    }
+
+    /// R13: with the feature disabled the pages say so instead of
+    /// pretending there is no traffic.
+    #[tokio::test]
+    async fn referer_pages_report_the_disabled_feature() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_config(referer_dir, false);
+
+        for html in [
+            response_html(
+                render_referers(&app, "csrf-token", b"")
+                    .await
+                    .expect("live render"),
+            )
+            .await,
+            response_html(
+                render_referers_history(&app, "csrf-token", b"")
+                    .await
+                    .expect("history render"),
+            )
+            .await,
+            response_html(
+                render_referers_stats(&app, "csrf-token", b"")
+                    .await
+                    .expect("stats render"),
+            )
+            .await,
+        ] {
+            assert!(
+                html.contains("Referer logging is disabled"),
+                "the disabled notice is missing: {html}"
+            );
+        }
+    }
+
+    /// The live page's site scope: "All sites" shows every row, a
+    /// selected site shows only the rows that landed on one of its
+    /// domains.
+    #[tokio::test]
+    async fn referer_live_page_scopes_the_summary_to_the_selected_site() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com", "www.example.com"]).await;
+        seed_site_with_domains(&app, "shop", &["shop.example.net"]).await;
+
+        // Two referral rows, one per site.
+        let entry = pangolin_core::events::AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: "GET".into(),
+            path: "/a".into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "1.1.1.1".into(),
+            user_agent: None,
+        };
+        let hit = pangolin_core::RefererHit {
+            referer: "https://news.example.org/a".into(),
+            referer_host: "news.example.org".into(),
+        };
+        app.push_referer_log(&entry, &hit);
+
+        let mut shop_entry = entry.clone();
+        shop_entry.host = "shop.example.net".into();
+        app.push_referer_log(&shop_entry, &hit);
+
+        // "All sites" — every row is in scope, including the one
+        // that landed on the other site.
+        let resp = render_referers(&app, "csrf-token", b"")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "the referrer row must show with no site selected: {html}"
+        );
+        assert!(
+            html.contains("shop.example.net"),
+            "with no site selected, every site's rows must show: {html}"
+        );
+
+        // A selected site narrows the scope to that site's domains.
+        let resp = render_referers(&app, "csrf-token", b"site=web")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "the referrer row must still show for the site's own domain: {html}"
+        );
+        assert!(
+            !html.contains("shop.example.net"),
+            "a row of another site leaked into the scoped live page: {html}"
+        );
+    }
+
+    #[test]
+    fn referer_date_links_stay_on_their_own_page() {
+        let dates = vec![chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()];
+        let filter = RefererHistoryFilter {
+            date: "2026-10-01".into(),
+            site: "web".into(),
+            ..RefererHistoryFilter::default()
+        };
+
+        let history = referer_date_links(&dates, &filter, RefererPage::History);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].active);
+        assert!(
+            history[0].href.starts_with("/logs/referers/history?"),
+            "history sidebar link left the history page: {}",
+            history[0].href
+        );
+        assert!(history[0].href.contains("site=web"));
+        assert!(history[0].href.contains("page=1"));
+
+        let stats = referer_date_links(&dates, &filter, RefererPage::Stats);
+        assert!(
+            stats[0].href.starts_with("/logs/referers/stats?"),
+            "stats sidebar link left the stats page: {}",
+            stats[0].href
+        );
+        assert!(stats[0].href.contains("site=web"));
+    }
+
+    #[test]
+    fn parse_referer_params_reads_every_filter() {
+        let p = parse_referer_params(
+            b"date=2026-10-01&site=web&referer_host=news&host=example.com&path=%2Fa&status=404&method=get&client_ip=1.2.3.4&page=3",
+        );
+        assert_eq!(p.filter.date, "2026-10-01");
+        assert_eq!(p.filter.site, "web");
+        assert_eq!(p.filter.referer_host, "news");
+        assert_eq!(p.filter.host, "example.com");
+        assert_eq!(p.filter.path, "/a");
+        assert_eq!(p.filter.status, "404");
+        assert_eq!(p.filter.method, "get");
+        assert_eq!(p.filter.client_ip, "1.2.3.4");
+        assert_eq!(p.page, 3);
+    }
+
+    #[test]
+    fn parse_referer_params_empty_input_yields_defaults() {
+        let p = parse_referer_params(b"");
+        assert!(p.filter.date.is_empty());
+        assert!(p.filter.site.is_empty());
+        assert!(p.filter.referer_host.is_empty());
+        assert!(p.filter.host.is_empty());
+        assert!(p.filter.path.is_empty());
+        assert!(p.filter.status.is_empty());
+        assert!(p.filter.method.is_empty());
+        assert!(p.filter.client_ip.is_empty());
+        // The page defaults to 1.
+        assert_eq!(p.page, 1);
+    }
+
+    #[test]
+    fn parse_referer_params_clamps_an_oversized_page() {
+        let p = parse_referer_params(b"page=999999999");
+        assert_eq!(p.page, REFERRER_HISTORY_MAX_PAGE);
+        let p = parse_referer_params(b"page=0");
+        assert_eq!(p.page, 1);
+    }
+
+    /// A `?site=` that names no site must NOT widen the live page to
+    /// "All sites": the history/stats pages scope such a value to an
+    /// empty domain set and show nothing, so the live page has to
+    /// agree. Otherwise the operator sees every site's traffic on one
+    /// page and no traffic on the others.
+    #[tokio::test]
+    async fn referer_live_page_shows_no_rows_for_an_unknown_site() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        let entry = pangolin_core::events::AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: "GET".into(),
+            path: "/a".into(),
+            host: "example.com".into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "1.1.1.1".into(),
+            user_agent: None,
+        };
+        let hit = pangolin_core::RefererHit {
+            referer: "https://news.example.org/a".into(),
+            referer_host: "news.example.org".into(),
+        };
+        app.push_referer_log(&entry, &hit);
+
+        // No site selected → every row is in scope.
+        let resp = render_referers(&app, "csrf-token", b"")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "without a site every row must show: {html}"
+        );
+
+        // An unknown site → no row is in scope.
+        let resp = render_referers(&app, "csrf-token", b"site=nosuchsite")
+            .await
+            .expect("live render");
+        let html = response_html(resp).await;
+        assert!(
+            !html.contains("news.example.org"),
+            "an unknown site must not widen the view to all sites: {html}"
+        );
+    }
+
+    /// The cross-links between the history and stats pages carry the
+    /// current filters — the site scope above all. Dropping them
+    /// silently widens the operator's view to every site.
+    #[tokio::test]
+    async fn referer_pages_cross_link_with_the_site_scope_intact() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        let resp = render_referers_history(&app, "csrf-token", b"site=web&referer_host=news")
+            .await
+            .expect("history render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("/logs/referers/stats?date=") && html.contains("site=web"),
+            "the history→stats link must keep the site scope: {html}"
+        );
+        assert!(
+            html.contains("referer_host=news"),
+            "the history→stats link must keep the other filters: {html}"
+        );
+
+        let resp = render_referers_stats(&app, "csrf-token", b"site=web&referer_host=news")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("/logs/referers/history?date=") && html.contains("site=web"),
+            "the stats→history link must keep the site scope: {html}"
+        );
+    }
+
+    /// The stats page applies the `status` / `method` / `client_ip`
+    /// filters it keeps in its URL — and its "Apply" button must not
+    /// drop them.
+    #[tokio::test]
+    async fn referer_stats_page_applies_and_keeps_the_status_filter() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir.clone());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let ts = chrono::Utc::now();
+        let mut not_found = referer_entry("news.example.org", "example.com", "/a", "1.1.1.1", ts);
+        not_found.status = 404;
+        seed_referer_file(
+            &referer_dir,
+            day,
+            &[
+                not_found,
+                referer_entry("blog.example.org", "example.com", "/b", "1.1.1.2", ts),
+            ],
+        );
+
+        let resp = render_referers_stats(&app, "csrf-token", b"date=2026-10-01&status=404")
+            .await
+            .expect("stats render");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("news.example.org"),
+            "the matching referrer must show: {html}"
+        );
+        assert!(
+            !html.contains("blog.example.org"),
+            "a referrer the status filter excludes must not show: {html}"
+        );
+        // The form's Apply button carries the filter forward.
+        assert!(
+            html.contains("name=\"status\" value=\"404\""),
+            "the stats form must carry the status filter: {html}"
+        );
     }
 }

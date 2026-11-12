@@ -395,11 +395,63 @@ pub struct LogConfig {
     /// `/logs/bots` page.
     #[serde(default)]
     pub bot: BotLogConfig,
+    /// Referer log side-channel. Writes `referer-YYYY-MM-DD.jsonl`
+    /// per UTC day, with an in-memory ring buffer + a dedicated SSE
+    /// stream for the admin UI's `/logs/referers` page.
+    #[serde(default)]
+    pub referer: RefererLogConfig,
     /// In-memory traffic stats (no persistence). When `false` the
     /// aggregator thread is not spawned and `on_start`/`on_finish`
     /// are no-ops. Default `true`.
     #[serde(default)]
     pub traffic: TrafficConfig,
+}
+
+/// Per-day JSONL side-channel for inbound external referrals.
+///
+/// All fields have safe defaults — a missing `log.referer:` block in
+/// `ngx.yml` (or no `ngx.yml` at all) produces a working referer
+/// log. The block mirrors `log.bot` so the two side-channels are
+/// configured the same way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefererLogConfig {
+    /// Master switch. When `false` the gateway does not capture the
+    /// `Referer` header at all, no rows are recorded, and the admin
+    /// pages say the feature is disabled. Default `true` — the
+    /// feature is the point of the change and a missing block must
+    /// still produce a working referer log.
+    #[serde(default = "default_referer_enabled")]
+    pub enabled: bool,
+    /// Capacity of the in-memory ring buffer used by `/logs/referers`
+    /// late-join replay. Default 200. Set to 0 to disable replay
+    /// (the live SSE stream still works).
+    #[serde(default = "default_referer_recent")]
+    pub recent: usize,
+    /// Capacity of the dedicated `tokio::sync::broadcast` channel for
+    /// referral rows. Default 1000 — same rationale as
+    /// `access_log_capacity`.
+    #[serde(default = "default_referer_capacity")]
+    pub capacity: usize,
+    /// Output directory for `referer-YYYY-MM-DD.jsonl`. Created
+    /// lazily on first write. Default `./logs/referers`.
+    #[serde(default = "default_referer_dir")]
+    pub dir: PathBuf,
+}
+
+fn default_referer_enabled() -> bool {
+    true
+}
+
+fn default_referer_recent() -> usize {
+    200
+}
+
+fn default_referer_capacity() -> usize {
+    1000
+}
+
+fn default_referer_dir() -> PathBuf {
+    PathBuf::from("./logs/referers")
 }
 
 /// Kill switch for the in-memory traffic side-channel.
@@ -517,7 +569,19 @@ impl Default for LogConfig {
             access_log_recent: default_access_log_recent(),
             access_log_capacity: default_access_log_capacity(),
             bot: BotLogConfig::default(),
+            referer: RefererLogConfig::default(),
             traffic: TrafficConfig::default(),
+        }
+    }
+}
+
+impl Default for RefererLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_referer_enabled(),
+            recent: default_referer_recent(),
+            capacity: default_referer_capacity(),
+            dir: default_referer_dir(),
         }
     }
 }
@@ -720,6 +784,73 @@ mod tests {
             // defaults.
             assert_eq!(c.log.bot.recent, 200);
             assert_eq!(c.log.bot.capacity, 1000);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_shipped_example_config_parses() {
+        // `ngx.yml` at the repo root lists every field explicitly, so
+        // it is the schema's canary: a new key that does not parse
+        // breaks the example config that every operator copies.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str(include_str!("../../../ngx.yml")).expect("ngx.yml must parse");
+            // The referer block in the example carries the documented
+            // defaults.
+            assert!(c.log.referer.enabled);
+            assert_eq!(c.log.referer.recent, 200);
+            assert_eq!(c.log.referer.capacity, 1000);
+            assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_referer_keys_parse_and_default() {
+        // A config file with no `log.referer:` block must produce a
+        // working referer log — the block mirrors `log.bot`'s "safe
+        // default" policy.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert!(c.log.referer.enabled);
+            assert_eq!(c.log.referer.recent, 200);
+            assert_eq!(c.log.referer.capacity, 1000);
+            assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
+            Ok(())
+        });
+
+        // And operators who set them explicitly get the values they
+        // asked for.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                log:
+                  referer:
+                    enabled: false
+                    recent: 5
+                    capacity: 7
+                    dir: /var/log/referers
+            "#;
+            let c = Config::from_str(s).unwrap();
+            assert!(!c.log.referer.enabled);
+            assert_eq!(c.log.referer.recent, 5);
+            assert_eq!(c.log.referer.capacity, 7);
+            assert_eq!(c.log.referer.dir, PathBuf::from("/var/log/referers"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn log_referer_dir_can_be_overridden_by_env() {
+        // `NGX_LOG__REFERER__DIR` matches the existing
+        // `NGX_LOG__BOT__DIR` convention.
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("NGX_LOG__REFERER__DIR", "/srv/referers");
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.log.referer.dir, PathBuf::from("/srv/referers"));
             Ok(())
         });
     }

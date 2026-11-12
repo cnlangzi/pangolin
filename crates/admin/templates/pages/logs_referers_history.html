@@ -1,0 +1,98 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Referer Logs — History — Pangolin{% endblock %}
+
+{% block content %}
+<main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
+  {# ── Header + sub-nav ────────────────────────────────────────────── #}
+  <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Referer Logs</h1>
+      <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
+        Query the per-day JSONL archive under <code>log.referer.dir</code> — survives restarts.
+      </p>
+    </div>
+  </div>
+
+  {% include "views/referers/_subnav.html" %}
+
+  {% if !enabled %}
+    <div class="card p-6">
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Referer logging is disabled</h2>
+      <p class="mt-2 text-sm text-slate-600 dark:text-gray-300">
+        Set <code>log.referer.enabled: true</code> in <code>ngx.yml</code> and restart the gateway to start
+        recording inbound external referrals.
+      </p>
+    </div>
+  {% else %}
+
+  {# ── Two-column layout: date sidebar + filter form / result ───────── #}
+  <div class="grid grid-cols-1 lg:grid-cols-[12rem_minmax(0,1fr)] gap-6">
+    {% include "views/referers/_date_sidebar.html" %}
+
+    <div>
+      {# Filter form. GET reloads the whole page, so the date
+         sidebar is rendered against the submitted query. #}
+      <form method="get" action="/logs/referers/history"
+            id="referers-history-form"
+            class="card p-4 mb-6 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <label class="flex flex-col gap-1 col-span-2 md:col-span-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date (UTC)</span>
+          <input type="date" name="date" value="{{ filter.date }}"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        {% include "views/referers/_site_selector.html" %}
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Referrer</span>
+          <input type="text" name="referer_host" value="{{ filter.referer_host }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Host</span>
+          <input type="text" name="host" value="{{ filter.host }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Path</span>
+          <input type="text" name="path" value="{{ filter.path }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Status</span>
+          <input type="number" name="status" value="{{ filter.status }}" placeholder="200, 404…" min="100" max="599"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Method</span>
+          <input type="text" name="method" value="{{ filter.method }}" placeholder="GET, POST…" maxlength="8"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Client IP</span>
+          <input type="text" name="client_ip" value="{{ filter.client_ip }}" placeholder="substring"
+                 class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 font-mono">
+        </label>
+        <div class="flex gap-2 col-span-2 md:col-span-1">
+          <button type="submit"
+                  class="inline-flex items-center px-3 py-1.5 rounded-lg bg-accent-500 hover:bg-accent-600 text-white text-sm font-medium transition-colors">
+            Apply
+          </button>
+          <a href="/logs/referers/history"
+             class="inline-flex items-center px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 text-sm font-medium transition-colors">
+            Reset
+          </a>
+        </div>
+      </form>
+
+      {% include "views/referers/_history_result.html" %}
+
+      <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
+        Sourced from <code>{{ filter.date }}</code>'s JSONL file. Dates and rotation are <strong>UTC</strong>
+        (a request at 2026-11-12 23:59 UTC lands in 2026-11-12 even if your local clock says 2026-11-13).
+        Per-referrer rollups are on <a href="{{ stats_url }}" class="underline hover:text-accent-600">Stats</a>.
+      </p>
+    </div>
+  </div>
+  {% endif %}
+</main>
+{% endblock %}

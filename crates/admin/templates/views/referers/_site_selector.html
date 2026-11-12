@@ -1,0 +1,18 @@
+{# Site selector. The scoping unit of the referer analysis is the
+   *site*, not the hostname: a site may own several domains, and a
+   referral between two of them is internal to the site.
+
+   The partial renders only the control — the surrounding `<form>`
+   is the page's, so the selector can carry the other filters along
+   on submit. `filter.site` holds the current selection; `sites`
+   holds the options. #}
+<label class="flex flex-col gap-1">
+  <span class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Site</span>
+  <select name="site"
+          class="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100">
+    <option value="" {% if filter.site == "" %}selected{% endif %}>All sites</option>
+    {% for s in sites %}
+      <option value="{{ s.name }}" {% if s.selected %}selected{% endif %}>{{ s.name }}</option>
+    {% endfor %}
+  </select>
+</label>
