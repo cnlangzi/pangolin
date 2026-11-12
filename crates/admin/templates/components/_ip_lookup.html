@@ -6,6 +6,7 @@
 {#   {% import "components/_ip_lookup.html" as lookup %}                  #}
 {#   {{ lookup::ip_cell(ip=row.ip) }}                                     #}
 {#   {{ lookup::bot_cell(name=row.bot_name, dash_class="text-slate-400") }} #}
+{#   {{ lookup::badbot_cell(code=row.badbot_code, dash_class="…") }}      #}
 {#                                                                          #}
 {# Why a macro and not an `{% include %}`: an include takes a path only, #}
 {# so the two tables could not pass their own address and their own     #}
@@ -57,3 +58,29 @@
   {% endif %}
 </td>
 {% endmacro bot_cell %}
+
+{# The reputation-verdict cell (issue #141): what the IP reputation   #}
+{# library said about the client — a badge whose colour is keyed off   #}
+{# the verdict code — or a muted em dash for a client the library was  #}
+{# never asked about (a verified known bot, a request without an      #}
+{# authoritative client IP).                                           #}
+{#                                                                        #}
+{# The badge markup lives here, not in the two tables that render it,  #}
+{# so the verdict codes and their colours cannot drift apart.           #}
+{% macro badbot_cell(code, dash_class) %}
+<td class="px-4 py-2 text-xs">
+  {% if let Some(c) = code %}
+  {% if c == "bad_address" %}
+  <span data-badbot="bad_address" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">bad address</span>
+  {% else if c == "bot_user_agent" %}
+  <span data-badbot="bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">bot user-agent</span>
+  {% else if c == "bad_address_bot_user_agent" %}
+  <span data-badbot="bad_address_bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">bad address + bot user-agent</span>
+  {% else %}
+  <span data-badbot="unknown" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300">unknown</span>
+  {% endif %}
+  {% else %}
+  <span class="{{ dash_class }}">—</span>
+  {% endif %}
+</td>
+{% endmacro badbot_cell %}

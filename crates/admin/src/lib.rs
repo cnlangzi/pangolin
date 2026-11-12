@@ -291,7 +291,7 @@ pub async fn handle(
         // not in `ngx.yml` — the only credential they carry is a
         // provider API key.
         ("settings/badbots", "POST") => {
-            routes::badbots::handle_update_badbots(&app, &merged_params).await?
+            routes::badbots::handle_update_badbots(&app, &csrf_token, &merged_params).await?
         }
         ("api/badbots/config", "GET") => routes::badbots::handle_get_badbots_config(&app).await?,
 
