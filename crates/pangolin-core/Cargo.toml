@@ -57,6 +57,12 @@ knownbots = { path = "../knownbots" }
 # CIDR parsing / matching for the per-site IP rules (issue #117).
 ipnet.workspace = true
 
+# IP reputation (issue #141). The library is consulted only on the
+# throttle path; the verdict it answers with is the local one, and the
+# upstream verification it schedules runs in the library's own worker
+# thread — never on the request path.
+badbots.workspace = true
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `figment::Jail` lives behind the `test` feature flag — used by the

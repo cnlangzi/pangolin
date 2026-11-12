@@ -100,6 +100,13 @@ sha2 = "0.10"
 # knownbots crate already depends on it for its official IP ranges.
 ipnet = "2"
 
+# IP reputation (issue #141). The `full` feature compiles in every
+# provider the crate ships: the three list publishers (Spamhaus,
+# DShield, Blocklist.de) and the two keyed lookup providers
+# (AbuseIPDB, CrowdSec). A provider is only *queried* when the
+# gateway enables it — see `pangolin_core::badbots`.
+badbots = { version = "0.1.1", features = ["full"] }
+
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"

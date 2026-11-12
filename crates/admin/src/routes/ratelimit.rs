@@ -937,6 +937,7 @@ mod tests {
                 "Site",
                 "Client IP",
                 "Bot",
+                "Bad Bots",
                 "Country",
                 "Region",
                 "Status",
@@ -985,6 +986,37 @@ mod tests {
         assert!(!cells[2].contains("bg-blue-100"), "{row}");
     }
 
+    /// The over-limit table shows what the IP reputation library said
+    /// about the client (issue #141).
+    ///
+    /// The verdict is recorded by the proxy after the limiter decided
+    /// to throttle the client; the table renders it as a badge whose
+    /// colour is keyed off the verdict code.
+    #[tokio::test]
+    async fn the_over_limit_table_shows_the_reputation_verdict() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.50".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        app.rate_limiter.record_badbot_verdict(
+            "a",
+            client,
+            pangolin_core::BadbotVerdict::BadAddress,
+        );
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let row = row_with(&html, "data-ip=\"198.51.100.50\"");
+        assert!(
+            row.contains("data-badbot=\"bad_address\""),
+            "the verdict code must be on the row: {row}"
+        );
+        assert!(
+            row.contains(">bad address</span>"),
+            "the verdict must be rendered as a badge: {row}"
+        );
+    }
+
     /// The dashboard's live "blocked clients" table shows the bot name
     /// and the lookup hooks too (issue #134, R3–R6).
     #[tokio::test]
@@ -1000,7 +1032,15 @@ mod tests {
         // client IP (R3).
         assert_eq!(
             table_headers(&html, "Blocked clients"),
-            vec!["Client IP", "Bot", "Site", "403", "429", "Last seen"]
+            vec![
+                "Client IP",
+                "Bot",
+                "Bad Bots",
+                "Site",
+                "403",
+                "429",
+                "Last seen"
+            ]
         );
 
         let row = row_with(&html, "data-bot=\"googlebot\"");

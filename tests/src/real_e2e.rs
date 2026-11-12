@@ -4580,6 +4580,37 @@ fn seed_rate_limit_with_body(
     .expect("insert site_rate_limits");
 }
 
+/// Seed the per-site rate-limit policy with a custom 429 **and** 403
+/// page.
+///
+/// The 403 page is the one an escalated client receives (issue #141):
+/// the reputation check turns a throttled client's `429` into a `403`
+/// that carries the site's own page, exactly like the `403` the
+/// gateway produces for a blocked client.
+fn seed_rate_limit_with_bodies(
+    conn: &Connection,
+    site_name: &str,
+    req_limit: i64,
+    window_secs: i64,
+    custom_429_body: Option<&str>,
+    custom_403_body: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO site_rate_limits (site_name, enabled, req_limit, req_window_secs,
+                page_limit, page_window_secs, ip_capacity, throttle_capacity, throttle_secs,
+                custom_429_body, custom_403_body)
+         VALUES (?1, 1, ?2, ?3, 0, 3600, 1024, 1024, 600, ?4, ?5)",
+        rusqlite::params![
+            site_name,
+            req_limit,
+            window_secs,
+            custom_429_body,
+            custom_403_body
+        ],
+    )
+    .expect("insert site_rate_limits");
+}
+
 /// Seed the per-site list of known bots that are **not** exempt from
 /// that site's rate limits (the `site_rate_limit_bots` table added by
 /// the V11 migration).
@@ -4634,8 +4665,13 @@ async fn raw_get_full(addr: &str, host: &str, path: &str) -> (u16, String) {
         .await
         .expect("connect (5s timeout)")
         .expect("connect");
+    // The harness's user agent, shared: it has to be browser-shaped
+    // (the gateway's reputation check treats a non-browser user agent
+    // as a bot and escalates a throttled client to 403), and the
+    // constant carries the reason.
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: pangolin-e2e\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: {}\r\n\r\n",
+        crate::harness::DEFAULT_USER_AGENT
     );
     stream
         .write_all(req.as_bytes())
@@ -4891,6 +4927,70 @@ async fn real_e2e_an_unlisted_known_bot_stays_exempt() {
         );
     }
     assert_eq!(backend.seen().await.len(), 5);
+}
+
+/// A throttled client whose user agent declares itself a bot is
+/// escalated from `429` to `403` (issue #141).
+///
+/// The reputation check is on by default, so the gateway asks the
+/// library about the client on the throttle path. The **user agent**
+/// is the signal that fires here: the address is a loopback address,
+/// which the library never assesses (it has no public reputation),
+/// but a user agent that declares itself an automation tool is
+/// enough to escalate.
+///
+/// The escalated answer carries the site's own `403` page — the same
+/// page the gateway serves for a blocked client — and no
+/// `Retry-After`: a rejected client is not expected to become
+/// acceptable by waiting.
+#[tokio::test]
+async fn real_e2e_rate_limit_escalates_a_bot_user_agent_to_403() {
+    let backend = InspectingBackend::start().await;
+    let custom_403 = "<!DOCTYPE html><html><body><h1 id=\"custom403\">Blocked</h1></body></html>";
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        // The check is off in the e2e by default — this test is the
+        // one that turns it on.
+        crate::harness::enable_badbots(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit_with_bodies(&conn, "rl-site", 1, 60, None, Some(custom_403));
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    // The first request is within the limit.
+    let (status, _) = raw_get(&addr, "rl.test", "/").await;
+    assert_eq!(status, 200, "the first request must be served");
+
+    // The second one is over the limit, and the client announces
+    // itself as an automation tool.
+    let (status, text) =
+        crate::harness::raw_request_with_user_agent(&addr, "rl.test", "GET", "/", &[], "curl/8.0")
+            .await;
+    assert_eq!(
+        status,
+        403,
+        "a throttled bot must be escalated to 403, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        text.contains("custom403"),
+        "the escalated answer must carry the site's own 403 page: {text}"
+    );
+    assert!(
+        response_header(&text, "Retry-After").is_none(),
+        "a 403 carries no Retry-After: {text}"
+    );
+
+    // The rejected request never reached the backend.
+    assert_eq!(
+        backend.seen().await.len(),
+        1,
+        "the escalated request must never reach the backend"
+    );
 }
 
 /// A throttled request is answered with the built-in default 429

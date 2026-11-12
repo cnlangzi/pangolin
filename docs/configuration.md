@@ -353,6 +353,62 @@ The provider model, the origin guard, the background fetch and the
 request-path order are documented in
 [design/provider.md](design/provider.md).
 
+### `badbots_config` table (DB) — IP reputation
+
+The gateway's IP reputation check (issue #141). A client that trips a
+site's rate limit is answered `429 Too Many Requests` — a soft
+rejection that says "slow down". When the check is on, the gateway
+asks a reputation library about the client first: an address the
+library convicts, or a user agent that declares itself a bot, is
+answered `403 Forbidden` with the site's own error page instead — a
+hard rejection. A crawler the known-bot validator confirmed (user
+agent **and** the publisher's official address ranges **and** reverse
+DNS) is never escalated.
+
+Like `system_config`, this is a **singleton** row — `id` is always 1
+and a `CHECK` constraint fails loudly on a second `INSERT`. Unlike
+every other knob of the gateway, it is **not** read from `ngx.yml` and
+has **no** `NGX_*` environment override: the only credential it
+carries is a provider API key, and a key in the configuration file
+ends up in backups, in a config management system and in a shell
+history. The operator edits the row from the **Settings** page
+(`/settings`), which is behind the admin authentication.
+
+| Field                        | Type              | Default   | Notes |
+| ---------------------------- | ----------------- | --------- | ----- |
+| `id`                         | `INTEGER`         | `1`       | Always 1 — the singleton key. |
+| `enabled`                    | `INTEGER`         | `1`       | Whether the check runs. **On by default** — the feature needs no configuration. |
+| `evidence_policy`            | `string`          | `lenient` | `strict` or `lenient`. `lenient` convicts on any report of doubt about the address; `strict` needs either a conviction-strength observation or two corroborating sources. The gateway asks for a second opinion about a client it has *already* decided to reject, so `lenient` is the right bar. |
+| `feed_refresh_interval_secs` | `INTEGER`         | `300`     | How often the publishers' lists are refreshed. A publisher whose own interval has not elapsed is not asked, so a short interval costs nothing. |
+| `abuseipdb_api_key`          | `string \| null`  | `NULL`    | The AbuseIPDB key. `NULL` → the provider is not queried. |
+| `crowdsec_api_key`           | `string \| null`  | `NULL`    | The CrowdSec key. `NULL` → the provider is not queried. |
+| `updated_at`                 | `string`          | —         | When the row was last written. |
+
+The three providers that need no credential — Spamhaus DROP, DShield
+and the Blocklist.de service lists — are always queried while the
+check is on. The two keyed providers are queried **only** when their
+key is stored: the library refuses to build a provider that is enabled
+without its credential, so the gateway never enables one it has no
+key for.
+
+The keys are stored **in the clear** — an upstream key has to be sent
+to the upstream verbatim, so it cannot be hashed the way `tun.token`
+is (that one is only ever compared, never sent). The admin UI never
+renders a key back: the form shows whether a key is configured and
+takes a new one to replace it.
+
+Changing the settings takes effect immediately — the admin POST
+rebuilds the library, because a provider key is baked into the
+library instance when it is built.
+
+What the operator sees on the **Rate Limit** page: every rejected
+client carries a "Bad Bots" column with the verdict the library
+reached for it — `bad address`, `bot user-agent`, `bad address +
+bot user-agent` or `unknown`. A client the library was never asked
+about (a verified known bot, a request without an authoritative
+client IP) shows a dash.
+
+
 ## `tun.yml` — tunnel client configuration
 
 ### Top-level fields

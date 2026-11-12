@@ -68,6 +68,7 @@
           <th class="px-4 py-2 text-left font-medium text-slate-500">Site</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Client IP</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Bot</th>
+          <th class="px-4 py-2 text-left font-medium text-slate-500">Bad Bots</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Country</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Region</th>
           <th class="px-4 py-2 text-left font-medium text-slate-500">Status</th>
@@ -77,15 +78,16 @@
       </thead>
       <tbody class="divide-y divide-slate-200 dark:divide-slate-700">
         {% if top_over.is_empty() %}
-        <tr><td colspan="8" class="px-4 py-6 text-center text-slate-400">No client has been throttled yet.</td></tr>
+        <tr><td colspan="9" class="px-4 py-6 text-center text-slate-400">No client has been throttled yet.</td></tr>
         {% else %}
         {% for row in top_over %}
         {# The `data-*` attributes carry the raw values, so a test can #}
         {# assert on them without scraping the rendered cells.         #}
-        <tr data-ip="{{ row.ip }}" data-country="{% if let Some(c) = row.country %}{{ c }}{% endif %}" data-region="{% if let Some(r) = row.region %}{{ r }}{% endif %}" data-bot="{% if let Some(b) = row.bot_name %}{{ b }}{% endif %}" data-rejections="{{ row.rejections }}">
+        <tr data-ip="{{ row.ip }}" data-country="{% if let Some(c) = row.country %}{{ c }}{% endif %}" data-region="{% if let Some(r) = row.region %}{{ r }}{% endif %}" data-bot="{% if let Some(b) = row.bot_name %}{{ b }}{% endif %}" data-badbot="{% if let Some(c) = row.badbot_code %}{{ c }}{% endif %}" data-rejections="{{ row.rejections }}">
           <td class="px-4 py-2 font-mono text-xs">{{ row.site }}</td>
           {% call lookup::ip_cell(ip=row.ip.as_str()) %}
           {% call lookup::bot_cell(name=row.bot_name.as_deref(), dash_class="text-slate-400") %}
+          {% call lookup::badbot_cell(code=row.badbot_code.clone(), dash_class="text-slate-400") %}
           <td class="px-4 py-2 text-xs">{% if let Some(c) = row.country %}{{ c }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
           <td class="px-4 py-2 text-xs">{% if let Some(r) = row.region %}{{ r }}{% else %}<span class="text-slate-400">—</span>{% endif %}</td>
           <td class="px-4 py-2 text-xs">

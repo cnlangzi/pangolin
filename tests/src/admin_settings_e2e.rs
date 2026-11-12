@@ -265,3 +265,159 @@ async fn settings_post_no_csrf_forbidden() {
         "missing CSRF should be forbidden"
     );
 }
+
+// ── §7 — The IP reputation settings (issue #141) ───────────────────────────
+//
+// The reputation configuration lives in the database, not in
+// `ngx.yml`, and is edited from its own form on the settings page.
+
+#[tokio::test]
+async fn settings_page_renders_the_reputation_form() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(r#"action="/settings/badbots""#),
+        "the reputation form must be present"
+    );
+    for field in [
+        "badbots_enabled",
+        "badbots_evidence_policy",
+        "badbots_feed_refresh_interval_secs",
+        "badbots_abuseipdb_api_key",
+        "badbots_crowdsec_api_key",
+    ] {
+        assert!(
+            body.contains(&format!(r#"name="{field}""#)),
+            "{field} input missing"
+        );
+    }
+    // The check is on by default (the feature needs no configuration)
+    // — but the e2e harness turns it off, so the page renders it
+    // unchecked. The seeded default itself is pinned by the
+    // `badbots_config_seeded_after_migrate` unit test.
+    assert!(
+        body.contains(r#"name="badbots_enabled" value="true""#),
+        "the reputation switch must be present"
+    );
+    assert!(
+        !body.contains(r#"name="badbots_enabled" value="true" checked"#),
+        "the e2e harness turns the reputation check off"
+    );
+}
+
+#[tokio::test]
+async fn settings_post_reputation_saves_the_row_without_echoing_the_key() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/badbots",
+            &[
+                ("_csrf", &csrf),
+                ("badbots_enabled", "true"),
+                ("badbots_evidence_policy", "strict"),
+                ("badbots_feed_refresh_interval_secs", "600"),
+                ("badbots_abuseipdb_api_key", "secret-key"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "a successful save redirects back to the settings page"
+    );
+
+    // The row carries the new settings.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let enabled: i64 = conn
+        .query_row("SELECT enabled FROM badbots_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(enabled, 1, "the check must stay on");
+    let policy: String = conn
+        .query_row(
+            "SELECT evidence_policy FROM badbots_config WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the row exists");
+    assert_eq!(policy, "strict", "the policy must be stored");
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT abuseipdb_api_key FROM badbots_config WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the row exists");
+    assert_eq!(key.as_deref(), Some("secret-key"), "the key must be stored");
+
+    // The key is never rendered back into the page.
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        !body.contains("secret-key"),
+        "the stored key must never be rendered back into the page"
+    );
+    assert!(
+        body.contains("configured"),
+        "the page must say that a key is configured"
+    );
+}
+
+#[tokio::test]
+async fn settings_post_reputation_rejects_a_bad_policy_inline() {
+    // A failure re-renders the settings page with the message inline
+    // — not a standalone error page — so the operator sees it where
+    // they were.
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/badbots",
+            &[
+                ("_csrf", &csrf),
+                ("badbots_enabled", "true"),
+                ("badbots_evidence_policy", "bogus"),
+                ("badbots_feed_refresh_interval_secs", "300"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("bogus"),
+        "the error must name the offending value: {body}"
+    );
+    assert!(
+        body.contains(r#"action="/settings/badbots""#),
+        "the reputation form must still be on the page: {body}"
+    );
+
+    // The row is unchanged — a rejected form never writes.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let policy: String = conn
+        .query_row(
+            "SELECT evidence_policy FROM badbots_config WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the row exists");
+    assert_eq!(policy, "lenient", "a rejected form must not write");
+}

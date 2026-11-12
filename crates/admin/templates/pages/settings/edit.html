@@ -195,5 +195,119 @@
       </div>
     </div>
   </form>
+
+  {# The IP reputation settings (issue #141). A separate form: the
+     settings live in the database, not in `ngx.yml`, and a failure to
+     save them must not block the gateway settings above. #}
+  <form method="POST" action="/settings/badbots" class="card p-6 mt-6 space-y-6" data-testid="badbots-form">
+    {% include "components/_csrf.html" %}
+
+    <div>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-1">IP reputation</h2>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        A client that trips a site's rate limit is answered
+        <code class="font-mono">429</code>. When this check is on, the gateway asks a
+        reputation library about the client first: an address the library convicts, or a
+        user agent that declares itself a bot, is answered
+        <code class="font-mono">403</code> with the site's own error page instead. A crawler
+        the known-bot validator confirmed is never escalated.
+      </p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
+        These settings live in the <strong>database</strong>, not in
+        <code class="font-mono">ngx.yml</code> — the only credential they carry is a provider
+        API key, and a key in the configuration file ends up in backups and in shell history.
+      </p>
+    </div>
+
+    <div>
+      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
+           form always carries an explicit value. #}
+        <input type="hidden" name="badbots_enabled" value="false">
+        <input type="checkbox" name="badbots_enabled" value="true" {% if badbots.enabled %}checked{% endif %}
+          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <div>
+          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Enable the reputation check</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            On by default. The three list publishers (Spamhaus, DShield, Blocklist.de) need no
+            credential and are always queried while the check is on.
+          </div>
+        </div>
+      </label>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="badbots-evidence-policy">Evidence policy</label>
+        <select name="badbots_evidence_policy" id="badbots-evidence-policy"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+          {% if badbots.evidence_policy == "lenient" %}
+          <option value="lenient" selected>lenient — any report of doubt is enough</option>
+          <option value="strict">strict — a conviction or two corroborating sources</option>
+          {% else %}
+          <option value="lenient">lenient — any report of doubt is enough</option>
+          <option value="strict" selected>strict — a conviction or two corroborating sources</option>
+          {% endif %}
+        </select>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          The gateway asks the library for a second opinion about a client it has already
+          decided to reject, so <code class="font-mono">lenient</code> is the right bar.
+        </p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="badbots-refresh-interval">List refresh interval (seconds)</label>
+        <input type="number" name="badbots_feed_refresh_interval_secs" id="badbots-refresh-interval"
+          value="{{ badbots.feed_refresh_interval_secs }}" min="1" required
+          class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          How often the publishers' lists are refreshed. A publisher that is not due is not
+          asked, so a short interval costs nothing.
+        </p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="badbots-abuseipdb-key">AbuseIPDB key</label>
+        <input type="password" name="badbots_abuseipdb_api_key" id="badbots-abuseipdb-key"
+          autocomplete="off" placeholder="{% if badbots.abuseipdb_key_configured %}configured — type to replace{% else %}not configured{% endif %}"
+          class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <label class="flex items-center gap-2 mt-2 text-xs text-slate-500 dark:text-slate-400">
+          <input type="checkbox" name="badbots_abuseipdb_clear" value="true"
+            class="h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+          Remove the stored key
+        </label>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          The provider is queried only when a key is stored. Leave the field empty to keep the
+          stored key.
+        </p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="badbots-crowdsec-key">CrowdSec key</label>
+        <input type="password" name="badbots_crowdsec_api_key" id="badbots-crowdsec-key"
+          autocomplete="off" placeholder="{% if badbots.crowdsec_key_configured %}configured — type to replace{% else %}not configured{% endif %}"
+          class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <label class="flex items-center gap-2 mt-2 text-xs text-slate-500 dark:text-slate-400">
+          <input type="checkbox" name="badbots_crowdsec_clear" value="true"
+            class="h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+          Remove the stored key
+        </label>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          The provider is queried only when a key is stored. Leave the field empty to keep the
+          stored key.
+        </p>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
+      <div class="text-xs text-slate-500 dark:text-slate-400">
+        Last updated: <span class="font-mono">{{ badbots.updated_at }}</span>
+      </div>
+      <div class="flex gap-2">
+        <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">Save</button>
+      </div>
+    </div>
+  </form>
+
 </main>
 {% endblock %}

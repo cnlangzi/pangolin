@@ -287,6 +287,13 @@ pub async fn handle(
         ("settings", "POST") => {
             routes::settings::handle_update_settings(&app, &csrf_token, &merged_params).await?
         }
+        // Issue #141: the IP reputation settings live in the database,
+        // not in `ngx.yml` — the only credential they carry is a
+        // provider API key.
+        ("settings/badbots", "POST") => {
+            routes::badbots::handle_update_badbots(&app, &csrf_token, &merged_params).await?
+        }
+        ("api/badbots/config", "GET") => routes::badbots::handle_get_badbots_config(&app).await?,
 
         // ── Auth ────────────────────────────────────────────────────
         ("login", "GET") => {

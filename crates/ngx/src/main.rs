@@ -18,6 +18,7 @@
 //!    finishes, the pingora thread is joined, and `main` returns.
 
 mod acme;
+mod badbots_feed;
 mod dns;
 mod provider_ip;
 mod proxy;
@@ -186,6 +187,14 @@ fn main() -> anyhow::Result<()> {
             Box::new(crate::provider_ip::ProviderIpService::new(
                 std::time::Duration::from_secs(app.config.provider.ip_refresh_interval_secs),
             )?),
+            // Issue #141: keep the reputation library's published
+            // lists fresh. The service is registered unconditionally
+            // and does nothing while the library is absent — the
+            // operator can turn the check on from the dashboard, and
+            // the service picks the new instance up on its next tick.
+            Box::new(crate::badbots_feed::BadbotsFeedService::new(
+                crate::badbots_feed::DEFAULT_INTERVAL,
+            )),
         ];
 
         // `ServiceContext` takes ownership of the `App`; keep a

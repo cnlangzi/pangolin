@@ -657,6 +657,19 @@ struct BlockedIpStat {
     bot_name: Option<String>,
     /// When the bot name above was observed.
     bot_name_at: Option<Instant>,
+    /// What the IP reputation library said about this client
+    /// (issue #141).
+    ///
+    /// `None` for a client the library was never asked about — a
+    /// verified known bot, a request without an authoritative client
+    /// IP, or a gateway without the reputation check.
+    ///
+    /// The **most recent** observation wins, like the bot name: a
+    /// later verdict replaces an earlier one, and a request that
+    /// produced no verdict leaves the recorded one alone.
+    badbot: Option<crate::reputation::BadbotVerdict>,
+    /// When the verdict above was observed.
+    badbot_at: Option<Instant>,
     /// When the client was last rejected.
     last_seen: Instant,
 }
@@ -886,6 +899,8 @@ impl SiteState {
             region: None,
             bot_name: None,
             bot_name_at: None,
+            badbot: None,
+            badbot_at: None,
             last_seen: now,
         });
         if rule_block {
@@ -920,6 +935,32 @@ impl SiteState {
             stat.bot_name_at = Some(now);
         }
         stat.total
+    }
+
+    /// Record the reputation verdict of a client (issue #141).
+    ///
+    /// The verdict is attached to the client's row, which the
+    /// dashboard's "top over-limit clients" table shows. A client that
+    /// was never rejected has no row and is not remembered: the
+    /// reputation library is only consulted on the throttle path, so
+    /// a verdict always belongs to a client the limiter rejected.
+    fn record_badbot_verdict(&mut self, ip: IpAddr, verdict: crate::reputation::BadbotVerdict) {
+        let Some(stat) = self.blocked_ips.get_mut(&ip) else {
+            return;
+        };
+        stat.badbot = Some(verdict);
+        stat.badbot_at = Some(Instant::now());
+    }
+
+    /// Whether this rejection of the client should be logged.
+    ///
+    /// A client the limiter never rejected has no counter: its
+    /// rejection is logged.
+    fn should_log_rejection(&self, ip: IpAddr) -> bool {
+        match self.blocked_ips.get(&ip) {
+            Some(stat) => should_log(stat.total),
+            None => true,
+        }
     }
 }
 
@@ -1086,6 +1127,9 @@ pub struct OverLimitClient {
     /// identified as — `None` for a client that is not one (issue
     /// #134).
     pub bot_name: Option<String>,
+    /// What the IP reputation library said about the client (issue
+    /// #141) — `None` when the library was never asked about it.
+    pub badbot: Option<crate::reputation::BadbotVerdict>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1116,6 +1160,12 @@ pub struct BlockedClient {
     /// bot identity never clears a name that was already recorded
     /// (issue #134).
     pub bot_name: Option<String>,
+    /// What the IP reputation library said about the client (issue
+    /// #141) — `None` when the library was never asked about it.
+    ///
+    /// The address is merged across the sites, so this is the **most
+    /// recent** observation that carried a verdict.
+    pub badbot: Option<crate::reputation::BadbotVerdict>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1290,6 +1340,47 @@ impl RateLimiter {
         state.lock().check(site, cfg, ip, bot_name, page_key, geo)
     }
 
+    /// Record what the IP reputation library said about a client
+    /// (issue #141).
+    ///
+    /// Called by the proxy after the limiter decided to throttle a
+    /// client and the library answered for its address. The verdict is
+    /// **not** part of the limiter's decision — the limiter's counters
+    /// and its verdict stay exactly what they were — the recording
+    /// only exists so the operator can see on the rate-limit page why
+    /// a client was escalated.
+    ///
+    /// A client the limiter never rejected is not recorded: there is
+    /// no row to attach the verdict to.
+    pub fn record_badbot_verdict(
+        &self,
+        site: &str,
+        ip: IpAddr,
+        verdict: crate::reputation::BadbotVerdict,
+    ) {
+        let Some(state) = self.sites.read().get(site).cloned() else {
+            return;
+        };
+        state.lock().record_badbot_verdict(ip, verdict);
+    }
+
+    /// Whether a rejection of this client should reach the log.
+    ///
+    /// The limiter logs the first rejection of a client and then every
+    /// [`LOG_EVERY`]-th one, so an attack cannot flood the log. A
+    /// caller that writes its **own** rejection line — the escalation
+    /// the reputation check produces (issue #141) — asks here, so its
+    /// line follows the same cadence as the limiter's.
+    ///
+    /// The count is the client's rejection counter, which
+    /// [`Self::check`] has already incremented.
+    pub fn should_log_rejection(&self, site: &str, ip: IpAddr) -> bool {
+        let Some(state) = self.sites.read().get(site).cloned() else {
+            return true;
+        };
+        state.lock().should_log_rejection(ip)
+    }
+
     /// The latest published snapshot.
     pub fn snapshot(&self) -> Arc<RateLimitSnapshot> {
         self.published.read().clone()
@@ -1342,6 +1433,8 @@ struct MergedBlocked {
     site_at: Instant,
     /// When the recorded bot name was observed.
     bot_at: Option<Instant>,
+    /// When the recorded reputation verdict was observed.
+    badbot_at: Option<Instant>,
 }
 
 /// Build the snapshot from the current runtime state.
@@ -1401,6 +1494,7 @@ fn build_snapshot(
                 country: stat.country.clone(),
                 region: stat.region.clone(),
                 bot_name: stat.bot_name.clone(),
+                badbot: stat.badbot,
                 rule_blocks: stat.rule_blocks,
                 throttled: stat.throttled,
                 first_seen_secs: now.duration_since(stat.first_seen).as_secs(),
@@ -1411,12 +1505,14 @@ fn build_snapshot(
                     ip: ip.to_string(),
                     site: name.clone(),
                     bot_name: None,
+                    badbot: None,
                     rule_blocks: 0,
                     throttled: 0,
                     last_seen_secs: 0,
                 },
                 site_at: stat.last_seen,
                 bot_at: None,
+                badbot_at: None,
             });
             entry.client.rule_blocks = entry.client.rule_blocks.saturating_add(stat.rule_blocks);
             entry.client.throttled = entry.client.throttled.saturating_add(stat.throttled);
@@ -1435,6 +1531,16 @@ fn build_snapshot(
             {
                 entry.client.bot_name = Some(name.clone());
                 entry.bot_at = Some(at);
+            }
+            // The reputation verdict of the most recent observation
+            // that carried one wins (issue #141), by the same rule as
+            // the bot name: a site that produced no verdict never
+            // clears the verdict another site recorded.
+            if let (Some(verdict), Some(at)) = (stat.badbot, stat.badbot_at)
+                && entry.badbot_at.is_none_or(|seen| at >= seen)
+            {
+                entry.client.badbot = Some(verdict);
+                entry.badbot_at = Some(at);
             }
             entry.client.last_seen_secs = now.duration_since(stat.last_seen).as_secs();
         }
@@ -2593,6 +2699,76 @@ mod tests {
         }
         assert_eq!(snap.sites.len(), 1);
         assert_eq!(snap.sites[0].req_limit, 42);
+    }
+
+    #[test]
+    fn the_reputation_verdict_reaches_the_snapshot() {
+        // The verdict the reputation library reached for a throttled
+        // client is recorded on the client's row, so the rate-limit
+        // page can show it (issue #141). The recording does not touch
+        // the limiter's own counters or its decision.
+        use crate::reputation::BadbotVerdict;
+
+        let mut p = policy(1, 0);
+        p.req_window_secs = 60;
+        let (limiter, cfg) = limiter_with(p);
+        let client = ip(198, 51, 100, 30);
+
+        // The first request is within the limit, the second is over it
+        // — the limiter answers `429`.
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+
+        // The proxy asks the library and records what it said.
+        limiter.record_badbot_verdict("site", client, BadbotVerdict::BotUserAgent);
+
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.blocked.len(), 1, "the client must be remembered");
+        assert_eq!(
+            snap.blocked[0].badbot,
+            Some(BadbotVerdict::BotUserAgent),
+            "the verdict must reach the snapshot"
+        );
+        // The limiter's own counters are untouched by the recording.
+        assert_eq!(snap.blocked[0].throttled, 1);
+        assert_eq!(snap.blocked[0].rule_blocks, 0);
+        // And the per-site table carries the verdict too.
+        assert_eq!(snap.top_over.len(), 1);
+        assert_eq!(snap.top_over[0].badbot, Some(BadbotVerdict::BotUserAgent));
+    }
+
+    #[test]
+    fn a_verdict_for_a_client_that_was_never_rejected_is_dropped() {
+        // The library is only consulted on the throttle path, so a
+        // verdict always belongs to a client the limiter rejected —
+        // there is no row to attach it to otherwise.
+        use crate::reputation::BadbotVerdict;
+
+        let (limiter, _cfg) = limiter_with(policy(1, 0));
+        limiter.record_badbot_verdict("site", ip(198, 51, 100, 31), BadbotVerdict::BadAddress);
+        let snap = limiter.snapshot_now();
+        assert!(snap.blocked.is_empty(), "no row, no verdict");
+        assert!(snap.top_over.is_empty());
     }
 
     #[test]

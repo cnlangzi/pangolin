@@ -64,7 +64,7 @@ pub use ratelimit::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
     TopOverRow,
 };
-pub use settings::{ProviderOption, SettingsTemplate};
+pub use settings::{BadbotsSettingsView, ProviderOption, SettingsTemplate};
 pub use sites::{
     SitesEditTemplate, SitesFormFieldsView, SitesListTemplate, SitesNewTemplate, SitesTableView,
 };

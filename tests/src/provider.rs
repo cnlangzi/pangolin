@@ -174,7 +174,7 @@ fn the_migration_applies_to_a_fresh_database() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(count, 11, "V1..V11 must be applied");
+    assert_eq!(count, 12, "V1..V12 must be applied");
 
     // The renamed column and the new tables are there.
     let cols: Vec<String> = conn

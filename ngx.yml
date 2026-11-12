@@ -107,6 +107,14 @@ provider:
   # stored ranges. Default 3600.
   ip_refresh_interval_secs: 3600
 
+# The IP reputation check (issue #141) has NO section here on purpose:
+# it is configured in the database and edited from the dashboard
+# (`/settings`), because the only credential it carries is a provider
+# API key and a key in this file ends up in backups and in shell
+# history. It is on by default — a throttled client whose address the
+# reputation library convicts, or whose user agent declares itself a
+# bot, is answered 403 instead of 429. See docs/configuration.md.
+
 tls:
   enable_h2: true       # advertise HTTP/2 via ALPN for non-tunnel sites.
                         # Tunnel sites (backend with `tun_name:` prefix) always

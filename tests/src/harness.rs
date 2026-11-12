@@ -179,7 +179,16 @@ pub async fn raw_request_with_user_agent(
 
 /// The `User-Agent` the raw request helpers send unless the test asks
 /// for another one.
-const DEFAULT_USER_AGENT: &str = "pangolin-e2e";
+///
+/// A **browser** user agent on purpose. The gateway's reputation check
+/// (issue #141) treats a user agent that declares itself a crawler or
+/// an automation tool — and, by the library's definition, any user
+/// agent that is not browser-shaped — as a bot, and escalates a
+/// throttled client to `403`. A test that wants the soft `429` has to
+/// look like a browser; a test that wants the hard `403` sends a bot
+/// user agent explicitly (see `real_e2e_rate_limit_escalates_a_bot_
+/// user_agent_to_403`).
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// How a raw request head is shaped.
 ///
@@ -396,6 +405,28 @@ pub fn init_pangolin_db(path: &Path) {
     }
     let mut conn = pangolin_core::db::open(path).expect("open pangolin.db");
     pangolin_core::db::migrate(&mut conn).expect("run migrations");
+    // The reputation check is on by default (issue #141), and a
+    // gateway that has it on fetches the publishers' lists over the
+    // network on every start. The e2e suite spawns a gateway per test,
+    // so the check is off by default here — the tests that want the
+    // soft `429` of a plain browser client need it off, and the one
+    // test that exercises the escalation turns it on with
+    // `enable_badbots`.
+    conn.execute("UPDATE badbots_config SET enabled = 0 WHERE id = 1", [])
+        .expect("disable the reputation check");
+}
+
+/// Turn the IP reputation check on for a seeded database (issue
+/// #141).
+///
+/// The counterpart of the `UPDATE` in [`init_pangolin_db`]: a test
+/// that exercises the escalation — a throttled client whose user
+/// agent declares itself a bot is answered `403` instead of `429` —
+/// turns the check on and pays for exactly one set of list fetches.
+pub fn enable_badbots(path: &Path) {
+    let conn = pangolin_core::db::open(path).expect("open pangolin.db");
+    conn.execute("UPDATE badbots_config SET enabled = 1 WHERE id = 1", [])
+        .expect("enable the reputation check");
 }
 
 /// Shared, lock-protected log buffer (stdout+stderr) captured from

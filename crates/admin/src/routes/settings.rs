@@ -24,7 +24,7 @@ use super::provider::{provider_range_statuses, total_guard_rejections};
 use super::system::{parse_system_config_form_merged, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
-use crate::templates::settings::ProviderOption;
+use crate::templates::settings::{BadbotsSettingsView, ProviderOption};
 
 /// Render the settings page. `error` is `None` on the initial
 /// GET and on a successful POST (which 302s back here); it's
@@ -48,6 +48,30 @@ async fn render_page(
             }
         })
         .collect();
+    // The IP reputation settings (issue #141) live in the database.
+    // A read failure must not take the whole settings page down — the
+    // card falls back to the documented defaults.
+    let badbots = match app.badbots_settings().await {
+        Ok(s) => BadbotsSettingsView {
+            enabled: s.enabled,
+            evidence_policy: s.evidence_policy.as_str(),
+            feed_refresh_interval_secs: s.feed_refresh_interval_secs,
+            abuseipdb_key_configured: s.abuseipdb_api_key.is_some(),
+            crowdsec_key_configured: s.crowdsec_api_key.is_some(),
+            updated_at: s.updated_at.to_rfc3339(),
+        },
+        Err(e) => {
+            log::warn!("settings: reading the badbots configuration failed: {e}");
+            BadbotsSettingsView {
+                enabled: true,
+                evidence_policy: "lenient",
+                feed_refresh_interval_secs: 300,
+                abuseipdb_key_configured: false,
+                crowdsec_key_configured: false,
+                updated_at: String::new(),
+            }
+        }
+    };
     let template = SettingsTemplate {
         provider: cfg.provider.as_str(),
         providers,
@@ -61,6 +85,7 @@ async fn render_page(
         provider_ranges: provider_range_statuses(app).await,
         guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
+        badbots,
         error,
         active_nav: "settings",
     };
@@ -103,4 +128,21 @@ pub async fn handle_update_settings(
         }
         Err(msg) => render_page(app, csrf, Some(&msg)).await,
     }
+}
+
+/// Render the settings page with an error message inline.
+///
+/// Used by the IP reputation form (`POST /settings/badbots`), which is
+/// a form of its own on the page: a failure re-renders the page with
+/// the message where the operator was, instead of a standalone error
+/// page.
+///
+/// The page is rendered from the **stored** row, so the values that
+/// were typed but not saved are lost — the operator retypes them.
+pub async fn render_with_error(
+    app: &Arc<App>,
+    csrf: &str,
+    error: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    render_page(app, csrf, Some(error)).await
 }
