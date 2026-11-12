@@ -373,3 +373,51 @@ async fn settings_post_reputation_saves_the_row_without_echoing_the_key() {
         "the page must say that a key is configured"
     );
 }
+
+#[tokio::test]
+async fn settings_post_reputation_rejects_a_bad_policy_inline() {
+    // A failure re-renders the settings page with the message inline
+    // — not a standalone error page — so the operator sees it where
+    // they were.
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/badbots",
+            &[
+                ("_csrf", &csrf),
+                ("badbots_enabled", "true"),
+                ("badbots_evidence_policy", "bogus"),
+                ("badbots_feed_refresh_interval_secs", "300"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("bogus"),
+        "the error must name the offending value: {body}"
+    );
+    assert!(
+        body.contains(r#"action="/settings/badbots""#),
+        "the reputation form must still be on the page: {body}"
+    );
+
+    // The row is unchanged — a rejected form never writes.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let policy: String = conn
+        .query_row(
+            "SELECT evidence_policy FROM badbots_config WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the row exists");
+    assert_eq!(policy, "lenient", "a rejected form must not write");
+}

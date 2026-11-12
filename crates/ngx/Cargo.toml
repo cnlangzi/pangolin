@@ -84,6 +84,10 @@ urlencoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# The refresh service's test builds a library that asks nobody, so it
+# needs the library's own builder. Dev-only: the shipped binary never
+# names the crate — it reads the instance from `App`.
+badbots.workspace = true
 bytes = "1"
 http-body = "0.4"
 http-body-util = "0.1"

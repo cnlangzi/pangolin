@@ -4665,8 +4665,13 @@ async fn raw_get_full(addr: &str, host: &str, path: &str) -> (u16, String) {
         .await
         .expect("connect (5s timeout)")
         .expect("connect");
+    // The harness's user agent, shared: it has to be browser-shaped
+    // (the gateway's reputation check treats a non-browser user agent
+    // as a bot and escalates a throttled client to 403), and the
+    // constant carries the reason.
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: {}\r\n\r\n",
+        crate::harness::DEFAULT_USER_AGENT
     );
     stream
         .write_all(req.as_bytes())

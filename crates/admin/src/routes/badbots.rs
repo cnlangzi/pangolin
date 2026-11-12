@@ -20,7 +20,7 @@ use http::{Response, StatusCode};
 use http_body_util::Full;
 use pangolin_core::{App, BadbotsEvidencePolicy, BadbotsSettings};
 
-use super::helpers::{flash_error, param_bool, redirect};
+use super::helpers::{param_bool, redirect};
 
 /// The smallest refresh interval the gateway accepts, in seconds.
 ///
@@ -83,13 +83,23 @@ pub fn parse_badbots_form(
 ///
 /// The stored key is never rendered back into the form, so an empty
 /// field is the normal case after a save — it must not silently
-/// delete the operator's credential.
+/// delete the operator's credential. A field that carries nothing but
+/// whitespace counts as empty: it is a stray space in a password
+/// input, not an intent to remove the credential. Only the checkbox
+/// removes a key.
 fn api_key(body: &[u8], field: &str, clear_field: &str, current: Option<String>) -> Option<String> {
     if param_bool(body, clear_field, false) {
         return None;
     }
     match super::helpers::require_param(body, field) {
-        Some(value) => Some(value.trim().to_string()).filter(|v| !v.is_empty()),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                current
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
         None => current,
     }
 }
@@ -113,22 +123,31 @@ pub async fn save_badbots_settings(app: &Arc<App>, cfg: BadbotsSettings) -> Resu
 /// `POST /settings/badbots` — validate, persist, rebuild, redirect.
 ///
 /// A failure re-renders the settings page with the error message
-/// inline, so the operator can fix the input without losing the rest
-/// of the form.
+/// inline, where the operator was, instead of a standalone error
+/// page. The page is rendered from the stored row, so the values that
+/// were typed but not saved are lost.
 pub async fn handle_update_badbots(
     app: &Arc<App>,
+    csrf: &str,
     body: &[u8],
 ) -> http::Result<Response<Full<Bytes>>> {
     let current = match app.badbots_settings().await {
         Ok(c) => c,
-        Err(e) => return flash_error(&format!("Reading the current settings failed: {e}")),
+        Err(e) => {
+            return super::settings::render_with_error(
+                app,
+                csrf,
+                &format!("Reading the current settings failed: {e}"),
+            )
+            .await;
+        }
     };
     let parsed = match parse_badbots_form(body, &current) {
         Ok(p) => p,
-        Err(msg) => return flash_error(&msg),
+        Err(msg) => return super::settings::render_with_error(app, csrf, &msg).await,
     };
     if let Err(msg) = save_badbots_settings(app, parsed).await {
-        return flash_error(&msg);
+        return super::settings::render_with_error(app, csrf, &msg).await;
     }
     Ok(redirect("/settings"))
 }
@@ -214,6 +233,20 @@ mod tests {
         )
         .expect("the form parses");
         assert_eq!(parsed.abuseipdb_api_key, None);
+    }
+
+    #[test]
+    fn a_whitespace_only_key_field_keeps_the_stored_key() {
+        // A stray space in the password input is not an intent to
+        // remove the credential: only the checkbox removes a key.
+        let parsed = parse_badbots_form(
+            // `%20` is a percent-encoded space — `require_param` keeps a
+            // literal `+` as `+`, so the space has to be encoded.
+            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300&badbots_abuseipdb_api_key=%20",
+            &current(),
+        )
+        .expect("the form parses");
+        assert_eq!(parsed.abuseipdb_api_key.as_deref(), Some("stored-key"));
     }
 
     #[test]

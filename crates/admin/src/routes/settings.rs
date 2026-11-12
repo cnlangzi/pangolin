@@ -129,3 +129,20 @@ pub async fn handle_update_settings(
         Err(msg) => render_page(app, csrf, Some(&msg)).await,
     }
 }
+
+/// Render the settings page with an error message inline.
+///
+/// Used by the IP reputation form (`POST /settings/badbots`), which is
+/// a form of its own on the page: a failure re-renders the page with
+/// the message where the operator was, instead of a standalone error
+/// page.
+///
+/// The page is rendered from the **stored** row, so the values that
+/// were typed but not saved are lost — the operator retypes them.
+pub async fn render_with_error(
+    app: &Arc<App>,
+    csrf: &str,
+    error: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    render_page(app, csrf, Some(error)).await
+}

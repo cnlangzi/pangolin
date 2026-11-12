@@ -188,7 +188,7 @@ pub async fn raw_request_with_user_agent(
 /// look like a browser; a test that wants the hard `403` sends a bot
 /// user agent explicitly (see `real_e2e_rate_limit_escalates_a_bot_
 /// user_agent_to_403`).
-const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// How a raw request head is shaped.
 ///

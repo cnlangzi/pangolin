@@ -56,7 +56,7 @@ impl BadbotsFeedService {
             match &result.result {
                 Ok(snapshot) => {
                     info!(
-                        "badbots: {} — {} entr(y|ies) loaded",
+                        "badbots: {} — {} entries loaded",
                         result.provider,
                         snapshot.entries.len()
                     );
@@ -154,9 +154,10 @@ mod tests {
     /// A gateway whose reputation check is on has a library, and the
     /// service refreshes it.
     ///
-    /// The refresh itself is the library's business — it honours the
-    /// interval each publisher states — so this only pins that the
-    /// service reaches the library at all.
+    /// The library asks nobody — it is built with no provider at all —
+    /// so the refresh issues no request and the test stays hermetic.
+    /// What it pins is that the service reaches the library instead of
+    /// quietly doing nothing.
     #[tokio::test]
     async fn the_refresh_reaches_the_library() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -169,15 +170,16 @@ mod tests {
             )
             .expect("App::new"),
         );
-        assert!(
-            app.badbots.read().is_some(),
-            "the check is on by default, so there is a library"
-        );
+        let library = badbots::BadBots::builder()
+            .config(badbots::Config::default())
+            .build()
+            .expect("the library builds");
+        *app.badbots.write() = Some(Arc::new(library));
 
         let service = BadbotsFeedService::new(DEFAULT_INTERVAL);
-        // The publishers are not reachable from a unit test, so the
-        // refresh reports a failure — what matters is that it ran and
-        // did not panic.
-        let _ = service.refresh_once(&app).await;
+        assert!(
+            service.refresh_once(&app).await,
+            "a library with no publisher is not a failure"
+        );
     }
 }

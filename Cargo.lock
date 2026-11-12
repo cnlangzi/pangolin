@@ -2133,6 +2133,7 @@ dependencies = [
  "admin",
  "anyhow",
  "async-trait",
+ "badbots",
  "base64 0.22.1",
  "bytes",
  "chrono",
