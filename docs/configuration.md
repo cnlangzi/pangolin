@@ -201,6 +201,10 @@ Shape of the `config` JSON per kind:
 | `bot.dir`              | `path`   | `./logs/bots` | no | Output directory for `bot-YYYY-MM-DD.jsonl`. Created lazily on first write. Rotation is **daily at UTC 00:00**; no size-based rotation in v1 (the operator can `logrotate` / `find -mtime` for retention). |
 | `bot.cache_dir`        | `path`   | `./logs/bots/cache` | no | knownbots cache root: per-bot `ips.txt` (downloaded CIDRs) and `rdns.txt` (successful PTR results). A `conf.d/` sub-directory may hold extra bot YAMLs; one that cannot be parsed is **skipped and reported** on `/logs/bots` (the gateway still starts). |
 | `bot.refresh_interval_secs` | `u64` | `86400` | no | Seconds between successful official IP-list refreshes. On refresh failure the scheduler retries with exponential backoff (5s → 5min) instead of waiting a full interval. `0` still runs one startup refresh, then sleeps for a very long time. |
+| `referer.enabled`        | `bool`   | `true`  | no       | Master switch for the referer log side-channel. When `false` the gateway does not read the `Referer` header at all, no rows are recorded, no JSONL is written, and `/logs/referers*` says the feature is disabled. |
+| `referer.recent`         | `usize`  | `200`   | no       | Capacity of the in-memory ring buffer for `/logs/referers` late-join replay. Set to `0` to disable replay (the live SSE + JSONL still work). |
+| `referer.capacity`       | `usize`  | `1000`  | no       | Capacity of the dedicated `tokio::sync::broadcast` channel for referral rows. A lagged subscriber sees `: lagged N events` on `/api/logs/referers/stream`. |
+| `referer.dir`            | `path`   | `./logs/referers` | no | Output directory for `referer-YYYY-MM-DD.jsonl`. Created lazily on first write. Rotation is **daily at UTC 00:00**; no size-based rotation in v1 (the operator can `logrotate` / `find -mtime` for retention). |
 | `traffic.enabled`      | `bool`   | `true`  | no       | Master switch for the in-memory traffic side-channel. When `false` the aggregator thread is not spawned and the proxy hot path skips `try_send`. See [design/traffic.md](design/traffic.md). |
 
 > **In-memory access log + `/logs` admin page (issue #73).** Every
@@ -227,6 +231,25 @@ Shape of the `config` JSON per kind:
 > Verification order: case-sensitive word-boundary UA match →
 > official/custom CIDR → cached RDNS (with FCrDNS on cold lookup).
 > See [design/bot-log.md](design/bot-log.md).
+
+> **Referer log side-channel.** Each request's `Referer` header is
+> read on the hot path, but only a **top-level document navigation**
+> (`Sec-Fetch-Dest: document`, or an `Accept` header containing
+> `text/html` when that header is absent) is eligible — a page view
+> pulls a couple of dozen subresources, each carrying the same
+> `Referer` header, so counting requests would inflate the figure
+> roughly twentyfold. A referral is recorded when the referrer's
+> owning **site** differs from the site serving the request; a link
+> between two domains of the same site is internal and is not
+> recorded. A referral to another site of ours is recorded as an
+> ordinary external referral — it is not labelled as ours.
+>
+> Each row stores the referring URL without its query string,
+> fragment and userinfo, plus the lowercased referrer host (the
+> grouping key). The rows carry **no** site name: the site is
+> resolved at query time from the live index, so re-pointing a
+> domain re-groups its history. See
+> [design/referer-log.md](design/referer-log.md).
 
 ### `[tls]` — TLS listener tuning
 

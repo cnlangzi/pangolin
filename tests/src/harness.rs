@@ -140,8 +140,11 @@ pub async fn raw_request(
         method,
         path,
         body,
-        /* send_content_length */ true,
-        DEFAULT_USER_AGENT,
+        RawRequestOptions {
+            send_content_length: true,
+            user_agent: DEFAULT_USER_AGENT,
+            extra_headers: &[],
+        },
     )
     .await
 }
@@ -160,7 +163,16 @@ pub async fn raw_request_with_user_agent(
     user_agent: &str,
 ) -> (u16, String) {
     raw_request_inner(
-        addr, host, method, path, body, /* send_content_length */ true, user_agent,
+        addr,
+        host,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            send_content_length: true,
+            user_agent,
+            extra_headers: &[],
+        },
     )
     .await
 }
@@ -168,6 +180,23 @@ pub async fn raw_request_with_user_agent(
 /// The `User-Agent` the raw request helpers send unless the test asks
 /// for another one.
 const DEFAULT_USER_AGENT: &str = "pangolin-e2e";
+
+/// How a raw request head is shaped.
+///
+/// Bundled into one struct so the shared low-level helper stays
+/// under clippy's argument-count limit — the number of knobs a raw
+/// request carries has grown over time (content-length framing, a
+/// custom user agent, extra headers) and each one used to be its own
+/// positional parameter.
+struct RawRequestOptions<'a> {
+    /// Emit the `Content-Length` framing header.
+    send_content_length: bool,
+    /// The `User-Agent` to send.
+    user_agent: &'a str,
+    /// Extra headers. A name that matches a default header replaces
+    /// it (case-insensitively).
+    extra_headers: &'a [(&'a str, &'a str)],
+}
 
 /// Issue a raw HTTP/1.1 request **without** a `Content-Length` header.
 ///
@@ -188,25 +217,67 @@ pub async fn raw_request_no_content_length(
         method,
         path,
         b"",
-        /* send_content_length */ false,
-        DEFAULT_USER_AGENT,
+        RawRequestOptions {
+            send_content_length: false,
+            user_agent: DEFAULT_USER_AGENT,
+            extra_headers: &[],
+        },
+    )
+    .await
+}
+
+/// Issue a raw HTTP/1.1 request with **arbitrary extra headers**.
+///
+/// The referer log's detection rule reads `Referer`, `Sec-Fetch-Dest`
+/// and `Accept`, so a test that exercises it needs to put those
+/// headers on the wire — the fixed-header helpers can't.
+///
+/// An extra header whose name matches one of the defaults (`Host`,
+/// `Connection`, `User-Agent`, `Accept`, `Content-Length`)
+/// **replaces** it; the comparison is case-insensitive, as HTTP
+/// header names are. That matters for `Accept`: the default is
+/// `*/*`, and a test that wants the `text/html` fallback must
+/// replace it rather than send a second `Accept` line.
+pub async fn raw_request_with_headers(
+    addr: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    raw_request_inner(
+        addr,
+        host,
+        method,
+        path,
+        body,
+        RawRequestOptions {
+            send_content_length: true,
+            user_agent: DEFAULT_USER_AGENT,
+            extra_headers,
+        },
     )
     .await
 }
 
 /// Shared low-level path for the `raw_request*` helpers. The only
-/// thing they vary on is whether the `Content-Length` framing header
-/// is emitted and which `User-Agent` is sent; everything else
-/// (timeout, headers, response parsing) is the same.
+/// things they vary on are whether the `Content-Length` framing header
+/// is emitted, which `User-Agent` is sent, and which extra headers
+/// are added; everything else (timeout, response parsing) is the same.
 async fn raw_request_inner(
     addr: &str,
     host: &str,
     method: &str,
     path: &str,
     body: &[u8],
-    send_content_length: bool,
-    user_agent: &str,
+    opts: RawRequestOptions<'_>,
 ) -> (u16, String) {
+    let RawRequestOptions {
+        send_content_length,
+        user_agent,
+        extra_headers,
+    } = opts;
     let timeout = Duration::from_secs(5);
 
     let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
@@ -214,11 +285,32 @@ async fn raw_request_inner(
         .expect("connect to addr (5s timeout)")
         .expect("connect to addr");
 
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: {user_agent}\r\nAccept: */*\r\n",
-    );
+    // Start from the default header set, then let each extra header
+    // replace a same-named default (case-insensitively) or be
+    // appended. Keeping the list ordered means the request head
+    // reads like a real one.
+    let mut headers: Vec<(String, String)> = vec![
+        ("Host".into(), host.to_string()),
+        ("Connection".into(), "close".into()),
+        ("User-Agent".into(), user_agent.to_string()),
+        ("Accept".into(), "*/*".into()),
+    ];
     if send_content_length {
-        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        headers.push(("Content-Length".into(), body.len().to_string()));
+    }
+    for (name, value) in extra_headers {
+        match headers
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            Some(slot) => slot.1 = (*value).to_string(),
+            None => headers.push(((*name).to_string(), (*value).to_string())),
+        }
+    }
+
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    for (name, value) in &headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
     }
     req.push_str("\r\n");
     stream
@@ -529,6 +621,17 @@ acme:
     /// install a per-host cert before connecting with TLS+SNI.
     pub fn cert_dir(&self) -> PathBuf {
         self.cert_dir.clone()
+    }
+
+    /// The binary's working directory — the per-test tempdir. The
+    /// child process is spawned with `current_dir(tmpdir)`, so every
+    /// *relative* path the binary uses (the default
+    /// `./logs/referers`, the `pangolin.db` file) lands here.
+    ///
+    /// A test that needs to inspect a file the binary wrote reads it
+    /// under this directory.
+    pub fn work_dir(&self) -> PathBuf {
+        self._tmpdir.path().to_path_buf()
     }
 
     /// Path to the SQLite database backing this `pangolin-ngx`. Lives

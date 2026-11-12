@@ -49,6 +49,15 @@ use pangolin_core::{
 
 use crate::App;
 
+/// Longest `Referer` header value the gateway will look at.
+///
+/// The HTTP header parser already bounds the total header size, so
+/// this is a second, tighter guard against a client making the
+/// gateway copy a multi-kilobyte string on every request. Any real
+/// linking URL is orders of magnitude shorter; a longer value is a
+/// sign of abuse and is treated as "no referer".
+const MAX_REFERRER_HEADER_LEN: usize = 4_096;
+
 // ─────────────────────────────────────────────────────────────────
 //  BackendExecutor — transport abstraction
 // ─────────────────────────────────────────────────────────────────
@@ -265,6 +274,30 @@ pub struct RequestState {
     pub traffic_route: pangolin_core::TrafficRoute,
     pub traffic_kind: pangolin_core::TrafficKind,
     pub host_known: bool,
+    /// The raw `Referer` header, captured once per request in
+    /// `request_filter`. `None` when the client sent none, the
+    /// header wasn't valid UTF-8, or the referer log is disabled.
+    ///
+    /// Kept raw because the classification needs the full URL: the
+    /// parsed form ([`Self::referer_hit`]) is derived from it at the
+    /// site lookup, and a request that turns out to be ineligible
+    /// never pays for the parse.
+    pub referer: Option<String>,
+    /// `Sec-Fetch-Dest` header value — the primary signal for
+    /// "is this a top-level document navigation".
+    pub sec_fetch_dest: Option<String>,
+    /// `Accept` header value — the fallback signal, used only when
+    /// `Sec-Fetch-Dest` is absent.
+    pub accept: Option<String>,
+    /// The resolved external referral, or `None` when the request
+    /// is not an external document navigation.
+    ///
+    /// Written at the site lookup, inside the index-lock scope
+    /// `request_filter` already holds — the classification needs the
+    /// current site *and* the owning site of the referer host, and
+    /// both live in the index. Resolving it here is what keeps the
+    /// logging path from taking the index lock a second time.
+    pub referer_hit: Option<pangolin_core::RefererHit>,
 }
 
 impl Default for RequestState {
@@ -282,6 +315,10 @@ impl Default for RequestState {
             traffic_route: pangolin_core::TrafficRoute::Unknown,
             traffic_kind: pangolin_core::TrafficKind::Http,
             host_known: false,
+            referer: None,
+            sec_fetch_dest: None,
+            accept: None,
+            referer_hit: None,
         }
     }
 }
@@ -335,6 +372,43 @@ impl ProxyHttp for AppProxy {
             .headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok().map(String::from));
+
+        // Referer log (inbound external referrals): capture the three
+        // headers the classification needs, next to the User-Agent
+        // capture above so all the request-header reads happen in one
+        // place on the hot path.
+        //
+        // The header is only read when the feature is enabled
+        // (`log.referer.enabled`), so a deploy that turns the
+        // feature off pays nothing for the capture.
+        //
+        // `Referer` is a client-supplied value: it is truncated by
+        // the header parser, but we still keep it short. A referer
+        // URL longer than this is a sign of abuse, not of a real
+        // link, and the referrer *host* — the only thing the
+        // classification and the rollup use — is already captured
+        // in the first few bytes.
+        if self.app.config.log.referer.enabled {
+            ctx.referer = session
+                .req_header()
+                .headers
+                .get("referer")
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.is_empty() && v.len() <= MAX_REFERRER_HEADER_LEN)
+                .map(String::from);
+            ctx.sec_fetch_dest = session
+                .req_header()
+                .headers
+                .get("sec-fetch-dest")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            ctx.accept = session
+                .req_header()
+                .headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+        }
 
         // The TCP peer, resolved once per request.
         let peer = peer_addr_std(session);
@@ -419,6 +493,23 @@ impl ProxyHttp for AppProxy {
             .get(&site.name)
             .cloned()
             .unwrap_or_else(|| Arc::new(pangolin_core::provider::SiteProviderConfig::default()));
+
+        // ── Referer classification (inbound external referrals) ──
+        //
+        // The verdict needs two things that both live in the index:
+        // the *current* site (just resolved above) and the *owning*
+        // site of the referer host. Resolving it here — inside the
+        // lock scope `request_filter` already holds — is what keeps
+        // the logging path from taking the index lock a second time.
+        // `App::push_access_log` is synchronous and could not await
+        // the async index lock anyway.
+        //
+        // A referral is external when the referer host belongs to a
+        // different site of ours — or to no site of ours at all. A
+        // referral inside the current site is internal and is not
+        // recorded.
+        ctx.referer_hit = classify_referer(ctx, &site.name, &indexes.domain);
+
         drop(indexes);
         // The host is known from here on — a rate-limited request is
         // still attributed to its host in the traffic side-channel.
@@ -2259,6 +2350,45 @@ fn warn_once_per_value(name: &str, value: &str) {
     }
 }
 
+/// Classify a request's `Referer` header into an external referral.
+///
+/// Returns `Some(hit)` when the request is a **top-level document
+/// navigation** whose referrer belongs to a different site (or to no
+/// site of ours at all). Returns `None` for every other request:
+/// a subresource, a request without a referer, a referer without a
+/// host, or a referer inside the current site.
+///
+/// Pure function over the request state and the domain index — the
+/// caller holds the index lock.
+///
+/// The eligibility rule is decided from the **request**, not from the
+/// response's `Content-Type`: the request-side signal is available
+/// uniformly on every path that reaches the access log (including the
+/// `file://` and tunnel short-circuits) and needs no upstream round
+/// trip.
+fn classify_referer(
+    ctx: &RequestState,
+    current_site: &str,
+    domain: &std::collections::HashMap<String, Arc<pangolin_core::Site>>,
+) -> Option<pangolin_core::RefererHit> {
+    let raw = ctx.referer.as_deref()?;
+    // Document-ness is checked first: it is a header lookup plus a
+    // substring compare, while the parse allocates two `String`s. A
+    // subresource request carries the same `Referer` as its parent
+    // page, so most requests that reach this point fail here.
+    if !pangolin_core::referer::is_document_request(
+        ctx.sec_fetch_dest.as_deref(),
+        ctx.accept.as_deref(),
+    ) {
+        return None;
+    }
+    let hit = pangolin_core::referer::parse_referer(raw)?;
+    if !pangolin_core::referer::is_external_referer(&hit.referer_host, current_site, domain) {
+        return None;
+    }
+    Some(hit)
+}
+
 /// Append the access-log entry to the live broadcast + ring buffer
 /// (issue #73 + fix-client-ip + issue #115).
 ///
@@ -2268,6 +2398,11 @@ fn warn_once_per_value(name: &str, value: &str) {
 /// knownbots verification all show the same string (R10). The
 /// `unknown` literal is preserved as the final fallback so old
 /// log-parsing scripts do not break.
+///
+/// The referer side-channel is fanned out from here too, through a
+/// **separate** [`App::push_referer_log`] call: the bot branch of
+/// `push_access_log` returns early in five places, so a referer
+/// branch placed after it would never fire.
 async fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
     let entry = pangolin_core::AccessLogEntry {
@@ -2284,6 +2419,11 @@ async fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16) {
         // side-channel; a missing UA simply skips the bot path.
         user_agent: ctx.user_agent.clone(),
     };
+    // The referer fan-out goes first: it needs a borrow of the
+    // entry, and `push_access_log` consumes it.
+    if let Some(hit) = ctx.referer_hit.as_ref() {
+        app.push_referer_log(&entry, hit);
+    }
     app.push_access_log(entry);
 }
 

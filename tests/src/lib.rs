@@ -123,6 +123,9 @@ mod admin_dns_e2e;
 mod access_log_e2e;
 
 #[cfg(feature = "integration")]
+mod referer_log_e2e;
+
+#[cfg(feature = "integration")]
 mod traffic_e2e;
 
 #[cfg(feature = "integration")]

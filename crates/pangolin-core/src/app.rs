@@ -17,6 +17,9 @@ use crate::bot_stats::BotStats;
 use crate::cidr::CidrSet;
 use crate::provider::{GlobalProviderConfig, GuardRejectionCounter, ProviderKey};
 use crate::ratelimit::RateLimiter;
+use crate::referer::RefererHit;
+use crate::referer_log::{RefererLogBuffer, RefererLogEntry, RefererLogWriter};
+use crate::referer_stats::RefererStats;
 use crate::traffic::TrafficHub;
 use crate::tunnel::YamuxTunnel;
 use crate::{
@@ -429,6 +432,49 @@ pub struct App {
     /// always a single `Option::take` and we never hold the guard
     /// across an await.
     bot_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+
+    /// Referer log side-channel (inbound external referrals).
+    ///
+    /// [`App::push_referer_log`] fans an entry out to:
+    ///
+    ///   - [`Self::referer_log_recent`] — in-memory ring buffer for
+    ///     the admin UI's `/logs/referers` late-join replay.
+    ///   - [`Self::referer_log_tx`] — dedicated SSE channel
+    ///     (`/api/logs/referers/stream`).
+    ///   - [`Self::referer_stats`] — per-(referer_host, host) hit
+    ///     counters for the admin dashboard.
+    ///   - [`Self::referer_writer`] — async JSONL writer that
+    ///     appends one line per entry to
+    ///     `referer-YYYY-MM-DD.jsonl` under `config.log.referer.dir`.
+    ///
+    /// Independent of the bot channel: a bot's referral is a
+    /// separate question from "where did this visitor come from",
+    /// and the bot channel's fail-closed verification must not leak
+    /// into this one.
+    ///
+    /// All four writes are synchronous on the request hot path
+    /// (no `await`); the actual disk write happens in the
+    /// background `RefererLogWriter::run` task.
+    pub referer_log_tx: broadcast::Sender<RefererLogEntry>,
+    /// In-memory ring buffer for referral rows (default 200).
+    pub referer_log_recent: Arc<RefererLogBuffer>,
+    /// Per-(referer_host, host) hit counters.
+    pub referer_stats: Arc<RefererStats>,
+    /// Background JSONL writer. `None` when `log.referer.enabled`
+    /// is `false` — the feature is then fully off (no capture, no
+    /// rows, no live stream data).
+    ///
+    /// Like the bot writer, the writer *object* is built in
+    /// [`App::new`] but the task that drains its queue is **not**
+    /// spawned there — `App::new` runs from synchronous `main()`
+    /// before any tokio runtime exists. Callers must invoke
+    /// [`App::start_referer_writer`] exactly once after entering a
+    /// tokio runtime.
+    pub referer_writer: Option<Arc<RefererLogWriter>>,
+    /// `JoinHandle` for the background referer-writer task.
+    /// Populated by [`App::start_referer_writer`], consumed by
+    /// [`App::shutdown_referer_writer`].
+    referer_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// In-memory traffic stats (no persistence). Hot path is
     /// `on_start` / `on_finish` (`try_send` only); aggregation
     /// lives on a dedicated OS thread. See `docs/design/traffic.md`.
@@ -604,6 +650,21 @@ impl App {
         let bot_writer = Some(BotLogWriter::new(bot_cfg.dir.clone()));
         let bot_verifier = Some(verifier);
 
+        // Referer log side-channel (inbound external referrals).
+        //
+        // The channel, the ring buffer and the counters exist even
+        // when the feature is disabled — `push_referer_log` is the
+        // single gate, and the admin pages read `config.log.referer.enabled`
+        // to render the "disabled" notice. The *writer* is `None`
+        // when disabled so no JSONL file is ever created.
+        let referer_cfg = &config.log.referer;
+        let (referer_log_tx, _initial_referer_rx) = broadcast::channel(referer_cfg.capacity.max(1));
+        let referer_log_recent = Arc::new(RefererLogBuffer::new(referer_cfg.recent));
+        let referer_stats = RefererStats::new();
+        let referer_writer = referer_cfg
+            .enabled
+            .then(|| RefererLogWriter::new(referer_cfg.dir.clone()));
+
         let traffic_enabled = config.log.traffic.enabled;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
@@ -627,6 +688,11 @@ impl App {
             bot_writer,
             bot_verifier,
             bot_writer_task: parking_lot::Mutex::new(None),
+            referer_log_tx,
+            referer_log_recent,
+            referer_stats,
+            referer_writer,
+            referer_writer_task: parking_lot::Mutex::new(None),
             cert_links,
             traffic: TrafficHub::new(traffic_enabled),
             rate_limiter,
@@ -839,6 +905,130 @@ impl App {
     /// (`access_log_recent: 0`).
     pub fn recent_access_log(&self) -> Vec<AccessLogEntry> {
         self.access_log_recent.snapshot()
+    }
+
+    /// Fan one external-referral row out to the referer channel.
+    ///
+    /// Called by the proxy once it has decided that a request is an
+    /// *external* referral (a top-level document navigation whose
+    /// `Referer` host belongs to another site — see
+    /// [`crate::referer::is_external_referer`]).
+    ///
+    /// It is a **separate** method rather than a branch inside
+    /// [`App::push_access_log`]: the bot branch of that method
+    /// returns early in five places, so a referer branch placed
+    /// after it would never fire. It also keeps the
+    /// [`AccessLogEntry`] wire format unchanged, so the general
+    /// `/logs` SSE stream and the bot JSONL are unaffected.
+    ///
+    /// The whole fan-out is synchronous (no `.await`); the actual
+    /// disk write happens in the background `RefererLogWriter::run`
+    /// task.
+    ///
+    /// No-op when `log.referer.enabled` is `false` — the writer is
+    /// `None` in that case, which is the single gate.
+    pub fn push_referer_log(&self, entry: &AccessLogEntry, hit: &RefererHit) {
+        let Some(writer) = self.referer_writer.as_ref() else {
+            return;
+        };
+        let referer_entry = RefererLogEntry::from_access_log(entry, hit);
+
+        self.referer_log_recent.push(referer_entry.clone());
+        self.referer_stats.record(&referer_entry);
+        writer.enqueue(referer_entry.clone());
+        let _ = self.referer_log_tx.send(referer_entry);
+    }
+
+    /// Snapshot the referer log ring buffer in chronological order
+    /// (oldest first). Used by `/api/logs/referers/stream` to replay
+    /// entries on connect. Empty Vec when the referer log is
+    /// disabled or `referer.recent: 0`.
+    pub fn recent_referer_log(&self) -> Vec<RefererLogEntry> {
+        self.referer_log_recent.snapshot()
+    }
+
+    /// Snapshot per-(referer_host, host) hit counters + totals.
+    /// Used by the `/logs/referers` dashboard card.
+    pub fn referer_stats_snapshot(
+        &self,
+    ) -> (
+        Vec<crate::referer_stats::RefererStatsRow>,
+        crate::referer_stats::RefererStatsSummary,
+    ) {
+        self.referer_stats.snapshot()
+    }
+
+    /// Spawn the background referer-log writer task. Must be called
+    /// **once**, from inside a tokio runtime context, after
+    /// [`App::new`].
+    ///
+    /// Returns `true` if the task was spawned, `false` if any of:
+    ///   - no tokio runtime is in scope (e.g. unit tests without
+    ///     `#[tokio::test]`)
+    ///   - `start_referer_writer` was already called once (idempotent
+    ///     guard — second call is a no-op)
+    ///   - the referer log is disabled (`log.referer.enabled: false`)
+    pub fn start_referer_writer(&self) -> bool {
+        let Some(writer) = self.referer_writer.as_ref() else {
+            return false;
+        };
+        let mut guard = self.referer_writer_task.lock();
+        if guard.is_some() {
+            // Already started — second call is a silent no-op so a
+            // careless caller doesn't double-spawn and leak a task.
+            return false;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::warn!(
+                "referer_log: writer task not spawned — no tokio runtime in scope. \
+                 JSONL disk writes are disabled. Call App::start_referer_writer() \
+                 from inside a runtime context (main.rs does this automatically)."
+            );
+            return false;
+        };
+        let writer_for_task = writer.clone();
+        let join = handle.spawn(async move { writer_for_task.run().await });
+        *guard = Some(join);
+        true
+    }
+
+    /// Trigger a graceful shutdown of the referer log writer task and
+    /// wait for it to exit, so the last rows are flushed before the
+    /// process exits.
+    ///
+    /// Called from `main` after pingora's drain, next to
+    /// [`App::shutdown_bot_writer`].
+    pub async fn shutdown_referer_writer(&self) {
+        let Some(writer) = self.referer_writer.as_ref() else {
+            return;
+        };
+        let handle = self.referer_writer_task.lock().take();
+        writer.shutdown();
+        let Some(handle) = handle else {
+            // Task was never spawned (`start_referer_writer` returned
+            // false because there was no runtime). Nothing to wait
+            // for; silent return.
+            return;
+        };
+        match tokio::time::timeout(Self::writer_shutdown_timeout(), handle).await {
+            Ok(Ok(())) => {
+                // Task exited cleanly within the timeout.
+            }
+            Ok(Err(join_err)) => {
+                // The task itself panicked. Surfaces as a loud log so
+                // the operator investigates.
+                log::error!("referer_log: writer task panicked: {join_err}");
+            }
+            Err(_elapsed) => {
+                // Wedged disk / stuck fsync. Log loudly but don't
+                // block process exit.
+                log::warn!(
+                    "referer_log: writer shutdown deadline ({:?}) reached; \
+                     disk may be wedged.",
+                    Self::writer_shutdown_timeout()
+                );
+            }
+        }
     }
 
     /// Snapshot the bot log ring buffer in chronological order
@@ -1652,6 +1842,7 @@ mod tests {
                 // The bot log is always on (issue #117) — the
                 // defaults are the operator-visible knobs.
                 bot: crate::BotLogConfig::default(),
+                referer: crate::RefererLogConfig::default(),
                 traffic: crate::TrafficConfig::default(),
             },
             ..Config::default()
@@ -2183,6 +2374,151 @@ mod tests {
         assert!(app.start_bot_writer(), "first spawn must succeed");
         assert!(
             !app.start_bot_writer(),
+            "second call must be a silent no-op (return false)"
+        );
+    }
+
+    // ---- Referer log side-channel tests ----
+
+    /// Build a `RefererHit` for the given referrer host.
+    fn referer_hit(referer_host: &str) -> crate::referer::RefererHit {
+        crate::referer::RefererHit {
+            referer: format!("https://{referer_host}/landing"),
+            referer_host: referer_host.into(),
+        }
+    }
+
+    /// The referer fan-out must reach the ring buffer, the counters,
+    /// the JSONL writer and the broadcast channel — and must not
+    /// disturb the bot channel.
+    #[test]
+    fn push_referer_log_routes_to_every_referer_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        cfg.log.referer.dir = dir.path().to_path_buf();
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(app.referer_writer.is_some());
+
+        let mut rx = app.referer_log_tx.subscribe();
+        let entry = make_entry("GET", "/landing", 200);
+        app.push_referer_log(&entry, &referer_hit("news.example.org"));
+
+        // 1) Ring buffer.
+        let snap = app.recent_referer_log();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].referer_host, "news.example.org");
+        assert_eq!(snap[0].host, "example.com");
+        assert_eq!(snap[0].path, "/landing");
+
+        // 2) Counters.
+        let (rows, summary) = app.referer_stats_snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hits, 1);
+        assert_eq!(rows[0].referer_host, "news.example.org");
+        assert_eq!(rows[0].host, "example.com");
+        assert_eq!(summary.total_records, 1);
+
+        // 3) Broadcast channel.
+        let delivered = tokio_test_block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("referer recv timed out")
+                .expect("referer broadcast channel closed unexpectedly")
+        });
+        assert_eq!(delivered.referer_host, "news.example.org");
+
+        // 4) The bot channel is untouched — the two side-channels are
+        //    independent.
+        assert!(app.recent_bot_log().is_empty());
+    }
+
+    /// `log.referer.enabled: false` must suppress the capture
+    /// entirely: no rows, no counters, no writer.
+    #[test]
+    fn push_referer_log_is_a_noop_when_the_feature_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        cfg.log.referer.enabled = false;
+        cfg.log.referer.dir = dir.path().to_path_buf();
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.referer_writer.is_none(),
+            "no writer may exist when the feature is disabled"
+        );
+
+        let entry = make_entry("GET", "/landing", 200);
+        app.push_referer_log(&entry, &referer_hit("news.example.org"));
+
+        assert!(app.recent_referer_log().is_empty());
+        let (rows, summary) = app.referer_stats_snapshot();
+        assert!(rows.is_empty());
+        assert_eq!(summary.total_records, 0);
+    }
+
+    /// The JSONL writer writes one JSON object per line into
+    /// `referer-YYYY-MM-DD.jsonl`.
+    #[tokio::test]
+    async fn push_referer_log_writer_task_writes_jsonl_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        cfg.log.referer.dir = dir.path().to_path_buf();
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.start_referer_writer(),
+            "writer task must spawn inside the #[tokio::test] runtime"
+        );
+
+        let entry = make_entry("GET", "/landing", 200);
+        app.push_referer_log(&entry, &referer_hit("news.example.org"));
+
+        let today = chrono::Utc::now().date_naive();
+        let path = dir.path().join(format!("referer-{today}.jsonl"));
+        let mut found: Option<String> = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(s) = std::fs::read_to_string(&path)
+                && s.lines().count() >= 1
+            {
+                found = Some(s);
+                break;
+            }
+        }
+
+        app.shutdown_referer_writer().await;
+
+        let body = found.expect("referer jsonl file should have 1 line after polling");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1, "expected 1 JSONL line, got: {body}");
+        let v: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("line 0 must be valid JSON");
+        assert_eq!(v["referer_host"], "news.example.org");
+        assert_eq!(v["host"], "example.com");
+        assert_eq!(v["path"], "/landing");
+    }
+
+    /// `start_referer_writer` must be a silent no-op without a
+    /// runtime (mirrors the bot writer's contract).
+    #[test]
+    fn start_referer_writer_no_runtime_returns_false_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(!app.start_referer_writer());
+    }
+
+    #[tokio::test]
+    async fn start_referer_writer_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(app.start_referer_writer(), "first spawn must succeed");
+        assert!(
+            !app.start_referer_writer(),
             "second call must be a silent no-op (return false)"
         );
     }

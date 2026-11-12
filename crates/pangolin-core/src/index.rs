@@ -256,24 +256,53 @@ fn rebuild_tun_index(sites: &[SiteWithDomains]) -> HashMap<String, Vec<Arc<Domai
 ///   `foo.bar.example.com`        → exact miss → `*.bar.example.com`
 ///                                 (preferred over `*.example.com`)
 ///   `Foo.Example.COM:8443`       → normalize → `foo.example.com` → exact miss → `*.example.com`
+///
+/// The walk itself lives in [`site_of_host`], so the referer channel
+/// can resolve a host against the same map without going through
+/// the whole [`Indexes`].
 pub fn lookup_site(index: &Indexes, host: &str) -> Option<Arc<Site>> {
-    let domain = normalize_host(host);
+    site_of_host(&index.domain, host).cloned()
+}
+
+/// Resolve the owning site of `host` against a domain → site map.
+///
+/// Same resolution rule as [`lookup_site`] — exact match first, then
+/// the wildcard walk — but it takes the domain map directly instead of
+/// the whole [`Indexes`], so a caller that already holds the map (or a
+/// scoped copy of it) can resolve a host without taking the index lock
+/// a second time.
+///
+/// The referer channel uses this for two things that must agree:
+/// the request-time "is this referral external?" decision and the
+/// query-time "which site does this row belong to?" grouping. Sharing
+/// one function is what keeps the two from drifting — a hand-rolled
+/// string comparison would classify `notexample.com` as internal for
+/// `example.com`.
+///
+/// `domain` is expected to hold the same keys as `Indexes.domain`:
+/// exact FQDNs (`foo.example.com`) and wildcard literals
+/// (`*.example.com`).
+pub fn site_of_host<'a>(
+    domain: &'a HashMap<String, Arc<Site>>,
+    host: &str,
+) -> Option<&'a Arc<Site>> {
+    let normalized = normalize_host(host);
 
     // 1. exact match
-    if let Some(site) = index.domain.get(&domain) {
-        return Some(site.clone());
+    if let Some(site) = domain.get(&normalized) {
+        return Some(site);
     }
 
     // 2. wildcard fall back: replace first label with `*`, re-lookup.
     //    Iteration 1: strip first label, prepend `*`.
     //    Iteration 2: strip first label of *that*, prepend `*`.
     //    ... until no more dots.
-    let mut rest: &str = &domain;
+    let mut rest: &str = &normalized;
     while let Some(dot) = rest.find('.') {
         rest = &rest[dot + 1..];
         let candidate = format!("*.{}", rest);
-        if let Some(site) = index.domain.get(&candidate) {
-            return Some(site.clone());
+        if let Some(site) = domain.get(&candidate) {
+            return Some(site);
         }
     }
 

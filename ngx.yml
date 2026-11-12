@@ -163,3 +163,35 @@ log:
     recent: 200
     capacity: 1000
     dir: ./logs/bots
+  # ── Referer log side-channel (inbound external referrals) ────────
+  # Records the `Referer` header of every *top-level document
+  # navigation* that lands on one of our sites from another site.
+  # Rows are written to `<dir>/referer-YYYY-MM-DD.jsonl` (UTC daily
+  # rotation), fed to a dedicated `/api/logs/referers/stream` SSE
+  # channel, and counted per (referrer host, served host) pair for
+  # the `/logs/referers` dashboard card.
+  #
+  # Only document navigations are eligible — a page view pulls a
+  # couple of dozen subresources, each carrying the same `Referer`
+  # header, so counting requests would inflate the figure roughly
+  # twentyfold. A referral inside the current *site* (a link
+  # between two of its own domains) is internal and is not
+  # recorded.
+  #
+  #   * `enabled`    master switch. `false` turns the capture off
+  #                  entirely: no header is read, no row is
+  #                  recorded, no JSONL is written, and the admin
+  #                  pages say the feature is disabled.
+  #                  Default true.
+  #   * `recent`     in-memory ring buffer for `/logs/referers`
+  #                  late-join replay. 0 disables replay; the
+  #                  live SSE + JSONL still work. Default 200.
+  #   * `capacity`   tokio broadcast channel capacity for the
+  #                  referer-only SSE fan-out. Default 1000.
+  #   * `dir`        output directory for `referer-YYYY-MM-DD.jsonl`.
+  #                  Created lazily on first write.
+  referer:
+    enabled: true
+    recent: 200
+    capacity: 1000
+    dir: ./logs/referers

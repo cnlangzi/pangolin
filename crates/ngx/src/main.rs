@@ -205,6 +205,13 @@ fn main() -> anyhow::Result<()> {
         // disabled (so the call is always safe).
         app_for_shutdown.start_bot_writer();
 
+        // Spawn the referer-log JSONL writer task. Same reasoning as
+        // the bot writer above: `App::new` runs before the runtime
+        // exists, so the task has to be spawned from inside it.
+        // Returns `false` when `log.referer.enabled` is false — the
+        // call is safe either way.
+        app_for_shutdown.start_referer_writer();
+
         let mut handles = Vec::with_capacity(services.len());
         for svc in services.into_iter() {
             handles.push(runtime::spawn_service(svc, ctx.clone()));
@@ -223,6 +230,10 @@ fn main() -> anyhow::Result<()> {
         // drain and `await` its completion (Gap #5/#6 fix — was
         // previously fire-and-forget).
         app_for_shutdown.shutdown_bot_writer().await;
+        // Referer log JSONL writer flush — same reasoning as the bot
+        // writer: the last referral rows must reach the disk before
+        // the process exits.
+        app_for_shutdown.shutdown_referer_writer().await;
         // Ask the traffic aggregator to exit on its next tick.
         // Join happens when `App` drops, not on the host runtime.
         app_for_shutdown.traffic.shutdown();
