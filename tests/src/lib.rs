@@ -43,6 +43,13 @@ mod cargo_mirror;
 #[cfg(test)]
 mod release_version;
 
+// Dependency-swap regression tests (the `knownbots` crate moved out
+// of this repository, issue #146).  Like the mirror tests above, these
+// need neither the `integration` feature nor a real binary: they parse
+// the manifests and the lockfile.
+#[cfg(test)]
+mod knownbots_dependency;
+
 #[cfg(feature = "integration")]
 mod backend;
 

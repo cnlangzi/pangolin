@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use knownbots::{Validator, VerifyResult, VerifyStatus};
+use knownbots::{BotKind, Validator, VerifyResult, VerifyStatus};
 
 /// Identity of a verified bot, ready for the JSONL / SSE / stats sinks.
 ///
@@ -91,16 +91,38 @@ impl BotCategory {
             }
         }
     }
+}
 
-    /// Parse the wire label produced by knownbots `BotKind::to_category_label`.
-    pub fn from_label(label: &str) -> Self {
-        match label {
-            "search_engine" => BotCategory::SearchEngine,
-            "ai_bot" => BotCategory::AiBot,
-            "social" => BotCategory::Social,
-            "ads_bot" => BotCategory::AdsBot,
-            _ => BotCategory::Monitoring,
+/// The admin-facing bucket of a registry entry.
+///
+/// The library classifies a bot by [`BotKind`]; the admin UI needs
+/// five coarser buckets, and the `adsbot` / `mediapartners` names are
+/// pangolin's own filter vocabulary — so the mapping lives here, in
+/// the consumer, and not in the library.
+///
+/// The rule is inherited **verbatim** from the `BotKind::to_category_label`
+/// of the library method this replaces, down to the substring match.
+/// Narrowing it (an exact set, or a `starts_with`) would silently move
+/// bots between buckets and change the JSONL `bot_category` of the rows
+/// that follow — so it is a migration, not a cleanup. Today's registry
+/// holds seven `Monitor` bots, of which exactly `adsbot`,
+/// `adsbot-mobile` and `mediapartners-google` carry the substring.
+fn category_for(kind: BotKind, bot_name: &str) -> BotCategory {
+    match kind {
+        BotKind::SearchEngine | BotKind::SEO => BotCategory::SearchEngine,
+        BotKind::AITraining | BotKind::AIAssist | BotKind::AIMixed => BotCategory::AiBot,
+        BotKind::SocialMedia => BotCategory::Social,
+        BotKind::Monitor => {
+            // Ad-quality monitors (`adsbot*`, `mediapartners*`) land in
+            // `ads_bot` so the existing admin filter keeps working;
+            // every other monitor is `monitoring`.
+            if bot_name.contains("ads") || bot_name.contains("mediapartners") {
+                BotCategory::AdsBot
+            } else {
+                BotCategory::Monitoring
+            }
         }
+        BotKind::Security | BotKind::Scraper | BotKind::Unknown => BotCategory::Monitoring,
     }
 }
 
@@ -110,7 +132,7 @@ impl BotIdentity {
         Self {
             name: r.name.clone(),
             vendor: r.vendor.clone(),
-            category: BotCategory::from_label(r.category),
+            category: category_for(r.kind, &r.name),
         }
     }
 }
@@ -173,7 +195,7 @@ fn bot_info(bot: &knownbots::Bot) -> BotInfo {
     BotInfo {
         name: bot.name.clone(),
         vendor: bot.vendor.clone(),
-        category: BotCategory::from_label(bot.kind.to_category_label(&bot.name)),
+        category: category_for(bot.kind, &bot.name),
     }
 }
 
@@ -373,7 +395,7 @@ pub fn verification_health(verifier: Option<&Validator>) -> BotVerificationHealt
         .refresh_status()
         .into_iter()
         .map(|s| {
-            let category = BotCategory::from_label(s.kind.to_category_label(&s.name));
+            let category = category_for(s.kind, &s.name);
             let (error_kind, error_message) = match &s.error {
                 Some(knownbots::RefreshFailure::Unreachable(m)) => {
                     (Some(BotRefreshErrorKind::Unreachable), Some(m.clone()))
@@ -436,7 +458,7 @@ mod tests {
     #[test]
     fn verified_googlebot_with_seeded_cidr() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         v.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
@@ -449,7 +471,7 @@ mod tests {
     #[test]
     fn forged_ip_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         v.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1)";
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
@@ -460,7 +482,7 @@ mod tests {
     fn pending_rdns_returns_none() {
         // Fail closed: cold RDNS must not enter the bot log.
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         let ua = "Mozilla/5.0 (compatible; Baiduspider/2.0)";
         let ip = IpAddr::V4(Ipv4Addr::new(220, 181, 108, 94));
         assert!(verify_bot(&v, ua, ip).is_none());
@@ -469,7 +491,7 @@ mod tests {
     #[test]
     fn wrong_case_ua_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         v.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
         assert!(verify_bot(&v, "GOOGLEBOT/2.1", ip).is_none());
@@ -478,7 +500,7 @@ mod tests {
     #[test]
     fn facebook_custom_cidr_verifies() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         let ua = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)";
         let ip = IpAddr::V4(Ipv4Addr::new(31, 13, 24, 10));
         let ident = verify_bot(&v, ua, ip).expect("verified");
@@ -525,7 +547,7 @@ mod tests {
             "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\nkind: AITraining\n",
         )
         .unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         let bots = registry(Some(&v));
         assert!(bots.iter().any(|b| b.name == "custombot"));
         assert!(
@@ -565,10 +587,88 @@ mod tests {
         }
     }
 
+    /// The bucket of a registry entry is pangolin's own mapping from
+    /// the library's `BotKind` — the admin filters and the JSONL
+    /// `bot_category` depend on it, so every kind is pinned here.
     #[test]
-    fn category_from_label_roundtrip() {
-        for label in ["search_engine", "ai_bot", "social", "monitoring", "ads_bot"] {
-            assert_eq!(BotCategory::from_label(label).to_string(), label);
+    fn category_mapping_covers_every_bot_kind() {
+        assert_eq!(
+            category_for(BotKind::SearchEngine, "googlebot"),
+            BotCategory::SearchEngine
+        );
+        assert_eq!(
+            category_for(BotKind::SEO, "semrushbot"),
+            BotCategory::SearchEngine
+        );
+        assert_eq!(
+            category_for(BotKind::AITraining, "gptbot"),
+            BotCategory::AiBot
+        );
+        assert_eq!(
+            category_for(BotKind::AIAssist, "chatgpt-user"),
+            BotCategory::AiBot
+        );
+        assert_eq!(
+            category_for(BotKind::AIMixed, "perplexitybot"),
+            BotCategory::AiBot
+        );
+        assert_eq!(
+            category_for(BotKind::SocialMedia, "twitterbot"),
+            BotCategory::Social
+        );
+        assert_eq!(
+            category_for(BotKind::Monitor, "uptimerobot"),
+            BotCategory::Monitoring
+        );
+        assert_eq!(
+            category_for(BotKind::Security, "someguard"),
+            BotCategory::Monitoring
+        );
+        assert_eq!(
+            category_for(BotKind::Scraper, "somescraper"),
+            BotCategory::Monitoring
+        );
+        assert_eq!(
+            category_for(BotKind::Unknown, "somebot"),
+            BotCategory::Monitoring
+        );
+    }
+
+    /// Ad-quality monitors land in `ads_bot`; every other monitor is
+    /// `monitoring`. The names are pangolin's filter vocabulary, so
+    /// they are matched on the name and not on the kind.
+    #[test]
+    fn ads_and_mediapartners_monitors_are_the_ads_bucket() {
+        assert_eq!(
+            category_for(BotKind::Monitor, "adsbot"),
+            BotCategory::AdsBot
+        );
+        assert_eq!(
+            category_for(BotKind::Monitor, "adsbot-mobile"),
+            BotCategory::AdsBot
+        );
+        assert_eq!(
+            category_for(BotKind::Monitor, "mediapartners-google"),
+            BotCategory::AdsBot
+        );
+        assert_eq!(
+            category_for(BotKind::Monitor, "pingdom"),
+            BotCategory::Monitoring
+        );
+    }
+
+    /// The wire labels of the buckets are the JSONL `bot_category` of
+    /// every row — they must not drift.
+    #[test]
+    fn category_wire_labels_are_unchanged() {
+        for (category, label) in [
+            (BotCategory::SearchEngine, "search_engine"),
+            (BotCategory::AiBot, "ai_bot"),
+            (BotCategory::Social, "social"),
+            (BotCategory::Monitoring, "monitoring"),
+            (BotCategory::AdsBot, "ads_bot"),
+        ] {
+            assert_eq!(category.to_string(), label);
         }
     }
 
@@ -591,7 +691,7 @@ mod tests {
     #[test]
     fn verification_health_maps_the_validator_state() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
 
         let health = verification_health(Some(&v));
         assert!(health.available);
@@ -636,7 +736,7 @@ mod tests {
     #[test]
     fn a_failed_bot_with_a_loaded_prefix_set_still_verifies() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         v.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
         v.seed_refresh_error(
             "googlebot",
@@ -670,7 +770,7 @@ mod tests {
     #[test]
     fn a_failed_bot_without_a_loaded_prefix_set_is_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
         v.seed_refresh_error(
             "googlebot",
             knownbots::RefreshFailure::Broken("list did not parse".into()),
@@ -699,7 +799,7 @@ mod tests {
         std::fs::create_dir_all(&conf).unwrap();
         let broken = conf.join("broken.yaml");
         std::fs::write(&broken, "name: brokenbot\n  ua: [unclosed\n").unwrap();
-        let v = Validator::new_sync_only(dir.path()).unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
 
         let health = verification_health(Some(&v));
         assert_eq!(health.config_errors.len(), 1);

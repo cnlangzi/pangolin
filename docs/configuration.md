@@ -217,12 +217,15 @@ Shape of the `config` JSON per kind:
 > for the architecture, wire format, auth and failure modes.
 
 > **Bot log side-channel.** Each request's `User-Agent` + client IP
-> is verified by the `knownbots` crate (embedded YAML configs for
-> Googlebot / Bingbot / GPTBot / ClaudeBot / facebookexternalhit /
-> UptimeRobot / …). **Only verified** claims fan out to the four
-> sinks; forged UAs, cold RDNS, and unknown agents are fail-closed
-> (never written to the bot log). Each written row stores `bot_name`
-> (the YAML id, e.g. `googlebot`) and `ua` (the raw User-Agent).
+> is verified by the `knownbots` crate — an **external dependency**,
+> published to crates.io as `knownbots` 0.1 and developed in
+> [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)
+> (it ships the embedded YAML configs for Googlebot / Bingbot / GPTBot /
+> ClaudeBot / facebookexternalhit / UptimeRobot / …). **Only verified**
+> claims fan out to the four sinks; forged UAs, cold RDNS, and unknown
+> agents are fail-closed (never written to the bot log). Each written row
+> stores `bot_name` (the YAML id, e.g. `googlebot`) and `ua` (the raw
+> User-Agent).
 > Readers use `bot_name` directly and do not scan `ua` again.
 > Cold RDNS only warms a persistent
 > cache for the next request. Official IP lists refresh immediately

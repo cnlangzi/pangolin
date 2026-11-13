@@ -1,17 +1,26 @@
 # Knownbots — the verification model
 
 > **Status:** implemented
-> **Code:** `crates/knownbots/`
-> **Configs:** `crates/knownbots/conf.d/` (embedded), `<log.bot.cache_dir>/conf.d/` (operator)
-> **Contract test:** `crates/knownbots/src/bot.rs` →
-> `bot::tests::embedded_bot_configs_satisfy_the_contract`
+> **Code:** the published `knownbots` crate —
+> [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
+> consumed from crates.io as `knownbots` 0.1 (issue #146)
+> **Configs:** the crate's own `conf.d/` (embedded),
+> `<log.bot.cache_dir>/conf.d/` (operator)
+> **Contract test:** the crate's
+> `model::registry::tests::embedded_bot_configs_satisfy_the_contract`
 
-`crates/knownbots` answers exactly one question: **is this request a real
+The `knownbots` crate answers exactly one question: **is this request a real
 bot?** It is a Rust port of the upstream Go library
 [`github.com/cnlangzi/knownbots`](https://github.com/cnlangzi/knownbots).
 The port carries the code; this document carries the **contract** — what a bot
 config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
+
+The crate lives in **its own repository** and is **published to crates.io**
+(`knownbots` 0.1); pangolin consumes it from the registry and no longer
+carries a copy. What stays here is the consumer-side contract: the category
+mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
+verification layer, and the operator-facing knobs.
 
 The log pipeline that consumes the verdict (JSONL, SSE, per-bot counters) is
 documented in [`bot-log.md`](./bot-log.md). The operator-facing knobs are in
@@ -22,7 +31,7 @@ the `[log]` table of [`../configuration.md`](../configuration.md#log).
 | Term | Meaning |
 | ---- | ------- |
 | **Registry** | the set of bot definitions the verifier knows — the embedded configs plus whatever an operator drops into `<log.bot.cache_dir>/conf.d/` |
-| **Embedded config** | a YAML file in `crates/knownbots/conf.d/`, listed in `EMBEDDED_CONFIGS` in `crates/knownbots/src/bot.rs` and compiled into the binary with `include_str!` |
+| **Embedded config** | a YAML file in the crate's `conf.d/`, listed in `EMBEDDED_CONFIGS` in its `src/model/registry.rs` and compiled into the crate with `include_str!` |
 | **Operator config** | a YAML file an operator drops into `<log.bot.cache_dir>/conf.d/`; one whose bot `name` matches an embedded bot replaces it |
 | **UA marker** | the case-sensitive substring in the `User-Agent` header that identifies a bot (`ua:` in the config) |
 | **Prefix set** | the set of CIDR ranges a bot's requests are checked against — the downloaded list of a URL-backed bot, plus the `custom:` entries of the config |
@@ -44,7 +53,7 @@ ordinary request.
 
 ### The UA marker
 
-`crates/knownbots/src/ua.rs` matches the marker **byte-exactly**:
+The crate's UA matcher (`src/index/ua.rs`) matches the marker **byte-exactly**:
 
 - **Case-sensitive.** Official crawlers publish a fixed token (`Googlebot`,
   never `googlebot`). Folding the case would accept forgeries that only
@@ -98,6 +107,28 @@ request that triggered it fails closed. See
 The registry id is the identity of the bot everywhere in the system. It is
 *not* the UA marker: `applebot-extended` has the marker `Applebot-Extended`,
 and `semrushbot-ba` has the marker `SemrushBot-BA`.
+
+### The category mapping — pangolin's own
+
+The crate classifies a bot by `BotKind` (`SearchEngine`, `SocialMedia`,
+`AITraining`, `AIAssist`, `AIMixed`, `SEO`, `Monitor`, `Security`, `Scraper`,
+`Unknown`). The admin UI needs five coarser buckets, and the mapping between
+them lives **here**, in the consumer
+(`crates/pangolin-core/src/bot.rs` → `category_for`) — the library carries no
+admin vocabulary:
+
+| `BotKind` | Bucket | Wire label |
+| --------- | ------ | ---------- |
+| `SearchEngine`, `SEO` | search engine | `search_engine` |
+| `AITraining`, `AIAssist`, `AIMixed` | AI bot | `ai_bot` |
+| `SocialMedia` | social | `social` |
+| `Monitor` **and** the name contains `ads` or `mediapartners` | ads bot | `ads_bot` |
+| `Monitor` (every other name), `Security`, `Scraper`, `Unknown` | monitoring | `monitoring` |
+
+The `adsbot` / `mediapartners` names are pangolin's own filter vocabulary —
+the crate knows nothing about them — so the mapping needs the bot's **name**
+as well as its kind. The wire labels are the JSONL `bot_category` of every
+row and the values of the `/logs/bots` filters; they must not drift.
 
 ## What is not logged
 
@@ -172,7 +203,7 @@ Notes:
 ### The contract
 
 A bot config file must satisfy these rules. They are enforced by
-`bot::tests::embedded_bot_configs_satisfy_the_contract`, which runs offline
+`model::registry::tests::embedded_bot_configs_satisfy_the_contract`, which runs offline
 over the embedded set:
 
 1. **`name` is non-empty and unique across the registry.** The loader keeps
@@ -182,7 +213,7 @@ over the embedded set:
    would never verify.
 3. **If `urls` is non-empty, `parser` is absent (which means `txt`) or one
    of the parsers the crate implements** — `google`, `openai`, `uptimerobot`,
-   `ahrefs`, `amazon`, `txt`. The crate-internal `parser::is_known` is the
+   `ahrefs`, `amazon`, `txt`. The crate-internal `feed::is_known_parser` is the
    single source of that list.
 4. **If `rdns` is `true`, `domains` contains at least one entry that can
    still match a PTR record.** An RDNS bot without a domain list can never
@@ -194,8 +225,8 @@ over the embedded set:
 5. **Every `custom` entry parses as a CIDR.** The loader skips a bad one
    with a warning, so the bot would silently cover less address space than
    the config claims.
-6. **Every `*.yaml` / `*.yml` file in `crates/knownbots/conf.d/` is listed
-   in `EMBEDDED_CONFIGS`.** A file that is not compiled into the binary is
+6. **Every `*.yaml` / `*.yml` file in the crate's `conf.d/` is listed
+   in `EMBEDDED_CONFIGS`.** A file that is not compiled into the crate is
    never parsed, so it does nothing at all.
 
 Which of these failures are **silent** — the loader accepts the config and
@@ -216,23 +247,29 @@ and 6 are exactly the failures that are invisible today, and so is the
 duplicate half of rule 1.
 
 ```bash
-# The contract test — offline, no network access.
+# The contract test — offline, no network access. It runs in the
+# crate's own repository:
 cargo test -p knownbots --lib embedded_bot_configs_satisfy_the_contract
 
-# The real-address test — needs network access, checks that every
-# embedded bot still verifies against a published address.
-cargo test -p knownbots --test known_ips
+# The live test — needs network access, checks that the lists of the
+# vendors are still readable. It is `#[ignore]`d by default:
+cargo test --all-features --test live -- --ignored
 ```
 
 ## Adding or changing a bot
 
 ### An embedded bot
 
-1. Write the YAML file into `crates/knownbots/conf.d/`.
-2. List it in `EMBEDDED_CONFIGS` in `crates/knownbots/src/bot.rs`:
+Embedded bots are added in the **crate's own repository**
+([`cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)),
+not here — pangolin consumes the published crate and does not carry a copy of
+its registry.
+
+1. Write the YAML file into the crate's `conf.d/`.
+2. List it in `EMBEDDED_CONFIGS` in its `src/model/registry.rs`:
 
    ```rust
-   ("yourbot.yaml", include_str!("../conf.d/yourbot.yaml")),
+   ("yourbot.yaml", include_str!("../../conf.d/yourbot.yaml")),
    ```
 
    The **file name is the key** in that list. It does **not** have to equal
@@ -253,7 +290,8 @@ cargo test -p knownbots --test known_ips
 
 Removing a bot is the same in reverse: delete the file **and** its
 `EMBEDDED_CONFIGS` entry. A file left behind without the entry is caught by
-rule 6.
+rule 6. A new bot reaches pangolin when the crate is re-published and the
+dependency is bumped.
 
 ### An operator override
 
@@ -291,7 +329,7 @@ configs; this port embeds **45**.
 | ----- | ----- | ------------- | ------------------- |
 | HTTP-client / tooling markers | 20 | 19 of them carry **no address space at all** — only a `ua:` marker (`axios`, `wget`, `python-requests`, `okhttp`, `curl`, `node-fetch`, `rust-reqwest`, …). The twentieth, `github`, is backed upstream by GitHub's own webhook / CI ranges | the 19 identify a *client tool* for upstream's opt-in User-Agent **classification** — they carry no address space at all, so they can never verify a request, and importing them would add registry entries that could never be verified. `github` is a real bot upstream, but verifying it here would need a `github` list parser, which this crate does not implement |
 | `google-special` | 1 | upstream's combined AdsBot / FeedFetcher / MediaPartners entry (`ua: "AdsBot"`, the `special-crawlers.json` list) | **no coverage is lost**: this port covers the same UA marker and the same IP list under the registry id `adsbot`. Upstream's separate `feedfetcher` and `mediapartners-google` entries have their counterparts here as well |
-| Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in `crates/knownbots/src/parser.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
+| Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in the crate's `src/feed/parsers.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
 
 ### The 11 bots this port ships that upstream does not have
 

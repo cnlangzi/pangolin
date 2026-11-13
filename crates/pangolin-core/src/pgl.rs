@@ -443,12 +443,12 @@ mod tests {
     /// User-Agent.
     ///
     /// The verifier is built without background workers
-    /// (`new_sync_only`) so the test never touches the network: the
+    /// (`with_root`) so the test never touches the network: the
     /// CIDR is seeded directly.
     #[test]
     fn verified_crawler_is_reported_as_a_known_bot() {
         let root = std::env::temp_dir().join("pangolin-pgl-knownbot-test");
-        let validator = knownbots::Validator::new_sync_only(&root).expect("validator");
+        let validator = knownbots::Validator::with_root(&root).expect("validator");
         validator
             .seed_prefix("googlebot", "203.0.113.0/24")
             .expect("seed googlebot CIDR");
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn forged_user_agent_is_not_a_known_bot() {
         let root = std::env::temp_dir().join("pangolin-pgl-knownbot-test");
-        let validator = knownbots::Validator::new_sync_only(&root).expect("validator");
+        let validator = knownbots::Validator::with_root(&root).expect("validator");
         validator
             .seed_prefix("googlebot", "203.0.113.0/24")
             .expect("seed googlebot CIDR");
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn a_failed_verification_carries_no_bot_name() {
         let root = std::env::temp_dir().join("pangolin-pgl-knownbot-test");
-        let validator = knownbots::Validator::new_sync_only(&root).expect("validator");
+        let validator = knownbots::Validator::with_root(&root).expect("validator");
         validator
             .seed_prefix("googlebot", "203.0.113.0/24")
             .expect("seed googlebot CIDR");
