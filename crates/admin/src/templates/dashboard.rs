@@ -42,6 +42,9 @@ pub struct BlockedRow {
     /// #141) — the stable code, `None` when the library was never
     /// asked about it.
     pub badbot_code: Option<String>,
+    /// The `User-Agent` the client sent on its most recent rejection
+    /// that carried one (issue #149) — `None` when it never sent one.
+    pub user_agent: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.

@@ -1,0 +1,32 @@
+{# components/_ip_menu.html — the IP-lookup menu of the rate-limit tables. #}
+{#                                                                          #}
+{# One page-level panel, included by `layouts/base.html` right after the  #}
+{# content block. It is a **single** element on purpose:                   #}
+{#                                                                          #}
+{#   - the tables live in regions that htmx replaces wholesale every two  #}
+{#     seconds (`hx-swap="innerHTML"`), so a per-row panel would destroy #}
+{#     itself in the middle of the interaction;                            #}
+{#   - the panel has to live **outside** every swapped region for the     #}
+{#     same reason — it is a child of `<body>`, not of a table.            #}
+{#                                                                          #}
+{# The entries carry the URL of their site with an `{ip}` placeholder. The #}
+{# client-side code replaces the placeholder with the address of the row  #}
+{# the menu was opened from and sets the `href` — the panel ships without #}
+{# a `href`, so an entry can never point at a literal `{ip}`.             #}
+{#                                                                          #}
+{# The Tailwind classes below must appear literally here: the Tailwind   #}
+{# content glob does not scan `assets/app.js`, so a class that only      #}
+{# appears there is purged from the stylesheet and the menu ships        #}
+{# unstyled. The panel is positioned with absolute coordinates computed   #}
+{# by the script, so it is never `fixed` — a fixed panel would stay      #}
+{# behind when the page scrolls.                                          #}
+<div data-ip-menu-panel class="hidden absolute z-50 min-w-52 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-lg py-1">
+  <a data-ip-site data-url-template="https://ipinsights.io/ip/{ip}" target="_blank" rel="noopener noreferrer"
+     class="block px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700">ipinsights.io<span class="block text-[10px] text-slate-400">blacklist · proxy · threat score</span></a>
+  <a data-ip-site data-url-template="https://viz.greynoise.io/ips/{ip}" target="_blank" rel="noopener noreferrer"
+     class="block px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700">GreyNoise<span class="block text-[10px] text-slate-400">known scanner · benign crawler</span></a>
+  <a data-ip-site data-url-template="https://www.abuseipdb.com/check/{ip}" target="_blank" rel="noopener noreferrer"
+     class="block px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700">AbuseIPDB<span class="block text-[10px] text-slate-400">community abuse confidence</span></a>
+  <a data-ip-site data-url-template="https://scamalytics.com/ip/{ip}" target="_blank" rel="noopener noreferrer"
+     class="block px-3 py-1.5 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700">Scamalytics<span class="block text-[10px] text-slate-400">fraud score · proxy detection · ISP</span></a>
+</div>

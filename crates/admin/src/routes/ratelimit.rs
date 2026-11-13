@@ -835,6 +835,36 @@ mod tests {
         cells
     }
 
+    /// The markup inside the `<div>` that opens at `start`.
+    ///
+    /// The divs nest, so the end of the element is found by counting
+    /// them — a `find("</div>")` would stop at the first *inner* div
+    /// and miss most of the element.
+    fn div_body(html: &str, start: usize) -> &str {
+        // The scan is byte-wise: a byte offset can land in the
+        // middle of a multi-byte character, and the tags are ASCII.
+        let bytes = html.as_bytes();
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"<div") {
+                depth += 1;
+                i += "<div".len();
+                continue;
+            }
+            if bytes[i..].starts_with(b"</div>") {
+                depth -= 1;
+                if depth == 0 {
+                    return &html[start..i];
+                }
+                i += "</div>".len();
+                continue;
+            }
+            i += 1;
+        }
+        panic!("the div is not closed");
+    }
+
     #[tokio::test]
     async fn the_over_limit_table_shows_the_geo_the_status_and_the_first_block_time() {
         let (_dir, app) = make_test_app();
@@ -913,9 +943,9 @@ mod tests {
         // not say *which* cells are empty.
         let row = row_with(&html, "data-ip=\"198.51.100.10\"");
         let cells = cells_of(row);
-        // Site, Client IP, Bot, Country, Region, …
-        assert!(cells[3].contains('—'), "{row}");
-        assert!(cells[4].contains('—'), "{row}");
+        // Site, Client IP, User-Agent, Bot, Bad Bots, Country, Region, …
+        assert!(cells[5].contains('—'), "{row}");
+        assert!(cells[6].contains('—'), "{row}");
     }
 
     /// A throttled known bot is shown with its name, and its client-IP
@@ -930,12 +960,14 @@ mod tests {
 
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
         // The column order — the Bot column sits right after the
-        // client IP (R3).
+        // client IP (R3), and the User-Agent column right after that
+        // (issue #149, R7).
         assert_eq!(
             table_headers(&html, "Top over-limit clients"),
             vec![
                 "Site",
                 "Client IP",
+                "User-Agent",
                 "Bot",
                 "Bad Bots",
                 "Country",
@@ -980,10 +1012,10 @@ mod tests {
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
         let row = row_with(&html, "data-bot=\"\"");
         assert!(!row.contains("bg-blue-100"), "{row}");
-        // Site, Client IP, Bot, …
+        // Site, Client IP, User-Agent, Bot, …
         let cells = cells_of(row);
-        assert!(cells[2].contains('—'), "{row}");
-        assert!(!cells[2].contains("bg-blue-100"), "{row}");
+        assert!(cells[3].contains('—'), "{row}");
+        assert!(!cells[3].contains("bg-blue-100"), "{row}");
     }
 
     /// The over-limit table shows what the IP reputation library said
@@ -1029,11 +1061,13 @@ mod tests {
 
         let html = html_of(api_blocked(&app).await.expect("api_blocked")).await;
         // The column order — the Bot column sits right after the
-        // client IP (R3).
+        // client IP (R3), and the User-Agent column right after that
+        // (issue #149, R7).
         assert_eq!(
             table_headers(&html, "Blocked clients"),
             vec![
                 "Client IP",
+                "User-Agent",
                 "Bot",
                 "Bad Bots",
                 "Site",
@@ -1056,12 +1090,176 @@ mod tests {
     }
 
     /// The empty state of the "top over-limit clients" table spans the
-    /// eight columns of the table (issue #134, R3).
+    /// ten columns of the table (issue #149).
     #[tokio::test]
-    async fn the_empty_over_limit_table_spans_eight_columns() {
+    async fn the_empty_over_limit_table_spans_every_column() {
         let (_dir, app) = make_test_app();
         let html = html_of(api_sites(&app).await.expect("api_sites")).await;
-        assert!(html.contains("colspan=\"8\""), "{html}");
+        assert!(html.contains("colspan=\"10\""), "{html}");
+    }
+
+    /// The over-limit table shows the user agent of the rejected
+    /// client (issue #149, R7–R9).
+    #[tokio::test]
+    async fn the_over_limit_table_shows_the_user_agent() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.70".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        // The gateway records the header of the request it rejected.
+        app.rate_limiter
+            .record_user_agent("a", client, Some("scraper/1.0"));
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        // The raw value rides on the row (R9).
+        let row = row_with(&html, "data-ip=\"198.51.100.70\"");
+        assert!(row.contains("data-ua=\"scraper/1.0\""), "{row}");
+        // The cell carries the value and its title (R8).
+        let cell = cells_of(row)[2];
+        assert!(cell.contains("title=\"scraper/1.0\""), "{cell}");
+        assert!(cell.contains(">scraper/1.0</span>"), "{cell}");
+    }
+
+    /// A client that never sent a user agent renders the dash of the
+    /// table it belongs to (issue #149, R8).
+    #[tokio::test]
+    async fn a_client_without_a_user_agent_renders_an_em_dash() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.71".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let row = row_with(&html, "data-ip=\"198.51.100.71\"");
+        assert!(row.contains("data-ua=\"\""), "{row}");
+        // The dash of the over-limit table.
+        let cell = cells_of(row)[2];
+        assert!(cell.contains("text-slate-400"), "{cell}");
+        assert!(cell.contains('—'), "{cell}");
+    }
+
+    /// The dashboard's live "blocked clients" table shows the user
+    /// agent too (issue #149, R7–R9).
+    #[tokio::test]
+    async fn the_dashboard_blocked_table_shows_the_user_agent() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.72".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        app.rate_limiter
+            .record_user_agent("a", client, Some("scraper/1.0"));
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_blocked(&app).await.expect("api_blocked")).await;
+        let row = row_with(&html, "data-ua=\"scraper/1.0\"");
+        assert!(row.contains("data-ua=\"scraper/1.0\""), "{row}");
+        let cell = cells_of(row)[1];
+        assert!(cell.contains("title=\"scraper/1.0\""), "{cell}");
+    }
+
+    /// A user agent with characters that need HTML escaping is
+    /// escaped — the header is client-controlled, so a quote in it
+    /// must not break the markup (issue #149).
+    #[tokio::test]
+    async fn a_user_agent_with_html_characters_is_escaped() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.75".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        app.rate_limiter
+            .record_user_agent("a", client, Some(r#"Mozilla/5.0 "<script>" & "x""#));
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let row = row_with(&html, "data-ip=\"198.51.100.75\"");
+        assert!(row.contains("&quot;"), "{row}");
+        assert!(row.contains("&amp;"), "{row}");
+        assert!(!row.contains("<script>"), "{row}");
+    }
+
+    /// The client-IP cell carries the button that opens the IP-lookup
+    /// menu — and the address itself stays plain text (issue #149,
+    /// R10, R16).
+    #[tokio::test]
+    async fn the_client_ip_cell_carries_the_lookup_menu_button() {
+        let (_dir, app) = make_test_app();
+        seed_limited_site(&app).await;
+        let client: std::net::IpAddr = "198.51.100.73".parse().unwrap();
+        throttle(&app, client, ClientGeo::default()).await;
+        wait_for_published(&app, &client.to_string(), 1).await;
+
+        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let row = row_with(&html, "data-ip=\"198.51.100.73\"");
+        let cell = cells_of(row)[1];
+        // The dropdown button carries the address of its row.
+        assert!(
+            cell.contains("data-ip-menu-toggle"),
+            "the IP cell must carry the menu button: {cell}"
+        );
+        assert!(
+            cell.contains("data-ip=\"198.51.100.73\""),
+            "the menu button must carry the address of the row: {cell}"
+        );
+        // The address is not a link — the menu offers several
+        // destinations, so the address cannot be one of them.
+        assert!(
+            !cell.contains("<a "),
+            "the address must stay plain text: {cell}"
+        );
+        // The magnifier button is kept (R16).
+        assert!(cell.contains("data-asn-trigger"), "{cell}");
+    }
+
+    /// The menu offers the four IP-intelligence sites (issue #149,
+    /// R11).
+    #[tokio::test]
+    async fn the_lookup_menu_offers_the_four_ip_intelligence_sites() {
+        let (_dir, app) = make_test_app();
+        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        for template in [
+            "https://ipinsights.io/ip/{ip}",
+            "https://viz.greynoise.io/ips/{ip}",
+            "https://www.abuseipdb.com/check/{ip}",
+            "https://scamalytics.com/ip/{ip}",
+        ] {
+            assert!(
+                page.contains(template),
+                "the menu must offer {template}: {page}"
+            );
+        }
+        // Every entry opens in a new tab, without handing the opened
+        // page a reference to the admin UI.
+        assert_eq!(
+            page.matches("rel=\"noopener noreferrer\"").count(),
+            4,
+            "every menu entry must carry the rel: {page}"
+        );
+        assert_eq!(
+            page.matches("target=\"_blank\"").count(),
+            4,
+            "every menu entry must open in a new tab: {page}"
+        );
+    }
+
+    /// The panel lives **outside** the region the tables refresh every
+    /// two seconds — otherwise the menu would be destroyed while the
+    /// operator reads it (issue #149, R13).
+    #[tokio::test]
+    async fn the_lookup_menu_panel_is_outside_the_refreshed_region() {
+        let (_dir, app) = make_test_app();
+        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        let region = page
+            .find("<div id=\"ratelimit-sites\"")
+            .expect("the region");
+        let body = div_body(&page, region);
+        assert!(
+            !body.contains("data-ip-menu-panel"),
+            "the panel must not live inside the refreshed region: {page}"
+        );
+        // It is on the page all the same.
+        assert!(page.contains("data-ip-menu-panel"), "{page}");
     }
 
     #[tokio::test]

@@ -2542,7 +2542,10 @@ mod tests {
             "stats page must reload instead of swapping a fragment: {html}"
         );
         assert!(
-            !html.contains("Hosts in this file") && !html.contains("b.com"),
+            // The host name is matched with its markup: a bare
+            // "b.com" would also match the "abuseipdb.com" of the
+            // IP-lookup menu the layout now carries (issue #149).
+            !html.contains("Hosts in this file") && !html.contains(">b.com</a>"),
             "the host picker should leave once a host is selected: {html}"
         );
         assert!(

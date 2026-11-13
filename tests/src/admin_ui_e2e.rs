@@ -4211,3 +4211,109 @@ async fn a_throttled_known_bot_shows_up_in_the_tables_with_its_name() {
     );
     assert!(html.contains("data-asn-ip=\"127.0.0.1\""), "{html}");
 }
+
+// ── §22 — The user agent of a rejected client (issue #149) ─────────────────
+
+/// A rejected client shows up in the rate-limit tables with the user
+/// agent it sent.
+///
+/// The user agent is what tells a scraper from a misconfigured
+/// crawler from a residential client — without it the operator only
+/// sees *that* a client was rejected.
+///
+/// The reputation check is **on** here, and the client announces
+/// itself as an automation tool: the throttle path escalates the
+/// answer to 403. The user agent is recorded before that escalation
+/// decides, so an escalated client is recorded exactly once
+/// (issue #149, R6).
+#[tokio::test]
+async fn a_rejected_client_shows_up_with_its_user_agent() {
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        crate::harness::enable_badbots(db_path);
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+             VALUES ('ua-site', 'http://127.0.0.1:9', 1, 'passthrough', NULL, ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert site");
+        conn.execute(
+            "INSERT INTO domains (domain, site_name, enabled, created_at) \
+             VALUES ('ua.test', 'ua-site', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("insert domain");
+        // One request per window — the second request of the client
+        // is over the limit.
+        conn.execute(
+            "INSERT INTO site_rate_limits \
+             (site_name, enabled, req_limit, req_window_secs, page_limit, page_window_secs) \
+             VALUES ('ua-site', 1, 1, 60, 0, 3600)",
+            rusqlite::params![],
+        )
+        .expect("insert site rate limit");
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let ua = "PangolinIssue149/1.0";
+    let (status, _body) =
+        crate::harness::raw_request_with_user_agent(&addr, "ua.test", "GET", "/", b"", ua).await;
+    // The site has no backend, so the gateway answers 502 — what
+    // matters is that the request was *served*, not rejected: the
+    // limiter only counts it. A rate-limit answer here would mean
+    // the limit is not what the test thinks it is.
+    assert_eq!(
+        status, 502,
+        "the first request must be within the limit of 1, got {status}"
+    );
+    let (status, _body) =
+        crate::harness::raw_request_with_user_agent(&addr, "ua.test", "GET", "/", b"", ua).await;
+    assert_eq!(
+        status, 403,
+        "the throttled client must be escalated to 403, got {status}"
+    );
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The counters are published once per second — poll for the row.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let resp = client.get("/api/ratelimit/sites").await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        html = resp.text().await.unwrap();
+        if html.contains("data-ua=\"PangolinIssue149/1.0\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("data-ua=\"PangolinIssue149/1.0\""),
+        "the rejected client must be listed with its user agent: {html}"
+    );
+    // The cell shows the user agent and keeps the full value in its
+    // title.
+    assert!(
+        html.contains("title=\"PangolinIssue149/1.0\""),
+        "the user-agent cell must carry the value: {html}"
+    );
+
+    // The dashboard's live list carries it too.
+    let mut html = String::new();
+    for _ in 0..40 {
+        let resp = client.get("/api/ratelimit/blocked").await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        html = resp.text().await.unwrap();
+        if html.contains("data-ua=\"PangolinIssue149/1.0\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        html.contains("data-ua=\"PangolinIssue149/1.0\""),
+        "the rejected client must be listed with its user agent: {html}"
+    );
+}

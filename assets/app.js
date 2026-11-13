@@ -12,6 +12,7 @@
 //   - htmx toast auto-clear (#toast swap, 4s timeout)
 //   - site form backend mode toggle (data-backend-form)
 //   - client-IP lookup (data-asn-trigger → data-asn-ip cell)
+//   - IP lookup menu (data-ip-menu-toggle → data-ip-menu-panel)
 //
 // htmx is loaded separately via script tag in base.html
 
@@ -620,4 +621,144 @@
   } else {
     rehydrateAsnCells();
   }
+
+  // ── IP lookup menu (issue #149) ─────────────────────────────────────────
+  //
+  // The caret next to a client IP opens a menu of IP-intelligence
+  // sites: the operator picks the site that answers the question
+  // they actually have (scanner? abuse report? proxy? port?). The
+  // address itself stays plain text — the menu offers several
+  // destinations, so the address cannot be one of them.
+  //
+  // The panel is a **single** page-level element, rendered by the
+  // layout outside every region htmx replaces: the tables refresh
+  // every two seconds, and a per-row menu would destroy itself in
+  // the middle of the interaction.
+  //
+  // The markup (the panel, the entries and their URL templates)
+  // lives in a template, not here: the Tailwind content glob does
+  // not scan this file, so a class that only appears here is purged
+  // from the stylesheet and the menu ships unstyled. The code below
+  // only fills in the `href` of the entries, positions the panel
+  // and toggles its visibility.
+
+  // The caret that opened the menu, and the address it was opened
+  // for.
+  //
+  // The caret can go **stale**: the tables refresh every two seconds
+  // and the row that carried it is replaced, so the node this points
+  // at is no longer in the document. The address is what stays
+  // true — the menu keeps showing the address of the row that
+  // opened it.
+  var ipMenuButton = null;
+  var ipMenuIp = null;
+
+  function ipMenuPanel() {
+    return document.querySelector('[data-ip-menu-panel]');
+  }
+
+  // Whether the node is still in the document.
+  function isConnected(node) {
+    if (!node) return false;
+    if (typeof node.isConnected !== 'boolean') return true;
+    return node.isConnected;
+  }
+
+  function closeIpMenu() {
+    var panel = ipMenuPanel();
+    if (panel) {
+      panel.classList.add('hidden');
+      panel.removeAttribute('data-ip');
+    }
+    if (ipMenuButton) {
+      ipMenuButton.setAttribute('aria-expanded', 'false');
+      ipMenuButton = null;
+    }
+    ipMenuIp = null;
+  }
+
+  function openIpMenu(button, ip) {
+    var panel = ipMenuPanel();
+    if (!panel) return;
+    // Only one menu is open: the caret that opened the previous
+    // one is marked as closed again.
+    if (ipMenuButton && ipMenuButton !== button) {
+      ipMenuButton.setAttribute('aria-expanded', 'false');
+    }
+    // Every entry points at its own site, for this address. The
+    // address is rendered by the server from an `IpAddr`, and
+    // `ipPath` keeps the colons of an IPv6 address — but the
+    // encoding is done anyway, so a stray character can never break
+    // the URL.
+    var entries = panel.querySelectorAll('[data-ip-site]');
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      var template = entry.getAttribute('data-url-template') || '';
+      entry.setAttribute('href', template.replace('{ip}', ipPath(ip)));
+    }
+    panel.setAttribute('data-ip', ip);
+    // The panel sits under the caret: absolute coordinates taken
+    // from the caret's viewport rectangle plus the page scroll
+    // offset. A `fixed` panel would stay behind when the page
+    // scrolls, and the table clips its own overflow.
+    var rect = button.getBoundingClientRect();
+    var scrollX = window.scrollX || 0;
+    var scrollY = window.scrollY || 0;
+    var left = rect.left + scrollX;
+    var top = rect.bottom + scrollY;
+    // The panel has to be visible before it can be measured.
+    panel.classList.remove('hidden');
+    // Keep the panel on the screen: the tables scroll sideways, so
+    // a caret can sit near the right edge.
+    var width = panel.offsetWidth || 0;
+    var viewport = window.innerWidth || 0;
+    if (width > 0 && viewport > 0) {
+      var maxLeft = viewport + scrollX - width - 8;
+      if (left > maxLeft) left = Math.max(scrollX + 8, maxLeft);
+    }
+    panel.style.left = Math.round(left) + 'px';
+    panel.style.top = Math.round(top) + 'px';
+    ipMenuButton = button;
+    ipMenuIp = ip;
+    button.setAttribute('aria-expanded', 'true');
+  }
+
+  document.addEventListener('click', function (e) {
+    var target = e.target;
+    // An entry opens its site in a new tab — the menu has done its
+    // job, so it goes away.
+    if (target && target.closest && target.closest('[data-ip-site]')) {
+      closeIpMenu();
+      return;
+    }
+    var toggle =
+      target && target.closest ? target.closest('[data-ip-menu-toggle]') : null;
+    if (toggle) {
+      var ip = toggle.getAttribute('data-ip');
+      if (!ip) return;
+      // The same caret closes the menu it opened. After a refresh
+      // the caret is a *new* node — the menu is still open for that
+      // address, so the address decides then.
+      var sameCaret = ipMenuButton === toggle;
+      var staleCaret = ipMenuButton !== null && !isConnected(ipMenuButton);
+      if (ipMenuIp === ip && (sameCaret || staleCaret)) {
+        closeIpMenu();
+        return;
+      }
+      openIpMenu(toggle, ip);
+      return;
+    }
+    // A click outside the menu closes it.
+    if (!ipMenuButton) return;
+    var panel = ipMenuPanel();
+    var inPanel =
+      panel && target && target.closest
+        ? target.closest('[data-ip-menu-panel]')
+        : null;
+    if (!inPanel) closeIpMenu();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' || e.key === 'Esc') closeIpMenu();
+  });
 })();
