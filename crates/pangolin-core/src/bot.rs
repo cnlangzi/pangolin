@@ -99,6 +99,14 @@ impl BotCategory {
 /// five coarser buckets, and the `adsbot` / `mediapartners` names are
 /// pangolin's own filter vocabulary — so the mapping lives here, in
 /// the consumer, and not in the library.
+///
+/// The rule is inherited **verbatim** from the `BotKind::to_category_label`
+/// of the library method this replaces, down to the substring match.
+/// Narrowing it (an exact set, or a `starts_with`) would silently move
+/// bots between buckets and change the JSONL `bot_category` of the rows
+/// that follow — so it is a migration, not a cleanup. Today's registry
+/// holds seven `Monitor` bots, of which exactly `adsbot`,
+/// `adsbot-mobile` and `mediapartners-google` carry the substring.
 fn category_for(kind: BotKind, bot_name: &str) -> BotCategory {
     match kind {
         BotKind::SearchEngine | BotKind::SEO => BotCategory::SearchEngine,

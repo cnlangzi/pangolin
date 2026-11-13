@@ -73,16 +73,20 @@ fn the_in_tree_knownbots_crate_is_gone() {
 
 /// The adapter depends on the **published** crate: a version
 /// requirement, not a path.
+///
+/// The version and the feature set are workspace-managed — one place
+/// names them, so a second consumer cannot pick a different pair.
+/// `pangolin-core` therefore inherits them (`knownbots.workspace =
+/// true`), and a `path` key would mean the in-tree copy crept back.
 #[test]
 fn pangolin_core_depends_on_the_published_crate() {
-    let manifest = parse_toml("crates/pangolin-core/Cargo.toml");
+    let manifest = parse_toml("Cargo.toml");
     let dependency = manifest
-        .get("dependencies")
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
         .and_then(|d| d.get(CRATE))
-        .unwrap_or_else(|| panic!("pangolin-core must depend on {CRATE}"));
-    let dependency = dependency
-        .as_table()
-        .unwrap_or_else(|| panic!("the {CRATE} dependency must be an inline table"));
+        .and_then(|d| d.as_table())
+        .unwrap_or_else(|| panic!("the workspace must manage the {CRATE} dependency"));
 
     assert!(
         !dependency.contains_key("path"),
@@ -96,6 +100,23 @@ fn pangolin_core_depends_on_the_published_crate() {
         version.starts_with("0.1"),
         "the {CRATE} dependency must ask for the 0.1 line, got {version:?}"
     );
+
+    // The consumer inherits it — it does not declare its own.
+    let consumer = parse_toml("crates/pangolin-core/Cargo.toml");
+    let declared = consumer
+        .get("dependencies")
+        .and_then(|d| d.get(CRATE))
+        .and_then(|d| d.as_table())
+        .unwrap_or_else(|| panic!("pangolin-core must depend on {CRATE}"));
+    assert_eq!(
+        declared.get("workspace").and_then(|w| w.as_bool()),
+        Some(true),
+        "pangolin-core must inherit the workspace dependency: {declared:?}"
+    );
+    assert!(
+        !declared.contains_key("path"),
+        "pangolin-core must not point at a path — the crate is published"
+    );
 }
 
 /// The `full` feature is enabled.  The crate's default feature set is
@@ -103,12 +124,13 @@ fn pangolin_core_depends_on_the_published_crate() {
 /// not compiled in — and every URL-backed bot stays `Cold`.
 #[test]
 fn the_full_feature_is_enabled() {
-    let manifest = parse_toml("crates/pangolin-core/Cargo.toml");
+    let manifest = parse_toml("Cargo.toml");
     let dependency = manifest
-        .get("dependencies")
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
         .and_then(|d| d.get(CRATE))
         .and_then(|d| d.as_table())
-        .expect("the knownbots dependency must be an inline table");
+        .expect("the workspace must manage the knownbots dependency");
 
     let features = dependency
         .get("features")
@@ -147,8 +169,14 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
         .and_then(|d| d.as_array())
         .expect("the lockfile lists the dependencies of the package");
     for optional in ["dns-lookup", "reqwest", "tokio"] {
+        // Cargo writes `name` alone while one version of the crate is
+        // in the graph, and `name version` as soon as a second one
+        // appears. Both forms mean the same dependency.
         assert!(
-            dependencies.iter().any(|d| d.as_str() == Some(optional)),
+            dependencies.iter().any(|d| {
+                d.as_str()
+                    .is_some_and(|d| d == optional || d.starts_with(&format!("{optional} ")))
+            }),
             "the `full` feature pulls in {optional} — it is missing from the lockfile"
         );
     }

@@ -1158,11 +1158,17 @@ impl App {
     /// background workers. Must be called **once**, from inside a
     /// tokio runtime context, after [`App::new`].
     ///
-    /// Returns `true` if the task was spawned, `false` if any of:
-    ///   - no tokio runtime is in scope (e.g. unit tests without
-    ///     `#[tokio::test]`)
-    ///   - `start_bot_writer` was already called once (idempotent
-    ///     guard — second call is a no-op)
+    /// The return value answers one question: **was the writer task
+    /// spawned by this call?** It is `true` the first time and `false`
+    /// afterwards, and `false` when no tokio runtime is in scope (e.g.
+    /// unit tests without `#[tokio::test]`).
+    ///
+    /// The knownbots workers are started whenever a runtime is in
+    /// scope, *including* on a call that answers `false` — they are
+    /// idempotent on their own, and a caller that started the writer
+    /// task alone still needs them. `false` therefore means "the
+    /// writer task was not spawned by this call", not "nothing
+    /// happened".
     ///
     /// Production callers: see `main.rs`, which calls this inside
     /// `block_on_host` immediately after `App::new` returns.

@@ -99,6 +99,13 @@ sha2 = "0.10"
 # knownbots crate already depends on it for its official IP ranges.
 ipnet = "2"
 
+# Bot verification (UA + official IP ranges / RDNS) — issue #146. The
+# crate is published (github.com/cnlangzi/knownbots-rust), not part
+# of this workspace. The `full` feature compiles in the IP-list
+# download and the RDNS workers; without it every URL-backed bot
+# would stay `Cold`.
+knownbots = { version = "0.1", features = ["full"] }
+
 # IP reputation (issue #141). The `full` feature compiles in every
 # provider the crate ships: the three list publishers (Spamhaus,
 # DShield, Blocklist.de) and the two keyed lookup providers

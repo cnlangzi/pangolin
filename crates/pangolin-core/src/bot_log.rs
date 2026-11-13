@@ -1806,15 +1806,21 @@ mod tests {
         // The measurement is a wall clock, and this binary runs 500+
         // tests in parallel: how much CPU the other threads happen
         // to steal while this one runs decides the number. The
-        // **fastest** of three batches is therefore the sample that
+        // **fastest** of five batches is therefore the sample that
         // comes closest to the cost of the enqueue path itself, and
         // it is the one the budget is checked against. A regression
         // that makes `enqueue` block slows down *every* batch, so it
         // still fails the budget — what a single sample could not
         // tell apart from the suite's own noise.
+        //
+        // Five, not three: the first batches pay for the cold heap
+        // (the queue's pages, the allocator's arenas), so the fastest
+        // of three is still the third batch — a warm-up — and moves
+        // with the machine's load. The fifth batch is the steady
+        // state, and the budget then has a margin of about half.
         let writer = BotLogWriter::new(PathBuf::from("/tmp/pangolin-bot-test-does-not-exist"));
         let mut elapsed = std::time::Duration::MAX;
-        for _ in 0..3 {
+        for _ in 0..5 {
             let start = std::time::Instant::now();
             for i in 0..100_000 {
                 writer.enqueue(bot_entry("Googlebot", &format!("/p{i}")));
@@ -1826,7 +1832,7 @@ mod tests {
         }
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "100k enqueues took {elapsed:?} (best of three); expected < 500ms"
+            "100k enqueues took {elapsed:?} (best of five); expected < 500ms"
         );
     }
 

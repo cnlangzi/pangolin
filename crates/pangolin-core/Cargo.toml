@@ -55,9 +55,9 @@ dashmap.workspace = true
 #
 # The published crate (issue #146) — the port lives in
 # github.com/cnlangzi/knownbots-rust, not in this repository. The
-# `full` feature compiles in the IP-list download and the RDNS
-# workers; without it every URL-backed bot would stay `Cold`.
-knownbots = { version = "0.1", features = ["full"] }
+# version and the `full` feature are workspace-managed; see the root
+# Cargo.toml.
+knownbots.workspace = true
 
 # CIDR parsing / matching for the per-site IP rules (issue #117).
 ipnet.workspace = true
