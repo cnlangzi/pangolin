@@ -1154,9 +1154,9 @@ impl App {
     // traffic fan-out is tested in `traffic::tests` via TrafficHub
     // directly — App just holds the Arc.
 
-    /// Spawn the background bot-log writer task. Must be called
-    /// **once**, from inside a tokio runtime context, after
-    /// [`App::new`].
+    /// Spawn the background bot-log writer task **and** the knownbots
+    /// background workers. Must be called **once**, from inside a
+    /// tokio runtime context, after [`App::new`].
     ///
     /// Returns `true` if the task was spawned, `false` if any of:
     ///   - no tokio runtime is in scope (e.g. unit tests without
@@ -1166,18 +1166,38 @@ impl App {
     ///
     /// Production callers: see `main.rs`, which calls this inside
     /// `block_on_host` immediately after `App::new` returns.
-    /// Tests that exercise the JSONL side-channel must also call
-    /// this inside `#[tokio::test]`.
     pub fn start_bot_writer(&self) -> bool {
+        self.start_bot_writer_inner(true)
+    }
+
+    /// Spawn the background bot-log writer task **alone** — the
+    /// knownbots background workers are *not* started.
+    ///
+    /// The knownbots workers refresh the published IP lists over the
+    /// network, and the published crate runs them on a thread of their
+    /// own: a worker started by a unit test keeps downloading the
+    /// vendor lists long after the test returned and competes with the
+    /// rest of the suite for the CPU. The unit tests therefore start
+    /// the writer alone; production calls [`App::start_bot_writer`],
+    /// which starts both.
+    #[cfg(test)]
+    fn start_bot_log_writer(&self) -> bool {
+        self.start_bot_writer_inner(false)
+    }
+
+    /// The body of both start methods.
+    ///
+    /// `start_verifier_workers` decides whether the knownbots workers
+    /// go with the writer task. They are started *before* the
+    /// idempotency guard returns, because they are idempotent on their
+    /// own: a caller that already started the writer task alone still
+    /// gets the workers.
+    fn start_bot_writer_inner(&self, start_verifier_workers: bool) -> bool {
         let Some(writer) = self.bot_writer.as_ref() else {
             return false;
         };
         let mut guard = self.bot_writer_task.lock();
-        if guard.is_some() {
-            // Already started — second call is a silent no-op so
-            // a careless caller doesn't double-spawn and leak a task.
-            return false;
-        }
+        let already_started = guard.is_some();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No runtime in scope. `bot_writer` stays Some(...) so
             // the in-memory ring buffer / stats / SSE fan-out keep
@@ -1190,10 +1210,20 @@ impl App {
             );
             return false;
         };
-        // Start knownbots RDNS / IP-refresh workers alongside the
-        // JSONL writer — both need a tokio runtime.
-        if let Some(verifier) = self.bot_verifier.as_ref() {
-            let _ = verifier.start_background();
+        if start_verifier_workers {
+            // Start the knownbots RDNS / IP-refresh workers alongside
+            // the JSONL writer. The published crate runs them on a
+            // thread of their own, so they no longer need the host's
+            // runtime — but they *do* reach the network, which is why
+            // a unit test starts the writer alone.
+            if let Some(verifier) = self.bot_verifier.as_ref() {
+                let _ = verifier.start_background();
+            }
+        }
+        if already_started {
+            // Already started — second call is a silent no-op so
+            // a careless caller doesn't double-spawn and leak a task.
+            return false;
         }
         let writer_for_task = writer.clone();
         let join = handle.spawn(async move { writer_for_task.run().await });
@@ -2376,9 +2406,12 @@ mod tests {
         // `App::new` no longer spawns the writer task — it runs
         // before any tokio runtime exists. Production callers
         // invoke `start_bot_writer` from inside `block_on_host`;
-        // this test does the equivalent.
+        // this test does the equivalent — but starts the **writer
+        // alone**: the knownbots workers reach the network, and a
+        // unit test must not leave a downloader running for the rest
+        // of the suite.
         assert!(
-            app.start_bot_writer(),
+            app.start_bot_log_writer(),
             "writer task must spawn inside the #[tokio::test] runtime"
         );
         seed_googlebot_cidr(&app);
@@ -2458,11 +2491,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
         let cfg = make_log_config(50, 16);
-        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        let mut app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        // Drop the verifier: the knownbots workers reach the network
+        // (they refresh the published IP lists), and the published
+        // crate runs them on a thread of its own — a worker started
+        // by a unit test would keep downloading after the test
+        // returned. The assertion here is about the writer task.
+        app.bot_verifier = None;
         assert!(app.start_bot_writer(), "first spawn must succeed");
         assert!(
             !app.start_bot_writer(),
             "second call must be a silent no-op (return false)"
+        );
+    }
+
+    /// The writer task and the knownbots workers are two different
+    /// things, and a unit test must be able to start one without the
+    /// other: the knownbots workers download the published IP lists
+    /// over the network, and the published crate runs them on a thread
+    /// of their own — a worker started by a test would keep
+    /// downloading long after the test returned.
+    ///
+    /// So `start_bot_log_writer` starts the writer alone, and
+    /// `start_bot_writer` — the production entry point — starts both.
+    #[tokio::test]
+    async fn the_writer_task_can_start_without_the_knownbots_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        // A cache root of its own, so the assertion below cannot see
+        // the lists a previous run downloaded into the default one.
+        cfg.log.bot.cache_dir = dir.path().join("bot-cache");
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(
+            app.start_bot_log_writer(),
+            "the writer task must spawn on its own"
+        );
+        // The knownbots workers were not started, so the verifier
+        // never went out to the network: no prefix list was
+        // downloaded into the cache root of this app.
+        let cache = app.bot_verifier.as_ref().unwrap().root().join("googlebot");
+        assert!(
+            !cache.join("ips.txt").exists(),
+            "a unit test must not download the vendor IP lists"
         );
     }
 
