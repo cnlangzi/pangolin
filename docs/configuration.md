@@ -411,6 +411,25 @@ bot user-agent` or `unknown`. A client the library was never asked
 about (a verified known bot, a request without an authoritative
 client IP) shows a dash.
 
+The same table — and the dashboard's live "Blocked clients" list —
+carry a **User-Agent** column: the header the rejected client sent
+on its most recent rejection. A client that never sent one shows a
+dash, and a request without a user agent never clears the one
+recorded before it. The value is cut to 512 bytes when it is stored
+(the header is client-controlled), and the full value stays
+available in the cell's tooltip.
+
+Next to the client address there are two buttons: the magnifier,
+which looks the address up inline (country, ISP and ASN — the
+address leaves the browser for ipwhois.app / ipinfo.io), and a
+caret, which opens a menu of IP-intelligence sites for that
+address — ipinsights.io (blacklist hits, proxy and hosting flags,
+threat score), GreyNoise (known scanner or benign crawler),
+AbuseIPDB (community abuse confidence) and Scamalytics (fraud
+score, proxy detection, ISP). Each entry opens the site's own page
+for the address in a new tab; the address itself stays plain text,
+so it is never a link the operator can follow by accident.
+
 
 ## `tun.yml` — tunnel client configuration
 

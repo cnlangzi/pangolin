@@ -66,6 +66,9 @@ pub struct TopOverRow {
     /// string literal, and Askama binds a `&str` out of an `Option`
     /// as a `&&str`, which does not compare with a `&str`.
     pub badbot_code: Option<String>,
+    /// The `User-Agent` the client sent on its most recent rejection
+    /// that carried one (issue #149) — `None` when it never sent one.
+    pub user_agent: Option<String>,
     /// "403", "429" or "403+429" — the status the client was rejected
     /// with.
     pub status: String,
@@ -99,6 +102,7 @@ impl TopOverRow {
             region: client.region.clone(),
             bot_name: client.bot_name.clone(),
             badbot_code: client.badbot.map(|v| v.code().to_string()),
+            user_agent: client.user_agent.clone(),
             status: status.to_string(),
             rejections: client.rule_blocks.saturating_add(client.throttled),
             first_seen_rel: super::relative_time(client.first_seen_at, now),
@@ -160,6 +164,7 @@ mod tests {
             region: Some("13".into()),
             bot_name: None,
             badbot: None,
+            user_agent: None,
             rule_blocks,
             throttled,
             first_seen_secs: 42,
@@ -206,5 +211,20 @@ mod tests {
         );
         // A client that is not a verified known bot has no name.
         assert_eq!(TopOverRow::new(&client(0, 7), now).bot_name, None);
+    }
+
+    /// The user agent of the client is carried into the row (issue
+    /// #149).
+    #[test]
+    fn the_user_agent_is_carried_into_the_row() {
+        let now = Utc::now();
+        let mut c = client(0, 7);
+        c.user_agent = Some("scraper/1.0".into());
+        assert_eq!(
+            TopOverRow::new(&c, now).user_agent.as_deref(),
+            Some("scraper/1.0")
+        );
+        // A client that never sent a user agent has none.
+        assert_eq!(TopOverRow::new(&client(0, 7), now).user_agent, None);
     }
 }

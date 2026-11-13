@@ -68,6 +68,11 @@
 
 {% block content %}{% endblock %}
 
+{# The IP-lookup menu (issue #149). It lives **outside** the content  #}
+{# block, so the tables that open it — which htmx replaces every two  #}
+{# seconds — cannot destroy it while the operator reads it.            #}
+{% include "components/_ip_menu.html" %}
+
 <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.9/dist/htmx.min.js"></script>
 <script src="/assets/__JS_FILE__?v=__JS_HASH__" defer></script>
 

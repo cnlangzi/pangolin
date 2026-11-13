@@ -1,12 +1,13 @@
 {# components/_ip_lookup.html — the shared cells of the rate-limit tables. #}
 {#                                                                          #}
-{# Two macros, imported by the templates that render a client-IP cell   #}
-{# and a bot cell:                                                         #}
+{# Four macros, imported by the templates that render a client-IP cell,  #}
+{# a bot cell and a user-agent cell:                                   #}
 {#                                                                          #}
 {#   {% import "components/_ip_lookup.html" as lookup %}                  #}
 {#   {{ lookup::ip_cell(ip=row.ip) }}                                     #}
 {#   {{ lookup::bot_cell(name=row.bot_name, dash_class="text-slate-400") }} #}
 {#   {{ lookup::badbot_cell(code=row.badbot_code, dash_class="…") }}      #}
+{#   {{ lookup::ua_cell(ua=row.user_agent, dash_class="…") }}              #}
 {#                                                                          #}
 {# Why a macro and not an `{% include %}`: an include takes a path only, #}
 {# so the two tables could not pass their own address and their own     #}
@@ -17,6 +18,8 @@
 {# Parameters:                                                             #}
 {#   ip         (required) — the client address of the row.              #}
 {#   name       (required) — the registry id of the known bot, or None.   #}
+{#   code       (required) — the reputation verdict code, or None.       #}
+{#   ua         (required) — the User-Agent the client sent, or None.     #}
 {#   dash_class (required) — the muted em dash of the table the cell     #}
 {#                          belongs to.                                   #}
 {#                                                                          #}
@@ -27,7 +30,11 @@
 {# and toggles their visibility.                                          #}
 
 {# The client-IP cell: the address, the magnifier button that looks the  #}
-{# address up, and the two lines the answer is rendered into.             #}
+{# address up, the caret that opens the IP-lookup menu, and the two     #}
+{# lines the answer is rendered into.                                      #}
+{#                                                                          #}
+{# The address itself stays plain text — the menu offers several        #}
+{# destinations, so the address cannot be the single link (issue #149).   #}
 {% macro ip_cell(ip) %}
 <td class="px-4 py-2 font-mono text-xs" data-asn-ip="{{ ip }}">
   <span class="font-mono text-xs">{{ ip }}</span>
@@ -40,6 +47,11 @@
       <svg data-asn-spinner class="hidden w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 0 1 8-8V0C5.373 0 0 5.373 0 12h4Z"></path></svg>
     </span>
   </button>
+  <button type="button" data-ip-menu-toggle data-ip="{{ ip }}"
+          aria-haspopup="true" aria-expanded="false"
+          title="open an IP lookup site — the address leaves your browser"
+          aria-label="Open an IP lookup site for {{ ip }}"
+          class="ml-1 align-middle text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300">▾</button>
   <div data-asn-geo class="hidden mt-0.5 font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
   <div data-asn-asn class="hidden font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
 </td>
@@ -84,3 +96,17 @@
   {% endif %}
 </td>
 {% endmacro badbot_cell %}
+
+{# The user-agent cell (issue #149): what the rejected client sent.  #}
+{# The value is cut for display — the full one stays available in   #}
+{# the cell's title, so the operator can read a long agent in place. #}
+{# A client that never sent one renders a muted em dash.            #}
+{% macro ua_cell(ua, dash_class) %}
+<td class="px-4 py-2 text-xs">
+  {% if let Some(u) = ua %}
+  <span class="inline-block max-w-[16rem] truncate align-middle" title="{{ u }}">{{ u }}</span>
+  {% else %}
+  <span class="{{ dash_class }}">—</span>
+  {% endif %}
+</td>
+{% endmacro ua_cell %}

@@ -81,6 +81,14 @@ const MAX_BLOCKED_CLIENTS: usize = 200;
 /// remembered (the ones already listed keep their counters).
 const MAX_BLOCKED_IPS: usize = 1024;
 
+/// Upper bound on the length of a recorded user agent, in bytes.
+///
+/// The header is client-controlled and the limiter remembers up to
+/// [`MAX_BLOCKED_IPS`] clients per site, so an unbounded copy of it
+/// would have no upper memory bound. 512 bytes covers every real
+/// user agent.
+const MAX_USER_AGENT_BYTES: usize = 512;
+
 /// How many identical rejection events are logged per client IP:
 /// the first one, then every 1000th.
 const LOG_EVERY: u64 = 1000;
@@ -670,6 +678,17 @@ struct BlockedIpStat {
     badbot: Option<crate::reputation::BadbotVerdict>,
     /// When the verdict above was observed.
     badbot_at: Option<Instant>,
+    /// The `User-Agent` the client sent on the most recent rejection
+    /// that carried one — `None` for every client that never sent
+    /// one.
+    ///
+    /// The **most recent** observation wins (issue #149): a rejection
+    /// that carried a user agent replaces it, a rejection that
+    /// carried none leaves it alone — an unidentified request never
+    /// clears what was seen before.
+    user_agent: Option<String>,
+    /// When the user agent above was observed.
+    user_agent_at: Option<Instant>,
     /// When the client was last rejected.
     last_seen: Instant,
 }
@@ -901,6 +920,8 @@ impl SiteState {
             bot_name_at: None,
             badbot: None,
             badbot_at: None,
+            user_agent: None,
+            user_agent_at: None,
             last_seen: now,
         });
         if rule_block {
@@ -952,6 +973,30 @@ impl SiteState {
         stat.badbot_at = Some(Instant::now());
     }
 
+    /// Record the `User-Agent` a rejected client sent (issue #149).
+    ///
+    /// The user agent is attached to the client's row, which the
+    /// rate-limit tables show: it is what tells a scraper from a
+    /// misconfigured crawler from a residential client.
+    ///
+    /// A client the limiter never rejected has no row and is not
+    /// remembered — the gateway only records the user agent of a
+    /// request it has just rejected.
+    ///
+    /// The **most recent** observation that carried one wins: a
+    /// request without a user agent leaves the recorded one alone,
+    /// exactly like the bot name (issue #134).
+    fn record_user_agent(&mut self, ip: IpAddr, user_agent: Option<&str>) {
+        let Some(ua) = user_agent.filter(|u| !u.is_empty()) else {
+            return;
+        };
+        let Some(stat) = self.blocked_ips.get_mut(&ip) else {
+            return;
+        };
+        stat.user_agent = Some(truncate_user_agent(ua));
+        stat.user_agent_at = Some(Instant::now());
+    }
+
     /// Whether this rejection of the client should be logged.
     ///
     /// A client the limiter never rejected has no counter: its
@@ -1001,6 +1046,29 @@ fn window_remaining(window_secs: u64, epoch_start: Instant, now: Instant) -> u64
 /// one, then every [`LOG_EVERY`]-th.
 fn should_log(count: u64) -> bool {
     count == 1 || count.is_multiple_of(LOG_EVERY)
+}
+
+/// Cut a user agent down to at most [`MAX_USER_AGENT_BYTES`] bytes.
+///
+/// The cut happens at a character boundary — a byte offset in the
+/// middle of a multi-byte character is not a `&str` — and the
+/// ellipsis is part of the budget, so the result is at most 512 bytes
+/// long. A user agent that already fits is kept unchanged.
+fn truncate_user_agent(user_agent: &str) -> String {
+    if user_agent.len() <= MAX_USER_AGENT_BYTES {
+        return user_agent.to_string();
+    }
+    // "…" is three bytes — the budget it leaves is what the cut has
+    // to fit in.
+    let budget = MAX_USER_AGENT_BYTES - "…".len();
+    let mut end = budget;
+    while end > 0 && !user_agent.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + "…".len());
+    out.push_str(&user_agent[..end]);
+    out.push('…');
+    out
 }
 
 /// splitmix64 finalizer — a strong avalanche mixer.
@@ -1130,6 +1198,9 @@ pub struct OverLimitClient {
     /// What the IP reputation library said about the client (issue
     /// #141) — `None` when the library was never asked about it.
     pub badbot: Option<crate::reputation::BadbotVerdict>,
+    /// The `User-Agent` the client sent on the most recent rejection
+    /// that carried one (issue #149) — `None` when it never sent one.
+    pub user_agent: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1166,6 +1237,13 @@ pub struct BlockedClient {
     /// The address is merged across the sites, so this is the **most
     /// recent** observation that carried a verdict.
     pub badbot: Option<crate::reputation::BadbotVerdict>,
+    /// The `User-Agent` the client sent on the most recent rejection
+    /// that carried one (issue #149) — `None` when it never sent one.
+    ///
+    /// The address is merged across the sites, so this is the **most
+    /// recent** observation that carried one: a site that recorded no
+    /// user agent never clears the one another site recorded.
+    pub user_agent: Option<String>,
     /// 403 answers — a blacklist rule matched the client.
     pub rule_blocks: u64,
     /// 429 answers — the client was over one of the site's limits.
@@ -1364,6 +1442,24 @@ impl RateLimiter {
         state.lock().record_badbot_verdict(ip, verdict);
     }
 
+    /// Record the `User-Agent` a rejected client sent (issue #149).
+    ///
+    /// Called by the proxy for every request the limiter rejected, so
+    /// the operator can tell a scraper from a misconfigured crawler
+    /// from a residential client without leaving the admin UI.
+    ///
+    /// The recording never changes the limiter's verdict — it only
+    /// annotates the row of a client that was already rejected. A
+    /// client the limiter never rejected is not recorded: there is
+    /// no row to attach the user agent to. An unknown site is a
+    /// no-op.
+    pub fn record_user_agent(&self, site: &str, ip: IpAddr, user_agent: Option<&str>) {
+        let Some(state) = self.sites.read().get(site).cloned() else {
+            return;
+        };
+        state.lock().record_user_agent(ip, user_agent);
+    }
+
     /// Whether a rejection of this client should reach the log.
     ///
     /// The limiter logs the first rejection of a client and then every
@@ -1435,6 +1531,8 @@ struct MergedBlocked {
     bot_at: Option<Instant>,
     /// When the recorded reputation verdict was observed.
     badbot_at: Option<Instant>,
+    /// When the recorded user agent was observed.
+    ua_at: Option<Instant>,
 }
 
 /// Build the snapshot from the current runtime state.
@@ -1495,6 +1593,7 @@ fn build_snapshot(
                 region: stat.region.clone(),
                 bot_name: stat.bot_name.clone(),
                 badbot: stat.badbot,
+                user_agent: stat.user_agent.clone(),
                 rule_blocks: stat.rule_blocks,
                 throttled: stat.throttled,
                 first_seen_secs: now.duration_since(stat.first_seen).as_secs(),
@@ -1506,6 +1605,7 @@ fn build_snapshot(
                     site: name.clone(),
                     bot_name: None,
                     badbot: None,
+                    user_agent: None,
                     rule_blocks: 0,
                     throttled: 0,
                     last_seen_secs: 0,
@@ -1513,6 +1613,7 @@ fn build_snapshot(
                 site_at: stat.last_seen,
                 bot_at: None,
                 badbot_at: None,
+                ua_at: None,
             });
             entry.client.rule_blocks = entry.client.rule_blocks.saturating_add(stat.rule_blocks);
             entry.client.throttled = entry.client.throttled.saturating_add(stat.throttled);
@@ -1541,6 +1642,16 @@ fn build_snapshot(
             {
                 entry.client.badbot = Some(verdict);
                 entry.badbot_at = Some(at);
+            }
+            // The user agent of the most recent observation that
+            // carried one wins (issue #149), by the same rule as the
+            // bot name: a site that recorded no user agent never
+            // clears the one another site recorded.
+            if let (Some(ua), Some(at)) = (&stat.user_agent, stat.user_agent_at)
+                && entry.ua_at.is_none_or(|seen| at >= seen)
+            {
+                entry.client.user_agent = Some(ua.clone());
+                entry.ua_at = Some(at);
             }
             entry.client.last_seen_secs = now.duration_since(stat.last_seen).as_secs();
         }
@@ -3460,5 +3571,212 @@ mod tests {
             .find(|c| c.ip == client.to_string())
             .expect("the blocked client is listed");
         assert_eq!(row.bot_name.as_deref(), Some("bingbot"));
+    }
+
+    /// Drive a client over the request limit of the site, the way the
+    /// gateway does before it records the user agent.
+    fn throttle(limiter: &RateLimiter, cfg: &SiteLimitConfig, client: IpAddr) {
+        assert_eq!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+    }
+
+    /// The user agent of a rejected client reaches both tables
+    /// (issue #149, R1).
+    #[test]
+    fn the_user_agent_of_a_rejected_client_reaches_the_snapshot() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(198, 51, 100, 60);
+        throttle(&limiter, &cfg, client);
+
+        // The gateway records the header of the request it rejected.
+        limiter.record_user_agent("site", client, Some("scraper/1.0"));
+
+        let snap = limiter.snapshot_now();
+        let over = snap
+            .top_over
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(over.user_agent.as_deref(), Some("scraper/1.0"));
+        let blocked = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the rejected client is listed");
+        assert_eq!(blocked.user_agent.as_deref(), Some("scraper/1.0"));
+    }
+
+    /// A client the limiter never rejected gets no row — the
+    /// recording never creates one (issue #149, R2).
+    #[test]
+    fn a_user_agent_for_a_client_that_was_never_rejected_is_dropped() {
+        let (limiter, _cfg) = limiter_with(policy(1, 0));
+        limiter.record_user_agent("site", ip(198, 51, 100, 61), Some("scraper/1.0"));
+        let snap = limiter.snapshot_now();
+        assert!(snap.blocked.is_empty(), "no row, no user agent");
+        assert!(snap.top_over.is_empty());
+    }
+
+    /// The most recent observation that carried a user agent wins — a
+    /// rejection without one never clears it (issue #149, R3).
+    #[test]
+    fn the_most_recent_user_agent_wins() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(198, 51, 100, 62);
+        throttle(&limiter, &cfg, client);
+
+        limiter.record_user_agent("site", client, Some("A"));
+        // A request without a user agent leaves the recorded one
+        // alone.
+        limiter.record_user_agent("site", client, None);
+        limiter.record_user_agent("site", client, Some(""));
+        let snap = limiter.snapshot_now();
+        assert_eq!(
+            snap.blocked[0].user_agent.as_deref(),
+            Some("A"),
+            "a request without a user agent must not clear the recorded one"
+        );
+
+        // A later request that carries one replaces it.
+        limiter.record_user_agent("site", client, Some("B"));
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.blocked[0].user_agent.as_deref(), Some("B"));
+    }
+
+    /// The recorded user agent is bounded — the header is
+    /// client-controlled (issue #149, R4).
+    #[test]
+    fn a_long_user_agent_is_truncated() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(198, 51, 100, 63);
+        throttle(&limiter, &cfg, client);
+
+        let long = "x".repeat(1000);
+        limiter.record_user_agent("site", client, Some(&long));
+        let snap = limiter.snapshot_now();
+        let recorded = snap.blocked[0]
+            .user_agent
+            .as_deref()
+            .expect("the user agent is recorded");
+        assert!(
+            recorded.len() <= MAX_USER_AGENT_BYTES,
+            "the recorded user agent must be bounded: {} bytes",
+            recorded.len()
+        );
+        assert!(recorded.ends_with('…'), "{recorded}");
+
+        // A user agent that fits is kept unchanged.
+        let exact = "y".repeat(MAX_USER_AGENT_BYTES);
+        limiter.record_user_agent("site", client, Some(&exact));
+        let snap = limiter.snapshot_now();
+        assert_eq!(
+            snap.blocked[0].user_agent.as_deref(),
+            Some(exact.as_str()),
+            "a user agent that fits must be stored unchanged"
+        );
+    }
+
+    /// The truncation cuts at a character boundary — a multi-byte
+    /// character must not be split (issue #149, R4).
+    #[test]
+    fn the_truncation_cuts_at_a_character_boundary() {
+        // Each "ä" is two bytes, so the cut lands inside one.
+        let long = "ä".repeat(400);
+        let cut = truncate_user_agent(&long);
+        assert!(cut.len() <= MAX_USER_AGENT_BYTES, "{}", cut.len());
+        assert!(cut.ends_with('…'), "{cut}");
+        // The result is still valid UTF-8 — a split character would
+        // have been replaced by the lossy conversion of the assert.
+        assert_eq!(cut.chars().count(), 255);
+    }
+
+    /// A site that recorded no user agent never clears the one
+    /// another site recorded (issue #149, R5).
+    #[test]
+    fn the_merged_row_keeps_a_user_agent_a_later_rejection_did_not_carry() {
+        let (limiter, cfgs) = limiter_with_bot_limited_sites(policy(1, 0), &["a", "b"], &[]);
+        let client = ip(203, 0, 113, 44);
+        // Site "a" rejects the client…
+        let cfg_a = &cfgs["a"];
+        assert_eq!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "a",
+                cfg_a,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        limiter.record_user_agent("a", client, Some("scraper/1.0"));
+        // …and site "b" rejects the very same address.
+        let cfg_b = &cfgs["b"];
+        assert_eq!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            limiter.check(
+                "b",
+                cfg_b,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        limiter.record_user_agent("b", client, None);
+
+        let snap = limiter.snapshot_now();
+        let row = snap
+            .blocked
+            .iter()
+            .find(|c| c.ip == client.to_string())
+            .expect("the blocked client is listed");
+        assert_eq!(
+            row.user_agent.as_deref(),
+            Some("scraper/1.0"),
+            "a site that recorded no user agent must not clear the recorded one"
+        );
     }
 }

@@ -797,6 +797,23 @@ impl ProxyHttp for AppProxy {
                     geo,
                 )
             };
+            // The user agent of a rejected client is recorded for
+            // the operator (issue #149): it is what tells a scraper
+            // from a misconfigured crawler from a residential
+            // client. The address is the one the rejection was
+            // filed under — the peer fallback when there is no
+            // authoritative client IP.
+            //
+            // The recording happens **before** the reputation check
+            // below decides between 429 and 403, so an escalated
+            // client is recorded exactly once.
+            if !matches!(decision, pangolin_core::LimitDecision::Allow)
+                && let Some(ip) = limit_ip
+            {
+                self.app
+                    .rate_limiter
+                    .record_user_agent(&site.name, ip, ctx.user_agent.as_deref());
+            }
             match decision {
                 pangolin_core::LimitDecision::Allow => {}
                 pangolin_core::LimitDecision::Blocked => {
