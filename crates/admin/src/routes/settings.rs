@@ -55,7 +55,6 @@ async fn render_page(
         Ok(s) => BadbotsSettingsView {
             enabled: s.enabled,
             evidence_policy: s.evidence_policy.as_str(),
-            feed_refresh_interval_secs: s.feed_refresh_interval_secs,
             abuseipdb_key_configured: s.abuseipdb_api_key.is_some(),
             crowdsec_key_configured: s.crowdsec_api_key.is_some(),
             updated_at: s.updated_at.to_rfc3339(),
@@ -65,7 +64,6 @@ async fn render_page(
             BadbotsSettingsView {
                 enabled: true,
                 evidence_policy: "lenient",
-                feed_refresh_interval_secs: 300,
                 abuseipdb_key_configured: false,
                 crowdsec_key_configured: false,
                 updated_at: String::new(),

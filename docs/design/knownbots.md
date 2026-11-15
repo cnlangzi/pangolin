@@ -3,7 +3,7 @@
 > **Status:** implemented
 > **Code:** the published `knownbots` crate —
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
-> consumed from crates.io as `knownbots` 0.1 (issue #146)
+> consumed from crates.io as `knownbots` 0.2 (issue #146)
 > **Configs:** the crate's own `conf.d/` (embedded),
 > `<log.bot.cache_dir>/conf.d/` (operator)
 > **Contract test:** the crate's
@@ -17,7 +17,7 @@ config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
 
 The crate lives in **its own repository** and is **published to crates.io**
-(`knownbots` 0.1); pangolin consumes it from the registry and no longer
+(`knownbots` 0.2); pangolin consumes it from the registry and no longer
 carries a copy. What stays here is the consumer-side contract: the category
 mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
 verification layer, and the operator-facing knobs.
@@ -64,12 +64,58 @@ The crate's UA matcher (`src/index/ua.rs`) matches the marker **byte-exactly**:
   word `Applebot`.
 - **Longest marker wins.** When several markers match one header, the longest
   one wins, so a specific bot shadows a generic one: a
-  `Applebot-Extended/1.0` header contains the word `Applebot` *and* the word
-  `Applebot-Extended`, and resolves to `applebot-extended`.
+  `SemrushBot-SI/1.0` header contains the word `SemrushBot` *and* the word
+  `SemrushBot-SI`, and resolves to `semrushbot-si`.
 
 The registry id (`name`) of the matched bot — not the raw header — is what
 carries forward. The raw `User-Agent` is stored separately in the log row, so
 readers never re-scan it.
+
+### The 0.2 registry change
+
+The registry is **data inside the published crate**, not code in this
+repository — so the gateway needs no change to consume a new registry
+version, but the change is visible in four places.
+
+**The markers are the tokens the vendors publish.** The marker of a registry
+entry is the exact string the vendor puts in its own `User-Agent` header,
+and the match is case-sensitive, so a marker that is spelled differently can
+never fire. knownbots 0.2 corrected six of them:
+
+| Registry id | Marker before 0.2 | Marker in 0.2 |
+| ----------- | ----------------- | ------------- |
+| `twitterbot` | `twitterbot` | `Twitterbot` |
+| `pinterestbot` | `PinterestBot` | `Pinterestbot` |
+| `redditbot` | `Redditbot` | `redditbot` |
+| `mj12bot` | `MJ12Bot` | `MJ12bot` |
+| `meta-externalagent` | `Meta-ExternalAgent` | `meta-externalagent` |
+| `google-storebot` | `GoogleStoreBot` | `Storebot-Google` |
+
+Those crawlers were **invisible** to the gateway before 0.2 — a request
+carrying `Twitterbot/1.0` matched nothing, so it was not a verified bot and
+was not exempt from the rate limits. They are visible now.
+
+**Three crawlers are gone.** `applebot-extended`, `google-extended` and
+`cloudflare-alwaysonline` are no longer in the registry: **a token the
+crawler does not send is no User-Agent at all**. `Google-Extended` and
+`Applebot-Extended` are opt-out tokens a vendor writes in `robots.txt`, not
+User-Agents, and Cloudflare publishes no `AlwaysOnline` crawler — a
+definition whose marker no request carries would sit in the registry
+advertising a traffic it can never recognise. A request carrying
+`Applebot-Extended` still matches the marker `Applebot` (a hyphen is a word
+boundary) and is now identified as `applebot`; a request carrying
+`Google-Extended` matches nothing and is no longer a verified bot.
+
+**Two crawlers changed their verification source.** `bytespider` and
+`chatgpt-user` now verify from the vendor's published address list instead
+of their reverse DNS, so they **fail closed** until the first list refresh
+has succeeded.
+
+The per-site bot list (`site_rate_limit_bots`) stores registry ids, so the
+three removed ids leave the table inert. The V14 migration rewrites
+`applebot-extended` to `applebot` — the request now identifies as
+`applebot`, and a site that deliberately kept it out of its exemptions must
+keep doing so — and deletes the two ids with no successor.
 
 ### The address space — three sources
 
@@ -105,8 +151,8 @@ request that triggered it fails closed. See
 | `kind` (e.g. `SearchEngine`) | JSONL `bot_category`, after the coarse bucket mapping (`search_engine`, `ai_bot`, `social`, `ads_bot`, `monitoring`) |
 
 The registry id is the identity of the bot everywhere in the system. It is
-*not* the UA marker: `applebot-extended` has the marker `Applebot-Extended`,
-and `semrushbot-ba` has the marker `SemrushBot-BA`.
+*not* the UA marker: `semrushbot-si` has the marker `SemrushBot-SI`, and
+`adsbot-mobile` has the marker `AdsBot-Google-Mobile`.
 
 ### The category mapping — pangolin's own
 
@@ -321,21 +367,29 @@ this repository controls.
 ## Relationship with upstream cnlangzi/knownbots
 
 This port tracks upstream, but not one-for-one. Upstream ships **57** bot
-configs; this port embeds **45**.
+configs; this port embeds **75**.
 
-### The 23 upstream configs this port does not embed
+### The 25 upstream configs this port does not embed
 
 | Group | Count | What they are | Why they are absent |
 | ----- | ----- | ------------- | ------------------- |
 | HTTP-client / tooling markers | 20 | 19 of them carry **no address space at all** — only a `ua:` marker (`axios`, `wget`, `python-requests`, `okhttp`, `curl`, `node-fetch`, `rust-reqwest`, …). The twentieth, `github`, is backed upstream by GitHub's own webhook / CI ranges | the 19 identify a *client tool* for upstream's opt-in User-Agent **classification** — they carry no address space at all, so they can never verify a request, and importing them would add registry entries that could never be verified. `github` is a real bot upstream, but verifying it here would need a `github` list parser, which this crate does not implement |
 | `google-special` | 1 | upstream's combined AdsBot / FeedFetcher / MediaPartners entry (`ua: "AdsBot"`, the `special-crawlers.json` list) | **no coverage is lost**: this port covers the same UA marker and the same IP list under the registry id `adsbot`. Upstream's separate `feedfetcher` and `mediapartners-google` entries have their counterparts here as well |
 | Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in the crate's `src/feed/parsers.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
+| Crawlers dropped in knownbots 0.2 | 2 | `google-extended` (upstream's `Google-Extended`) and `cloudflare-alwaysonline` (upstream's `CloudFlare-AlwaysOnline`) | **no coverage is lost, because no request ever carried them**: neither token is a User-Agent a vendor publishes. The port shipped both until 0.2 and dropped them for the same reason it corrected the other markers — see [The 0.2 registry change](#the-02-registry-change) |
 
-### The 11 bots this port ships that upstream does not have
+### The 43 bots this port ships that upstream does not have
 
-`applebot-extended`, `bytespider`, `ccbot`, `claudebot`, `discordbot`,
-`perplexitybot`, `pingdom`, `redditbot`, `slackbot`, `telegrambot`,
-`whatsapp`.
+`amzn-searchbot`, `amzn-user`, `bytespider`, `ccbot`, `censysinspect`,
+`claudebot`, `claude-searchbot`, `claude-user`, `dataforseobot`,
+`discordbot`, `duckassistbot`, `google-agent`, `google-cloudvertexbot`,
+`google-cws`, `google-gemininotebook`, `googlemessages`, `google-pinpoint`,
+`googleproducer`, `google-read-aloud`, `google-safety`,
+`google-site-verification`, `hetrixtools`, `meta-externalfetcher`,
+`meta-webindexer`, `mistralai-index`, `mistralai-user`, `mojeekbot`,
+`oai-adsbot`, `perplexitybot`, `pingdom`, `redditbot`, `semrushbot-si`,
+`semrushbot-swa`, `seokicks`, `seznambot`, `siteauditbot`, `sitebulb`,
+`slackbot`, `splitsignalbot`, `telegrambot`, `whatsapp`, `yeti`, `youbot`.
 
 ### The ASN step is not ported
 
@@ -357,9 +411,17 @@ carries one parses here and the key is ignored.
 - **`vendor:` is a pangolin addition.** Upstream's configs have no vendor
   field at all; the JSONL `bot_vendor` and the admin UI's vendor column are
   this port's own.
-- The **34 configs both projects ship** are otherwise identical, with one
-  exception: `google-inspectiontool` is `kind: SearchEngine` here and
-  `kind: Monitor` upstream.
+- The **32 configs both projects ship** are otherwise identical, with these
+  exceptions:
+  - `google-inspectiontool` is `kind: SearchEngine` here and `kind: Monitor`
+    upstream;
+  - five markers are spelled the way the **vendor** publishes them and not
+    the way upstream spells them — `Twitterbot` (not `twitterbot`),
+    `Pinterestbot` (not `PinterestBot`), `MJ12bot` (not `MJ12Bot`),
+    `meta-externalagent` (not `Meta-ExternalAgent`) and `Storebot-Google`
+    (not `GoogleStoreBot`);
+  - `chatgpt-user` and `perplexity-user` are backed by the vendor's
+    **published address list** here and by their reverse DNS upstream.
 
 There is **no automated upstream sync**. CI has no guaranteed network
 access, and the comparison is cross-language — the config sets are compared

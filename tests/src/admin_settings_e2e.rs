@@ -285,7 +285,6 @@ async fn settings_page_renders_the_reputation_form() {
     for field in [
         "badbots_enabled",
         "badbots_evidence_policy",
-        "badbots_feed_refresh_interval_secs",
         "badbots_abuseipdb_api_key",
         "badbots_crowdsec_api_key",
     ] {
@@ -306,6 +305,22 @@ async fn settings_page_renders_the_reputation_form() {
         !body.contains(r#"name="badbots_enabled" value="true" checked"#),
         "the e2e harness turns the reputation check off"
     );
+    // The list-refresh-interval setting is gone (issue #151): the
+    // library owns the refresh cadence now, so the page offers no
+    // interval — it only tells the operator where the cadence comes
+    // from.
+    assert!(
+        !body.contains("badbots_feed_refresh_interval_secs"),
+        "the removed setting must not be on the page"
+    );
+    assert!(
+        !body.contains("List refresh interval"),
+        "the removed setting must not be on the page"
+    );
+    assert!(
+        body.contains("at most once a day"),
+        "the page must say where the refresh cadence comes from: {body}"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +340,6 @@ async fn settings_post_reputation_saves_the_row_without_echoing_the_key() {
                 ("_csrf", &csrf),
                 ("badbots_enabled", "true"),
                 ("badbots_evidence_policy", "strict"),
-                ("badbots_feed_refresh_interval_secs", "600"),
                 ("badbots_abuseipdb_api_key", "secret-key"),
             ],
         )
@@ -394,7 +408,6 @@ async fn settings_post_reputation_rejects_a_bad_policy_inline() {
                 ("_csrf", &csrf),
                 ("badbots_enabled", "true"),
                 ("badbots_evidence_policy", "bogus"),
-                ("badbots_feed_refresh_interval_secs", "300"),
             ],
         )
         .await

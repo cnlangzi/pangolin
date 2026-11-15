@@ -229,8 +229,8 @@
         <div>
           <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Enable the reputation check</div>
           <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            On by default. The three list publishers (Spamhaus, DShield, Blocklist.de) need no
-            credential and are always queried while the check is on.
+            On by default. The five list publishers (Spamhaus, DShield, Blocklist.de, steeman,
+            CINS Army) need no credential and are always queried while the check is on.
           </div>
         </div>
       </label>
@@ -255,13 +255,10 @@
         </p>
       </div>
       <div>
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="badbots-refresh-interval">List refresh interval (seconds)</label>
-        <input type="number" name="badbots_feed_refresh_interval_secs" id="badbots-refresh-interval"
-          value="{{ badbots.feed_refresh_interval_secs }}" min="1" required
-          class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">List refresh cadence</p>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          How often the publishers' lists are refreshed. A publisher that is not due is not
-          asked, so a short interval costs nothing.
+          Each publisher's list is refreshed by the library at most once a day. The cadence
+          belongs to the library, not to this gateway, so there is no interval to set here.
         </p>
       </div>
     </div>
