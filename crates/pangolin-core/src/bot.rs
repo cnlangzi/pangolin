@@ -167,7 +167,7 @@ pub struct BotInfo {
 /// The embedded registry, parsed once.
 ///
 /// The YAML is compiled into the binary, so the result is a constant:
-/// parsing it per call would cost 45 YAML documents and 45+ CIDR
+/// parsing it per call would cost 75 YAML documents and 75+ CIDR
 /// parses for nothing.
 static EMBEDDED_REGISTRY: OnceLock<Vec<BotInfo>> = OnceLock::new();
 
@@ -521,6 +521,40 @@ mod tests {
             serde_json::to_string(&BotCategory::AdsBot).unwrap(),
             "\"ads_bot\""
         );
+    }
+
+    /// A request whose `User-Agent` carries the token the vendor
+    /// actually publishes verifies as that crawler.
+    ///
+    /// The marker match is **case-sensitive**, so a marker that does
+    /// not spell the vendor's token exactly can never fire — the
+    /// crawler stays invisible to the gateway and is not exempt from
+    /// the rate limits. knownbots 0.1.0 shipped the markers
+    /// `twitterbot` and `PinterestBot`, which no real crawler ever
+    /// sends; 0.2.0 spells them `Twitterbot` and `Pinterestbot`, the
+    /// way the vendors publish them.
+    #[test]
+    fn a_vendor_published_marker_verifies_as_that_crawler() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
+        v.seed_prefix("twitterbot", "104.244.42.0/24").unwrap();
+        v.seed_prefix("pinterestbot", "157.55.0.0/16").unwrap();
+
+        let twitter = verify_bot(
+            &v,
+            "Mozilla/5.0 (compatible; Twitterbot/1.0)",
+            IpAddr::V4(Ipv4Addr::new(104, 244, 42, 129)),
+        )
+        .expect("the published marker must verify");
+        assert_eq!(twitter.name, "twitterbot");
+
+        let pinterest = verify_bot(
+            &v,
+            "Mozilla/5.0 (compatible; Pinterestbot/0.2; +http://www.pinterest.com/bot.html)",
+            IpAddr::V4(Ipv4Addr::new(157, 55, 39, 1)),
+        )
+        .expect("the published marker must verify");
+        assert_eq!(pinterest.name, "pinterestbot");
     }
 
     /// The registry the admin UI offers as checkboxes — the embedded

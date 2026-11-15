@@ -2,14 +2,20 @@
 //! (issue #141).
 //!
 //! The library never refreshes a list on its own — the host has to
-//! ask. This service asks, on the interval the operator configured in
-//! the dashboard (`badbots_config.feed_refresh_interval_secs`).
+//! ask. This service asks, on a fixed tick.
 //!
 //! The library honours the interval each publisher states: a
 //! publisher whose interval has not elapsed is not asked again and is
 //! reported with the time that is left. The tick may therefore be far
 //! more frequent than the shortest publisher interval without
-//! spending anything.
+//! spending anything — and since badbots 0.1.4 the floor of every
+//! list publisher is 24 hours, so a five-minute tick costs one cheap
+//! "is anything due?" answer per tick and nothing more.
+//!
+//! The operator-facing refresh-interval setting is gone (issue #151):
+//! it decided only how often the gateway *asked*, which the library
+//! now answers on its own terms. The tick stays at the value the
+//! setting used to default to.
 //!
 //! The service reads the current library instance on every tick, so a
 //! rebuild — the operator changed a provider key in the dashboard —
@@ -24,20 +30,22 @@ use pangolin_core::App;
 
 use crate::runtime::{Service, ServiceContext};
 
-/// The fallback tick when the operator's setting cannot be read.
+/// The tick the service polls on.
+///
+/// It asks the library whether a publisher is due; it does not decide
+/// when a list is downloaded — the publisher's own refresh floor does.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The service that keeps the reputation library's lists fresh.
 pub struct BadbotsFeedService {
-    /// The tick the service falls back to when the configured value
-    /// cannot be read.
-    default_interval: Duration,
+    /// The tick the service polls on.
+    interval: Duration,
 }
 
 impl BadbotsFeedService {
     /// Build the service.
-    pub fn new(default_interval: Duration) -> Self {
-        Self { default_interval }
+    pub fn new(interval: Duration) -> Self {
+        Self { interval }
     }
 
     /// Refresh every list once.
@@ -87,23 +95,12 @@ impl Service for BadbotsFeedService {
         loop {
             self.refresh_once(&ctx.app).await;
 
-            // The interval is re-read every tick: the operator can
-            // change it in the dashboard, and the change takes effect
-            // without a restart.
-            let interval = match ctx.app.badbots_settings().await {
-                Ok(settings) => Duration::from_secs(settings.feed_refresh_interval_secs.max(1)),
-                Err(e) => {
-                    warn!("badbots: reading the refresh interval failed: {e}");
-                    self.default_interval
-                }
-            };
-
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => {
                     info!("badbots: shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(self.interval) => {}
             }
         }
         Ok(())
@@ -114,6 +111,19 @@ impl Service for BadbotsFeedService {
 mod tests {
     use super::*;
     use pangolin_core::{CertManager, Config};
+
+    /// The poll tick is fixed at five minutes (issue #151).
+    ///
+    /// The operator-facing refresh-interval setting is gone: it
+    /// decided only how often the gateway *asked* the library whether
+    /// a list was due, and the library now answers on its own terms
+    /// (every list publisher has a 24-hour floor). The tick keeps the
+    /// value the setting defaulted to, so the poll cadence does not
+    /// change.
+    #[test]
+    fn the_poll_tick_is_five_minutes() {
+        assert_eq!(DEFAULT_INTERVAL, Duration::from_secs(300));
+    }
 
     /// A gateway whose reputation check is off has nothing to refresh.
     ///

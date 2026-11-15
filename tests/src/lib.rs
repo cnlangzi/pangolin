@@ -50,6 +50,14 @@ mod release_version;
 #[cfg(test)]
 mod knownbots_dependency;
 
+// Migration regression tests for the badbots / knownbots upgrade
+// (issue #151).  Like the dependency tests above, these need neither
+// the `integration` feature nor a real binary: they drive refinery
+// against a throwaway SQLite file and assert the outcome of the two
+// new migrations.
+#[cfg(test)]
+mod badbots_migrations;
+
 #[cfg(feature = "integration")]
 mod backend;
 

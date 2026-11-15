@@ -348,9 +348,9 @@ dependencies = [
 
 [[package]]
 name = "badbots"
-version = "0.1.1"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "957ddf7e3aac6225306cef5d9a368d1d3f3012267b54614547ed7d5ed6651e79"
+checksum = "37e9ff59bc547ee509db47cdd4ffca0722966ba9a5d534c793eaac260a045704"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1931,9 +1931,9 @@ dependencies = [
 
 [[package]]
 name = "knownbots"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe31123efc4b7d056b37345623363f24405ab6aa6ca827facdec9e9007f0400d"
+checksum = "4e852764d1ba1389b3acf762e9cc005b94f7eac0f10174d6e93ccc3ef68d4785"
 dependencies = [
  "dns-lookup",
  "ipnet",

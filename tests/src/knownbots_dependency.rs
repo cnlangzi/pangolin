@@ -97,8 +97,8 @@ fn pangolin_core_depends_on_the_published_crate() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
     assert!(
-        version.starts_with("0.1"),
-        "the {CRATE} dependency must ask for the 0.1 line, got {version:?}"
+        version.starts_with("0.2"),
+        "the {CRATE} dependency must ask for the 0.2 line, got {version:?}"
     );
 
     // The consumer inherits it — it does not declare its own.
@@ -160,8 +160,8 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
     );
     assert_eq!(
         entry.get("version").and_then(|v| v.as_str()),
-        Some("0.1.0"),
-        "the locked {CRATE} must be the published 0.1.0"
+        Some("0.2.0"),
+        "the locked {CRATE} must be the published 0.2.0"
     );
 
     let dependencies = entry
@@ -186,7 +186,7 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
 /// name cargo resolves it to.
 #[test]
 fn the_published_crate_is_the_one_on_the_registry() {
-    // The checksum pins the exact artefact: a re-publish of 0.1.0
+    // The checksum pins the exact artefact: a re-publish of 0.2.0
     // under a different content would not resolve to the same
     // checksum, and cargo would refuse the lockfile.
     let packages = lock_packages();
@@ -196,8 +196,8 @@ fn the_published_crate_is_the_one_on_the_registry() {
         .and_then(|c| c.as_str())
         .unwrap_or_else(|| panic!("the registry entry of {CRATE} must carry a checksum"));
     assert_eq!(
-        checksum, "fe31123efc4b7d056b37345623363f24405ab6aa6ca827facdec9e9007f0400d",
-        "the locked {CRATE} must be the published 0.1.0 artefact"
+        checksum, "4e852764d1ba1389b3acf762e9cc005b94f7eac0f10174d6e93ccc3ef68d4785",
+        "the locked {CRATE} must be the published 0.2.0 artefact"
     );
 }
 

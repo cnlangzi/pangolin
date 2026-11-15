@@ -1,0 +1,23 @@
+-- V13: drop the operator-facing list-refresh-interval setting (issue #151)
+--
+-- The setting never decided when a list was downloaded — the
+-- publisher's own refresh floor does, and badbots 0.1.4 moved every
+-- list publisher to a 24-hour floor. What the setting decided was how
+-- often the gateway *asked* the library whether anything was due, and
+-- the gateway now asks on a fixed 300-second tick.
+--
+-- So the knob controls nothing the operator can act on: a setting that
+-- looks meaningful and is not is worse than no setting. It is removed
+-- from the schema, from the settings struct, from the admin API and
+-- from the dashboard.
+--
+-- The column is dropped here rather than in V12 because V12 shipped
+-- with the reputation feature and is applied in the running
+-- databases: an applied migration is immutable, so the schema change
+-- has to be a new, forward-only migration.
+--
+-- The other columns of the singleton row are untouched — `enabled`,
+-- `evidence_policy`, both API keys and `updated_at` keep their
+-- values.
+
+ALTER TABLE badbots_config DROP COLUMN feed_refresh_interval_secs;

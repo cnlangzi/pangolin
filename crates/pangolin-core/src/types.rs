@@ -845,13 +845,6 @@ pub struct BadbotsSettings {
     /// asks the library for a second opinion about a client it has
     /// already decided to reject, so `lenient` is the default.
     pub evidence_policy: BadbotsEvidencePolicy,
-    /// How often the gateway asks the library to refresh the
-    /// publishers' lists, in seconds.
-    ///
-    /// The library issues no request for a publisher whose own
-    /// interval has not elapsed, so this tick may be far more
-    /// frequent than the shortest publisher interval.
-    pub feed_refresh_interval_secs: u64,
     /// The AbuseIPDB key. `None` = the provider is not queried.
     pub abuseipdb_api_key: Option<String>,
     /// The CrowdSec key. `None` = the provider is not queried.
@@ -898,14 +891,12 @@ impl BadbotsEvidencePolicy {
 
 impl Default for BadbotsSettings {
     /// The documented defaults of a deployment that has never opened
-    /// the dashboard: the check is on, the bar is lenient, the lists
-    /// are refreshed every five minutes and neither keyed provider is
-    /// queried.
+    /// the dashboard: the check is on, the bar is lenient and neither
+    /// keyed provider is queried.
     fn default() -> Self {
         Self {
             enabled: true,
             evidence_policy: BadbotsEvidencePolicy::Lenient,
-            feed_refresh_interval_secs: 300,
             abuseipdb_api_key: None,
             crowdsec_api_key: None,
             updated_at: DateTime::<Utc>::UNIX_EPOCH,
