@@ -23,8 +23,9 @@
 -- The redundant `applebot-extended` row is therefore deleted first,
 -- and only the rows that are still alone are renamed.
 
--- The rows with no successor: the crawlers are gone from the
--- registry and no request can match them any more.
+-- The rows with no successor: the registry has no crawler under
+-- these ids any more, so a request can never be identified as one
+-- of them and the rows can never match.
 DELETE FROM site_rate_limit_bots
  WHERE bot_name IN ('google-extended', 'cloudflare-alwaysonline');
 

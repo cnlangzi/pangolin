@@ -218,7 +218,7 @@ Shape of the `config` JSON per kind:
 
 > **Bot log side-channel.** Each request's `User-Agent` + client IP
 > is verified by the `knownbots` crate — an **external dependency**,
-> published to crates.io as `knownbots` 0.1 and developed in
+> published to crates.io as `knownbots` 0.2 and developed in
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)
 > (it ships the embedded YAML configs for Googlebot / Bingbot / GPTBot /
 > ClaudeBot / facebookexternalhit / UptimeRobot / …). **Only verified**

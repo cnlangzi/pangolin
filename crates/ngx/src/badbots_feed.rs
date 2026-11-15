@@ -34,7 +34,7 @@ use crate::runtime::{Service, ServiceContext};
 ///
 /// It asks the library whether a publisher is due; it does not decide
 /// when a list is downloaded — the publisher's own refresh floor does.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The service that keeps the reputation library's lists fresh.
 pub struct BadbotsFeedService {
@@ -44,8 +44,13 @@ pub struct BadbotsFeedService {
 
 impl BadbotsFeedService {
     /// Build the service.
-    pub fn new(interval: Duration) -> Self {
-        Self { interval }
+    ///
+    /// The tick is the service's own: the operator-facing refresh
+    /// setting is gone (issue #151), so there is nothing to pass in.
+    pub fn new() -> Self {
+        Self {
+            interval: DEFAULT_INTERVAL,
+        }
     }
 
     /// Refresh every list once.
@@ -82,6 +87,13 @@ impl BadbotsFeedService {
             debug!("badbots: no publisher was due for a refresh");
         }
         all_ok
+    }
+}
+
+/// The service has nothing to configure — the tick is its own.
+impl Default for BadbotsFeedService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -123,6 +135,10 @@ mod tests {
     #[test]
     fn the_poll_tick_is_five_minutes() {
         assert_eq!(DEFAULT_INTERVAL, Duration::from_secs(300));
+        // The service polls on that tick — the constant is not a
+        // declaration the service ignores.
+        let service = BadbotsFeedService::new();
+        assert_eq!(service.interval, Duration::from_secs(300));
     }
 
     /// A gateway whose reputation check is off has nothing to refresh.
@@ -154,7 +170,7 @@ mod tests {
             "the check is off, so there is no library"
         );
 
-        let service = BadbotsFeedService::new(DEFAULT_INTERVAL);
+        let service = BadbotsFeedService::new();
         assert!(
             service.refresh_once(&app).await,
             "a missing library is not a failure"
@@ -186,7 +202,7 @@ mod tests {
             .expect("the library builds");
         *app.badbots.write() = Some(Arc::new(library));
 
-        let service = BadbotsFeedService::new(DEFAULT_INTERVAL);
+        let service = BadbotsFeedService::new();
         assert!(
             service.refresh_once(&app).await,
             "a library with no publisher is not a failure"

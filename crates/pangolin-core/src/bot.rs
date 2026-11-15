@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn safe_bot_ids_are_the_form_field_safe_ones() {
         assert!(is_safe_bot_id("googlebot"));
-        assert!(is_safe_bot_id("applebot-extended"));
+        assert!(is_safe_bot_id("adsbot-mobile"));
         assert!(is_safe_bot_id("chatgpt_user"));
         assert!(is_safe_bot_id("bot2"));
         assert!(!is_safe_bot_id(""));
