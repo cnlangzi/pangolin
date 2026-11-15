@@ -88,8 +88,6 @@ pub struct BadbotsSettingsView {
     pub enabled: bool,
     /// The evidence policy — `"strict"` or `"lenient"`.
     pub evidence_policy: &'static str,
-    /// How often the publishers' lists are refreshed, in seconds.
-    pub feed_refresh_interval_secs: u64,
     /// Whether an AbuseIPDB key is configured.
     pub abuseipdb_key_configured: bool,
     /// Whether a CrowdSec key is configured.

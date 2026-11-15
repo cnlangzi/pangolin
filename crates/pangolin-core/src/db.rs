@@ -888,7 +888,7 @@ pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::
 /// a read went wrong.
 pub fn get_badbots_config(conn: &Connection) -> rusqlite::Result<BadbotsSettings> {
     let mut stmt = conn.prepare(
-        "SELECT enabled, evidence_policy, feed_refresh_interval_secs,
+        "SELECT enabled, evidence_policy,
                 abuseipdb_api_key, crowdsec_api_key, updated_at
          FROM badbots_config WHERE id = 1",
     )?;
@@ -905,15 +905,13 @@ pub fn update_badbots_config(conn: &Connection, cfg: &BadbotsSettings) -> rusqli
         "UPDATE badbots_config
             SET enabled = ?1,
                 evidence_policy = ?2,
-                feed_refresh_interval_secs = ?3,
-                abuseipdb_api_key = ?4,
-                crowdsec_api_key = ?5,
-                updated_at = ?6
+                abuseipdb_api_key = ?3,
+                crowdsec_api_key = ?4,
+                updated_at = ?5
           WHERE id = 1",
         params![
             cfg.enabled as i64,
             cfg.evidence_policy.as_str(),
-            cfg.feed_refresh_interval_secs as i64,
             cfg.abuseipdb_api_key,
             cfg.crowdsec_api_key,
             cfg.updated_at.to_rfc3339(),
@@ -925,20 +923,15 @@ pub fn update_badbots_config(conn: &Connection, cfg: &BadbotsSettings) -> rusqli
 fn row_to_badbots_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<BadbotsSettings> {
     let enabled: i64 = row.get(0)?;
     let policy_raw: String = row.get(1)?;
-    let interval: i64 = row.get(2)?;
-    let abuseipdb_api_key: Option<String> = row.get(3)?;
-    let crowdsec_api_key: Option<String> = row.get(4)?;
-    let updated_at: String = row.get(5)?;
+    let abuseipdb_api_key: Option<String> = row.get(2)?;
+    let crowdsec_api_key: Option<String> = row.get(3)?;
+    let updated_at: String = row.get(4)?;
     let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!("invalid evidence policy: {policy_raw}"))
     })?;
     Ok(BadbotsSettings {
         enabled: enabled != 0,
         evidence_policy,
-        // A zero interval would make the refresh loop spin at full
-        // speed. The gateway clamps it to at least one second; the
-        // value read here is the operator's raw request.
-        feed_refresh_interval_secs: interval.max(0) as u64,
         abuseipdb_api_key,
         crowdsec_api_key,
         updated_at: parse_dt(&updated_at)?,
@@ -1721,7 +1714,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V12 as applied. (V2 merges
+        // it's there and lists V1..V14 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
@@ -1731,15 +1724,17 @@ mod tests {
         // per-site rate limits + IP rules for issue #117; V10 adds the
         // per-site provider configuration + origin guard for issue #122;
         // V11 adds the per-site known-bot rate-limit list for issue #131;
-        // V12 adds the badbots_config singleton for issue #141.)
+        // V12 adds the badbots_config singleton for issue #141; V13
+        // drops the list-refresh-interval setting for issue #151; V14
+        // rewrites the per-site bot list for the removed crawlers.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 12,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 to be applied"
+            count, 14,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -2663,7 +2658,6 @@ mod tests {
             "the gateway asks for a second opinion about a client it already rejected, \
              so the lenient bar is the default"
         );
-        assert_eq!(cfg.feed_refresh_interval_secs, 300);
         assert_eq!(cfg.abuseipdb_api_key, None);
         assert_eq!(cfg.crowdsec_api_key, None);
     }
@@ -2674,7 +2668,6 @@ mod tests {
         let mut cfg = get_badbots_config(&conn).unwrap();
         cfg.enabled = false;
         cfg.evidence_policy = BadbotsEvidencePolicy::Strict;
-        cfg.feed_refresh_interval_secs = 900;
         cfg.abuseipdb_api_key = Some("key-a".into());
         cfg.crowdsec_api_key = Some("key-c".into());
         cfg.updated_at = dt("2026-01-02T03:04:05Z");
@@ -2683,7 +2676,6 @@ mod tests {
         let read = get_badbots_config(&conn).unwrap();
         assert!(!read.enabled);
         assert_eq!(read.evidence_policy, BadbotsEvidencePolicy::Strict);
-        assert_eq!(read.feed_refresh_interval_secs, 900);
         assert_eq!(read.abuseipdb_api_key.as_deref(), Some("key-a"));
         assert_eq!(read.crowdsec_api_key.as_deref(), Some("key-c"));
         assert_eq!(read.updated_at, dt("2026-01-02T03:04:05Z"));

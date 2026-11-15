@@ -43,8 +43,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use badbots::{
-    AbuseIpdbConfig, BadBots, BlocklistDeConfig, Classification, Config, CrowdSecConfig,
-    DShieldConfig, EvidencePolicy, ProviderConfig, SpamhausConfig,
+    AbuseIpdbConfig, BadBots, BlocklistDeConfig, CinsConfig, Classification, Config,
+    CrowdSecConfig, DShieldConfig, EvidencePolicy, ProviderConfig, SpamhausConfig, SteemanConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +148,14 @@ pub fn library_config(settings: &BadbotsSettings) -> Config {
         enabled: true,
         ..Default::default()
     };
+    let steeman = SteemanConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let cins = CinsConfig {
+        enabled: true,
+        ..Default::default()
+    };
 
     // The keyed lookup providers — enabled only with a key.
     let abuseipdb = non_empty(settings.abuseipdb_api_key.as_deref()).map(|key| AbuseIpdbConfig {
@@ -168,6 +176,8 @@ pub fn library_config(settings: &BadbotsSettings) -> Config {
             spamhaus: Some(spamhaus),
             blocklist_de: Some(blocklist_de),
             dshield: Some(dshield),
+            steeman: Some(steeman),
+            cins: Some(cins),
         },
         evidence_policy: match settings.evidence_policy {
             BadbotsEvidencePolicy::Strict => EvidencePolicy::Strict,
@@ -421,6 +431,11 @@ mod tests {
         assert!(config.providers.spamhaus_enabled());
         assert!(config.providers.dshield_enabled());
         assert!(config.providers.blocklist_de_enabled());
+        // The two attack-list publishers added in badbots 0.1.4 —
+        // steeman and the CINS Army — need no credential either, so
+        // they join the always-on group.
+        assert!(config.providers.steeman_enabled());
+        assert!(config.providers.cins_enabled());
         // The keyed ones are not.
         assert!(!config.providers.abuseipdb_enabled());
         assert!(!config.providers.crowdsec_enabled());

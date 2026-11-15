@@ -22,12 +22,6 @@ use pangolin_core::{App, BadbotsEvidencePolicy, BadbotsSettings};
 
 use super::helpers::{param_bool, redirect};
 
-/// The smallest refresh interval the gateway accepts, in seconds.
-///
-/// A zero interval would make the refresh loop spin at full speed and
-/// hammer the publishers without pause.
-const MIN_REFRESH_INTERVAL_SECS: u64 = 1;
-
 /// Parse the form-encoded body of the reputation form.
 ///
 /// `current` is the stored row: a key field that is empty keeps the
@@ -42,21 +36,9 @@ pub fn parse_badbots_form(
         format!("Invalid evidence policy '{policy_raw}'. Expected one of: strict, lenient.")
     })?;
 
-    let interval_raw = super::helpers::require_param(body, "badbots_feed_refresh_interval_secs")
-        .unwrap_or_else(|| current.feed_refresh_interval_secs.to_string());
-    let interval: u64 = interval_raw.trim().parse().map_err(|_| {
-        format!("Invalid refresh interval '{interval_raw}': expected a whole number of seconds.")
-    })?;
-    if interval < MIN_REFRESH_INTERVAL_SECS {
-        return Err(format!(
-            "The refresh interval must be at least {MIN_REFRESH_INTERVAL_SECS} second."
-        ));
-    }
-
     Ok(BadbotsSettings {
         enabled: param_bool(body, "badbots_enabled", current.enabled),
         evidence_policy,
-        feed_refresh_interval_secs: interval,
         abuseipdb_api_key: api_key(
             body,
             "badbots_abuseipdb_api_key",
@@ -176,7 +158,6 @@ pub async fn handle_get_badbots_config(app: &Arc<App>) -> http::Result<Response<
     let body = serde_json::json!({
         "enabled": settings.enabled,
         "evidence_policy": settings.evidence_policy.as_str(),
-        "feed_refresh_interval_secs": settings.feed_refresh_interval_secs,
         "abuseipdb_api_key_configured": settings.abuseipdb_api_key.is_some(),
         "crowdsec_api_key_configured": settings.crowdsec_api_key.is_some(),
         "updated_at": settings.updated_at.to_rfc3339(),
@@ -195,7 +176,6 @@ mod tests {
         BadbotsSettings {
             enabled: true,
             evidence_policy: BadbotsEvidencePolicy::Lenient,
-            feed_refresh_interval_secs: 300,
             abuseipdb_api_key: Some("stored-key".into()),
             crowdsec_api_key: None,
             updated_at: chrono::Utc::now(),
@@ -208,7 +188,7 @@ mod tests {
         // empty field is the normal case after a save — it must not
         // delete the operator's credential.
         let parsed = parse_badbots_form(
-            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300",
+            b"badbots_enabled=true&badbots_evidence_policy=lenient",
             &current(),
         )
         .expect("the form parses");
@@ -218,7 +198,7 @@ mod tests {
     #[test]
     fn a_typed_key_replaces_the_stored_one() {
         let parsed = parse_badbots_form(
-            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300&badbots_abuseipdb_api_key=new-key",
+            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_abuseipdb_api_key=new-key",
             &current(),
         )
         .expect("the form parses");
@@ -228,7 +208,7 @@ mod tests {
     #[test]
     fn the_clear_checkbox_removes_the_stored_key() {
         let parsed = parse_badbots_form(
-            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300&badbots_abuseipdb_clear=true",
+            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_abuseipdb_clear=true",
             &current(),
         )
         .expect("the form parses");
@@ -242,7 +222,7 @@ mod tests {
         let parsed = parse_badbots_form(
             // `%20` is a percent-encoded space — `require_param` keeps a
             // literal `+` as `+`, so the space has to be encoded.
-            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300&badbots_abuseipdb_api_key=%20",
+            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_abuseipdb_api_key=%20",
             &current(),
         )
         .expect("the form parses");
@@ -254,7 +234,7 @@ mod tests {
         // An unchecked checkbox is not submitted at all, so the form
         // pairs it with a hidden "false" field.
         let parsed = parse_badbots_form(
-            b"badbots_enabled=false&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=300",
+            b"badbots_enabled=false&badbots_evidence_policy=lenient",
             &current(),
         )
         .expect("the form parses");
@@ -264,23 +244,54 @@ mod tests {
     #[test]
     fn an_unknown_policy_is_rejected() {
         let err = parse_badbots_form(
-            b"badbots_enabled=true&badbots_evidence_policy=bogus&badbots_feed_refresh_interval_secs=300",
+            b"badbots_enabled=true&badbots_evidence_policy=bogus",
             &current(),
         )
         .expect_err("the policy must be validated");
         assert!(err.contains("bogus"), "{err}");
     }
 
-    #[test]
-    fn a_zero_interval_is_rejected() {
-        // A zero interval would make the refresh loop spin at full
-        // speed and hammer the publishers without pause.
-        let err = parse_badbots_form(
-            b"badbots_enabled=true&badbots_evidence_policy=lenient&badbots_feed_refresh_interval_secs=0",
-            &current(),
-        )
-        .expect_err("the interval must be validated");
-        assert!(err.contains("at least"), "{err}");
+    /// The list-refresh-interval setting is gone (issue #151).
+    ///
+    /// The knob decided only how often the gateway *asked* the library
+    /// whether a list was due; the publisher's own refresh floor
+    /// decides that, and the floor is 24 hours now. A setting that
+    /// looks meaningful and is not is worse than no setting — so the
+    /// API does not report one any more.
+    #[tokio::test]
+    async fn the_api_response_has_no_refresh_interval() {
+        use http_body_util::BodyExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let app = Arc::new(
+            App::new(
+                db_path.to_str().expect("utf8"),
+                pangolin_core::Config::default(),
+                pangolin_core::CertManager::default(),
+            )
+            .expect("App::new"),
+        );
+
+        let response = handle_get_badbots_config(&app)
+            .await
+            .expect("the response builds");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            json.get("feed_refresh_interval_secs").is_none(),
+            "the removed setting must not be in the response: {json}"
+        );
+        // The settings that are still there.
+        assert_eq!(
+            json.get("evidence_policy").and_then(|v| v.as_str()),
+            Some("lenient")
+        );
     }
 
     #[test]

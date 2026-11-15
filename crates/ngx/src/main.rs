@@ -192,9 +192,7 @@ fn main() -> anyhow::Result<()> {
             // and does nothing while the library is absent — the
             // operator can turn the check on from the dashboard, and
             // the service picks the new instance up on its next tick.
-            Box::new(crate::badbots_feed::BadbotsFeedService::new(
-                crate::badbots_feed::DEFAULT_INTERVAL,
-            )),
+            Box::new(crate::badbots_feed::BadbotsFeedService::new()),
         ];
 
         // `ServiceContext` takes ownership of the `App`; keep a
