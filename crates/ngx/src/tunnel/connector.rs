@@ -60,7 +60,9 @@ use pingora::protocols::l4::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use pangolin_core::tunnel::{TunnelStream, decode_connect_reply, encode_connect, read_crlf_line};
+use pangolin_core::tunnel::{
+    TunnelStream, TunnelTransport, decode_connect_reply, encode_connect, read_crlf_line,
+};
 
 use crate::App;
 
@@ -123,59 +125,32 @@ impl L4Connect for TunnelConnector {
             ));
         };
 
-        let mut stream = transport.open_stream().await.map_err(|e| {
-            Error::explain(
-                ErrorType::ConnectError,
-                format!("tun {}: open stream: {e}", self.tun_name),
-            )
-        })?;
+        // The whole exchange is bounded. The pre-#153 executor
+        // bounded the response read at 60 s and answered 504; without
+        // a bound here, a wedged tun (or a tun whose DNS lookup
+        // hangs) would hold a pingora worker for as long as it liked.
+        let exchange = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_exchange(transport.as_ref(), &self.host, self.port),
+        )
+        .await;
 
-        // The connection instruction: the target by **name**, so the
-        // tun resolves it in its own network.
-        stream
-            .write_all(&encode_connect(&self.host, self.port))
-            .await
-            .map_err(|e| {
-                Error::explain(
-                    ErrorType::ConnectError,
-                    format!("tun {}: write CONNECT: {e}", self.tun_name),
-                )
-            })?;
-        stream.flush().await.map_err(|e| {
-            Error::explain(
-                ErrorType::ConnectError,
-                format!("tun {}: flush CONNECT: {e}", self.tun_name),
-            )
-        })?;
-
-        // The tun answers `OK` or `ERR <reason>` before any request
-        // byte travels. `ERR` becomes a 502 for the client.
-        let reply = read_crlf_line(&mut stream, MAX_INSTRUCTION_LEN)
-            .await
-            .map_err(|e| {
-                Error::explain(
-                    ErrorType::ConnectError,
-                    format!("tun {}: read CONNECT reply: {e}", self.tun_name),
-                )
-            })?;
-        match decode_connect_reply(reply.as_bytes()).map_err(|e| {
-            Error::explain(
-                ErrorType::ConnectError,
-                format!("tun {}: bad CONNECT reply: {e}", self.tun_name),
-            )
-        })? {
-            Ok(()) => {}
-            Err(reason) => {
-                warn!(
-                    "tunnel {}: backend {}:{} refused: {}",
-                    self.tun_name, self.host, self.port, reason
-                );
+        let stream = match exchange {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
                 return Err(Error::explain(
                     ErrorType::ConnectError,
-                    format!("tun {}: {reason}", self.tun_name),
+                    format!(
+                        "tun {}: the CONNECT exchange with {}:{} did not finish within {}s",
+                        self.tun_name,
+                        self.host,
+                        self.port,
+                        CONNECT_TIMEOUT.as_secs()
+                    ),
                 ));
             }
-        }
+        };
 
         debug!(
             "tunnel {}: connected to {}:{} over {}",
@@ -198,6 +173,68 @@ impl L4Connect for TunnelConnector {
     }
 }
 
+/// How long the CONNECT exchange may take before the request is
+/// failed.
+///
+/// The exchange is: open a stream, write the `CONNECT` instruction,
+/// read the tun's `OK` / `ERR` answer. The tun only answers after it
+/// has resolved and dialled the backend, so this bounds the DNS
+/// lookup and the connect too.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open a tunnel stream and run the `CONNECT` exchange on it.
+///
+/// The tun answers `OK` or `ERR <reason>` before any request byte
+/// travels; `ERR` becomes a 502 for the client.
+async fn connect_exchange(
+    transport: &dyn TunnelTransport,
+    host: &str,
+    port: u16,
+) -> Result<pangolin_core::tunnel::TunnelStream> {
+    let mut stream = transport
+        .open_stream()
+        .await
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("open stream: {e}")))?;
+
+    // The connection instruction: the target by **name**, so the tun
+    // resolves it in its own network.
+    //
+    // The instruction is a **line**, so a host carrying CR, LF or NUL
+    // would split it and leave a forged line in the tun's stream. The
+    // backend URL is admin-controlled, so this is a defence in depth
+    // — but a clear error beats a malformed instruction.
+    if host.contains(['\r', '\n', '\0']) {
+        return Err(Error::explain(
+            ErrorType::ConnectError,
+            "the backend host contains an illegal character",
+        ));
+    }
+    stream
+        .write_all(&encode_connect(host, port))
+        .await
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("write CONNECT: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("flush CONNECT: {e}")))?;
+
+    let reply = read_crlf_line(&mut stream, MAX_INSTRUCTION_LEN)
+        .await
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("read CONNECT reply: {e}")))?;
+    match decode_connect_reply(reply.as_bytes())
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("bad CONNECT reply: {e}")))?
+    {
+        Ok(()) => Ok(stream),
+        Err(reason) => {
+            warn!("tunnel: the backend refused the connection: {reason}");
+            Err(Error::explain(
+                ErrorType::ConnectError,
+                format!("the backend refused the connection: {reason}"),
+            ))
+        }
+    }
+}
+
 /// Derive the peer group key for a tunnel backend.
 ///
 /// pingora pools upstream connections per peer, and `HttpPeer::hash`
@@ -206,6 +243,11 @@ impl L4Connect for TunnelConnector {
 /// backend would otherwise be handed to a request for another. The
 /// key is derived from everything that identifies the backend: the
 /// tun, the host, the port and the scheme.
+///
+/// This is the **explicit** separator. The SNI also lands in
+/// pingora's peer hash, but the SNI is a TLS concept; relying on it
+/// for a plain-HTTP backend would be an accident rather than a
+/// contract.
 pub fn tunnel_group_key(tun_name: &str, host: &str, port: u16, tls: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -220,27 +262,28 @@ pub fn tunnel_group_key(tun_name: &str, host: &str, port: u16, tls: bool) -> u64
 // The loopback socket
 // ---------------------------------------------------------------------------
 
-/// The process-wide loopback listener used to mint socket handles.
-///
-/// One listener serves every tunnel stream: each request connects to
-/// it and takes the accepted end.
-async fn loopback_listener() -> std::io::Result<Arc<TcpListener>> {
-    static LISTENER: tokio::sync::OnceCell<Arc<TcpListener>> = tokio::sync::OnceCell::const_new();
-    LISTENER
-        .get_or_try_init(|| async { Ok(Arc::new(TcpListener::bind("127.0.0.1:0").await?)) })
-        .await
-        .cloned()
-}
-
 /// Mint a connected pair of loopback sockets.
 ///
 /// The two ends are interchangeable: one goes to pingora, the other
 /// carries the tunnel stream.
+///
+/// **Each pair gets its own listener.** The obvious implementation —
+/// one shared listener, then `connect` and `accept` as two independent
+/// awaits — is a cross-request data leak: `connect` parks the task
+/// while it waits, so with two concurrent requests the accept order
+/// need not match the connect order and a request can end up with
+/// *another* request's accepted socket. One request's bytes would
+/// then travel into another request's tunnel stream.
+///
+/// A fresh listener has room for exactly one pending connection, so
+/// the accept is guaranteed to be the one we just made. The listener
+/// is dropped as soon as the pair is minted.
 async fn mint_loopback_pair() -> std::io::Result<(TcpStream, TcpStream)> {
-    let listener = loopback_listener().await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let client = TcpStream::connect(addr).await?;
     let (server, _) = listener.accept().await?;
+    drop(listener);
     Ok((client, server))
 }
 
@@ -336,6 +379,39 @@ mod tests {
         let mut buf = [0u8; 5];
         b.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    /// Two concurrent requests must not be able to take each other's
+    /// accepted socket.
+    ///
+    /// The connect and the accept are two independent awaits against
+    /// one shared listener, and `connect` parks the task while it
+    /// waits — so the accept order need not match the connect order.
+    /// When they crossed, one request's bytes would travel into
+    /// another request's tunnel stream: a cross-request (and
+    /// cross-tenant) data leak.
+    ///
+    /// The test mints several pairs at once and checks that each pair
+    /// is connected **to itself**: the marker one end writes has to
+    /// come back on the other end of the same pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pairs_are_not_crossed() {
+        let mut tasks = Vec::new();
+        for marker in 0u8..8 {
+            tasks.push(tokio::spawn(async move {
+                let (mut client, mut server) = mint_loopback_pair().await.unwrap();
+                client.write_all(&[marker]).await.unwrap();
+                let mut buf = [0u8; 1];
+                server.read_exact(&mut buf).await.unwrap();
+                assert_eq!(
+                    buf[0], marker,
+                    "the pair was crossed: another request's socket was accepted"
+                );
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     /// The bridge carries the request bytes to the tunnel side and the

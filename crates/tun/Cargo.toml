@@ -18,10 +18,10 @@ path = "src/lib.rs"
 tokio.workspace = true
 fastwebsockets.workspace = true
 tokio-yamux.workspace = true
-bytes = "1"
 # The tun is a byte relay (issue #153): it no longer speaks HTTP, so
-# it needs neither `pingora-core` nor `pingora-http`. The tunnel's
-# byte-stream interface lives in `pangolin-core`.
+# it needs neither `pingora-core` nor `pingora-http` — and no HTTP
+# types either. The tunnel's byte-stream interface lives in
+# `pangolin-core`.
 async-trait.workspace = true
 futures.workspace = true
 futures-util.workspace = true
@@ -35,7 +35,6 @@ thiserror.workspace = true
 clap.workspace = true
 chrono.workspace = true
 pangolin-core = { path = "../pangolin-core" }
-http = "1.4.1"
 
 [dev-dependencies]
 # `figment::Jail` lives behind the `test` feature flag — used by the

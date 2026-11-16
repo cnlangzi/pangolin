@@ -475,9 +475,15 @@ time and refuses to start on any violation.
 The tun writes two files next to its configuration file. They are
 state, not configuration — do not edit them by hand except to re-pin.
 
+**The directory has to be writable by the tun's user.** The tun
+cannot record a pin it cannot write, and a trust failure is fatal by
+design (it never falls back to the unencrypted transport), so an
+unwritable directory means the tun cannot use QUIC at all. The log
+says so explicitly.
+
 | File | Written by | Purpose |
 | ---- | ---------- | ------- |
-| `tun.pins` | the tun | The SHA-256 fingerprints of the gateway certificates this tun trusts, one per line. The first successful QUIC connection pins the certificate it presented; a later connection that presents a different fingerprint is refused. Delete a line to stop trusting that gateway, add a line to trust another one. |
+| `tun.pins` | the tun | The SHA-256 fingerprints of the gateway certificates this tun trusts, one per line. The first successful QUIC connection pins the certificate it presented; a later connection that presents a different fingerprint is refused — and the tun does **not** fall back to the unencrypted transport, because that would send the bearer token in cleartext. Delete a line to stop trusting that gateway, add a line to trust another one. |
 | `tun.quic-fail` | the tun | The Unix timestamp of the last failed QUIC attempt. The tun skips the QUIC probe for ten minutes after a failure, so a network that blocks UDP does not pay the handshake timeout on every reconnect. |
 
 ### `[log]`

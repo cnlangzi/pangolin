@@ -73,7 +73,7 @@ matrix; only the transport and the schema-specific bits vary.
 | `Host` header rewrite (`host_mode` policy) | **yes** | `pangolin-core::proxy::apply_proxy_policy` | all three |
 | Hop-by-hop header stripping | **yes** | `pangolin-core::proxy::apply_proxy_policy` | all three |
 | `X-Forwarded-Host` / `X-Forwarded-Proto` | **yes** | same | all three |
-| Static-file serving (`file://` backend) | **yes** | `pangolin-core::file_serve::serve_file_target` | `ngx` direct, `tun` local |
+| Static-file serving (`file://` backend) | **yes** | `pangolin-core::file_serve::serve_file_target` | `ngx` direct |
 | Backend URL parsing | **yes** | `pangolin-core::parse::parse_backend` (existing) | all three |
 | **HTTP/1.1 client to backend** | **yes** | `pingora-core` `Connector` + `HttpPeer` | `ngx` direct, `ngx` tunnel (via `tun`) |
 | **WebSocket upgrade to backend** | **yes** | pingora's built-in upgrade path | `ngx` direct, `ngx` tunnel (via `tun`) |
@@ -430,12 +430,16 @@ After the refactor:
    `pangolin-core::tunnel`).
 2. `ngx`'s file:// direct branch calls it and writes the
    returned `HttpResponse` to the session.
-3. `tun`'s file:// tunnel branch calls it after decoding the
-   frame and applying `apply_proxy_policy`.
 
-**Both code paths now share one implementation**, and the
-existing `real_e2e_tunnel_file_backend` test serves as the
-regression net for both.
+**The direct path has one implementation**, covered by
+`real_e2e_static_file` and the `serve_file_target` unit tests.
+
+A `file://` backend **over a tunnel** no longer works (issue #153):
+the tunnel is a byte splice, so the tun dials a `host:port` and
+copies bytes — it cannot serve a local file, and it no longer speaks
+HTTP, so it cannot synthesise a response for one either. The gateway
+refuses such a backend with a 501; `real_e2e_tunnel_file_backend_is_refused`
+is the regression net for that.
 
 ---
 
@@ -493,8 +497,8 @@ These are the testable contracts. Each row gets a unit test in
 | I-16 | Tunnel path: path + query round-trips byte-exact | `real_e2e_tunnel_path_invariant` |
 | I-17 | Tunnel path: body round-trips byte-exact | `real_e2e_tunnel_http_verbs_{post,put,patch}` |
 | I-18 | Tunnel path: `host_mode` reaches backend with correct Host | `real_e2e_tunnel_host_mode_preserves_path` |
-| I-19 | Tunnel path: backend path-prefix concat (`/blogs` + `/2026-06` → `/blogs/2026-06`) | `real_e2e_tunnel_backend_path_prefix` |
-| I-20 | Tunnel + file://: same security checks as direct + file:// | `real_e2e_tunnel_file_backend` (existing, extended) |
+| I-19 | Tunnel path: backend path-prefix concat (`/blogs` + `/2026-06` → `/blogs/2026-06`) | `real_e2e_tunnel_backend_path_prefix_is_applied` |
+| I-20 | Tunnel + file://: refused with a 501 (the splice cannot serve a local file) | `real_e2e_tunnel_file_backend_is_refused` |
 | I-21 | Tunnel WS upgrade: full headers reach backend; path preserved | `real_e2e_tunnel_ws_upgrade_path_preserved` |
 | I-22 | Tunnel WS upgrade: `host_mode` rewrites Host | `real_e2e_tunnel_ws_upgrade_host_mode` |
 | I-23 | Tunnel + https backend: TLS works through pingora client | `real_e2e_tunnel_https_backend` |

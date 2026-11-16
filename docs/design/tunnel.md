@@ -163,6 +163,20 @@ a middleman present at that moment would be pinned instead of the
 gateway. Both sides log the fingerprint when the pin is created, so an
 operator can compare the tun's log with the gateway's log afterwards.
 
+The pinned certificate is **public** — it travels in the handshake —
+so the pin alone would not be enough: the TLS handshake signature is
+verified as well, which proves the peer holds the certificate's
+private key. The fingerprint identifies the certificate; the signature
+proves the key.
+
+**A trust failure never falls back.** The tun falls back to the
+WebSocket/TCP transport when the gateway cannot be *reached* (the
+network blocks UDP), but not when it cannot be *trusted*: the fallback
+is unencrypted, so falling back would hand the bearer token to
+whoever is presenting the wrong certificate. The tun refuses, says so
+in the log, and tells the operator to fix the pin — or to choose
+`transport: tcp` deliberately if they want the downgrade.
+
 ## The fallback policy
 
 At the start of a session the tun attempts QUIC. The attempt is
@@ -227,6 +241,23 @@ A `file://` backend over a tunnel. The file lives on the tun's
 machine and the tunnel only dials a `host:port`, so there is nothing
 to relay. The gateway refuses such a backend with a 501 and a log
 line. The **direct** `file://` path is unchanged.
+
+### The status codes a failed tunnel produces
+
+The tunnel path goes through pingora's upstream machinery, so its
+failures surface as pingora's standard upstream statuses: **502** for
+a tun that is not connected, that refuses the connection, or whose
+session drops mid-request. The pre-#153 code answered **503** for a
+tun that was not online; the distinction is gone, because the tunnel
+no longer has a hand-written path that could pick its own status.
+
+### The backend's path prefix
+
+A tunnelled backend's URL may carry a path prefix
+(`office:http://10.0.0.1:8080/apis`). The prefix is part of the
+backend's identity, so the gateway prepends it to the upstream
+request path — the CONNECT instruction only carries a `host:port`,
+and the path is the request's own.
 
 ## Design choices
 

@@ -41,11 +41,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use pangolin_core::tunnel::WsRole;
 use pangolin_core::tunnel::pin::PinStore;
-use pangolin_core::tunnel::quic::QuicClientTransport;
+use pangolin_core::tunnel::quic::{QuicClientTransport, QuicConnectError};
 use pangolin_core::tunnel::{
     TUNNEL_PROTOCOL_VERSION, TUNNEL_VERSION_HEADER, TunnelRole, TunnelStream, TunnelTransport,
     build_ws_upgrade_request, decode_auth_reply, decode_connect, encode_auth, encode_connect_reply,
@@ -175,7 +175,7 @@ impl TunnelClient {
             },
             TransportSelector::Quic => match self.connect_quic().await {
                 Ok(t) => t,
-                Err(e) => return SessionOutcome::NotConnected(e),
+                Err(e) => return SessionOutcome::NotConnected(e.to_string()),
             },
             TransportSelector::Auto => {
                 if self.quic_recently_failed() {
@@ -190,7 +190,10 @@ impl TunnelClient {
                 } else {
                     match self.connect_quic().await {
                         Ok(t) => t,
-                        Err(e) => {
+                        Err(e) if quic_failure_falls_back(&e) => {
+                            // The gateway could not be reached — the
+                            // network most likely blocks UDP. The
+                            // fallback is the right answer here.
                             warn!(
                                 "tun {}: the QUIC attempt failed ({}); falling back to the \
                                  WebSocket/TCP transport",
@@ -201,6 +204,36 @@ impl TunnelClient {
                                 Ok(t) => t,
                                 Err(e) => return SessionOutcome::NotConnected(e),
                             }
+                        }
+                        Err(e) => {
+                            // The gateway could not be **trusted**,
+                            // or it refused the session. Falling
+                            // back here would send the bearer token
+                            // over the unencrypted WebSocket/TCP
+                            // transport — to whoever is presenting
+                            // the wrong certificate, or with no gain
+                            // at all. That is the exact downgrade the
+                            // QUIC transport exists to prevent, so
+                            // refuse and let the operator fix it (or
+                            // choose `transport: tcp` deliberately).
+                            let reason = match &e {
+                                QuicConnectError::Untrusted(_) => format!(
+                                    "the gateway's QUIC certificate is not trusted ({e}); refusing \
+                                     to fall back to the unencrypted WebSocket/TCP transport — \
+                                     falling back would send the bearer token in cleartext"
+                                ),
+                                _ => format!(
+                                    "the QUIC session was refused ({e}); not falling back to the \
+                                     unencrypted WebSocket/TCP transport — it would carry the \
+                                     bearer token in cleartext for no gain"
+                                ),
+                            };
+                            error!(
+                                "tun {}: {reason}. Fix the problem, or set `transport: tcp` in \
+                                 tun.yml to downgrade deliberately",
+                                self.config.name
+                            );
+                            return SessionOutcome::NotConnected(e.to_string());
                         }
                     }
                 }
@@ -214,9 +247,20 @@ impl TunnelClient {
     }
 
     /// Connect over QUIC and authenticate on a control stream.
-    async fn connect_quic(&self) -> Result<Arc<dyn TunnelTransport>, String> {
-        let (addr, server_name) = resolve_server(&self.config.server).await?;
-        let pins = PinStore::open(&self.pin_path).map_err(|e| e.to_string())?;
+    ///
+    /// The error says **whether** the gateway was unreachable or
+    /// untrusted — the caller must not fall back to the unencrypted
+    /// transport after a trust failure.
+    async fn connect_quic(&self) -> Result<Arc<dyn TunnelTransport>, QuicConnectError> {
+        let (addr, server_name) = resolve_server(&self.config.server)
+            .await
+            .map_err(QuicConnectError::Unreachable)?;
+        let pins = PinStore::open(&self.pin_path).map_err(|e| {
+            QuicConnectError::PinStore(format!(
+                "the pin file {} could not be read: {e}",
+                self.pin_path.display()
+            ))
+        })?;
 
         let (transport, _pinned) = tokio::time::timeout(
             Duration::from_secs(QUIC_HANDSHAKE_TIMEOUT_SECS),
@@ -224,19 +268,17 @@ impl TunnelClient {
         )
         .await
         .map_err(|_| {
-            format!(
+            QuicConnectError::Unreachable(format!(
                 "the QUIC handshake to {} timed out after {QUIC_HANDSHAKE_TIMEOUT_SECS}s",
                 self.config.server
-            )
-        })?
-        .map_err(|e| e.to_string())?;
+            ))
+        })??;
 
         // QUIC has no upgrade request to carry the token in, so the
         // tun opens a control stream and authenticates there.
-        let mut control = transport
-            .open_stream()
-            .await
-            .map_err(|e| format!("open the QUIC control stream: {e}"))?;
+        let mut control = transport.open_stream().await.map_err(|e| {
+            QuicConnectError::Unreachable(format!("open the QUIC control stream: {e}"))
+        })?;
         control
             .write_all(&encode_auth(
                 &self.config.token,
@@ -244,30 +286,40 @@ impl TunnelClient {
                 TUNNEL_PROTOCOL_VERSION,
             ))
             .await
-            .map_err(|e| format!("write the AUTH line: {e}"))?;
+            .map_err(|e| QuicConnectError::Unreachable(format!("write the AUTH line: {e}")))?;
         control
             .flush()
             .await
-            .map_err(|e| format!("flush the AUTH line: {e}"))?;
+            .map_err(|e| QuicConnectError::Unreachable(format!("flush the AUTH line: {e}")))?;
         let reply = tokio::time::timeout(
             Duration::from_secs(AUTH_REPLY_TIMEOUT_SECS),
             read_crlf_line(&mut control, MAX_INSTRUCTION_LEN),
         )
         .await
         .map_err(|_| {
-            format!("the gateway did not answer the AUTH line within {AUTH_REPLY_TIMEOUT_SECS}s")
+            QuicConnectError::Unreachable(format!(
+                "the gateway did not answer the AUTH line within {AUTH_REPLY_TIMEOUT_SECS}s"
+            ))
         })?
-        .map_err(|e| format!("read the AUTH reply: {e}"))?;
-        match decode_auth_reply(reply.as_bytes()).map_err(|e| e.to_string())? {
+        .map_err(|e| QuicConnectError::Unreachable(format!("read the AUTH reply: {e}")))?;
+        match decode_auth_reply(reply.as_bytes())
+            .map_err(|e| QuicConnectError::Unreachable(e.to_string()))?
+        {
             Ok(version) => {
                 if version != TUNNEL_PROTOCOL_VERSION {
-                    return Err(pangolin_core::tunnel::protocol_version_mismatch(
-                        TUNNEL_PROTOCOL_VERSION,
-                        version,
+                    return Err(QuicConnectError::Untrusted(
+                        pangolin_core::tunnel::protocol_version_mismatch(
+                            TUNNEL_PROTOCOL_VERSION,
+                            version,
+                        ),
                     ));
                 }
             }
-            Err(reason) => return Err(format!("the gateway refused the tun: {reason}")),
+            Err(reason) => {
+                return Err(QuicConnectError::Refused(format!(
+                    "the gateway refused the tun: {reason}"
+                )));
+            }
         }
 
         info!(
@@ -487,6 +539,21 @@ async fn relay_stream(mut stream: TunnelStream, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a failed QUIC attempt may fall back to the WebSocket/TCP
+/// transport.
+///
+/// A gateway that cannot be **reached** may: the network most likely
+/// blocks UDP, and the fallback is the only way through. A gateway
+/// that cannot be **trusted** may not — the fallback is unencrypted,
+/// so falling back would hand the bearer token to whoever is
+/// presenting the wrong certificate. That is the exact downgrade the
+/// QUIC transport exists to prevent, so the tun refuses and the
+/// operator has to fix the pin (or choose `transport: tcp`
+/// deliberately).
+fn quic_failure_falls_back(error: &QuicConnectError) -> bool {
+    matches!(error, QuicConnectError::Unreachable(_))
+}
+
 /// Resolve the target and dial it.
 ///
 /// The host is resolved **here**, in the operator's own network — a
@@ -526,6 +593,33 @@ async fn dial_target(host: &str, port: u16) -> Result<TcpStream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gateway that cannot be **reached** may fall back to the
+    /// unencrypted transport — that is the "the network blocks UDP"
+    /// case.
+    #[test]
+    fn an_unreachable_gateway_may_fall_back() {
+        assert!(quic_failure_falls_back(&QuicConnectError::Unreachable(
+            "connection refused".into()
+        )));
+    }
+
+    /// A gateway that cannot be **trusted** may not: falling back
+    /// would send the bearer token in cleartext to whoever is
+    /// presenting the wrong certificate. Neither may a refused
+    /// session or a pin store that cannot be written.
+    #[test]
+    fn an_untrusted_gateway_may_not_fall_back() {
+        assert!(!quic_failure_falls_back(&QuicConnectError::Untrusted(
+            "the certificate is not pinned".into()
+        )));
+        assert!(!quic_failure_falls_back(&QuicConnectError::Refused(
+            "the gateway refused the tun".into()
+        )));
+        assert!(!quic_failure_falls_back(&QuicConnectError::PinStore(
+            "the pin file is not writable".into()
+        )));
+    }
 
     /// The server address is split into the socket address and the
     /// name presented in the TLS handshake.

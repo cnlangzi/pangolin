@@ -289,6 +289,45 @@ impl AsyncWrite for QuicBiStream {
 // The client (the tun)
 // ---------------------------------------------------------------------------
 
+/// Why a QUIC attempt failed.
+///
+/// The distinction matters to the tun: a gateway that cannot be
+/// **reached** lets it fall back to the WebSocket/TCP transport, a
+/// gateway that cannot be **trusted** does not — the fallback is
+/// unencrypted, so falling back would hand the bearer token to
+/// whoever is presenting the wrong certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicConnectError {
+    /// The gateway could not be reached: UDP blocked, the address is
+    /// wrong, the handshake timed out. The tun MAY fall back to the
+    /// WebSocket/TCP transport.
+    Unreachable(String),
+    /// The gateway's certificate is not the one this tun pinned. The
+    /// tun MUST NOT fall back: the fallback is unencrypted, so it
+    /// would hand the bearer token to whoever is presenting the
+    /// wrong certificate.
+    Untrusted(String),
+    /// The gateway refused the session — a bad token or a protocol
+    /// version mismatch. The tun MUST NOT fall back either: the
+    /// fallback carries the same (refused) token in cleartext.
+    Refused(String),
+    /// The certificate was accepted but the pin could not be
+    /// recorded, so the trust could not be established for the next
+    /// connection. The tun MUST NOT fall back.
+    PinStore(String),
+}
+
+impl std::fmt::Display for QuicConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuicConnectError::Unreachable(msg)
+            | QuicConnectError::Untrusted(msg)
+            | QuicConnectError::Refused(msg)
+            | QuicConnectError::PinStore(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// The tun's QUIC transport.
 #[derive(Debug, Clone)]
 pub struct QuicClientTransport {
@@ -311,7 +350,7 @@ impl QuicClientTransport {
         addr: SocketAddr,
         server_name: &str,
         pins: &PinStore,
-    ) -> Result<(Self, bool)> {
+    ) -> std::result::Result<(Self, bool), QuicConnectError> {
         let state = Arc::new(PinState::default());
         let verifier = PinningVerifier::new(pins.pins(), state.clone(), pins.path().to_path_buf());
         // The certificate is self-signed by design and the tunnel has
@@ -320,28 +359,38 @@ impl QuicClientTransport {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|e| PangolinError::Invalid(format!("tls protocol versions: {e}")))?
+            .map_err(|e| QuicConnectError::Untrusted(format!("tls protocol versions: {e}")))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
         tls.alpn_protocols = vec![TUNNEL_ALPN.to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-            .map_err(|e| PangolinError::Invalid(format!("quic client config: {e}")))?;
+            .map_err(|e| QuicConnectError::Untrusted(format!("quic client config: {e}")))?;
         let mut config = quinn::ClientConfig::new(Arc::new(quic_config));
         // The tunnel session is long-lived: the idle timeout is
         // paired with a keep-alive so a quiet connection stays open.
         config.transport_config(Arc::new(transport_config()));
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| PangolinError::Io(std::io::Error::other(format!("quic endpoint: {e}"))))?;
+            .map_err(|e| QuicConnectError::Unreachable(format!("quic endpoint: {e}")))?;
         endpoint.set_default_client_config(config);
 
         let connecting = endpoint
             .connect(addr, server_name)
-            .map_err(|e| PangolinError::Io(std::io::Error::other(format!("quic connect: {e}"))))?;
-        let connection = connecting.await.map_err(|e| {
-            PangolinError::Io(std::io::Error::other(format!("quic handshake: {e}")))
-        })?;
+            .map_err(|e| QuicConnectError::Unreachable(format!("quic connect: {e}")))?;
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                // The verifier refused the certificate: that is a
+                // **trust** failure, not an unreachable gateway.
+                if let Some(reason) = state.refusal() {
+                    return Err(QuicConnectError::Untrusted(reason));
+                }
+                return Err(QuicConnectError::Unreachable(format!(
+                    "quic handshake: {e}"
+                )));
+            }
+        };
 
         // The handshake is over. Now decide whether we trust the
         // certificate that was presented.
@@ -350,17 +399,22 @@ impl QuicClientTransport {
             PinVerdict::Accepted => false,
             PinVerdict::Pin => {
                 let Some(fingerprint) = presented.as_deref() else {
-                    return Err(PangolinError::Invalid(
+                    return Err(QuicConnectError::Untrusted(
                         "the gateway presented no certificate, so there is nothing to pin".into(),
                     ));
                 };
-                pins.add(fingerprint)?;
+                pins.add(fingerprint).map_err(|e| {
+                    QuicConnectError::PinStore(format!(
+                        "the gateway's certificate could not be pinned in {}: {e}",
+                        pins.path().display()
+                    ))
+                })?;
                 info!("tunnel: pinned the gateway's QUIC certificate (fingerprint {fingerprint})");
                 true
             }
             PinVerdict::Refused(msg) => {
                 connection.close(0u32.into(), msg.as_bytes());
-                return Err(PangolinError::Invalid(msg));
+                return Err(QuicConnectError::Untrusted(msg));
             }
         };
 

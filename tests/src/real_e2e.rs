@@ -5258,11 +5258,16 @@ async fn real_e2e_origin_guard_ignores_a_forged_cf_connecting_ip() {
     );
 }
 
-/// The ACME HTTP-01 challenge and the tunnel control channel are
-/// exempt from the guard: they are answered normally even though the
-/// peer is outside the allowlist.
+/// The ACME HTTP-01 challenge is exempt from the guard: it is
+/// answered normally even though the peer is outside the allowlist.
+///
+/// The tunnel's control channel needs no exemption — it lives on the
+/// tunnel listener (`tunnel.addr`), not on the proxy port, so it never
+/// reaches the proxy. A WebSocket upgrade to `/tunnel` on the **proxy**
+/// port is ordinary site traffic and stays guarded, like any other
+/// request from an outside peer.
 #[tokio::test]
-async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() {
+async fn real_e2e_origin_guard_exempts_the_acme_challenge() {
     let backend = InspectingBackend::start().await;
 
     let ngx = NgxProcess::start({
@@ -5298,24 +5303,23 @@ async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() 
     );
     assert_eq!(body, key_auth);
 
-    // The tunnel control channel — a WebSocket **upgrade** — is
-    // answered normally too. The exemption is tied to the upgrade:
-    // the ws_path branch answers it before the guard runs.
+    // A WebSocket **upgrade** to the tunnel path on the proxy port is
+    // ordinary site traffic: the control channel lives on the tunnel
+    // listener, so there is nothing to exempt here.
     let handshake = try_open_ws_client(ngx.http_port, "guard.test", "/tunnel").await;
     let status = match &handshake {
         Ok((_ws, resp)) => resp.status().as_u16(),
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
         Err(e) => panic!("unexpected handshake error: {e}"),
     };
-    assert_ne!(
+    assert_eq!(
         status,
         403,
-        "the tunnel control channel must be exempt from the guard, got {status}\nngx log:\n{}",
+        "a ws upgrade to the tunnel path on the proxy port must be guarded, got {status}\nngx log:\n{}",
         ngx.log_string()
     );
 
-    // A **plain** request to the same path is ordinary site traffic
-    // and stays guarded — the exemption is not a hole in the guard.
+    // A **plain** request to the same path is guarded too.
     let (status, _) = raw_get_full(&addr, "guard.test", "/tunnel").await;
     assert_eq!(
         status,

@@ -113,8 +113,11 @@ pub mod pin;
 ///
 /// Two exist after issue #153: QUIC (the primary transport) and
 /// WebSocket-over-TCP (the fallback for networks where UDP is
-/// blocked). The name is used in the logs, in the admin UI and in the
-/// tun's transport selector.
+/// blocked). The name is used in the logs.
+///
+/// The tun's *selector* (`auto` / `quic` / `tcp`) is a separate type
+/// — `crates/tun/src/config.rs::TransportSelector` — because it also
+/// carries the `auto` value, which has no counterpart here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
     /// QUIC — one connection per tun, one bidirectional stream per
@@ -224,6 +227,16 @@ impl TunnelTransport for YamuxTunnel {
 /// reachable from the tun's side works. The instruction is a single
 /// line, so the tun can read it before it has connected to anything.
 pub fn encode_connect(host: &str, port: u16) -> Vec<u8> {
+    // The instruction is a **line**: a host carrying CR, LF or NUL
+    // would split it and leave a forged line in the tun's stream. The
+    // backend URL is admin-controlled, so this is a defence in depth
+    // rather than a reachable hole.
+    if host.contains(['\r', '\n', '\0']) {
+        // The host cannot be encoded safely, so the instruction is
+        // deliberately malformed: the tun refuses it and the request
+        // fails instead of smuggling a line.
+        return b"CONNECT <invalid-host>\r\n".to_vec();
+    }
     format!("CONNECT {host}:{port}\r\n").into_bytes()
 }
 
@@ -256,6 +269,14 @@ pub fn decode_connect(line: &[u8]) -> IoResult<(String, u16)> {
             format!("CONNECT instruction has a bad port: {text:?}: {e}"),
         )
     })?;
+    // An IPv6 literal arrives bracketed (`[::1]:8080`). The brackets
+    // are URL syntax, not part of the host — and `getaddrinfo` does
+    // not accept them, so the tun would fail to resolve the
+    // backend.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     Ok((host.to_string(), port))
 }
 
@@ -400,6 +421,12 @@ pub fn decode_auth_reply(line: &[u8]) -> IoResult<Result<u32, String>> {
 /// `AUTH` control line. The line is returned **without** its
 /// terminator. `max` bounds the read so a peer that never sends a
 /// newline cannot make us allocate without limit.
+///
+/// **The read is one byte at a time on purpose.** The gateway reads
+/// the tun's `OK` reply off the *same* stream that later carries the
+/// response, so a buffered read would swallow the first response
+/// bytes. One byte at a time leaves the rest of the stream exactly
+/// where it was.
 pub async fn read_crlf_line<R>(r: &mut R, max: usize) -> IoResult<String>
 where
     R: AsyncRead + Unpin,
@@ -970,7 +997,11 @@ pub fn compute_ws_accept(key: &str) -> String {
 }
 
 /// A parsed minimal view of a WebSocket upgrade request.
-#[derive(Debug, Clone)]
+///
+/// The `Debug` impl redacts the `Authorization` header: the struct
+/// carries the tun's bearer token, and a `{:?}` dump would put the
+/// credential into the log.
+#[derive(Clone)]
 pub struct WsUpgradeRequest {
     pub method: String,
     pub target: String,
@@ -981,6 +1012,40 @@ pub struct WsUpgradeRequest {
     /// version travels in [`TUNNEL_VERSION_HEADER`]; the named fields
     /// above are the ones the handshake itself needs.
     pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for WsUpgradeRequest {
+    /// Redacts the `Authorization` header.
+    ///
+    /// The struct carries the tun's bearer token; the derived `Debug`
+    /// would put it into every log line that dumps the request.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |name: &str| name.eq_ignore_ascii_case("authorization");
+        f.debug_struct("WsUpgradeRequest")
+            .field("method", &self.method)
+            .field("target", &self.target)
+            .field("version", &self.version)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .field("sec_websocket_key", &self.sec_websocket_key)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(k, v)| {
+                        if redact(k) {
+                            (k, "<redacted>".to_string())
+                        } else {
+                            (k, v.clone())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 /// The header the WebSocket/TCP transport carries the tunnel protocol
@@ -1264,6 +1329,32 @@ mod tests {
         let (host, port) = decode_connect(&bytes).unwrap();
         assert_eq!(host, "backend.internal");
         assert_eq!(port, 8080);
+    }
+
+    /// An IPv6 literal arrives bracketed; the brackets are URL syntax
+    /// and `getaddrinfo` does not accept them, so they must be
+    /// stripped before the tun resolves the host.
+    #[test]
+    fn connect_instruction_strips_the_brackets_of_an_ipv6_literal() {
+        let bytes = encode_connect("[::1]", 8080);
+        let (host, port) = decode_connect(&bytes).unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+    }
+
+    /// A host carrying a line break would split the instruction and
+    /// leave a forged line in the tun's stream, so it is refused.
+    #[test]
+    fn connect_instruction_refuses_a_host_with_a_line_break() {
+        let bytes = encode_connect("evil\r\nCONNECT other:1", 80);
+        // The instruction must stay a single line.
+        assert_eq!(
+            bytes.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "the instruction must not contain a second line: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("evil"));
     }
 
     /// A `CONNECT` instruction without a port is refused — the tun

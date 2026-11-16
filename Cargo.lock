@@ -4304,7 +4304,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bytes",
  "chrono",
  "clap",
  "env_logger",
@@ -4312,7 +4311,6 @@ dependencies = [
  "figment",
  "futures",
  "futures-util",
- "http 1.4.1",
  "log",
  "pangolin-core",
  "serde",

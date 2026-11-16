@@ -22,7 +22,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use log::info;
 use parking_lot::Mutex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -156,6 +155,11 @@ impl PinStore {
     }
 }
 
+/// The signature schemes this build supports.
+fn supported_schemes() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    rustls::crypto::ring::default_provider().signature_verification_algorithms
+}
+
 /// The message the tun shows when a certificate is not pinned.
 ///
 /// It names the pinned fingerprints **and** the presented one, and it
@@ -176,16 +180,28 @@ fn refusal_message(pins: &[String], presented: &str, path: &Path) -> String {
 }
 
 /// The state the pinning verifier shares with the caller: the
-/// fingerprint of the certificate the peer presented.
+/// fingerprint of the certificate the peer presented, and — when the
+/// verifier refused it — why.
 #[derive(Debug, Default)]
 pub struct PinState {
     presented: Mutex<Option<String>>,
+    refusal: Mutex<Option<String>>,
 }
 
 impl PinState {
     /// The fingerprint the peer presented, if any.
     pub fn presented(&self) -> Option<String> {
         self.presented.lock().clone()
+    }
+
+    /// The reason the verifier refused the certificate, if it did.
+    ///
+    /// The caller needs this to tell a **trust** failure (the gateway
+    /// is not the one we pinned) from an **unreachable** gateway (the
+    /// network blocked UDP). Only the first one must not fall back to
+    /// the unencrypted transport.
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal.lock().clone()
     }
 }
 
@@ -239,29 +255,33 @@ impl ServerCertVerifier for PinningVerifier {
         if pins.contains(&presented) {
             return Ok(ServerCertVerified::assertion());
         }
-        Err(RustlsError::General(refusal_message(
-            &pins,
-            &presented,
-            &self.pin_path,
-        )))
+        let message = refusal_message(&pins, &presented, &self.pin_path);
+        *self.state.refusal.lock() = Some(message.clone());
+        Err(RustlsError::General(message))
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        // The pinned certificate is **public** — it travels in the
+        // handshake. The fingerprint pin identifies the certificate;
+        // this check proves the peer holds *its* private key. Without
+        // it, anyone with a copy of the certificate could present it
+        // and sign the handshake with a key of their own, and the pin
+        // would not stop them.
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &supported_schemes())
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &supported_schemes())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -269,18 +289,6 @@ impl ServerCertVerifier for PinningVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-/// Log the fingerprint of a newly created pin.
-///
-/// Both sides log it: the tun when it pins, the gateway when it
-/// generates its certificate. An operator compares the two logs to
-/// confirm that the first contact was not intercepted.
-pub fn log_pin_created(fingerprint: &str, path: &Path) {
-    info!(
-        "tunnel: pinned the gateway's QUIC certificate {fingerprint} in {}",
-        path.display()
-    );
 }
 
 #[cfg(test)]

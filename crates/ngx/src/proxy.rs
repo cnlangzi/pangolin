@@ -449,15 +449,14 @@ impl ProxyHttp for AppProxy {
         // needs the site's provider and its range set) and before the
         // request is forwarded — a rejected request never reaches
         // the backend. The ACME HTTP-01 challenge is answered before
-        // the site lookup, and the tunnel control channel above, so
-        // both are exempt by construction.
+        // the site lookup, so it is exempt by construction.
         //
-        // The tunnel-path exemption is tied to the **upgrade**: the
-        // control channel is a WebSocket endpoint (the branch above
-        // answers it and returns), so a plain request to the same
-        // path is ordinary site traffic and stays guarded.
-        let is_tunnel_control = path == self.app.ws_path && is_upgrade;
-        if provider_cfg.origin_guard_enabled && !is_tunnel_control {
+        // The tunnel's control channel needs no exemption: it lives
+        // on the tunnel listener (`tunnel.addr`), not on the proxy
+        // port, so it never reaches this code. A WebSocket upgrade
+        // to `/tunnel` on the *proxy* port is ordinary site traffic
+        // and stays guarded.
+        if provider_cfg.origin_guard_enabled {
             let peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()));
             let provider_ranges = self
                 .app
@@ -959,14 +958,34 @@ impl ProxyHttp for AppProxy {
         // peer) will dial the backend, so the Host header
         // should be the backend's host:port. We do that
         // here because we know the backend authority.
+        let backend = parse_backend_to_target(&site.backend).ok();
         if site.host_mode == HostMode::Backend
-            && let Ok((
+            && let Some((
                 _,
                 BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. },
-            )) = parse_backend_to_target(&site.backend)
+            )) = &backend
         {
             let new_host = format!("{}:{}", host, port);
             upsert_header(&mut req.headers, "Host", &new_host);
+        }
+
+        // A tunnelled backend's URL may carry a **path prefix**
+        // (`office:http://10.0.0.1:8080/apis`). The prefix is part
+        // of the backend's identity, so the upstream request has to
+        // carry it: the pre-#153 tunnel path joined the prefix onto
+        // the request path before handing the request to the tun.
+        //
+        // The tunnel path needs it explicitly because the CONNECT
+        // instruction only carries a `host:port` — the path is the
+        // request's own.
+        if let Some((
+            tun_name,
+            BackendTarget::Http { base_path, .. } | BackendTarget::Https { base_path, .. },
+        )) = &backend
+            && !tun_name.is_empty()
+            && !base_path.is_empty()
+        {
+            prepend_base_path(upstream, base_path)?;
         }
 
         // Apply the mutations back to the pingora RequestHeader.
@@ -1070,9 +1089,24 @@ fn tunnel_peer(app: &Arc<App>, tun_name: &str, target: &BackendTarget) -> Result
             return Err(Error::explain(ErrorType::ReadError, "file:// not a peer"));
         }
     };
-    // A numeric address — `HttpPeer::new` resolves eagerly. The
-    // target host lives in the CONNECT instruction, not here.
+    // A numeric address — `HttpPeer::new` resolves eagerly, and the
+    // target host is resolved by the **tun** (in the operator's own
+    // network), not here. The address carries the target's port and
+    // nothing else; the host lives in the CONNECT instruction.
+    //
+    // The address is `0.0.0.0` on purpose: pingora checks a pooled
+    // connection's file descriptor against the peer address, and
+    // `0.0.0.0` is the one address that matches any fd (it is a
+    // source address, never a destination). That check is what keeps
+    // the pooled tunnel stream usable — and it is also why the
+    // `group_key` below has to separate the backends explicitly.
     let mut peer = HttpPeer::new(format!("0.0.0.0:{port}"), tls, host.clone());
+    // The group key is the **explicit** separator between two
+    // backends' pooled connections. The SNI also ends up in
+    // pingora's peer hash, but the SNI is a TLS concept — relying on
+    // it for a plain-HTTP backend would be an accident, not a
+    // contract. The key is derived from everything that identifies
+    // the backend, so it holds whatever the hash happens to include.
     peer.group_key = tunnel_group_key(tun_name, &host, port, tls);
     peer.options.custom_l4 = Some(Arc::new(TunnelConnector::new(
         app.clone(),
@@ -1081,6 +1115,32 @@ fn tunnel_peer(app: &Arc<App>, tun_name: &str, target: &BackendTarget) -> Result
         port,
     )));
     Ok(peer)
+}
+
+/// Prepend a backend's path prefix to the upstream request path.
+///
+/// `base_path` is the prefix of the backend URL (`/apis`); the request
+/// keeps its query string. The prefix is joined the way the pre-#153
+/// tunnel path joined it: the prefix without its trailing slash, then
+/// the request path as it arrived.
+fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()> {
+    let prefix = base_path.trim_end_matches('/');
+    let path = upstream.uri.path();
+    let query = upstream.uri.query();
+    let mut path_and_query = format!("{prefix}{path}");
+    if let Some(query) = query {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    let mut parts = upstream.uri.clone().into_parts();
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?,
+    );
+    upstream.uri = http::Uri::from_parts(parts)
+        .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?;
+    Ok(())
 }
 
 fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -1580,9 +1640,6 @@ fn host_from_session(session: &Session) -> String {
         })
         .unwrap_or_default()
 }
-
-// (pump_ws_relay is no longer used here — WS upgrade goes
-//  through the tunnel frame and the tun-side executor.)
 
 #[cfg(test)]
 mod tests {

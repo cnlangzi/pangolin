@@ -281,6 +281,53 @@ async fn real_e2e_tunnel_quic_http_request() {
     assert_transport(&ngx.log_string(), "connected over quic", &tun.log_string());
 }
 
+/// A tunnelled backend whose URL carries a **path prefix** must get
+/// the prefixed path.
+///
+/// `office:http://10.0.0.1:8080/apis` means "the backend serves
+/// under `/apis`". The pre-#153 tunnel path joined the prefix onto
+/// the request path before handing the request to the tun; the splice
+/// carries the request bytes verbatim, so the prefix has to be
+/// applied on the gateway.
+#[tokio::test]
+async fn real_e2e_tunnel_backend_path_prefix_is_applied() {
+    let backend = EchoBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}/apis"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    let tun = TunProcess::start_with_transport(&ngx, "office", "test-token", "quic").await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, body) = raw_request(&addr, "office.test", "GET", "/api/echo?x=1", b"").await;
+    assert_eq!(
+        status,
+        200,
+        "expected 200 through the tun, got {status} (body={body:?})\nngx log:\n{}\ntun log:\n{}",
+        ngx.log_string(),
+        tun.log_string()
+    );
+
+    let seen = backend.seen().await;
+    assert_eq!(seen.len(), 1, "the backend should have seen one request");
+    assert!(
+        seen[0].starts_with("GET /apis/api/echo?x=1 HTTP/1.1"),
+        "the backend's path prefix must be applied to the request path, got {:?}",
+        seen[0]
+    );
+}
+
 /// The same request through a tun pinned to **TCP** — the
 /// WebSocket/TCP fallback transport.
 #[tokio::test]
