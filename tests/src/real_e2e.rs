@@ -1274,8 +1274,16 @@ async fn real_e2e_tunnel_file_backend_is_refused() {
         "a tunnelled file:// backend must be refused with 501. ngx log:\n{}",
         ngx.log_string()
     );
+    // The log is captured asynchronously, so the line may not have
+    // been read yet when the response arrived — wait for it instead of
+    // racing the capture task.
     assert!(
-        ngx.log_string().contains("refused a file:// backend"),
+        crate::harness::wait_for_log(
+            &ngx.log,
+            "refused a file:// backend",
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         "the gateway must log the refusal, got:\n{}",
         ngx.log_string()
     );

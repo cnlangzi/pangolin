@@ -718,6 +718,30 @@ acme:
     }
 }
 
+/// Wait until a captured log contains `needle`.
+///
+/// The log is captured **asynchronously** — a detached task drains
+/// the process's pipes — so a line the process has just written may
+/// not have been read yet when the response arrives. Asserting on
+/// the log directly is therefore a race: on a loaded CI the capture
+/// task can lose to the test task and the assertion sees a log that
+/// is missing the line the process has already written.
+///
+/// Poll for the line instead. Returns whether it showed up within
+/// `timeout`.
+pub async fn wait_for_log(log: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if String::from_utf8_lossy(&log.lock().unwrap()).contains(needle) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 impl Drop for NgxProcess {
     fn drop(&mut self) {
         // Release allocated ports back to the pool so other tests can use them

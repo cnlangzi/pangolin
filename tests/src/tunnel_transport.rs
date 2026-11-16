@@ -212,11 +212,29 @@ async fn raw_request(
 }
 
 /// Assert that the tun's log says it is on the expected transport.
-fn assert_transport(tun_log: &str, expected: &str, ngx_log: &str) {
+///
+/// The log is captured asynchronously, so the line may not have been
+/// read yet when the assertion runs — wait for it instead of racing
+/// the capture task.
+async fn assert_transport(tun: &TunProcess, expected: &str) {
+    assert_log_contains(&tun.log, "tun", expected).await;
+}
+
+/// Assert that a captured log contains `expected`.
+///
+/// The log is captured asynchronously — a detached task drains the
+/// process's pipes — so a line the process has just written may not
+/// have been read yet when the response arrives. Asserting on the log
+/// directly is a race; poll for the line instead.
+async fn assert_log_contains(
+    log: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    what: &str,
+    expected: &str,
+) {
     assert!(
-        tun_log.contains(expected),
-        "the tun must be on the {expected} transport, but its log says:\n{tun_log}\n\
-         ngx log:\n{ngx_log}"
+        crate::harness::wait_for_log(log, expected, std::time::Duration::from_secs(5)).await,
+        "the {what} log must contain {expected:?}, got:\n{}",
+        String::from_utf8_lossy(&log.lock().unwrap())
     );
 }
 
@@ -277,8 +295,8 @@ async fn real_e2e_tunnel_quic_http_request() {
     );
 
     // The transport must be QUIC on **both** sides.
-    assert_transport(&tun.log_string(), "over quic", &ngx.log_string());
-    assert_transport(&ngx.log_string(), "connected over quic", &tun.log_string());
+    assert_transport(&tun, "over quic").await;
+    assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
 }
 
 /// A tunnelled backend whose URL carries a **path prefix** must get
@@ -366,16 +384,13 @@ async fn real_e2e_tunnel_tcp_http_request() {
     assert_eq!(seen.len(), 1, "the backend should have seen one request");
 
     // The transport must be the fallback on **both** sides.
-    assert_transport(
-        &tun.log_string(),
-        "over the WebSocket/TCP transport",
-        &ngx.log_string(),
-    );
-    assert_transport(
-        &ngx.log_string(),
+    assert_transport(&tun, "over the WebSocket/TCP transport").await;
+    assert_log_contains(
+        &ngx.log,
+        "gateway",
         "connected over the WebSocket/TCP transport",
-        &tun.log_string(),
-    );
+    )
+    .await;
 }
 
 /// An endless response (SSE) through a tun pinned to **QUIC**.
@@ -444,13 +459,9 @@ async fn sse_streams_through(transport: &str) {
         "the SSE backend never received the request"
     );
     if transport == "quic" {
-        assert_transport(&tun.log_string(), "over quic", &ngx.log_string());
+        assert_transport(&tun, "over quic").await;
     } else {
-        assert_transport(
-            &tun.log_string(),
-            "over the WebSocket/TCP transport",
-            &ngx.log_string(),
-        );
+        assert_transport(&tun, "over the WebSocket/TCP transport").await;
     }
 }
 
@@ -539,13 +550,9 @@ async fn ws_upgrade_over(transport: &str) {
     );
 
     if transport == "quic" {
-        assert_transport(&tun.log_string(), "over quic", &ngx.log_string());
+        assert_transport(&tun, "over quic").await;
     } else {
-        assert_transport(
-            &tun.log_string(),
-            "over the WebSocket/TCP transport",
-            &ngx.log_string(),
-        );
+        assert_transport(&tun, "over the WebSocket/TCP transport").await;
     }
 }
 
@@ -592,16 +599,8 @@ async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
     );
 
     // The tun must report that it fell back…
-    assert_transport(
-        &tun.log_string(),
-        "falling back to the WebSocket/TCP transport",
-        &ngx.log_string(),
-    );
+    assert_transport(&tun, "falling back to the WebSocket/TCP transport").await;
     // …and the gateway must report that it could not bind QUIC and
     // is serving the WebSocket/TCP tunnel only.
-    assert_transport(
-        &ngx.log_string(),
-        "serving the WebSocket/TCP tunnel only",
-        &tun.log_string(),
-    );
+    assert_log_contains(&ngx.log, "gateway", "serving the WebSocket/TCP tunnel only").await;
 }
