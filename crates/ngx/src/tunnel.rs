@@ -1,25 +1,45 @@
-//! Tunnel WebSocket endpoint — receives connections from remote tun nodes.
+//! Tunnel endpoint — receives connections from remote tun nodes.
 //!
-//! ## Protocol (issue #39, yamux-over-fastwebsockets)
+//! ## Protocol (issue #153 — the tunnel is a splice)
+//!
+//! The tunnel carries **raw bytes**. The gateway's pingora writes the
+//! client's request into a tunnel stream; the tun copies those bytes
+//! to the backend socket and copies the backend's bytes back. The
+//! tun never speaks HTTP.
+//!
+//! Two transports implement the same byte-stream interface
+//! (`pangolin_core::tunnel::TunnelTransport`):
+//!
+//! * **QUIC** (primary) — one connection per tun, one bidirectional
+//!   stream per request. Encrypted by default. The tun authenticates
+//!   on a control stream right after the handshake.
+//! * **WebSocket over TCP** (fallback) — the pre-#153 transport, kept
+//!   for networks where UDP is blocked. The token and the protocol
+//!   version ride in the WebSocket upgrade request.
+//!
+//! Both transports carry the tunnel protocol version, so a tun and a
+//! gateway that were not upgraded together fail with a clear message
+//! instead of a protocol error mid-request.
+//!
+//! ## The WebSocket/TCP handshake
 //!
 //! 1. tun opens a TCP connection to ngx's tunnel listener.
-//! 2. tun sends a `GET /tunnel HTTP/1.1` upgrade request with
-//!    `Authorization: Bearer <token>` (the token's sha256 is
-//!    what's stored in the DB; we hash the inbound bearer
-//!    before lookup).
-//! 3. ngx validates the bearer via the `tun` table. On
-//!    success: send `101 Switching Protocols`. On failure:
-//!    send a real HTTP 401/403/500 and close.
-//! 4. Once the WS is up, a yamux server session is layered on
-//!    top. Each HTTP request from ngx's proxy path opens one
-//!    yamux stream carrying raw HTTP/1.1 bytes (no
-//!    msgpack, no rid correlation, no DEFLATE on the wire
-//!    beyond permessage-deflate). Each WS relay connection
-//!    also gets one yamux stream, with a 1-byte tag
-//!    (`0x01` = HTTP, `0x02` = WS) to disambiguate.
-//! 5. The session is registered in `App::tun_sessions` keyed
-//!    by `tun_name`. When a tun disconnects, the entry is
-//!    removed and all in-flight HTTP requests get 504.
+//! 2. tun sends a `GET /tunnel?name=<NAME> HTTP/1.1` upgrade request
+//!    with `Authorization: Bearer <token>` (the token's sha256 is
+//!    what's stored in the DB; we hash the inbound bearer before
+//!    lookup) and the protocol version in the
+//!    `X-Pangolin-Tunnel-Version` header.
+//! 3. ngx validates the bearer via the `tun` table and the protocol
+//!    version. On success: send `101 Switching Protocols`. On failure:
+//!    send a real HTTP 400/401/403/500 and close.
+//! 4. Once the WS is up, a yamux server session is layered on top.
+//!    Each request from ngx's proxy path opens one yamux stream
+//!    carrying the `CONNECT` instruction and then raw bytes.
+//! 5. The session is registered in `App::tun_sessions` keyed by
+//!    `tun_name`. When a tun disconnects, the entry is removed.
+
+pub mod connector;
+pub mod quic;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,7 +49,8 @@ use log::{debug, error, info, warn};
 use tokio::net::TcpListener;
 
 use pangolin_core::tunnel::{
-    TunnelRole, bearer_token, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
+    TUNNEL_PROTOCOL_VERSION, TUNNEL_VERSION_HEADER, TunnelRole, TunnelTransport, bearer_token,
+    protocol_version_mismatch, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
     write_ws_accept_response,
 };
 
@@ -42,7 +63,7 @@ use crate::App;
 /// V3: `auth_tun` hashes the inbound token and compares
 /// against `tun.token_hash`. We hash *here* in the call
 /// path; the DB lookup is just the equality check.
-async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
+pub(crate) async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
     let conn = app.db.lock().await;
     let row = match pangolin_core::db::auth_tun(&conn, tun_name, token) {
         Ok(r) => r,
@@ -58,12 +79,12 @@ async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u1
     }
 }
 
-async fn mark_tun_online(app: &App, tun_name: &str) {
+pub(crate) async fn mark_tun_online(app: &App, tun_name: &str) {
     let conn = app.db.lock().await;
     let _ = pangolin_core::db::set_tun_online(&conn, tun_name, true);
 }
 
-async fn mark_tun_offline(app: &App, tun_name: &str) {
+pub(crate) async fn mark_tun_offline(app: &App, tun_name: &str) {
     let conn = app.db.lock().await;
     let _ = pangolin_core::db::set_tun_online(&conn, tun_name, false);
 }
@@ -191,6 +212,23 @@ async fn handle_client(
         write_http_error(&mut tcp_stream, 404, "Not Found").await?;
         return Ok(());
     }
+
+    // The protocol version rides in the upgrade request. A tun that
+    // omits it predates issue #153 and speaks the frame protocol,
+    // which this gateway no longer understands — refuse it here with
+    // a message that names both versions instead of failing later
+    // inside the protocol.
+    let peer_version = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(TUNNEL_VERSION_HEADER))
+        .and_then(|(_, v)| v.trim().parse::<u32>().ok());
+    if let Err(msg) = check_protocol_version(peer_version) {
+        warn!("tunnel {}: {}", tun_name, msg);
+        write_http_error(&mut tcp_stream, 400, &msg).await?;
+        return Ok(());
+    }
+
     let sec_key = match req.sec_websocket_key.as_deref() {
         Some(k) => k.to_string(),
         None => {
@@ -218,12 +256,6 @@ async fn handle_client(
         }
     }
 
-    mark_tun_online(&app, &tun_name).await;
-    info!("tun {} connected", tun_name);
-    app.add_event(pangolin_core::EventType::TunConnected {
-        name: tun_name.clone(),
-    });
-
     // Now upgrade the connection to a WebSocket. We can't
     // use fastwebsockets' accept_hdr_async (callback is
     // sync; we already validated the token above so we
@@ -240,16 +272,23 @@ async fn handle_client(
     // Register the session keyed by tun_name. Reject
     // duplicates to avoid two tuns fighting for the same
     // routing slot.
-    let session_end = {
-        let mut sessions = app.tun_sessions.write().await;
-        if sessions.contains_key(&tun_name) {
-            warn!("tunnel: duplicate tun_name '{}' rejected", tun_name);
-            return Ok(());
-        }
-        let end = tunnel.session_end.clone();
-        sessions.insert(tun_name.clone(), tunnel);
-        end
-    };
+    let session_end = tunnel.session_end.clone();
+    let transport: Arc<dyn TunnelTransport> = Arc::new(tunnel);
+    if !app.register_tun(tun_name.clone(), transport.clone()).await {
+        warn!("tunnel: duplicate tun_name '{}' rejected", tun_name);
+        return Ok(());
+    }
+
+    mark_tun_online(&app, &tun_name).await;
+    // The transport is named in the log so the operator can tell a
+    // QUIC session from a fallback session that silently happened.
+    info!(
+        "tun {} connected over the WebSocket/TCP transport",
+        tun_name
+    );
+    app.add_event(pangolin_core::EventType::TunConnected {
+        name: tun_name.clone(),
+    });
 
     // Block on the bridge's end-of-session notification.
     // This future resolves when the WebSocket EOFs (the
@@ -258,12 +297,68 @@ async fn handle_client(
     // is reachable from the proxy hot path.
     session_end.notified().await;
 
-    // Cleanup on disconnect.
-    app.unregister_tun(&tun_name).await;
-    mark_tun_offline(&app, &tun_name).await;
-    info!("tun {} disconnected", tun_name);
-    app.add_event(pangolin_core::EventType::TunDisconnected {
-        name: tun_name.clone(),
-    });
+    // Cleanup on disconnect — but only if this session is still the
+    // registered one. A tun that reconnected (possibly on the other
+    // transport) must not be unregistered by the old session's
+    // cleanup.
+    if app.unregister_tun_if(&tun_name, &transport).await {
+        mark_tun_offline(&app, &tun_name).await;
+        info!("tun {} disconnected", tun_name);
+        app.add_event(pangolin_core::EventType::TunDisconnected {
+            name: tun_name.clone(),
+        });
+    }
     Ok(())
+}
+
+/// Check the tun's protocol version against the gateway's.
+///
+/// A tun that reports a different version speaks a different wire
+/// format, so the upgrade is refused with a message that names both
+/// versions. A tun that reports **no** version predates issue #153
+/// and speaks the frame protocol — also refused.
+fn check_protocol_version(peer_version: Option<u32>) -> Result<(), String> {
+    match peer_version {
+        Some(v) if v == TUNNEL_PROTOCOL_VERSION => Ok(()),
+        Some(v) => Err(protocol_version_mismatch(TUNNEL_PROTOCOL_VERSION, v)),
+        None => Err(format!(
+            "{} (the tun sent no {} header)",
+            protocol_version_mismatch(TUNNEL_PROTOCOL_VERSION, 0),
+            TUNNEL_VERSION_HEADER
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tun that speaks the gateway's protocol version is accepted.
+    #[test]
+    fn a_matching_protocol_version_is_accepted() {
+        assert!(check_protocol_version(Some(TUNNEL_PROTOCOL_VERSION)).is_ok());
+    }
+
+    /// A tun that speaks a different version is refused, and the
+    /// refusal names **both** versions.
+    #[test]
+    fn a_mismatched_protocol_version_is_refused_with_both_versions() {
+        let err = check_protocol_version(Some(TUNNEL_PROTOCOL_VERSION + 1)).unwrap_err();
+        assert!(
+            err.contains(&format!("v{}", TUNNEL_PROTOCOL_VERSION)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("v{}", TUNNEL_PROTOCOL_VERSION + 1)),
+            "{err}"
+        );
+    }
+
+    /// A tun that sends no version header predates issue #153 and
+    /// speaks the frame protocol — it is refused too.
+    #[test]
+    fn a_missing_protocol_version_is_refused() {
+        let err = check_protocol_version(None).unwrap_err();
+        assert!(err.contains(TUNNEL_VERSION_HEADER), "{err}");
+    }
 }

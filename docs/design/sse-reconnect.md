@@ -4,18 +4,26 @@
 > (commit `d27c59b`). Defines the contract pangolin provides
 > for SSE / long-lived chunked responses when a client disconnects and
 > (later) reconnects.
+>
+> **Note (issue #153)**: the tunnel is a byte splice now, so the
+> gateway streams the response with pingora's own HTTP client on
+> **both** the direct and the tunnelled path — the separate
+> tun-side streaming path this doc describes is gone. The *contract*
+> (a client disconnect must reach the backend promptly) is
+> unchanged and still holds; the mechanism is now the tunnel
+> stream's reset reaching the tun's relay.
 
 This doc captures the behaviour **pangolin does and does not provide** for
-SSE-style streams. For the transport-level details (yamux streaming,
-`is_streaming` flag, byte-relay path), see
-[`tunnel.md`](tunnel.md#sse--streaming-response-support). For the
+SSE-style streams. For the transport-level details (the byte splice,
+the CONNECT instruction, the two transports), see
+[`tunnel.md`](tunnel.md). For the
 direct-path streaming flow (pingora-native, no buffering), see
 [`reverse-proxy.md`](reverse-proxy.md).
 
 ## Context
 
 `pangolin-ngx` exposes a tunnel path for SSE / long-lived streaming
-responses (`is_streaming = true` on `TunnelHttpFrame`). When a client
+responses (the `is_streaming_request` heuristic). When a client
 browser disconnects mid-stream, the gateway detects the close on
 `session.write_response_body` error and exits its body-forwarding loop
 ([`crates/ngx/src/proxy.rs:1208-1226`](../../crates/ngx/src/proxy.rs)).

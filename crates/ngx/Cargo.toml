@@ -52,6 +52,9 @@ fastwebsockets.workspace = true
 tokio-yamux.workspace = true
 futures-util.workspace = true
 
+# QUIC transport for the tunnel (issue #153) — the primary transport.
+quinn.workspace = true
+
 # TLS / ACME
 instant-acme = { version = "0.8", features = ["hyper-rustls"] }
 rustls = "0.23.40"

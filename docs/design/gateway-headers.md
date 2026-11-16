@@ -89,12 +89,10 @@ further work, because
 
 * the direct path's upstream request is a clone of the downstream
   request header (pingora `proxy_h1.rs` / `proxy_h2.rs`),
-* the tunnel path copies the session's headers into the
-  `TunnelHttpFrame`'s `HttpRequest`,
-* the tunnel streaming path relays the frame's headers verbatim,
-* the tunnel WebSocket path is the one exception (it rebuilds the
-  upgrade request from scratch) and is handled explicitly in
-  `tun::client::ws_upgrade_extra_headers`.
+* the tunnel path is the same: since issue #153 the tun is a byte
+  splice, so pingora clones the downstream header into the upstream
+  request and writes those bytes into the tunnel stream — the
+  tun forwards them unchanged.
 
 The pure value computation lives in `pangolin-core::pgl` so it can
 be unit-tested without pingora.

@@ -8,4 +8,4 @@ pub mod client;
 pub mod config;
 
 pub use client::TunnelClient;
-pub use config::TunConfig;
+pub use config::{TransportSelector, TunConfig};

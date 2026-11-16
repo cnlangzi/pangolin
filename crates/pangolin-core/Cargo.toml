@@ -30,6 +30,10 @@ tokio-yamux.workspace = true
 fastwebsockets.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+# QUIC transport (issue #153): the tunnel's primary transport.
+quinn.workspace = true
+# Self-signed certificate for the gateway's QUIC endpoint (issue #153).
+rcgen.workspace = true
 # Manual WS upgrade helpers (Sec-WebSocket-Key / Accept).
 sha1 = "0.10"
 base64 = "0.22"

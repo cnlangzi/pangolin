@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
     let tun_cfg = TunConfig::from_file(&args.config)?;
     init_logger(&tun_cfg.log);
 
-    let client = TunnelClient::new(tun_cfg);
+    // The trust-on-first-use pin file and the record of the last
+    // failed QUIC attempt live next to the configuration file — see
+    // `TunConfig::pin_path`.
+    let client = TunnelClient::new(tun_cfg, &args.config);
     client.run().await;
 
     Ok(())

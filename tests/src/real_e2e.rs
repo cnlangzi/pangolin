@@ -1224,18 +1224,23 @@ async fn real_e2e_h2_direct_backend_keeps_h2() {
 }
 
 ///
-/// Regression test for the static-file path through the tunnel.
-/// With the new `tun::client::proxy_request` accepting `file:///`
-/// URLs (in addition to `http://`/`https://`), a site configured
-/// with `office:file:///tmp/somedir` must be served correctly when
-/// the request goes through the tun.
+/// **Issue #153 — a `file://` backend over a tunnel is refused.**
 ///
-/// Verifies:
-///   - The tun decodes the `file:///` URL from the request frame
-///   - It reads the local file and returns 200 with the body
-///   - The body is returned to the client through the response frame
+/// Before issue #153 the tunnel carried a frame protocol, so the tun
+/// could be asked to serve a local file: the frame carried the
+/// `file://` target and the tun answered with the file's bytes.
+///
+/// The tunnel is a **splice** now: the gateway's pingora writes the
+/// client's request bytes into a tunnel stream and the tun copies
+/// them to a backend it dials by `host:port`. There is no
+/// `host:port` for a local file, and the tun no longer speaks HTTP,
+/// so it cannot synthesise an HTTP response for one either.
+///
+/// The gateway therefore refuses a tunnelled `file://` backend with a
+/// 501 and a log line. The **direct** `file://` path is unchanged —
+/// `real_e2e_static_file` still covers it.
 #[tokio::test]
-async fn real_e2e_tunnel_file_backend() {
+async fn real_e2e_tunnel_file_backend_is_refused() {
     // Build a temp directory holding a single file we want the
     // tun to serve. The path passed to seed_site must be the
     // **absolute** path (file:/// requires absolute).
@@ -1259,23 +1264,27 @@ async fn real_e2e_tunnel_file_backend() {
     let _tun = TunProcess::start(&ngx, "office", "test-token").await;
 
     let addr = format!("127.0.0.1:{}", ngx.http_port);
-    // Use POST with a body so the proxy's `read_body_or_idle`
-    // path completes immediately (the GET-without-body case is a
-    // separate `read_body_or_idle(false)` behavior that's still
-    // being investigated). What we're testing here is the
-    // file:// backend through the tunnel — the body is irrelevant
-    // for that, we just need the path to flow through the tun.
-    let (status, body) = raw_request(&addr, "file.test", "POST", "/index.html", b"x").await;
+    // The tunnel relays bytes to a host:port — there is nothing to
+    // dial for a local file, so the gateway refuses the backend
+    // instead of hanging or answering with something misleading.
+    let (status, _body) = raw_request(&addr, "file.test", "GET", "/index.html", b"").await;
     assert_eq!(
         status,
-        200,
-        "expected 200 for tunnel-served file, got {status} (body={body:?}). \
-         ngx log:\n{}",
+        501,
+        "a tunnelled file:// backend must be refused with 501. ngx log:\n{}",
         ngx.log_string()
     );
+    // The log is captured asynchronously, so the line may not have
+    // been read yet when the response arrived — wait for it instead of
+    // racing the capture task.
     assert!(
-        body.contains("tunnel-served-static-file"),
-        "expected file body, got: {body} (ngx log: {})",
+        crate::harness::wait_for_log(
+            &ngx.log,
+            "refused a file:// backend",
+            std::time::Duration::from_secs(5)
+        )
+        .await,
+        "the gateway must log the refusal, got:\n{}",
         ngx.log_string()
     );
 }
@@ -2289,10 +2298,10 @@ async fn real_e2e_proxy_propagates_backend_error_codes() {
 /// Implementation note: the `X-Forwarded-*` injection lives in
 /// `pangolin_core::apply_proxy_policy` so the direct path
 /// (ngx → upstream TCP) and the tunnel path (ngx → tun →
-///
 /// upstream) are both covered. The TCP peer is detected
-/// from `session.client_addr()` on the ngx side and shipped
-/// to the tun inside the `TunnelHttpFrame`.
+/// from `session.client_addr()` on the ngx side and added to the
+/// upstream request on the gateway — since issue #153 the tun
+/// forwards the bytes unchanged.
 #[tokio::test]
 async fn real_e2e_proxy_adds_x_forwarded_for() {
     let backend = InspectingBackend::start().await;
@@ -5257,11 +5266,16 @@ async fn real_e2e_origin_guard_ignores_a_forged_cf_connecting_ip() {
     );
 }
 
-/// The ACME HTTP-01 challenge and the tunnel control channel are
-/// exempt from the guard: they are answered normally even though the
-/// peer is outside the allowlist.
+/// The ACME HTTP-01 challenge is exempt from the guard: it is
+/// answered normally even though the peer is outside the allowlist.
+///
+/// The tunnel's control channel needs no exemption — it lives on the
+/// tunnel listener (`tunnel.addr`), not on the proxy port, so it never
+/// reaches the proxy. A WebSocket upgrade to `/tunnel` on the **proxy**
+/// port is ordinary site traffic and stays guarded, like any other
+/// request from an outside peer.
 #[tokio::test]
-async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() {
+async fn real_e2e_origin_guard_exempts_the_acme_challenge() {
     let backend = InspectingBackend::start().await;
 
     let ngx = NgxProcess::start({
@@ -5297,24 +5311,23 @@ async fn real_e2e_origin_guard_exempts_the_acme_challenge_and_the_tunnel_path() 
     );
     assert_eq!(body, key_auth);
 
-    // The tunnel control channel — a WebSocket **upgrade** — is
-    // answered normally too. The exemption is tied to the upgrade:
-    // the ws_path branch answers it before the guard runs.
+    // A WebSocket **upgrade** to the tunnel path on the proxy port is
+    // ordinary site traffic: the control channel lives on the tunnel
+    // listener, so there is nothing to exempt here.
     let handshake = try_open_ws_client(ngx.http_port, "guard.test", "/tunnel").await;
     let status = match &handshake {
         Ok((_ws, resp)) => resp.status().as_u16(),
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
         Err(e) => panic!("unexpected handshake error: {e}"),
     };
-    assert_ne!(
+    assert_eq!(
         status,
         403,
-        "the tunnel control channel must be exempt from the guard, got {status}\nngx log:\n{}",
+        "a ws upgrade to the tunnel path on the proxy port must be guarded, got {status}\nngx log:\n{}",
         ngx.log_string()
     );
 
-    // A **plain** request to the same path is ordinary site traffic
-    // and stays guarded — the exemption is not a hole in the guard.
+    // A **plain** request to the same path is guarded too.
     let (status, _) = raw_get_full(&addr, "guard.test", "/tunnel").await;
     assert_eq!(
         status,

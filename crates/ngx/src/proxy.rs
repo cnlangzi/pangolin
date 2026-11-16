@@ -1,31 +1,41 @@
 //! HTTP proxy via pingora `ProxyHttp` trait.
 //!
 //! `AppProxy` implements `ProxyHttp` and handles domain-routed proxying.
-//! `request_filter` short-circuits for admin API / tunnel routes.
-//! Otherwise falls through to `upstream_peer` for direct backends.
+//! `request_filter` short-circuits for the admin API and for `file://`
+//! backends. Everything else — direct **and** tunnelled — goes
+//! through pingora's normal upstream path.
 //!
-//! ## Architecture (v8 — see `docs/design/reverse-proxy.md`)
+//! ## Architecture (issue #153 — the tunnel is a splice)
 //!
 //! `request_filter` does:
 //!   1. ACME HTTP-01 short-circuit
-//!   2. WS-upgrade short-circuit (when path is the configured
-//!      tun ws_path)
-//!   3. Site lookup
-//!   4. Build a `BackendTarget` (Http / Https / File)
-//!   5. Dispatch:
+//!   2. Site lookup
+//!   3. Build a `BackendTarget` (Http / Https / File)
+//!   4. Dispatch:
 //!        - file:// direct → `serve_file_target` (pangolin-core)
-//!        - tun_name set   → `YamuxTunnelExecutor`
-//!        - direct         → fall through to pingora (return Ok(false))
+//!        - everything else → fall through to pingora (return Ok(false))
 //!
-//! `upstream_request_filter` (called by pingora on the direct path)
-//! runs `apply_proxy_policy` (pangolin-core) so that Host rewriting
-//! is identical on every delivery path.
+//! `upstream_peer` then picks the delivery path:
+//!   - a direct backend → pingora's own TCP/TLS peer;
+//!   - a tun backend   → a peer whose `custom_l4` connector opens a
+//!     **tunnel byte stream** and writes the `CONNECT` instruction on
+//!     it (see `crate::tunnel::connector`).
+//!
+//! Because the tunnel is a splice, pingora's HTTP client writes the
+//! client's request bytes into the stream and reads the backend's
+//! bytes out of it. There is exactly **one** HTTP path for every
+//! backend, and the tun never speaks HTTP.
+//!
+//! `upstream_request_filter` (called by pingora on every upstream
+//! request, tunnelled or not) runs `apply_proxy_policy`
+//! (pangolin-core), so the Host header and the `X-Forwarded-*` set a
+//! tunneled request carries are the same ones a direct request
+//! carries.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,19 +45,17 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
-use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
 
-use pangolin_core::decode_http_response;
-use pangolin_core::tunnel::{HttpRequest, HttpResponse, compute_ws_accept};
+use pangolin_core::tunnel::{HttpRequest, HttpResponse};
 use pangolin_core::types::HostMode;
 
 use pangolin_core::{
-    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
+    BackendTarget, ProxyCtx, Scheme, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
 };
 
 use crate::App;
+use crate::tunnel::connector::{TunnelConnector, tunnel_group_key};
 
 /// Longest `Referer` header value the gateway will look at.
 ///
@@ -57,176 +65,6 @@ use crate::App;
 /// linking URL is orders of magnitude shorter; a longer value is a
 /// sign of abuse and is treated as "no referer".
 const MAX_REFERRER_HEADER_LEN: usize = 4_096;
-
-// ─────────────────────────────────────────────────────────────────
-//  BackendExecutor — transport abstraction
-// ─────────────────────────────────────────────────────────────────
-
-/// Error type for executor failures. Maps onto the same HTTP
-/// status codes the previous direct path produced.
-#[derive(Debug)]
-pub enum ProxyError {
-    Backend(String),
-    Timeout,
-    Unavailable(String),
-}
-
-impl std::fmt::Display for ProxyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProxyError::Backend(s) => write!(f, "backend error: {s}"),
-            ProxyError::Timeout => write!(f, "timeout"),
-            ProxyError::Unavailable(s) => write!(f, "unavailable: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for ProxyError {}
-
-/// Send `request` to the backend described by `target` and
-/// return the response. `host_mode` and `host_custom` are
-/// explicit parameters so the executor does not have to
-/// second-guess the request headers — the v8 design wants
-/// host_mode to flow through the executor in a typed slot,
-/// not be inferred from the presence/absence of
-/// `X-Forwarded-Host`.
-///
-/// The trait is **defined in `ngx`** (not in `pangolin-core`)
-/// because all current implementations need pingora — and
-/// `pangolin-core` deliberately avoids the pingora dependency.
-/// The `tun` side uses the same trait shape but the
-/// `PingoraClientExecutor` lives in the `tun` crate.
-#[async_trait]
-pub trait BackendExecutor: Send + Sync {
-    /// Send `request` to the backend described by `target` and
-    /// return the response.
-    ///
-    /// `peer_ip` is the TCP peer address (from
-    /// `session.client_addr()`); it is forwarded to the backend
-    /// so the tun's `apply_proxy_policy` can append it to
-    /// `X-Forwarded-For`. `None` for sessions where the peer
-    /// address is unknown (e.g. a test that doesn't bind a real
-    /// client).
-    async fn execute_http(
-        &self,
-        request: HttpRequest,
-        target: &BackendTarget,
-        host_mode: HostMode,
-        host_custom: Option<String>,
-        peer_ip: Option<String>,
-    ) -> Result<HttpResponse, ProxyError>;
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  YamuxTunnelExecutor — encode → yamux stream → decode
-// ─────────────────────────────────────────────────────────────────
-
-/// Send a request through a live `YamuxTunnel`. Encodes a
-/// `TunnelHttpFrame` (carrying host_mode, host_custom,
-/// is_upgrade, is_streaming) and waits for the matching
-/// response.
-///
-/// `is_streaming` is currently only used as a **routing flag**
-/// on the tun side: when set, the tun dispatches to
-/// `handle_streaming_response` (byte-relay path) instead of
-/// `handle_http_request` (buffered `HttpResponse` path). The
-/// executor still reads back a full `HttpResponse` from the
-/// yamux stream, because the byte-relay path on the tun side
-/// terminates the stream cleanly after the response — the
-/// protocol surface is unchanged.
-pub struct YamuxTunnelExecutor<'a> {
-    pub tunnel: &'a pangolin_core::YamuxTunnel,
-}
-
-#[async_trait]
-impl<'a> BackendExecutor for YamuxTunnelExecutor<'a> {
-    async fn execute_http(
-        &self,
-        request: HttpRequest,
-        target: &BackendTarget,
-        host_mode: HostMode,
-        host_custom: Option<String>,
-        peer_ip: Option<String>,
-    ) -> Result<HttpResponse, ProxyError> {
-        let is_upgrade = is_ws_upgrade(&request);
-        // The buffered tunnel executor never carries a streaming
-        // request — the SSE / streaming path short-circuits in
-        // `request_filter` and constructs its own frame directly
-        // with `is_streaming = true`. Hardcoding `false` here
-        // avoids a per-request header scan for a value that is
-        // provably always false on this code path.
-        let frame = TunnelHttpFrame {
-            request,
-            target: target.clone(),
-            host_mode,
-            host_custom,
-            is_upgrade,
-            is_streaming: false,
-            peer_ip,
-        };
-        let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
-
-        let mut stream = self
-            .tunnel
-            .open_stream()
-            .await
-            .map_err(|e| ProxyError::Unavailable(format!("open_stream: {e}")))?;
-        // Write 4-byte big-endian length prefix followed by frame bytes.
-        // The tun side reads the length first, then reads exactly that many
-        // bytes — no need to wait for EOF (which is unreliable over yamux).
-        let len = bytes.len() as u32;
-        stream
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(|e| ProxyError::Backend(format!("write frame length: {e}")))?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| ProxyError::Backend(format!("write frame: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ProxyError::Backend(format!("flush: {e}")))?;
-
-        // Read 4-byte big-endian length prefix, then read exactly that many
-        // bytes for the response. Mirrors the tun→ngx write protocol.
-        use tokio::io::AsyncReadExt as _;
-        let mut len_buf = [0u8; 4];
-        timeout(Duration::from_secs(60), stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| ProxyError::Backend(format!("read response length: {e}")))?;
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        timeout(Duration::from_secs(60), stream.read_exact(&mut resp_buf))
-            .await
-            .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| ProxyError::Backend(format!("read response body: {e}")))?;
-
-        let response = decode_http_response(&resp_buf)
-            .map_err(|e| ProxyError::Backend(format!("decode response: {e}")))?
-            .ok_or_else(|| ProxyError::Backend("empty response".into()))?;
-
-        Ok(response)
-    }
-}
-
-fn is_ws_upgrade(req: &HttpRequest) -> bool {
-    let has_upgrade = read_header_value(req, "Upgrade").is_ok();
-    let connection_has_upgrade = read_header_value(req, "Connection")
-        .map(|v| v.to_ascii_lowercase().contains("upgrade"))
-        .unwrap_or(false);
-    has_upgrade && connection_has_upgrade
-}
-
-fn read_header_value(req: &HttpRequest, name: &str) -> Result<String, ()> {
-    for (k, v) in &req.headers {
-        if k.eq_ignore_ascii_case(name) {
-            return Ok(v.clone());
-        }
-    }
-    Err(())
-}
 
 // ─────────────────────────────────────────────────────────────────
 //  AppProxy (pingora)
@@ -555,13 +393,12 @@ impl ProxyHttp for AppProxy {
         apply_pgl_headers(session, cfg.pgl_headers_enabled, &pgl);
 
         // ── SSE / streaming response detection ────────────────
-        // The streaming path is a byte-relay that exists for the
-        // **tunnel** transport: the tun-side relay uses
-        // `copy_bidirectional` because the buffering HttpResponse
-        // path would deadlock on an infinite chunked body. For
-        // **direct** backends, pingora's H1/H2 client streams the
-        // response natively — we just let it through to
-        // `upstream_peer` and nothing buffers.
+        // A streaming response (SSE) used to need a hand-written
+        // byte-relay on the tunnel path, because the tun's buffering
+        // `HttpResponse` path deadlocked on an infinite chunked
+        // body. Since issue #153 the tunnel is a splice, so pingora's
+        // own HTTP client streams the response natively — the same
+        // way it does for a direct backend.
         //
         // The detection is delegated to the shared
         // `pangolin_core::is_streaming_request` so the heuristic
@@ -570,12 +407,6 @@ impl ProxyHttp for AppProxy {
         // pangolin-core and reaches both transports at once.
         // See `is_streaming_request_detects_text_event_stream`
         // for the unit-test contract.
-        //
-        // The short-circuit itself runs *after* the site lookup
-        // below so we can branch on `tun_name.is_empty()`:
-        //   - tunnel    → call `handle_streaming_request` (byte-relay)
-        //   - direct    → fall through, pingora streams natively
-        //   - file://   → 415 (no streaming concept for a single file)
         let is_streaming = {
             // Build a minimal `HttpRequest` (no body — the helper
             // only reads `headers`) from the session so we can
@@ -597,72 +428,12 @@ impl ProxyHttp for AppProxy {
             pangolin_core::is_streaming_request(&req)
         };
 
-        // ── WebSocket upgrade short-circuit ────────────────────
-        //
-        // The tunnel control channel. It reuses the site that was
-        // looked up above, so the request path still performs exactly
-        // one site lookup. Being answered here, it is also exempt
-        // from the origin guard by construction.
-        if is_upgrade && path == self.app.ws_path {
-            let (tun_name, ws_target) = pangolin_core::parse::parse_backend(&site.backend)
-                .ok()
-                .and_then(|(tn, _)| {
-                    if tn.is_empty() {
-                        None
-                    } else {
-                        // For WS, derive a placeholder
-                        // Http/Https target from the backend
-                        // URL so the tun has a host:port to
-                        // dial. The WS path bypasses the
-                        // dispatcher's http/https-vs-file
-                        // branch — `handle_ws_upgrade` reads
-                        // `request.target` to get host:port.
-                        let target = pangolin_core::parse_backend_to_target(&site.backend)
-                            .ok()
-                            .map(|(_, t)| t);
-                        Some((tn, target))
-                    }
-                })
-                .unwrap_or_default();
-
-            if !tun_name.is_empty() {
-                info!("Tunnel WS relay: {} → tun {}", host, tun_name);
-
-                // For WS, if the target is File, there's no
-                // host:port to dial — bail out (file://
-                // doesn't make sense for a WS upgrade).
-                let ws_target = ws_target.unwrap_or_else(|| BackendTarget::Http {
-                    host: "127.0.0.1".into(),
-                    port: 80,
-                    base_path: String::new(),
-                });
-                if matches!(ws_target, BackendTarget::File { .. }) {
-                    let _ = session.respond_error(400).await;
-                    return Ok(true);
-                }
-                let tunnel = {
-                    let sessions = self.app.tun_sessions.read().await;
-                    sessions.get(&tun_name).cloned()
-                };
-                let Some(tunnel) = tunnel else {
-                    warn!("Tun {} not online for WS relay", tun_name);
-                    return Ok(true);
-                };
-                ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
-                ws_relay_to_tun(
-                    session,
-                    &ws_target,
-                    &tunnel,
-                    HostMode::Passthrough,
-                    None,
-                    ctx.peer_ip.clone(),
-                )
-                .await?;
-                return Ok(true);
-            }
-            // Direct WS: let pingora handle the 101 upgrade.
+        // A WebSocket upgrade is marked as such for the traffic
+        // histogram — the connection's lifetime is the upgrade's,
+        // not a request's. Since issue #153 both the direct and the
+        // tunnelled upgrade go through pingora's normal path.
+        if is_upgrade {
             ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
-            return Ok(false);
         }
 
         // ── Origin guard (issue #122) ──────────────────────────
@@ -678,15 +449,14 @@ impl ProxyHttp for AppProxy {
         // needs the site's provider and its range set) and before the
         // request is forwarded — a rejected request never reaches
         // the backend. The ACME HTTP-01 challenge is answered before
-        // the site lookup, and the tunnel control channel above, so
-        // both are exempt by construction.
+        // the site lookup, so it is exempt by construction.
         //
-        // The tunnel-path exemption is tied to the **upgrade**: the
-        // control channel is a WebSocket endpoint (the branch above
-        // answers it and returns), so a plain request to the same
-        // path is ordinary site traffic and stays guarded.
-        let is_tunnel_control = path == self.app.ws_path && is_upgrade;
-        if provider_cfg.origin_guard_enabled && !is_tunnel_control {
+        // The tunnel's control channel needs no exemption: it lives
+        // on the tunnel listener (`tunnel.addr`), not on the proxy
+        // port, so it never reaches this code. A WebSocket upgrade
+        // to `/tunnel` on the *proxy* port is ordinary site traffic
+        // and stays guarded.
+        if provider_cfg.origin_guard_enabled {
             let peer_ip = peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip()));
             let provider_ranges = self
                 .app
@@ -933,48 +703,36 @@ impl ProxyHttp for AppProxy {
             pangolin_core::TrafficRoute::Direct
         };
 
-        // ── SSE / streaming response short-circuit (tunnel only) ──
-        // Branch on the routing decision we just made:
-        //   - tunnel:    the tun-side `handle_streaming_response`
-        //                byte-relay is required (the tun's buffered
-        //                HttpResponse path deadlocks on infinite
-        //                chunked bodies). Take the short-circuit.
-        //   - direct +   file:// is not a streaming transport —
-        //     file://    refuse with 415 Unsupported Media Type
-        //                (and a small JSON body explaining why,
-        //                so callers can distinguish this from a
-        //                generic 400).
-        //   - direct +   pingora's H1/H2 client streams the
-        //     Http/Https response natively, no buffering on the
-        //                ngx side. Fall through to the standard
-        //                direct path (the `Ok(false)` branch at
-        //                the bottom of `request_filter`).
+        // ── SSE / streaming response ──────────────────────────
+        // A streaming response used to need a hand-written byte-relay
+        // on the tunnel path, because the tun's buffering
+        // `HttpResponse` path deadlocked on an infinite chunked body.
+        // Since issue #153 the tunnel is a splice, so pingora's own
+        // HTTP client streams the response natively — for a direct
+        // backend **and** for a tunnelled one.
+        //
+        //   - file://    refuse with 415 Unsupported Media Type (a
+        //     file://    single file response has no streaming
+        //                concept; and with a small JSON body
+        //                explaining why, so callers can
+        //                distinguish this from a generic 400).
+        //   - direct +   fall through to the standard path (the
+        //     tunneled   `Ok(false)` branch at the bottom of
+        //                `request_filter`).
         if is_streaming {
-            if !tun_name.is_empty() {
-                ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
-                return handle_streaming_request(&self.app, session, ctx.peer_ip.clone()).await;
-            }
             if matches!(target, BackendTarget::File { .. }) {
                 warn!(
-                    "SSE: refused on file:// backend for {} \
-                     (file:// has no streaming concept)",
+                    "SSE: refused on file:// backend for {} (file:// has no streaming concept)",
                     host
                 );
                 respond_streaming_unsupported_on_file(session).await;
                 return Ok(true);
             }
-            // Direct Http/Https + SSE: fall through to the
-            // pingora direct path. The access-log entry is
-            // already populated above (`ctx.backend`), and
-            // `response_filter` will record the final status
-            // when pingora finishes the stream.
-            //
             // Mark Stream so the traffic histogram / RPS rings
             // ignore the hang time of a long-lived SSE response.
             ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
             debug!(
-                "SSE: direct path (pingora-native streaming) \
-                 {} → {}",
+                "SSE: pingora-native streaming {} → {}",
                 host,
                 target.authority()
             );
@@ -1031,202 +789,51 @@ impl ProxyHttp for AppProxy {
             return Ok(true);
         }
 
-        // ── WS upgrade through a tun (any path, not just `ws_path`) ──
-        // The ws_path short-circuit above only fires for the tun
-        // control channel endpoint (default `/tunnel`). For WS
-        // upgrades on any other path that route to a tun backend
-        // we must also forward the upgrade over the yamux stream
-        // — otherwise the request falls into the plain tunnel
-        // HTTP path with `is_upgrade: false`, the tun replays a
-        // plain GET to the backend, and the WS upgrade is lost.
-        // See `real_e2e_tunnel_ws_upgrade_path_preserved` and
-        // `real_e2e_tunnel_ws_upgrade_host_mode` in
-        // `tests/src/real_e2e.rs` (doc invariants I-21 and I-22).
-        if is_upgrade && !tun_name.is_empty() {
-            if matches!(target, BackendTarget::File { .. }) {
-                // WS upgrade against a file:// backend makes no
-                // sense (single file response, no host:port to
-                // dial). Mirror the ws_path short-circuit's 400.
-                let _ = session.respond_error(400).await;
-                return Ok(true);
-            }
-            let tunnel = {
-                let sessions = self.app.tun_sessions.read().await;
-                sessions.get(&tun_name).cloned()
-            };
-            let Some(tunnel) = tunnel else {
-                warn!("Tun {} not online for WS upgrade relay", tun_name);
-                let _ = session.respond_error(503).await;
-                return Ok(true);
-            };
-            info!(
-                "Tunnel WS upgrade relay: {} path={} → tun {}",
-                host, path, tun_name
+        // ── WS upgrade through a tun ───────────────────────────
+        // Since issue #153 the tunnel is a splice, so a WebSocket
+        // upgrade is just another byte stream: pingora performs the
+        // 101 handshake with the backend over the tunnel stream and
+        // then relays the frames. There is no separate relay path
+        // any more — the old one built a `TunnelHttpFrame` with
+        // `is_upgrade: true` and pumped the bytes by hand.
+        //
+        // The only case that cannot work is a `file://` backend: it
+        // has no host:port to dial.
+        if is_upgrade && !tun_name.is_empty() && matches!(target, BackendTarget::File { .. }) {
+            warn!(
+                "WS upgrade: refused on file:// backend for {} (no host:port to dial)",
+                host
             );
-            ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
-            ws_relay_to_tun(
-                session,
-                &target,
-                &tunnel,
-                site.host_mode,
-                site.host_custom.clone(),
-                ctx.peer_ip.clone(),
-            )
-            .await?;
+            let _ = session.respond_error(400).await;
             return Ok(true);
         }
 
         // ── tunnel path ───────────────────────────────────────
+        // The tunnel is a splice: the request falls through to
+        // pingora, whose upstream peer carries a `custom_l4`
+        // connector that opens a tunnel byte stream and writes the
+        // `CONNECT <host>:<port>` instruction on it (see
+        // `crate::tunnel::connector`).
+        //
+        // A `file://` backend is the one case the splice cannot
+        // carry: the file lives on the tun's machine and the tunnel
+        // only dials a host:port, so there is nothing to relay.
         if !tun_name.is_empty() {
-            // Special case: file:// backend over a tunnel.
-            // The file lives on the tun's machine, so we
-            // delegate the serve to the tun — frame is
-            // built with the same target as http/https.
-            if let BackendTarget::File { .. } = &target {
-                // The whole flow is identical to the
-                // http/https tunnel path below; nothing
-                // special to do here.
-            }
-            let tunnel = {
-                let sessions = self.app.tun_sessions.read().await;
-                sessions.get(&tun_name).cloned()
-            };
-            let Some(tunnel) = tunnel else {
-                warn!("Tun {} not online", tun_name);
-                let _ = session.respond_error(503).await;
+            if matches!(target, BackendTarget::File { .. }) {
+                warn!(
+                    "tunnel: refused a file:// backend for {} — the tunnel relays \
+                     bytes to a host:port and cannot serve a local file",
+                    host
+                );
+                let _ = session.respond_error(501).await;
                 return Ok(true);
-            };
-
-            // Build the request with the whole-URL target
-            // (backend base + original path+query).
-            let path_and_query = session
-                .req_header()
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            let req_path = if path_and_query.starts_with('/') {
-                path_and_query
-            } else {
-                format!("/{}", path_and_query)
-            };
-            // Build the whole-URL target. For http/https this
-            // is the URL the tun will dial; for file:// this
-            // is the URL the tun will use to look up the
-            // on-disk root. The request's path itself is
-            // reconstructed in `build_request_from_session`
-            // — for file:// backends we use the **original**
-            // path (so `serve_file_target` can extract it),
-            // while for http/https we use the joined full URL.
-            let target_url = match &target {
-                BackendTarget::Http {
-                    host,
-                    port,
-                    base_path,
-                } => format!(
-                    "http://{}:{}{}",
-                    host,
-                    port,
-                    if base_path.is_empty() {
-                        req_path.clone()
-                    } else {
-                        format!("{}{}", base_path.trim_end_matches('/'), req_path)
-                    },
-                ),
-                BackendTarget::Https {
-                    host,
-                    port,
-                    base_path,
-                } => format!(
-                    "https://{}:{}{}",
-                    host,
-                    port,
-                    if base_path.is_empty() {
-                        req_path.clone()
-                    } else {
-                        format!("{}{}", base_path.trim_end_matches('/'), req_path)
-                    },
-                ),
-                BackendTarget::File { doc_root } => {
-                    // For file:// the tun will parse
-                    // `request.target` (which we set to the
-                    // **original path** below) and join it
-                    // with `doc_root`. We just embed the
-                    // doc_root here for the tun's
-                    // BackendTarget classification; the
-                    // actual file lookup uses request.target
-                    // as the relative path.
-                    format!("file://{}", doc_root.to_string_lossy())
-                }
-            };
-
-            // The `target_url` is what we put in the frame's
-            // `request.target` for http/https backends (the
-            // tun will dial it as a whole URL). For
-            // `file://` we override to the **original**
-            // path — `serve_file_target` parses it to find
-            // the file within the doc_root.
-            let frame_target_url = match &target {
-                BackendTarget::File { .. } => req_path.clone(),
-                _ => target_url,
-            };
-
-            let req = match build_request_from_session(session, &frame_target_url).await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("tunnel: build request: {}", e);
-                    let _ = session.respond_error(500).await;
-                    return Ok(true);
-                }
-            };
-
-            // Encode host_mode + host_custom + the typed
-            // BackendTarget so the tun can dispatch
-            // without re-deriving it from the request
-            // target. (`serve_file_target` etc. are pure
-            // functions on `BackendTarget` + `HttpRequest`.)
-            let frame = TunnelHttpFrame {
-                request: req,
-                target: target.clone(),
-                host_mode: site.host_mode,
-                host_custom: site.host_custom.clone(),
-                is_upgrade: false,
-                is_streaming: false,
-                // The TCP peer, resolved once in `request_filter`.
-                peer_ip: ctx.peer_ip.clone(),
-            };
-            let exec = YamuxTunnelExecutor { tunnel: &tunnel };
-            match exec
-                .execute_http(
-                    frame.request,
-                    &target,
-                    frame.host_mode,
-                    frame.host_custom,
-                    frame.peer_ip,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    // Issue #73: tunnel-path requests short-circuit
-                    // pingora so the proxy `response_filter` never
-                    // runs — record the access log here so the entry
-                    // shows up on /logs.
-                    record_access_log(&self.app, ctx, parse_status_from_line(&resp.status_line))
-                        .await;
-                    write_response_to_session(session, &resp).await;
-                    return Ok(true);
-                }
-                Err(e) => {
-                    warn!("tunnel execute_http error: {}", e);
-                    let code = match e {
-                        ProxyError::Timeout => 504,
-                        ProxyError::Unavailable(_) => 503,
-                        _ => 502,
-                    };
-                    let _ = session.respond_error(code).await;
-                    return Ok(true);
-                }
             }
+            info!(
+                "Tunnel: {} → tun {} ({})",
+                host,
+                tun_name,
+                target.authority()
+            );
         }
 
         // ── direct path (Http/Https) → fall through to pingora ──
@@ -1235,6 +842,12 @@ impl ProxyHttp for AppProxy {
     }
 
     /// Select the upstream peer based on the site backend URL.
+    ///
+    /// A tun backend gets a peer whose `custom_l4` connector opens a
+    /// **tunnel byte stream** — from pingora's point of view that is
+    /// an ordinary upstream connection, so the tunnel path uses
+    /// pingora's own HTTP machinery (chunked bodies, upgrades,
+    /// connection reuse) instead of a hand-written counterpart.
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -1247,8 +860,11 @@ impl ProxyHttp for AppProxy {
             None => return Err(Error::new_str("site not found")),
         };
         drop(indexes);
-        let (_tun, target) = parse_backend_to_target(&site.backend)
+        let (tun, target) = parse_backend_to_target(&site.backend)
             .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad backend: {e}")))?;
+        if !tun.is_empty() {
+            return Ok(Box::new(tunnel_peer(&self.app, &tun, &target)?));
+        }
         match &target {
             BackendTarget::Http { host: h, port, .. } => Ok(Box::new(HttpPeer::new(
                 format!("{}:{}", h, port),
@@ -1342,14 +958,34 @@ impl ProxyHttp for AppProxy {
         // peer) will dial the backend, so the Host header
         // should be the backend's host:port. We do that
         // here because we know the backend authority.
+        let backend = parse_backend_to_target(&site.backend).ok();
         if site.host_mode == HostMode::Backend
-            && let Ok((
+            && let Some((
                 _,
                 BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. },
-            )) = parse_backend_to_target(&site.backend)
+            )) = &backend
         {
             let new_host = format!("{}:{}", host, port);
             upsert_header(&mut req.headers, "Host", &new_host);
+        }
+
+        // A tunnelled backend's URL may carry a **path prefix**
+        // (`office:http://10.0.0.1:8080/apis`). The prefix is part
+        // of the backend's identity, so the upstream request has to
+        // carry it: the pre-#153 tunnel path joined the prefix onto
+        // the request path before handing the request to the tun.
+        //
+        // The tunnel path needs it explicitly because the CONNECT
+        // instruction only carries a `host:port` — the path is the
+        // request's own.
+        if let Some((
+            tun_name,
+            BackendTarget::Http { base_path, .. } | BackendTarget::Https { base_path, .. },
+        )) = &backend
+            && !tun_name.is_empty()
+            && !base_path.is_empty()
+        {
+            prepend_base_path(upstream, base_path)?;
         }
 
         // Apply the mutations back to the pingora RequestHeader.
@@ -1431,647 +1067,80 @@ impl ProxyHttp for AppProxy {
     }
 }
 
-/// WebSocket upgrade relay to a tun backend. Used by two callers in
-/// `request_filter`:
-///   1. The historical short-circuit for `path == ws_path` (the
-///      tun control channel endpoint, default `/tunnel`) — kept
-///      for defense-in-depth.
-///   2. The new general branch for any WS upgrade that routes
-///      to a tun backend on a non-`ws_path` path (issue: WS
-///      upgrades through a tun were silently broken because
-///      the tunnel path set `is_upgrade: false`).
+/// Build the upstream peer for a tunnelled backend.
 ///
-/// Steps:
-///   1. Build a `TunnelHttpFrame` with `is_upgrade: true`,
-///      `host_mode` and `host_custom` from the site.
-///   2. Send `HTTP/1.1 101 Switching Protocols` to the client,
-///      forwarding `Upgrade`, `Connection`, `Sec-WebSocket-Key`
-///      → `Sec-WebSocket-Accept`, `Sec-WebSocket-Protocol`, and
-///      `Sec-WebSocket-Version`.
-///   3. Open a yamux stream to the tun and write the encoded
-///      frame so the tun knows to perform the WS upgrade
-///      against the backend.
-///   4. **Pump** raw bytes between the client's HTTP/1 stream
-///      and the yamux stream. Once the 101 is sent the
-///      connection is in WebSocket mode; the proxy's job from
-///      here on is the same opaque byte-relay the SSE
-///      streaming path uses (see `handle_streaming_request`).
-///      The tun's `handle_ws_upgrade` performs the matching
-///      relay between yamux and the backend, so the byte path
-///      is client ↔ proxy ↔ yamux ↔ tun ↔ backend.
+/// The peer carries a **numeric** address: `HttpPeer::new` resolves
+/// its argument eagerly and panics when the resolution fails, and the
+/// target host is resolved by the **tun** — in the operator's own
+/// network — not by the gateway. The address therefore carries the
+/// target's port and nothing else; the host travels in the `CONNECT`
+/// instruction.
 ///
-/// On error the helper sends the appropriate HTTP error
-/// response to the client before returning; the caller is
-/// expected to `return Ok(true)` from `request_filter` once
-/// this resolves. On success the helper runs the byte-pump
-/// to completion and only then returns.
-async fn ws_relay_to_tun(
-    session: &mut Session,
-    target: &BackendTarget,
-    tunnel: &pangolin_core::YamuxTunnel,
-    host_mode: HostMode,
-    host_custom: Option<String>,
-    peer_ip: Option<String>,
-) -> Result<()> {
-    debug!("ws_relay_to_tun: helper entered");
-    // Build the HttpRequest from the session and encode as a
-    // TunnelHttpFrame with is_upgrade=true. The path used in
-    // `request.target` is the full URL of the backend (e.g.
-    // `http://1.2.3.4:8080/chat?x=1`) — the tun's
-    // `handle_ws_upgrade` parses it to derive the
-    // authority:port it needs to dial and the path to send on
-    // the upgrade request.
-    let path_and_query = session
-        .req_header()
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let req_path = if path_and_query.starts_with('/') {
-        path_and_query
-    } else {
-        format!("/{}", path_and_query)
-    };
-    let target_url = match target {
-        BackendTarget::Http {
-            host,
-            port,
-            base_path,
-        } => format!(
-            "http://{}:{}{}",
-            host,
-            port,
-            if base_path.is_empty() {
-                req_path.clone()
-            } else {
-                format!("{}{}", base_path.trim_end_matches('/'), req_path)
-            }
-        ),
-        BackendTarget::Https {
-            host,
-            port,
-            base_path,
-        } => format!(
-            "https://{}:{}{}",
-            host,
-            port,
-            if base_path.is_empty() {
-                req_path.clone()
-            } else {
-                format!("{}{}", base_path.trim_end_matches('/'), req_path)
-            }
-        ),
+/// `group_key` is derived from (tun, host, port, scheme): pingora
+/// pools upstream connections per peer and `HttpPeer::hash` includes
+/// the group key, so two backends that differ only by host must not
+/// share a pooled connection — a stream opened for one backend would
+/// otherwise be handed to a request for another.
+fn tunnel_peer(app: &Arc<App>, tun_name: &str, target: &BackendTarget) -> Result<HttpPeer> {
+    let (host, port, tls) = match target {
+        BackendTarget::Http { host, port, .. } => (host.clone(), *port, false),
+        BackendTarget::Https { host, port, .. } => (host.clone(), *port, true),
         BackendTarget::File { .. } => {
-            // ws_relay_to_tun's callers gate on
-            // `!matches!(target, File)` already; this branch is
-            // unreachable but the match must be total.
-            return Ok(());
+            return Err(Error::explain(ErrorType::ReadError, "file:// not a peer"));
         }
     };
-    let req = match build_request_from_session(session, &target_url).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("ws relay: build request: {}", e);
-            let _ = session.respond_error(500).await;
-            return Ok(());
-        }
-    };
-    let frame = TunnelHttpFrame {
-        request: req,
-        target: target.clone(),
-        host_mode,
-        host_custom,
-        is_upgrade: true,
-        is_streaming: false,
-        // The TCP peer, resolved once in `request_filter`. The
-        // tunnel-side code appends it to `X-Forwarded-For`; the
-        // visitor's own address travels in the `P-Client-Ip`
-        // header, which the frame's request headers already carry.
-        peer_ip,
-    };
-
-    // 101 Switching Protocols — replicate the WS handshake on
-    // the proxy's side so the client sees the upgrade succeed
-    // before we hand the rest of the connection off to yamux.
-    let mut hdr = ResponseHeader::build(101, None).unwrap();
-    hdr.insert_header("Upgrade", "websocket").ok();
-    hdr.insert_header("Connection", "Upgrade").ok();
-    if let Some(sec_key) = session.get_header("Sec-WebSocket-Key")
-        && let Ok(key_str) = std::str::from_utf8(sec_key.as_bytes())
-    {
-        let accept = compute_ws_accept(key_str);
-        hdr.insert_header("Sec-WebSocket-Accept", accept).ok();
-    }
-    if let Some(protocols) = session.get_header("Sec-WebSocket-Protocol")
-        && let Ok(v) = std::str::from_utf8(protocols.as_bytes())
-    {
-        hdr.insert_header("Sec-WebSocket-Protocol", v).ok();
-    }
-    if let Some(version) = session.get_header("Sec-WebSocket-Version")
-        && let Ok(v) = std::str::from_utf8(version.as_bytes())
-    {
-        hdr.insert_header("Sec-WebSocket-Version", v).ok();
-    }
-    session.write_response_header(Box::new(hdr), false).await?;
-
-    // Take the client's stream out of the session. pingora's
-    // `take_stream` uses `std::ptr::read` which copies the
-    // `Stream` (a `Box<dyn IO>`) out but does NOT zero the
-    // original location — when `request_filter` returns
-    // `Ok(true)` and pingora's runtime calls
-    // `session.downstream_session.finish().await`, the
-    // `Http1Session::reuse` path invokes
-    // `self.underlying_stream.shutdown()` on the moved-from
-    // field, closing the underlying TcpStream and RST'ing the
-    // client. The dedicated helper below patches the
-    // moved-from slot with a no-op `Stream` (an in-memory
-    // `DuplexStream` whose Drop does nothing) so the later
-    // `finish()` shutdown is a no-op. This is a workaround
-    // for an upstream pingora contract; the unsafe layout
-    // assumption is isolated in `patch_moved_from_stream_in_h1`
-    // with a `debug_assert!` for the offset.
-    let mut stream = {
-        let h1 = session.as_http1_mut().expect("not HTTP/1 session");
-        let taken = h1.take_stream();
-        patch_moved_from_stream_in_h1(h1);
-        taken
-    };
-
-    // Open a yamux stream and write the frame.
-    let mut yamux_stream = match tunnel.open_stream().await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("open yamux stream for WS relay: {}", e);
-            return Ok(());
-        }
-    };
-    let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
-    let len = bytes.len() as u32;
-    if let Err(e) = async {
-        use tokio::io::AsyncWriteExt;
-        // The tun's `handle_tunnel_frame` reads a 4-byte BE
-        // length prefix then that many bytes of frame body
-        // (see `tun/src/client.rs:242-254`). Without the
-        // prefix the tun's first read of `len_buf` consumes
-        // the start of the encoded frame and the whole
-        // pipeline desyncs — the WS upgrade silently never
-        // reaches the tun. The historical ws_path
-        // short-circuit was missing this prefix too; the
-        // path was untested, so the bug never surfaced.
-        yamux_stream.write_all(&len.to_be_bytes()).await?;
-        yamux_stream.write_all(&bytes).await?;
-        yamux_stream.flush().await?;
-        Ok::<(), std::io::Error>(())
-    }
-    .await
-    {
-        warn!("failed to write WS relay frame: {}", e);
-        return Ok(());
-    }
-
-    // Run the byte-pump synchronously in the request_filter
-    // future. The pingora worker is tied up until both sides
-    // close — that's fine for a WS connection (it's the
-    // lifetime of the upgrade). A future enhancement can
-    // hand the pump to a dedicated long-lived task via a
-    // channel; for now, keeping it inline avoids a class of
-    // issues where a `tokio::spawn`'d task is starved or
-    // aborted by pingora's task-queue lifecycle (request_filter
-    // runs in a per-request future, and detached tasks
-    // spawned inside it are not always polled promptly
-    // before pingora's finish path tears the connection
-    // down). The relay is the same `copy_bidirectional`
-    // pattern the SSE streaming path uses.
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut yamux_stream).await;
-    Ok(())
+    // A numeric address — `HttpPeer::new` resolves eagerly, and the
+    // target host is resolved by the **tun** (in the operator's own
+    // network), not here. The address carries the target's port and
+    // nothing else; the host lives in the CONNECT instruction.
+    //
+    // The address is `0.0.0.0` on purpose: pingora checks a pooled
+    // connection's file descriptor against the peer address, and
+    // `0.0.0.0` is the one address that matches any fd (it is a
+    // source address, never a destination). That check is what keeps
+    // the pooled tunnel stream usable — and it is also why the
+    // `group_key` below has to separate the backends explicitly.
+    let mut peer = HttpPeer::new(format!("0.0.0.0:{port}"), tls, host.clone());
+    // The group key is the **explicit** separator between two
+    // backends' pooled connections. The SNI also ends up in
+    // pingora's peer hash, but the SNI is a TLS concept — relying on
+    // it for a plain-HTTP backend would be an accident, not a
+    // contract. The key is derived from everything that identifies
+    // the backend, so it holds whatever the hash happens to include.
+    peer.group_key = tunnel_group_key(tun_name, &host, port, tls);
+    peer.options.custom_l4 = Some(Arc::new(TunnelConnector::new(
+        app.clone(),
+        tun_name,
+        &host,
+        port,
+    )));
+    Ok(peer)
 }
 
-/// Workaround for a pingora contract gap (see
-/// [`ws_relay_to_tun`]): after `Http1Session::take_stream` runs
-/// the original `underlying_stream: Stream` field still holds
-/// the same TcpStream, so pingora's `finish()` later
-/// `shutdown()`s the connection the byte-pump is using.
+/// Prepend a backend's path prefix to the upstream request path.
 ///
-/// The workaround: overwrite the moved-from field with a
-/// no-op `Stream` (a `tokio::io::DuplexStream` whose Drop
-/// just frees the in-memory buffer). The `Stream` type is
-/// `Box<dyn IO>`, so the only field-level access we have
-/// is via the struct pointer; in practice the field is the
-/// first member of `Http1Session`, but `repr(Rust)` does
-/// not guarantee layout.
-///
-/// **Layout assumption — re-validate on every pingora bump.**
-/// The pingora fork + commit is pinned below; the
-/// `Http1Session::take_stream` body in
-/// `pingora-core/src/protocols/http/v1/server.rs` must
-/// leave the moved-from slot uninitialized enough that an
-/// immediate `ptr::write` (inside the helper) doesn't first
-/// run the previous `Drop`. The actual runtime guard is
-/// the WS e2e test
-/// `real_e2e_proxy_wss_upgrade_to_direct_backend` —
-/// re-run it (and a fresh `make build`) on any pingora bump.
-///
-/// When pingora eventually exposes a real
-/// `Option<Stream>::take()` API, delete this helper.
-fn patch_moved_from_stream_in_h1(h1: &mut pingora::protocols::http::v1::server::HttpSession) {
-    // Pinned to the pingora fork at:
-    //   https://github.com/cnlangzi/pingora?branch=pangolin
-    //   revision: e46648dd000ffb5f0ff62db38e44bf34efa94e40
-    // (Cargo.toml: `pingora = { git = "...", branch = "pangolin" }`)
-    //
-    // Re-validate the layout below if you bump pingora. The
-    // `Http1Session::take_stream` method is at
-    //   pingora-core/src/protocols/http/v1/server.rs:1726
-    // and the struct definition just above. We expect:
-    //   pub struct HttpSession {
-    //       underlying_stream: Stream,   // <- first field
-    //       buf: Bytes,
-    //       ...
-    //   }
-    // No runtime layout check — the earlier `debug_assert!`
-    // compared `h1` to itself and so was vacuous. The real
-    // guard is the WS e2e test
-    // (`real_e2e_proxy_wss_upgrade_to_direct_backend`) plus
-    // manual review on any pingora bump. The pinned commit
-    // hash in this file's doc comment is the authoritative
-    // version this `unsafe` is sound against.
-    let (a, _b) = tokio::io::duplex(64);
-    let noop: pingora_core::protocols::Stream = Box::new(a);
-    // SAFETY: `Http1Session::underlying_stream` is at offset 0
-    // (see doc comment for the pinned revision). `take_stream`
-    // ran `std::ptr::read` on the field, leaving the original
-    // location still holding the same TcpStream via a
-    // `Box<dyn IO>`. We overwrite it with a no-op
-    // `DuplexStream` so the subsequent `finish() → reuse() →
-    // shutdown()` on the moved-from field is a no-op
-    // (DuplexStream's Drop just frees the in-memory buffer; no
-    // socket close). The noop's allocation is bounded (a
-    // 64-byte in-memory duplex) and dropped when the
-    // Http1Session is finally dropped, so no leak.
-    //
-    // **Re-validate this whole block if pingora is bumped.**
-    // Two distinct layout assumptions to recheck:
-    // 1. The first field of `Http1Session` is still
-    //    `underlying_stream: Stream`. `repr(Rust)` permits
-    //    reordering on field add/remove, so a bump that
-    //    inserts a new field at the front would silently
-    //    corrupt a different field here.
-    // 2. `take_stream`'s implementation still uses `ptr::read`
-    //    and leaves the moved-from slot in a state where an
-    //    immediate `ptr::write` (this call) is safe — i.e.,
-    //    the previous `Drop` has NOT been queued to run on the
-    //    moved-from `Box<dyn IO>`. If a future pingora starts
-    //    running `Drop` on the moved-from slot, the
-    //    subsequent `ptr::write` would overwrite a live
-    //    `Box` and leak its inner heap allocation.
-    let field_ptr = h1 as *mut _ as *mut pingora_core::protocols::Stream;
-    unsafe {
-        std::ptr::write(field_ptr, noop);
+/// `base_path` is the prefix of the backend URL (`/apis`); the request
+/// keeps its query string. The prefix is joined the way the pre-#153
+/// tunnel path joined it: the prefix without its trailing slash, then
+/// the request path as it arrived.
+fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()> {
+    let prefix = base_path.trim_end_matches('/');
+    let path = upstream.uri.path();
+    let query = upstream.uri.query();
+    let mut path_and_query = format!("{prefix}{path}");
+    if let Some(query) = query {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
     }
-}
-
-/// Handle a streaming (SSE / long-lived chunked) request over
-/// the tunnel.
-///
-/// Mirrors the WebSocket relay at the top of `request_filter`:
-///   1. Site lookup → determine the tun name + backend URL.
-///   2. Open a yamux stream to the tun.
-///   3. Write the `TunnelHttpFrame` (with `is_streaming = true`).
-///   4. Read the response **header** off the yamux stream —
-///      just the HTTP head (status line + headers), no body
-///      length required because we are going to stream the
-///      body. The tun side writes the head, then the body
-///      bytes are relayed verbatim from the backend TCP
-///      socket by `handle_streaming_response` in the tun
-///      binary.
-///   5. Send the response head to the client, then
-///      `copy_bidirectional` between the yamux stream and
-///      the client session until either side closes.
-///
-/// This mirrors what `handle_ws_upgrade` does in the tun:
-/// both sides treat the yamux stream as a transparent byte
-/// pipe once the handshake is done.
-async fn handle_streaming_request(
-    app: &App,
-    session: &mut Session,
-    peer_ip: Option<String>,
-) -> Result<bool> {
-    let host = host_from_session(session);
-
-    let indexes = app.indexes.read().await;
-    let site = match pangolin_core::index::lookup_site(&indexes, &host) {
-        Some(s) => s.clone(),
-        None => {
-            debug!("SSE: no site for host {}", host);
-            let _ = session.respond_error(404).await;
-            return Ok(true);
-        }
-    };
-    drop(indexes);
-
-    let (tun_name, target) = match parse_backend_to_target(&site.backend) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("SSE: invalid backend for {}: {}", site.name, e);
-            let _ = session.respond_error(502).await;
-            return Ok(true);
-        }
-    };
-
-    if tun_name.is_empty() {
-        // Streaming is a tunnel-only feature for now — direct
-        // backends should still work, but the buffering path
-        // (which we explicitly bypassed up front) needs a
-        // non-tunnel implementation. We do not have one yet;
-        // return 501 to surface that the feature is
-        // tunnel-only.
-        warn!(
-            "SSE: no tun configured for {} (streaming is tunnel-only)",
-            host
-        );
-        let _ = session.respond_error(501).await;
-        return Ok(true);
-    }
-
-    if matches!(target, BackendTarget::File { .. }) {
-        // File:// backends over a tunnel are technically
-        // supported (the tun can serve files), but streaming
-        // makes no sense for a single-file response. Bail.
-        let _ = session.respond_error(400).await;
-        return Ok(true);
-    }
-
-    let tunnel = {
-        let sessions = app.tun_sessions.read().await;
-        sessions.get(&tun_name).cloned()
-    };
-    let Some(tunnel) = tunnel else {
-        warn!("SSE: tun {} not online", tun_name);
-        let _ = session.respond_error(503).await;
-        return Ok(true);
-    };
-
-    info!("Tunnel SSE relay: {} → tun {}", host, tun_name);
-
-    // Build the request — same URL construction as the buffered
-    // tunnel path, so path-prefix joining and host header rules
-    // are identical.
-    let path_and_query = session
-        .req_header()
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let req_path = if path_and_query.starts_with('/') {
+    let mut parts = upstream.uri.clone().into_parts();
+    parts.path_and_query = Some(
         path_and_query
-    } else {
-        format!("/{}", path_and_query)
-    };
-
-    // For the frame, the tun reads `request.target` to find
-    // the URL it must dial. We follow the same convention as
-    // the buffered tunnel path: full URL for http/https, the
-    // original path for file://.
-    let req_target = match &target {
-        BackendTarget::File { .. } => req_path.clone(),
-        BackendTarget::Http {
-            host,
-            port,
-            base_path,
-        } => format!(
-            "http://{}:{}{}",
-            host,
-            port,
-            if base_path.is_empty() {
-                req_path.clone()
-            } else {
-                format!("{}{}", base_path.trim_end_matches('/'), req_path)
-            }
-        ),
-        BackendTarget::Https {
-            host,
-            port,
-            base_path,
-        } => format!(
-            "https://{}:{}{}",
-            host,
-            port,
-            if base_path.is_empty() {
-                req_path.clone()
-            } else {
-                format!("{}{}", base_path.trim_end_matches('/'), req_path)
-            }
-        ),
-    };
-
-    let req = match build_request_from_session(session, &req_target).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("SSE: build request: {}", e);
-            let _ = session.respond_error(500).await;
-            return Ok(true);
-        }
-    };
-
-    let frame = TunnelHttpFrame {
-        request: req,
-        target: target.clone(),
-        host_mode: site.host_mode,
-        host_custom: site.host_custom.clone(),
-        is_upgrade: false,
-        is_streaming: true,
-        // The TCP peer, resolved once in `request_filter` (same
-        // path as the WS relay above).
-        peer_ip,
-    };
-
-    let mut yamux_stream = match tunnel.open_stream().await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("SSE: open yamux stream: {}", e);
-            let _ = session.respond_error(502).await;
-            return Ok(true);
-        }
-    };
-
-    // Write the frame (length-prefixed). Same wire format as
-    // the buffered path.
-    let bytes = pangolin_core::proxy::encode_tunnel_frame(&frame);
-    let len = bytes.len() as u32;
-    if let Err(e) = async {
-        use tokio::io::AsyncWriteExt;
-        yamux_stream.write_all(&len.to_be_bytes()).await?;
-        yamux_stream.write_all(&bytes).await?;
-        yamux_stream.flush().await?;
-        Ok::<(), std::io::Error>(())
-    }
-    .await
-    {
-        warn!("SSE: write frame: {}", e);
-        let _ = session.respond_error(502).await;
-        return Ok(true);
-    }
-
-    // Read the response head off the yamux stream. The tun
-    // writes the head as soon as the backend has produced
-    // it, then relays body bytes. We do not require a length
-    // prefix here: we just scan for the CRLFCRLF delimiter.
-    use tokio::io::AsyncReadExt;
-    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 1024];
-    let header_read = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let n = yamux_stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err::<usize, std::io::Error>(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "tun closed before sending response head",
-                ));
-            }
-            header_buf.extend_from_slice(&tmp[..n]);
-            if let Some(idx) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                return Ok(idx + 4);
-            }
-            if header_buf.len() > 64 * 1024 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "response head >64 KiB without CRLFCRLF",
-                ));
-            }
-        }
-    })
-    .await;
-    let head_end = match header_read {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            warn!("SSE: read response head: {}", e);
-            let _ = session.respond_error(502).await;
-            return Ok(true);
-        }
-        Err(_) => {
-            warn!("SSE: read response head timeout (60s)");
-            let _ = session.respond_error(504).await;
-            return Ok(true);
-        }
-    };
-
-    // Preserve any body bytes that came along with the head
-    // read — yamux is a streaming transport, so a single `read`
-    // often returns the entire head plus the first body chunk
-    // in one go. Discarding those bytes silently drops the
-    // first SSE event (the test panic on CI showed exactly
-    // this: events 1 and 2 arrived but event 0 was missing).
-    let pre_buffered_body: Vec<u8> = header_buf[head_end..].to_vec();
-
-    // Parse the status line + headers. We need a ResponseHeader
-    // that pingora can write to the client.
-    let head_str = match std::str::from_utf8(&header_buf[..head_end]) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("SSE: response head is not valid UTF-8: {}", e);
-            let _ = session.respond_error(502).await;
-            return Ok(true);
-        }
-    };
-    let mut status: u16 = 502;
-    let mut resp_headers: Vec<(String, String)> = Vec::new();
-    {
-        let mut lines = head_str.split("\r\n");
-        if let Some(status_line) = lines.next() {
-            // "HTTP/1.1 200 OK"
-            let mut parts = status_line.splitn(3, ' ');
-            let _ = parts.next();
-            if let Some(code) = parts.next() {
-                status = code.parse().unwrap_or(502);
-            }
-        }
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                resp_headers.push((k.trim().to_string(), v.trim().to_string()));
-            }
-        }
-    }
-
-    let mut hdr = match ResponseHeader::build(status, None) {
-        Ok(h) => h,
-        Err(e) => {
-            error!("SSE: build response header: {}", e);
-            let _ = session.respond_error(502).await;
-            return Ok(true);
-        }
-    };
-    // `append_header` is the multi-value-safe variant (see
-    // `real_e2e_tunnel_preserves_multiple_set_cookie`). It takes
-    // owned `String` values, so we hand it clones of the (k, v)
-    // pairs directly — the borrow on `resp_headers` only needs
-    // to last for the iteration, not for the call.
-    for (k, v) in &resp_headers {
-        let _ = hdr.append_header(k.clone(), v.clone());
-    }
-    if let Err(e) = session.write_response_header(Box::new(hdr), false).await {
-        error!("SSE: write response header: {}", e);
-        return Ok(true);
-    }
-
-    // Drain any body bytes that were already in the head-read
-    // buffer before we resume reading from the yamux stream.
-    if !pre_buffered_body.is_empty()
-        && let Err(e) = session
-            .write_response_body(Some(Bytes::copy_from_slice(&pre_buffered_body)), false)
-            .await
-    {
-        debug!("SSE: client closed early (prebuffer): {}", e);
-        return Ok(true);
-    }
-
-    // Stream body bytes: yamux → client. We do not await
-    // EOF — the next "tun wrote nothing for a while" or
-    // client-close triggers a graceful return.
-    //
-    // **Do not** add an explicit `yamux_stream.shutdown().await`
-    // here. When the client disconnects we `break` out of the
-    // loop and let `yamux_stream` drop out of scope at the
-    // bottom of this function. That Drop sends **RST** (not
-    // FIN) on the yamux stream
-    // (`tokio-yamux-0.3.18/src/stream.rs:597-622`, state
-    // `Established` → `Flag::Rst`). The tun-side
-    // `tokio::io::copy(&mut backend, &mut stream)` then errors
-    // out on its next write with `ECONNRESET`, which lets the
-    // tun promptly shut down the backend TCP. By contrast an
-    // explicit `shutdown().await` would set state to
-    // `LocalClosing` and send FIN — a half-close handshake —
-    // which is *slower* to propagate through the back-half of
-    // the tun's copy loop. See
-    // `docs/design/sse-reconnect.md` for the full rationale.
-    let mut buf = [0u8; 8192];
-    loop {
-        match yamux_stream.read(&mut buf).await {
-            Ok(0) => break, // tun closed the stream
-            Ok(n) => {
-                if let Err(e) = session
-                    .write_response_body(Some(Bytes::copy_from_slice(&buf[..n])), false)
-                    .await
-                {
-                    debug!("SSE: client closed early: {}", e);
-                    break;
-                }
-            }
-            Err(e) => {
-                debug!("SSE: read from yamux: {}", e);
-                break;
-            }
-        }
-    }
-
-    // Finalise the response body so the client sees the
-    // body terminator / chunked-end / connection-close.
-    if let Err(e) = session.finish_body().await {
-        debug!("SSE: finish body: {}", e);
-    }
-    Ok(true)
+            .parse()
+            .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?,
+    );
+    upstream.uri = http::Uri::from_parts(parts)
+        .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?;
+    Ok(())
 }
 
 fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -2571,9 +1640,6 @@ fn host_from_session(session: &Session) -> String {
         })
         .unwrap_or_default()
 }
-
-// (pump_ws_relay is no longer used here — WS upgrade goes
-//  through the tunnel frame and the tun-side executor.)
 
 #[cfg(test)]
 mod tests {

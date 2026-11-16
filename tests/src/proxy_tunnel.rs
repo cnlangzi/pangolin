@@ -2,22 +2,23 @@
 //!
 //! These tests exercise the **tunnel path through the proxy**
 //! end-to-end: ngx routes a request whose `site.backend` has a
-//! `tun_name:` prefix, opens a yamux stream to the live tun
-//! session, the tun fetches the backend, and the response is
-//! re-serialised back to the client.
+//! `tun_name:` prefix, opens a tunnel byte stream to the live tun
+//! session, the tun dials the backend and copies the bytes, and the
+//! response travels back the same way.
 //!
-//! As of issue #39, the wire format inside the WS is yamux
-//! streams carrying raw HTTP/1.1 bytes (no msgpack, no
-//! per-stream ids). The tests in this file use the higher
-//! level `real_e2e::tunnel_*` tests for the full round trip.
-//! Here we keep a couple of low-level sanity checks for
-//! protocol invariants on the new tunnel module.
+//! Since issue #153 the tunnel is a **splice**: the wire format
+//! inside the transport is a single `CONNECT <host>:<port>`
+//! instruction followed by raw bytes — no frames, no per-stream
+//! ids, no request re-serialisation. The transport-specific
+//! end-to-end tests live in `tunnel_transport.rs`; here we keep a
+//! couple of low-level sanity checks for protocol invariants on the
+//! tunnel module.
 
 use std::time::Duration;
 
 use pangolin_core::tunnel::{
-    HttpRequest, bearer_token, compute_ws_accept, encode_http_request, generate_ws_key,
-    strip_hop_by_hop_headers,
+    bearer_token, compute_ws_accept, decode_connect, decode_connect_reply, encode_connect,
+    encode_connect_reply, generate_ws_key, strip_hop_by_hop_headers,
 };
 
 use tokio::io::AsyncReadExt;
@@ -39,26 +40,25 @@ async fn start_hanging_backend() -> String {
     addr
 }
 
-/// Encoding the same request twice should produce identical
-/// bytes (so the tun side sees the same input regardless of
-/// which ngx instance forwarded it).
+/// The connection instruction names the target by **host and port**,
+/// so the tun can resolve the host in the operator's own network.
 #[test]
-fn http_request_encoding_is_deterministic() {
-    let req = HttpRequest {
-        method: "GET".into(),
-        target: "http://127.0.0.1:8080/api/users".into(),
-        version: "HTTP/1.1".into(),
-        headers: vec![("Host".into(), "app.example.com".into())],
-        body: vec![],
-    };
-    let a = encode_http_request(&req);
-    let b = encode_http_request(&req);
-    assert_eq!(a, b);
-    // The encoded form must include the request line and the
-    // Host header (which the tun uses for routing fallback).
-    let as_str = std::str::from_utf8(&a).unwrap();
-    assert!(as_str.starts_with("GET http://127.0.0.1:8080/api/users HTTP/1.1\r\n"));
-    assert!(as_str.contains("Host: app.example.com"));
+fn connect_instruction_names_the_target_by_host_and_port() {
+    let bytes = encode_connect("backend.internal", 8080);
+    assert_eq!(bytes, b"CONNECT backend.internal:8080\r\n");
+    let (host, port) = decode_connect(&bytes).unwrap();
+    assert_eq!(host, "backend.internal");
+    assert_eq!(port, 8080);
+}
+
+/// The tun's answer is `OK` or `ERR <reason>` — and an `ERR` becomes
+/// a 502 for the client, so the reason has to survive.
+#[test]
+fn connect_reply_carries_the_failure_reason() {
+    let ok = decode_connect_reply(&encode_connect_reply(Ok(()))).unwrap();
+    assert_eq!(ok, Ok(()));
+    let err = decode_connect_reply(&encode_connect_reply(Err("connection refused"))).unwrap();
+    assert_eq!(err, Err("connection refused".to_string()));
 }
 
 /// strip_hop_by_hop_headers removes Connection, Keep-Alive,

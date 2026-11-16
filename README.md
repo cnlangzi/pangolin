@@ -101,7 +101,7 @@ pangolin/
 | `home:http://192.168.1.100:8080/apis` | tunnel + 路径前缀 |
 | `http://127.0.0.1:8080/admin` | direct + 路径前缀 |
 | `file:///var/www/static` | **direct + 静态文件**：ngx 直接从 `/var/www/static` 服务文件（类 nginx `root`） |
-| `office:file:///home/user/docs` | **tunnel + 静态文件**：通过 office tun 把客户内网目录暴露为可访问的网站 |
+| `office:file:///home/user/docs` | **不再支持**：tunnel 现在是字节拼接（splice），只按 `host:port` 拨号，不能让 tun 读本地文件；网关会返回 501 |
 
 **静态文件后端（file:///）行为**（对齐 nginx）：
 
@@ -734,11 +734,23 @@ server: ngx.example.com:9001   # ngx 地址(匹配 ngx 的 [tunnel].addr)
 token: "your-tun-token-here"   # 认证 token,直接写在文件里
 name: office                  # tun 节点名;^[a-z0-9_-]+$, 1~32 字符,
                               # 非纯数字
+transport: auto               # auto(默认) | quic | tcp
 
 log:
   level: "info"
   file: ""                    # 空 = stderr
 ```
+
+**隧道传输(transport)**：隧道有两条传输——**QUIC**(主用)和
+**WebSocket/TCP**(UDP 被封时的回退)。`auto`(默认)先试 QUIC,
+握手超时 5 秒后回退到 WebSocket/TCP,并在失败后 10 分钟内不再探测
+QUIC。`quic` / `tcp` 把 tun 固定在一条传输上。
+
+QUIC 的网关证书是网关自己生成的自签证书(存在
+`{acme.cert_dir}/tunnel/`,重启不变),tun **首次连接时按指纹信任
+(trust on first use)**,指纹存在配置旁边的 `tun.pins` 里。两端都会
+在日志里打印指纹,方便比对。详见
+[`docs/design/tunnel.md`](docs/design/tunnel.md)。
 
 `tun.yml` 不再接受 CLI 参数(`--server` / `--token` / `--name` 已废弃)。`token` 字段直接写即可;如果想保密,可以:
 - 把配置文件设 0600 权限(或用系统 secret 管理工具管理整个文件);

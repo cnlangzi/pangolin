@@ -13,13 +13,53 @@
 //! substitution scheme, which scanned the raw YAML text and could
 //! not tell a documentation example from a real value.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
 use pangolin_core::config::LogConfig;
+
+/// Which transport the tun uses to reach the gateway.
+///
+/// `auto` is the default and reproduces the pre-#153 behaviour of
+/// trying QUIC first: the tun attempts QUIC with a bounded handshake
+/// timeout and falls back to the WebSocket/TCP transport when the
+/// attempt fails. `quic` and `tcp` pin the tun to one transport —
+/// which is what the end-to-end tests need, because a test that cannot
+/// pin the transport cannot tell a QUIC session from a fallback
+/// session that silently happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportSelector {
+    /// Prefer QUIC, fall back to the WebSocket/TCP transport.
+    #[default]
+    Auto,
+    /// QUIC only — no fallback. The tunnel fails when the network
+    /// blocks UDP.
+    Quic,
+    /// WebSocket/TCP only — the pre-#153 transport.
+    Tcp,
+}
+
+impl TransportSelector {
+    /// The stable, lower-case name used in the configuration file and
+    /// in the log lines.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransportSelector::Auto => "auto",
+            TransportSelector::Quic => "quic",
+            TransportSelector::Tcp => "tcp",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Top-level config for the `pangolin-tun` binary. Read once at startup.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -35,6 +75,14 @@ pub struct TunConfig {
     /// non-purely-numeric. The ngx side uses this to attribute
     /// proxied domains to a specific tun.
     pub name: String,
+
+    /// Which transport to use for the tunnel. `auto` (the default)
+    /// prefers QUIC and falls back to the WebSocket/TCP transport.
+    ///
+    /// Added in issue #153. It is the only new field the tun's
+    /// configuration gained; every existing field keeps its meaning.
+    #[serde(default)]
+    pub transport: TransportSelector,
 
     /// TLS settings for the WS connection to ngx. When `tls` is
     /// absent or empty, the tun speaks plaintext `ws://` to the
@@ -89,6 +137,29 @@ impl TunConfig {
         validate(&cfg)?;
         Ok(cfg)
     }
+
+    /// The path of the trust-on-first-use pin file, next to the
+    /// configuration file.
+    ///
+    /// The pin file holds the fingerprints of the gateway
+    /// certificates this tun trusts. It lives next to the
+    /// configuration so the operator finds both in the same place when
+    /// they have to re-pin.
+    pub fn pin_path(config_path: &Path) -> PathBuf {
+        config_path.with_extension("pins")
+    }
+
+    /// The path of the file that records when the last QUIC attempt
+    /// failed.
+    ///
+    /// The tun skips the QUIC probe for ten minutes after a failure,
+    /// so a network that blocks UDP does not pay the handshake
+    /// timeout on every reconnect. The record has to survive a
+    /// restart, otherwise a tun that is restarted every few minutes
+    /// would probe on every session.
+    pub fn quic_failure_path(config_path: &Path) -> PathBuf {
+        config_path.with_extension("quic-fail")
+    }
 }
 
 /// Field-level validation. Mirrors the rules previously in
@@ -126,8 +197,8 @@ pub fn validate(c: &TunConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     // `figment::Jail` returns `Result<(), figment::Error>` from its
-    // closure; the Err variant is large, but it's test-only code so
-    // we silence the lint.
+    // closure; the Err variant is large, but it's test-only code so we
+    // silence the lint.
     #![allow(clippy::result_large_err)]
     use super::*;
 
@@ -150,6 +221,89 @@ mod tests {
         assert_eq!(c.name, "");
         assert_eq!(c.log.level, "info");
         assert_eq!(c.log.file, "");
+    }
+
+    /// The transport selector defaults to `auto` — the tun prefers
+    /// QUIC and falls back to the WebSocket/TCP transport.
+    #[test]
+    fn transport_defaults_to_auto() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: "secret-abc"
+                name: office
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            assert_eq!(c.transport, TransportSelector::Auto);
+            Ok(())
+        });
+    }
+
+    /// The selector accepts the three documented values.
+    #[test]
+    fn transport_selector_accepts_the_three_values() {
+        for (value, expected) in [
+            ("auto", TransportSelector::Auto),
+            ("quic", TransportSelector::Quic),
+            ("tcp", TransportSelector::Tcp),
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.clear_env();
+                let s = format!(
+                    "server: gateway.local:8080\ntoken: t\nname: office\ntransport: {value}\n"
+                );
+                let c = TunConfig::from_str(&s).unwrap();
+                assert_eq!(c.transport, expected);
+                Ok(())
+            });
+        }
+    }
+
+    /// The selector is reachable through the `TUN_*` environment
+    /// override, so a test can pin the transport without touching the
+    /// configuration file.
+    #[test]
+    fn transport_selector_is_reachable_through_the_env_override() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: t
+                name: office
+            "#;
+            jail.set_env("TUN_TRANSPORT", "quic");
+            let c = TunConfig::from_str(s).unwrap();
+            assert_eq!(c.transport, TransportSelector::Quic);
+            Ok(())
+        });
+    }
+
+    /// An unknown transport value is rejected at load time rather than
+    /// at the first connect.
+    #[test]
+    fn unknown_transport_value_is_rejected() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: t
+                name: office
+                transport: carrier-pigeon
+            "#;
+            assert!(TunConfig::from_str(s).is_err());
+            Ok(())
+        });
+    }
+
+    /// The pin file and the QUIC-failure record live next to the
+    /// configuration file, so the operator finds them in one place.
+    #[test]
+    fn state_files_live_next_to_the_configuration() {
+        let pins = TunConfig::pin_path(Path::new("/etc/pangolin/tun.yml"));
+        assert_eq!(pins, PathBuf::from("/etc/pangolin/tun.pins"));
+        let failed = TunConfig::quic_failure_path(Path::new("/etc/pangolin/tun.yml"));
+        assert_eq!(failed, PathBuf::from("/etc/pangolin/tun.quic-fail"));
     }
 
     #[test]

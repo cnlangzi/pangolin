@@ -18,14 +18,10 @@ path = "src/lib.rs"
 tokio.workspace = true
 fastwebsockets.workspace = true
 tokio-yamux.workspace = true
-bytes = "1"
-# pingora-core powers the tun-side HTTP client (v8 design).
-# We use the default features (matches ngx) — the rustls
-# feature is enabled transitively through `rustls` from
-# the workspace patch. Replacing the previous reqwest +
-# rustls + webpki-roots stack.
-pingora-core = { workspace = true }
-pingora-http = { workspace = true }
+# The tun is a byte relay (issue #153): it no longer speaks HTTP, so
+# it needs neither `pingora-core` nor `pingora-http` — and no HTTP
+# types either. The tunnel's byte-stream interface lives in
+# `pangolin-core`.
 async-trait.workspace = true
 futures.workspace = true
 futures-util.workspace = true
@@ -39,10 +35,11 @@ thiserror.workspace = true
 clap.workspace = true
 chrono.workspace = true
 pangolin-core = { path = "../pangolin-core" }
-http = "1.4.1"
 
 [dev-dependencies]
 # `figment::Jail` lives behind the `test` feature flag — used by the
 # config tests to sandbox `TUN_*` env vars that the Makefile's
 # `.env`-export step would otherwise leak in.
 figment = { workspace = true, features = ["test"] }
+# The fallback-policy tests write their state files into a temp dir.
+tempfile = { workspace = true }

@@ -13,8 +13,8 @@
 //!
 //! Fix: ngx detects SSE (via `is_streaming_request` in
 //! `pangolin-core::proxy`) and sets `is_streaming: true` on the
-//! `TunnelHttpFrame`. The tun side dispatches the request to
-//! `handle_streaming_response`, which connects to the backend
+//! the tunnel's `CONNECT` instruction. The tun side connects to
+//! the backend
 //! over plain TCP, sends the request bytes, and uses
 //! `tokio::io::copy_bidirectional` to relay bytes as they
 //! arrive — the same pattern as `pump_ws_relay` for WebSocket.
@@ -161,10 +161,9 @@ impl Drop for SseBackend {
 // ---------------------------------------------------------------------------
 // Mock SSE backend that **records** when its peer closes the
 // TCP connection. Used by the disconnect-propagation e2e test
-// to verify that the tun-side `handle_streaming_response`
-// promptly closes the backend TCP after the ngx-side yamux
-// stream drops on client disconnect. See
-// `docs/design/sse-reconnect.md`.
+// to verify that the tun-side relay promptly closes the backend
+// TCP after the gateway-side tunnel stream drops on client
+// disconnect. See `docs/design/sse-reconnect.md`.
 // ---------------------------------------------------------------------------
 
 /// Mock backend that emits events forever on a fixed cadence
@@ -337,7 +336,7 @@ impl Drop for ObservableSseBackend {
 /// emit all events; for a real infinite stream we'd never
 /// reach EOF, but the mock backend closes the chunked
 /// response cleanly).
-async fn raw_sse_request(
+pub(crate) async fn raw_sse_request(
     addr: &str,
     host: &str,
     path: &str,
@@ -420,9 +419,9 @@ async fn raw_sse_request(
 ///
 /// Post-fix behavior: `is_streaming_request` matches the
 /// `Accept: text/event-stream` header, ngx sets
-/// `is_streaming = true` on the frame, the tun dispatches
-/// to `handle_streaming_response`, and bytes are relayed
-/// through `copy_bidirectional` as they arrive.
+/// the request is marked as a stream, and the bytes are relayed
+/// through the tunnel as they arrive — the tunnel is a splice, so
+/// the response is never buffered on either side.
 #[tokio::test]
 async fn real_e2e_tunnel_sse_streams_through() {
     let backend = SseBackend::start(3, Duration::from_millis(50)).await;
@@ -492,8 +491,8 @@ async fn real_e2e_tunnel_sse_streams_through() {
 ///
 /// ## Regression test for two related DNS-resolution bugs
 ///
-/// `handle_streaming_response` (and its sibling `handle_ws_upgrade`)
-/// in `crates/tun/src/client.rs` need to dial the backend by
+/// the tun-side relay in `crates/tun/src/client.rs` has to dial the
+/// backend by
 /// authority string. The historical bugs and the corresponding
 /// fixes are:
 ///
@@ -505,7 +504,7 @@ async fn real_e2e_tunnel_sse_streams_through() {
 ///    stream, and ngx surfaced a 502 Bad Gateway to the client.
 ///    Fix: replace with `tokio::net::lookup_host(authority)`,
 ///    which performs a real DNS lookup. The same fix is now in
-///    `handle_ws_upgrade`.
+///    the WebSocket relay path.
 ///
 /// 2. **First-result-only resolver (OS-dependent ordering)** —
 ///    even after switching to `lookup_host`, the code took only
@@ -668,8 +667,8 @@ async fn real_e2e_tunnel_sse_client_disconnect_propagates_to_backend() {
 /// (hostname, not `127.0.0.1:<port>`). On a post-fix binary
 /// the resolver finds `127.0.0.1` and the SSE stream flows
 /// through. The test passes on every platform because
-/// `handle_streaming_response` now falls through to whichever
-/// address family is reachable.
+/// the tun's relay now falls through to whichever address family is
+/// reachable.
 #[tokio::test]
 async fn real_e2e_tunnel_sse_hostname_backend() {
     // Start a mock SSE backend on a random port.
@@ -1043,14 +1042,21 @@ async fn real_e2e_tunnel_sse_preserves_keepalive_comments() {
                 return;
             }
             let _ = stream.flush().await;
-            // Comment line, then first data event.
+            // Comment line, then first data event — **two** chunks.
+            //
+            // Issue #153: the tunnel is a splice, so the gateway's
+            // pingora parses the response as HTTP instead of
+            // relaying the raw bytes. The chunk lengths therefore
+            // have to be correct — the previous fixture packed the
+            // comment and the first event into one chunk while
+            // announcing the comment's length, which only survived
+            // the old byte-transparent relay.
             let comment = ": keepalive\r\n";
             let data0 = "data: hello\n\n";
             let chunk0 = format!(
-                "{:x}\r\n{}{}\r\n{:x}\r\n{}\r\n",
+                "{:x}\r\n{}\r\n{:x}\r\n{}\r\n",
                 comment.len(),
                 comment,
-                data0,
                 data0.len(),
                 data0,
             );
