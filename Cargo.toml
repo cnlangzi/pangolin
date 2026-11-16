@@ -59,6 +59,18 @@ fastwebsockets = { version = "0.10", features = ["upgrade"] }
 # for HTTP/1.1 byte pipe + WS relay as byte pipe)
 tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-timer"] }
 
+# QUIC transport for the tunnel (issue #153). The primary transport
+# carries the tunnel's byte streams over one connection per tun, one
+# bidirectional stream per request — and encrypts them by default.
+# `platform-verifier` is off: the tun pins the gateway's certificate
+# by fingerprint (trust on first use), so it never consults a root
+# store.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+
 futures = "0.3"
 futures-util = "0.3"
 

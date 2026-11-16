@@ -484,6 +484,9 @@ pub struct NgxProcess {
     pub tls_port: u16,
     pub tunnel_port: u16,
     pub admin_port: u16,
+    /// Held so the occupied UDP port stays occupied for the lifetime
+    /// of the process (see [`NgxProcess::start_with_quic_blocked`]).
+    _udp_blocker: Option<std::net::UdpSocket>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub cert_dir: PathBuf,
@@ -509,6 +512,22 @@ impl NgxProcess {
     /// which seed data is visible without an explicit
     /// `reload_indexes` admin call.
     pub async fn start<F: FnOnce(&Path)>(seed_db: F) -> Self {
+        Self::start_inner(seed_db, false).await
+    }
+
+    /// Start ngx with the tunnel's **UDP** port already occupied by a
+    /// socket that never answers.
+    ///
+    /// The gateway's QUIC listener cannot bind then, so it logs a
+    /// warning and serves the WebSocket/TCP fallback only — and a tun
+    /// that prefers QUIC sees its handshake time out and falls back.
+    /// That is the "the network blocks UDP" case, exercised without
+    /// touching the host's firewall.
+    pub async fn start_with_quic_blocked<F: FnOnce(&Path)>(seed_db: F) -> Self {
+        Self::start_inner(seed_db, true).await
+    }
+
+    async fn start_inner<F: FnOnce(&Path)>(seed_db: F, occupy_udp: bool) -> Self {
         let tmpdir = tempfile::Builder::new()
             .prefix("pangolin-e2e-ngx-")
             .tempdir()
@@ -527,6 +546,18 @@ impl NgxProcess {
         let tls_port = free_port();
         let tunnel_port = free_port();
         let admin_port = free_port();
+
+        // Occupy the tunnel's UDP port before the gateway starts. TCP
+        // and UDP have separate port spaces, so the TCP listener still
+        // binds — only QUIC is blocked.
+        let _udp_blocker = if occupy_udp {
+            Some(
+                std::net::UdpSocket::bind(("127.0.0.1", tunnel_port))
+                    .expect("bind the udp port to block quic"),
+            )
+        } else {
+            None
+        };
 
         let config = format!(
             r#"
@@ -628,6 +659,7 @@ acme:
         Self {
             child: Some(child),
             log_tasks,
+            _udp_blocker,
             http_port,
             tls_port,
             tunnel_port,
@@ -745,10 +777,28 @@ pub struct TunProcess {
 
 impl TunProcess {
     /// Spawn `pangolin-tun` pointing at the given ngx instance.
-    /// Waits ~1s for the WS connection to complete before returning
-    /// (tun logs "tun X connected to ngx" on success; if the auth
-    /// fails the log captures the rejection).
+    /// Waits for the transport session to come up before returning
+    /// (the tun logs "tun X connected to ngx ... over <transport>" on
+    /// success; if the auth fails the log captures the rejection).
+    ///
+    /// The tun uses its default transport selector (`auto`): it tries
+    /// QUIC first and falls back to the WebSocket/TCP transport.
     pub async fn start(ngx: &NgxProcess, name: &str, token: &str) -> Self {
+        Self::start_with_transport(ngx, name, token, "auto").await
+    }
+
+    /// Spawn `pangolin-tun` pinned to one transport.
+    ///
+    /// `transport` is `auto`, `quic` or `tcp`. A test that cannot pin
+    /// the transport cannot tell a QUIC session from a fallback
+    /// session that silently happened — so the QUIC tests pin `quic`
+    /// and the fallback tests pin `tcp`.
+    pub async fn start_with_transport(
+        ngx: &NgxProcess,
+        name: &str,
+        token: &str,
+        transport: &str,
+    ) -> Self {
         let bin = tun_binary();
         if !bin.exists() {
             panic!(
@@ -767,12 +817,14 @@ impl TunProcess {
 server: {server}
 name: {name}
 token: {token}
+transport: {transport}
 log:
   level: debug
 "#,
             server = server,
             name = name,
             token = token,
+            transport = transport,
         );
         let tmpdir = tempfile::tempdir().expect("tempdir for tun config");
         let config_path = tmpdir.path().join("tun.yml");
@@ -802,19 +854,16 @@ log:
         cmd.env_remove("no_proxy");
         let (child, log, log_tasks) = spawn_with_log_capture(cmd);
 
-        // Tun's own "yamux session live" log is the cleanest readiness
-        // signal — it fires AFTER the WS upgrade succeeded AND the
-        // yamux control session is open, which is exactly the
-        // moment the proxy side will start honouring
-        // `app.tun_sessions[name]`. Earlier we waited for
-        // "connected to ngx", which fires after the TCP/WS
+        // The tun's own "connected to ngx ... over <transport>" log is
+        // the cleanest readiness signal — it fires AFTER the
+        // transport session is up (the WebSocket upgrade succeeded, or
+        // the QUIC handshake and the AUTH control line both went
+        // through), which is exactly the moment the proxy side will
+        // start honouring `app.tun_sessions[name]`. Earlier we waited
+        // for "connected to ngx", which fires after the TCP/WS
         // handshake but before the yamux open-stream exchange —
         // on cold CI runners that gap is enough for the test's first
         // request to race ahead and hit "Tun <name> not online" (503).
-        //
-        // The "yamux session live" marker is emitted by the tun client
-        // after the control-stream handshake completes; see
-        // `crates/tun/src/client.rs::run_session`.
         //
         // 5s → 15s deadline: cold-cache CI runners routinely take 6-8s
         // to reach this state (DNS + cert verify + dynamic loader +
@@ -824,14 +873,14 @@ log:
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let log_s = String::from_utf8_lossy(&log.lock().unwrap()).into_owned();
-            if log_s.contains("yamux session live") {
+            if log_s.contains("connected to ngx") {
                 break;
             }
             // Legacy fallback for older tun builds that don't log the
-            // "yamux session live" marker. Keep this so a freshly-built
+            // "connected to ngx" marker. Keep this so a freshly-built
             // test crate running against an old `bin/pangolin-tun` still
             // finds the tun ready.
-            if log_s.contains("connected to ngx") && log_s.contains("WS upgrade ok") {
+            if log_s.contains("yamux session live") {
                 break;
             }
             // Detect early failure (e.g. auth rejection) by looking

@@ -75,13 +75,19 @@ matrix; only the transport and the schema-specific bits vary.
 | `X-Forwarded-Host` / `X-Forwarded-Proto` | **yes** | same | all three |
 | Static-file serving (`file://` backend) | **yes** | `pangolin-core::file_serve::serve_file_target` | `ngx` direct, `tun` local |
 | Backend URL parsing | **yes** | `pangolin-core::parse::parse_backend` (existing) | all three |
-| **HTTP/1.1 client to backend** | **yes** | `pingora-core` `Connector` + `HttpPeer` | `ngx` direct, `ngx` tunnel (via `tun`), `tun` local |
-| **WebSocket upgrade to backend** | **yes** | pingora's built-in upgrade path | `ngx` direct, `ngx` tunnel (via `tun`), `tun` local |
+| **HTTP/1.1 client to backend** | **yes** | `pingora-core` `Connector` + `HttpPeer` | `ngx` direct, `ngx` tunnel (via `tun`) |
+| **WebSocket upgrade to backend** | **yes** | pingora's built-in upgrade path | `ngx` direct, `ngx` tunnel (via `tun`) |
+| Static-file serving (`file://` backend) | **yes** | `pangolin-core::file_serve::serve_file_target` | `ngx` direct |
 
 **Shared layer** = one function, one trait, one HTTP client, one
 file-serve function. Each binary wires them up to its own
-*transport* (pingora server framework on `ngx`; yamux frame
-encoder/decoder on `ngx`; pingora client on `tun`).
+*transport* (pingora server framework on `ngx`; a tunnel byte
+stream on `ngx` and on `tun`).
+
+Since issue #153 the tunnel is a **splice**: the tun is a byte relay
+and no longer runs an HTTP client of its own, so the `tun` column
+disappeared from the table above. `ngx` serves every backend —
+direct or tunnelled — through pingora's own upstream path.
 
 ---
 
@@ -182,60 +188,61 @@ pub trait BackendExecutor: Send + Sync {
 }
 ```
 
-Three concrete implementations:
+Two concrete implementations:
 
 | Executor | Lives in | Talks to backend via |
 |---|---|---|
 | `PingoraServerExecutor` | `ngx` | pingora's server framework (delegates to `upstream_peer` + `upstream_request_filter`) |
-| `YamuxTunnelExecutor`   | `ngx` | Encodes a `TunnelHttpFrame` into a yamux stream; reads the response frame |
-| `PingoraClientExecutor` | `tun` | pingora-core's `Connector` + `HttpPeer` (HTTP/1.1 client) |
+| `TunnelConnector`        | `ngx` | A pingora `L4Connect` that opens a **tunnel byte stream** and writes the `CONNECT <host>:<port>` instruction on it (issue #153) |
 
 **`file://` backends do not go through this trait** — they call
 `serve_file_target` directly. Adding file-scheme support to the
 trait would conflate "make an HTTP request" with "read a file",
-which are not the same kind of operation.
+which are not the same kind of operation. A `file://` backend
+**over a tunnel** is refused (501): the tunnel relays bytes to a
+`host:port`, and there is no `host:port` for a local file.
 
-### 4.5 `TunnelHttpFrame` — the per-request yamux payload
+### 4.5 The tunnel — a byte splice (issue #153)
 
 ```rust
-// pangolin-core/src/proxy.rs
-pub struct TunnelHttpFrame {
-    pub request:     HttpRequest,   // method, target, headers, body
-    pub host_mode:   HostMode,      // per-request (NOT a site cache)
-    pub host_custom: Option<String>,
-    pub is_upgrade:  bool,          // WebSocket upgrade flag
-    pub is_streaming: bool,         // SSE / chunked streaming response
-    pub peer_ip:     Option<String>, // the TCP peer (appended to X-Forwarded-For)
-}
+// pangolin-core/src/tunnel.rs
+/// Wire-format version of the tunnel protocol.
+pub const TUNNEL_PROTOCOL_VERSION: u32 = 2;
 
-pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8>;
-pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame>;
+/// The instruction the gateway writes at the start of a stream.
+pub fn encode_connect(host: &str, port: u16) -> Vec<u8>;
+pub fn decode_connect(line: &[u8]) -> IoResult<(String, u16)>;
+
+/// The tun's answer: `OK` or `ERR <reason>`.
+pub fn encode_connect_reply(result: Result<(), &str>) -> Vec<u8>;
+pub fn decode_connect_reply(line: &[u8]) -> IoResult<Result<(), String>>;
 
 /// Heuristic: returns true if the request expects a streaming
 /// response (matches `text/event-stream` in Accept or Content-Type).
-/// Used by ngx to flip `is_streaming = true` on the frame.
 pub fn is_streaming_request(request: &HttpRequest) -> bool;
 ```
 
 Wire layout:
 
 ```
-┌──────────────┬──────────┬─────────────────────────────┐
-│ host_mode    │ custom?  │ host_custom bytes (optional)│
-│ (1 byte)     │ (1 byte) │ (2 bytes BE len + UTF-8)    │
-└──────────────┴──────────┴─────────────────────────────┘
-┌──────────────────────────────────────────────────────────┐
-│ encode_http_request(&frame.request) bytes                │
-│ (method target version \r\n headers \r\n \r\n body)      │
-└──────────────────────────────────────────────────────────┘
+gateway → tun:  CONNECT <host>:<port>\r\n
+tun → gateway:  OK\r\n          (or)   ERR <reason>\r\n
+<raw bytes in both directions>
 ```
 
+The request is **not** re-serialised: `ngx`'s pingora writes the
+client's request bytes into the tunnel stream and reads the
+backend's bytes out of it. The proxy policy (the `Host` rewrite,
+the `X-Forwarded-*` family) is applied once, on the gateway, in
+`upstream_request_filter` — so a tunneled request carries the same
+headers a direct one does.
+
 `tun` is **stateless**: it never caches `host_mode`, `host_custom`,
-`backend_url`, or anything else. Every frame carries its own
-routing context. There is no reload protocol, no config sync, no
-list of "domains I serve." If `ngx` mutates a site, the next
-request from that client picks up the change without any tun-side
-state to invalidate.
+`backend_url`, or anything else. Every stream carries its own
+routing context — the `CONNECT` instruction. There is no reload
+protocol, no config sync, no list of "domains I serve." If `ngx`
+mutates a site, the next request from that client picks up the
+change without any tun-side state to invalidate.
 
 ---
 
@@ -264,18 +271,19 @@ state to invalidate.
         ┌─────────┼─────────────┐    │
         │         │             │    │
    direct      tunnel       file://    │
-   pingora     yamux       local fs    │
-   server      (frame)     (serve_file)│
+   pingora     byte        local fs    │
+   server      splice      (serve_file)│
         │         │             │      │
         ▼         ▼             ▼      ▼
-  upstream_peer YamuxTunnelExecutor  serve_file_target
-  + upstream_   ::execute_http       (no trait, just
-  request_filter                      a function call)
+  upstream_peer TunnelConnector    serve_file_target
+  + upstream_   (custom_l4,          (no trait, just
+  request_filter opens a tunnel       a function call)
+                 stream)
 ```
 
 The `request_filter` does the routing; it does **not** call
-`apply_proxy_policy` itself in the tunnel branch — it bakes the
-`ProxyCtx` into the frame and lets `tun` apply the policy. In the
+`apply_proxy_policy` itself — `upstream_request_filter` does, for
+every backend, direct or tunnelled (issue #153). In the
 direct branch, the existing `upstream_request_filter` hook
 (replicated in shared form) calls `apply_proxy_policy` because
 pingora owns the request-header buffer at that point.
@@ -320,14 +328,14 @@ the transports are different.
    is_upgrade=true     is_streaming=true     http/https | file
         │                   │                   │
         ▼                   ▼                   ▼
-  handle_ws_upgrade   handle_streaming_     same executor
-  (TCP + manual WS     response             (pingora supports
-   handshake +         (TCP + plain HTTP    upgrade natively;
-   pump_ws_relay)       request +            is_upgrade=true)
-        │               copy_bidirectional)       │
+  pingora's own      pingora's own        same executor
+  upgrade path       streaming path       (pingora supports
+  (the 101 and the    (the response is     upgrade natively;
+   frames ride the     relayed as it       is_upgrade=true)
+   tunnel stream)      arrives)
         │                   │                   │
         ▼                   ▼                   ▼
-  bytes ↔ yamux       bytes ↔ yamux       HttpResponse
+  bytes ↔ tunnel      bytes ↔ tunnel      HttpResponse
   stream ↔ backend    stream ↔ backend    (buffered)
   TCP socket          TCP socket          (in-memory)
 ```
@@ -438,25 +446,24 @@ a *bare path* into the yamux stream (`format!("/{}", path)`),
 `tun` re-parsed it, and manually drove a TCP+WS handshake to the
 backend. `host_mode` was not applied.
 
-Post-refactor:
+Post-refactor (and again after issue #153, which turned the tunnel
+into a byte splice):
 
-1. `ngx`'s WS-upgrade branch builds a `TunnelHttpFrame` exactly
-   like the HTTP branch, but with `is_upgrade: true`. The full
-   `HttpRequest` (including `Upgrade`, `Connection`,
-   `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) is encoded.
-2. `tun` decodes the frame, calls `apply_proxy_policy`, then
-   dispatches on `is_upgrade`. For an upgrade, it calls
-   `PingoraClientExecutor::execute_http`, which uses
-   `HttpSession::write_request_header` + `write_request_body` +
-   `read_response_header`. pingora's `was_upgraded()` returns
-   `true` on a 101, and from then on the executor takes the
-   underlying stream out of `HttpSession` and pumps it
-   bidirectionally with the yamux side via `pump_ws_relay`.
+1. `ngx` sends the request through its **normal** upstream path —
+   the same `upstream_peer` / `upstream_request_filter` pair every
+   other backend uses. For a tun backend the peer carries a
+   `custom_l4` connector, so pingora writes the request bytes
+   (including `Upgrade`, `Connection`, `Sec-WebSocket-Key`,
+   `Sec-WebSocket-Version`) into a tunnel byte stream.
+2. pingora's HTTP client performs the upgrade against the backend
+   over that stream: `was_upgraded()` returns `true` on a 101, and
+   from then on the session hands the stream over and pumps it
+   bidirectionally with the peer over the tunnel stream.
 
-This closes [tunnel.md "gap #6" (frame-level duplex over
-msgpack)](tunnel.md) for the HTTP-upgrade case, with pingora
-doing the heavy lifting (we just hook the upgrade outcome and
-hand the stream off).
+Since issue #153 the tunnel is a byte splice, so the upgrade needs
+no special handling on either side: pingora does the heavy lifting
+(it hooks the upgrade outcome and hands the stream off) and the tun
+copies the bytes without knowing what they are.
 
 ---
 
@@ -474,7 +481,7 @@ These are the testable contracts. Each row gets a unit test in
 | I-4  | `host_mode = Passthrough` leaves Host unchanged | `apply_proxy_policy_passthrough_leaves_host` |
 | I-5  | All hop-by-hop headers are stripped | `apply_proxy_policy_strips_hop_by_hop` |
 | I-6  | `parse_backend_to_target` round-trips every `parse_backend` case | `parse_backend_to_target_roundtrips` |
-| I-7  | `TunnelHttpFrame` encode → decode round-trips | `tunnel_frame_roundtrip` |
+| I-7  | The `CONNECT <host>:<port>` instruction round-trips, and the tun's `OK` / `ERR` reply decodes | `connect_instruction_roundtrips`, `connect_reply_roundtrips` (in `pangolin-core`) |
 | I-8  | `serve_file_target` rejects `..` segments | `serve_file_rejects_traversal` |
 | I-9  | `serve_file_target` rejects hidden files | `serve_file_rejects_hidden` |
 | I-10 | `serve_file_target` returns 404 on missing | `serve_file_404_on_missing` |
@@ -508,18 +515,15 @@ These are the testable contracts. Each row gets a unit test in
                 │   - ProxyCtx, BackendTarget                │
                 │   - apply_proxy_policy                     │
                 │   - parse_backend_to_target                │
-                │   - TunnelHttpFrame + encode/decode         │
-                │   - BackendExecutor trait                  │
                 │                                            │
                 │  file_serve.rs                             │
                 │   - serve_file_target (1 impl, both sides) │
                 │                                            │
-                │  tunnel.rs (existing)                      │
+                │  tunnel.rs                                 │
                 │   - HttpRequest, HttpResponse              │
-                │   - encode_http_request/response            │
-                │   - read_http_request/response              │
-                │   - strip_hop_by_hop_headers                │
-                │   - pump_ws_relay                          │
+                │   - TunnelTransport + CONNECT instruction  │
+                │   - relay_bidirectional (half-close)       │
+                │   - quic.rs / pin.rs (QUIC + TOFU trust)   │
                 │                                            │
                 │  parse.rs (existing)                       │
                 │   - parse_backend                          │
@@ -528,25 +532,25 @@ These are the testable contracts. Each row gets a unit test in
               ┌────────────────┴────────────────┐
               │                                 │
        ┌──────▼──────┐                   ┌───────▼─────┐
-       │    ngx      │                   │     tun     │
+       │ Pingora     │                   │ Byte relay  │
+       │ Server      │                   │ (reads the  │
+       │ (server     │                   │  CONNECT    │
+       │ framework)  │                   │  line,      │
+       │             │                   │  dials the  │
+       │ Tunnel      │                   │  target,    │
+       │ Connector   │                   │  copies     │
+       │ (custom_l4) │                   │  bytes)     │
        │             │                   │             │
-       │ Pingora     │                   │ Pingora     │
-       │ Server      │                   │ Client      │
-       │ Executor    │                   │ Executor    │
-       │ (server     │                   │ (HttpClient │
-       │ framework)  │                   │  Pool +     │
-       │             │                   │  Connector) │
-       │ YamuxTunnel │                   │             │
-       │ Executor    │                   │ (no site    │
-       │ (frame      │                   │  cache,     │
-       │  codec)     │                   │  no DB,     │
+       │             │                   │ (no site    │
+       │             │                   │  cache,     │
+       │             │                   │  no DB,     │
        │             │                   │  stateless) │
        └──────┬──────┘                   └──────┬──────┘
               │                                 │
-              │  TunnelHttpFrame over yamux     │
+              │      raw bytes over the tunnel    │
+              │      (QUIC, or yamux over WS)     │
               └────────────────┬────────────────┘
                                │
-                            (WS)
 ```
 
 ---
@@ -565,8 +569,10 @@ To keep the scope tight:
   [tunnel.md](tunnel.md) (issue #39).
 - **No `TunnelMode::TcpRaw` / raw-TCP passthrough.** That
   remains a future gap.
-- **No application-layer encryption** on the yamux channel
-  ([tunnel.md](tunnel.md) gap #7).
+- **No application-layer encryption** on the WebSocket/TCP
+  transport. The QUIC transport (the primary one since issue #153)
+  is encrypted by the protocol itself — see
+  [tunnel.md](tunnel.md).
 - **No changes to admin UI, ACME, cert management, DNS
   providers.** Out of scope.
 - **No stripping of Cloudflare's own headers.** The `P-*` gateway
@@ -605,14 +611,14 @@ To keep the scope tight:
 
 | File | Status | Summary |
 |---|---|---|
-| `crates/pangolin-core/src/proxy.rs` | **new** | `ProxyCtx`, `BackendTarget`, `apply_proxy_policy`, `parse_backend_to_target`, `TunnelHttpFrame` + codec, `BackendExecutor` trait, `ProxyError` |
+| `crates/pangolin-core/src/proxy.rs` | **new** | `ProxyCtx`, `BackendTarget`, `apply_proxy_policy`, `parse_backend_to_target` |
 | `crates/pangolin-core/src/file_serve.rs` | **new** | `serve_file_target` (lifted 1:1 from `ngx` `serve_static_file`) |
 | `crates/pangolin-core/src/lib.rs` | edit | add `pub mod proxy; pub mod file_serve;` + re-exports |
-| `crates/ngx/src/proxy.rs` | **rewrite** | `request_filter` routes + dispatches to executor; `upstream_request_filter` calls `apply_proxy_policy`; `serve_static_file` removed (replaced by `serve_file_target`); new `PingoraServerExecutor` + `YamuxTunnelExecutor` |
+| `crates/ngx/src/proxy.rs` | **rewrite** | `request_filter` routes; `upstream_peer` returns either a direct peer or a **tunnel peer** (a `custom_l4` connector); `upstream_request_filter` calls `apply_proxy_policy` for every backend; `serve_static_file` removed (replaced by `serve_file_target`) |
 | `crates/ngx/src/tunnel.rs` | unchanged | handshake/auth logic stays |
 | `crates/ngx/Cargo.toml` | unchanged | `pangolin-core` is already a dependency |
-| `crates/tun/src/client.rs` | **rewrite** | `handle_http_stream` decodes `TunnelHttpFrame`, calls `apply_proxy_policy`, dispatches; `handle_ws_stream` uses the same path with `is_upgrade=true`; new `PingoraClientExecutor` + `HttpClientPool`; `proxy_via_reqwest` and `serve_static_file` removed |
-| `crates/tun/Cargo.toml` | edit | drop `reqwest`, `rustls`, `webpki-roots`; add `pingora-core` with `rustls` feature |
+| `crates/tun/src/client.rs` | **rewrite** | The tun is a **byte relay** (issue #153): it reads the `CONNECT <host>:<port>` instruction, dials the target, answers `OK` / `ERR` and copies the bytes. The `pingora-core` / `pingora-http` dependencies are gone — the tun no longer speaks HTTP. |
+| `crates/tun/Cargo.toml` | edit | drop `pingora-core` / `pingora-http` (issue #153: the tun no longer speaks HTTP) |
 | `tests/src/real_e2e.rs` | **extend** | new cases per invariant table (§10) |
 | `tests/src/ws_relay_e2e.rs` | **extend** | new WS-upgrade-through-tunnel cases |
 | `crates/pangolin-core/src/tunnel.rs` | unchanged | existing wire types and codec stay |

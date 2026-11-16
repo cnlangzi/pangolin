@@ -1224,18 +1224,23 @@ async fn real_e2e_h2_direct_backend_keeps_h2() {
 }
 
 ///
-/// Regression test for the static-file path through the tunnel.
-/// With the new `tun::client::proxy_request` accepting `file:///`
-/// URLs (in addition to `http://`/`https://`), a site configured
-/// with `office:file:///tmp/somedir` must be served correctly when
-/// the request goes through the tun.
+/// **Issue #153 — a `file://` backend over a tunnel is refused.**
 ///
-/// Verifies:
-///   - The tun decodes the `file:///` URL from the request frame
-///   - It reads the local file and returns 200 with the body
-///   - The body is returned to the client through the response frame
+/// Before issue #153 the tunnel carried a frame protocol, so the tun
+/// could be asked to serve a local file: the frame carried the
+/// `file://` target and the tun answered with the file's bytes.
+///
+/// The tunnel is a **splice** now: the gateway's pingora writes the
+/// client's request bytes into a tunnel stream and the tun copies
+/// them to a backend it dials by `host:port`. There is no
+/// `host:port` for a local file, and the tun no longer speaks HTTP,
+/// so it cannot synthesise an HTTP response for one either.
+///
+/// The gateway therefore refuses a tunnelled `file://` backend with a
+/// 501 and a log line. The **direct** `file://` path is unchanged —
+/// `real_e2e_static_file` still covers it.
 #[tokio::test]
-async fn real_e2e_tunnel_file_backend() {
+async fn real_e2e_tunnel_file_backend_is_refused() {
     // Build a temp directory holding a single file we want the
     // tun to serve. The path passed to seed_site must be the
     // **absolute** path (file:/// requires absolute).
@@ -1259,23 +1264,19 @@ async fn real_e2e_tunnel_file_backend() {
     let _tun = TunProcess::start(&ngx, "office", "test-token").await;
 
     let addr = format!("127.0.0.1:{}", ngx.http_port);
-    // Use POST with a body so the proxy's `read_body_or_idle`
-    // path completes immediately (the GET-without-body case is a
-    // separate `read_body_or_idle(false)` behavior that's still
-    // being investigated). What we're testing here is the
-    // file:// backend through the tunnel — the body is irrelevant
-    // for that, we just need the path to flow through the tun.
-    let (status, body) = raw_request(&addr, "file.test", "POST", "/index.html", b"x").await;
+    // The tunnel relays bytes to a host:port — there is nothing to
+    // dial for a local file, so the gateway refuses the backend
+    // instead of hanging or answering with something misleading.
+    let (status, _body) = raw_request(&addr, "file.test", "GET", "/index.html", b"").await;
     assert_eq!(
         status,
-        200,
-        "expected 200 for tunnel-served file, got {status} (body={body:?}). \
-         ngx log:\n{}",
+        501,
+        "a tunnelled file:// backend must be refused with 501. ngx log:\n{}",
         ngx.log_string()
     );
     assert!(
-        body.contains("tunnel-served-static-file"),
-        "expected file body, got: {body} (ngx log: {})",
+        ngx.log_string().contains("refused a file:// backend"),
+        "the gateway must log the refusal, got:\n{}",
         ngx.log_string()
     );
 }
@@ -2289,10 +2290,10 @@ async fn real_e2e_proxy_propagates_backend_error_codes() {
 /// Implementation note: the `X-Forwarded-*` injection lives in
 /// `pangolin_core::apply_proxy_policy` so the direct path
 /// (ngx → upstream TCP) and the tunnel path (ngx → tun →
-///
 /// upstream) are both covered. The TCP peer is detected
-/// from `session.client_addr()` on the ngx side and shipped
-/// to the tun inside the `TunnelHttpFrame`.
+/// from `session.client_addr()` on the ngx side and added to the
+/// upstream request on the gateway — since issue #153 the tun
+/// forwards the bytes unchanged.
 #[tokio::test]
 async fn real_e2e_proxy_adds_x_forwarded_for() {
     let backend = InspectingBackend::start().await;

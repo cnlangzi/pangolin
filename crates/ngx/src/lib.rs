@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod runtime;
 pub mod serve;
 pub mod sse;
+pub mod tunnel;
 
 // Re-export shared types so they are accessible as `crate::App` etc.
 pub use pangolin_core::{App, CertManager, TunnelMessage};

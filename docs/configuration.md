@@ -87,12 +87,31 @@ because they apply to the whole file, not just one section.
 | `host`        | `string \| null` | `null`      | no       | Per-domain cert resolution. `null` → virtual host `"default"`, which looks up certs at `./certs/default/`. Unrelated to `[addr]` — `host` selects the SNI fallback, not the bind address. |
 | `workers`     | `usize \| null` | `null`       | no       | `pingora` worker count. `null` → auto = number of CPU cores. |
 
-### `[tunnel]` — WebSocket endpoint for tun clients
+### `[tunnel]` — tunnel endpoint for tun clients
+
+The tunnel has **two** transports: QUIC (the primary one) and
+WebSocket over TCP (the fallback for networks where UDP is blocked).
+Both listen on the **same port number** — `tunnel.addr` — because TCP
+and UDP have separate port spaces. So no new configuration key is
+needed for QUIC, and a firewall rule that opens the TCP port should
+open the UDP port too.
 
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
-| `tunnel.addr` | `string` | `0.0.0.0:9001` | no | Full `host:port` string for the tun WebSocket listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **The tun client's `tun.yml: server:` field must resolve to this listener** — if `addr` is `0.0.0.0:9001`, use the gateway's public hostname or IP + port 9001 in `server`. |
+| `tunnel.addr` | `string` | `0.0.0.0:9001` | no | Full `host:port` string for the tun listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **The tun client's `tun.yml: server:` field must resolve to this listener** — if `addr` is `0.0.0.0:9001`, use the gateway's public hostname or IP + port 9001 in `server`. The port is used for **both** TCP (WebSocket fallback) and UDP (QUIC); a failure to bind the UDP port is logged as a warning and the gateway keeps serving the WebSocket/TCP tunnel. |
 | `ws_path`   | `string` | `/tunnel`        | no       | WebSocket path on the listen port. Change it if you proxy the WS port through another path-aware reverse proxy. |
+
+The gateway generates a self-signed certificate for its QUIC endpoint
+on first start and stores it under `{acme.cert_dir}/tunnel/`, so a
+restart does not change it. Its SHA-256 fingerprint is logged at
+startup:
+
+```
+tunnel: QUIC certificate fingerprint 3f2a… (/etc/pangolin/certs/tunnel)
+```
+
+The tun pins that fingerprint on first contact (trust on first use).
+See [`design/tunnel.md`](design/tunnel.md#the-quic-certificate-and-the-tuns-trust-in-it).
 
 ### `[admin]` — admin UI / API
 
@@ -449,6 +468,17 @@ time and refuses to start on any violation.
 | `server`   | `string` | —       | **yes**  | Non-empty. Format `host:port` (or `ip:port`); the `port` must match `tunnel.port` in `ngx.yml`. |
 | `token`    | `string` | —       | **yes**  | Non-empty. Matched against `tun.token` in the gateway's `tun` table (the v2 schema has no separate `tokens` table). Write the real token directly in this file, or override at runtime with `TUN_TOKEN=…` (see "Environment variable override" above). |
 | `name`     | `string` | —       | **yes**  | `^[a-z0-9_-]+$`, 1–32 chars, **not purely numeric**. The name is the tun's primary key on the ngx side; the validator refuses to start if the name collides with another online tun or violates the rule. |
+| `transport` | `string` | `auto`  | no       | `auto`, `quic` or `tcp`. `auto` (the default) tries QUIC first with a five-second handshake timeout and falls back to the WebSocket/TCP transport; after a failed QUIC attempt it does not probe QUIC again for ten minutes. `quic` and `tcp` pin the tun to one transport. Override at runtime with `TUN_TRANSPORT=quic`. |
+
+### State files next to `tun.yml`
+
+The tun writes two files next to its configuration file. They are
+state, not configuration — do not edit them by hand except to re-pin.
+
+| File | Written by | Purpose |
+| ---- | ---------- | ------- |
+| `tun.pins` | the tun | The SHA-256 fingerprints of the gateway certificates this tun trusts, one per line. The first successful QUIC connection pins the certificate it presented; a later connection that presents a different fingerprint is refused. Delete a line to stop trusting that gateway, add a line to trust another one. |
+| `tun.quic-fail` | the tun | The Unix timestamp of the last failed QUIC attempt. The tun skips the QUIC probe for ten minutes after a failure, so a network that blocks UDP does not pay the handshake timeout on every reconnect. |
 
 ### `[log]`
 

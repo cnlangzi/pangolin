@@ -67,7 +67,7 @@ pub use provider::{
     RangeUrl, SiteProviderConfig, SiteProviderOverride, spec,
 };
 pub use proxy::{
-    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy,
+    BackendTarget, ProxyCtx, Scheme, apply_proxy_policy,
     apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_request, parse_backend_to_target,
     serve_file_target,
 };
@@ -88,7 +88,9 @@ pub use traffic::{
     classify_route, normalize_path,
 };
 pub use tunnel::{
-    TunnelRole, YamuxTunnel, decode_http_response, encode_http_response, parse_http_request_bytes,
+    TUNNEL_PROTOCOL_VERSION, TransportKind, TunnelByteStream, TunnelRole, TunnelStream,
+    TunnelTransport, YamuxTunnel, decode_auth, decode_connect, decode_connect_reply, encode_auth,
+    encode_connect, encode_connect_reply, protocol_version_mismatch,
 };
 pub use types::{
     BackendKind, BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus,

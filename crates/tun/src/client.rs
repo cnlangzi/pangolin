@@ -1,78 +1,129 @@
-//! Pangolin tunnel node (tun) — yamux-over-fastwebsockets client.
+//! Pangolin tunnel node (tun) — a **byte relay**.
 //!
-//! ## Architecture (v8 — see `docs/design/reverse-proxy.md`)
+//! ## Architecture (issue #153 — the tunnel is a splice)
 //!
-//! Each yamux stream carries a [`TunnelHttpFrame`] from ngx
-//! (see `pangolin-core::proxy`). The frame contains:
-//!   - the raw `HttpRequest`
-//!   - per-request `host_mode` and `host_custom`
-//!   - `is_upgrade` flag (WebSocket upgrade)
-//!   - `is_streaming` flag (SSE / chunked streaming response)
+//! The gateway's pingora writes the client's request bytes into a
+//! tunnel stream and reads the backend's bytes out of it. The tun's
+//! job is therefore tiny:
 //!
-//! The tun applies `apply_proxy_policy` (pangolin-core) and
-//! dispatches based on the frame flags + backend scheme:
-//!   - `file://` → `serve_file_target` (pangolin-core)
-//!   - `http/https` → `PingoraClientExecutor` (this file)
-//!   - WS upgrade → `handle_ws_upgrade` (TCP + manual WS handshake + `pump_ws_relay`)
-//!   - streaming → `handle_streaming_response` (TCP + plain HTTP request + `copy_bidirectional`)
+//! 1. read the `CONNECT <host>:<port>` instruction;
+//! 2. resolve the host **in the operator's own network** and dial it;
+//! 3. answer `OK` (or `ERR <reason>`);
+//! 4. copy bytes in both directions until both sides are done.
 //!
-//! See `docs/design/tunnel.md` "SSE / streaming-response support"
-//! for why this mirrors the WS relay instead of using the
-//! buffered `HttpResponse` path.
+//! The tun does not speak HTTP. It never parses a request, never
+//! builds one and never buffers a response — which is why SSE,
+//! WebSocket upgrades and any other protocol feature the gateway
+//! owns work over the tunnel without a counterpart on this side.
 //!
-//! There is **no reqwest** on this side: the v8 design uses
-//! pingora-core for the HTTP client so behavior matches the
-//! ngx side (single HTTP stack end-to-end).
+//! ## Transports
+//!
+//! Two transports implement the same interface
+//! (`pangolin_core::tunnel::TunnelTransport`):
+//!
+//! * **QUIC** (primary) — one connection per tun, one bidirectional
+//!   stream per request. Encrypted by default. The tun authenticates
+//!   on a control stream right after the handshake.
+//! * **WebSocket over TCP** (fallback) — the pre-#153 transport, kept
+//!   for networks where UDP is blocked.
+//!
+//! The transport is chosen **once per session**. At the start of a
+//! session the tun attempts QUIC with a five-second handshake
+//! timeout; on failure it falls back to the WebSocket/TCP transport
+//! and stays on it for the rest of the session. It records the time of
+//! the failure and does not probe QUIC again for ten minutes, so a
+//! network that blocks UDP does not pay the timeout on every
+//! reconnect.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use log::{debug, info, warn};
 
+use pangolin_core::tunnel::WsRole;
+use pangolin_core::tunnel::pin::PinStore;
+use pangolin_core::tunnel::quic::QuicClientTransport;
 use pangolin_core::tunnel::{
-    HttpRequest, HttpResponse, TunnelRole, WsRole, YamuxTunnel, build_ws_upgrade_request,
-    encode_http_response, pump_ws_relay, read_ws_accept_response, tunnel_over_websocket,
-};
-use pangolin_core::types::HostMode;
-use pangolin_core::{
-    BackendTarget, ProxyCtx, Scheme, TunnelHttpFrame, apply_proxy_policy, serve_file_target,
+    TUNNEL_PROTOCOL_VERSION, TUNNEL_VERSION_HEADER, TunnelRole, TunnelStream, TunnelTransport,
+    build_ws_upgrade_request, decode_auth_reply, decode_connect, encode_auth, encode_connect_reply,
+    read_crlf_line, read_ws_accept_response, relay_bidirectional, tunnel_over_websocket,
 };
 
 use fastwebsockets::WebSocket;
-use pingora_core::connectors::http::Connector;
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_http::RequestHeader;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 
-use crate::config::TunConfig;
+use crate::config::{TransportSelector, TunConfig};
+
+/// How long the tun waits for the QUIC handshake before it gives up
+/// and falls back to the WebSocket/TCP transport.
+///
+/// A network that silently drops UDP (no ICMP) never produces an
+/// error — the timeout is what saves the connection, so it has to be
+/// short enough to keep the fallback responsive and long enough for a
+/// slow link to complete the handshake.
+pub const QUIC_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+
+/// How long the tun skips the QUIC probe after a failed attempt.
+///
+/// Without this, every reconnect in a UDP-blocked network would pay
+/// the handshake timeout again.
+pub const QUIC_PROBE_SKIP_SECS: i64 = 600;
+
+/// Largest connection instruction the tun accepts.
+const MAX_INSTRUCTION_LEN: usize = 4096;
+
+/// How long the tun waits for the gateway's answer to its `AUTH`
+/// line.
+///
+/// A gateway that accepts the QUIC connection but never answers would
+/// otherwise hang the tun's session forever.
+const AUTH_REPLY_TIMEOUT_SECS: u64 = 10;
 
 // ─────────────────────────────────────────────────────────────────
 //  WS handshake helpers (kept from the original file — used by
-//  the connect path, not by the per-frame dispatch).
+//  the connect path, not by the per-stream dispatch).
 // ─────────────────────────────────────────────────────────────────
 
 /// Outcome of a single connect + session cycle.
 enum SessionOutcome {
-    EstablishedAndEnded(Result<()>),
-    NeverConnected(anyhow::Error),
+    /// The session was established and ended cleanly.
+    Ended,
+    /// The session was established and ended with an error.
+    Errored(String),
+    /// The session could not be established at all.
+    NotConnected(String),
 }
 
 pub struct TunnelClient {
     config: TunConfig,
+    /// The trust-on-first-use pin file — next to the configuration.
+    pin_path: PathBuf,
+    /// The record of the last failed QUIC attempt — next to the
+    /// configuration, so it survives a restart.
+    quic_failure_path: PathBuf,
 }
 
 impl TunnelClient {
-    pub fn new(config: TunConfig) -> Self {
-        Self { config }
+    /// Build the client. `config_path` is the path of the tun's
+    /// configuration file; the pin file and the QUIC-failure record
+    /// live next to it.
+    pub fn new(config: TunConfig, config_path: &std::path::Path) -> Self {
+        Self {
+            pin_path: TunConfig::pin_path(config_path),
+            quic_failure_path: TunConfig::quic_failure_path(config_path),
+            config,
+        }
     }
 
     pub async fn run(&self) {
         info!(
-            "tun {} starting, target {}",
-            self.config.name, self.config.server
+            "tun {} starting, target {} (transport: {})",
+            self.config.name, self.config.server, self.config.transport
         );
 
         const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -84,18 +135,18 @@ impl TunnelClient {
         loop {
             let session_outcome = self.connect_and_handle().await;
             match session_outcome {
-                SessionOutcome::EstablishedAndEnded(Ok(())) => {
+                SessionOutcome::Ended => {
                     info!("tun {} disconnected, will reconnect", self.config.name);
                     backoff_secs = INITIAL_BACKOFF_SECS;
                 }
-                SessionOutcome::EstablishedAndEnded(Err(e)) => {
+                SessionOutcome::Errored(e) => {
                     warn!(
                         "tun {} session errored ({}), will reconnect",
                         self.config.name, e
                     );
                     backoff_secs = INITIAL_BACKOFF_SECS;
                 }
-                SessionOutcome::NeverConnected(e) => {
+                SessionOutcome::NotConnected(e) => {
                     log::error!(
                         "tun {} connect error: {}, reconnecting in {}s",
                         self.config.name,
@@ -115,42 +166,144 @@ impl TunnelClient {
         }
     }
 
+    /// Establish one session and serve it until it ends.
     async fn connect_and_handle(&self) -> SessionOutcome {
-        let tcp = match TcpStream::connect(&self.config.server).await {
-            Ok(s) => s,
-            Err(e) => {
-                return SessionOutcome::NeverConnected(anyhow::anyhow!(
-                    "tcp connect to {}: {}",
-                    self.config.server,
-                    e
-                ));
+        let transport = match self.config.transport {
+            TransportSelector::Tcp => match self.connect_tcp().await {
+                Ok(t) => t,
+                Err(e) => return SessionOutcome::NotConnected(e),
+            },
+            TransportSelector::Quic => match self.connect_quic().await {
+                Ok(t) => t,
+                Err(e) => return SessionOutcome::NotConnected(e),
+            },
+            TransportSelector::Auto => {
+                if self.quic_recently_failed() {
+                    info!(
+                        "tun {}: skipping the QUIC probe (the last attempt failed less than {}s ago)",
+                        self.config.name, QUIC_PROBE_SKIP_SECS
+                    );
+                    match self.connect_tcp().await {
+                        Ok(t) => t,
+                        Err(e) => return SessionOutcome::NotConnected(e),
+                    }
+                } else {
+                    match self.connect_quic().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(
+                                "tun {}: the QUIC attempt failed ({}); falling back to the \
+                                 WebSocket/TCP transport",
+                                self.config.name, e
+                            );
+                            self.record_quic_failure();
+                            match self.connect_tcp().await {
+                                Ok(t) => t,
+                                Err(e) => return SessionOutcome::NotConnected(e),
+                            }
+                        }
+                    }
+                }
             }
         };
-        info!(
-            "tun {} connected to ngx {}, starting WS upgrade",
-            self.config.name, self.config.server
-        );
-        match self.handshake_and_serve(tcp).await {
-            Ok(()) => SessionOutcome::EstablishedAndEnded(Ok(())),
-            Err(e) => SessionOutcome::EstablishedAndEnded(Err(e)),
+
+        match serve_tun_session(&self.config, transport).await {
+            Ok(()) => SessionOutcome::Ended,
+            Err(e) => SessionOutcome::Errored(e.to_string()),
         }
     }
 
-    /// Perform the WebSocket upgrade against the connected TCP
-    /// stream, hand the resulting WebSocket to a `YamuxTunnel`,
-    /// and run the per-stream dispatcher until the tunnel ends.
-    async fn handshake_and_serve(&self, tcp: TcpStream) -> Result<()> {
+    /// Connect over QUIC and authenticate on a control stream.
+    async fn connect_quic(&self) -> Result<Arc<dyn TunnelTransport>, String> {
+        let (addr, server_name) = resolve_server(&self.config.server).await?;
+        let pins = PinStore::open(&self.pin_path).map_err(|e| e.to_string())?;
+
+        let (transport, _pinned) = tokio::time::timeout(
+            Duration::from_secs(QUIC_HANDSHAKE_TIMEOUT_SECS),
+            QuicClientTransport::connect(addr, &server_name, &pins),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "the QUIC handshake to {} timed out after {QUIC_HANDSHAKE_TIMEOUT_SECS}s",
+                self.config.server
+            )
+        })?
+        .map_err(|e| e.to_string())?;
+
+        // QUIC has no upgrade request to carry the token in, so the
+        // tun opens a control stream and authenticates there.
+        let mut control = transport
+            .open_stream()
+            .await
+            .map_err(|e| format!("open the QUIC control stream: {e}"))?;
+        control
+            .write_all(&encode_auth(
+                &self.config.token,
+                &self.config.name,
+                TUNNEL_PROTOCOL_VERSION,
+            ))
+            .await
+            .map_err(|e| format!("write the AUTH line: {e}"))?;
+        control
+            .flush()
+            .await
+            .map_err(|e| format!("flush the AUTH line: {e}"))?;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(AUTH_REPLY_TIMEOUT_SECS),
+            read_crlf_line(&mut control, MAX_INSTRUCTION_LEN),
+        )
+        .await
+        .map_err(|_| {
+            format!("the gateway did not answer the AUTH line within {AUTH_REPLY_TIMEOUT_SECS}s")
+        })?
+        .map_err(|e| format!("read the AUTH reply: {e}"))?;
+        match decode_auth_reply(reply.as_bytes()).map_err(|e| e.to_string())? {
+            Ok(version) => {
+                if version != TUNNEL_PROTOCOL_VERSION {
+                    return Err(pangolin_core::tunnel::protocol_version_mismatch(
+                        TUNNEL_PROTOCOL_VERSION,
+                        version,
+                    ));
+                }
+            }
+            Err(reason) => return Err(format!("the gateway refused the tun: {reason}")),
+        }
+
+        info!(
+            "tun {} connected to ngx {} over quic",
+            self.config.name, self.config.server
+        );
+        Ok(Arc::new(transport))
+    }
+
+    /// Connect over the WebSocket/TCP fallback transport.
+    async fn connect_tcp(&self) -> Result<Arc<dyn TunnelTransport>, String> {
+        let tcp = TcpStream::connect(&self.config.server)
+            .await
+            .map_err(|e| format!("tcp connect to {}: {e}", self.config.server))?;
         let (mut tcp_read, mut tcp_write) = tcp.into_split();
         let path = format!("/tunnel?name={}", self.config.name);
         let host = &self.config.server;
-        // The registration handshake carries no client context, so
-        // it adds no extra headers — the bytes are identical to
-        // what this builder produced before the gateway-header
-        // contract existed.
-        let (req_bytes, key) = build_ws_upgrade_request(&path, host, &self.config.token, &[]);
-        tcp_write.write_all(&req_bytes).await?;
-        tcp_write.flush().await?;
-        read_ws_accept_response(&mut tcp_read, &key).await?;
+        // The protocol version rides in the upgrade request — it is
+        // the only handshake the TCP fallback has.
+        let extra_headers = vec![(
+            TUNNEL_VERSION_HEADER.to_string(),
+            TUNNEL_PROTOCOL_VERSION.to_string(),
+        )];
+        let (req_bytes, key) =
+            build_ws_upgrade_request(&path, host, &self.config.token, &extra_headers);
+        tcp_write
+            .write_all(&req_bytes)
+            .await
+            .map_err(|e| format!("write the upgrade request: {e}"))?;
+        tcp_write
+            .flush()
+            .await
+            .map_err(|e| format!("flush the upgrade request: {e}"))?;
+        read_ws_accept_response(&mut tcp_read, &key)
+            .await
+            .map_err(|e| format!("the gateway refused the upgrade: {e}"))?;
         let ws = WebSocket::after_handshake(
             OwnedTcpHalf {
                 reader: tcp_read,
@@ -159,9 +312,67 @@ impl TunnelClient {
             WsRole::Client,
         );
         let tunnel = tunnel_over_websocket(ws, TunnelRole::Client);
-        info!("tun {} WS upgrade ok, yamux session live", self.config.name);
-        serve_tun_session(&self.config, tunnel).await
+        info!(
+            "tun {} connected to ngx {} over the WebSocket/TCP transport",
+            self.config.name, self.config.server
+        );
+        Ok(Arc::new(tunnel))
     }
+
+    /// Whether the last QUIC attempt failed recently enough that the
+    /// probe should be skipped.
+    fn quic_recently_failed(&self) -> bool {
+        let Ok(text) = std::fs::read_to_string(&self.quic_failure_path) else {
+            return false;
+        };
+        let Ok(failed_at) = text.trim().parse::<i64>() else {
+            return false;
+        };
+        let now = chrono::Utc::now().timestamp();
+        now - failed_at < QUIC_PROBE_SKIP_SECS
+    }
+
+    /// Record the time of the failed QUIC attempt so the next session
+    /// goes straight to the fallback.
+    fn record_quic_failure(&self) {
+        if let Err(e) = std::fs::write(
+            &self.quic_failure_path,
+            chrono::Utc::now().timestamp().to_string(),
+        ) {
+            warn!(
+                "tun {}: could not record the QUIC failure in {}: {}",
+                self.config.name,
+                self.quic_failure_path.display(),
+                e
+            );
+        }
+    }
+}
+
+/// Resolve `host:port` into a socket address and the name to present
+/// in the TLS handshake.
+///
+/// The host may be a name or an IP literal. Either way it is the
+/// operator's gateway address, and the certificate is pinned by
+/// fingerprint — so the name is only used for the TLS handshake
+/// itself, never for verification.
+async fn resolve_server(server: &str) -> Result<(SocketAddr, String), String> {
+    let (host, port) = server
+        .rsplit_once(':')
+        .ok_or_else(|| format!("the server address {server:?} has no port"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("the server address {server:?} has a bad port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let server_name = host.to_string();
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("resolve the server address {server:?}: {e}"))?;
+    let addr = addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("the server address {server:?} did not resolve"))?;
+    Ok((addr, server_name))
 }
 
 struct OwnedTcpHalf {
@@ -201,726 +412,205 @@ impl AsyncWrite for OwnedTcpHalf {
     }
 }
 
-/// Run the tun-side per-stream dispatcher.
-async fn serve_tun_session(config: &TunConfig, tunnel: YamuxTunnel) -> Result<()> {
+/// Run the tun-side accept loop: every stream the gateway opens is a
+/// request the tun has to relay to a backend.
+async fn serve_tun_session(config: &TunConfig, transport: Arc<dyn TunnelTransport>) -> Result<()> {
     let name = config.name.clone();
     loop {
-        let stream = match tunnel.accept_stream().await {
+        let stream = match transport.accept_stream().await {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
                 warn!("tun {} accept error: {}", name, e);
-                continue;
+                return Err(anyhow::anyhow!("tun {name} accept error: {e}"));
             }
             None => {
-                info!("tun {} yamux session ended", name);
+                info!("tun {} session ended", name);
                 return Ok(());
             }
         };
 
-        let config = config.clone();
         let name_for_log = name.clone();
         tokio::spawn(async move {
-            // v8: every yamux stream carries a single
-            // `TunnelHttpFrame`. The previous TAG_HTTP /
-            // TAG_WS discriminator bytes are removed —
-            // see `pangolin_core::proxy`.
-            if let Err(e) = handle_tunnel_frame(stream, &config, &name_for_log).await {
-                warn!("tun {} tunnel frame error: {}", name_for_log, e);
+            if let Err(e) = relay_stream(stream, &name_for_log).await {
+                warn!("tun {} relay error: {}", name_for_log, e);
             }
         });
     }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Per-frame dispatch
+//  The relay
 // ─────────────────────────────────────────────────────────────────
 
-/// Read the `TunnelHttpFrame` bytes off the stream and hand
-/// them to either `handle_http_request` or
-/// `handle_ws_upgrade` based on the frame's `is_upgrade`
-/// flag.
-async fn handle_tunnel_frame<S>(mut stream: S, _config: &TunConfig, name: &str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // Read 4-byte big-endian length prefix, then read exactly that many bytes.
-    // This avoids waiting for EOF (unreliable over yamux half-close).
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
+/// Relay one tunnel stream to a backend.
+///
+/// The stream starts with a single `CONNECT <host>:<port>` line; the
+/// answer is `OK` or `ERR <reason>`. After `OK` the stream carries
+/// nothing but bytes.
+async fn relay_stream(mut stream: TunnelStream, name: &str) -> Result<()> {
+    let line = read_crlf_line(&mut stream, MAX_INSTRUCTION_LEN)
         .await
-        .map_err(|e| anyhow::anyhow!("read frame length: {}", e))?;
-    let frame_len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; frame_len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("read frame body: {}", e))?;
-    let frame = decode_frame(&buf).map_err(|e| anyhow::anyhow!(e))?;
-    if frame.is_upgrade {
-        handle_ws_upgrade(stream, frame, name).await
-    } else if frame.is_streaming {
-        handle_streaming_response(stream, frame, name).await
-    } else {
-        handle_http_request(stream, frame, name).await
-    }
-}
+        .map_err(|e| anyhow::anyhow!("read the CONNECT instruction: {e}"))?;
+    let (host, port) = decode_connect(line.as_bytes())
+        .map_err(|e| anyhow::anyhow!("bad CONNECT instruction: {e}"))?;
 
-/// Handle one HTTP request from a parsed `TunnelHttpFrame`:
-///   1. Apply `apply_proxy_policy` (Host rewrite per
-///      `host_mode`, X-Forwarded-*, hop-by-hop stripping).
-///   2. Dispatch by target scheme:
-///        - file:// → `serve_file_target` (pangolin-core)
-///        - http/https → `execute_via_pingora`
-///   3. Encode the response and write it back to the stream.
-async fn handle_http_request<S>(mut stream: S, frame: TunnelHttpFrame, name: &str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let original_host = frame
-        .request
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let ctx = ProxyCtx {
-        original_host,
-        original_scheme: Scheme::Http,
-        host_mode: frame.host_mode,
-        host_custom: frame.host_custom.clone(),
-        // The TCP peer was detected by ngx from
-        // `session.client_addr()` and shipped to us inside the
-        // frame. When the frame predates the field, `peer_ip` is
-        // `None` and we degrade gracefully (no X-Forwarded-For).
-        peer_ip: frame.peer_ip.clone(),
-    };
-
-    info!(
-        "tun {} http {} {} host_mode={:?}",
-        name, frame.request.method, frame.request.target, ctx.host_mode
-    );
-
-    let mut request = frame.request;
-    apply_proxy_policy(&mut request, &ctx);
-
-    let response: HttpResponse = match &frame.target {
-        BackendTarget::File { doc_root } => serve_file_target(&request, doc_root),
-        target @ (BackendTarget::Http { .. } | BackendTarget::Https { .. }) => {
-            let host_mode = ctx.host_mode;
-            let host_custom = ctx.host_custom.clone();
-            execute_via_pingora(&request, target, host_mode, host_custom)
+    let backend = match dial_target(&host, port).await {
+        Ok(backend) => backend,
+        Err(reason) => {
+            // The gateway turns `ERR` into a 502 for the client.
+            stream
+                .write_all(&encode_connect_reply(Err(&reason)))
                 .await
-                .map_err(|e| anyhow::anyhow!(e))?
+                .map_err(|e| anyhow::anyhow!("write the ERR reply: {e}"))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| anyhow::anyhow!("flush the ERR reply: {e}"))?;
+            return Ok(());
         }
     };
 
-    let resp_bytes = encode_http_response(&response);
-    // Write 4-byte big-endian length prefix followed by response bytes.
-    // Mirrors the request direction (ngx→tun) so ngx can read an exact
-    // byte count without waiting for EOF or shutdown.
-    let len = resp_bytes.len() as u32;
-    if let Err(e) = stream.write_all(&len.to_be_bytes()).await {
-        warn!("tun {} write response length: {}", name, e);
-        return Err(e.into());
-    }
-    if let Err(e) = stream.write_all(&resp_bytes).await {
-        warn!("tun {} write response: {}", name, e);
-        return Err(e.into());
-    }
-    stream.flush().await?;
+    stream
+        .write_all(&encode_connect_reply(Ok(())))
+        .await
+        .map_err(|e| anyhow::anyhow!("write the OK reply: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| anyhow::anyhow!("flush the OK reply: {e}"))?;
+
+    let mut backend = backend;
+    info!("tun {} relaying to {}:{}", name, host, port);
+    relay_bidirectional(&mut stream, &mut backend)
+        .await
+        .map_err(|e| anyhow::anyhow!("relay to {host}:{port}: {e}"))?;
     Ok(())
 }
 
-/// Handle a WebSocket upgrade from a parsed `TunnelHttpFrame`.
-/// Replays the request bytes to the backend (TCP + manual
-/// WS handshake) and then pumps bytes between the yamux
-/// stream and the backend.
-async fn handle_ws_upgrade<S>(mut stream: S, frame: TunnelHttpFrame, name: &str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let original_host = frame
-        .request
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let host_mode = frame.host_mode;
-    let host_custom = frame.host_custom.clone();
-    let ctx = ProxyCtx {
-        original_host,
-        original_scheme: Scheme::Http,
-        host_mode,
-        host_custom: host_custom.clone(),
-        peer_ip: frame.peer_ip.clone(),
-    };
-    let mut request = frame.request;
-    apply_proxy_policy(&mut request, &ctx);
-
-    let (authority, path) = match request.target.find("://") {
-        Some(idx) => {
-            let rest = &request.target[idx + 3..];
-            match rest.find('/') {
-                Some(p) => (&rest[..p], &rest[p..]),
-                None => (rest, "/"),
-            }
-        }
-        None => {
-            let resp_bytes = synth_502_bytes("ws target has no scheme");
-            stream.write_all(&resp_bytes).await?;
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-
-    // Resolve the backend address. The authority may be a
-    // hostname (e.g. "xiajie:8888") rather than a bare IP:port;
-    // we use tokio's async DNS resolver. Try **every** address
-    // returned by the resolver — see the matching comment in
-    // `handle_streaming_response` for why (the first DNS result
-    // is often v6 on Linux, where the backend only listens on
-    // v4, and a single-address resolver turns that into a
-    // "connection refused → connection reset" path).
-    let addrs = match tokio::net::lookup_host(authority).await {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            let resp_bytes = synth_502_bytes(&format!("bad backend addr: {e}"));
-            stream.write_all(&resp_bytes).await?;
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-    let mut backend = None;
+/// Resolve the target and dial it.
+///
+/// The host is resolved **here**, in the operator's own network — a
+/// backend that is only reachable from the tun's side is reachable
+/// through the tunnel.
+///
+/// Every address the resolver returns is tried, not just the first:
+/// `lookup_host` ordering is OS-dependent (Linux lists `::1` before
+/// `127.0.0.1` for `localhost`), and the back-half of the connection
+/// failures are "wrong address family" — the backend only listens on
+/// v4 but the resolver hands us v6 first.
+async fn dial_target(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?;
     let mut last_err: Option<std::io::Error> = None;
     for addr in addrs {
         match TcpStream::connect(addr).await {
-            Ok(stream) => {
-                backend = Some(stream);
-                break;
-            }
+            Ok(stream) => return Ok(stream),
             Err(e) => {
                 debug!(
-                    "tun {} ws relay connect to {} failed: {} — trying next address",
-                    name, addr, e
+                    "tun: connect to {} failed: {} — trying the next address",
+                    addr, e
                 );
                 last_err = Some(e);
             }
         }
     }
-    let mut backend = match backend {
-        Some(s) => s,
-        None => {
-            let resp_bytes = synth_502_bytes(&format!(
-                "no reachable address for {authority}: {}",
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "no addresses".into())
-            ));
-            stream.write_all(&resp_bytes).await?;
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-
-    let backend_addr = backend
-        .peer_addr()
-        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-    info!("tun {} ws relay to {} path={}", name, backend_addr, path);
-
-    // Mirror the HTTP path's Host header logic: apply_proxy_policy
-    // handles Passthrough and Custom modes. For Backend mode, we
-    // derive Host from the BackendTarget (frame.target) like
-    // execute_via_pingora does at lines 476-481.
-    let host_hdr = match host_mode {
-        HostMode::Passthrough | HostMode::Custom => request
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| authority.to_string()),
-        HostMode::Backend => match &frame.target {
-            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
-                format!("{}:{}", host, port)
-            }
-            _ => authority.to_string(),
-        },
-    };
-
-    // The upgrade request is built from scratch, so it does not
-    // inherit the frame's headers the way the regular HTTP path
-    // does. Carry over the ones the backend needs: the four `P-*`
-    // gateway headers (computed by the gateway and shipped inside
-    // the frame) and the forwarded-for chain (the incoming chain
-    // with the TCP peer appended — `apply_proxy_policy` above
-    // already did the append).
-    let extra_headers = ws_upgrade_extra_headers(&request.headers);
-    let (req_bytes, key) = build_ws_upgrade_request(path, &host_hdr, "", &extra_headers);
-    backend.write_all(&req_bytes).await?;
-    backend.flush().await?;
-    read_ws_accept_response(&mut backend, &key).await?;
-    pump_ws_relay(stream, backend, "ngx", "backend").await?;
-    Ok(())
+    Err(format!(
+        "no reachable address for {host}:{port}: {}",
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no addresses".into())
+    ))
 }
 
-/// The headers the tun carries on the WS upgrade request to the
-/// backend: the four `P-*` gateway headers plus the
-/// forwarded-for chain.
-///
-/// The names are fixed by the gateway-header contract; a header
-/// that is not present in the frame (e.g. an older gateway that
-/// does not send them) is simply not forwarded.
-fn ws_upgrade_extra_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    // The names come from the shared contract
-    // (`pangolin_core::PGL_HEADER_NAMES`) so a rename or a fifth
-    // gateway header cannot silently stop being forwarded here.
-    let wanted: Vec<&str> = pangolin_core::PGL_HEADER_NAMES
-        .iter()
-        .copied()
-        .chain(std::iter::once("X-Forwarded-For"))
-        .collect();
-    let mut out = Vec::new();
-    for want in wanted {
-        if let Some((_, value)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)) {
-            out.push((want.to_string(), value.clone()));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The server address is split into the socket address and the
+    /// name presented in the TLS handshake.
+    #[tokio::test]
+    async fn server_address_is_split() {
+        let (addr, name) = resolve_server("127.0.0.1:9001").await.unwrap();
+        assert_eq!(addr, "127.0.0.1:9001".parse::<SocketAddr>().unwrap());
+        assert_eq!(name, "127.0.0.1");
     }
-    out
-}
 
-/// Handle a streaming response (SSE, long-lived chunked) from a
-/// parsed `TunnelHttpFrame`.
-///
-/// Mirrors [`handle_ws_upgrade`] but for plain HTTP/1.1 streaming
-/// instead of WebSocket upgrade:
-///   1. Connect to the backend over plain TCP.
-///   2. Send the original HTTP request bytes (no WS handshake).
-///   3. Use [`tokio::io::copy_bidirectional`] to relay bytes
-///      between the yamux stream and the backend TCP socket.
-///
-/// This is the path that supports `Content-Type: text/event-stream`
-/// (SSE) and other long-lived HTTP responses. The standard
-/// HTTP path in [`handle_http_request`] would buffer the entire
-/// body in memory and never complete for an infinite stream —
-/// this path forwards bytes as they arrive, the same way
-/// [`pump_ws_relay`] does for WebSocket frames.
-async fn handle_streaming_response<S>(
-    mut stream: S,
-    frame: TunnelHttpFrame,
-    name: &str,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let original_host = frame
-        .request
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let host_mode = frame.host_mode;
-    let host_custom = frame.host_custom.clone();
-    let ctx = ProxyCtx {
-        original_host,
-        original_scheme: Scheme::Http,
-        host_mode,
-        host_custom: host_custom.clone(),
-        peer_ip: frame.peer_ip.clone(),
-    };
-    let mut request = frame.request;
-    apply_proxy_policy(&mut request, &ctx);
-
-    let (authority, path) = match request.target.find("://") {
-        Some(idx) => {
-            let rest = &request.target[idx + 3..];
-            match rest.find('/') {
-                Some(p) => (&rest[..p], &rest[p..]),
-                None => (rest, "/"),
-            }
-        }
-        None => {
-            let resp_bytes = synth_502_bytes("streaming target has no scheme");
-            stream.write_all(&resp_bytes).await?;
-            stream.flush().await?;
-            return Ok(());
-        }
-    };
-
-    // Resolve the backend address. The authority from the URL
-    // may be a hostname (e.g. "xiajie:8888") rather than a bare
-    // IP:port, so we use tokio's async DNS resolver instead of
-    // SocketAddr::parse(), which only handles numeric addresses.
-    //
-    // We try **every** address returned by the resolver, not just
-    // the first: `lookup_host` ordering is OS-dependent (Linux
-    // `/etc/hosts` typically lists `::1` before `127.0.0.1`, so
-    // `localhost` resolves to v6 first on Linux and v4 first on
-    // macOS), and a back-half of the connection failure modes are
-    // "wrong address family" — the backend only listens on v4, but
-    // the resolver hands us v6 first. Taking the first result
-    // gives a flakey "connection reset" path on the wrong-family
-    // case; iterating the full set and stopping at the first
-    // successful `TcpStream::connect` makes the lookup robust
-    // across OSes and dual-homed backends.
-    let addrs = match tokio::net::lookup_host(authority).await {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            let resp_bytes = synth_502_bytes(&format!("DNS lookup failed for {authority}: {e}"));
-            stream.write_all(&resp_bytes).await?;
-            stream.flush().await?;
-            return Ok(());
-        }
-    };
-    let mut backend = None;
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in addrs {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => {
-                backend = Some(stream);
-                break;
-            }
-            Err(e) => {
-                debug!(
-                    "tun {} streaming connect to {} failed: {} — trying next address",
-                    name, addr, e
-                );
-                last_err = Some(e);
-            }
-        }
+    /// A host name works too — the certificate is pinned by
+    /// fingerprint, so the name is only used for the handshake.
+    #[tokio::test]
+    async fn server_address_accepts_a_host_name() {
+        let (addr, name) = resolve_server("localhost:9001").await.unwrap();
+        assert_eq!(addr.port(), 9001);
+        assert_eq!(name, "localhost");
     }
-    let mut backend = match backend {
-        Some(s) => s,
-        None => {
-            let resp_bytes = synth_502_bytes(&format!(
-                "no reachable address for {authority}: {}",
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "no addresses".into())
-            ));
-            stream.write_all(&resp_bytes).await?;
-            stream.flush().await?;
-            return Ok(());
-        }
-    };
 
-    let backend_addr = backend.peer_addr().unwrap_or_else(|_| {
-        // Fall back to a representative address for the log
-        // line; we don't need the exact one for diagnostics.
-        std::net::SocketAddr::from(([0, 0, 0, 0], 0))
-    });
-    info!("tun {} streaming to {} path={}", name, backend_addr, path);
-
-    // Host header per host_mode (same logic as the HTTP and WS paths).
-    let host_hdr = match host_mode {
-        HostMode::Passthrough | HostMode::Custom => request
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| authority.to_string()),
-        HostMode::Backend => match &frame.target {
-            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
-                format!("{}:{}", host, port)
-            }
-            _ => authority.to_string(),
-        },
-    };
-
-    // Build a plain HTTP/1.1 request (no WS upgrade, no key).
-    // Mirrors the request line + headers produced by the WS
-    // path but stops there — the backend replies with a normal
-    // HTTP response, which we then byte-relay.
-    let req_bytes = build_plain_http_request(&request, path, &host_hdr);
-    // Debug: log the headers being sent to the backend (excluding body)
-    {
-        let header_part = std::str::from_utf8(&req_bytes).unwrap_or("(invalid utf8)");
-        let header_end = header_part.find("\r\n\r\n").unwrap_or(header_part.len());
-        debug!(
-            "tun {} streaming headers→backend:\n{}",
-            name,
-            &header_part[..header_end]
+    /// An address without a port is refused up front rather than at
+    /// the first connect.
+    #[tokio::test]
+    async fn server_address_without_port_is_refused() {
+        assert!(resolve_server("gateway.example.com").await.is_err());
+        assert!(
+            resolve_server("gateway.example.com:not-a-port")
+                .await
+                .is_err()
         );
     }
-    backend.write_all(&req_bytes).await?;
-    backend.flush().await?;
 
-    // Unidirectional relay: backend → stream only.
-    //
-    // SSE / long-lived chunked responses are server-push: the
-    // client sends the GET request and then sits idle. We must
-    // **not** use `copy_bidirectional` here, because its
-    // `copy` loop reads from both sides; the moment the client
-    // direction is idle / EOF, it shuts down the backend
-    // direction, killing the stream. We need the stream
-    // direction to stay open until the backend closes it.
-    //
-    // We ignore the stream direction entirely (it carries no
-    // SSE traffic anyway) and copy backend → stream until the
-    // backend closes. The teardown contract is:
-    //
-    //   - `Ok(_)`: backend closed cleanly. We must propagate
-    //     EOF to the client by calling `stream.shutdown()` —
-    //     yamux's `Drop` only sends RST, not FIN, and a
-    //     successful end-of-stream is the one case where we
-    //     want a clean FIN so the client sees the end of the
-    //     body.
-    //
-    //   - `Err(_)`: the yamux stream broke (most commonly
-    //     because ngx dropped it on client disconnect).
-    //     Without an explicit `backend.shutdown()` here, the
-    //     backend TCP would linger until OS-level FIN
-    //     timeout (60–120 s on Linux) and keep producing
-    //     events that go nowhere. We must NOT call
-    //     `stream.shutdown()` on this path: that would
-    //     transition the yamux state to `LocalClosing`, and
-    //     `Drop for StreamHandle` skips the RST frame when
-    //     state is `LocalClosing` (see
-    //     `docs/design/sse-reconnect.md`). Instead, let
-    //     `stream` fall out of scope at function return —
-    //     `Drop` then sees `Established` and sends RST,
-    //     which propagates faster than FIN.
-    match tokio::io::copy(&mut backend, &mut stream).await {
-        Ok(_) => {
-            // Backend closed cleanly: propagate EOF to the
-            // client (see contract above).
-            let _ = stream.shutdown().await;
-        }
-        Err(e) => {
-            debug!(
-                "tun {} streaming backend→stream copy: {} → closing backend TCP",
-                name, e
-            );
-            // Close the backend TCP so it stops producing
-            // events that go nowhere. Do NOT call
-            // `stream.shutdown()` — let it drop at function
-            // return so Drop emits RST (faster than FIN).
-            let _ = backend.shutdown().await;
-        }
-    }
-    Ok(())
-}
-
-/// Build a plain HTTP/1.1 request byte stream (no WebSocket
-/// upgrade). Used by the streaming path: SSE / chunked / long-lived
-/// responses that the standard HttpResponse buffering path cannot
-/// handle.
-fn build_plain_http_request(request: &HttpRequest, path: &str, host_hdr: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + request.body.len());
-    out.extend_from_slice(request.method.as_bytes());
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(path.as_bytes());
-    out.extend_from_slice(b" HTTP/1.1\r\n");
-    out.extend_from_slice(b"Host: ");
-    out.extend_from_slice(host_hdr.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    // Content-Length must be set whenever the request carries a
-    // body — otherwise the backend has no way to know when the
-    // body ends (no Transfer-Encoding: chunked is implied here)
-    // and will hang waiting for more bytes. Mirrors the
-    // Content-Length injection in `execute_via_pingora`.
-    let mut has_content_length = false;
-    for (k, v) in &request.headers {
-        if k.eq_ignore_ascii_case("Host") {
-            // Already written above; skip to avoid duplicates.
-            continue;
-        }
-        if k.eq_ignore_ascii_case("Content-Length") {
-            has_content_length = true;
-        }
-        out.extend_from_slice(k.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(v.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    if !request.body.is_empty() && !has_content_length {
-        out.extend_from_slice(b"Content-Length: ");
-        out.extend_from_slice(request.body.len().to_string().as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&request.body);
-    out
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  Frame codec
-// ─────────────────────────────────────────────────────────────────
-
-fn decode_frame(bytes: &[u8]) -> Result<TunnelHttpFrame, String> {
-    pangolin_core::proxy::decode_tunnel_frame(bytes)
-        .map_err(|e| format!("decode_tunnel_frame: {e}"))
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  PingoraClientExecutor — HTTP client using pingora-core
-// ─────────────────────────────────────────────────────────────────
-
-static CONNECTOR: std::sync::OnceLock<Arc<Connector>> = std::sync::OnceLock::new();
-
-fn connector() -> &'static Arc<Connector> {
-    CONNECTOR.get_or_init(|| Arc::new(Connector::new(None)))
-}
-
-/// Send `request` to the backend described by `target` using
-/// pingora-core's HTTP/1.1 client. Honors `host_mode` (in
-/// particular, Backend mode overwrites Host with the
-/// backend's authority).
-async fn execute_via_pingora(
-    request: &HttpRequest,
-    target: &BackendTarget,
-    host_mode: HostMode,
-    host_custom: Option<String>,
-) -> Result<HttpResponse, String> {
-    let peer = match target {
-        BackendTarget::Http { host, port, .. } => {
-            HttpPeer::new((host.clone(), *port), false, host.clone())
-        }
-        BackendTarget::Https { host, port, .. } => {
-            HttpPeer::new((host.clone(), *port), true, host.clone())
-        }
-        BackendTarget::File { .. } => {
-            return Err("file:// not handled by pingora client".into());
-        }
-    };
-
-    let method =
-        http::Method::from_bytes(request.method.as_bytes()).map_err(|e| format!("method: {e}"))?;
-
-    // Path only.
-    let path_only = match request.target.find("://") {
-        Some(idx) => match request.target[idx + 3..].find('/') {
-            Some(p) => &request.target[idx + 3 + p..],
-            None => "/",
-        },
-        None => request.target.as_str(),
-    };
-    if path_only.is_empty() {
-        return Err("empty path".into());
+    fn client_for(dir: &std::path::Path) -> TunnelClient {
+        let config = TunConfig {
+            server: "127.0.0.1:9001".into(),
+            token: "t".into(),
+            name: "office".into(),
+            ..TunConfig::default()
+        };
+        let config_path = dir.join("tun.yml");
+        TunnelClient::new(config, &config_path)
     }
 
-    // `RequestHeader::build` and `insert_header` accept borrowed
-    // slices / `String`; no `&'static` is required. The previous
-    // code used `Box::leak` on every request, leaking the path
-    // bytes and one allocation per header name per request.
-    let mut header_builder = RequestHeader::build(&method, path_only.as_bytes(), None)
-        .map_err(|e| format!("build header: {e}"))?;
-
-    // Insert all non-Host, non-Content-Length headers.
-    // Collect first to avoid borrow checker issues with the iterator.
-    let header_pairs: Vec<(String, String)> = request
-        .headers
-        .iter()
-        .filter(|(k, _)| {
-            !k.eq_ignore_ascii_case("Host") && !k.eq_ignore_ascii_case("Content-Length")
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    for (k, v) in header_pairs {
-        let _ = header_builder.insert_header(k, v.as_bytes());
+    /// A tun that has never tried QUIC probes it on the next session.
+    #[test]
+    fn a_fresh_tun_probes_quic() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client_for(dir.path());
+        assert!(
+            !client.quic_recently_failed(),
+            "a tun that never tried QUIC must probe it"
+        );
     }
 
-    // Apply host_mode Host override.
-    let host_value = match host_mode {
-        HostMode::Passthrough => request
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("Host"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default(),
-        HostMode::Backend => match target {
-            BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
-                format!("{}:{}", host, port)
-            }
-            _ => unreachable!(),
-        },
-        HostMode::Custom => host_custom.clone().unwrap_or_default(),
-    };
-    if !host_value.is_empty() {
-        header_builder
-            .insert_header("Host", host_value.as_bytes())
-            .ok();
-    }
-    header_builder
-        .insert_header("Content-Length", request.body.len().to_string().as_bytes())
-        .ok();
+    /// After a failed QUIC attempt the tun skips the probe — and the
+    /// record survives a restart, so a tun that is restarted every
+    /// few minutes does not pay the handshake timeout every time.
+    #[test]
+    fn a_failed_quic_attempt_skips_the_probe_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client_for(dir.path());
+        client.record_quic_failure();
+        assert!(client.quic_recently_failed());
 
-    let connector = connector().clone();
-    let (mut session, _reused) = connector
-        .get_http_session(&peer)
-        .await
-        .map_err(|e| format!("get_http_session: {e}"))?;
-
-    session
-        .write_request_header(Box::new(header_builder))
-        .await
-        .map_err(|e| format!("write_request_header: {e}"))?;
-    if !request.body.is_empty() {
-        session
-            .write_request_body(bytes::Bytes::copy_from_slice(&request.body), true)
-            .await
-            .map_err(|e| format!("write_request_body: {e}"))?;
-    }
-    session
-        .finish_request_body()
-        .await
-        .map_err(|e| format!("finish_request_body: {e}"))?;
-
-    session
-        .read_response_header()
-        .await
-        .map_err(|e| format!("read_response_header: {e}"))?;
-
-    let resp_header = session
-        .response_header()
-        .cloned()
-        .ok_or_else(|| "no response header".to_string())?;
-
-    let mut body = Vec::new();
-    while let Some(chunk) = session
-        .read_response_body()
-        .await
-        .map_err(|e| format!("read_response_body: {e}"))?
-    {
-        body.extend_from_slice(&chunk);
+        // A "restart" — a new client reading the same directory.
+        let restarted = client_for(dir.path());
+        assert!(
+            restarted.quic_recently_failed(),
+            "the QUIC failure record must survive a restart"
+        );
     }
 
-    let idle = Some(Duration::from_secs(90));
-    connector.release_http_session(session, &peer, idle).await;
-
-    let status = resp_header.status;
-    let status_line = format!(
-        "{} {}",
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("")
-    );
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for (k, v) in resp_header.headers.iter() {
-        if let Ok(v) = v.to_str() {
-            headers.push((k.as_str().to_string(), v.to_string()));
-        }
+    /// The skip expires: after the ten-minute window the tun probes
+    /// QUIC again, so a network that unblocks UDP is picked up
+    /// without operator action.
+    #[test]
+    fn the_quic_probe_skip_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client_for(dir.path());
+        client.record_quic_failure();
+        // Backdate the record past the skip window.
+        let old = chrono::Utc::now().timestamp() - QUIC_PROBE_SKIP_SECS - 60;
+        std::fs::write(client.quic_failure_path.clone(), old.to_string()).unwrap();
+        assert!(
+            !client.quic_recently_failed(),
+            "the tun must probe QUIC again after the skip window"
+        );
     }
-    Ok(HttpResponse {
-        version: format!("{:?}", resp_header.version),
-        status_line,
-        headers,
-        body,
-    })
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  502 helpers
-// ─────────────────────────────────────────────────────────────────
-
-fn synth_502_bytes(err: &str) -> Vec<u8> {
-    let body = err.as_bytes();
-    let mut out = Vec::new();
-    out.extend_from_slice(b"HTTP/1.1 502 Bad Gateway\r\n");
-    out.extend_from_slice(b"Content-Type: text/plain\r\n");
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n");
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
-    out
 }

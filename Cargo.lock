@@ -2183,6 +2183,7 @@ dependencies = [
  "pingora",
  "pingora-core",
  "pingora-openssl 0.8.1",
+ "quinn",
  "reqwest",
  "ring",
  "rusqlite",
@@ -2387,7 +2388,9 @@ dependencies = [
  "log",
  "mime_guess",
  "parking_lot",
+ "quinn",
  "rand 0.8.6",
+ "rcgen",
  "refinery",
  "rusqlite",
  "rustls",
@@ -4263,6 +4266,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -4311,10 +4315,9 @@ dependencies = [
  "http 1.4.1",
  "log",
  "pangolin-core",
- "pingora-core",
- "pingora-http",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-yamux",

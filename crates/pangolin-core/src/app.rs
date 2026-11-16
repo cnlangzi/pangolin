@@ -22,7 +22,7 @@ use crate::referer_log::{RefererLogBuffer, RefererLogEntry, RefererLogWriter};
 use crate::referer_stats::RefererStats;
 use crate::reputation::build_library;
 use crate::traffic::TrafficHub;
-use crate::tunnel::YamuxTunnel;
+use crate::tunnel::TunnelTransport;
 use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,
@@ -342,10 +342,13 @@ pub struct App {
     pub config: Config,
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
     pub ws_path: String,
-    /// Active tunnel sessions: tun_name → yamux control handle.
-    /// Holds the per-tun control plane used to open new yamux
-    /// streams from ngx to that tun.
-    pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, YamuxTunnel>>>,
+    /// Active tunnel sessions: tun_name → transport handle.
+    /// Holds the per-tun control plane used to open new byte streams
+    /// from ngx to that tun. The transport is either QUIC or the
+    /// WebSocket/TCP fallback (issue #153) — both implement
+    /// [`TunnelTransport`], so the proxy path does not care which one
+    /// a tun is on.
+    pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, Arc<dyn TunnelTransport>>>>,
     /// Per-tun last-seen timestamp (Unix seconds), used by the
     /// admin UI's tun list. Updated by the tunnel accept loop
     /// on each new request.
@@ -887,14 +890,43 @@ impl App {
         self.dns_change_notify.notify_one();
     }
 
-    /// Register a live tunnel session. Called when a tun node connects via WS.
-    pub async fn register_tun(&self, name: String, tunnel: YamuxTunnel) {
-        self.tun_sessions.write().await.insert(name, tunnel);
+    /// Register a live tunnel session. Called when a tun node connects
+    /// — over QUIC or over the WebSocket/TCP fallback.
+    ///
+    /// Returns `false` when a session for that name is already
+    /// registered: two tuns must not fight for the same routing slot,
+    /// so the second one is rejected.
+    pub async fn register_tun(&self, name: String, tunnel: Arc<dyn TunnelTransport>) -> bool {
+        let mut sessions = self.tun_sessions.write().await;
+        if sessions.contains_key(&name) {
+            return false;
+        }
+        sessions.insert(name, tunnel);
+        true
     }
 
-    /// Unregister a tunnel session. Called on WS disconnect.
-    pub async fn unregister_tun(&self, name: &str) {
-        self.tun_sessions.write().await.remove(name);
+    /// Unregister a tunnel session **only if it is still the same
+    /// one**.
+    ///
+    /// A tun can reconnect — on the same transport or on the other
+    /// one — while the previous session's cleanup is still running.
+    /// Removing the entry blindly would drop the *new* session and
+    /// leave the proxy with no route to a tun that is online.
+    ///
+    /// Returns whether the entry was removed.
+    pub async fn unregister_tun_if(
+        &self,
+        name: &str,
+        transport: &Arc<dyn TunnelTransport>,
+    ) -> bool {
+        let mut sessions = self.tun_sessions.write().await;
+        let matches = sessions
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, transport));
+        if matches {
+            sessions.remove(name);
+        }
+        matches
     }
 
     /// Add an event to the dashboard activity feed.

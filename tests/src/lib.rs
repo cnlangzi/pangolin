@@ -128,6 +128,11 @@ mod real_e2e;
 #[cfg(feature = "integration")]
 mod sse_e2e;
 
+// Transport-specific tunnel end-to-end tests (issue #153): the QUIC
+// transport, the WebSocket/TCP fallback and the fallback policy.
+#[cfg(feature = "integration")]
+mod tunnel_transport;
+
 #[cfg(feature = "integration")]
 mod admin_ui_e2e;
 

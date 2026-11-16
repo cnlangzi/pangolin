@@ -18,8 +18,8 @@ New to Pangolin? Start here:
 
 ## Design
 
-- [Tunnel](design/tunnel.md) — WebSocket tunnel design choices, implementation map, known gaps
-- [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, `BackendExecutor` trait, pingora as the single HTTP client, `file://` parity, WS upgrade
+- [Tunnel](design/tunnel.md) — the tunnel as a byte splice: the two transports (QUIC + WebSocket/TCP), the CONNECT instruction, the certificate and the trust model, the fallback policy
+- [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade
 - [Access log + SSE real-time push](design/access-log.md) — in-memory access log streamed to the `/logs` admin page (issue #73): ring buffer + `broadcast` channel, replay-then-live SSE, capacity knobs, failure modes
 - [Referer log side-channel](design/referer-log.md) — inbound external referrals: the document-navigation + site-boundary detection rules, the `referer-YYYY-MM-DD.jsonl` wire format, the `/logs/referers` pages, failure modes
 - [Cert link + in-memory cache](design/cert-link.md) — pre-computed domain→cert map for the SNI callback (branch `fix/cert_www`): single-level wildcard fallback, derived view over `domains` × `certs`, CRUD sync flow

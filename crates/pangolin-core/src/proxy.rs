@@ -1,21 +1,22 @@
-//! Reverse-proxy policy + frame format shared by `ngx` and `tun`.
+//! Reverse-proxy policy shared by `ngx` and `tun`.
 //!
 //! **Layering**: this module sits between "site config" (higher) and
 //! "transport" (lower). It does not know which transport (pingora
-//! server, yamux, reqwest, …) ultimately carries the request —
+//! server, a tunnel stream, …) ultimately carries the request —
 //! callers supply transport-specific executors that consume a
 //! [`HttpRequest`] and return a [`HttpResponse`].
 //!
 //! **Single source of truth for Host rewriting**: [`apply_proxy_policy`]
 //! is the only function in the workspace that mutates the `Host`
-//! header (and adds `X-Forwarded-*`). Both `ngx` and `tun` call it.
+//! header (and adds `X-Forwarded-*`). Since issue #153 it runs on the
+//! gateway only — the tunnel is a byte splice, so the tun has nothing
+//! to apply the policy to.
 //!
 //! See `docs/design/reverse-proxy.md` for the full v8 design.
 
-use std::io::{Error, ErrorKind, Result as IoResult};
 use std::path::PathBuf;
 
-use crate::tunnel::{HttpRequest, HttpResponse, encode_http_request, strip_hop_by_hop_headers};
+use crate::tunnel::{HttpRequest, HttpResponse, strip_hop_by_hop_headers};
 use crate::types::HostMode;
 use crate::{ParseError, parse_backend};
 
@@ -52,7 +53,7 @@ pub struct ProxyCtx {
     ///
     /// Both direct and tunnel paths populate this from
     /// `session.client_addr()` on the ngx side; the tunnel
-    /// path also ships it inside the `TunnelHttpFrame` so the
+    /// path also ships it inside the tunnel request so the
     /// tun's `apply_proxy_policy` call sees it.
     pub peer_ip: Option<String>,
 }
@@ -324,385 +325,6 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     headers.push((name.to_string(), value.to_string()));
 }
 
-// ── TunnelHttpFrame ────────────────────────────────────────────
-
-/// Per-request payload sent from `ngx` to `tun` over a yamux
-/// stream. Carries the entire `HttpRequest`, the routing
-/// policy `tun` needs to apply (`host_mode`, `host_custom`),
-/// the disambiguated backend target (so the tun knows
-/// which host/port to dial or which doc_root to serve from
-/// without re-deriving it from the request target), and a
-/// flag indicating whether the request is a WebSocket
-/// upgrade.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TunnelHttpFrame {
-    pub request: HttpRequest,
-    pub target: BackendTarget,
-    pub host_mode: HostMode,
-    pub host_custom: Option<String>,
-    pub is_upgrade: bool,
-    /// True for streaming responses (SSE, long-lived chunked responses).
-    /// When set, the tun side bypasses HttpResponse buffering and
-    /// relays bytes directly from backend TCP to the yamux stream.
-    pub is_streaming: bool,
-    /// The TCP peer address, detected by ngx from
-    /// `session.client_addr()`. Shipped to the tun so
-    /// `apply_proxy_policy` on the tun side can append it to
-    /// `X-Forwarded-For` even when the request goes through a
-    /// tunnel. `None` for frames that pre-date the field's
-    /// introduction; those frames are decoded back as `None` so
-    /// old tun versions stay wire-compatible.
-    ///
-    /// The wire layout is unchanged — same presence byte, same
-    /// length-prefixed payload — only the *meaning* of the field
-    /// changed (it used to carry the resolved client IP).
-    pub peer_ip: Option<String>,
-}
-
-const FRAME_HOST_PASSTHROUGH: u8 = 0;
-const FRAME_HOST_BACKEND: u8 = 1;
-const FRAME_HOST_CUSTOM: u8 = 2;
-const FRAME_TARGET_HTTP: u8 = 0;
-const FRAME_TARGET_HTTPS: u8 = 1;
-const FRAME_TARGET_FILE: u8 = 2;
-
-/// Encode a `TunnelHttpFrame` to wire bytes.
-///
-/// Wire layout:
-/// ```text
-/// ┌──────────┬──────────┬─────────────────────────────────────┐
-/// │ host_mode│ custom?  │ host_custom bytes (when custom? = 1)│
-/// │ 1 byte   │ 1 byte   │ 2-byte BE length + UTF-8            │
-/// ├──────────┴──────────┴─────────────────────────────────────┤
-/// │ is_upgrade (1 byte, 0/1)                                  │
-/// │ is_streaming (1 byte, 0/1)                                │
-/// ├────────────────────────────────────────────────────────────┤
-/// │ target_kind (1 byte: 0=http, 1=https, 2=file)            │
-/// │ target_host_len (2 bytes BE) | UTF-8 ("" for file)        │
-/// │ target_port (2 bytes BE; 0 for file)                       │
-/// │ target_base_path_len (2 bytes BE) | UTF-8 (base_path)      │
-/// │ target_doc_root_len (2 bytes BE) | UTF-8 (only for file)  │
-/// ├────────────────────────────────────────────────────────────┤
-/// │ peer_ip_present (1 byte, 0/1)                              │
-/// │ peer_ip_len (2 bytes BE) | UTF-8 (when present)           │
-/// ├────────────────────────────────────────────────────────────┤
-/// │ encode_http_request(&request) — full HTTP/1.1 byte stream  │
-/// └────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// The peer-IP block was added after the initial wire format. The
-/// decoder accepts the **old** layout (no peer-IP block) and
-/// decodes back `peer_ip = None`, so a new ngx talking to an
-/// old tun (and vice-versa) still works on the bytes they each
-/// understand.
-///
-/// The block was originally called `client_ip`; it was renamed to
-/// `peer_ip` when its meaning changed (it carries the TCP peer,
-/// not the visitor). The **wire layout is unchanged** — same
-/// presence byte, same length-prefixed payload.
-pub fn encode_tunnel_frame(frame: &TunnelHttpFrame) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + 16 + frame.request.body.len());
-    // host_mode
-    out.push(host_mode_byte(frame.host_mode));
-    // host_custom
-    match &frame.host_custom {
-        None => out.push(0),
-        Some(s) => {
-            out.push(1);
-            let bytes = s.as_bytes();
-            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            out.extend_from_slice(bytes);
-        }
-    }
-    // is_upgrade
-    out.push(if frame.is_upgrade { 1 } else { 0 });
-    // is_streaming (feature flag: 0 = not streaming, 1 = streaming)
-    out.push(if frame.is_streaming { 1 } else { 0 });
-    // target
-    let (kind, host, port, base_path, doc_root) = match &frame.target {
-        BackendTarget::Http {
-            host,
-            port,
-            base_path,
-        } => (
-            FRAME_TARGET_HTTP,
-            host.clone(),
-            *port,
-            base_path.clone(),
-            String::new(),
-        ),
-        BackendTarget::Https {
-            host,
-            port,
-            base_path,
-        } => (
-            FRAME_TARGET_HTTPS,
-            host.clone(),
-            *port,
-            base_path.clone(),
-            String::new(),
-        ),
-        BackendTarget::File { doc_root } => (
-            FRAME_TARGET_FILE,
-            String::new(),
-            0u16,
-            String::new(),
-            doc_root.to_string_lossy().into_owned(),
-        ),
-    };
-    out.push(kind);
-    let host_bytes = host.as_bytes();
-    out.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(host_bytes);
-    out.extend_from_slice(&port.to_be_bytes());
-    let base_bytes = base_path.as_bytes();
-    out.extend_from_slice(&(base_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(base_bytes);
-    let doc_bytes = doc_root.as_bytes();
-    out.extend_from_slice(&(doc_bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(doc_bytes);
-    // peer_ip (optional; see wire-format doc above)
-    match &frame.peer_ip {
-        None => out.push(0),
-        Some(s) => {
-            out.push(1);
-            let bytes = s.as_bytes();
-            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            out.extend_from_slice(bytes);
-        }
-    }
-    // request bytes
-    out.extend_from_slice(&encode_http_request(&frame.request));
-    out
-}
-
-/// Decode a `TunnelHttpFrame` from wire bytes. Inverse of
-/// [`encode_tunnel_frame`].
-pub fn decode_tunnel_frame(bytes: &[u8]) -> IoResult<TunnelHttpFrame> {
-    if bytes.len() < 3 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame header truncated",
-        ));
-    }
-    let host_mode = match bytes[0] {
-        FRAME_HOST_PASSTHROUGH => HostMode::Passthrough,
-        FRAME_HOST_BACKEND => HostMode::Backend,
-        FRAME_HOST_CUSTOM => HostMode::Custom,
-        other => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("unknown host_mode byte 0x{other:02x}"),
-            ));
-        }
-    };
-    let custom_present = bytes[1];
-    let mut cursor = 2usize;
-    let host_custom = if custom_present == 1 {
-        if bytes.len() < cursor + 2 {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "tunnel frame: missing host_custom length",
-            ));
-        }
-        let len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-        cursor += 2;
-        if bytes.len() < cursor + len {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "tunnel frame: host_custom truncated",
-            ));
-        }
-        let s = std::str::from_utf8(&bytes[cursor..cursor + len])
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("host_custom utf-8: {e}")))?
-            .to_string();
-        cursor += len;
-        Some(s)
-    } else if custom_present != 0 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("tunnel frame: bad custom_present byte 0x{custom_present:02x}"),
-        ));
-    } else {
-        None
-    };
-    // is_upgrade
-    if bytes.len() < cursor + 1 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing is_upgrade byte",
-        ));
-    }
-    let is_upgrade = bytes[cursor] != 0;
-    cursor += 1;
-    // is_streaming
-    if bytes.len() < cursor + 1 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing is_streaming byte",
-        ));
-    }
-    let is_streaming = bytes[cursor] != 0;
-    cursor += 1;
-    // target
-    if bytes.len() < cursor + 1 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing target kind",
-        ));
-    }
-    let kind = bytes[cursor];
-    cursor += 1;
-    if bytes.len() < cursor + 2 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing host len",
-        ));
-    }
-    let host_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-    cursor += 2;
-    if bytes.len() < cursor + host_len {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: host truncated",
-        ));
-    }
-    let host = std::str::from_utf8(&bytes[cursor..cursor + host_len])
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("host utf-8: {e}")))?
-        .to_string();
-    cursor += host_len;
-    if bytes.len() < cursor + 2 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing port",
-        ));
-    }
-    let port = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
-    cursor += 2;
-    if bytes.len() < cursor + 2 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing base_path len",
-        ));
-    }
-    let base_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-    cursor += 2;
-    if bytes.len() < cursor + base_len {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: base_path truncated",
-        ));
-    }
-    let base_path = std::str::from_utf8(&bytes[cursor..cursor + base_len])
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("base_path utf-8: {e}")))?
-        .to_string();
-    cursor += base_len;
-    if bytes.len() < cursor + 2 {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: missing doc_root len",
-        ));
-    }
-    let doc_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-    cursor += 2;
-    if bytes.len() < cursor + doc_len {
-        return Err(Error::new(
-            ErrorKind::UnexpectedEof,
-            "tunnel frame: doc_root truncated",
-        ));
-    }
-    let doc_root = std::str::from_utf8(&bytes[cursor..cursor + doc_len])
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("doc_root utf-8: {e}")))?
-        .to_string();
-    cursor += doc_len;
-
-    let target = match kind {
-        FRAME_TARGET_HTTP => BackendTarget::Http {
-            host,
-            port,
-            base_path,
-        },
-        FRAME_TARGET_HTTPS => BackendTarget::Https {
-            host,
-            port,
-            base_path,
-        },
-        FRAME_TARGET_FILE => BackendTarget::File {
-            doc_root: std::path::PathBuf::from(doc_root),
-        },
-        other => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("unknown target kind 0x{other:02x}"),
-            ));
-        }
-    };
-
-    // The peer-IP block was added after the initial wire format;
-    // the old layout (no peer-IP block) is still in the wild.
-    // The new layout inserts a 1-byte flag (0/1) right before
-    // the request bytes. We can detect which layout we got by
-    // peeking at `bytes[cursor]`: the new flag is always 0 or 1,
-    // while the first byte of an HTTP request method is always
-    // an ASCII letter (G/P/C/H/D/L/...) which is all > 1. So
-    // 0/1 is unambiguously the new flag; anything else is the
-    // start of the request.
-    let (peer_ip, request) = match bytes.get(cursor).copied() {
-        Some(0) | Some(1) => {
-            // New format.
-            cursor += 1;
-            let ip = if bytes[cursor - 1] == 1 {
-                if bytes.len() < cursor + 2 {
-                    return Err(Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "tunnel frame: missing peer_ip length",
-                    ));
-                }
-                let ip_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-                cursor += 2;
-                if bytes.len() < cursor + ip_len {
-                    return Err(Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "tunnel frame: peer_ip truncated",
-                    ));
-                }
-                let s = std::str::from_utf8(&bytes[cursor..cursor + ip_len])
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("peer_ip utf-8: {e}")))?
-                    .to_string();
-                cursor += ip_len;
-                Some(s)
-            } else {
-                None
-            };
-            let req = crate::tunnel::parse_http_request_bytes(&bytes[cursor..])?;
-            (ip, req)
-        }
-        _ => {
-            // Old format: no peer-IP block.
-            let req = crate::tunnel::parse_http_request_bytes(&bytes[cursor..])?;
-            (None, req)
-        }
-    };
-
-    Ok(TunnelHttpFrame {
-        request,
-        target,
-        host_mode,
-        host_custom,
-        is_upgrade,
-        is_streaming,
-        peer_ip,
-    })
-}
-
-fn host_mode_byte(mode: HostMode) -> u8 {
-    match mode {
-        HostMode::Passthrough => FRAME_HOST_PASSTHROUGH,
-        HostMode::Backend => FRAME_HOST_BACKEND,
-        HostMode::Custom => FRAME_HOST_CUSTOM,
-    }
-}
-
 // ── is_streaming_request ──────────────────────────────────────
 
 /// Detect if `request` expects a streaming response that should
@@ -716,8 +338,9 @@ fn host_mode_byte(mode: HostMode) -> u8 {
 ///
 /// Future extensions (chunked responses, custom headers, path
 /// patterns) can be added here without touching the transport
-/// layer. The `is_streaming` flag in `TunnelHttpFrame` is what
-/// ultimately decides the dispatch; this helper just sets it.
+/// layer. The flag only decides how the response is *accounted*
+/// for — since issue #153 both the direct and the tunnelled path
+/// stream the response natively.
 pub fn is_streaming_request(request: &HttpRequest) -> bool {
     request.headers.iter().any(|(k, v)| {
         (k.eq_ignore_ascii_case("Accept") || k.eq_ignore_ascii_case("Content-Type"))
@@ -1301,128 +924,9 @@ mod tests {
         assert!(parse_backend_to_target("office:mailto:foo@bar.com").is_err());
     }
 
-    // I-7
-    #[test]
-    fn tunnel_frame_roundtrip() {
-        for mode in [HostMode::Passthrough, HostMode::Backend, HostMode::Custom] {
-            let custom = if mode == HostMode::Custom {
-                Some("custom.example.com".into())
-            } else {
-                None
-            };
-            // Build a frame; `encode_http_request` will auto-add
-            // a `Content-Length: 7` for the body, so after the
-            // round-trip we expect the request to carry that
-            // header. The test compares the **decoded** frame
-            // against a frame that already has Content-Length.
-            let mut request = mk(
-                "POST",
-                "http://10.0.0.1:9000/chat?x=1",
-                &[
-                    ("Host", "10.0.0.1:9000"),
-                    ("Content-Type", "application/json"),
-                ],
-                b"{\"a\":1}",
-            );
-            request
-                .headers
-                .push(("Content-Length".to_string(), "7".to_string()));
-            let target = BackendTarget::Http {
-                host: "10.0.0.1".into(),
-                port: 9000,
-                base_path: String::new(),
-            };
-            let frame = TunnelHttpFrame {
-                request,
-                target,
-                host_mode: mode,
-                host_custom: custom.clone(),
-                is_upgrade: true,
-                is_streaming: false,
-                peer_ip: None,
-            };
-            let bytes = encode_tunnel_frame(&frame);
-            let decoded = decode_tunnel_frame(&bytes).unwrap();
-            assert_eq!(decoded, frame);
-        }
-        // Also test no-custom / non-upgrade, no body. The
-        // encoder auto-adds `Content-Length: 0` for empty-body
-        // requests, so build that into the expected frame.
-        let mut request = mk("GET", "/", &[("Host", "x")], &[]);
-        request
-            .headers
-            .push(("Content-Length".to_string(), "0".to_string()));
-        let target = BackendTarget::Http {
-            host: "127.0.0.1".into(),
-            port: 80,
-            base_path: String::new(),
-        };
-        let frame = TunnelHttpFrame {
-            request,
-            target,
-            host_mode: HostMode::Passthrough,
-            host_custom: None,
-            is_upgrade: false,
-            is_streaming: false,
-            peer_ip: None,
-        };
-        let bytes = encode_tunnel_frame(&frame);
-        let decoded = decode_tunnel_frame(&bytes).unwrap();
-        assert_eq!(decoded, frame);
-    }
-
-    /// The frame's IP field carries the TCP peer (`peer_ip`). It was
-    /// renamed from `client_ip` when its meaning changed — the
-    /// **wire layout must not change**, so an old peer still reads
-    /// the value (and a frame without the block still decodes).
-    #[test]
-    fn tunnel_frame_peer_ip_roundtrips_with_unchanged_wire_layout() {
-        let request = mk("GET", "/", &[("Host", "x")], &[]);
-        let target = BackendTarget::Http {
-            host: "127.0.0.1".into(),
-            port: 80,
-            base_path: String::new(),
-        };
-        let frame = TunnelHttpFrame {
-            request,
-            target,
-            host_mode: HostMode::Passthrough,
-            host_custom: None,
-            is_upgrade: false,
-            is_streaming: false,
-            peer_ip: Some("203.0.113.7".into()),
-        };
-        let bytes = encode_tunnel_frame(&frame);
-        let decoded = decode_tunnel_frame(&bytes).unwrap();
-        assert_eq!(decoded.peer_ip.as_deref(), Some("203.0.113.7"));
-
-        // Pin the wire layout: the peer value sits immediately
-        // before the request bytes, behind a presence byte (1) and a
-        // 2-byte big-endian length. A frame that omits the block
-        // decodes back to `None` (the old-format branch).
-        let req_bytes = crate::tunnel::encode_http_request(&frame.request);
-        let req_start = bytes.len() - req_bytes.len();
-        // Layout: [presence(1)][length(2 BE)][value(11)][request...]
-        assert_eq!(bytes[req_start - 14], 1, "peer presence byte");
-        assert_eq!(
-            u16::from_be_bytes([bytes[req_start - 13], bytes[req_start - 12]]),
-            11,
-            "peer length prefix"
-        );
-        assert_eq!(&bytes[req_start - 11..req_start], b"203.0.113.7");
-
-        // Old format: no peer block at all → `None`.
-        let mut old = frame.clone();
-        old.peer_ip = None;
-        let old_bytes = encode_tunnel_frame(&old);
-        let decoded_old = decode_tunnel_frame(&old_bytes).unwrap();
-        assert_eq!(decoded_old.peer_ip, None);
-    }
-
     // is_streaming_request: heuristics for SSE / streaming responses.
-    // Used by ngx to flip `TunnelHttpFrame::is_streaming = true`,
-    // which routes the request to the byte-relay path instead of
-    // the buffering HttpResponse path.
+    // Used by ngx to mark the request as a stream, so the traffic
+    // histogram ignores the hang time of a long-lived response.
     #[test]
     fn is_streaming_request_detects_text_event_stream() {
         // Accept header matches → streaming

@@ -152,6 +152,19 @@ fn main() -> anyhow::Result<()> {
     // operators set it to e.g. 127.0.0.1:9001 to keep tun clients on
     // this host only.
     let tunnel_addr = config.tunnel.addr.clone();
+    // The QUIC listener binds the **same port number** as the
+    // WebSocket/TCP tunnel listener, over UDP. TCP and UDP have
+    // separate port spaces, so no new configuration key is needed.
+    // A failure to bind it is not fatal: the gateway logs a warning
+    // and keeps serving the WebSocket/TCP tunnel.
+    let tunnel_quic_addr: std::net::SocketAddr = tunnel_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid tunnel server address {tunnel_addr:?}: {e}"))?;
+    // The QUIC certificate lives with the rest of the gateway's key
+    // material, so a restart does not change it (the tun pins its
+    // fingerprint).
+    let tunnel_quic_cert_dir =
+        pangolin_core::tunnel::quic::certificate_dir(std::path::Path::new(&config.acme.cert_dir));
 
     let host_result = runtime::block_on_host(async move {
         // OS signal handlers cancel the shared token.
@@ -181,6 +194,11 @@ fn main() -> anyhow::Result<()> {
         let services: Vec<Box<dyn runtime::Service>> = vec![
             Box::new(acme::AcmeService::new(acme_for_service)),
             Box::new(tunnel::TunnelService::new(tunnel_addr)),
+            // The QUIC tunnel endpoint — the primary transport.
+            Box::new(tunnel::quic::QuicService::new(
+                tunnel_quic_addr,
+                tunnel_quic_cert_dir,
+            )),
             // Issue #122: keep the providers' published source-IP
             // ranges fresh — the origin guard compares the TCP peer
             // against them.
