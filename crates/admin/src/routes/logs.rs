@@ -1949,6 +1949,158 @@ mod tests {
         );
     }
 
+    // ── Not-ready badge (issue #158) ─────────────────────────────────
+
+    /// The badge on the panel header states how many bot address
+    /// lists are not ready — a bot whose list is missing fails closed,
+    /// so its traffic never reaches the log below.
+    #[test]
+    fn verification_panel_badges_the_bot_lists_that_are_not_ready() {
+        let health = BotVerificationHealth {
+            bots: vec![
+                BotVerificationStatus {
+                    name: "coldbot".into(),
+                    vendor: "Example".into(),
+                    category: BotCategory::Monitoring,
+                    state: BotVerificationState::Cold,
+                    prefixes: 0,
+                    error_kind: None,
+                    error_message: None,
+                },
+                BotVerificationStatus {
+                    name: "failedbot".into(),
+                    vendor: "Example".into(),
+                    category: BotCategory::Monitoring,
+                    state: BotVerificationState::Failed,
+                    prefixes: 0,
+                    error_kind: Some(BotRefreshErrorKind::Unreachable),
+                    error_message: Some("vendor refused us".into()),
+                },
+                BotVerificationStatus {
+                    name: "readybot".into(),
+                    vendor: "Example".into(),
+                    category: BotCategory::Monitoring,
+                    state: BotVerificationState::Ready,
+                    prefixes: 12,
+                    error_kind: None,
+                    error_message: None,
+                },
+            ],
+            config_errors: vec![],
+            rdns_overflow: 0,
+            available: true,
+        };
+        let html = render_bots_with_health(health);
+
+        assert!(
+            html.contains("data-not-ready=\"2\""),
+            "the not-ready badge missing: {html}"
+        );
+        assert!(
+            html.contains("bot lists not ready"),
+            "the badge label missing: {html}"
+        );
+        // The count is rendered as the badge's own number …
+        assert!(
+            html.contains(
+                "<span class=\"font-semibold tabular-nums\">2</span> bot lists not ready"
+            ),
+            "the badge count missing: {html}"
+        );
+        // … and the badge states the consequence.
+        assert!(
+            html.contains(
+                "A bot whose address list is missing or whose last refresh failed may fail closed: \
+                 its traffic stays out of the log and it gets no rate-limit exemption."
+            ),
+            "the badge tooltip missing: {html}"
+        );
+    }
+
+    /// A single not-ready bot is badged with a count of one — the
+    /// badge counts, it does not merely warn.
+    #[test]
+    fn verification_panel_badge_counts_a_single_not_ready_bot() {
+        let html = render_bots_with_health(health_with_problems());
+
+        assert!(
+            html.contains("data-not-ready=\"1\""),
+            "the not-ready badge missing: {html}"
+        );
+        assert!(
+            html.contains("bot lists not ready"),
+            "the badge label missing: {html}"
+        );
+    }
+
+    /// Every list loaded → no badge. The panel keeps saying `All IP
+    /// lists loaded`; a badge here would contradict it.
+    #[test]
+    fn verification_panel_omits_the_badge_when_every_list_is_loaded() {
+        let health = BotVerificationHealth {
+            bots: vec![BotVerificationStatus {
+                name: "googlebot".into(),
+                vendor: "Google".into(),
+                category: BotCategory::SearchEngine,
+                state: BotVerificationState::Ready,
+                prefixes: 42,
+                error_kind: None,
+                error_message: None,
+            }],
+            config_errors: vec![],
+            rdns_overflow: 0,
+            available: true,
+        };
+        let html = render_bots_with_health(health);
+
+        assert!(html.contains("All IP lists loaded"));
+        assert!(
+            !html.contains("data-not-ready"),
+            "no badge when every list is loaded: {html}"
+        );
+        assert!(
+            !html.contains("bot lists not ready"),
+            "no badge when every list is loaded: {html}"
+        );
+    }
+
+    /// No verifier attached → no badge. The panel says the status is
+    /// unavailable; it must not claim that a list is missing.
+    #[test]
+    fn verification_panel_omits_the_badge_without_a_verifier() {
+        let html = render_bots_with_health(BotVerificationHealth::default());
+
+        assert!(
+            !html.contains("data-not-ready"),
+            "no badge without a verifier: {html}"
+        );
+        assert!(
+            !html.contains("bot lists not ready"),
+            "no badge without a verifier: {html}"
+        );
+    }
+
+    /// A broken operator config file is not a missing address list —
+    /// the count is about lists, so the badge stays hidden and the
+    /// file is still listed in the table.
+    #[test]
+    fn verification_panel_omits_the_badge_for_a_config_error_alone() {
+        let mut health = health_with_problems();
+        health
+            .bots
+            .retain(|b| b.state == BotVerificationState::Ready);
+        let html = render_bots_with_health(health);
+
+        assert!(
+            html.contains("did not find expected key"),
+            "the config error must still be listed: {html}"
+        );
+        assert!(
+            !html.contains("data-not-ready"),
+            "a config error is not a missing address list: {html}"
+        );
+    }
+
     // ── /logs/bots/history (stage-3) ─────────────────────────────────
 
     /// Build a `BotLogEntry` directly with a static bot identity +

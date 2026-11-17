@@ -362,6 +362,20 @@ impl BotVerificationHealth {
         self.count(BotVerificationState::Failed)
     }
 
+    /// The bots whose address space is not loaded — cold (never
+    /// downloaded) or failed (the last refresh failed).
+    ///
+    /// Such a bot may fail closed: its traffic stays out of the bot
+    /// log and it gets no rate-limit exemption. The count equals
+    /// `problem_bots().len()` — the same set the admin panel lists as
+    /// needing attention — so the badge and the table can never
+    /// disagree. `Ready` bots and `config_errors` are not counted:
+    /// the count is about address *lists*, not about broken operator
+    /// files.
+    pub fn not_ready_count(&self) -> usize {
+        self.cold_count() + self.failed_count()
+    }
+
     /// The bots that need the operator's attention — everything that
     /// is not `Ready`.
     pub fn problem_bots(&self) -> Vec<&BotVerificationStatus> {
@@ -840,5 +854,46 @@ mod tests {
         assert_eq!(health.config_errors[0].path, broken.display().to_string());
         assert!(!health.config_errors[0].message.is_empty());
         assert!(health.needs_attention());
+    }
+
+    /// The not-ready count — the badge on the admin panel's
+    /// "Verification status" header (issue #158).
+    ///
+    /// It counts the bots whose address list is missing (`Cold`) or
+    /// whose last refresh failed (`Failed`), and nothing else: a
+    /// `Ready` bot has a loaded list, and a config error is a broken
+    /// operator file, not a missing address list.
+    #[test]
+    fn not_ready_count_counts_the_cold_and_the_failed_bots() {
+        fn bot(name: &str, state: BotVerificationState) -> BotVerificationStatus {
+            BotVerificationStatus {
+                name: name.into(),
+                vendor: "Example".into(),
+                category: BotCategory::Monitoring,
+                state,
+                prefixes: 0,
+                error_kind: None,
+                error_message: None,
+            }
+        }
+
+        let health = BotVerificationHealth {
+            bots: vec![
+                bot("coldbot", BotVerificationState::Cold),
+                bot("failedbot", BotVerificationState::Failed),
+                bot("readybot", BotVerificationState::Ready),
+            ],
+            config_errors: vec![BotConfigError {
+                path: "/var/lib/pangolin/cache/conf.d/broken.yaml".into(),
+                message: "parse bot config broken.yaml: did not find expected key".into(),
+            }],
+            rdns_overflow: 0,
+            available: true,
+        };
+
+        assert_eq!(health.not_ready_count(), 2);
+        // The badge and the panel's table list the same set — they
+        // can never disagree.
+        assert_eq!(health.not_ready_count(), health.problem_bots().len());
     }
 }

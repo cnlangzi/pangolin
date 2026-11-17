@@ -92,7 +92,9 @@ mapping from the crate's `BotKind` to those five buckets lives here, in the
 consumer — the library carries no admin vocabulary.
 `verification_health()` maps the validator's state onto plain data
 (`BotVerificationHealth`) for the admin crate, which does not depend on
-`knownbots`.
+`knownbots`. `BotVerificationHealth::not_ready_count()` is the count the
+admin panel's badge shows — `cold_count() + failed_count()`, i.e. every
+bot whose address list is not loaded (issue #158).
 
 ### `crates/pangolin-core/src/bot_log.rs`
 
@@ -214,6 +216,26 @@ nothing needs attention the panel says `All IP lists loaded`. The
 overflowed; the count is a since-startup total, and only the lookups
 that were dropped failed closed — once the queue drains, later requests
 are verified normally.
+
+The panel's header carries an **amber badge** reading `N bot lists not
+ready` whenever at least one bot's address list is missing or its last
+refresh failed (issue #158). The count is `cold_count() +
+failed_count()` — the same set the table lists as needing attention, so
+the badge and the table can never disagree. A `Ready` bot has a loaded
+list and a broken operator config file is not an address list, so
+neither is counted. The badge is absent when every list is loaded and
+when no verifier is attached (the panel then says `Verification status
+unavailable`); it is server-rendered like the rest of the panel and is
+never pushed over the SSE feed.
+
+The badge carries the count because the degraded state is otherwise easy
+to miss: the `ready` / `cold` / `failed` counts read as part of a
+sentence, the table sits below the fold on a small screen, and the panel
+is only reached by opening the bots page at all. Its tooltip states the
+consequence — a bot whose list is missing may fail closed, so its
+traffic stays out of the log and it gets no rate-limit exemption. The
+wording is "may fail closed" because a `Failed` bot whose prefix set is
+still loaded keeps verifying from that cache.
 
 A bot config file under `<log.bot.cache_dir>/conf.d/` that cannot be
 turned into a bot — a YAML syntax error, or a document without the
@@ -344,6 +366,7 @@ duckdb -c "
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
 | Unit | `knownbots::model::registry::tests::*` (in the crate's own repository, issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **or incomplete** **embedded** config stays fatal, and every shipped embedded config is complete; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
 | Unit | `knownbots::model::registry::tests::embedded_bot_configs_satisfy_the_contract` (in the crate's own repository, issue #137) | The embedded bot configs satisfy the six-rule contract — unique + non-empty `name`, non-empty `ua`, a known parser for every URL-backed bot, a usable domain list for every RDNS bot, valid `custom:` CIDRs, and every `conf.d/` file compiled into `EMBEDDED_CONFIGS`. Offline; reports every violation in one message. `domain_usability_mirrors_the_ptr_comparison` pins the domain check against the PTR comparison it stands in for. See [`knownbots.md`](./knownbots.md) |
-| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None`; a failed bot with a loaded prefix set still verifies and the panel row says how many prefixes are still in use; the `BotKind` → bucket mapping covers every kind, the `adsbot` / `mediapartners` monitors land in `ads_bot`, and the five wire labels are unchanged (issue #146) |
+| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None`; a failed bot with a loaded prefix set still verifies and the panel row says how many prefixes are still in use; the `BotKind` → bucket mapping covers every kind, the `adsbot` / `mediapartners` monitors land in `ads_bot`, and the five wire labels are unchanged (issue #146); `not_ready_count()` counts the cold and the failed bots, ignores the ready ones and the config errors, and equals `problem_bots().len()` (issue #158) |
 | Unit | `pangolin_integration_tests::knownbots_dependency` (issue #146) | The in-tree copy of the crate is gone and is not a workspace member; `pangolin-core` depends on the published crate from the registry (not a path), with the `full` feature enabled; the lockfile resolves `knownbots 0.3.0` from crates.io |
 | Unit | `admin::routes::logs::tests::*` (issue #136) | The `/logs/bots` page renders the verification panel with its three counts; a failed bot shows its kind + message; a config error shows its path + reason; a healthy bot is not listed; `All IP lists loaded` when nothing needs attention; the `RDNS lookups dropped` line only when the count is non-zero |
+| Unit | `admin::routes::logs::tests::*` (issue #158) | The panel header badges the bot address lists that are not ready — `data-not-ready="<count>"`, the count itself and the "may fail closed" tooltip; the badge is absent when every list is loaded, when no verifier is attached, and when only an operator config file is broken |
