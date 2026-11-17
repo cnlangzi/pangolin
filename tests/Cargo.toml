@@ -58,7 +58,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tokio-rustls = "0.26"
 
 # Real-binary e2e harness: self-signed cert generation
-rcgen = "0.14"
+rcgen.workspace = true
 
 [features]
 integration = []
