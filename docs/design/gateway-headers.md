@@ -2,7 +2,7 @@
 
 > **Status:** implemented (issue #115)
 > **Code:** `crates/pangolin-core/src/pgl.rs`, `crates/pangolin-core/src/client_ip.rs`,
-> `crates/ngx/src/proxy.rs`, `crates/tun/src/client.rs`
+> `crates/ngx/src/proxy.rs`, the `pangolin-tun` crate (the tun-side client)
 
 > **⚠ Breaking change (issue #131):** `P-Known-Bot` no longer carries
 > `1` / `0`. It carries the verified bot's **registry id**

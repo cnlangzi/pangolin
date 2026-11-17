@@ -13,6 +13,28 @@ For configuration of the tunnel listener and client, see
 [`configuration.md`](../configuration.md).
 For out-of-band DB edit reload, see [`admin/reload-api.md`](../admin/reload-api.md).
 
+## Where the protocol lives
+
+The tunnel's **wire protocol** and the **tunnel client** are the
+published crate [`pangolin-tun`](https://crates.io/crates/pangolin-tun),
+developed in `github.com/cnlangzi/pangolin-tun`. This repository
+consumes it from crates.io — the same way it consumes `knownbots` and
+`badbots` — so the two ends of the protocol are versioned together
+with the crate and a second implementation of the protocol has
+something published to build against.
+
+What stays in this repository is the **gateway's** side of the tunnel
+(`crates/ngx/src/tunnel/`) and the **tun's configuration and binary**
+(`crates/tun/`): the accept loops, the token validation, the session
+registry and the pingora L4 connector are the gateway's own code, and
+`tun.yml` is the operator's file. The crate carries the codecs, the
+two transports, the trust-on-first-use pin store and the client
+itself; the `tun` binary hands it typed values and runs it.
+
+A contract test (`tests/src/pangolin_tun_dependency.rs`) pins the
+dependency: it fails the build if a second copy of the protocol ever
+appears in this repository.
+
 ---
 
 ## The shape
@@ -59,21 +81,21 @@ When the gateway's direction reaches end-of-file the tun shuts the
 backend socket's **write** side down and keeps reading, and the other
 way round. A response that only arrives after the request is complete
 still reaches the client. The relay in
-`pangolin_core::tunnel::relay_bidirectional` implements this
+`pangolin_tun::relay_bidirectional` implements this
 explicitly; the regression test
 `relay_keeps_the_response_direction_open_after_the_request_ends`
 pins it.
 
 ## The transports
 
-One trait in `crates/pangolin-core/src/tunnel.rs` opens a tunnel's byte
+One trait in the published `pangolin-tun` crate opens a tunnel's byte
 streams:
 
 ```rust
 #[async_trait]
 pub trait TunnelTransport: Send + Sync {
-    async fn open_stream(&self) -> pangolin_core::Result<TunnelStream>;
-    async fn accept_stream(&self) -> Option<pangolin_core::Result<TunnelStream>>;
+    async fn open_stream(&self) -> pangolin_tun::Result<TunnelStream>;
+    async fn accept_stream(&self) -> Option<pangolin_tun::Result<TunnelStream>>;
     fn kind(&self) -> TransportKind;
 }
 ```

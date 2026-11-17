@@ -18,26 +18,18 @@ chrono.workspace = true
 env_logger.workspace = true
 sha2.workspace = true
 tokio = { workspace = true }
-futures.workspace = true
-futures-util.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
-# Tunnel transport (issue #39): yamux over fastwebsockets, plus
-# permessage-deflate (built into fastwebsockets) and rustls for
-# wss:// on the tun side.
-tokio-yamux.workspace = true
-fastwebsockets.workspace = true
+# The tunnel's wire protocol, its two transports and the TOFU pin
+# store (issue #159). The crate is published — see the root
+# Cargo.toml — so this repository no longer carries a second copy of
+# the protocol that could drift away from it.
+pangolin-tun.workspace = true
+# rustls stays: this crate installs the process-level crypto provider
+# (`install_crypto_provider`), and nothing here builds a TLS config
+# without one.
 rustls.workspace = true
-webpki-roots.workspace = true
-# QUIC transport (issue #153): the tunnel's primary transport.
-quinn.workspace = true
-# Self-signed certificate for the gateway's QUIC endpoint (issue #153).
-rcgen.workspace = true
-# Manual WS upgrade helpers (Sec-WebSocket-Key / Accept).
-sha1 = "0.10"
-base64 = "0.22"
-rand = "0.8"
 
 # Static-file serving helpers used by file:// backends.
 mime_guess.workspace = true

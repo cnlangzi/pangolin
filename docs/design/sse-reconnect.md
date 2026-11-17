@@ -101,7 +101,7 @@ product or implement `Last-Event-ID` in their own backend.
 
 | File | Change | Reason |
 |---|---|---|
-| `crates/tun/src/client.rs:621-628` | Match on `copy` result. On `Err`, call `backend.shutdown().await` before returning. | Close backend TCP promptly when yamux peer disappears. Mirrors `pump_ws_relay`'s "read failure → peer shutdown" pattern. |
+| `pangolin-tun` crate (the tun-side client, issue #159) | Match on `copy` result. On `Err`, call `backend.shutdown().await` before returning. | Close backend TCP promptly when yamux peer disappears. Mirrors `relay_bidirectional`'s "read failure → peer shutdown" pattern. |
 | `crates/ngx/src/proxy.rs:1205` | Comment block above the body loop. **No code change.** | Lock the contract that `StreamHandle::drop` sends RST (not FIN), and that calling `shutdown().await` explicitly here would be *worse*, not better. |
 | `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend TCP closes within 2 s of client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — direct path skips the tun/yamux hops, so it should propagate faster). |
 | `docs/design/sse-reconnect.md` | This document | Record the contract. |
@@ -246,12 +246,12 @@ Observability
 
 ## References
 
-- `crates/tun/src/client.rs::handle_streaming_response` — tun-side
-  unidirectional copy loop
+- `pangolin_tun::relay_bidirectional` — tun-side copy loop (the tun's
+  client moved to the published `pangolin-tun` crate in issue #159)
 - `crates/ngx/src/proxy.rs::handle_streaming_request` — ngx-side body
   forwarding loop
-- `crates/pangolin-core/src/tunnel.rs::pump_ws_relay` — reference
-  pattern for "read failure → peer shutdown"
+- `pangolin_tun::relay_bidirectional` — reference pattern for
+  "read failure → peer shutdown"
 - `tests/src/sse_e2e.rs::real_e2e_tunnel_sse_client_disconnect_propagates_to_backend`
   — the new e2e test
 - `tokio-yamux-0.3.18/src/stream.rs:597` — `Drop for StreamHandle`,

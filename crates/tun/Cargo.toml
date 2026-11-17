@@ -15,25 +15,21 @@ name = "tun"
 path = "src/lib.rs"
 
 [dependencies]
-tokio.workspace = true
-fastwebsockets.workspace = true
-tokio-yamux.workspace = true
 # The tun is a byte relay (issue #153): it no longer speaks HTTP, so
 # it needs neither `pingora-core` nor `pingora-http` — and no HTTP
-# types either. The tunnel's byte-stream interface lives in
-# `pangolin-core`.
-async-trait.workspace = true
-futures.workspace = true
-futures-util.workspace = true
+# types either.
+tokio.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 figment.workspace = true
 log.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 clap.workspace = true
-chrono.workspace = true
+# The tunnel's wire protocol and its client (issue #159). The crate
+# is published — see the root Cargo.toml — so the tun binary is the
+# configuration and the entry point, and the client itself lives
+# there.
+pangolin-tun.workspace = true
 pangolin-core = { path = "../pangolin-core" }
 
 [dev-dependencies]
@@ -41,5 +37,3 @@ pangolin-core = { path = "../pangolin-core" }
 # config tests to sandbox `TUN_*` env vars that the Makefile's
 # `.env`-export step would otherwise leak in.
 figment = { workspace = true, features = ["test"] }
-# The fallback-policy tests write their state files into a temp dir.
-tempfile = { workspace = true }

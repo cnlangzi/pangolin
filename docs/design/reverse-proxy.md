@@ -205,7 +205,7 @@ which are not the same kind of operation. A `file://` backend
 ### 4.5 The tunnel — a byte splice (issue #153)
 
 ```rust
-// pangolin-core/src/tunnel.rs
+// pangolin-tun (the published crate, issue #159)
 /// Wire-format version of the tunnel protocol.
 pub const TUNNEL_PROTOCOL_VERSION: u32 = 2;
 
@@ -417,7 +417,9 @@ TLS). The server framework (`ProxyHttp`, `Server`, workers) is
 file rejection, `index.html`/`index.htm` probing, ETag,
 `If-None-Match` / `If-Modified-Since`, Range, MIME via
 `mime_guess`). The tun side had a *different*, **buggy** file
-handler ([`crates/tun/src/client.rs:472-540`](../../crates/tun/src/client.rs))
+handler (the [`pangolin-tun`](https://crates.io/crates/pangolin-tun)
+crate, which carried the tun-side client before issue #159 moved it
+out of this repository)
 that ran on tun's local fs but skipped the path-traversal guard
 and used ad-hoc semantics.
 
@@ -621,11 +623,11 @@ To keep the scope tight:
 | `crates/ngx/src/proxy.rs` | **rewrite** | `request_filter` routes; `upstream_peer` returns either a direct peer or a **tunnel peer** (a `custom_l4` connector); `upstream_request_filter` calls `apply_proxy_policy` for every backend; `serve_static_file` removed (replaced by `serve_file_target`) |
 | `crates/ngx/src/tunnel.rs` | unchanged | handshake/auth logic stays |
 | `crates/ngx/Cargo.toml` | unchanged | `pangolin-core` is already a dependency |
-| `crates/tun/src/client.rs` | **rewrite** | The tun is a **byte relay** (issue #153): it reads the `CONNECT <host>:<port>` instruction, dials the target, answers `OK` / `ERR` and copies the bytes. The `pingora-core` / `pingora-http` dependencies are gone — the tun no longer speaks HTTP. |
+| `pangolin-tun` crate (the tun-side client) | **rewrite** | The tun is a **byte relay** (issue #153): it reads the `CONNECT <host>:<port>` instruction, dials the target, answers `OK` / `ERR` and copies the bytes. The `pingora-core` / `pingora-http` dependencies are gone — the tun no longer speaks HTTP. |
 | `crates/tun/Cargo.toml` | edit | drop `pingora-core` / `pingora-http` (issue #153: the tun no longer speaks HTTP) |
 | `tests/src/real_e2e.rs` | **extend** | new cases per invariant table (§10) |
 | `tests/src/ws_relay_e2e.rs` | **extend** | new WS-upgrade-through-tunnel cases |
-| `crates/pangolin-core/src/tunnel.rs` | unchanged | existing wire types and codec stay |
+| `pangolin-tun` crate (the wire protocol) | unchanged | existing wire types and codec stay |
 | `crates/pangolin-core/src/parse.rs` | unchanged | `parse_backend` stays; we wrap it |
 | `crates/pangolin-core/src/types.rs` | unchanged | `HostMode` already there |
 | DB schema | unchanged | `sites.host_mode` already there |

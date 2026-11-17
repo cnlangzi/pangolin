@@ -55,10 +55,6 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # permessage-deflate is built-in, zero-copy frame parsing)
 fastwebsockets = { version = "0.10", features = ["upgrade"] }
 
-# Multiplexing (issue #39: yamux over the fastwebsockets byte stream
-# for HTTP/1.1 byte pipe + WS relay as byte pipe)
-tokio-yamux = { version = "0.3", default-features = false, features = ["tokio-timer"] }
-
 # QUIC transport for the tunnel (issue #153). The primary transport
 # carries the tunnel's byte streams over one connection per tun, one
 # bidirectional stream per request — and encrypts them by default.
@@ -71,7 +67,6 @@ quinn = { version = "0.11", default-features = false, features = [
     "log",
 ] }
 
-futures = "0.3"
 futures-util = "0.3"
 
 # parking_lot::Mutex / RwLock are used in two places:
@@ -100,10 +95,6 @@ serde_yaml = "0.9"
 # hand-rolled `expand_env_vars` + `serde_yaml::from_str` path.
 figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 
-# TLS root store for tun `tls.verify=true`. webpki-roots bundles Mozilla CA
-# roots so tun clients can validate production certs without operator setup.
-webpki-roots = "0.26"
-
 # Hashing — issue #39 stores `tun.token` as `sha256(token)` hex (V3 migration).
 sha2 = "0.10"
 
@@ -131,6 +122,24 @@ knownbots = { version = "0.3.0", features = ["full"] }
 # providers (AbuseIPDB, CrowdSec). A provider is only *queried* when
 # the gateway enables it — see `pangolin_core::badbots`.
 badbots = { version = "0.1.4", features = ["full"] }
+
+# The tunnel's wire protocol and its client (issue #159). The crate is
+# published (github.com/cnlangzi/pangolin-tun), not part of this
+# workspace: the protocol, the two transports, the TOFU pin store and
+# the client all live there, and this repository consumes them from
+# the registry the way it consumes `knownbots` and `badbots`.
+#
+# The requirement is a caret on the 0.1 line — a future 0.2 release
+# would carry a protocol change, so it must not be picked up silently.
+#
+# The crate pins `base64 0.23` and `thiserror 2` while this workspace
+# asks for `base64 0.22` and `thiserror 1`, so the tree carries two
+# copies of each. The duplication is harmless: none of the crate's
+# public API is a `base64` or a `thiserror` type, so the two copies
+# never meet at a type boundary. Aligning the workspace on the
+# crate's versions would remove the duplication but is a workspace-wide
+# change that belongs in its own pull request.
+pangolin-tun = { version = "0.1" }
 
 log = "0.4"
 env_logger = "0.11"

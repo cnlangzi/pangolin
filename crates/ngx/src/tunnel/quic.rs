@@ -30,18 +30,14 @@ use std::sync::Arc;
 use log::{info, warn};
 use tokio::io::AsyncWriteExt;
 
-use pangolin_core::tunnel::quic::{QuicBiStream, QuicCert, QuicServerTransport, bind_endpoint};
-use pangolin_core::tunnel::{
-    TUNNEL_PROTOCOL_VERSION, TunnelTransport, decode_auth, encode_auth_reply,
-    protocol_version_mismatch, read_crlf_line,
+use pangolin_tun::{
+    QuicBiStream, QuicCert, QuicServerTransport, TUNNEL_PROTOCOL_VERSION, TunnelTransport,
+    bind_endpoint, decode_auth, encode_auth_reply, protocol_version_mismatch, read_crlf_line,
 };
 
 use crate::App;
 use crate::runtime::{Service, ServiceContext};
 use crate::tunnel::validate_token;
-
-/// Largest control line the gateway accepts from a tun.
-const MAX_CONTROL_LINE: usize = 4096;
 
 /// How long the gateway waits for the tun's `AUTH` control line.
 ///
@@ -153,7 +149,7 @@ async fn handle_quic_client(app: Arc<App>, connection: quinn::Connection) -> any
 
     let line = tokio::time::timeout(
         std::time::Duration::from_secs(AUTH_TIMEOUT_SECS),
-        read_crlf_line(&mut control, MAX_CONTROL_LINE),
+        read_crlf_line(&mut control),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the tun did not send an AUTH line in time"))?

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pangolin_tun::TunnelTransport;
 use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -22,7 +23,6 @@ use crate::referer_log::{RefererLogBuffer, RefererLogEntry, RefererLogWriter};
 use crate::referer_stats::RefererStats;
 use crate::reputation::build_library;
 use crate::traffic::TrafficHub;
-use crate::tunnel::TunnelTransport;
 use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
     config::Config,

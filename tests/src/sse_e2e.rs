@@ -1,8 +1,8 @@
 //! Server-Sent Events (SSE) and streaming-response e2e tests
 //! through the tunnel.
 //!
-//! Background: the standard HTTP path in
-//! `crates/tun/src/client.rs::handle_http_request` buffers the
+//! Background: the standard HTTP path in the tun's HTTP handler
+//! (the pre-#153 client, now gone) buffers the
 //! entire response body in memory via
 //! `encode_http_response(HttpResponse { body: Vec<u8>, ... })`
 //! and reads `Content-Length` / `Transfer-Encoding: chunked` to
@@ -491,8 +491,8 @@ async fn real_e2e_tunnel_sse_streams_through() {
 ///
 /// ## Regression test for two related DNS-resolution bugs
 ///
-/// the tun-side relay in `crates/tun/src/client.rs` has to dial the
-/// backend by
+/// the tun-side relay in the published `pangolin-tun` crate has to
+/// dial the backend by
 /// authority string. The historical bugs and the corresponding
 /// fixes are:
 ///
@@ -1125,7 +1125,7 @@ async fn real_e2e_tunnel_sse_preserves_keepalive_comments() {
 #[test]
 fn is_streaming_request_detects_text_event_stream() {
     use pangolin_core::is_streaming_request;
-    use pangolin_core::tunnel::HttpRequest;
+    use pangolin_core::proxy::HttpRequest;
 
     let mk = |accept: &str| HttpRequest {
         method: "GET".into(),
