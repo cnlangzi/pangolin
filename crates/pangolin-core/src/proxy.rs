@@ -49,9 +49,12 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-/// Strip RFC 7230 §6.1 hop-by-hop headers. Called by the ngx
-/// side before re-serialising the HTTP request bytes to the
-/// backend.
+/// Strip RFC 7230 §6.1 hop-by-hop headers.
+///
+/// Called by [`apply_proxy_policy`] — the only caller that re-writes
+/// the request on its way upstream. The tunnel is a byte splice
+/// (issue #153), so nothing re-serialises the request bytes on the
+/// tun's side any more.
 pub fn strip_hop_by_hop_headers(headers: &mut Vec<(String, String)>) {
     fn is_hop_by_hop(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();

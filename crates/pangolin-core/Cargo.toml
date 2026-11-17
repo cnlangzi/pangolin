@@ -26,9 +26,9 @@ async-trait.workspace = true
 # Cargo.toml — so this repository no longer carries a second copy of
 # the protocol that could drift away from it.
 pangolin-tun.workspace = true
-# rustls stays: it is the process-level crypto provider
-# (`install_crypto_provider`), which the ACME client and the QUIC
-# transport both need.
+# rustls stays: this crate installs the process-level crypto provider
+# (`install_crypto_provider`), and nothing here builds a TLS config
+# without one.
 rustls.workspace = true
 
 # Static-file serving helpers used by file:// backends.
