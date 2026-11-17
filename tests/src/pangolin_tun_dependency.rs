@@ -123,6 +123,12 @@ fn the_in_tree_tunnel_protocol_is_gone() {
 /// point of this assertion is the *message*: it names the mistake
 /// (a leftover import of the deleted module) instead of leaving the
 /// reader to work it out from a compiler error somewhere else.
+///
+/// The match is on the **import form**, not on the bare path: this
+/// repository's convention is to name retired paths in prose (a
+/// comment explaining what the tunnel's client used to do), and a
+/// guard that fired on any occurrence would turn such a sentence into
+/// a red build.
 #[test]
 fn no_crate_imports_the_in_tree_tunnel_module() {
     let root = repo_root();
@@ -131,11 +137,21 @@ fn no_crate_imports_the_in_tree_tunnel_module() {
     for file in rust_files(&crates_dir) {
         let source = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        assert!(
-            !source.contains("pangolin_core::tunnel"),
-            "{} still imports pangolin_core::tunnel — the protocol is published as pangolin-tun",
-            file.strip_prefix(&root).unwrap_or(&file).display()
-        );
+        for (number, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let import = trimmed
+                .strip_prefix("pub use ")
+                .or_else(|| trimmed.strip_prefix("use "));
+            let names_the_module = import.is_some_and(|rest| {
+                rest.contains("pangolin_core::tunnel") || rest.contains("pangolin_core::{tunnel")
+            });
+            assert!(
+                !names_the_module,
+                "{}:{} still imports pangolin_core::tunnel — the protocol is published as pangolin-tun",
+                file.strip_prefix(&root).unwrap_or(&file).display(),
+                number + 1
+            );
+        }
     }
 }
 
