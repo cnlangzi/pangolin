@@ -1379,11 +1379,13 @@ async fn real_e2e_tunnel_full() {
 }
 
 /// Auth rejection: `pangolin-tun` connecting with an expired token.
-/// The WS upgrade may complete (the server doesn't gate the upgrade
-/// on auth), but ngx then resets the connection and the tun sees a
-/// "Connection reset without closing handshake" or similar.
-/// Importantly the tun should NOT see "tun office connected" (the
-/// server-side log line emitted only after `validate_token` passes).
+/// The gateway refuses the session: it never logs the "tun office
+/// connected" line (the server-side log line emitted only after
+/// `validate_token` passes) and it says why in its own log.
+///
+/// How the tun *reports* that refusal is the crate's behaviour and is
+/// asserted by `pangolin-tun`'s own suite; what this repository owns
+/// is the gateway's half of the handshake.
 #[tokio::test]
 async fn real_e2e_tunnel_token_rejected() {
     let ngx = NgxProcess::start(|db_path| {
@@ -1397,8 +1399,9 @@ async fn real_e2e_tunnel_token_rejected() {
     })
     .await;
 
-    let tun = TunProcess::start(&ngx, "office", "expired-token").await;
-    let tun_log = tun.log_string();
+    // The tun must stay alive for the gateway to refuse it — drop the
+    // handle and the process is killed before the handshake.
+    let _tun = TunProcess::start(&ngx, "office", "expired-token").await;
     // The tun's "connected to ngx" line is logged on WS handshake
     // completion — that's before auth, so it MAY appear. What we
     // really want to assert is the SERVER side didn't log the
@@ -1409,17 +1412,19 @@ async fn real_e2e_tunnel_token_rejected() {
         "ngx accepted a tun with an expired token. ngx log:\n{}",
         ngx_log
     );
-    // And the connection should be closed shortly after (within
-    // a couple of seconds). The tun client may or may not log a
-    // specific "auth failed" depending on its own error handling,
-    // but it should NOT be happily reading frames indefinitely.
+    // The gateway must have refused it, not merely stayed silent —
+    // the refusal is the gateway's own log line. The log is captured
+    // asynchronously, so wait for the line instead of racing the
+    // capture task.
     assert!(
-        tun_log.to_lowercase().contains("reset")
-            || tun_log.to_lowercase().contains("disconnected")
-            || tun_log.to_lowercase().contains("error")
-            || tun_log.contains("reconnecting"),
-        "expected tun to see connection reset/error/reconnect with bad token. log:\n{}",
-        tun_log
+        crate::harness::wait_for_log(
+            &ngx.log,
+            "tunnel auth failed for office",
+            std::time::Duration::from_secs(5)
+        )
+        .await,
+        "the gateway must log the refused tun, got:\n{}",
+        ngx.log_string()
     );
 }
 

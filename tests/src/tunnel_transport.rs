@@ -9,6 +9,16 @@
 //!
 //! The tests drive the **real** `pangolin-ngx` and `pangolin-tun`
 //! binaries.
+//!
+//! **What this suite asserts, and what it leaves to the crate.**
+//! The tun's own decisions — which transport it picked, whether it
+//! fell back, how it reported a refused gateway — belong to the
+//! `pangolin-tun` crate and are asserted by the crate's own
+//! end-to-end suite. This suite asserts the **product path**: the
+//! request reaching the backend byte-exact, the endless response
+//! arriving, the WebSocket upgrade round-tripping — and, on the
+//! gateway's side, the transport the gateway itself logged. The tun's
+//! log is the tun's; the gateway's log is the gateway's.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -211,15 +221,6 @@ async fn raw_request(
     crate::harness::raw_request(addr, host, method, path, body).await
 }
 
-/// Assert that the tun's log says it is on the expected transport.
-///
-/// The log is captured asynchronously, so the line may not have been
-/// read yet when the assertion runs — wait for it instead of racing
-/// the capture task.
-async fn assert_transport(tun: &TunProcess, expected: &str) {
-    assert_log_contains(&tun.log, "tun", expected).await;
-}
-
 /// Assert that a captured log contains `expected`.
 ///
 /// The log is captured asynchronously — a detached task drains the
@@ -294,8 +295,7 @@ async fn real_e2e_tunnel_quic_http_request() {
         seen[0]
     );
 
-    // The transport must be QUIC on **both** sides.
-    assert_transport(&tun, "over quic").await;
+    // The gateway must report that the session came up over QUIC.
     assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
 }
 
@@ -383,8 +383,8 @@ async fn real_e2e_tunnel_tcp_http_request() {
     let seen = backend.seen().await;
     assert_eq!(seen.len(), 1, "the backend should have seen one request");
 
-    // The transport must be the fallback on **both** sides.
-    assert_transport(&tun, "over the WebSocket/TCP transport").await;
+    // The gateway must report that the session came up over the
+    // WebSocket/TCP transport.
     assert_log_contains(
         &ngx.log,
         "gateway",
@@ -458,11 +458,6 @@ async fn sse_streams_through(transport: &str) {
         backend.seen_request().await,
         "the SSE backend never received the request"
     );
-    if transport == "quic" {
-        assert_transport(&tun, "over quic").await;
-    } else {
-        assert_transport(&tun, "over the WebSocket/TCP transport").await;
-    }
 }
 
 /// A WebSocket upgrade through a tun pinned to **QUIC**.
@@ -548,12 +543,6 @@ async fn ws_upgrade_over(transport: &str) {
         text, "hello",
         "the WS payload must round-trip through the tunnel byte-exact"
     );
-
-    if transport == "quic" {
-        assert_transport(&tun, "over quic").await;
-    } else {
-        assert_transport(&tun, "over the WebSocket/TCP transport").await;
-    }
 }
 
 /// A tun whose **QUIC attempt fails** falls back to the
@@ -561,9 +550,13 @@ async fn ws_upgrade_over(transport: &str) {
 ///
 /// The gateway's QUIC listener cannot bind (the UDP port is occupied
 /// by a socket that never answers), so the QUIC handshake times out
-/// and the tun falls back. The test asserts both that the fallback
-/// happened and that the request still works — a tun that gave up
-/// instead of falling back would fail the second half.
+/// and the tun falls back. The test asserts that the request still
+/// works — a tun that gave up instead of falling back would fail
+/// that — and that the gateway reports its own degraded mode.
+///
+/// The tun's decision to fall back is the crate's behaviour and is
+/// asserted by `pangolin-tun`'s own suite; the gateway's log line is
+/// the gateway's, and stays here.
 #[tokio::test]
 async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
     let backend = EchoBackend::start().await;
@@ -598,9 +591,9 @@ async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
         tun.log_string()
     );
 
-    // The tun must report that it fell back…
-    assert_transport(&tun, "falling back to the WebSocket/TCP transport").await;
-    // …and the gateway must report that it could not bind QUIC and
-    // is serving the WebSocket/TCP tunnel only.
+    // The gateway must report that it could not bind QUIC and is
+    // serving the WebSocket/TCP tunnel only. Whether the tun *chose*
+    // to fall back is the crate's business — `pangolin-tun`'s own
+    // suite asserts that (`tests/fallback.rs`).
     assert_log_contains(&ngx.log, "gateway", "serving the WebSocket/TCP tunnel only").await;
 }
