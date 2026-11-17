@@ -1399,32 +1399,29 @@ async fn real_e2e_tunnel_token_rejected() {
     })
     .await;
 
-    // The tun must stay alive for the gateway to refuse it — drop the
-    // handle and the process is killed before the handshake.
+    // Keep the handle bound (`let _tun`, not `let _`): dropping it
+    // kills the tun before the handshake, and the gateway would
+    // never see a session to refuse.
     let _tun = TunProcess::start(&ngx, "office", "expired-token").await;
-    // The tun's "connected to ngx" line is logged on WS handshake
-    // completion — that's before auth, so it MAY appear. What we
-    // really want to assert is the SERVER side didn't log the
-    // "tun office connected" line, which is gated on validate_token.
+    // The gateway must have refused the session, not merely stayed
+    // silent — the refusal is the gateway's own log line. The log is
+    // captured asynchronously, so wait for the line instead of racing
+    // the capture task.
+    crate::tunnel_transport::assert_log_contains(
+        &ngx.log,
+        "gateway",
+        "tunnel auth failed for office",
+    )
+    .await;
+    // Having refused it, the gateway must not have accepted it
+    // either: "tun office connected" is logged only after
+    // `validate_token` passes. Checked *after* the refusal so the
+    // snapshot is not racing the capture task.
     let ngx_log = ngx.log_string();
     assert!(
         !ngx_log.contains("tun office connected"),
         "ngx accepted a tun with an expired token. ngx log:\n{}",
         ngx_log
-    );
-    // The gateway must have refused it, not merely stayed silent —
-    // the refusal is the gateway's own log line. The log is captured
-    // asynchronously, so wait for the line instead of racing the
-    // capture task.
-    assert!(
-        crate::harness::wait_for_log(
-            &ngx.log,
-            "tunnel auth failed for office",
-            std::time::Duration::from_secs(5)
-        )
-        .await,
-        "the gateway must log the refused tun, got:\n{}",
-        ngx.log_string()
     );
 }
 

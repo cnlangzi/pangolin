@@ -227,7 +227,10 @@ async fn raw_request(
 /// process's pipes — so a line the process has just written may not
 /// have been read yet when the response arrives. Asserting on the log
 /// directly is a race; poll for the line instead.
-async fn assert_log_contains(
+///
+/// Shared with `real_e2e.rs`: the gateway's log is asserted from
+/// both files.
+pub(crate) async fn assert_log_contains(
     log: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     what: &str,
     expected: &str,
@@ -458,6 +461,20 @@ async fn sse_streams_through(transport: &str) {
         backend.seen_request().await,
         "the SSE backend never received the request"
     );
+    // The gateway must report the pinned transport. The tun's own
+    // "over <transport>" line is the crate's business; the
+    // gateway's is this suite's — and it is what keeps the pin
+    // visible now that the tun's log is not asserted here.
+    if transport == "quic" {
+        assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
+    } else {
+        assert_log_contains(
+            &ngx.log,
+            "gateway",
+            "connected over the WebSocket/TCP transport",
+        )
+        .await;
+    }
 }
 
 /// A WebSocket upgrade through a tun pinned to **QUIC**.
@@ -543,6 +560,19 @@ async fn ws_upgrade_over(transport: &str) {
         text, "hello",
         "the WS payload must round-trip through the tunnel byte-exact"
     );
+    // The gateway must report the pinned transport — see the same
+    // assertion in `sse_streams_through` for why it is the
+    // gateway's log and not the tun's.
+    if transport == "quic" {
+        assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
+    } else {
+        assert_log_contains(
+            &ngx.log,
+            "gateway",
+            "connected over the WebSocket/TCP transport",
+        )
+        .await;
+    }
 }
 
 /// A tun whose **QUIC attempt fails** falls back to the
