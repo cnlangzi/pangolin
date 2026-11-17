@@ -5,6 +5,14 @@
 //! `knownbots` on crates.io, consumed from the registry, and the
 //! in-tree copy is gone.
 //!
+//! The locked version is 0.3.0 (issue #157): the first release whose
+//! transport repeats a refused download over the other address family
+//! and remembers the family that delivered the list.  0.2.0 leaves
+//! the address order to the system resolver, which hands back the AAAA
+//! record first — a tampered IPv6 path to a publisher then starves the
+//! crawler of its address list, and the crawler is throttled like an
+//! ordinary client.
+//!
 //! Two failure modes are worth a test, and neither of them shows up
 //! as a compile error:
 //!
@@ -97,8 +105,8 @@ fn pangolin_core_depends_on_the_published_crate() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
     assert!(
-        version.starts_with("0.2"),
-        "the {CRATE} dependency must ask for the 0.2 line, got {version:?}"
+        version.starts_with("0.3"),
+        "the {CRATE} dependency must ask for the 0.3 line, got {version:?}"
     );
 
     // The consumer inherits it — it does not declare its own.
@@ -160,8 +168,8 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
     );
     assert_eq!(
         entry.get("version").and_then(|v| v.as_str()),
-        Some("0.2.0"),
-        "the locked {CRATE} must be the published 0.2.0"
+        Some("0.3.0"),
+        "the locked {CRATE} must be the published 0.3.0"
     );
 
     let dependencies = entry
@@ -186,7 +194,7 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
 /// name cargo resolves it to.
 #[test]
 fn the_published_crate_is_the_one_on_the_registry() {
-    // The checksum pins the exact artefact: a re-publish of 0.2.0
+    // The checksum pins the exact artefact: a re-publish of 0.3.0
     // under a different content would not resolve to the same
     // checksum, and cargo would refuse the lockfile.
     let packages = lock_packages();
@@ -196,8 +204,8 @@ fn the_published_crate_is_the_one_on_the_registry() {
         .and_then(|c| c.as_str())
         .unwrap_or_else(|| panic!("the registry entry of {CRATE} must carry a checksum"));
     assert_eq!(
-        checksum, "4e852764d1ba1389b3acf762e9cc005b94f7eac0f10174d6e93ccc3ef68d4785",
-        "the locked {CRATE} must be the published 0.2.0 artefact"
+        checksum, "5e12496a640648418238b967277e857dc6010046ddb76793f6aed452ad109be2",
+        "the locked {CRATE} must be the published 0.3.0 artefact"
     );
 }
 

@@ -167,8 +167,8 @@ pub struct BotInfo {
 /// The embedded registry, parsed once.
 ///
 /// The YAML is compiled into the binary, so the result is a constant:
-/// parsing it per call would cost 75 YAML documents and 75+ CIDR
-/// parses for nothing.
+/// parsing it per call would cost every YAML document of the registry,
+/// and every CIDR in them, for nothing.
 static EMBEDDED_REGISTRY: OnceLock<Vec<BotInfo>> = OnceLock::new();
 
 /// Every bot of the knownbots registry.

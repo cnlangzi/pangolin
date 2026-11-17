@@ -3,7 +3,7 @@
 > **Status:** implemented
 > **Code:** the published `knownbots` crate —
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
-> consumed from crates.io as `knownbots` 0.2 (issue #146)
+> consumed from crates.io as `knownbots` 0.3.0 (issues #146, #157)
 > **Configs:** the crate's own `conf.d/` (embedded),
 > `<log.bot.cache_dir>/conf.d/` (operator)
 > **Contract test:** the crate's
@@ -17,7 +17,7 @@ config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
 
 The crate lives in **its own repository** and is **published to crates.io**
-(`knownbots` 0.2); pangolin consumes it from the registry and no longer
+(`knownbots` 0.3.0); pangolin consumes it from the registry and no longer
 carries a copy. What stays here is the consumer-side contract: the category
 mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
 verification layer, and the operator-facing knobs.
@@ -130,6 +130,79 @@ independent: a bot may use one, two, or all three.
 
 The `custom:` CIDRs are merged into the same prefix set as the downloaded
 list, so a bot can be half static, half dynamic.
+
+### Downloading a published list
+
+The crate downloads the list itself, with the clients it builds
+(`knownbots::http::build_clients()`). **Since 0.3.0 a download that the
+endpoint refuses is repeated over the other address family** (issue #157),
+and the family that delivered the list is remembered for the host.
+
+The crate builds **three** clients: one that reaches every address of a
+host, one bound to the IPv4 addresses only, and one bound to the IPv6
+addresses only. A document takes at most three attempts:
+
+1. the client of the family that delivered the list of that host the last
+   time — or, for a host seen for the first time, the unbound client;
+2. the client of the other family, when the first attempt was **refused** (a
+   status of the 2xx range other than 200, or a 200 whose body the parser
+   does not read) or when the route to the vendor failed;
+3. the client of the family that is left.
+
+The family that delivered the document is **remembered for the host**, so
+the next list of the same vendor goes straight to the client that works.
+
+The reason is measured, not hypothetical: on a host whose IPv6 path to Bing
+is tampered with, `https://www.bing.com/toolbox/bingbot.json` answers
+`203 Non-Authoritative Information` with a two-byte body over IPv6, and
+`200 application/json` with the 29 published prefixes over IPv4. The
+refusal over IPv6 is repaired by the repetition over IPv4, and the family
+that answered is remembered. Before, the answer was read as a JSON syntax
+error — a message that reads as "our code is at fault" — and `bingbot` kept
+an empty prefix set: every request claiming to be that crawler failed
+closed, never reached the bot log, and was throttled like an ordinary
+client.
+
+The gateway therefore **does not supply a `client_set` of its own**
+(`ValidatorOptions::client_set` stays `None`): a host-supplied set of
+clients keeps its own choice of the address family, and the bookkeeping of
+the families lives in the transport the crate builds.
+
+**A refused download names what the endpoint answered.** The message shapes:
+
+| What the endpoint did | The message | The panel shows |
+| --------------------- | ----------- | -------------- |
+| A status other than 200 | `{url} returned {status} ({content_type}): {excerpt}` | `unreachable` |
+| A status other than 200, no body | `{url} returned {status}` | `unreachable` |
+| 200, a body the parser cannot read | `{url} answered 200 with {content_type}: {excerpt}` | `unreachable` |
+| 200, a document whose shape changed | `{url}: {reason}` | `broken` |
+
+A status the upstream decided itself — `401`, `403`, `404`, `429`, `5xx` — is
+**never** a refusal: it is the vendor's answer about the request, so it is
+not repeated over the other family. A `429` or a `5xx` is transient and is
+retried twice (3 s apart, or the `Retry-After` of the answer) on the same
+family; every other status fails at once.
+
+The **excerpt** is the first at most 64 bytes of the body, decoded as UTF-8
+with a lossy conversion, with the control characters replaced by `·` and a
+`…` appended when the body is longer. So the tampered path above reads:
+
+```
+https://www.bing.com/toolbox/bingbot.json returned 203 Non-Authoritative Information (text/xml): OK
+```
+
+The **URL in a message is sanitized** — its query and its fragment are cut
+off, so a token of the vendor does not reach the log.
+
+A list that fails to refresh **keeps the prefixes that were already loaded**
+— the crawler keeps verifying from them.
+
+The crate logs through `tracing`, and pangolin installs no tracing
+subscriber, so the reason reaches the operator through
+`Validator::refresh_status()` and the "Verification status" panel, not
+through the gateway log. The one line the operator misses is the repair
+itself — *"the endpoint refused the request; the other address family
+delivered the list"* — which the crate logs and pangolin drops.
 
 ### The order the verifier uses
 
@@ -366,10 +439,16 @@ this repository controls.
 
 ## Relationship with upstream cnlangzi/knownbots
 
-This port tracks upstream, but not one-for-one. Upstream ships **57** bot
-configs; this port embeds **75**.
+This port tracks upstream, but not one-for-one. This port embeds the
+crate's own set of bots — **the inventory belongs to the crate**, whose
+contract test (`embedded_bot_configs_satisfy_the_contract`) checks it, so
+this document does not restate how many bots it holds.
 
-### The 25 upstream configs this port does not embed
+What follows is the comparison with the Go upstream the crate was ported
+from. Upstream ships **57** bot configs, and this port deliberately leaves
+some of them out:
+
+### The upstream configs this port does not embed
 
 | Group | Count | What they are | Why they are absent |
 | ----- | ----- | ------------- | ------------------- |
@@ -378,18 +457,11 @@ configs; this port embeds **75**.
 | Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in the crate's `src/feed/parsers.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
 | Crawlers dropped in knownbots 0.2 | 2 | `google-extended` (upstream's `Google-Extended`) and `cloudflare-alwaysonline` (upstream's `CloudFlare-AlwaysOnline`) | **no coverage is lost, because no request ever carried them**: neither token is a User-Agent a vendor publishes. The port shipped both until 0.2 and dropped them for the same reason it corrected the other markers — see [The 0.2 registry change](#the-02-registry-change) |
 
-### The 43 bots this port ships that upstream does not have
+### The bots this port ships that upstream does not have
 
-`amzn-searchbot`, `amzn-user`, `bytespider`, `ccbot`, `censysinspect`,
-`claudebot`, `claude-searchbot`, `claude-user`, `dataforseobot`,
-`discordbot`, `duckassistbot`, `google-agent`, `google-cloudvertexbot`,
-`google-cws`, `google-gemininotebook`, `googlemessages`, `google-pinpoint`,
-`googleproducer`, `google-read-aloud`, `google-safety`,
-`google-site-verification`, `hetrixtools`, `meta-externalfetcher`,
-`meta-webindexer`, `mistralai-index`, `mistralai-user`, `mojeekbot`,
-`oai-adsbot`, `perplexitybot`, `pingdom`, `redditbot`, `semrushbot-si`,
-`semrushbot-swa`, `seokicks`, `seznambot`, `siteauditbot`, `sitebulb`,
-`slackbot`, `splitsignalbot`, `telegrambot`, `whatsapp`, `yeti`, `youbot`.
+The crate's `conf.d/` is the source of truth for that set, and the crate's
+own contract test checks it — so this document does not enumerate it
+either.
 
 ### The ASN step is not ported
 
@@ -411,7 +483,7 @@ carries one parses here and the key is ignored.
 - **`vendor:` is a pangolin addition.** Upstream's configs have no vendor
   field at all; the JSONL `bot_vendor` and the admin UI's vendor column are
   this port's own.
-- The **32 configs both projects ship** are otherwise identical, with these
+- The configs **both projects ship** are otherwise identical, with these
   exceptions:
   - `google-inspectiontool` is `kind: SearchEngine` here and `kind: Monitor`
     upstream;
