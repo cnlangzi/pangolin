@@ -164,7 +164,7 @@ fn main() -> anyhow::Result<()> {
     // material, so a restart does not change it (the tun pins its
     // fingerprint).
     let tunnel_quic_cert_dir =
-        pangolin_core::tunnel::quic::certificate_dir(std::path::Path::new(&config.acme.cert_dir));
+        pangolin_tun::certificate_dir(std::path::Path::new(&config.acme.cert_dir));
 
     let host_result = runtime::block_on_host(async move {
         // OS signal handlers cancel the shared token.

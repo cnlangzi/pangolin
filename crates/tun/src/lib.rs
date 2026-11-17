@@ -1,11 +1,14 @@
-#![allow(unused_imports)]
 //! Pangolin tunnel node (tun) library.
 //!
-//! Re-exports the public API: `TunnelClient`, `TunConfig`, plus
-//! the `config` module (loaded from `tun.yml`).
+//! Re-exports the public API: `TunConfig`, the `config` module
+//! (loaded from `tun.yml`), and the transport selector the
+//! configuration uses.
+//!
+//! The tunnel's wire protocol and the client itself live in the
+//! published `pangolin-tun` crate (issue #159); this crate is the
+//! configuration and the binary that ships it.
 
-pub mod client;
 pub mod config;
 
-pub use client::TunnelClient;
-pub use config::{TransportSelector, TunConfig};
+pub use config::TunConfig;
+pub use pangolin_tun::TransportSelector;

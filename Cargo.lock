@@ -377,6 +377,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "basic-toml"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,6 +2185,7 @@ dependencies = [
  "mime_guess",
  "openssl",
  "pangolin-core",
+ "pangolin-tun",
  "pem",
  "pingora",
  "pingora-core",
@@ -2199,7 +2206,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
- "tokio-yamux",
  "urlencoding",
  "uuid",
  "x509-parser 0.15.1",
@@ -2374,35 +2380,26 @@ dependencies = [
  "anyhow",
  "async-trait",
  "badbots",
- "base64 0.22.1",
  "chrono",
  "dashmap 6.2.1",
  "env_logger",
- "fastwebsockets",
  "figment",
- "futures",
- "futures-util",
  "httpdate",
  "ipnet",
  "knownbots",
  "log",
  "mime_guess",
+ "pangolin-tun",
  "parking_lot",
- "quinn",
- "rand 0.8.6",
- "rcgen",
  "refinery",
  "rusqlite",
  "rustls",
  "serde",
  "serde_json",
- "sha1",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-yamux",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -2423,6 +2420,7 @@ dependencies = [
  "log",
  "ngx",
  "pangolin-core",
+ "pangolin-tun",
  "rcgen",
  "reqwest",
  "rusqlite",
@@ -2438,6 +2436,29 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tun",
+]
+
+[[package]]
+name = "pangolin-tun"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "becd40f4e2de655c0ddc6bbe538bae8c49b5ecea9efc7c16b0847ef8d4118082"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "fastwebsockets",
+ "futures-util",
+ "log",
+ "parking_lot",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-yamux",
 ]
 
 [[package]]
@@ -4303,22 +4324,14 @@ name = "tun"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "chrono",
  "clap",
  "env_logger",
- "fastwebsockets",
  "figment",
- "futures",
- "futures-util",
  "log",
  "pangolin-core",
+ "pangolin-tun",
  "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
  "tokio",
- "tokio-yamux",
 ]
 
 [[package]]

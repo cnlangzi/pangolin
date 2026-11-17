@@ -132,6 +132,16 @@ knownbots = { version = "0.3.0", features = ["full"] }
 # the gateway enables it — see `pangolin_core::badbots`.
 badbots = { version = "0.1.4", features = ["full"] }
 
+# The tunnel's wire protocol and its client (issue #159). The crate is
+# published (github.com/cnlangzi/pangolin-tun), not part of this
+# workspace: the protocol, the two transports, the TOFU pin store and
+# the client all live there, and this repository consumes them from
+# the registry the way it consumes `knownbots` and `badbots`.
+#
+# The requirement is a caret on the 0.1 line — a future 0.2 release
+# would carry a protocol change, so it must not be picked up silently.
+pangolin-tun = { version = "0.1" }
+
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"

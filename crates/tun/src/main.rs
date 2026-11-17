@@ -10,12 +10,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-mod client;
 mod config;
 
-use client::TunnelClient;
 use config::TunConfig;
 use pangolin_core::init_logger;
+use pangolin_tun::{TunSettings, TunnelClient};
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "tun")]
@@ -33,20 +32,25 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install the rustls crypto provider before any TLS work. See
-    // `pangolin_core::install_crypto_provider` for the rationale —
-    // tun connects to ngx over `wss://` when `tunnel.tls.enabled = true`,
-    // which goes through rustls and panics without a provider.
-    pangolin_core::install_crypto_provider();
-
     let args = Args::parse();
     let tun_cfg = TunConfig::from_file(&args.config)?;
     init_logger(&tun_cfg.log);
 
+    // The tunnel's protocol and its client live in the published
+    // `pangolin-tun` crate (issue #159); this binary owns the
+    // configuration file and hands the crate typed values.
+    //
     // The trust-on-first-use pin file and the record of the last
     // failed QUIC attempt live next to the configuration file — see
     // `TunConfig::pin_path`.
-    let client = TunnelClient::new(tun_cfg, &args.config);
+    let client = TunnelClient::new(TunSettings {
+        server: tun_cfg.server,
+        token: tun_cfg.token,
+        name: tun_cfg.name,
+        transport: tun_cfg.transport,
+        pin_path: TunConfig::pin_path(&args.config),
+        quic_failure_path: TunConfig::quic_failure_path(&args.config),
+    });
     client.run().await;
 
     Ok(())

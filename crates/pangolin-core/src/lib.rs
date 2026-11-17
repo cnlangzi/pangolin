@@ -39,7 +39,6 @@ pub mod referer_log;
 pub mod referer_stats;
 pub mod reputation;
 pub mod traffic;
-pub mod tunnel;
 pub mod types;
 
 pub use app::{
@@ -86,11 +85,6 @@ pub use reputation::{BadbotVerdict, build_library, library_config};
 pub use traffic::{
     TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,
     classify_route, normalize_path,
-};
-pub use tunnel::{
-    TUNNEL_PROTOCOL_VERSION, TransportKind, TunnelByteStream, TunnelRole, TunnelStream,
-    TunnelTransport, YamuxTunnel, decode_auth, decode_connect, decode_connect_reply, encode_auth,
-    encode_connect, encode_connect_reply, protocol_version_mismatch,
 };
 pub use types::{
     BackendKind, BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus,

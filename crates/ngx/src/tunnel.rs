@@ -8,7 +8,7 @@
 //! tun never speaks HTTP.
 //!
 //! Two transports implement the same byte-stream interface
-//! (`pangolin_core::tunnel::TunnelTransport`):
+//! (`pangolin_tun::TunnelTransport`):
 //!
 //! * **QUIC** (primary) — one connection per tun, one bidirectional
 //!   stream per request. Encrypted by default. The tun authenticates
@@ -48,7 +48,7 @@ use fastwebsockets::{Role as WsRole, WebSocket};
 use log::{debug, error, info, warn};
 use tokio::net::TcpListener;
 
-use pangolin_core::tunnel::{
+use pangolin_tun::{
     TUNNEL_PROTOCOL_VERSION, TUNNEL_VERSION_HEADER, TunnelRole, TunnelTransport, bearer_token,
     protocol_version_mismatch, read_ws_upgrade_request, tunnel_over_websocket, write_http_error,
     write_ws_accept_response,

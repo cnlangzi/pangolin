@@ -1799,7 +1799,7 @@ async fn serve_ws_connection(
     let key = sec_key.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Sec-WebSocket-Key")
     })?;
-    let accept = pangolin_core::tunnel::compute_ws_accept(&key);
+    let accept = pangolin_tun::compute_ws_accept(&key);
 
     // 2. Write 101 Switching Protocols.
     let resp = format!(

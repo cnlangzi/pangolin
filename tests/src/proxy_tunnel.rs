@@ -16,9 +16,10 @@
 
 use std::time::Duration;
 
-use pangolin_core::tunnel::{
+use pangolin_core::proxy::strip_hop_by_hop_headers;
+use pangolin_tun::{
     bearer_token, compute_ws_accept, decode_connect, decode_connect_reply, encode_connect,
-    encode_connect_reply, generate_ws_key, strip_hop_by_hop_headers,
+    encode_connect_reply, generate_ws_key,
 };
 
 use tokio::io::AsyncReadExt;

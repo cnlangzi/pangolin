@@ -49,11 +49,16 @@ hyper-rustls = "0.27"
 
 # WebSocket
 fastwebsockets.workspace = true
-tokio-yamux.workspace = true
 futures-util.workspace = true
 
 # QUIC transport for the tunnel (issue #153) — the primary transport.
 quinn.workspace = true
+
+# The tunnel's wire protocol and its transports (issue #159). The
+# crate is published — see the root Cargo.toml. The yamux session
+# comes from it too, so `tokio-yamux` is no longer a direct
+# dependency of the gateway.
+pangolin-tun.workspace = true
 
 # TLS / ACME
 instant-acme = { version = "0.8", features = ["hyper-rustls"] }

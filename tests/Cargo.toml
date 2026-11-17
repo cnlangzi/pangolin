@@ -13,6 +13,9 @@ path = "src/lib.rs"
 pangolin-core = { path = "../crates/pangolin-core" }
 ngx = { path = "../crates/ngx" }
 tun = { path = "../crates/tun" }
+# The tunnel's wire protocol (issue #159) — the suite drives the
+# published crate's codecs, not an in-tree copy.
+pangolin-tun.workspace = true
 
 # Test infra
 tokio = { version = "1", features = ["full"] }

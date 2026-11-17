@@ -50,6 +50,13 @@ mod release_version;
 #[cfg(test)]
 mod knownbots_dependency;
 
+// Dependency-swap regression tests (the `pangolin-tun` crate moved out
+// of this repository, issue #159).  Like the knownbots tests above,
+// these need neither the `integration` feature nor a real binary:
+// they parse the manifests and the lockfile.
+#[cfg(test)]
+mod pangolin_tun_dependency;
+
 // Migration regression tests for the badbots / knownbots upgrade
 // (issue #151).  Like the dependency tests above, these need neither
 // the `integration` feature nor a real binary: they drive refinery

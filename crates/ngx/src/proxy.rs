@@ -46,7 +46,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
 
-use pangolin_core::tunnel::{HttpRequest, HttpResponse};
+use pangolin_core::proxy::{HttpRequest, HttpResponse};
 use pangolin_core::types::HostMode;
 
 use pangolin_core::{

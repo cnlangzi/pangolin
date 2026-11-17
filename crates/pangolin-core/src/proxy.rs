@@ -16,9 +16,59 @@
 
 use std::path::PathBuf;
 
-use crate::tunnel::{HttpRequest, HttpResponse, strip_hop_by_hop_headers};
 use crate::types::HostMode;
 use crate::{ParseError, parse_backend};
+
+// ── HTTP model ──────────────────────────────────────────────────
+//
+// The request/response shapes the gateway's proxy path works with.
+// They are the gateway's model, not the tunnel's protocol: the tunnel
+// is a byte splice (issue #153), so nothing in the tunnel speaks
+// HTTP. They used to live in the tunnel module — with the protocol
+// they were re-homed here when the protocol moved to the published
+// `pangolin-tun` crate (issue #159).
+
+/// A request, as the proxy path sees it: the head fields plus the
+/// body it may already have buffered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub target: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// A response, as the proxy path builds it: the status line, the
+/// headers and the (possibly buffered) body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponse {
+    pub version: String,
+    pub status_line: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Strip RFC 7230 §6.1 hop-by-hop headers. Called by the ngx
+/// side before re-serialising the HTTP request bytes to the
+/// backend.
+pub fn strip_hop_by_hop_headers(headers: &mut Vec<(String, String)>) {
+    fn is_hop_by_hop(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) || lower.starts_with("proxy-")
+    }
+    headers.retain(|(k, _)| !is_hop_by_hop(k));
+}
 
 // ── Scheme ──────────────────────────────────────────────────────
 

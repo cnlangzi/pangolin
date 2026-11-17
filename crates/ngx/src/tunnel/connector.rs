@@ -60,17 +60,11 @@ use pingora::protocols::l4::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use pangolin_core::tunnel::{
+use pangolin_tun::{
     TunnelStream, TunnelTransport, decode_connect_reply, encode_connect, read_crlf_line,
 };
 
 use crate::App;
-
-/// Largest connection instruction we accept from a peer.
-///
-/// The instruction is one short line; a bigger one means the peer is
-/// not speaking our protocol.
-const MAX_INSTRUCTION_LEN: usize = 4096;
 
 /// A pingora L4 connector that opens a tunnel byte stream.
 ///
@@ -190,7 +184,7 @@ async fn connect_exchange(
     transport: &dyn TunnelTransport,
     host: &str,
     port: u16,
-) -> Result<pangolin_core::tunnel::TunnelStream> {
+) -> Result<pangolin_tun::TunnelStream> {
     let mut stream = transport
         .open_stream()
         .await
@@ -218,7 +212,10 @@ async fn connect_exchange(
         .await
         .map_err(|e| Error::explain(ErrorType::ConnectError, format!("flush CONNECT: {e}")))?;
 
-    let reply = read_crlf_line(&mut stream, MAX_INSTRUCTION_LEN)
+    // The crate bounds the line length itself (4096 bytes), so a peer
+    // that never sends a newline cannot make us allocate without
+    // limit.
+    let reply = read_crlf_line(&mut stream)
         .await
         .map_err(|e| Error::explain(ErrorType::ConnectError, format!("read CONNECT reply: {e}")))?;
     match decode_connect_reply(reply.as_bytes())

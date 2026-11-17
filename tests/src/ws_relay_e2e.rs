@@ -3,7 +3,7 @@
 //! Since issue #153 the tunnel is a **splice**: the gateway's pingora
 //! writes the client's request bytes into a tunnel stream and the tun
 //! copies them to the backend. The copy is
-//! `pangolin_core::tunnel::relay_bidirectional`, and its
+//! `pangolin_tun::relay_bidirectional`, and its
 //! **half-close** behaviour is what makes a long-lived response
 //! survive the end of the request.
 //!
@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use pangolin_core::tunnel::relay_bidirectional;
+use pangolin_tun::relay_bidirectional;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Half-close: closing one direction of the request side must only

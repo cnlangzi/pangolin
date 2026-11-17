@@ -1,10 +1,15 @@
-//! Configuration for the `pangolin-tun` client. Loaded from `tun.yml`
+//! Configuration for the `pangolin-tun` binary. Loaded from `tun.yml`
 //! (see README.md "全局配置"). The top level of `tun.yml` is the tunnel
 //! client itself — its connection target, auth token, and node name —
 //! plus a `[log]` sub-section for log routing. The file is intentionally
 //! separate from `ngx.yml`: the two binaries share a protocol, not a
 //! process, and mixing their configs would hide which knob affects
 //! which surface.
+//!
+//! The protocol and the client the values are handed to live in the
+//! published `pangolin-tun` crate (issue #159); the vocabulary of the
+//! file stays here, so this module converts the strings into the
+//! crate's typed values.
 //!
 //! Loaded with `figment`: YAML provides the base, `TUN_*` env vars
 //! override. e.g. `TUN_TOKEN=…` wins over `tun.yml: token:`, and
@@ -20,45 +25,36 @@ use figment::providers::{Env, Format, Yaml};
 use serde::{Deserialize, Serialize};
 
 use pangolin_core::config::LogConfig;
+use pangolin_tun::TransportSelector;
 
-/// Which transport the tun uses to reach the gateway.
+/// Read the transport from the configuration file's own vocabulary.
 ///
-/// `auto` is the default and reproduces the pre-#153 behaviour of
-/// trying QUIC first: the tun attempts QUIC with a bounded handshake
-/// timeout and falls back to the WebSocket/TCP transport when the
-/// attempt fails. `quic` and `tcp` pin the tun to one transport —
-/// which is what the end-to-end tests need, because a test that cannot
-/// pin the transport cannot tell a QUIC session from a fallback
-/// session that silently happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TransportSelector {
-    /// Prefer QUIC, fall back to the WebSocket/TCP transport.
-    #[default]
-    Auto,
-    /// QUIC only — no fallback. The tunnel fails when the network
-    /// blocks UDP.
-    Quic,
-    /// WebSocket/TCP only — the pre-#153 transport.
-    Tcp,
-}
-
-impl TransportSelector {
-    /// The stable, lower-case name used in the configuration file and
-    /// in the log lines.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TransportSelector::Auto => "auto",
-            TransportSelector::Quic => "quic",
-            TransportSelector::Tcp => "tcp",
-        }
+/// The crate's [`TransportSelector`] is a typed enum and parses no
+/// string of its own — the vocabulary belongs to the configuration
+/// file, which lives in this repository, so the caller converts. An
+/// unknown value is refused here, at load time, rather than at the
+/// first connect.
+fn deserialize_transport<'de, D>(deserializer: D) -> Result<TransportSelector, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match raw.as_str() {
+        "auto" => Ok(TransportSelector::Auto),
+        "quic" => Ok(TransportSelector::Quic),
+        "tcp" => Ok(TransportSelector::Tcp),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown transport {other:?} — expected auto, quic or tcp"
+        ))),
     }
 }
 
-impl std::fmt::Display for TransportSelector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+/// Write the transport back in the configuration file's vocabulary.
+fn serialize_transport<S>(transport: &TransportSelector, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(transport.as_str())
 }
 
 /// Top-level config for the `pangolin-tun` binary. Read once at startup.
@@ -81,41 +77,15 @@ pub struct TunConfig {
     ///
     /// Added in issue #153. It is the only new field the tun's
     /// configuration gained; every existing field keeps its meaning.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_transport",
+        serialize_with = "serialize_transport"
+    )]
     pub transport: TransportSelector,
-
-    /// TLS settings for the WS connection to ngx. When `tls` is
-    /// absent or empty, the tun speaks plaintext `ws://` to the
-    /// server. When populated, the tun dials `wss://` and validates
-    /// (or skips validation of) the server certificate.
-    ///
-    /// Added in issue #39 (commit 0): schema extension only; the
-    /// TLS dial path is wired up in commit 1.
-    #[serde(default)]
-    pub tls: Option<TlsConfig>,
 
     #[serde(default)]
     pub log: LogConfig,
-}
-
-/// TLS client config for the tun → ngx WebSocket connection.
-///
-/// `verify = false` accepts any server certificate (dev / staging
-/// against a self-signed ngx). `verify = true` validates against
-/// either `ca_file` (PEM bundle) or the system trust store when
-/// `ca_file` is `None`. Production deploys SHOULD set `verify = true`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct TlsConfig {
-    /// Verify server certificate against `ca_file` (or the system
-    /// trust store when `ca_file` is `None`). Default `false` to
-    /// preserve the dev-friendly "accept anything" stance of the
-    /// pre-TLS build; operators MUST flip this on for production.
-    #[serde(default)]
-    pub verify: bool,
-    /// Optional path to a PEM-encoded CA bundle used to validate
-    /// the ngx server certificate. `None` = use system roots.
-    #[serde(default)]
-    pub ca_file: Option<String>,
 }
 
 impl TunConfig {
@@ -351,25 +321,16 @@ mod tests {
         });
     }
 
+    /// A `tls:` section left over in an operator's `tun.yml` keeps
+    /// loading.
+    ///
+    /// The `tls:` section was a schema extension that the client
+    /// never read (issue #39) and the field is gone with the
+    /// in-tree client (issue #159). The configuration does not use
+    /// `deny_unknown_fields`, so the key is ignored rather than
+    /// refused — an existing file must not stop working.
     #[test]
-    fn tls_section_optional_and_defaults_to_plaintext() {
-        // Commit 0 schema extension: `tls` is optional. Without it,
-        // the tun speaks plaintext ws://.
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            let s = r#"
-                server: gateway.example.com:9001
-                token: t
-                name: home
-            "#;
-            let c = TunConfig::from_str(s).unwrap();
-            assert!(c.tls.is_none(), "no tls: tun should use plaintext ws://");
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn tls_section_parses_with_verify_and_ca_file() {
+    fn a_leftover_tls_section_is_ignored() {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             let s = r#"
@@ -381,29 +342,8 @@ mod tests {
                   ca_file: /etc/pangolin/ca.pem
             "#;
             let c = TunConfig::from_str(s).unwrap();
-            let tls = c.tls.expect("tls section must parse when present");
-            assert!(tls.verify);
-            assert_eq!(tls.ca_file.as_deref(), Some("/etc/pangolin/ca.pem"));
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn tls_section_parses_with_verify_false_no_ca_file() {
-        // `verify: false` is the dev-mode "accept any cert" stance.
-        figment::Jail::expect_with(|jail| {
-            jail.clear_env();
-            let s = r#"
-                server: gateway.example.com:9443
-                token: t
-                name: home
-                tls:
-                  verify: false
-            "#;
-            let c = TunConfig::from_str(s).unwrap();
-            let tls = c.tls.unwrap();
-            assert!(!tls.verify);
-            assert!(tls.ca_file.is_none());
+            assert_eq!(c.server, "gateway.example.com:9443");
+            assert_eq!(c.name, "home");
             Ok(())
         });
     }
