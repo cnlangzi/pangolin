@@ -35,13 +35,13 @@
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3">
       <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Verification status</h2>
       {# The badge is the unmissable form of the degraded state. A bot #}
-      {# whose address list is missing fails closed — its traffic never #}
-      {# reaches the log below — and the counts in the panel body read #}
-      {# as part of a sentence. The chip does not: it carries the count #}
-      {# and says what it costs the operator. #}
+      {# whose address list is missing or stale may fail closed — its #}
+      {# traffic may never reach the log below — and the counts in the #}
+      {# panel body read as part of a sentence. The chip does not: it #}
+      {# carries the count and says what it may cost the operator. #}
       {% if health.available && health.not_ready_count() > 0 %}
         <span data-not-ready="{{ health.not_ready_count() }}"
-              class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300"
+              class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 whitespace-nowrap"
               title="A bot whose address list is missing or whose last refresh failed may fail closed: its traffic stays out of the log and it gets no rate-limit exemption.">
           <span class="font-semibold tabular-nums">{{ health.not_ready_count() }}</span> bot lists not ready
         </span>

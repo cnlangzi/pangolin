@@ -362,27 +362,35 @@ impl BotVerificationHealth {
         self.count(BotVerificationState::Failed)
     }
 
-    /// The bots whose address space is not loaded — cold (never
+    /// The bots whose address list is missing or stale — cold (never
     /// downloaded) or failed (the last refresh failed).
     ///
-    /// Such a bot may fail closed: its traffic stays out of the bot
-    /// log and it gets no rate-limit exemption. The count equals
-    /// `problem_bots().len()` — the same set the admin panel lists as
-    /// needing attention — so the badge and the table can never
-    /// disagree. `Ready` bots and `config_errors` are not counted:
-    /// the count is about address *lists*, not about broken operator
-    /// files.
+    /// Such a bot *may* fail closed: its traffic stays out of the bot
+    /// log and it gets no rate-limit exemption. A failed bot that
+    /// still holds its cached prefix set keeps verifying from that
+    /// cache, so it is counted anyway — a failed refresh has to stay
+    /// visible, and the badge says "may", not "does".
+    ///
+    /// The count equals `problem_bots().len()` — the same set the
+    /// admin panel lists as needing attention — so the badge and the
+    /// table can never disagree. `Ready` bots and `config_errors` are
+    /// not counted: the count is about address *lists*, not about
+    /// broken operator files.
     pub fn not_ready_count(&self) -> usize {
-        self.cold_count() + self.failed_count()
+        self.bots.iter().filter(|b| Self::is_not_ready(b)).count()
     }
 
     /// The bots that need the operator's attention — everything that
     /// is not `Ready`.
     pub fn problem_bots(&self) -> Vec<&BotVerificationStatus> {
-        self.bots
-            .iter()
-            .filter(|b| b.state != BotVerificationState::Ready)
-            .collect()
+        self.bots.iter().filter(|b| Self::is_not_ready(b)).collect()
+    }
+
+    /// One definition of "the bot's address list is not usable", so
+    /// the badge count and the attention table can never disagree —
+    /// even if a new state is added to [`BotVerificationState`].
+    fn is_not_ready(bot: &BotVerificationStatus) -> bool {
+        bot.state != BotVerificationState::Ready
     }
 
     /// True when something needs the operator's attention.
@@ -894,6 +902,32 @@ mod tests {
         assert_eq!(health.not_ready_count(), 2);
         // The badge and the panel's table list the same set — they
         // can never disagree.
+        assert_eq!(health.not_ready_count(), health.problem_bots().len());
+    }
+
+    /// A failed bot whose cached prefix set is still loaded keeps
+    /// verifying — it is **not** fail-closed — but its refresh
+    /// failed, so the badge still counts it. A failed refresh has to
+    /// stay visible; the badge's wording says "may fail closed", not
+    /// "fails closed".
+    #[test]
+    fn not_ready_count_includes_a_failed_bot_that_still_holds_its_cache() {
+        let health = BotVerificationHealth {
+            bots: vec![BotVerificationStatus {
+                name: "googlebot".into(),
+                vendor: "Google".into(),
+                category: BotCategory::SearchEngine,
+                state: BotVerificationState::Failed,
+                prefixes: 42,
+                error_kind: Some(BotRefreshErrorKind::Unreachable),
+                error_message: Some("vendor refused us".into()),
+            }],
+            config_errors: vec![],
+            rdns_overflow: 0,
+            available: true,
+        };
+
+        assert_eq!(health.not_ready_count(), 1);
         assert_eq!(health.not_ready_count(), health.problem_bots().len());
     }
 }

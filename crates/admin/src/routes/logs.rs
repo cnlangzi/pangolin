@@ -2002,9 +2002,7 @@ mod tests {
         );
         // The count is rendered as the badge's own number …
         assert!(
-            html.contains(
-                "<span class=\"font-semibold tabular-nums\">2</span> bot lists not ready"
-            ),
+            html.contains(">2</span> bot lists not ready"),
             "the badge count missing: {html}"
         );
         // … and the badge states the consequence.
@@ -2030,6 +2028,29 @@ mod tests {
         assert!(
             html.contains("bot lists not ready"),
             "the badge label missing: {html}"
+        );
+    }
+
+    /// A failed bot whose cached prefix set is still loaded keeps
+    /// verifying — it is *not* fail-closed. It is still counted as
+    /// not ready, because its refresh failed and that has to stay
+    /// visible; the badge's tooltip says "may fail closed" for
+    /// exactly this case.
+    #[test]
+    fn verification_panel_badge_counts_a_failed_bot_that_still_holds_its_cache() {
+        let mut health = health_with_problems();
+        health.bots[0].prefixes = 42;
+        let html = render_bots_with_health(health);
+
+        assert!(
+            html.contains("data-not-ready=\"1\""),
+            "a failed refresh must stay visible: {html}"
+        );
+        // The row still tells the operator the cached list is in use,
+        // so the badge cannot be read as "this bot is gone".
+        assert!(
+            html.contains("42 prefixes still loaded"),
+            "the cached prefix count missing: {html}"
         );
     }
 
