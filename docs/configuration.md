@@ -237,7 +237,7 @@ Shape of the `config` JSON per kind:
 
 > **Bot log side-channel.** Each request's `User-Agent` + client IP
 > is verified by the `knownbots` crate — an **external dependency**,
-> published to crates.io as `knownbots` 0.2.1 and developed in
+> published to crates.io as `knownbots` 0.3.0 and developed in
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)
 > (it ships the embedded YAML configs for Googlebot / Bingbot / GPTBot /
 > ClaudeBot / facebookexternalhit / UptimeRobot / …). **Only verified**
@@ -248,11 +248,12 @@ Shape of the `config` JSON per kind:
 > Readers use `bot_name` directly and do not scan `ua` again.
 > Cold RDNS only warms a persistent
 > cache for the next request. Official IP lists refresh immediately
-> on startup, then on `bot.refresh_interval_secs`. The crate downloads
-> them over **IPv4 first** (0.2.1), so a tampered IPv6 path to a
-> publisher cannot starve a crawler of its address list; a refused
-> download names the endpoint's own answer instead of a JSON syntax
-> error.
+> on startup, then on `bot.refresh_interval_secs`. A download the
+> endpoint refuses is **repeated over the other address family**
+> (0.3.0), and the family that delivered the list is remembered for
+> the host — so a tampered IPv6 path to a publisher cannot starve a
+> crawler of its address list; a refused download names the endpoint's
+> own answer instead of a JSON syntax error.
 >
 > Verification order: case-sensitive word-boundary UA match →
 > official/custom CIDR → cached RDNS (with FCrDNS on cold lookup).

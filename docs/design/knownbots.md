@@ -3,7 +3,7 @@
 > **Status:** implemented
 > **Code:** the published `knownbots` crate —
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
-> consumed from crates.io as `knownbots` 0.2.1 (issues #146, #157)
+> consumed from crates.io as `knownbots` 0.3.0 (issues #146, #157)
 > **Configs:** the crate's own `conf.d/` (embedded),
 > `<log.bot.cache_dir>/conf.d/` (operator)
 > **Contract test:** the crate's
@@ -17,7 +17,7 @@ config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
 
 The crate lives in **its own repository** and is **published to crates.io**
-(`knownbots` 0.2.1); pangolin consumes it from the registry and no longer
+(`knownbots` 0.3.0); pangolin consumes it from the registry and no longer
 carries a copy. What stays here is the consumer-side contract: the category
 mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
 verification layer, and the operator-facing knobs.
@@ -117,6 +117,30 @@ three removed ids leave the table inert. The V14 migration rewrites
 `applebot`, and a site that deliberately kept it out of its exemptions must
 keep doing so — and deletes the two ids with no successor.
 
+### The 0.3 registry change
+
+knownbots 0.3 **added four crawlers** and changed nothing else in the
+registry: the marker of every bot that shipped before is the marker it
+shipped with, and the address space of every bot is the address space it
+had. The four new entries are URL-backed — they verify from the list their
+vendor publishes:
+
+| Registry id | Vendor | Kind | Marker | The list it verifies from |
+| ----------- | ------ | ---- | ------ | ------------------------- |
+| `hyspider` | Tencent | `AITraining` | `HySpider` | `https://hy.tencent.com/policy/hyspider.json` |
+| `kimbot` | Moonshot | `AITraining` | `KimiBot` | `https://www.kimi.ai/policies/kimibot.json` |
+| `kimi-searchbot` | Moonshot | `AIAssist` | `Kimi-SearchBot` | `https://www.kimi.ai/policies/kimi-searchbot.json` |
+| `kimi-user` | Moonshot | `AIAssist` | `Kimi-User` | `https://www.kimi.ai/policies/kimi-user.json` |
+
+All four land in the `ai_bot` bucket of the category mapping — `AITraining`
+and `AIAssist` both do — and all four are **new** registry ids: a request
+carrying `KimiBot/1.0` matched nothing before 0.3, so it was not a verified
+bot and was not exempt from the rate limits. It is now.
+
+The three Moonshot crawlers publish a list each, and the lists hold the
+same prefixes today. The crate keeps them as separate entries because each
+one has its own marker.
+
 ### The address space — three sources
 
 A bot's address space is assembled from up to three sources. They are
@@ -133,40 +157,55 @@ list, so a bot can be half static, half dynamic.
 
 ### Downloading a published list
 
-The crate downloads the list itself, with the client it builds
-(`knownbots::http::build_client()`). **Since 0.2.1 that client resolves a
-vendor over IPv4 first** (issue #157): the resolver of the crate returns the
-IPv4 addresses of a host before its IPv6 ones, the HTTP stack splits the
-addresses into two groups by the family of the first one, and the IPv6 group
-starts 300 ms later and is raced against the IPv4 group. A host that answers
-with IPv6 only keeps using IPv6.
+The crate downloads the list itself, with the clients it builds
+(`knownbots::http::build_clients()`). **Since 0.3.0 a download that the
+endpoint refuses is repeated over the other address family** (issue #157),
+and the family that delivered the list is remembered for the host.
 
-The reason is measured, not hypothetical: on a host whose IPv6 path to Bing is
-tampered with, `https://www.bing.com/toolbox/bingbot.json` answers
+The crate builds **three** clients: one that reaches every address of a
+host, one bound to the IPv4 addresses only, and one bound to the IPv6
+addresses only. A document takes at most three attempts:
+
+1. the client of the family that delivered the list of that host the last
+   time — or, for a host seen for the first time, the unbound client;
+2. the client of the other family, when the first attempt was **refused** (a
+   status of the 2xx range other than 200, or a 200 whose body the parser
+   does not read) or when the route to the vendor failed;
+3. the client of the family that is left.
+
+The family that delivered the document is **remembered for the host**, so
+the next list of the same vendor goes straight to the client that works.
+
+The reason is measured, not hypothetical: on a host whose IPv6 path to Bing
+is tampered with, `https://www.bing.com/toolbox/bingbot.json` answers
 `203 Non-Authoritative Information` with a two-byte body over IPv6, and
-`200 application/json` with the 29 published prefixes over IPv4. 0.2.0 left
-the address order to the system resolver, which returns the AAAA record
-first, so the tampered path won the race. `bingbot` then kept an empty
-prefix set, every request claiming to be that crawler failed closed, never
-reached the bot log, and was throttled like an ordinary client.
+`200 application/json` with the 29 published prefixes over IPv4. The
+refusal over IPv6 is repaired by the repetition over IPv4, and the family
+that answered is remembered. Before, the answer was read as a JSON syntax
+error — a message that reads as "our code is at fault" — and `bingbot` kept
+an empty prefix set: every request claiming to be that crawler failed
+closed, never reached the bot log, and was throttled like an ordinary
+client.
 
-The gateway therefore **does not supply an `http_client` of its own**
-(`ValidatorOptions::http_client` stays `None`): a host-supplied client keeps
-its own choice of the address family, and the crate's IPv4-first resolver
-lives only in the client the crate builds.
+The gateway therefore **does not supply a `client_set` of its own**
+(`ValidatorOptions::client_set` stays `None`): a host-supplied set of
+clients keeps its own choice of the address family, and the bookkeeping of
+the families lives in the transport the crate builds.
 
-**A refused download names what the endpoint answered** (0.2.1). Before, a
-vendor that answered with something other than its document surfaced as a
-JSON syntax error, which reads as "our code is at fault"; now the message
-names the endpoint's own answer, and the panel reports it as
-`unreachable` — the environment — rather than `broken`:
+**A refused download names what the endpoint answered.** The message shapes:
 
 | What the endpoint did | The message | The panel shows |
 | --------------------- | ----------- | -------------- |
 | A status other than 200 | `{url} returned {status} ({content_type}): {excerpt}` | `unreachable` |
 | A status other than 200, no body | `{url} returned {status}` | `unreachable` |
-| 200, a body the parser cannot read | `{url} answered {status code} with {content_type}: {excerpt}` | `unreachable` |
+| 200, a body the parser cannot read | `{url} answered 200 with {content_type}: {excerpt}` | `unreachable` |
 | 200, a document whose shape changed | `{url}: {reason}` | `broken` |
+
+A status the upstream decided itself — `401`, `403`, `404`, `429`, `5xx` — is
+**never** a refusal: it is the vendor's answer about the request, so it is
+not repeated over the other family. A `429` or a `5xx` is transient and is
+retried twice (3 s apart, or the `Retry-After` of the answer) on the same
+family; every other status fails at once.
 
 The **excerpt** is the first at most 64 bytes of the body, decoded as UTF-8
 with a lossy conversion, with the control characters replaced by `·` and a
@@ -176,15 +215,18 @@ with a lossy conversion, with the control characters replaced by `·` and a
 https://www.bing.com/toolbox/bingbot.json returned 203 Non-Authoritative Information (text/xml): OK
 ```
 
-A `429` or a `5xx` is transient and is retried twice (3 s apart, or the
-`Retry-After` of the answer); every other status fails at once. A list that
-fails to refresh **keeps the prefixes that were already loaded** — the
-crawler keeps verifying from them.
+The **URL in a message is sanitized** — its query and its fragment are cut
+off, so a token of the vendor does not reach the log.
+
+A list that fails to refresh **keeps the prefixes that were already loaded**
+— the crawler keeps verifying from them.
 
 The crate logs through `tracing`, and pangolin installs no tracing
 subscriber, so the reason reaches the operator through
 `Validator::refresh_status()` and the "Verification status" panel, not
-through the gateway log.
+through the gateway log. The one line the operator misses is the repair
+itself — *"the endpoint refused the request; the other address family
+delivered the list"* — which the crate logs and pangolin drops.
 
 ### The order the verifier uses
 
@@ -422,7 +464,7 @@ this repository controls.
 ## Relationship with upstream cnlangzi/knownbots
 
 This port tracks upstream, but not one-for-one. Upstream ships **57** bot
-configs; this port embeds **75**.
+configs; this port embeds **79**.
 
 ### The 25 upstream configs this port does not embed
 
@@ -433,16 +475,17 @@ configs; this port embeds **75**.
 | Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in the crate's `src/feed/parsers.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
 | Crawlers dropped in knownbots 0.2 | 2 | `google-extended` (upstream's `Google-Extended`) and `cloudflare-alwaysonline` (upstream's `CloudFlare-AlwaysOnline`) | **no coverage is lost, because no request ever carried them**: neither token is a User-Agent a vendor publishes. The port shipped both until 0.2 and dropped them for the same reason it corrected the other markers — see [The 0.2 registry change](#the-02-registry-change) |
 
-### The 43 bots this port ships that upstream does not have
+### The 47 bots this port ships that upstream does not have
 
 `amzn-searchbot`, `amzn-user`, `bytespider`, `ccbot`, `censysinspect`,
 `claudebot`, `claude-searchbot`, `claude-user`, `dataforseobot`,
 `discordbot`, `duckassistbot`, `google-agent`, `google-cloudvertexbot`,
 `google-cws`, `google-gemininotebook`, `googlemessages`, `google-pinpoint`,
 `googleproducer`, `google-read-aloud`, `google-safety`,
-`google-site-verification`, `hetrixtools`, `meta-externalfetcher`,
-`meta-webindexer`, `mistralai-index`, `mistralai-user`, `mojeekbot`,
-`oai-adsbot`, `perplexitybot`, `pingdom`, `redditbot`, `semrushbot-si`,
+`google-site-verification`, `hetrixtools`, `hyspider`, `kimbot`,
+`kimi-searchbot`, `kimi-user`, `meta-externalfetcher`, `meta-webindexer`,
+`mistralai-index`, `mistralai-user`, `mojeekbot`, `oai-adsbot`,
+`perplexitybot`, `pingdom`, `redditbot`, `semrushbot-si`,
 `semrushbot-swa`, `seokicks`, `seznambot`, `siteauditbot`, `sitebulb`,
 `slackbot`, `splitsignalbot`, `telegrambot`, `whatsapp`, `yeti`, `youbot`.
 
