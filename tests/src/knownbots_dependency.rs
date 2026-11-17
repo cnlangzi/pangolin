@@ -5,6 +5,13 @@
 //! `knownbots` on crates.io, consumed from the registry, and the
 //! in-tree copy is gone.
 //!
+//! The locked version is 0.2.1 (issue #157): the first release whose
+//! built-in HTTP client resolves a vendor over IPv4 first.  0.2.0
+//! leaves the address order to the system resolver, which hands back
+//! the AAAA record first — a tampered IPv6 path to a publisher then
+//! starves the crawler of its address list, and the crawler is
+//! throttled like an ordinary client.
+//!
 //! Two failure modes are worth a test, and neither of them shows up
 //! as a compile error:
 //!
@@ -160,8 +167,8 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
     );
     assert_eq!(
         entry.get("version").and_then(|v| v.as_str()),
-        Some("0.2.0"),
-        "the locked {CRATE} must be the published 0.2.0"
+        Some("0.2.1"),
+        "the locked {CRATE} must be the published 0.2.1"
     );
 
     let dependencies = entry
@@ -186,7 +193,7 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
 /// name cargo resolves it to.
 #[test]
 fn the_published_crate_is_the_one_on_the_registry() {
-    // The checksum pins the exact artefact: a re-publish of 0.2.0
+    // The checksum pins the exact artefact: a re-publish of 0.2.1
     // under a different content would not resolve to the same
     // checksum, and cargo would refuse the lockfile.
     let packages = lock_packages();
@@ -196,8 +203,8 @@ fn the_published_crate_is_the_one_on_the_registry() {
         .and_then(|c| c.as_str())
         .unwrap_or_else(|| panic!("the registry entry of {CRATE} must carry a checksum"));
     assert_eq!(
-        checksum, "4e852764d1ba1389b3acf762e9cc005b94f7eac0f10174d6e93ccc3ef68d4785",
-        "the locked {CRATE} must be the published 0.2.0 artefact"
+        checksum, "864c72fd60e1a4f150b7e5912b1809d27b259c5f14e3c01929862325d358af60",
+        "the locked {CRATE} must be the published 0.2.1 artefact"
     );
 }
 

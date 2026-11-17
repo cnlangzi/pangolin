@@ -3,7 +3,7 @@
 > **Status:** implemented
 > **Code:** the published `knownbots` crate —
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
-> consumed from crates.io as `knownbots` 0.2 (issue #146)
+> consumed from crates.io as `knownbots` 0.2.1 (issues #146, #157)
 > **Configs:** the crate's own `conf.d/` (embedded),
 > `<log.bot.cache_dir>/conf.d/` (operator)
 > **Contract test:** the crate's
@@ -17,7 +17,7 @@ config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
 
 The crate lives in **its own repository** and is **published to crates.io**
-(`knownbots` 0.2); pangolin consumes it from the registry and no longer
+(`knownbots` 0.2.1); pangolin consumes it from the registry and no longer
 carries a copy. What stays here is the consumer-side contract: the category
 mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
 verification layer, and the operator-facing knobs.
@@ -130,6 +130,61 @@ independent: a bot may use one, two, or all three.
 
 The `custom:` CIDRs are merged into the same prefix set as the downloaded
 list, so a bot can be half static, half dynamic.
+
+### Downloading a published list
+
+The crate downloads the list itself, with the client it builds
+(`knownbots::http::build_client()`). **Since 0.2.1 that client resolves a
+vendor over IPv4 first** (issue #157): the resolver of the crate returns the
+IPv4 addresses of a host before its IPv6 ones, the HTTP stack splits the
+addresses into two groups by the family of the first one, and the IPv6 group
+starts 300 ms later and is raced against the IPv4 group. A host that answers
+with IPv6 only keeps using IPv6.
+
+The reason is measured, not hypothetical: on a host whose IPv6 path to Bing is
+tampered with, `https://www.bing.com/toolbox/bingbot.json` answers
+`203 Non-Authoritative Information` with a two-byte body over IPv6, and
+`200 application/json` with the 29 published prefixes over IPv4. 0.2.0 left
+the address order to the system resolver, which returns the AAAA record
+first, so the tampered path won the race. `bingbot` then kept an empty
+prefix set, every request claiming to be that crawler failed closed, never
+reached the bot log, and was throttled like an ordinary client.
+
+The gateway therefore **does not supply an `http_client` of its own**
+(`ValidatorOptions::http_client` stays `None`): a host-supplied client keeps
+its own choice of the address family, and the crate's IPv4-first resolver
+lives only in the client the crate builds.
+
+**A refused download names what the endpoint answered** (0.2.1). Before, a
+vendor that answered with something other than its document surfaced as a
+JSON syntax error, which reads as "our code is at fault"; now the message
+names the endpoint's own answer, and the panel reports it as
+`unreachable` — the environment — rather than `broken`:
+
+| What the endpoint did | The message | The panel shows |
+| --------------------- | ----------- | -------------- |
+| A status other than 200 | `{url} returned {status} ({content_type}): {excerpt}` | `unreachable` |
+| A status other than 200, no body | `{url} returned {status}` | `unreachable` |
+| 200, a body the parser cannot read | `{url} answered {status code} with {content_type}: {excerpt}` | `unreachable` |
+| 200, a document whose shape changed | `{url}: {reason}` | `broken` |
+
+The **excerpt** is the first at most 64 bytes of the body, decoded as UTF-8
+with a lossy conversion, with the control characters replaced by `·` and a
+`…` appended when the body is longer. So the tampered path above reads:
+
+```
+https://www.bing.com/toolbox/bingbot.json returned 203 Non-Authoritative Information (text/xml): OK
+```
+
+A `429` or a `5xx` is transient and is retried twice (3 s apart, or the
+`Retry-After` of the answer); every other status fails at once. A list that
+fails to refresh **keeps the prefixes that were already loaded** — the
+crawler keeps verifying from them.
+
+The crate logs through `tracing`, and pangolin installs no tracing
+subscriber, so the reason reaches the operator through
+`Validator::refresh_status()` and the "Verification status" panel, not
+through the gateway log.
 
 ### The order the verifier uses
 

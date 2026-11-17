@@ -116,7 +116,13 @@ ipnet = "2"
 # of this workspace. The `full` feature compiles in the IP-list
 # download and the RDNS workers; without it every URL-backed bot
 # would stay `Cold`.
-knownbots = { version = "0.2", features = ["full"] }
+#
+# 0.2.1 is the floor (issue #157): its built-in HTTP client resolves a
+# vendor over IPv4 first, so a tampered IPv6 path to a publisher can
+# no longer starve a crawler of its address list — 0.2.0 left the
+# address order to the system resolver, which hands back the AAAA
+# record first (upstream issue #57).
+knownbots = { version = "0.2.1", features = ["full"] }
 
 # IP reputation (issue #141). The `full` feature compiles in every
 # provider the crate ships: the five list publishers (Spamhaus,
