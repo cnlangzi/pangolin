@@ -207,8 +207,8 @@ message. A `Failed` bot with **no** prefixes loaded is the fail-closed
 case, and its traffic stops reaching the log.
 
 Only `Cold` and `Failed` bots are listed in the panel's table; the rest
-are covered by the `ready` / `cold` / `failed` counts (the registry has
-~75 bots, and listing them all would bury the two that matter). When
+are covered by the `ready` / `cold` / `failed` counts (the registry holds
+dozens of bots, and listing them all would bury the ones that matter). When
 nothing needs attention the panel says `All IP lists loaded`. The
 `RDNS lookups dropped` line appears only when the reverse-DNS work queue
 overflowed; the count is a since-startup total, and only the lookups

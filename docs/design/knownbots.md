@@ -117,30 +117,6 @@ three removed ids leave the table inert. The V14 migration rewrites
 `applebot`, and a site that deliberately kept it out of its exemptions must
 keep doing so — and deletes the two ids with no successor.
 
-### The 0.3 registry change
-
-knownbots 0.3 **added four crawlers** and changed nothing else in the
-registry: the marker of every bot that shipped before is the marker it
-shipped with, and the address space of every bot is the address space it
-had. The four new entries are URL-backed — they verify from the list their
-vendor publishes:
-
-| Registry id | Vendor | Kind | Marker | The list it verifies from |
-| ----------- | ------ | ---- | ------ | ------------------------- |
-| `hyspider` | Tencent | `AITraining` | `HySpider` | `https://hy.tencent.com/policy/hyspider.json` |
-| `kimbot` | Moonshot | `AITraining` | `KimiBot` | `https://www.kimi.ai/policies/kimibot.json` |
-| `kimi-searchbot` | Moonshot | `AIAssist` | `Kimi-SearchBot` | `https://www.kimi.ai/policies/kimi-searchbot.json` |
-| `kimi-user` | Moonshot | `AIAssist` | `Kimi-User` | `https://www.kimi.ai/policies/kimi-user.json` |
-
-All four land in the `ai_bot` bucket of the category mapping — `AITraining`
-and `AIAssist` both do — and all four are **new** registry ids: a request
-carrying `KimiBot/1.0` matched nothing before 0.3, so it was not a verified
-bot and was not exempt from the rate limits. It is now.
-
-The three Moonshot crawlers publish a list each, and the lists hold the
-same prefixes today. The crate keeps them as separate entries because each
-one has its own marker.
-
 ### The address space — three sources
 
 A bot's address space is assembled from up to three sources. They are
@@ -463,10 +439,16 @@ this repository controls.
 
 ## Relationship with upstream cnlangzi/knownbots
 
-This port tracks upstream, but not one-for-one. Upstream ships **57** bot
-configs; this port embeds **79**.
+This port tracks upstream, but not one-for-one. This port embeds the
+crate's own set of bots — **the inventory belongs to the crate**, whose
+contract test (`embedded_bot_configs_satisfy_the_contract`) checks it, so
+this document does not restate how many bots it holds.
 
-### The 25 upstream configs this port does not embed
+What follows is the comparison with the Go upstream the crate was ported
+from. Upstream ships **57** bot configs, and this port deliberately leaves
+some of them out:
+
+### The upstream configs this port does not embed
 
 | Group | Count | What they are | Why they are absent |
 | ----- | ----- | ------------- | ------------------- |
@@ -475,19 +457,11 @@ configs; this port embeds **79**.
 | Genuine crawlers | 2 | `chrome-lighthouse` (a reverse-DNS bot) and `stripe` (a URL-backed bot that would also need a `stripe` list parser) | **absent, not forgotten**. Adding `stripe` needs a new list parser in the crate's `src/feed/parsers.rs`; `chrome-lighthouse` is a single audit-tool crawler. Both are out of scope for a documentation change |
 | Crawlers dropped in knownbots 0.2 | 2 | `google-extended` (upstream's `Google-Extended`) and `cloudflare-alwaysonline` (upstream's `CloudFlare-AlwaysOnline`) | **no coverage is lost, because no request ever carried them**: neither token is a User-Agent a vendor publishes. The port shipped both until 0.2 and dropped them for the same reason it corrected the other markers — see [The 0.2 registry change](#the-02-registry-change) |
 
-### The 47 bots this port ships that upstream does not have
+### The bots this port ships that upstream does not have
 
-`amzn-searchbot`, `amzn-user`, `bytespider`, `ccbot`, `censysinspect`,
-`claudebot`, `claude-searchbot`, `claude-user`, `dataforseobot`,
-`discordbot`, `duckassistbot`, `google-agent`, `google-cloudvertexbot`,
-`google-cws`, `google-gemininotebook`, `googlemessages`, `google-pinpoint`,
-`googleproducer`, `google-read-aloud`, `google-safety`,
-`google-site-verification`, `hetrixtools`, `hyspider`, `kimbot`,
-`kimi-searchbot`, `kimi-user`, `meta-externalfetcher`, `meta-webindexer`,
-`mistralai-index`, `mistralai-user`, `mojeekbot`, `oai-adsbot`,
-`perplexitybot`, `pingdom`, `redditbot`, `semrushbot-si`,
-`semrushbot-swa`, `seokicks`, `seznambot`, `siteauditbot`, `sitebulb`,
-`slackbot`, `splitsignalbot`, `telegrambot`, `whatsapp`, `yeti`, `youbot`.
+The crate's `conf.d/` is the source of truth for that set, and the crate's
+own contract test checks it — so this document does not enumerate it
+either.
 
 ### The ASN step is not ported
 
@@ -509,7 +483,7 @@ carries one parses here and the key is ignored.
 - **`vendor:` is a pangolin addition.** Upstream's configs have no vendor
   field at all; the JSONL `bot_vendor` and the admin UI's vendor column are
   this port's own.
-- The **32 configs both projects ship** are otherwise identical, with these
+- The configs **both projects ship** are otherwise identical, with these
   exceptions:
   - `google-inspectiontool` is `kind: SearchEngine` here and `kind: Monitor`
     upstream;
