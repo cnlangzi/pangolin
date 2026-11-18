@@ -2,9 +2,9 @@
 # default is `tun.yml`).
 #
 # The top level of this file IS the tun client config — its connection
-# target, auth token, and node name. There is no `connection:` wrapper.
-# Only `[log]` is a sub-section, since the three connection fields are
-# siblings of equal weight.
+# target, auth token, node name and transport. There is no
+# `connection:` wrapper. Only `[log]` is a sub-section, since the
+# connection fields are siblings of equal weight.
 #
 # Every field is the equivalent of the previous CLI flags:
 #   --server <ADDR>  →  server: <ADDR>
@@ -16,6 +16,7 @@
 #   TUN_TOKEN=abc123              # overrides `token:`
 #   TUN_NAME=office               # overrides `name:`
 #   TUN_SERVER=gw.example.com:443 # overrides `server:`
+#   TUN_TRANSPORT=quic             # overrides `transport:`
 #   TUN_LOG__LEVEL=debug          # overrides `log.level`
 #   TUN_LOG__FILE=/var/log/tun.log
 # The loader is figment-based, so env override is value-level — the
@@ -23,19 +24,39 @@
 # permissions (0600) on this file are the canonical protection for
 # the token.
 #
-# Rules for `name` (validated at load):
-#   - matches ^[a-z0-9_-]+$ (lowercase letters, digits, dash, underscore)
-#   - 1..=32 chars
-#   - non-purely-numeric (ngx uses a non-numeric name as the tun PK)
+# The full field reference is
+# https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
 
 # ── Connection (top level: this file IS the tun config) ─────────────────
-server: 127.0.0.1:9001     # ngx address to connect to
-token: "dev"
-name: local               # this tun's name; admin must have already
-                           # created the matching (name, token) row
-                           # in ngx's `tun` table via POST /api/tun
-                           # (or the admin UI Tunnels page). The
-                           # server does NOT auto-register on connect.
+server: 127.0.0.1:9001     # the gateway's `tunnel.addr` to connect to.
+                           # Must not be empty.
+token: "dev"               # Must not be empty. This is the tun's bearer
+                           # token: the gateway compares it against the
+                           # token of the tun row that carries the same
+                           # `name` (see `name` below).
+name: local               # this tun's name. Validated at load: it must
+                           # match ^[a-z0-9_-]+$ (lowercase letters,
+                           # digits, dash, underscore), be 1..=32
+                           # characters long, and must not be purely
+                           # numeric.
+                           # The admin must have already created the
+                           # matching (name, token) row in the
+                           # gateway's `tun` table — via the admin
+                           # UI's Tunnels page, or POST /api/tun. The
+                           # gateway does NOT auto-register a tun on
+                           # connect: a tun whose row is missing is
+                           # rejected at the handshake.
+transport: auto            # auto | quic | tcp.
+                           # `auto` prefers QUIC and falls back to the
+                           # WebSocket/TCP transport when QUIC is
+                           # unavailable (a network that blocks UDP,
+                           # or a gateway that could not bind its UDP
+                           # port). `quic` and `tcp` pin the tun to one
+                           # transport. The WebSocket/TCP fallback is
+                           # not encrypted — the token crosses the
+                           # network in clear text — so a deployment
+                           # that can reach the gateway over UDP
+                           # should pin `quic`.
 
 log:
   level: info              # env_logger filter: trace|debug|info|warn|error

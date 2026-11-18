@@ -248,11 +248,18 @@ jobs:
           mkdir -p "$stage"
           install -m 0755 bin/pangolin-ngx "$stage/pangolin-ngx"
           install -m 0755 bin/pangolin-tun "$stage/pangolin-tun"
-          cp README.md "$stage/README.md"
-          # The three files sit at the archive root — no wrapping
+          # The configuration files are the repository's own — the same
+          # bytes `make start-ngx` / `make start-tun` read, so there is
+          # exactly one copy of each in the world. The `diff` proves
+          # the archive carries them unchanged.
+          cp ngx.yml "$stage/ngx.yml"
+          cp tun.yml "$stage/tun.yml"
+          diff ngx.yml "$stage/ngx.yml"
+          diff tun.yml "$stage/tun.yml"
+          # The four files sit at the archive root — no wrapping
           # directory, no path prefix.
           tar -C "$stage" -czf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" \
-            pangolin-ngx pangolin-tun README.md
+            pangolin-ngx pangolin-tun ngx.yml tun.yml
           tar -tzf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz"
 
       - name: Upload build artifact

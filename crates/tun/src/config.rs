@@ -210,6 +210,41 @@ mod tests {
         });
     }
 
+    /// The shipped `tun.yml` must parse with the real loader and name
+    /// a transport the loader accepts (issue #165).
+    ///
+    /// The release archive carries this file, so an operator receives
+    /// it as the starting point: every key it carries has to survive
+    /// the same load path the binary uses, and the transport it names
+    /// has to be one of the three the selector accepts.
+    ///
+    /// The transport is asserted on the *text* as well: a file that
+    /// does not mention `transport:` still parses — the selector
+    /// defaults to `auto` — so only the text can tell "the operator
+    /// was shown the knob" from "the operator was not".
+    #[test]
+    fn the_shipped_example_config_parses() {
+        let shipped = include_str!("../../../tun.yml");
+        assert!(
+            shipped.contains("transport:"),
+            "tun.yml must mention `transport:` — the tun implements it, so an operator who \
+             reads only the shipped file has to learn that it exists"
+        );
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = TunConfig::from_str(shipped).expect("tun.yml must parse");
+            assert_eq!(c.transport, TransportSelector::Auto);
+            // The three connection fields are required — a shipped
+            // file that carries an empty one would be rejected by the
+            // loader before the transport was even looked at.
+            assert!(!c.server.is_empty());
+            assert!(!c.token.is_empty());
+            assert!(!c.name.is_empty());
+            Ok(())
+        });
+    }
+
     /// The selector accepts the three documented values.
     #[test]
     fn transport_selector_accepts_the_three_values() {

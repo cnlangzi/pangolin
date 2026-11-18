@@ -2,15 +2,31 @@
 # default is `ngx.yml`).
 #
 # The top level of this file IS the proxy config — there is no
-# `proxy:` wrapper. The `[tunnel]` sub-section is the WebSocket
-# endpoint that tun clients connect into. Other features (admin UI,
-# response cache, ACME certs, logging) each have their own sub-section.
+# `proxy:` wrapper. The `[tunnel]` sub-section is the endpoint that tun
+# clients connect into. Other features (admin UI, ACME certs, logging)
+# each have their own sub-section.
 #
 # Every field is optional — all sections have `#[serde(default)]` in
-# crates/pangolin-core/src/config.rs. This file lists every field
-# explicitly so that:
-#   (a) schema drift is impossible (the file mirrors Config 1:1)
+# crates/pangolin-core/src/config.rs. This file lists every field the
+# gateway acts on, plus the inert ones named below, so that:
+#   (a) schema drift is visible: a field the code stops reading has to
+#       be removed here too, not only in the Rust source;
 #   (b) new contributors see all knobs without reading the Rust source
+#
+# Some keys are accepted by the loader but NOT implemented by the
+# gateway. A configuration that carries them parses fine and nothing
+# happens:
+#   * the `cache` section — there is no response cache in the gateway;
+#   * `tunnel.tls_cert` / `tunnel.tls_key` — the tunnel listener is a
+#     plain TCP socket. The encrypted path is QUIC, which uses its own
+#     certificate under `acme.cert_dir`;
+#   * the top-level `host` and `workers` — the TLS listener is
+#     SNI-based (it resolves a certificate through the pre-computed
+#     domain → cert link, not through a virtual host), and the worker
+#     count is chosen by the runtime.
+# The `cache` section and the two tunnel TLS keys are therefore left
+# out of this file; `host` and `workers` are listed below so the
+# schema stays visible, but nothing reads them.
 #
 # Environment-variable override: any NGX_<KEY> env var wins over the
 # matching YAML path, with `__` as the nested-key separator. Examples:
@@ -22,10 +38,11 @@
 # The loader is figment-based, so env override is value-level — the
 # YAML text is never re-scanned for `$VAR` placeholders.
 #
-# Dev ports are non-privileged (9080/9443) so `make start-ngx` works
+# Dev ports are non-privileged (8000/8443) so `make start-ngx` works
 # without sudo. Production defaults are 0.0.0.0:80 / 0.0.0.0:443
-# (privileged) — see docs/configuration.md for the per-field
-# documentation.
+# (privileged) — see
+# https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
+# for the per-field documentation.
 #
 # ── TLS setup for local dev ──────────────────────────────────────────────
 # In v2 there is no `default` blob fallback — each host you serve TLS
@@ -52,13 +69,32 @@
 addr:
   http: 0.0.0.0:8000    # HTTP listen addr
   https: 0.0.0.0:8443   # HTTPS listen addr; ":0" = disable TLS entirely
-host: null              # virtual host for per-domain cert resolution
-                        # (null = "default" → ./certs/default/...)
-                        # UNRELATED to [addr] — `host` is the SNI fallback,
-                        # not a bind address.
-workers: null           # pingora worker count; null = auto (CPU count)
+host: null              # Accepted, but NOT read by the gateway: it used
+                        # to name the virtual host that resolved the
+                        # per-domain certificate. Since v2 the TLS
+                        # listener is SNI-based and resolves a
+                        # certificate through the pre-computed
+                        # domain → cert link, so there is no virtual
+                        # host any more. Setting it changes nothing.
+workers: null           # Accepted, but NOT read by the gateway: the
+                        # worker count is chosen by the runtime, not by
+                        # the configuration. Setting it changes nothing.
 
-# ── WebSocket endpoint for tun clients ───────────────────────────────────
+# ── Endpoint for tun clients ─────────────────────────────────────────────
+# Two transports carry the same protocol:
+#   * QUIC — the primary transport. It listens on the **same port
+#     number** as the tunnel's `addr` key, but over **UDP** (TCP and
+#     UDP have separate port spaces, so no extra key is needed). A
+#     firewall rule that opens the TCP port has to open the UDP port
+#     too. The gateway generates the QUIC certificate under
+#     `{acme.cert_dir}/tunnel/` and logs its SHA-256 fingerprint at
+#     startup.
+#   * WebSocket over TCP — the fallback for networks that block UDP.
+#     It is **not encrypted**: the listener is a plain TCP socket, so
+#     the tun's bearer token crosses the network in clear text in the
+#     `Authorization` header of the upgrade request. Keep the tunnel
+#     port on a trusted network, or pin the tun to QUIC with
+#     `transport: quic` in tun.yml.
 tunnel:
   addr: 0.0.0.0:9001    # listen addr (full host:port). Default
                         # `0.0.0.0:9001` accepts tun clients on any
@@ -74,11 +110,11 @@ admin:
                         # this file; restrict access via ufw/iptables
                         # if exposing to a non-trusted network.
   username: admin
-  password: admin
-
-cache:
-  enabled: false        # response cache (pingora proxy_cache)
-  dir: ./cache          # cache storage dir
+  password: admin       # the shipped default is `admin` — change it
+                        # before the admin port is reachable from an
+                        # untrusted network. The gateway logs no
+                        # warning about it, so this file is the only
+                        # place the operator is told.
 
 acme:
   email: ""               # ACME registration email
@@ -87,7 +123,7 @@ acme:
                           # v2 has NO `default` blob fallback — each host
                           # must have its own cert on disk.
   # Production LE
-  acme_directory: https://acme-v02.api.letsencrypt.org/directory  # Production LE. 
+  acme_directory: https://acme-v02.api.letsencrypt.org/directory  # Production LE.
   # Override with NGX_ACME__ACME_DIRECTORY env (e.g. https://acme-staging-v02.api.letsencrypt.org/directory for testing).
   # acme_directory: https://acme-staging-v02.api.letsencrypt.org/directory
   renew_threshold_days: 14
@@ -98,6 +134,23 @@ acme:
   # the DNS provider used for DNS-01 challenges is set per-domain via
   # `domains.dns_provider` (referencing a row in the `dns_providers`
   # table). See the v2 design doc for details.
+  # ── ACME lifecycle hooks ───────────────────────────────────────────
+  # Each hook is a shell command, run with `sh -c`, so shell syntax
+  # works. Two environment variables are set for every hook:
+  #   DOMAIN     the domain being issued
+  #   CERT_FILE  the path of the issued certificate — EMPTY for
+  #              `pre_renew` (no certificate exists yet), set for
+  #              `post_renew` and `deploy`
+  # The hooks run in this order:
+  #   pre_renew  →  issuance  →  post_renew  →  deploy
+  # A non-zero exit from `pre_renew` **aborts** that domain's issuance
+  # and marks the certificate as failed. A non-zero exit from
+  # `post_renew` or `deploy` is only logged as a warning — the
+  # certificate is already on disk and the issuance counts as
+  # successful.
+  # pre_renew: "/usr/local/bin/prepare-dns.sh"
+  # post_renew: "/usr/local/bin/notify-ops.sh"
+  # deploy: "/usr/local/bin/reload-proxy.sh"
 
 provider:
   # How often the providers' published source-IP ranges are refreshed
@@ -113,7 +166,8 @@ provider:
 # API key and a key in this file ends up in backups and in shell
 # history. It is on by default — a throttled client whose address the
 # reputation library convicts, or whose user agent declares itself a
-# bot, is answered 403 instead of 429. See docs/configuration.md.
+# bot, is answered 403 instead of 429. See
+# https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
 
 tls:
   enable_h2: true       # advertise HTTP/2 via ALPN for non-tunnel sites.
@@ -167,10 +221,23 @@ log:
   #                   bot-only SSE fan-out. Default 1000.
   #   * `dir`         output directory for `bot-YYYY-MM-DD.jsonl`.
   #                   Created lazily on first write.
+  #   * `cache_dir`   root of the knownbots cache — per-bot `ips.txt`
+  #                   (the publisher's official ranges) and `rdns.txt`
+  #                   (the reverse-DNS results). A `conf.d/`
+  #                   sub-directory may hold extra bot YAMLs.
+  #                   Default ./logs/bots/cache.
+  #   * `refresh_interval_secs`
+  #                   seconds between successful official IP-list
+  #                   refreshes. A failed refresh retries with
+  #                   exponential backoff instead of waiting a full
+  #                   interval. 0 still runs one startup refresh.
+  #                   Default 86400 (24h).
   bot:
     recent: 200
     capacity: 1000
     dir: ./logs/bots
+    cache_dir: ./logs/bots/cache
+    refresh_interval_secs: 86400
   # ── Referer log side-channel (inbound external referrals) ────────
   # Records the `Referer` header of every *top-level document
   # navigation* that lands on one of our sites from another site.
@@ -203,3 +270,11 @@ log:
     recent: 200
     capacity: 1000
     dir: ./logs/referers
+  # ── Traffic side-channel (in-memory, no persistence) ──────────────
+  # The gateway counts requests per host / path / status in memory and
+  # feeds the `/logs/traffic` dashboard card.
+  #   * `enabled`  master switch. `false` does not spawn the
+  #                aggregator thread and the proxy hot path stops
+  #                feeding it. Default true.
+  traffic:
+    enabled: true

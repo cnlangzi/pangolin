@@ -84,8 +84,8 @@ because they apply to the whole file, not just one section.
 | ------------- | --------------- | ------------ | -------- | ----- |
 | `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Set to `":0"` to disable plain-HTTP serving entirely. |
 | `addr.https`  | `string`        | `0.0.0.0:443`| no       | Full `host:port` for the HTTPS listener. Set to `":0"` to disable TLS entirely. |
-| `host`        | `string \| null` | `null`      | no       | Per-domain cert resolution. `null` → virtual host `"default"`, which looks up certs at `./certs/default/`. Unrelated to `[addr]` — `host` selects the SNI fallback, not the bind address. |
-| `workers`     | `usize \| null` | `null`       | no       | `pingora` worker count. `null` → auto = number of CPU cores. |
+| `host`        | `string \| null` | `null`      | no       | Parsed, but **not read by the gateway**. It used to name the virtual host that resolved the per-domain certificate; since v2 the TLS listener is SNI-based and resolves a certificate through the pre-computed domain → cert link, so there is no virtual host any more. Setting it changes nothing. |
+| `workers`     | `usize \| null` | `null`       | no       | Parsed, but **not read by the gateway** — the worker count is chosen by the runtime, not by the configuration. Setting it changes nothing. |
 
 ### `[tunnel]` — tunnel endpoint for tun clients
 
@@ -95,6 +95,12 @@ Both listen on the **same port number** — `tunnel.addr` — because TCP
 and UDP have separate port spaces. So no new configuration key is
 needed for QUIC, and a firewall rule that opens the TCP port should
 open the UDP port too.
+
+The WebSocket/TCP fallback is **not encrypted**: the listener is a
+plain TCP socket, so the tun's bearer token crosses the network in
+clear text in the `Authorization` header of the upgrade request. Pin
+the tun to QUIC (`transport: quic` in `tun.yml`) wherever the network
+allows it.
 
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
@@ -126,12 +132,18 @@ without an explicit override.
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
 | `password`  | `string` | `admin`          | no       | HTTP basic auth password. **Security**: stored in plaintext in `ngx.yml`; use `NGX_ADMIN__PASSWORD` env var to avoid committing secrets. Restrict port 9081 access via firewall (`ufw` / `iptables`) if exposing to untrusted networks. |
 
-### `[cache]` — response cache
+### `[cache]` — response cache (parsed, **not implemented**)
+
+The gateway accepts a `cache` section, but **there is no response
+cache in the gateway**: no code path reads either key. A configuration
+that still carries the section parses fine and nothing happens — the
+section is neither an error nor a promise. Do not expect a cache to
+appear, and do not rely on `dir` being used.
 
 | Field      | Type      | Default    | Required | Notes |
 | ---------- | --------- | ---------- | -------- | ----- |
-| `enabled`  | `bool`    | `false`    | no       | Master switch for `pingora` response cache. |
-| `dir`      | `string`  | `./cache`  | no       | On-disk cache directory. Absolute path recommended in production. |
+| `enabled`  | `bool`    | `false`    | no       | Parsed and ignored — there is no response cache. |
+| `dir`      | `string`  | `./cache`  | no       | Parsed and ignored — there is no response cache. |
 
 ### `[acme]` — ACME operational config (v2)
 
@@ -161,6 +173,31 @@ Two certificate modes coexist at runtime:
 | `renew_threshold_days`       | `u32`    | `14`                                                 | no       | Renew when remaining validity ≤ this. |
 | `renew_check_interval_hours` | `u32`    | `6`                                                  | no       | Background renew check cadence. |
 | `key_type`                   | `string` | `ecdsa`                                              | no       | `ecdsa` (P-256) or `rsa`. ECDSA is faster and smaller; choose `rsa` only for legacy clients. |
+| `pre_renew`                  | `string` | `""`                                                 | no       | Shell command run **before** the ACME issuance of a domain starts. `DOMAIN` is set to the domain being issued; `CERT_FILE` is set to the empty string (no certificate exists yet). A non-zero exit **aborts** that domain's issuance and marks the certificate as failed. |
+| `post_renew`                 | `string` | `""`                                                 | no       | Shell command run **after** a successful issuance. `DOMAIN` is set to the domain; `CERT_FILE` is set to the path of the issued certificate blob. A non-zero exit is logged as a warning — the certificate is already on disk and the issuance still counts as successful. |
+| `deploy`                     | `string` | `""`                                                 | no       | Shell command run **last**, after `post_renew`. Same environment variables (`DOMAIN`, `CERT_FILE`). A non-zero exit is logged as a warning. Use it to reload a reverse proxy, copy the certificate elsewhere, … |
+
+#### The ACME lifecycle hooks
+
+The three hooks are optional and all three default to unset. What they
+have in common:
+
+- The command is run with `sh -c`, so shell syntax works.
+- `DOMAIN` is set to the domain being issued, for every hook.
+- `CERT_FILE` is set to the path of the issued certificate for
+  `post_renew` and `deploy`, and to the **empty string** for
+  `pre_renew` — there is no certificate yet at that point.
+- The order is `pre_renew` → issuance → `post_renew` → `deploy`.
+
+The exit code decides what happens next:
+
+| Hook | Non-zero exit |
+| ---- | ------------- |
+| `pre_renew` | **Fatal for that domain**: the issuance is aborted and the certificate is marked failed (with a backoff, like any other transient failure). |
+| `post_renew` | Non-fatal: logged as a warning. The certificate is on disk and the issuance counts as successful. |
+| `deploy`   | Non-fatal: logged as a warning. |
+
+The shipped `ngx.yml` carries all three as commented-out examples.
 
 > **HTTP-01 vs DNS-01** is **per-domain** in v2: each domain's
 > `dns_provider` column decides which challenge type to use (empty →
@@ -507,9 +544,9 @@ Encrypt on every restart.
 ```yaml
 # ngx.yml — local dev
 addr:
-  http: 0.0.0.0:9080    # unprivileged HTTP port
+  http: 0.0.0.0:8000    # unprivileged HTTP port
   https: ":0"            # disable HTTPS entirely
-workers: 2              # fix workers for predictable debug output
+workers: 2              # accepted, but not read by the gateway
 
 tunnel:
   addr: 0.0.0.0:9001    # default
@@ -519,9 +556,6 @@ admin:
   addr: 0.0.0.0:9081    # default
   username: admin
   password: admin       # dev only — change for any real deploy
-
-cache:
-  enabled: false
 
 # v2: no `autorenew` field here. Per-domain `auto_issue` is in the DB;
 # leave every row's auto_issue=false for local dev so we never hit
@@ -548,7 +582,7 @@ log:
 ```
 
 Run: `make start-ngx` in one terminal, `make start-tun` in another,
-then `curl -H 'Host: example.test' http://127.0.0.1:9080/`.
+then `curl -H 'Host: example.test' http://127.0.0.1:8000/`.
 
 ### B. Single-host production (HTTPS + ACME HTTP-01)
 
@@ -560,8 +594,8 @@ challenges served from port 80.
 addr:
   http: 0.0.0.0:80
   https: 0.0.0.0:443
-host: default           # use ./certs/default/ for the cert
-workers: null           # auto = number of CPUs
+host: default           # accepted, but not read by the gateway
+workers: null           # accepted, but not read by the gateway
 
 tunnel:
   addr: 0.0.0.0:9001    # default
@@ -572,10 +606,6 @@ admin:
                         # exposing to a non-trusted network
   username: admin
   password: "your-admin-password"   # written directly in the file
-
-cache:
-  enabled: true
-  dir: /var/cache/pangolin
 
 acme:
   email: "ops@example.com"
@@ -657,7 +687,7 @@ in a site then routes traffic through the `home` tun.
 ## Gotchas
 
 - **Port 80/443 require root or `CAP_NET_BIND_SERVICE`.** Dev ports
-  (`9080`/`9443`) sidestep this. The shipped `ngx.yml` uses dev ports
+  (`8000`/`8443`) sidestep this. The shipped `ngx.yml` uses dev ports
   for that reason — change to `80`/`443` in production.
 - **`auto_issue = true` in dev** will spam Let's Encrypt on every
   restart (clock skew, no public IP, no DNS, etc.). Always leave the

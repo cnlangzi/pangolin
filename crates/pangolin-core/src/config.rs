@@ -806,6 +806,105 @@ mod tests {
         });
     }
 
+    /// The shipped `ngx.yml` must not offer the keys the gateway does
+    /// not implement (issue #165).
+    ///
+    /// The release archive carries this file, so an operator receives
+    /// it as the starting point. A key that is parsed and ignored is
+    /// worse than a missing one: the operator sets it and expects a
+    /// feature that does not exist. The `cache` section and the two
+    /// tunnel TLS keys are exactly that — the loader accepts them and
+    /// no code path reads them.
+    ///
+    /// The presence assertions are on the *text*, not on the parsed
+    /// config: a key the file carries with the default value is still
+    /// present in the file the operator reads.
+    #[test]
+    fn the_shipped_example_config_has_no_dead_fields() {
+        let shipped = include_str!("../../../ngx.yml");
+
+        assert!(
+            !shipped.contains("cache:"),
+            "ngx.yml must not carry the `cache` section — the gateway has no response \
+             cache, and the loader accepts the key without acting on it"
+        );
+        assert!(
+            !shipped.contains("tls_cert:") && !shipped.contains("tls_key:"),
+            "ngx.yml must not carry the tunnel TLS keys — the tunnel listener is a \
+             plain TCP socket and nothing reads them"
+        );
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str(shipped).expect("ngx.yml must parse");
+            // The defaults stand for the two groups the file omits.
+            assert!(!c.cache.enabled);
+            assert_eq!(c.cache.dir, "./cache");
+            assert!(c.tunnel.tls_cert.is_none());
+            assert!(c.tunnel.tls_key.is_none());
+            Ok(())
+        });
+    }
+
+    /// The shipped `ngx.yml` must carry the fields the gateway has
+    /// implemented since the file was last edited (issue #165).
+    ///
+    /// The three ACME hooks and the two knownbots knobs and the
+    /// traffic switch were all implemented without the shipped file
+    /// mentioning them, so an operator who read only the file did not
+    /// know they existed. The presence is asserted on the *text*: a
+    /// key the file does not mention still parses — the loader falls
+    /// back to the default — so only the text can tell "the operator
+    /// was shown the knob" from "the operator was not".
+    #[test]
+    fn the_shipped_example_config_carries_the_newer_fields() {
+        let shipped = include_str!("../../../ngx.yml");
+
+        for key in [
+            "pre_renew:",
+            "post_renew:",
+            "deploy:",
+            "cache_dir:",
+            "refresh_interval_secs:",
+            "traffic:",
+        ] {
+            assert!(
+                shipped.contains(key),
+                "ngx.yml must mention `{key}` — the gateway implements it, so an operator \
+                 who reads only the shipped file has to learn that it exists"
+            );
+        }
+        // The values are the ones the compiled-in defaults produce, so
+        // "change nothing" still means "get the documented behaviour".
+        assert!(shipped.contains("cache_dir: ./logs/bots/cache"));
+        assert!(shipped.contains("refresh_interval_secs: 86400"));
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str(shipped).expect("ngx.yml must parse");
+
+            // The ACME hooks ship as commented-out examples, so the
+            // parsed values are the "unset" ones.
+            assert!(c.acme.pre_renew.is_none());
+            assert!(c.acme.post_renew.is_none());
+            assert!(c.acme.deploy.is_none());
+
+            // The knownbots cache root and its refresh cadence.
+            assert_eq!(c.log.bot.cache_dir, PathBuf::from("./logs/bots/cache"));
+            assert_eq!(c.log.bot.refresh_interval_secs, 86_400);
+
+            // The traffic side-channel's master switch.
+            assert!(c.log.traffic.enabled);
+
+            // The listen addresses are the non-privileged dev ports:
+            // the shipped file has to be the one `make start-ngx` runs
+            // with, so its ports are the compiled-in defaults.
+            assert_eq!(c.addr.http, Config::default().addr.http);
+            assert_eq!(c.addr.https, Config::default().addr.https);
+            Ok(())
+        });
+    }
+
     #[test]
     fn log_referer_keys_parse_and_default() {
         // A config file with no `log.referer:` block must produce a
