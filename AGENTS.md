@@ -2,7 +2,8 @@
 
 Working guidance for AI agents (and humans) contributing to this repo.
 
-See [README.md](./README.md) for project overview, architecture, and terminology.
+See [README.md](./README.md) for the project overview and terminology, and
+[docs/](./docs/README.md) for the architecture and design detail.
 
 ## Before every commit
 

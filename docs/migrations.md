@@ -166,6 +166,10 @@ If the database has fewer rows than files, those migrations are pending and will
 | V8      | `add_gateway_header_config` | #115 | The `P-*` gateway header configuration (`pgl_headers_enabled`, `client_ip_header`, `client_country_header`, `client_region_header`); drops `trusted_headers` after copying its first entry into `client_ip_header` |
 | V9      | `add_site_rate_limits` | #117 | The per-site rate-limit policy (`site_rate_limits`) and the IP allow / block rules (`ip_rules`) |
 | V10     | `add_provider_config` | #122 | Renames `system_config.frontend_mode` to `provider` and adds `system_config.origin_guard_enabled`; adds the per-site provider configuration (`site_providers`), the manual allow ranges (`site_origin_allow`), the provider range lists (`provider_ip_lists`) and `site_rate_limits.custom_403_body` |
+| V11     | `add_site_rate_limit_bots` | #131 | The per-site list of known bots that are **not** exempt from that site's rate limits (`site_rate_limit_bots`); a site with no row exempts every verified bot |
+| V12     | `add_badbots_config` | #141 | The IP-reputation configuration (`badbots_config`): the master switch, the evidence policy and the AbuseIPDB / CrowdSec keys; the keys live in the database rather than in `ngx.yml` |
+| V13     | `drop_badbots_feed_refresh_interval` | #151 | Drops `badbots_config.feed_refresh_interval_secs` — the knob controlled when the gateway *asked* the library whether a list was due, not when a list was downloaded, so it controlled nothing the operator can act on |
+| V14     | `rewrite_removed_bot_ids` | #151 | Rewrites the per-site bot lists for crawlers the knownbots registry no longer has: deletes `google-extended` and `cloudflare-alwaysonline` (no successor), and renames `applebot-extended` to `applebot` |
 
 ## Troubleshooting
 

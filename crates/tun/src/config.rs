@@ -1,5 +1,5 @@
 //! Configuration for the `pangolin-tun` binary. Loaded from `tun.yml`
-//! (see README.md "全局配置"). The top level of `tun.yml` is the tunnel
+//! (see `docs/configuration.md`). The top level of `tun.yml` is the tunnel
 //! client itself — its connection target, auth token, and node name —
 //! plus a `[log]` sub-section for log routing. The file is intentionally
 //! separate from `ngx.yml`: the two binaries share a protocol, not a

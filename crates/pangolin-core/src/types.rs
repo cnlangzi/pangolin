@@ -1,7 +1,7 @@
-//! Pangolin core types. Mirrors the SQL schema in README.md.
+//! Pangolin core types. Mirrors the SQL schema in `docs/schema.md`.
 //!
 //! All primary keys are natural TEXT keys (no surrogate `id INTEGER`).
-//! This matches the README's "全部 TEXT 主键" decision and removes
+//! This matches the "natural TEXT key" decision and removes
 //! the need for ID/FK indirection.
 
 use chrono::{DateTime, Utc};

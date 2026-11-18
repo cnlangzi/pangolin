@@ -13,7 +13,8 @@
 //! Cert (independent, 1:1 with domain)
 //! ```
 //!
-//! See `README.md` for the design rationale.
+//! See `docs/schema.md` for the tables these types map onto, and
+//! `docs/design/routing-and-index.md` for the routing design rationale.
 
 pub mod app;
 pub mod bot;

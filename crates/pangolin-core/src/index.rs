@@ -30,7 +30,8 @@ struct SiteWithDomains {
 }
 
 /// All in-memory indexes. Wrapped in `Arc<RwLock<Indexes>>` at the
-/// `ngx` layer for concurrent reads + atomic reload (see README).
+/// `ngx` layer for concurrent reads + atomic reload (see
+/// `docs/design/routing-and-index.md`).
 #[derive(Debug, Default, Clone)]
 pub struct Indexes {
     /// domain (exact or `*.wildcard` literal) → Site
