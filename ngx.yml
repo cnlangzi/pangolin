@@ -20,13 +20,15 @@
 #   * `tunnel.tls_cert` / `tunnel.tls_key` — the tunnel listener is a
 #     plain TCP socket. The encrypted path is QUIC, which uses its own
 #     certificate under `acme.cert_dir`;
+#   * `tunnel.ws_path` — the gateway hardcodes the `/tunnel` upgrade
+#     path, so a different value changes nothing;
 #   * the top-level `host` and `workers` — the TLS listener is
 #     SNI-based (it resolves a certificate through the pre-computed
 #     domain → cert link, not through a virtual host), and the worker
 #     count is chosen by the runtime.
 # The `cache` section and the two tunnel TLS keys are therefore left
-# out of this file; `host` and `workers` are listed below so the
-# schema stays visible, but nothing reads them.
+# out of this file; `ws_path`, `host` and `workers` are listed below
+# so the schema stays visible, but nothing reads them.
 #
 # Environment-variable override: any NGX_<KEY> env var wins over the
 # matching YAML path, with `__` as the nested-key separator. Examples:
@@ -101,7 +103,12 @@ tunnel:
                         # interface (the normal multi-host deploy).
                         # Override to `127.0.0.1:9001` if you want
                         # to force tun-on-this-host-only semantics.
-  ws_path: /tunnel      # WebSocket path
+  ws_path: /tunnel      # WebSocket path. Accepted, but NOT read by the
+                        # gateway: the tunnel upgrade path is
+                        # hardcoded to `/tunnel`, so a different value
+                        # changes nothing. A reverse proxy in front of
+                        # this port has to rewrite the path to
+                        # `/tunnel`.
 
 admin:
   addr: 0.0.0.0:9081    # admin UI/API bind addr. Default `0.0.0.0:9081`
@@ -272,7 +279,7 @@ log:
     dir: ./logs/referers
   # ── Traffic side-channel (in-memory, no persistence) ──────────────
   # The gateway counts requests per host / path / status in memory and
-  # feeds the `/logs/traffic` dashboard card.
+  # feeds the `/traffic` admin page.
   #   * `enabled`  master switch. `false` does not spawn the
   #                aggregator thread and the proxy hot path stops
   #                feeding it. Default true.

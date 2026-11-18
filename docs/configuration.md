@@ -105,7 +105,7 @@ allows it.
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
 | `tunnel.addr` | `string` | `0.0.0.0:9001` | no | Full `host:port` string for the tun listener. Default `0.0.0.0:9001` accepts tun clients on any interface (the normal multi-host deploy). Override to `127.0.0.1:9001` to force tun-on-this-host-only semantics. **The tun client's `tun.yml: server:` field must resolve to this listener** — if `addr` is `0.0.0.0:9001`, use the gateway's public hostname or IP + port 9001 in `server`. The port is used for **both** TCP (WebSocket fallback) and UDP (QUIC); a failure to bind the UDP port is logged as a warning and the gateway keeps serving the WebSocket/TCP tunnel. |
-| `ws_path`   | `string` | `/tunnel`        | no       | WebSocket path on the listen port. Change it if you proxy the WS port through another path-aware reverse proxy. |
+| `ws_path`   | `string` | `/tunnel`        | no       | Parsed, but **not read by the gateway** — the tunnel upgrade path is hardcoded to `/tunnel` (`crates/ngx/src/tunnel.rs`), so a different value changes nothing. A path-aware reverse proxy in front of the tunnel port has to rewrite the request path to `/tunnel`. |
 
 The gateway generates a self-signed certificate for its QUIC endpoint
 on first start and stores it under `{acme.cert_dir}/tunnel/`, so a
