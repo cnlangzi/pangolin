@@ -248,11 +248,30 @@ jobs:
           mkdir -p "$stage"
           install -m 0755 bin/pangolin-ngx "$stage/pangolin-ngx"
           install -m 0755 bin/pangolin-tun "$stage/pangolin-tun"
-          cp README.md "$stage/README.md"
-          # The three files sit at the archive root — no wrapping
+          # The configuration files are the repository's own — the same
+          # bytes `make start-ngx` / `make start-tun` read, so there is
+          # exactly one copy of each in the world.
+          #
+          # 0600, not the source's 0644: `tun.yml` carries the tun's
+          # bearer token and `ngx.yml` the admin password, and both
+          # files say so themselves. `install` rather than `cp` so the
+          # mode in the archive is the one the operator wants.
+          install -m 0600 ngx.yml "$stage/ngx.yml"
+          install -m 0600 tun.yml "$stage/tun.yml"
+          # The four files sit at the archive root — no wrapping
           # directory, no path prefix.
           tar -C "$stage" -czf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" \
-            pangolin-ngx pangolin-tun README.md
+            pangolin-ngx pangolin-tun ngx.yml tun.yml
+          # Read the two configuration files back *out of the archive*
+          # and compare them with the repository's. This is the check
+          # that proves the archive carries them, unchanged, under the
+          # names the operator will find — diffing the staged copies
+          # would be a tautology, they are `install`s of the very
+          # files next to them.
+          tar -xzOf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" ngx.yml \
+            | diff - ngx.yml
+          tar -xzOf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz" tun.yml \
+            | diff - tun.yml
           tar -tzf "$PWD/dist/pangolin_${RELEASE_VERSION}_${suffix}.tar.gz"
 
       - name: Upload build artifact

@@ -61,6 +61,11 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Parsed, but **not implemented** — the gateway never reads it.
+    ///
+    /// There is no response cache in the gateway. A configuration
+    /// that carries the section parses fine and nothing happens; the
+    /// shipped `ngx.yml` omits it.
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -114,20 +119,18 @@ pub struct TunnelConfig {
     /// WebSocket endpoint path (e.g. `/tunnel`).
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
-    /// Optional path to a PEM-encoded TLS certificate (fullchain)
-    /// for `wss://` (TLS-wrapped WebSocket) on the tunnel listener.
-    /// When unset, the listener accepts plaintext `ws://` connections
-    /// only. The cert + key are loaded at startup; if either file is
-    /// missing or unreadable, the gateway fails to start (fail-fast)
-    /// rather than silently degrading to plaintext.
+    /// Parsed, but **not implemented** — the gateway never reads it.
     ///
-    /// Added in issue #39 (commit 0): schema extension only; no
-    /// behavior change when both fields are empty. The TLS wrap is
-    /// wired up in commit 1.
+    /// It was a schema extension for a planned `wss://` (TLS-wrapped
+    /// WebSocket) tunnel listener (issue #39). The listener is a
+    /// plain `TcpListener`, so the WebSocket/TCP transport is
+    /// plaintext; the encrypted path is QUIC, which uses its own
+    /// certificate under `acme.cert_dir` (see `ngx::tunnel::quic`).
+    /// A configuration that sets this key parses fine and changes
+    /// nothing.
     #[serde(default)]
     pub tls_cert: Option<String>,
-    /// Optional path to a PEM-encoded TLS private key matching
-    /// `tls_cert`. See `tls_cert` for the loading semantics.
+    /// Parsed, but **not implemented** — see `tls_cert`.
     #[serde(default)]
     pub tls_key: Option<String>,
 }
@@ -209,10 +212,15 @@ impl Default for AdminConfig {
     }
 }
 
+/// A response-cache section that the gateway does not implement.
+///
+/// Both fields are parsed and ignored — there is no response cache.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheConfig {
+    /// Parsed and ignored — there is no response cache.
     #[serde(default)]
     pub enabled: bool,
+    /// Parsed and ignored — there is no response cache.
     #[serde(default = "default_cache_dir")]
     pub dir: String,
 }
@@ -788,11 +796,41 @@ mod tests {
         });
     }
 
+    /// The shipped `ngx.yml`, parsed.
+    ///
+    /// The environment layer is deliberately *not* merged here: these
+    /// assertions are about what the file says, and an ambient `NGX_*`
+    /// variable (the Makefile's `.env` step exports some) would
+    /// override the file's values. The file's own load through the
+    /// real loader is covered by `the_shipped_example_config_parses`.
+    fn shipped_ngx() -> Config {
+        Figment::new()
+            .merge(Yaml::string(include_str!("../../../ngx.yml")))
+            .extract()
+            .expect("the shipped ngx.yml must parse")
+    }
+
+    /// The shipped `ngx.yml`, as a parsed document.
+    ///
+    /// The *document*, not the text: a key the file does not carry
+    /// still parses — the loader fills in the default — so only the
+    /// document can tell "the operator was shown the knob" from "the
+    /// operator was not". A raw substring scan cannot: the file's
+    /// comments mention the keys on purpose, and a `cache :` (valid
+    /// YAML) would slip past one.
+    fn shipped_ngx_document() -> Figment {
+        Figment::new().merge(Yaml::string(include_str!("../../../ngx.yml")))
+    }
+
     #[test]
     fn the_shipped_example_config_parses() {
         // `ngx.yml` at the repo root lists every field explicitly, so
         // it is the schema's canary: a new key that does not parse
         // breaks the example config that every operator copies.
+        //
+        // The real loader — YAML plus the `NGX_*` environment layer —
+        // under a cleared environment, so the developer's shell cannot
+        // change what the file says.
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             let c = Config::from_str(include_str!("../../../ngx.yml")).expect("ngx.yml must parse");
@@ -804,6 +842,112 @@ mod tests {
             assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
             Ok(())
         });
+    }
+
+    /// The shipped `ngx.yml` must not offer the keys the gateway does
+    /// not implement (issue #165).
+    ///
+    /// The release archive carries this file, so an operator receives
+    /// it as the starting point. A key that is parsed and ignored is
+    /// worse than a missing one: the operator sets it and expects a
+    /// feature that does not exist. The `cache` section and the two
+    /// tunnel TLS keys are exactly that — the loader accepts them and
+    /// no code path reads them.
+    #[test]
+    fn the_shipped_example_config_omits_the_unimplemented_keys() {
+        let document = shipped_ngx_document();
+
+        for key in ["cache", "tunnel.tls_cert", "tunnel.tls_key"] {
+            assert!(
+                document.find_value(key).is_err(),
+                "ngx.yml must not carry `{key}` — the gateway does not implement it, and the \
+                 loader accepts the key without acting on it"
+            );
+        }
+    }
+
+    /// The shipped `ngx.yml` must carry the fields the gateway has
+    /// implemented since the file was last edited (issue #165).
+    ///
+    /// The three ACME hooks and the two knownbots knobs and the
+    /// traffic switch were all implemented without the shipped file
+    /// mentioning them, so an operator who read only the file did not
+    /// know they existed.
+    #[test]
+    fn the_shipped_example_config_carries_the_newer_fields() {
+        let shipped = include_str!("../../../ngx.yml");
+        let document = shipped_ngx_document();
+
+        // The three live keys: they have to be in the document, with
+        // the values the compiled-in defaults produce, so that "change
+        // nothing" still means "get the documented behaviour".
+        for key in [
+            "log.bot.cache_dir",
+            "log.bot.refresh_interval_secs",
+            "log.traffic.enabled",
+        ] {
+            assert!(
+                document.find_value(key).is_ok(),
+                "ngx.yml must carry `{key}` — the gateway implements it, so an operator who \
+                 reads only the shipped file has to learn that it exists"
+            );
+        }
+        // The three ACME hooks ship as commented-out examples — a live
+        // key would mean "run this shell command on every issuance",
+        // which is not what a starting point should say. The match is
+        // anchored to a config line, so the header's prose (which
+        // mentions the hooks) cannot satisfy it.
+        for hook in ["pre_renew", "post_renew", "deploy"] {
+            assert!(
+                shipped.lines().any(|line| {
+                    let line = line.trim_start().trim_start_matches('#').trim_start();
+                    line.starts_with(&format!("{hook}:"))
+                }),
+                "ngx.yml must mention `{hook}:` as a commented-out example — the gateway \
+                 implements the hook, so an operator who reads only the shipped file has to \
+                 learn that it exists"
+            );
+        }
+
+        let c = shipped_ngx();
+        // The ACME hooks are unset in the shipped file.
+        assert!(c.acme.pre_renew.is_none());
+        assert!(c.acme.post_renew.is_none());
+        assert!(c.acme.deploy.is_none());
+
+        // The knownbots cache root and its refresh cadence.
+        assert_eq!(c.log.bot.cache_dir, PathBuf::from("./logs/bots/cache"));
+        assert_eq!(c.log.bot.refresh_interval_secs, 86_400);
+
+        // The traffic side-channel's master switch.
+        assert!(c.log.traffic.enabled);
+    }
+
+    /// The shipped `ngx.yml` must carry the listen addresses (issue
+    /// #165).
+    ///
+    /// The addresses are the first knobs an operator changes, and the
+    /// file's ports have to be the compiled-in defaults so that a
+    /// fresh `make start-ngx` runs unprivileged. The presence check
+    /// is on the document: a file that dropped the `addr:` block would
+    /// still parse — the loader would fill in the defaults — so only
+    /// the document can tell the two apart.
+    #[test]
+    fn the_shipped_example_config_carries_the_listen_addresses() {
+        let document = shipped_ngx_document();
+
+        for key in ["addr.http", "addr.https", "tunnel.addr", "admin.addr"] {
+            assert!(
+                document.find_value(key).is_ok(),
+                "ngx.yml must carry `{key}` — it is the first knob an operator changes"
+            );
+        }
+
+        let c = shipped_ngx();
+        assert_eq!(c.addr.http, Config::default().addr.http);
+        assert_eq!(c.addr.https, Config::default().addr.https);
+        assert_eq!(c.tunnel.addr, Config::default().tunnel.addr);
+        assert_eq!(c.admin.addr, Config::default().admin.addr);
     }
 
     #[test]

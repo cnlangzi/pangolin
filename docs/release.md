@@ -53,18 +53,32 @@ pangolin_v0.3.0_linux_amd64.tar.gz
 SHA256SUMS.txt
 ```
 
-The archive contains exactly three files, at its root:
+The archive contains exactly four files, at its root:
 
 ```
 pangolin-ngx
 pangolin-tun
-README.md
+ngx.yml
+tun.yml
 ```
 
-The repository's `ngx.yml` / `tun.yml` are *not* shipped: they are
-development configurations (ports 8000/8443/9081) and would mislead
-operators. The release archive is a download for humans — the Ansible
-deployment under `deploy/playbooks/` keeps consuming `build/output/`.
+`ngx.yml` and `tun.yml` are the repository's own configuration files,
+copied into the archive byte for byte — the same files
+`make start-ngx` and `make start-tun` read, so there is exactly one
+copy of each in the world. They carry the non-privileged development
+ports (`8000` / `8443` / `9001` / `9081`); a production host either
+edits them or overrides the values with the matching `NGX_*` / `TUN_*`
+environment variables. The Ansible deployment under `deploy/playbooks/`
+keeps consuming `build/output/` and generates its own configuration
+from its own templates.
+
+The repository README is not in the archive: the GitHub Release page
+already renders it, and a copy in the tarball would freeze a snapshot
+of prose the repository keeps moving.
+
+The two configuration files are stored with mode `0600`, not `0644`:
+`tun.yml` carries the tun's bearer token and `ngx.yml` the admin
+password, and both say so themselves. The binaries are stored `0755`.
 
 Verify a download with:
 
