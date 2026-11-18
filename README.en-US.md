@@ -1,4 +1,4 @@
-# 🦔 Pangolin — an SEO-oriented, self-hosted multi-site gateway
+# 🦔 Pangolin — an SEO-oriented, self-hosted CDN software
 
 [中文](./README.md)
 
