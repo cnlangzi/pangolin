@@ -76,6 +76,10 @@ The repository README is not in the archive: the GitHub Release page
 already renders it, and a copy in the tarball would freeze a snapshot
 of prose the repository keeps moving.
 
+The two configuration files are stored with mode `0600`, not `0644`:
+`tun.yml` carries the tun's bearer token and `ngx.yml` the admin
+password, and both say so themselves. The binaries are stored `0755`.
+
 Verify a download with:
 
 ```bash
