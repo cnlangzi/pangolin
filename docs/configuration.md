@@ -502,13 +502,14 @@ so it is never a link the operator can follow by accident.
 
 ### Top-level fields
 
-Every top-level field is required. The loader validates at parse
-time and refuses to start on any violation.
+`server`, `token` and `name` must be present and non-empty — the
+loader validates them at parse time and refuses to start on any
+violation. `transport` is optional and defaults to `auto`.
 
 | Field      | Type     | Default | Required | Validation |
 | ---------- | -------- | ------- | -------- | ---------- |
-| `server`   | `string` | —       | **yes**  | Non-empty. Format `host:port` (or `ip:port`); the `port` must match `tunnel.port` in `ngx.yml`. |
-| `token`    | `string` | —       | **yes**  | Non-empty. Matched against `tun.token` in the gateway's `tun` table (the v2 schema has no separate `tokens` table). Write the real token directly in this file, or override at runtime with `TUN_TOKEN=…` (see "Environment variable override" above). |
+| `server`   | `string` | —       | **yes**  | Non-empty. Format `host:port` (or `ip:port`); the `port` must match the port of `tunnel.addr` in `ngx.yml`. |
+| `token`    | `string` | —       | **yes**  | Non-empty. Hashed with SHA-256 and matched against `tun.token_hash` in the gateway's `tun` table (the v2 schema has no separate `tokens` table). Write the real token directly in this file, or override at runtime with `TUN_TOKEN=…` (see "Environment variable override" above). |
 | `name`     | `string` | —       | **yes**  | `^[a-z0-9_-]+$`, 1–32 chars, **not purely numeric**. The name is the tun's primary key on the ngx side; the validator refuses to start if the name collides with another online tun or violates the rule. |
 | `transport` | `string` | `auto`  | no       | `auto`, `quic` or `tcp`. `auto` (the default) tries QUIC first with a five-second handshake timeout and falls back to the WebSocket/TCP transport; after a failed QUIC attempt it does not probe QUIC again for ten minutes. `quic` and `tcp` pin the tun to one transport. Override at runtime with `TUN_TRANSPORT=quic`. |
 

@@ -29,9 +29,9 @@ struct SiteWithDomains {
     domains: Vec<Arc<Domain>>,
 }
 
-/// All in-memory indexes. Wrapped in `Arc<RwLock<Indexes>>` at the
-/// `ngx` layer for concurrent reads + atomic reload (see
-/// `docs/design/routing-and-index.md`).
+/// All in-memory indexes. Wrapped in `Arc<RwLock<Indexes>>` in
+/// `App::indexes` at the `pangolin-core` layer, for concurrent reads
+/// + atomic reload (see `docs/design/routing-and-index.md`).
 #[derive(Debug, Default, Clone)]
 pub struct Indexes {
     /// domain (exact or `*.wildcard` literal) → Site
