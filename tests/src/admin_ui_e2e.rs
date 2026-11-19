@@ -4318,7 +4318,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §N — Interface language (issue #178) ─────────────────────────────────────
+// ── §23 — Interface language (issue #178) ────────────────────────────────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
