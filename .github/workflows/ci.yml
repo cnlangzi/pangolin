@@ -4,6 +4,14 @@ on:
   pull_request:
     branches: [main]
 
+# Default to read-only. Every job compiles pull-request code, which
+# executes third-party build scripts (openssl-src, libz-ng-sys,
+# ring, rusqlite's bundled sqlite) — a write-scoped token would let
+# a compromised dependency push commits. Mirrors release.yml; no job
+# in this workflow needs to write.
+permissions:
+  contents: read
+
 # Cancel in-progress runs when the same PR gets a new push.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -95,9 +103,11 @@ jobs:
   # `tun`: `ngx` is Unix-only (pingora needs Unix sockets,
   # daemonize, sendfile; `crates/ngx` carries `#[cfg(unix)]` code of
   # its own), which is also why the release ships no Windows ngx
-  # archive. macOS uses `--features openssl/vendored` to match the
-  # release build exactly (the runner's Homebrew OpenSSL cannot
-  # serve the x64 cross link).
+  # archive. macOS passes `--features openssl/vendored` explicitly:
+  # vendored is already on via pingora-openssl on every platform,
+  # but the flag keeps the guarantee — and with it the x64 cross
+  # compile — even if that default changes (the runner's Homebrew
+  # OpenSSL is arm64-only and cannot serve the cross link).
   # ----------------------------------------------------------------
   smoke-cross:
     name: Compile smoke (${{ matrix.slug }})
@@ -159,9 +169,10 @@ jobs:
       - name: Ensure the MSVC ARM64 build tools are installed
         if: matrix.cargo-target == 'aarch64-pc-windows-msvc'
         shell: pwsh
-        # Same probe as the release workflow's build-tun job: ring
-        # (via quinn/rustls) compiles C for aarch64-pc-windows-msvc
-        # with clang-cl and links with the MSVC ARM64 libraries, an
+        # Byte-for-byte copy of the probe in the release workflow's
+        # build-tun job — keep the two in sync. ring (via
+        # quinn/rustls) compiles C for aarch64-pc-windows-msvc with
+        # clang-cl and links with the MSVC ARM64 libraries, an
         # optional VS2022 component. Install only when missing.
         run: |
           $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"

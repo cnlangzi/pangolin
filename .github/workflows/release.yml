@@ -295,12 +295,15 @@ jobs:
   # clang is natively multi-arch, so no second (paid, deprecated)
   # Intel runner is needed.
   #
-  # OpenSSL is vendored for both entries (`--features
-  # openssl/vendored` compiles it from source): the runner's Homebrew
-  # `openssl@3` is arm64-only and cannot serve the x64 cross link, so
-  # a system-OpenSSL build would need a second Rosetta-hosted
-  # Homebrew — fragile and uncacheable. Only macOS goes vendored;
-  # Linux keeps the system OpenSSL (`libssl-dev`).
+  # OpenSSL is vendored — compiled from source via openssl-src —
+  # here and on every other platform: pingora-openssl enables the
+  # `vendored` feature by default, so no pangolin binary links a
+  # system OpenSSL. The explicit `--features openssl/vendored` on
+  # the cargo command keeps that guarantee if pingora-openssl ever
+  # drops it. Vendored is what makes the x64 cross compile work at
+  # all: the runner's Homebrew `openssl@3` is arm64-only and could
+  # not serve the cross link, while openssl-src builds for whatever
+  # `--target` says.
   #
   # The full `make build` is not used: it accepts neither
   # `--features` nor `--target`. Its CSS half (`make build-css`)
@@ -803,6 +806,8 @@ jobs:
         # are the optional `VC.Tools.ARM64` component of VS2022.
         # Probe with vswhere; install only when missing (the current
         # windows-latest image ships it, so this is usually a no-op).
+        # A byte-for-byte copy of this probe lives in the smoke-cross
+        # job of .github/workflows/ci.yml — keep the two in sync.
         run: |
           $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
           $vswhere = "$installer\vswhere.exe"

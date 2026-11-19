@@ -156,11 +156,14 @@ glibc 2.35 floor, natively compiled with no cross toolchain.
 Both macOS archives are built on `macos-15` (Apple Silicon): arm64
 natively, x64 as a `--target x86_64-apple-darwin` cross compile on
 the same runner — clang is natively multi-arch, so no Intel runner
-is needed. macOS builds use the vendored OpenSSL
-(`--features openssl/vendored`, compiled from source) for both
-entries: the runner's Homebrew `openssl@3` is arm64-only and cannot
-serve the x64 cross link. Only macOS goes vendored — Linux keeps the
-system OpenSSL (`libssl-dev`). The macOS build runs `make build-css`
+is needed. OpenSSL is vendored — compiled from source via
+openssl-src — on every platform: pingora-openssl enables the
+`vendored` feature by default, and the macOS job passes
+`--features openssl/vendored` explicitly so the guarantee survives a
+pingora change. Vendored is what makes the x64 cross compile work
+at all: the runner's Homebrew `openssl@3` is arm64-only and cannot
+serve the cross link, while openssl-src builds for whichever
+`--target` is passed. The macOS build runs `make build-css`
 instead of the full `make build` (which accepts neither `--features`
 nor `--target`), so the binary still embeds the minified
 `assets/app.css`.
