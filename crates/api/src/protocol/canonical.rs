@@ -39,6 +39,15 @@ pub const CANONICAL_PREFIX: &str = "PANGOLIN-API-V1";
 /// seconds. A request older or newer than that is refused.
 pub const TIMESTAMP_WINDOW_SECS: i64 = 300;
 
+/// How long a used nonce is remembered.
+///
+/// **Twice** the timestamp window: a request signed with a timestamp
+/// that is *ahead* of the node's clock stays acceptable for the whole
+/// window after it was signed, so a nonce remembered for only one
+/// window would be forgotten while its request is still replayable.
+/// The replay protection has to outlive the request it protects.
+pub const NONCE_TTL_SECS: i64 = 2 * TIMESTAMP_WINDOW_SECS;
+
 /// The number of hex characters a nonce carries (16 random bytes).
 pub const NONCE_HEX_LEN: usize = 32;
 
@@ -99,8 +108,12 @@ pub fn is_valid_nonce(nonce: &str) -> bool {
 
 /// Whether `ts` is inside the ±[`TIMESTAMP_WINDOW_SECS`] window around
 /// `now`.
+///
+/// `abs_diff` and not `(now - ts).abs()`: the subtraction overflows for
+/// an extreme timestamp (`i64::MIN`), which panics in a debug build
+/// and wraps in a release one.
 pub fn is_in_window(now: i64, ts: i64) -> bool {
-    (now - ts).abs() <= TIMESTAMP_WINDOW_SECS
+    now.abs_diff(ts) <= TIMESTAMP_WINDOW_SECS as u64
 }
 
 #[cfg(test)]
@@ -186,5 +199,16 @@ mod tests {
         assert!(is_in_window(1_000, 1_000 + 299));
         assert!(!is_in_window(1_000, 1_000 - 301));
         assert!(!is_in_window(1_000, 1_000 + 301));
+    }
+
+    #[test]
+    fn an_extreme_timestamp_does_not_overflow_the_window_check() {
+        // `now - ts` overflows for `ts = i64::MIN`: in a debug build
+        // it panics, in a release build it wraps. Neither may decide
+        // whether the request is inside the window.
+        assert!(!is_in_window(1_700_000_000, i64::MIN));
+        assert!(!is_in_window(1_700_000_000, i64::MAX));
+        assert!(!is_in_window(0, i64::MIN));
+        assert!(is_in_window(0, 0));
     }
 }

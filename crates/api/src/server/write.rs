@@ -188,7 +188,7 @@ pub async fn delete_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_site(&db, name);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(200, &serde_json::json!({ "name": name, "deleted": true }))
+    ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
 }
 
 /// Write a site's provider override (and its manual ranges).
@@ -327,7 +327,7 @@ pub async fn delete_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_domain(&db, domain);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(
+    ApiResponse::json_of(
         200,
         &serde_json::json!({ "domain": domain, "deleted": true }),
     )
@@ -430,7 +430,7 @@ pub async fn delete_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_dns_provider(&db, name);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(200, &serde_json::json!({ "name": name, "deleted": true }))
+    ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
 }
 
 // ── Tunnel nodes ────────────────────────────────────────────────────────
@@ -493,7 +493,7 @@ pub async fn create_tun(ctx: &Ctx<'_>) -> ApiResponse {
         }
     }
     let view = crate::dto::views::TunView::of(&tun);
-    ApiResponse::json(
+    ApiResponse::json_of(
         201,
         &serde_json::json!({
             "tun": view,
@@ -535,6 +535,10 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     let rotated = parsed.token.clone();
     if let Some(new_token) = rotated.clone() {
         tun.token = Some(new_token);
+        // The stored digest belongs to the *old* token: `upsert_tun`
+        // prefers it over the cleartext one, so it has to be dropped
+        // for the rotation to take effect.
+        tun.token_hash = None;
     }
     tun.expires_at = parsed.expires_at;
     tun.enabled = parsed.enabled;
@@ -549,7 +553,7 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     if let Some(token) = rotated {
         body["token"] = serde_json::Value::String(token);
     }
-    ApiResponse::json(200, &body)
+    ApiResponse::json_of(200, &body)
 }
 
 /// `DELETE /api/v1/tun/{name}` — idempotent.
@@ -558,7 +562,7 @@ pub async fn delete_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         let db = ctx.state.app.db.lock().await;
         let _ = pangolin_core::db::delete_tun(&db, name);
     }
-    ApiResponse::json(200, &serde_json::json!({ "name": name, "deleted": true }))
+    ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
 }
 
 // ── IP rules ────────────────────────────────────────────────────────────
@@ -611,13 +615,29 @@ pub async fn delete_ip_rule(ctx: &Ctx<'_>, id: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_ip_rule(&db, id);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(200, &serde_json::json!({ "id": id, "deleted": true }))
+    ApiResponse::json_of(200, &serde_json::json!({ "id": id, "deleted": true }))
 }
 
 // ── The per-site rate limits ────────────────────────────────────────────
 
+/// Whether the site exists.
+///
+/// The per-site sub-resources carry no foreign key, so a write for a
+/// site that does not exist would leave an orphan row behind — and
+/// the orphan would attach itself to a site of that name created
+/// later.
+async fn site_exists(ctx: &Ctx<'_>, site: &str) -> bool {
+    let db = ctx.state.app.db.lock().await;
+    pangolin_core::db::get_site(&db, site)
+        .unwrap_or(None)
+        .is_some()
+}
+
 /// `PUT /api/v1/site_rate_limits/{site}` — full replace.
 pub async fn put_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
+    if !site_exists(ctx, site).await {
+        return ApiResponse::error(&read::site_not_found(site));
+    }
     let dto: RateLimitDto = match ctx.json_body() {
         Ok(d) => d,
         Err(e) => return ApiResponse::error(&e),
@@ -654,7 +674,7 @@ pub async fn delete_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_site_rate_limit(&db, site);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(
+    ApiResponse::json_of(
         200,
         &serde_json::json!({ "site_name": site, "deleted": true }),
     )
@@ -665,6 +685,9 @@ pub async fn delete_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 /// The list the body carries **is** the site's list: an entry the
 /// body omits is removed.
 pub async fn put_site_rate_limit_bots(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
+    if !site_exists(ctx, site).await {
+        return ApiResponse::error(&read::site_not_found(site));
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Body {
@@ -705,6 +728,9 @@ pub async fn put_site_rate_limit_bots(ctx: &Ctx<'_>, site: &str) -> ApiResponse 
 
 /// `PUT /api/v1/site_providers/{site}` — full replace.
 pub async fn put_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
+    if !site_exists(ctx, site).await {
+        return ApiResponse::error(&read::site_not_found(site));
+    }
     let dto: SiteProviderDto = match ctx.json_body() {
         Ok(d) => d,
         Err(e) => return ApiResponse::error(&e),
@@ -734,7 +760,7 @@ pub async fn put_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
     };
     match view {
         Some(v) => ApiResponse::json_of(200, &v),
-        None => ApiResponse::json(
+        None => ApiResponse::json_of(
             200,
             &serde_json::json!({ "site_name": site, "provider": null }),
         ),
@@ -748,7 +774,7 @@ pub async fn delete_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
         let _ = pangolin_core::db::delete_site_provider(&db, site);
     }
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(
+    ApiResponse::json_of(
         200,
         &serde_json::json!({ "site_name": site, "deleted": true }),
     )
@@ -761,6 +787,9 @@ pub async fn delete_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 /// The list the body carries **is** the site's list: an entry the
 /// body omits is removed.
 pub async fn put_site_origin_allow(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
+    if !site_exists(ctx, site).await {
+        return ApiResponse::error(&read::site_not_found(site));
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Body {
@@ -883,7 +912,7 @@ pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
 /// `POST /api/v1/reload` — re-read every index from the database.
 pub async fn reload(ctx: &Ctx<'_>) -> ApiResponse {
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json(
+    ApiResponse::json_of(
         200,
         &serde_json::json!({
             "status": "ok",

@@ -32,7 +32,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::HeaderMap;
 
 use super::canonical::{
-    CanonicalRequest, TIMESTAMP_WINDOW_SECS, is_in_window, is_valid_nonce, sha256_hex,
+    CanonicalRequest, NONCE_TTL_SECS, is_in_window, is_valid_nonce, sha256_hex,
 };
 use super::error::{ApiError, codes};
 use super::nonce::NonceCache;
@@ -236,15 +236,18 @@ impl Authenticator {
         };
         let message = super::canonical::canonical_string(&canonical);
         if !signature::verify(&self.verifying_key, message.as_bytes(), &creds.signature) {
+
             return Err(ApiError::unauthorized(
                 codes::INVALID_SIGNATURE,
                 "the request signature does not verify",
             ));
         }
 
-        // Every check passed — now the nonce is spent.
-        self.nonces
-            .remember(&creds.nonce, now, TIMESTAMP_WINDOW_SECS);
+        // Every check passed — now the nonce is spent. It is
+        // remembered for twice the timestamp window, because a request
+        // signed with a timestamp ahead of the node's clock stays
+        // acceptable for longer than one window.
+        self.nonces.remember(&creds.nonce, now, NONCE_TTL_SECS);
         Ok(creds)
     }
 }
@@ -508,5 +511,31 @@ mod tests {
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "ab"));
         assert!(!constant_time_eq("", "a"));
+    }
+
+    #[test]
+    fn a_nonce_outlives_the_window_its_timestamp_allows() {
+        // A request signed with a timestamp *ahead* of the node's
+        // clock stays acceptable for the whole window after it was
+        // signed — so the nonce has to be remembered for longer than
+        // one window, or the request becomes replayable while its
+        // nonce is gone.
+        let auth = Authenticator::new(key());
+        let now = 1_700_000_000;
+        let stored = sha256_hex(TOKEN.as_bytes());
+        let ts = now + 300;
+        let h = headers(ts, NONCE, &sign("GET", "/api/v1/sites", ts, NONCE, b""));
+        assert!(
+            auth.authenticate(&h, "GET", "/api/v1/sites", b"", &stored, now)
+                .is_ok()
+        );
+        // 400 seconds later the timestamp is still inside the window
+        // (|now + 400 - ts| = 100), so the request is still
+        // acceptable — and must still be refused as a replay.
+        let later = now + 400;
+        let err = auth
+            .authenticate(&h, "GET", "/api/v1/sites", b"", &stored, later)
+            .expect_err("the replay is rejected");
+        assert_eq!(err.code, codes::REPLAYED_NONCE);
     }
 }

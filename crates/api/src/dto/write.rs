@@ -493,17 +493,17 @@ fn normalize_expiry(value: &str) -> Result<String, ApiError> {
     if value.is_empty() {
         return Ok(String::new());
     }
-    if chrono::DateTime::parse_from_rfc3339(value).is_ok() {
-        let dt = chrono::DateTime::parse_from_rfc3339(value)
-            .expect("the timestamp parsed a moment ago")
-            .with_timezone(&chrono::Utc);
-        return Ok(dt.format("%Y-%m-%dT%H:%M").to_string());
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M")
+            .to_string());
     }
-    // The admin's own spelling.
-    if chrono::NaiveDate::parse_from_str(value.split('T').next().unwrap_or_default(), "%Y-%m-%d")
-        .is_ok()
-        && value.contains('T')
-    {
+    // The admin's own spelling: `YYYY-MM-DDTHH:MM`, UTC. The *whole*
+    // value has to parse — a date that parses with an impossible
+    // hour would otherwise reach the admin's parser, which drops it,
+    // and the tunnel's expiry would be silently wiped.
+    if chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").is_ok() {
         return Ok(value.to_string());
     }
     Err(ApiError::unprocessable(
@@ -840,6 +840,43 @@ mod tests {
         assert_eq!(dto.abuseipdb_api_key, None);
         let p = dto.to_params();
         assert!(!p.contains_key("badbots_abuseipdb_clear"));
+    }
+
+    #[test]
+    fn an_impossible_expiry_is_refused() {
+        // The date parses, the hour does not: the admin's parser would
+        // drop the value and the tunnel's expiry would be wiped
+        // without a word.
+        let dto = TunDto {
+            expires_at: Some("2026-06-01T99:99".into()),
+            ..Default::default()
+        };
+        let err = dto.to_params().expect_err("the expiry is refused");
+        assert_eq!(err.code, "expires_at_invalid");
+    }
+
+    #[test]
+    fn a_readable_expiry_is_accepted() {
+        let dto = TunDto {
+            expires_at: Some("2026-06-01T12:30".into()),
+            ..Default::default()
+        };
+        let params = dto.to_params().expect("the expiry is accepted");
+        assert_eq!(
+            params.get("expires_at").map(String::as_str),
+            Some("2026-06-01T12:30")
+        );
+
+        // The RFC-3339 spelling is brought into the admin's own.
+        let dto = TunDto {
+            expires_at: Some("2026-06-01T12:30:00Z".into()),
+            ..Default::default()
+        };
+        let params = dto.to_params().expect("the expiry is accepted");
+        assert_eq!(
+            params.get("expires_at").map(String::as_str),
+            Some("2026-06-01T12:30")
+        );
     }
 
     #[test]

@@ -36,6 +36,12 @@
 //! * everything else — **full replace**: a field the body omits is
 //!   cleared or falls back to its default.
 //!
+//! Two exceptions keep the stored value instead, because clearing it
+//! would be a trap: the `enabled` flag of a site and a domain, and the
+//! three sub-objects of a site (its rate limit, its bot list and its
+//! provider override) — those are writes to sub-resources that have
+//! their own endpoints.
+//!
 //! See `docs/design/api.md` for the byte-level specification.
 
 pub mod client;

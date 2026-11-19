@@ -73,15 +73,6 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
-    /// A JSON response.
-    pub fn json(status: u16, value: &serde_json::Value) -> Self {
-        Self {
-            status,
-            content_type: "application/json",
-            body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
-        }
-    }
-
     /// A JSON response built from a serializable value.
     pub fn json_of<T: serde::Serialize>(status: u16, value: &T) -> Self {
         Self {
@@ -252,10 +243,10 @@ async fn learn_dashboard_ip(
         return;
     }
     let db = state.app.db.lock().await;
-    let mut updated = runtime.clone();
-    updated.dashboard_ip = Some(ip.clone());
-    updated.updated_at = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = pangolin_core::db::upsert_api_config(&db, &updated) {
+    // Only the address column is written: the operator's settings
+    // (the token, the switch, the port) must not be reverted by a
+    // copy read before the authentication.
+    if let Err(e) = pangolin_core::db::update_api_dashboard_ip(&db, &ip) {
         log::warn!("api: storing the dashboard's address failed: {e}");
     }
 }
@@ -300,7 +291,22 @@ async fn dispatch(ctx: Ctx<'_>) -> ApiResponse {
         // ── IP rules ───────────────────────────────────────────────
         ("GET", ["ip_rules"]) => read::list_ip_rules(&ctx).await,
         ("POST", ["ip_rules"]) => write::create_ip_rule(&ctx).await,
-        ("DELETE", ["ip_rules", id]) => write::delete_ip_rule(&ctx, id).await,
+        // The rule's id is its natural key `<scope>|<kind>|<cidr>`, and
+        // a CIDR contains a `/` — so the id is the rest of the path,
+        // joined back together. The percent-encoded spelling
+        // (`%2F`) works too: the segments are decoded before the
+        // join.
+        ("DELETE", ["ip_rules", rest @ ..]) => {
+            let id = rest.join("/");
+            if id.is_empty() {
+                ApiResponse::error(&ApiError::not_found(
+                    codes::NOT_FOUND,
+                    "no such API endpoint",
+                ))
+            } else {
+                write::delete_ip_rule(&ctx, &id).await
+            }
+        }
 
         // ── The per-site rate limits ───────────────────────────────
         ("GET", ["site_rate_limits"]) => read::list_site_rate_limits(&ctx).await,

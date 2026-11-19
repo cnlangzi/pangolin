@@ -7,15 +7,30 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::{ApiRequest, ApiState, route};
+
+/// The largest request body the API accepts, in bytes.
+///
+/// The API's bodies are small JSON documents, so a megabyte is
+/// generous. The limit exists because the body is read **before** the
+/// authentication gate runs: an unauthenticated client must not be
+/// able to make the node buffer an arbitrary amount of memory.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// How long a client may take to send its request head.
+///
+/// Without it, a client that opens a connection and sends nothing
+/// holds a task for as long as it likes.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serve the API until `shutdown` is cancelled.
 ///
@@ -52,10 +67,12 @@ pub async fn serve(
                         let state = state.clone();
                         async move { Ok::<_, Infallible>(handle(state, req, peer).await) }
                     });
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
+                    let mut builder = hyper::server::conn::http1::Builder::new();
+                    // The timer is what makes the header-read
+                    // timeout below effective.
+                    builder.timer(TokioTimer::new());
+                    builder.header_read_timeout(HEADER_READ_TIMEOUT);
+                    if let Err(e) = builder.serve_connection(io, service).await {
                         log::debug!("api: the connection ended: {e}");
                     }
                 });
@@ -80,12 +97,28 @@ async fn handle(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
     let headers = req.headers().clone();
-    let body = req
-        .into_body()
+
+    // A body that announces more than the limit is refused before a
+    // single byte of it is read.
+    if let Some(len) = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && len > MAX_BODY_BYTES as u64
+    {
+        return too_large();
+    }
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
-        .map(|c| c.to_bytes().to_vec())
-        .unwrap_or_default();
+    {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(e) => {
+            log::warn!("api: the request body was rejected: {e}");
+            return too_large();
+        }
+    };
 
     let response = route(
         &state,
@@ -109,4 +142,18 @@ async fn handle(
                 .body(Full::new(Bytes::from_static(b"")))
                 .expect("the fallback response builds")
         })
+}
+
+/// The answer to a body that is too large.
+fn too_large() -> hyper::Response<Full<Bytes>> {
+    let body = crate::protocol::error::error_body(&crate::protocol::error::ApiError::new(
+        413,
+        "body_too_large",
+        format!("the request body is larger than {MAX_BODY_BYTES} bytes"),
+    ));
+    hyper::Response::builder()
+        .status(413)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .expect("the 413 response builds")
 }

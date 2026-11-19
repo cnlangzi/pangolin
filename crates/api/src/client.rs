@@ -18,6 +18,47 @@ use crate::protocol::auth::{HEADER_AUTHORIZATION, HEADER_NONCE, HEADER_SIG, HEAD
 use crate::protocol::canonical::{CanonicalRequest, canonical_string};
 use crate::protocol::signature;
 
+/// Percent-encode a request target.
+///
+/// The signature covers the target **as it goes on the wire**, and an
+/// HTTP client rewrites the characters it does not like — the `|` of
+/// an IP rule's natural key, for one. A client that signs the raw
+/// target and lets the library encode it produces a signature over
+/// bytes that never reach the node.
+///
+/// The encoding keeps the characters that carry the target's
+/// structure (the path separator, the query and its delimiters) and
+/// every character that is safe in a request target; everything else
+/// is percent-encoded.
+pub fn encode_target(target: &str) -> String {
+    let mut out = String::with_capacity(target.len());
+    for byte in target.bytes() {
+        match byte {
+            b'/' | b'?' | b'=' | b'&' => out.push(byte as char),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b':'
+            | b'@'
+            | b','
+            | b';'
+            | b'+'
+            | b'!'
+            | b'$'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// A request that is ready to be sent.
 #[derive(Debug, Clone)]
 pub struct SignedRequest {
@@ -63,9 +104,10 @@ impl ApiClient {
 
     /// Build a signed request.
     ///
-    /// `path` is the request target **as it will be sent** — the
-    /// query string included. The signature covers exactly those
-    /// bytes.
+    /// `path` is the request target — the query string included. The
+    /// signature covers the target **as it goes on the wire**, so the
+    /// client encodes it itself (see [`encode_target`]) and signs the
+    /// encoded form: the bytes it signs are the bytes it sends.
     pub fn signed_request(
         &self,
         method: &str,
@@ -74,9 +116,10 @@ impl ApiClient {
         ts: i64,
         nonce: &str,
     ) -> SignedRequest {
+        let path = encode_target(path);
         let canonical = canonical_string(&CanonicalRequest {
             method,
-            path,
+            path: &path,
             ts,
             nonce,
             token: &self.token,
@@ -199,6 +242,22 @@ mod tests {
                 crate::protocol::auth::now_secs(),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_target_is_encoded_before_it_is_signed() {
+        // The `|` of an IP rule's natural key is not a character a
+        // request target may carry unencoded — the client encodes it
+        // and signs the encoded form.
+        assert_eq!(
+            encode_target("/api/v1/ip_rules/example|blacklist|10.0.0.0/8"),
+            "/api/v1/ip_rules/example%7Cblacklist%7C10.0.0.0/8"
+        );
+        // The structure of the target survives.
+        assert_eq!(
+            encode_target("/api/v1/logs/bot/raw?date=2026-01-02"),
+            "/api/v1/logs/bot/raw?date=2026-01-02"
         );
     }
 
