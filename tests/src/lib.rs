@@ -87,6 +87,15 @@ mod proxy_tunnel;
 #[cfg(feature = "integration")]
 mod admin_api;
 
+// The dashboard-facing management API (issue #185). `management_api`
+// drives the server in process over a real port; `api_e2e` drives the
+// real binary.
+#[cfg(feature = "integration")]
+mod management_api;
+
+#[cfg(feature = "integration")]
+mod api_e2e;
+
 #[cfg(feature = "integration")]
 mod admin_reload;
 
