@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::common::{read_repo_file, repo_root};
+use crate::release_version::step_script;
 
 /// The version the fake release publishes.
 const RELEASE_VERSION: &str = "v1.2.3";
@@ -211,11 +212,24 @@ fn host_tool(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The installer is a shell script that downloads with curl.  A host
-/// without either cannot run it — the test skips instead of failing,
-/// the same rule `make test-js` follows when node is missing.
+/// The installer is a shell script that downloads with curl and
+/// verifies the download with one of the three digest tools.  A host
+/// without them cannot run it — the test skips instead of failing, the
+/// same rule `make test-js` follows when node is missing.
 fn prerequisites_available() -> bool {
-    host_tool("sh").is_some() && host_tool("curl").is_some()
+    host_tool("sh").is_some()
+        && host_tool("curl").is_some()
+        && DIGEST_TOOLS.iter().any(|tool| host_tool(tool).is_some())
+}
+
+/// The digest tool the sandbox offers by default: the first one the
+/// host actually has, in the order the installer prefers them.
+fn host_digest_tool() -> &'static str {
+    DIGEST_TOOLS
+        .iter()
+        .find(|tool| host_tool(tool).is_some())
+        .copied()
+        .expect("the host has one of sha256sum, shasum and openssl")
 }
 
 /// The tools the installer shells out to.  They are linked into a
@@ -223,8 +237,13 @@ fn prerequisites_available() -> bool {
 /// exist — that is how the digest-tool fallback is exercised.
 const TOOLS: &[&str] = &[
     "awk", "sed", "tr", "cut", "tar", "gzip", "curl", "mkdir", "cp", "mv", "rm", "chmod", "mktemp",
-    "cat",
+    "cat", "sleep",
 ];
+
+/// The SHA-256 implementation the host has, in the order the installer
+/// prefers them.  macOS has no `sha256sum` — only `shasum` — so the
+/// tool is resolved from what the host actually has.
+const DIGEST_TOOLS: &[&str] = &["sha256sum", "shasum", "openssl"];
 
 /// The fake `uname`.
 const FAKE_UNAME: &str = r#"#!/bin/sh
@@ -274,7 +293,35 @@ exit 0
 "#;
 
 /// The fake `systemctl`.
+///
+/// `is-active` answers according to `FAKE_SYSTEMCTL_ACTIVE`:
+///
+///   * `starting` — the unit is not active until it has been started
+///     (the default: the installer has to wait for it),
+///   * `already`  — the unit is running, so the installer restarts it,
+///   * `never`    — the unit never comes up.
+///
+/// `FAKE_SYSTEMCTL_FAIL=enable` makes the start fail, the way a broken
+/// unit does.
 const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
+case "$1" in
+  is-active)
+    case "$FAKE_SYSTEMCTL_ACTIVE" in
+      already) exit 0 ;;
+      never) exit 1 ;;
+      *)
+        if [ -f "$FAKE_CALLS.started" ]; then exit 0; fi
+        exit 1
+        ;;
+    esac
+    ;;
+  enable)
+    printf 'systemctl %s\n' "$*" >> "$FAKE_CALLS"
+    : > "$FAKE_CALLS.started"
+    if [ "$FAKE_SYSTEMCTL_FAIL" = "enable" ]; then exit 1; fi
+    exit 0
+    ;;
+esac
 printf 'systemctl %s\n' "$*" >> "$FAKE_CALLS"
 exit 0
 "#;
@@ -291,6 +338,20 @@ printf 'adduser %s\n' "$*" >> "$FAKE_CALLS"
 exit 0
 "#;
 
+/// The fake `getent` — it reports the `pangolin` group as missing
+/// unless the test says otherwise, because a release host does not
+/// necessarily have it yet.
+const FAKE_GETENT: &str = r#"#!/bin/sh
+if [ "$1" = "group" ] && [ "$2" = "pangolin" ]; then
+  if [ "$FAKE_GROUP_EXISTS" = "1" ]; then
+    printf 'pangolin:x:4242:\n'
+    exit 0
+  fi
+  exit 2
+fi
+exit 2
+"#;
+
 /// The sandbox the installer runs in: a private `PATH`, a private
 /// install directory and a log of the commands that would have touched
 /// the machine.
@@ -303,25 +364,29 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    /// A sandbox with the real tools linked in and the fakes in place.
-    ///
-    /// `digest_tool` names the SHA-256 implementation to make
-    /// available — `None` leaves the host without one, which is how the
-    /// "no digest tool at all" case is exercised.
-    fn new(digest_tool: Option<&str>) -> Sandbox {
+    /// A sandbox with the real tools linked in, the fakes in place and
+    /// the digest tool the host has.
+    fn new() -> Sandbox {
+        Sandbox::with_digest(Some(host_digest_tool()))
+    }
+
+    /// A sandbox with exactly one digest tool — `None` leaves the
+    /// host without one, which is how the "no digest tool at all" case
+    /// is exercised.
+    fn with_digest(digest_tool: Option<&str>) -> Sandbox {
         let dir = TempDir::new().expect("temp dir");
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).expect("create the private bin directory");
 
         for tool in TOOLS {
             if let Some(path) = host_tool(tool) {
-                let _ = fs::copy(&path, bin.join(tool));
+                fs::copy(&path, bin.join(tool)).expect("copy the tool");
             }
         }
-        if let Some(tool) = digest_tool
-            && let Some(path) = host_tool(tool)
-        {
-            let _ = fs::copy(&path, bin.join(tool));
+        if let Some(tool) = digest_tool {
+            let path = host_tool(tool)
+                .unwrap_or_else(|| panic!("the host has no {tool} — the test cannot use it"));
+            fs::copy(&path, bin.join(tool)).expect("copy the digest tool");
         }
 
         let calls = dir.path().join("calls.log");
@@ -339,6 +404,7 @@ impl Sandbox {
         sandbox.write_fake("systemctl", FAKE_SYSTEMCTL);
         sandbox.write_fake("useradd", FAKE_USERADD);
         sandbox.write_fake("adduser", FAKE_ADDUSER);
+        sandbox.write_fake("getent", FAKE_GETENT);
         sandbox
     }
 
@@ -372,6 +438,9 @@ impl Sandbox {
             .env("FAKE_USER_NAME", "root")
             .env("FAKE_USER_UID", "4242")
             .env("FAKE_USER_EXISTS", "1")
+            .env("FAKE_GROUP_EXISTS", "0")
+            .env("FAKE_SYSTEMCTL_ACTIVE", "starting")
+            .env("FAKE_SYSTEMCTL_FAIL", "")
             .env("PANGOLIN_BASE_URL", base_url)
             .env("PANGOLIN_LATEST_URL", format!("{base_url}/releases/latest"))
             .env("PANGOLIN_INSTALL_DIR", &self.install_dir)
@@ -430,30 +499,61 @@ fn mode_of(path: &Path) -> u32 {
         & 0o7777
 }
 
-/// A fake release: the archive, the checksum file and the two units,
-/// served over HTTP.
+/// A fake release: the archive, the units it ships and the checksum
+/// file that covers them, served over HTTP.
 struct FakeRelease {
     base_url: String,
     requests: Arc<Mutex<Vec<String>>>,
     archive: Vec<u8>,
-    ngx_unit: Vec<u8>,
-    tun_unit: Vec<u8>,
+    /// The units the release ships — empty for a release that predates
+    /// the one-line installer.
+    units: Vec<(String, Vec<u8>)>,
+    /// A checksum file that does not match the archive.
+    broken_sums: bool,
 }
 
 impl FakeRelease {
-    /// A release whose checksum file covers every asset.
+    /// A release that ships the archive, both units and a checksum file
+    /// that covers all three.
     fn new() -> FakeRelease {
+        FakeRelease::build(true, false)
+    }
+
+    /// A release that predates the one-line installer: it ships the
+    /// archive and the checksum file, but neither the units nor a
+    /// packaged configuration.
+    fn without_units() -> FakeRelease {
+        FakeRelease::build(false, false)
+    }
+
+    /// A release whose checksum file records the wrong digest for the
+    /// archive.
+    fn with_broken_checksum() -> FakeRelease {
+        FakeRelease::build(true, true)
+    }
+
+    /// Build a release and serve it.
+    fn build(with_units: bool, broken_sums: bool) -> FakeRelease {
         let dir = TempDir::new().expect("temp dir");
         let archive = build_archive(&dir.path().join("stage"));
-        let ngx_unit = read_repo_file("deploy/playbooks/roles/ngx/files/ngx.service").into_bytes();
-        let tun_unit = read_repo_file("deploy/playbooks/roles/tun/files/tun.service").into_bytes();
+        let mut units = Vec::new();
+        if with_units {
+            units.push((
+                "pangolin-ngx.service".to_string(),
+                read_repo_file("deploy/playbooks/roles/ngx/files/ngx.service").into_bytes(),
+            ));
+            units.push((
+                "pangolin-tun.service".to_string(),
+                read_repo_file("deploy/playbooks/roles/tun/files/tun.service").into_bytes(),
+            ));
+        }
 
         let release = FakeRelease {
             base_url: String::new(),
             requests: Arc::new(Mutex::new(Vec::new())),
             archive,
-            ngx_unit,
-            tun_unit,
+            units,
+            broken_sums,
         };
 
         let (base_url, requests) = spawn_server(release.handler());
@@ -471,8 +571,8 @@ impl FakeRelease {
     /// installer asks for the one of the version it resolved.
     fn handler(&self) -> Handler {
         let archive = self.archive.clone();
-        let ngx_unit = self.ngx_unit.clone();
-        let tun_unit = self.tun_unit.clone();
+        let units = self.units.clone();
+        let broken = self.broken_sums;
 
         Box::new(move |path: &str| {
             if path == "/releases/latest" {
@@ -486,16 +586,32 @@ impl FakeRelease {
             let version = segments.next().unwrap_or("");
             let name = segments.next().unwrap_or("");
             match name {
-                "SHA256SUMS.txt" => Reply::Body(sums_for_version(
-                    version,
-                    &archive,
-                    &[
-                        ("pangolin-ngx.service", &ngx_unit),
-                        ("pangolin-tun.service", &tun_unit),
-                    ],
-                )),
-                "pangolin-ngx.service" => Reply::Body(ngx_unit.clone()),
-                "pangolin-tun.service" => Reply::Body(tun_unit.clone()),
+                "SHA256SUMS.txt" => {
+                    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+                    for target in ["linux_amd64", "linux_arm64", "macos_arm64", "macos_x64"] {
+                        let bytes = if broken {
+                            b"not the archive".to_vec()
+                        } else {
+                            archive.clone()
+                        };
+                        entries.push((format!("pangolin_{version}_{target}.tar.gz"), bytes));
+                    }
+                    for (unit_name, bytes) in &units {
+                        entries.push((unit_name.clone(), bytes.clone()));
+                    }
+                    let borrowed: Vec<(&str, &[u8])> = entries
+                        .iter()
+                        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                        .collect();
+                    Reply::Body(sums_file(&borrowed))
+                }
+                name if units.iter().any(|(unit, _)| unit == name) => Reply::Body(
+                    units
+                        .iter()
+                        .find(|(unit, _)| unit == name)
+                        .map(|(_, bytes)| bytes.clone())
+                        .unwrap_or_default(),
+                ),
                 name if name.starts_with("pangolin_") && name.ends_with(".tar.gz") => {
                     Reply::Body(archive.clone())
                 }
@@ -648,7 +764,7 @@ fn install_script_picks_the_archive_for_the_platform() {
         ("Darwin", "amd64", "pangolin_v1.2.3_macos_x64.tar.gz"),
     ] {
         let release = FakeRelease::new();
-        let sandbox = Sandbox::new(Some("sha256sum"));
+        let sandbox = Sandbox::new();
         let output = sandbox.run(
             &release.base_url,
             &[("FAKE_UNAME_S", os), ("FAKE_UNAME_M", machine)],
@@ -679,7 +795,7 @@ fn install_script_refuses_an_unsupported_platform() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("FAKE_UNAME_S", "Linux"), ("FAKE_UNAME_M", "riscv64")],
@@ -716,7 +832,7 @@ fn install_script_resolves_the_latest_release() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[]);
     assert!(
         output.status.success(),
@@ -749,7 +865,7 @@ fn install_script_honours_pinned_versions() {
 
     for pinned in ["0.3.0", "v0.3.0"] {
         let release = FakeRelease::new();
-        let sandbox = Sandbox::new(Some("sha256sum"));
+        let sandbox = Sandbox::new();
         let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", pinned)]);
         assert!(
             output.status.success(),
@@ -785,7 +901,7 @@ fn install_script_honours_the_environment() {
 
     // A different install directory, and the units have to follow it.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let install_dir = sandbox.dir.path().join("elsewhere");
     let output = sandbox.run(
         &release.base_url,
@@ -811,7 +927,7 @@ fn install_script_honours_the_environment() {
 
     // PANGOLIN_NO_SERVICE skips the whole systemd half.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_NO_SERVICE", "1"), ("PANGOLIN_VERSION", "v1.2.3")],
@@ -844,37 +960,9 @@ fn install_script_verifies_before_it_installs() {
         return;
     }
 
-    let dir = TempDir::new().expect("temp dir");
-    let archive = build_archive(&dir.path().join("stage"));
-    let ngx_unit = read_repo_file("deploy/playbooks/roles/ngx/files/ngx.service").into_bytes();
-    let tun_unit = read_repo_file("deploy/playbooks/roles/tun/files/tun.service").into_bytes();
-    // The recorded digest of the archive is wrong.
-    let sums = sums_file(&[
-        ("pangolin_v1.2.3_linux_amd64.tar.gz", b"not the archive"),
-        ("pangolin-ngx.service", &ngx_unit),
-        ("pangolin-tun.service", &tun_unit),
-    ]);
-
-    let (base_url, _requests) = spawn_server({
-        let archive = archive.clone();
-        let sums = sums.clone();
-        let ngx_unit = ngx_unit.clone();
-        let tun_unit = tun_unit.clone();
-        Box::new(
-            move |path: &str| match path.rsplit('/').next().unwrap_or("") {
-                "SHA256SUMS.txt" => Reply::Body(sums.clone()),
-                "pangolin-ngx.service" => Reply::Body(ngx_unit.clone()),
-                "pangolin-tun.service" => Reply::Body(tun_unit.clone()),
-                name if name.starts_with("pangolin_") && name.ends_with(".tar.gz") => {
-                    Reply::Body(archive.clone())
-                }
-                _ => Reply::NotFound,
-            },
-        )
-    });
-
-    let sandbox = Sandbox::new(Some("sha256sum"));
-    let output = sandbox.run(&base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+    let release = FakeRelease::with_broken_checksum();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
 
     assert!(
         !output.status.success(),
@@ -902,40 +990,13 @@ fn install_script_checks_only_what_it_downloaded() {
         return;
     }
 
-    let dir = TempDir::new().expect("temp dir");
-    let archive = build_archive(&dir.path().join("stage"));
-    let ngx_unit = read_repo_file("deploy/playbooks/roles/ngx/files/ngx.service").into_bytes();
-    let tun_unit = read_repo_file("deploy/playbooks/roles/tun/files/tun.service").into_bytes();
-
-    // A checksum file that holds the three entries this machine needs
-    // and nothing else — the archive of the *other* platforms is not
-    // there, and the installer must not trip over its absence.
-    let sums = sums_file(&[
-        ("pangolin_v1.2.3_linux_amd64.tar.gz", &archive),
-        ("pangolin-ngx.service", &ngx_unit),
-        ("pangolin-tun.service", &tun_unit),
-    ]);
-
-    let (base_url, _requests) = spawn_server({
-        let archive = archive.clone();
-        let sums = sums.clone();
-        let ngx_unit = ngx_unit.clone();
-        let tun_unit = tun_unit.clone();
-        Box::new(
-            move |path: &str| match path.rsplit('/').next().unwrap_or("") {
-                "SHA256SUMS.txt" => Reply::Body(sums.clone()),
-                "pangolin-ngx.service" => Reply::Body(ngx_unit.clone()),
-                "pangolin-tun.service" => Reply::Body(tun_unit.clone()),
-                name if name.starts_with("pangolin_") && name.ends_with(".tar.gz") => {
-                    Reply::Body(archive.clone())
-                }
-                _ => Reply::NotFound,
-            },
-        )
-    });
-
-    let sandbox = Sandbox::new(Some("sha256sum"));
-    let output = sandbox.run(&base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+    // A release whose checksum file holds the three entries this
+    // machine needs and nothing else — the archive of the *other*
+    // platforms is not there, and the installer must not trip over
+    // its absence.
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
         "the install failed:\n{}{}",
@@ -944,15 +1005,16 @@ fn install_script_checks_only_what_it_downloaded() {
     );
 
     // Now the same release without the archive's entry.
-    let sums = sums_file(&[
-        ("pangolin-ngx.service", &ngx_unit),
-        ("pangolin-tun.service", &tun_unit),
-    ]);
+    let release = FakeRelease::new();
     let (base_url, _requests) = spawn_server({
-        let archive = archive.clone();
-        let sums = sums.clone();
-        let ngx_unit = ngx_unit.clone();
-        let tun_unit = tun_unit.clone();
+        let archive = release.archive.clone();
+        let ngx_unit = release.units[0].1.clone();
+        let tun_unit = release.units[1].1.clone();
+        // The checksum file covers the units, but not the archive.
+        let sums = sums_file(&[
+            ("pangolin-ngx.service", &ngx_unit),
+            ("pangolin-tun.service", &tun_unit),
+        ]);
         Box::new(
             move |path: &str| match path.rsplit('/').next().unwrap_or("") {
                 "SHA256SUMS.txt" => Reply::Body(sums.clone()),
@@ -966,7 +1028,7 @@ fn install_script_checks_only_what_it_downloaded() {
         )
     });
 
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         !output.status.success(),
@@ -977,6 +1039,117 @@ fn install_script_checks_only_what_it_downloaded() {
         stderr_of(&output).contains("pangolin_v1.2.3_linux_amd64.tar.gz"),
         "the error must name the missing entry:\n{}",
         stderr_of(&output)
+    );
+}
+
+/// A release that predates the one-line installer ships neither the
+/// systemd units nor a packaged configuration.  The installer has to
+/// say so — a 404 on an asset the operator never heard of is not an
+/// explanation.
+#[test]
+fn install_script_explains_a_release_without_the_units() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::without_units();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v0.0.2")]);
+
+    assert!(
+        !output.status.success(),
+        "a release without the units must fail the install:\n{}",
+        stdout_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("pangolin-ngx.service"),
+        "the error must name the missing asset:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("predates"),
+        "the error must say that the release is too old:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("getting-started"),
+        "the error must point at the manual installation:\n{stderr}"
+    );
+    assert!(
+        !sandbox.install_dir.exists(),
+        "a refused install must not create the install directory"
+    );
+}
+
+/// An archive without a packaged configuration cannot be configured by
+/// the installer either — the gateway would run on its built-in
+/// defaults (the development ports and the `admin` password).
+#[test]
+fn install_script_explains_a_release_without_a_configuration() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    // An archive with the two binaries only — the layout of the
+    // releases before the configuration was packaged.
+    let dir = TempDir::new().expect("temp dir");
+    let stage = dir.path().join("stage");
+    fs::create_dir_all(&stage).expect("create the staging directory");
+    fs::write(stage.join("pangolin-ngx"), "#!/bin/sh\n").expect("write the fake gateway");
+    fs::write(stage.join("pangolin-tun"), "#!/bin/sh\n").expect("write the fake tun");
+    let archive_path = dir.path().join("archive.tar.gz");
+    let status = Command::new(host_tool("tar").expect("tar"))
+        .arg("-C")
+        .arg(&stage)
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("pangolin-ngx")
+        .arg("pangolin-tun")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar failed to build the test archive");
+    let archive = fs::read(&archive_path).expect("read the test archive");
+
+    let release = FakeRelease::new();
+    let (base_url, _requests) = spawn_server({
+        let archive = archive.clone();
+        let ngx_unit = release.units[0].1.clone();
+        let tun_unit = release.units[1].1.clone();
+        let sums = sums_file(&[
+            ("pangolin_v1.2.3_linux_amd64.tar.gz", &archive),
+            ("pangolin-ngx.service", &ngx_unit),
+            ("pangolin-tun.service", &tun_unit),
+        ]);
+        Box::new(
+            move |path: &str| match path.rsplit('/').next().unwrap_or("") {
+                "SHA256SUMS.txt" => Reply::Body(sums.clone()),
+                "pangolin-ngx.service" => Reply::Body(ngx_unit.clone()),
+                "pangolin-tun.service" => Reply::Body(tun_unit.clone()),
+                name if name.starts_with("pangolin_") && name.ends_with(".tar.gz") => {
+                    Reply::Body(archive.clone())
+                }
+                _ => Reply::NotFound,
+            },
+        )
+    });
+
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+
+    assert!(
+        !output.status.success(),
+        "an archive without a configuration must fail the install:\n{}",
+        stdout_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("ngx.yml"),
+        "the error must name the missing configuration:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("predates"),
+        "the error must say that the release is too old:\n{stderr}"
     );
 }
 
@@ -993,7 +1166,7 @@ fn install_script_falls_back_to_another_digest_tool() {
     // Without `sha256sum` the install still has to verify the archive.
     if host_tool("shasum").is_some() {
         let release = FakeRelease::new();
-        let sandbox = Sandbox::new(Some("shasum"));
+        let sandbox = Sandbox::with_digest(Some("shasum"));
         let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
         assert!(
             output.status.success(),
@@ -1003,9 +1176,23 @@ fn install_script_falls_back_to_another_digest_tool() {
         );
     }
 
+    // The last resort: a host with openssl and neither of the other
+    // two — the shape of a minimal container image.
+    if host_tool("openssl").is_some() {
+        let release = FakeRelease::new();
+        let sandbox = Sandbox::with_digest(Some("openssl"));
+        let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+        assert!(
+            output.status.success(),
+            "the install must work with openssl alone:\n{}{}",
+            stdout_of(&output),
+            stderr_of(&output)
+        );
+    }
+
     // Without any of the three it has to say so.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(None);
+    let sandbox = Sandbox::with_digest(None);
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         !output.status.success(),
@@ -1017,6 +1204,32 @@ fn install_script_falls_back_to_another_digest_tool() {
         assert!(
             stderr.contains(tool),
             "the error must name {tool} as an option:\n{stderr}"
+        );
+    }
+}
+
+/// The version ends up in a URL and in a file name, so it must not be
+/// able to escape either.
+#[test]
+fn install_script_rejects_a_malicious_version() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    for version in ["v1.2.3/../../etc", "v1.2.3;rm -rf /", "../v1.2.3"] {
+        let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", version)]);
+        assert!(
+            !output.status.success(),
+            "the version `{version}` must be refused:\n{}",
+            stdout_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("invalid version"),
+            "the error must say that the version is invalid:\n{}",
+            stderr_of(&output)
         );
     }
 }
@@ -1034,7 +1247,7 @@ fn install_script_sets_the_installed_permissions() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1070,7 +1283,7 @@ fn install_script_creates_the_runtime_directories() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1097,7 +1310,7 @@ fn install_script_hands_the_directory_over_only_when_the_user_exists() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_USER_EXISTS", "1")],
@@ -1118,7 +1331,7 @@ fn install_script_hands_the_directory_over_only_when_the_user_exists() {
 
     // Without the user there is nobody to hand it over to.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_USER_EXISTS", "0")],
@@ -1149,7 +1362,7 @@ fn install_script_rewrites_the_five_production_settings() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1222,7 +1435,7 @@ fn install_script_derives_the_acme_email_from_the_host_name() {
         ("...", "pangolin@localhost.local"),
     ] {
         let release = FakeRelease::new();
-        let sandbox = Sandbox::new(Some("sha256sum"));
+        let sandbox = Sandbox::new();
         let output = sandbox.run(
             &release.base_url,
             &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_HOSTNAME", host)],
@@ -1254,7 +1467,7 @@ fn install_script_never_touches_tun_yml() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1285,7 +1498,7 @@ fn install_script_starts_the_gateway_and_not_the_tunnel_node() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1329,7 +1542,7 @@ fn install_script_keeps_an_existing_pangolin_user() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_USER_EXISTS", "1")],
@@ -1353,7 +1566,7 @@ fn install_script_keeps_an_existing_pangolin_user() {
     // Without the user it is created — with the arguments that make it
     // a system account that cannot log in.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_USER_EXISTS", "0")],
@@ -1377,6 +1590,187 @@ fn install_script_keeps_an_existing_pangolin_user() {
     );
 }
 
+/// The user needs a group of its own: the unit says `Group=pangolin`
+/// and the install directory is handed over to `pangolin:pangolin`.
+/// `useradd` only creates a same-named group where USERGROUPS_ENAB is
+/// yes — on the RHEL family it is not, and the user would land in the
+/// default group instead.
+#[test]
+fn install_script_creates_the_pangolin_group() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(
+        &release.base_url,
+        &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_USER_EXISTS", "0")],
+    );
+    assert!(
+        output.status.success(),
+        "the install failed:\n{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let calls = sandbox.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("useradd") && call.contains("--user-group")),
+        "the installer must ask for the group, it called {calls:?}"
+    );
+}
+
+/// A unit the operator edited is kept as `<name>.bak`, the same
+/// rolling-backup convention the binaries get.
+#[test]
+fn install_script_keeps_a_previous_unit() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+    assert!(
+        output.status.success(),
+        "the first install failed:\n{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+
+    // The operator edits the unit.
+    let unit = sandbox.systemd_dir.join("pangolin-ngx.service");
+    fs::write(&unit, "# edited by the operator\n").expect("edit the unit");
+
+    let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
+    assert!(
+        output.status.success(),
+        "the second install failed:\n{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        sandbox
+            .systemd_dir
+            .join("pangolin-ngx.service.bak")
+            .is_file(),
+        "the previous unit must be kept as pangolin-ngx.service.bak"
+    );
+    assert!(
+        fs::read_to_string(&unit)
+            .expect("read the installed unit")
+            .contains("ExecStart="),
+        "the installed unit must be the release's own file"
+    );
+}
+
+/// `enable --now` leaves a running unit alone, so the freshly
+/// installed binary would not be the one serving.
+#[test]
+fn install_script_restarts_a_running_gateway() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(
+        &release.base_url,
+        &[
+            ("PANGOLIN_VERSION", "v1.2.3"),
+            ("FAKE_SYSTEMCTL_ACTIVE", "already"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "the install failed:\n{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let calls = sandbox.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "systemctl restart pangolin-ngx"),
+        "a gateway that was already running must be restarted, it called {calls:?}"
+    );
+}
+
+/// A gateway that does not come up is a failed install — but the
+/// operator still needs the credentials, the ports and the tunnel
+/// steps, so the summary has to be printed before the script exits.
+#[test]
+fn install_script_still_summarizes_a_gateway_that_did_not_start() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(
+        &release.base_url,
+        &[
+            ("PANGOLIN_VERSION", "v1.2.3"),
+            ("FAKE_SYSTEMCTL_FAIL", "enable"),
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a gateway that did not start must be reported as a failure:\n{}",
+        stdout_of(&output)
+    );
+    let printed = stdout_of(&output);
+    for expected in ["9081", "9001", "pangolin-tun", "pangolin.db"] {
+        assert!(
+            printed.contains(expected),
+            "the summary must still mention {expected}:\n{printed}"
+        );
+    }
+    assert!(
+        stderr_of(&output).contains("systemctl status pangolin-ngx"),
+        "the failure must say where to look:\n{}",
+        stderr_of(&output)
+    );
+}
+
+/// The install directory ends up in the unit's `WorkingDirectory=` and
+/// `ExecStart=`, and systemd resolves a relative path against `/`.
+#[test]
+fn install_script_requires_an_absolute_install_dir() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(
+        &release.base_url,
+        &[
+            ("PANGOLIN_VERSION", "v1.2.3"),
+            ("PANGOLIN_INSTALL_DIR", "relative/pangolin"),
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a relative install directory must be refused:\n{}",
+        stdout_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("absolute path"),
+        "the error must say that the path has to be absolute:\n{}",
+        stderr_of(&output)
+    );
+}
+
 /// The unit ships with the default install directory baked in.  A
 /// different install directory has to be reflected in it, or systemd
 /// would start a binary that is not there.
@@ -1388,7 +1782,7 @@ fn install_script_rewrites_the_unit_paths() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let install_dir = sandbox.dir.path().join("opt/pangolin");
     let output = sandbox.run(
         &release.base_url,
@@ -1434,7 +1828,7 @@ fn install_script_skips_the_service_on_macos() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[
@@ -1476,7 +1870,7 @@ fn install_script_skips_the_service_without_systemctl() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     sandbox.remove_fake("systemctl");
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
 
@@ -1505,7 +1899,7 @@ fn install_script_is_idempotent() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1553,7 +1947,7 @@ fn install_script_warns_about_the_admin_interface() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1595,7 +1989,7 @@ fn install_script_prints_the_closing_summary() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),
@@ -1639,7 +2033,7 @@ fn install_script_asks_for_sudo_when_it_is_not_root() {
     }
 
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(
         &release.base_url,
         &[("PANGOLIN_VERSION", "v1.2.3"), ("FAKE_ID_UID", "1000")],
@@ -1687,15 +2081,30 @@ fn release_publishes_the_installer_and_the_units() {
         );
     }
 
-    // The checksum file has to cover the three new assets as well.
+    // The checksum file has to cover the three new assets as well —
+    // the installer verifies them against it, so a checksum file
+    // without them breaks every installation.
+    //
+    // The assertion is on the `sha256sum` invocation itself, not on
+    // the step as a whole: the assets appear in the staging step and
+    // in the publish list as well, so a substring check over the whole
+    // job would stay green when the checksum command loses them.
+    let checksum_step = step_script(&workflow, "Generate checksums");
+    let hashed = checksum_step
+        .split_once("sha256sum")
+        .unwrap_or_else(|| panic!("the checksum step must run sha256sum:\n{checksum_step}"))
+        .1
+        .split('>')
+        .next()
+        .unwrap_or_default();
     assert!(
-        release_job.contains("sha256sum pangolin_*.tar.gz pangolin_*.zip"),
-        "the checksum step must keep hashing the archives"
+        hashed.contains("pangolin_*.tar.gz") && hashed.contains("pangolin_*.zip"),
+        "the checksum step must keep hashing the archives:\n{checksum_step}"
     );
     for asset in ["install.sh", "pangolin-ngx.service", "pangolin-tun.service"] {
         assert!(
-            release_job.contains(asset),
-            "the checksum file must cover {asset}"
+            hashed.contains(asset),
+            "the checksum file must cover {asset}:\n{checksum_step}"
         );
     }
 
@@ -1748,7 +2157,7 @@ fn the_release_units_are_the_repository_files() {
     // install directory folded in — nothing else is changed, so the two
     // cannot drift apart.
     let release = FakeRelease::new();
-    let sandbox = Sandbox::new(Some("sha256sum"));
+    let sandbox = Sandbox::new();
     let output = sandbox.run(&release.base_url, &[("PANGOLIN_VERSION", "v1.2.3")]);
     assert!(
         output.status.success(),

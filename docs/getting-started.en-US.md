@@ -70,8 +70,9 @@ What the script does, in order:
 
 A digest that does not match aborts **before anything is written** — the
 install directory stays empty, and running the script again is safe: an
-existing `ngx.yml` / `tun.yml` is kept as it is, and an existing binary is
-renamed to `.bak` before it is replaced.
+existing `ngx.yml` / `tun.yml` is kept as it is, an existing binary or
+systemd unit is renamed to `.bak` before it is replaced, and a gateway
+that is already running is restarted with the new binary.
 
 When it finishes, `/usr/local/pangolin` holds a gateway that runs: on Linux
 `pangolin-ngx` is already up as a systemd service, listening on `80` / `443`;
@@ -82,8 +83,8 @@ The script's environment variables:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `PANGOLIN_VERSION` | empty (the latest stable release) | Pins the version; `0.3.0` and `v0.3.0` both work |
-| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | Where the gateway is installed |
+| `PANGOLIN_VERSION` | empty (the latest stable release) | Pins the version; `0.3.0` and `v0.3.0` both work. Only a release that **ships the packaged configuration (`ngx.yml`) and the systemd units** can be installed this way — install an older one by hand |
+| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | Where the gateway is installed (must be an absolute path) |
 | `PANGOLIN_BASE_URL` | `https://github.com/cnlangzi/pangolin/releases/download` | The download base |
 | `PANGOLIN_LATEST_URL` | `https://github.com/cnlangzi/pangolin/releases/latest` | Where the latest version is resolved from |
 | `PANGOLIN_NO_SERVICE` | unset | `1` skips the user, the units and every `systemctl` call |

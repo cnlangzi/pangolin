@@ -171,9 +171,23 @@ Three rules, all of them load-bearing:
   failed checksum must leave nothing behind, so a failed install can
   simply be run again.
 - **Never overwrite the operator's configuration.**  An existing
-  `ngx.yml` / `tun.yml` is kept byte for byte; an existing binary is
-  renamed to `<name>.bak` first — the same rolling-backup convention
-  the Ansible role uses.
+  `ngx.yml` / `tun.yml` is kept byte for byte; an existing binary or
+  systemd unit is renamed to `<name>.bak` first — the same
+  rolling-backup convention the Ansible role uses.
+
+Two more that the Ansible role taught us the hard way:
+
+- **The `pangolin` user needs a group of its own.**  The unit says
+  `Group=pangolin` and the install directory is handed over to
+  `pangolin:pangolin`, but `useradd` only creates a same-named group
+  where `USERGROUPS_ENAB` is yes — on the RHEL family it is not, and
+  the user lands in the default group.  The installer passes
+  `--user-group` for that reason.
+- **A re-run has to restart a running gateway.**  `systemctl enable
+  --now` leaves an active unit alone, so the freshly installed binary
+  would not be the one serving.  The installer restarts the unit when
+  it was already active, and waits for a freshly started one to come
+  up before it claims success.
 
 The script's knobs are environment variables (`PANGOLIN_VERSION`,
 `PANGOLIN_INSTALL_DIR`, `PANGOLIN_BASE_URL`, `PANGOLIN_LATEST_URL`,
@@ -182,6 +196,12 @@ test in `tests/src/install_script.rs` can drive the whole thing
 against a local HTTP server that impersonates a GitHub Release.
 `PANGOLIN_SYSTEMD_DIR` exists for that test — it is where the units
 are installed, `/etc/systemd/system` in production.
+
+Only a release that ships the **packaged configuration and the
+systemd units** can be installed with the script — the releases
+before them carry the two binaries only, and the installer says so
+instead of installing a gateway that would run on its built-in
+development defaults.
 
 Changing the script means changing the release workflow too: the
 publishing job copies `install.sh` and the two units out of the

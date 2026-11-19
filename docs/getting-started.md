@@ -50,7 +50,7 @@ curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install
 5. 改写 `ngx.yml` 里的五个生产配置（端口、管理密码、ACME 邮箱、日志级别）；
 6. Linux 上建 `pangolin` 系统用户、装 systemd unit、启动网关。
 
-摘要对不上就在**动文件系统之前**退出，安装目录一个字节都不会留下；重跑脚本是安全的 —— 已有的 `ngx.yml` / `tun.yml` 原样保留，已有的二进制先改名成 `.bak` 再换新的。
+摘要对不上就在**动文件系统之前**退出，安装目录一个字节都不会留下；重跑脚本是安全的 —— 已有的 `ngx.yml` / `tun.yml` 原样保留，已有的二进制和 systemd unit 先改名成 `.bak` 再换新的，已经在跑的网关会被重启（换上新二进制）。
 
 装完 `/usr/local/pangolin` 里就是能跑的网关：Linux 上 `pangolin-ngx` 已经作为 systemd 服务起来，监听 `80` / `443`；管理界面在 `http://<host>:9081/`（默认账号 `admin`、密码 `pangolin`）。
 
@@ -58,8 +58,8 @@ curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `PANGOLIN_VERSION` | 空（= 最新稳定版） | 钉死目标版本，`0.3.0` 和 `v0.3.0` 都认 |
-| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | 安装目录 |
+| `PANGOLIN_VERSION` | 空（= 最新稳定版） | 钉死目标版本，`0.3.0` 和 `v0.3.0` 都认。只有**带打包配置（`ngx.yml`）和 systemd unit 的版本**能这样装 —— 更早的版本请按下面的手工步骤装 |
+| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | 安装目录（必须是绝对路径） |
 | `PANGOLIN_BASE_URL` | `https://github.com/cnlangzi/pangolin/releases/download` | 下载基址 |
 | `PANGOLIN_LATEST_URL` | `https://github.com/cnlangzi/pangolin/releases/latest` | 最新版解析地址 |
 | `PANGOLIN_NO_SERVICE` | 未设置 | 设为 `1` 时跳过建用户、装 unit、`systemctl` 全套 |

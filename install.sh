@@ -71,11 +71,13 @@ esac
 # The gateway's own defaults in the shipped ngx.yml.  The installer
 # rewrites the two listen addresses and the log level; the tunnel port
 # is left alone and only reported in the summary.
-admin_addr='0.0.0.0:9081'
-admin_port="${admin_addr##*:}"
-admin_user='admin'
-admin_password='pangolin'
-tunnel_port='9001'
+#
+# The summary reports what is actually installed, so these are only the
+# fallbacks for a configuration that does not carry the key.
+admin_addr_default='0.0.0.0:9081'
+admin_user_default='admin'
+admin_password_default='pangolin'
+tunnel_addr_default='0.0.0.0:9001'
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -114,11 +116,36 @@ print_admin_warning() {
 WARNING: the admin UI ships wide open.
   * it listens on 0.0.0.0:9081 — every interface, not just localhost
   * it speaks plain HTTP, so the admin session crosses the wire in clear
-  * the password is the published default "pangolin"
+  * the password the installer writes is the published value "pangolin"
+    (the archive itself ships "admin") — both are public
 Change the password and narrow `admin.addr` before this host is
 reachable from an untrusted network.
 --------------------------------------------------------------------------
 EOF
+}
+
+# The value of one key of the gateway configuration, looked up by its
+# section.
+#
+# The summary has to report the configuration that is actually
+# installed — which is the operator's own file when they kept one — so
+# the values are read back instead of being repeated here.
+config_value() {
+    awk -v want_section="$2" -v want_key="$3" '
+        /^[A-Za-z_][A-Za-z0-9_]*:/ {
+            section = $0
+            sub(/:.*$/, "", section)
+            next
+        }
+        section == want_section && $0 ~ ("^  " want_key ":") {
+            value = $0
+            sub(/^  [A-Za-z_][A-Za-z0-9_]*:[ \t]*/, "", value)
+            sub(/[ \t]*#.*$/, "", value)
+            sub(/[ \t]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$1"
 }
 
 # The command that prints the whole install procedure — used when the
@@ -128,10 +155,12 @@ print_manual_start() {
     log "Start the gateway by hand:"
     log "  cd $install_dir && ./pangolin-ngx --config $install_dir/ngx.yml"
     log ""
-    log "The shipped configuration binds 0.0.0.0:80 and 0.0.0.0:443, which"
-    log "are privileged ports: run the gateway as root, or grant it"
-    log 'CAP_NET_BIND_SERVICE, or change `addr.http` / `addr.https` back to'
-    log "the unprivileged 8000 / 8443."
+    log "The installed configuration binds $http_addr and $https_addr."
+    if [ "$http_port" -lt 1024 ] 2>/dev/null; then
+        log "Those are privileged ports: run the gateway as root, or grant it"
+        log 'CAP_NET_BIND_SERVICE, or change `addr.http` / `addr.https` back to'
+        log "the unprivileged 8000 / 8443."
+    fi
 }
 
 # ── the platform ────────────────────────────────────────────────────────────
@@ -173,6 +202,15 @@ esac
 
 command -v curl >/dev/null 2>&1 || die "curl is required — install curl and run the command again"
 command -v tar >/dev/null 2>&1 || die "tar is required — install tar and run the command again"
+
+# The install directory ends up in the unit's `WorkingDirectory=` and
+# `ExecStart=`.  systemd resolves a relative path against `/`, so a
+# relative install directory would produce a unit that starts a binary
+# that is not there.
+case "$install_dir" in
+    /*) ;;
+    *) die "PANGOLIN_INSTALL_DIR must be an absolute path, got '$install_dir'" ;;
+esac
 
 print_admin_warning
 
@@ -285,6 +323,21 @@ fetch() {
     }
 }
 
+# Fetch a file that the release may not have at all.  A 404 is not an
+# error here — the caller decides what a missing file means.
+fetch_optional() {
+    fo_url="$1"
+    fo_dest="$2"
+    fo_code=$(curl -fsSL -o "$fo_dest" -w '%{http_code}' "$fo_url") || {
+        rm -f "$fo_dest"
+        if [ "$fo_code" = '404' ]; then
+            return 1
+        fi
+        die "could not download $fo_url (HTTP status: ${fo_code:-unknown})"
+    }
+    return 0
+}
+
 log "Downloading $archive_url"
 fetch "$archive_url" "$work_dir/$archive_name"
 
@@ -292,10 +345,20 @@ log "Downloading $sums_url"
 fetch "$sums_url" "$work_dir/$sums_name"
 
 log "Downloading $unit_ngx_url"
-fetch "$unit_ngx_url" "$work_dir/$unit_ngx_name"
+if ! fetch_optional "$unit_ngx_url" "$work_dir/$unit_ngx_name"; then
+    die "release $version does not ship $unit_ngx_name — it predates the one-line installer.
+Only a release that ships the packaged configuration and the systemd units can be
+installed with it.  Install this one by hand:
+  https://github.com/cnlangzi/pangolin/blob/main/docs/getting-started.md"
+fi
 
 log "Downloading $unit_tun_url"
-fetch "$unit_tun_url" "$work_dir/$unit_tun_name"
+if ! fetch_optional "$unit_tun_url" "$work_dir/$unit_tun_name"; then
+    die "release $version does not ship $unit_tun_name — it predates the one-line installer.
+Only a release that ships the packaged configuration and the systemd units can be
+installed with it.  Install this one by hand:
+  https://github.com/cnlangzi/pangolin/blob/main/docs/getting-started.md"
+fi
 
 # ── the checksums ───────────────────────────────────────────────────────────
 
@@ -366,14 +429,29 @@ pangolin_user_exists() {
     id -u pangolin >/dev/null 2>&1
 }
 
+pangolin_group_exists() {
+    getent group pangolin >/dev/null 2>&1
+}
+
 ensure_pangolin_user() {
     if pangolin_user_exists; then
         log "The system user 'pangolin' already exists — keeping it."
         return 0
     fi
     if command -v useradd >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin pangolin
+        # The group has to exist as well: the unit says `Group=pangolin`
+        # and the install directory is handed over to `pangolin:pangolin`.
+        # `useradd` only creates a same-named group where
+        # USERGROUPS_ENAB is yes (Debian) — on the RHEL family the user
+        # would land in the default group instead, and the chown below
+        # would fail.  `--user-group` asks for the group explicitly.
+        if pangolin_group_exists; then
+            useradd --system --no-create-home --shell /usr/sbin/nologin pangolin
+        else
+            useradd --system --no-create-home --user-group --shell /usr/sbin/nologin pangolin
+        fi
     elif command -v adduser >/dev/null 2>&1; then
+        # Debian's adduser creates the group with the user.
         adduser --system pangolin
     else
         die "neither useradd nor adduser is available — cannot create the 'pangolin' system user"
@@ -390,6 +468,16 @@ fi
 stage_dir="$work_dir/stage"
 mkdir -p "$stage_dir"
 tar -xzf "$work_dir/$archive_name" -C "$stage_dir"
+
+# The archive of a release that predates the packaged configuration
+# holds the two binaries and nothing else.  There is no configuration
+# to install and nothing to rewrite, so such a release cannot be
+# installed by this script.
+if [ ! -f "$stage_dir/ngx.yml" ] || [ ! -f "$stage_dir/tun.yml" ]; then
+    die "release $version ships no packaged configuration (ngx.yml / tun.yml) — it
+predates the one-line installer.  Install this one by hand:
+  https://github.com/cnlangzi/pangolin/blob/main/docs/getting-started.md"
+fi
 
 # One file at a time, because the operator's own configuration must
 # survive a re-run: the shipped ngx.yml / tun.yml are only installed
@@ -412,14 +500,12 @@ install_config() {
     ic_src="$1"
     ic_dst="$2"
     ic_name="${ic_dst##*/}"
-    config_installed=0
     if [ -e "$ic_dst" ]; then
         log "  kept the existing $ic_name — it was not overwritten"
         return 0
     fi
     cp "$ic_src" "$ic_dst"
     chmod 0600 "$ic_dst"
-    config_installed=1
 }
 
 log "Installing into $install_dir"
@@ -428,9 +514,13 @@ mkdir -p "$install_dir"
 install_binary "$stage_dir/pangolin-ngx" "$install_dir/pangolin-ngx"
 install_binary "$stage_dir/pangolin-tun" "$install_dir/pangolin-tun"
 
+# The flag is read before the call: `install_config` keeps an existing
+# file, and only a freshly installed one may be rewritten.
 ngx_installed=0
+if [ ! -e "$install_dir/ngx.yml" ]; then
+    ngx_installed=1
+fi
 install_config "$stage_dir/ngx.yml" "$install_dir/ngx.yml"
-ngx_installed="$config_installed"
 install_config "$stage_dir/tun.yml" "$install_dir/tun.yml"
 
 # The relative paths in the shipped configuration (./certs, ./logs/bots,
@@ -461,7 +551,7 @@ rewrite_ngx_config() {
     awk \
         -v addr_http='0.0.0.0:80' \
         -v addr_https='0.0.0.0:443' \
-        -v admin_password="$admin_password" \
+        -v admin_password="$admin_password_default" \
         -v acme_email="\"$acme_email\"" \
         -v log_level='info' '
         {
@@ -511,12 +601,38 @@ rewrite_ngx_config() {
 
 if [ "$ngx_installed" -eq 1 ]; then
     rewrite_ngx_config "$install_dir/ngx.yml" "$work_dir/ngx.yml"
+    # The rewritten file carries the admin password — it is 0600
+    # before it is moved into place, never 0644.
+    chmod 0600 "$work_dir/ngx.yml"
     mv "$work_dir/ngx.yml" "$install_dir/ngx.yml"
-    chmod 0600 "$install_dir/ngx.yml"
     log "  rewrote addr.http/addr.https, admin.password, acme.email and log.level in ngx.yml"
 else
     log "  ngx.yml was not rewritten — the existing configuration was kept"
 fi
+
+# ── the installed configuration ─────────────────────────────────────────────
+
+# The summary and the manual start instructions report the configuration
+# that is actually installed — which is the operator's own file when
+# they kept one.
+admin_addr=$(config_value "$install_dir/ngx.yml" admin addr)
+admin_user=$(config_value "$install_dir/ngx.yml" admin username)
+admin_password=$(config_value "$install_dir/ngx.yml" admin password)
+http_addr=$(config_value "$install_dir/ngx.yml" addr http)
+https_addr=$(config_value "$install_dir/ngx.yml" addr https)
+tunnel_addr=$(config_value "$install_dir/ngx.yml" tunnel addr)
+
+[ -n "$admin_addr" ] || admin_addr="$admin_addr_default"
+[ -n "$admin_user" ] || admin_user="$admin_user_default"
+[ -n "$admin_password" ] || admin_password="$admin_password_default"
+[ -n "$http_addr" ] || http_addr='0.0.0.0:80'
+[ -n "$https_addr" ] || https_addr='0.0.0.0:443'
+[ -n "$tunnel_addr" ] || tunnel_addr="$tunnel_addr_default"
+
+admin_port="${admin_addr##*:}"
+http_port="${http_addr##*:}"
+https_port="${https_addr##*:}"
+tunnel_port="${tunnel_addr##*:}"
 
 # ── the ownership ───────────────────────────────────────────────────────────
 
@@ -543,19 +659,69 @@ install_unit() {
     sed -e "s|$(escape_sed "$install_dir_default")|$(escape_sed "$install_dir")|g" \
         "$iu_src" > "$iu_dst.new"
     chmod 0644 "$iu_dst.new"
+    # A unit the operator edited is kept as <name>.bak, the same
+    # rolling-backup convention the binaries get.
+    if [ -e "$iu_dst" ]; then
+        mv "$iu_dst" "$iu_dst.bak"
+        log "  kept the previous $iu_name as $iu_name.bak"
+    fi
     mv "$iu_dst.new" "$iu_dst"
 }
+
+# The service is the last thing the script does, and a service that
+# does not come up must not swallow the summary — the operator needs
+# the credentials, the ports and the tunnel steps exactly then.
+service_ok=1
 
 if service_is_planned; then
     log "Installing the systemd units into $systemd_dir"
     install_unit "$work_dir/$unit_ngx_name" "$unit_ngx_name"
     install_unit "$work_dir/$unit_tun_name" "$unit_tun_name"
 
-    systemctl daemon-reload
+    if ! systemctl daemon-reload; then
+        warn "systemctl daemon-reload failed — systemd may not know the new unit"
+        service_ok=0
+    fi
+
+    # `enable --now` starts the unit — but a unit that is already
+    # running is left alone, and then the binary that was just
+    # installed would not be the one serving.  Restart it in that case,
+    # the way the Ansible role's restart handler does.
+    if systemctl is-active --quiet pangolin-ngx; then
+        was_active=1
+    else
+        was_active=0
+    fi
+
     # The tunnel node is installed but NOT started: the gateway rejects
     # a tun whose (name, token) row does not exist yet, so starting it
     # now would only produce a restart loop.
-    systemctl enable --now pangolin-ngx
+    if ! systemctl enable --now pangolin-ngx; then
+        warn "systemctl could not start the gateway — check 'systemctl status pangolin-ngx'"
+        service_ok=0
+    elif [ "$was_active" -eq 1 ]; then
+        log "  the gateway was already running — restarting it with the new binary"
+        if ! systemctl restart pangolin-ngx; then
+            warn "systemctl could not restart the gateway — check 'systemctl status pangolin-ngx'"
+            service_ok=0
+        fi
+    else
+        # The start job is only enqueued at this point, so the unit may
+        # not be up yet.  Give it a moment before the summary claims it
+        # is running.
+        waited=0
+        while [ "$waited" -lt 5 ]; do
+            if systemctl is-active --quiet pangolin-ngx; then
+                break
+            fi
+            waited=$((waited + 1))
+            sleep 1
+        done
+        if [ "$waited" -ge 5 ]; then
+            warn "the gateway did not come up — check 'systemctl status pangolin-ngx'"
+            service_ok=0
+        fi
+    fi
     log "  systemctl enable --now pangolin-ngx"
 else
     if [ "$no_service" = '1' ]; then
@@ -574,7 +740,12 @@ host_name=$(hostname -s 2>/dev/null || printf 'this-host')
 
 log ""
 log "--------------------------------------------------------------------------"
-log "Pangolin $version installed."
+if [ "$service_ok" -eq 1 ]; then
+    log "Pangolin $version installed."
+else
+    log "Pangolin $version installed — but the gateway is not running."
+    log "Check 'systemctl status pangolin-ngx' and 'journalctl -u pangolin-ngx'."
+fi
 log ""
 log "  install directory : $install_dir"
 log "  version           : $version"
@@ -583,8 +754,8 @@ log "  admin credentials : $admin_user / $admin_password"
 log "  database          : $install_dir/pangolin.db"
 log ""
 log "  Ports to open:"
-log "    TCP 80            HTTP"
-log "    TCP 443           HTTPS"
+log "    TCP $http_port            HTTP"
+log "    TCP $https_port           HTTPS"
 log "    TCP+UDP $tunnel_port      tunnel (QUIC on UDP, WebSocket/TCP fallback)"
 log ""
 log "  The tunnel node is NOT running yet.  To register one:"
@@ -598,3 +769,9 @@ else
 fi
 log ""
 print_admin_warning
+
+# A gateway that did not come up is a failed install: the files are in
+# place, but the operator asked for a running gateway.
+if [ "$service_ok" -ne 1 ]; then
+    exit 1
+fi
