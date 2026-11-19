@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pangolin — apt / yum 仓库</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.7; color: #1f2933; }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  p.lead { color: #52606d; margin-top: 0; }
+  pre { background: #f5f7fa; border: 1px solid #e4e7eb; border-radius: 6px;
+        padding: .75rem 1rem; overflow-x: auto; font-size: .875rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .note { border-left: 3px solid #9aa5b1; padding-left: .75rem; color: #52606d; }
+</style>
+</head>
+<body>
+<h1>Pangolin — apt / yum 仓库</h1>
+<p class="lead">这个分支由发布流水线自动生成，用于托管 Pangolin 的 Debian / RPM 包仓库。请不要手工修改。</p>
+
+<h2>Debian / Ubuntu</h2>
+<pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/pangolin-archive-keyring.gpg &gt; /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] https://cnlangzi.github.io/pangolin stable main" \
+  | sudo tee /etc/apt/sources.list.d/pangolin.list
+sudo apt update
+sudo apt install pangolin-ngx</code></pre>
+
+<h2>RHEL / Rocky / Alma</h2>
+<pre><code>sudo tee /etc/yum.repos.d/pangolin.repo &gt; /dev/null &lt;&lt;'REPO'
+[pangolin]
+name=Pangolin
+baseurl=https://cnlangzi.github.io/pangolin/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.asc
+REPO
+sudo dnf install pangolin-ngx</code></pre>
+
+<p class="note">仓库内容（<code>dists/</code>、<code>pool/</code>、<code>rpm/</code>）在每次发布 tag 时由
+<code>.github/workflows/release.yml</code> 的 <code>package</code> 与 <code>deploy-repo</code> 两个 job 重新生成并推送。</p>
+</body>
+</html>
