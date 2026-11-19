@@ -23,7 +23,7 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-use crate::common::{parse_toml, read_repo_file};
+use crate::common::{dependency_tables, parse_toml, read_repo_file, workspace_members};
 
 /// A stand-in for the repository manifest, shaped so that the rewrite
 /// is not trivial: a `[workspace.package]` table that owns the version
@@ -51,48 +51,6 @@ tokio = {
 }
 "#;
 
-/// One workspace member: its package name, its path in the tree and
-/// its parsed manifest.
-struct Member {
-    name: String,
-    path: String,
-    manifest: toml::Value,
-}
-
-/// Every workspace member, read from the root manifest.
-///
-/// Derived, not hardcoded: a member that pins its own version, or one
-/// that is added to the workspace later, has to be caught by the
-/// checks below — a list written out by hand would let both slip
-/// through.
-fn workspace_members() -> Vec<Member> {
-    let manifest = parse_toml("Cargo.toml");
-    let members = manifest
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-        .expect("[workspace] members");
-
-    members
-        .iter()
-        .map(|path| {
-            let path = path.as_str().expect("a member path");
-            let member = parse_toml(&format!("{path}/Cargo.toml"));
-            let name = member
-                .get("package")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or_else(|| panic!("{path} declares no package name"))
-                .to_string();
-            Member {
-                name,
-                path: path.to_string(),
-                manifest: member,
-            }
-        })
-        .collect()
-}
-
 /// The workspace version — the single line every member inherits.
 fn workspace_version() -> String {
     parse_toml("Cargo.toml")
@@ -102,26 +60,6 @@ fn workspace_version() -> String {
         .and_then(|v| v.as_str())
         .expect("[workspace.package].version")
         .to_string()
-}
-
-/// Every dependency table of a manifest, at any depth.
-///
-/// A `[target.'cfg(unix)'.dependencies]` section is a dependency table
-/// too, and a pinned version in one breaks the release exactly like a
-/// pinned version in `[dependencies]` does.
-fn dependency_tables<'a>(value: &'a toml::Value, out: &mut Vec<&'a toml::Value>) {
-    let Some(table) = value.as_table() else {
-        return;
-    };
-    for (key, child) in table {
-        if matches!(
-            key.as_str(),
-            "dependencies" | "dev-dependencies" | "build-dependencies"
-        ) {
-            out.push(child);
-        }
-        dependency_tables(child, out);
-    }
 }
 
 // ── the manifest ────────────────────────────────────────────────────────────

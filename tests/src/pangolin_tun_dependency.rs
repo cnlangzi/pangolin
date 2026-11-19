@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::common::{parse_toml, repo_root};
+use crate::common::{lock_entry, lock_packages, parse_toml, repo_root};
 
 /// The dependency the gateway and the tun consume.
 const CRATE: &str = "pangolin-tun";
@@ -39,23 +39,6 @@ const CHECKSUM: &str = "becd40f4e2de655c0ddc6bbe538bae8c49b5ecea9efc7c16b0847ef8
 
 /// The version the lockfile must resolve.
 const VERSION: &str = "0.1.0";
-
-/// The `[[package]]` entry of the lockfile for `name`.
-fn lock_entry<'a>(packages: &'a [toml::Value], name: &str) -> &'a toml::Value {
-    packages
-        .iter()
-        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
-        .unwrap_or_else(|| panic!("Cargo.lock has no entry for {name}"))
-}
-
-/// The `[[package]]` array of the lockfile.
-fn lock_packages() -> Vec<toml::Value> {
-    parse_toml("Cargo.lock")
-        .get("package")
-        .and_then(|p| p.as_array())
-        .expect("Cargo.lock has a [[package]] array")
-        .clone()
-}
 
 /// Every Rust file under `dir`, recursively.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {

@@ -27,9 +27,7 @@
 //! The policy these tests enforce is written down in
 //! `docs/design/pingora-dependency.md`.
 
-use std::path::Path;
-
-use crate::common::{parse_toml, repo_root};
+use crate::common::{dependency_tables, lock_packages, parse_toml, workspace_members};
 
 /// The dependency the gateway is built on.
 const CRATE: &str = "pingora";
@@ -40,15 +38,6 @@ const VERSION_LINE: &str = "0.9";
 /// The fork this repository used to consume.  Nothing may resolve
 /// from it any more.
 const FORK: &str = "cnlangzi/pingora";
-
-/// The `[[package]]` array of the lockfile.
-fn lock_packages() -> Vec<toml::Value> {
-    parse_toml("Cargo.lock")
-        .get("package")
-        .and_then(|p| p.as_array())
-        .expect("Cargo.lock has a [[package]] array")
-        .clone()
-}
 
 /// Every `pingora*` package in the lockfile.
 fn pingora_packages(packages: &[toml::Value]) -> Vec<&toml::Value> {
@@ -96,29 +85,37 @@ fn the_root_manifest_has_no_patch_table() {
 #[test]
 fn the_workspace_depends_on_the_published_crate() {
     let manifest = parse_toml("Cargo.toml");
-    let dependency = manifest
+    let dependencies = manifest
         .get("workspace")
         .and_then(|w| w.get("dependencies"))
-        .and_then(|d| d.get(CRATE))
         .and_then(|d| d.as_table())
-        .unwrap_or_else(|| panic!("the workspace must manage the {CRATE} dependency"));
+        .expect("Cargo.toml has a [workspace.dependencies] table");
 
-    for key in ["git", "branch", "rev", "path"] {
+    for crate_name in ["pingora", "pingora-core"] {
+        let dependency = dependencies
+            .get(crate_name)
+            .and_then(|d| d.as_table())
+            .unwrap_or_else(|| panic!("the workspace must manage the {crate_name} dependency"));
+
+        for key in ["git", "branch", "rev", "path"] {
+            assert!(
+                !dependency.contains_key(key),
+                "the {crate_name} dependency must not carry a {key:?} key — \
+                 it is consumed from crates.io, not from the {FORK} fork: {dependency:?}"
+            );
+        }
+
+        let version = dependency
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                panic!("the {crate_name} dependency must carry a version requirement")
+            });
         assert!(
-            !dependency.contains_key(key),
-            "the {CRATE} dependency must not carry a {key:?} key — \
-             it is consumed from crates.io, not from the {FORK} fork: {dependency:?}"
+            version.starts_with(VERSION_LINE),
+            "the {crate_name} dependency must ask for the {VERSION_LINE} line, got {version:?}"
         );
     }
-
-    let version = dependency
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
-    assert!(
-        version.starts_with(VERSION_LINE),
-        "the {CRATE} dependency must ask for the {VERSION_LINE} line, got {version:?}"
-    );
 }
 
 /// The `pingora-http` dependency is gone.
@@ -140,27 +137,19 @@ fn the_unused_pingora_http_dependency_is_gone() {
         "the workspace must not declare pingora-http — nothing uses it"
     );
 
-    for member in [
-        "crates/pangolin-core/Cargo.toml",
-        "crates/ngx/Cargo.toml",
-        "crates/tun/Cargo.toml",
-        "crates/admin/Cargo.toml",
-        "crates/api/Cargo.toml",
-        "tests/Cargo.toml",
-    ] {
-        let path = repo_root().join(member);
-        if !Path::new(&path).exists() {
-            continue;
-        }
-        let member_manifest = parse_toml(member);
-        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-            let declared = member_manifest
-                .get(section)
-                .and_then(|d| d.as_table())
-                .and_then(|d| d.get("pingora-http"));
+    // The member list is derived from the root manifest, so a member
+    // added later is covered without touching this test — and every
+    // dependency table of every member is scanned, including the
+    // `[target.'cfg(…)'.dependencies]` ones.
+    for member in workspace_members() {
+        let mut tables = Vec::new();
+        dependency_tables(&member.manifest, &mut tables);
+        for table in tables {
+            let declared = table.get("pingora-http");
             assert!(
                 declared.is_none(),
-                "{member} must not declare pingora-http — nothing uses it"
+                "{} must not declare pingora-http — nothing uses it",
+                member.path
             );
         }
     }
@@ -223,11 +212,6 @@ fn the_gateway_declares_the_matching_pingora_crates() {
 
 /// Every pingora crate in the lockfile comes from crates.io, on the
 /// 0.9 line.
-///
-/// One entry per crate: the old tree carried **two** copies of
-/// `pingora-openssl` (a git copy from the fork plus a crates.io
-/// copy), because the fork's version did not satisfy the
-/// requirement and cargo resolved the second one from the registry.
 #[test]
 fn the_lockfile_resolves_pingora_from_the_registry() {
     let packages = lock_packages();
@@ -279,18 +263,35 @@ fn no_lockfile_entry_comes_from_the_fork() {
     }
 }
 
-/// Exactly one copy of each crate the gateway names directly.
+/// Exactly one copy of **every** pingora crate.
+///
+/// The old tree carried **two** copies of `pingora-openssl` (a git
+/// copy from the fork plus a crates.io copy), because the fork's
+/// version did not satisfy the requirement and cargo resolved the
+/// second one from the registry.  Two copies of one crate drift
+/// apart, and the drift is not visible in the compiler.
 #[test]
 fn there_is_exactly_one_copy_of_each_pingora_crate() {
     let packages = lock_packages();
-    for crate_name in ["pingora-core", "pingora-openssl"] {
+    let pingora = pingora_packages(&packages);
+    assert!(
+        !pingora.is_empty(),
+        "the lockfile must contain pingora crates"
+    );
+
+    let mut names: Vec<&str> = pingora
+        .iter()
+        .map(|p| p.get("name").and_then(|n| n.as_str()).unwrap_or("?"))
+        .collect();
+    names.sort_unstable();
+    for name in &names {
         let count = packages
             .iter()
-            .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(crate_name))
+            .filter(|p| p.get("name").and_then(|n| n.as_str()) == Some(*name))
             .count();
         assert_eq!(
             count, 1,
-            "the lockfile must carry exactly one {crate_name} entry, found {count} — \
+            "the lockfile must carry exactly one {name} entry, found {count} — \
              two copies of one crate drift apart"
         );
     }
@@ -334,21 +335,15 @@ fn the_zstd_chain_is_past_the_advisories() {
     }
 }
 
-/// Compare two dotted version strings numerically, component by
-/// component.  The build metadata a `zstd-sys` version carries
-/// (`2.1.3+zstd.1.5.7`) is ignored: it is not a version component.
+/// Compare two version strings with the `semver` rules.
+///
+/// `semver` is the right tool here: a hand-rolled comparator would
+/// have to reimplement the pre-release and build-metadata rules, and
+/// the lockfile carries both (`2.1.3+zstd.1.5.7` is a build
+/// metadata suffix, which does not affect the ordering).
 fn version_at_least(version: &str, floor: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split(['.', '-', '+'])
-            .map(|part| part.parse::<u64>().unwrap_or(0))
-            .collect()
+    let parse = |v: &str| {
+        semver::Version::parse(v).unwrap_or_else(|e| panic!("{v} is not a semver version: {e}"))
     };
-    let version = parse(version);
-    let floor = parse(floor);
-    for (v, f) in version.iter().zip(floor.iter()) {
-        if v != f {
-            return v > f;
-        }
-    }
-    version.len() >= floor.len()
+    parse(version) >= parse(floor)
 }

@@ -981,3 +981,200 @@ impl Drop for TunProcess {
         let _ = child.start_kill();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared mock backend: parses the request it received and records it.
+// ---------------------------------------------------------------------------
+
+/// One request a mock backend received, parsed.
+///
+/// The header names keep the case the client sent them in: HTTP
+/// header names are case-insensitive, so the lookups go through
+/// [`RecordedRequest::header`] rather than a direct index.
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RecordedRequest {
+    /// The value of the first header called `name`, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether a header called `name` was received at all.
+    pub fn has_header(&self, name: &str) -> bool {
+        self.header(name).is_some()
+    }
+}
+
+/// A mock backend that parses the request it received and answers
+/// with a fixed response.
+///
+/// Shared by every e2e module that needs to assert on what the
+/// **backend** saw — one implementation, so a change to the parsing
+/// cannot leave one module stale.
+pub struct InspectingBackend {
+    addr: String,
+    requests: Arc<tokio::sync::Mutex<Vec<RecordedRequest>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl InspectingBackend {
+    /// Start a backend that answers `200 OK` with an empty JSON body.
+    pub async fn start() -> Self {
+        Self::start_with(200, "application/json", b"{}").await
+    }
+
+    /// Clear the recorded requests. Useful when reusing one
+    /// `InspectingBackend` across multiple assertions in a
+    /// single test (the `real_e2e_tunnel_path_invariant_*`
+    /// suite does this to amortise backend startup cost).
+    pub async fn reset(&self) {
+        self.requests.lock().await.clear();
+    }
+
+    /// Start a backend that answers with a fixed status, content type
+    /// and body.
+    pub async fn start_with(default_status: u16, default_ct: &str, default_body: &[u8]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let reqs_for_task = requests.clone();
+        let default_ct = default_ct.to_string();
+        let default_body = default_body.to_vec();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let reqs = reqs_for_task.clone();
+                let default_ct = default_ct.clone();
+                let default_body = default_body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    // Read until we've seen the end-of-headers marker,
+                    // then up to Content-Length more bytes for the body.
+                    let mut accumulated = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                accumulated.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&accumulated) {
+                                    break pos;
+                                }
+                                if accumulated.len() > 64 * 1024 {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    let head_str = String::from_utf8_lossy(&accumulated[..header_end]).into_owned();
+                    let mut lines = head_str.split("\r\n");
+                    let request_line = lines.next().unwrap_or("");
+                    let mut req_parts = request_line.split_whitespace();
+                    let method = req_parts.next().unwrap_or("").to_string();
+                    let full_path = req_parts.next().unwrap_or("").to_string();
+                    let (path, query) = match full_path.find('?') {
+                        Some(i) => (full_path[..i].to_string(), full_path[i + 1..].to_string()),
+                        None => (full_path.clone(), String::new()),
+                    };
+                    let mut headers: Vec<(String, String)> = Vec::new();
+                    let mut content_length: usize = 0;
+                    for line in lines {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            let k = k.trim().to_string();
+                            let v = v.trim().to_string();
+                            if k.eq_ignore_ascii_case("content-length") {
+                                content_length = v.parse().unwrap_or(0);
+                            }
+                            headers.push((k, v));
+                        }
+                    }
+                    // Now read the body.
+                    let already_have = accumulated.len() - (header_end + 4);
+                    let mut body = accumulated.split_off(header_end + 4);
+                    while body.len() < content_length {
+                        let need = content_length - body.len();
+                        match stream.read(&mut tmp).await {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n.min(need)]),
+                            Err(_) => break,
+                        }
+                    }
+                    reqs.lock().await.push(RecordedRequest {
+                        method: method.clone(),
+                        path: path.clone(),
+                        query: query.clone(),
+                        headers: headers.clone(),
+                        body: body.clone(),
+                    });
+                    // Response — just an echo JSON for the default case.
+                    let reason = match default_status {
+                        200 => "OK",
+                        201 => "Created",
+                        204 => "No Content",
+                        301 => "Moved Permanently",
+                        302 => "Found",
+                        400 => "Bad Request",
+                        401 => "Unauthorized",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        500 => "Internal Server Error",
+                        502 => "Bad Gateway",
+                        _ => "Status",
+                    };
+                    let status_line = format!("HTTP/1.1 {} {}\r\n", default_status, reason);
+                    let headers_out = format!(
+                        "Content-Type: {ct}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                        ct = default_ct,
+                        len = default_body.len()
+                    );
+                    let _ = stream.write_all(status_line.as_bytes()).await;
+                    let _ = stream.write_all(headers_out.as_bytes()).await;
+                    let _ = stream.write_all(&default_body).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            requests,
+            handle,
+        }
+    }
+
+    /// The `host:port` the backend listens on.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Every request the backend has received so far.
+    pub async fn seen(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().await.clone()
+    }
+}
+
+/// The offset of the end of the request head in `buf`.
+pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+impl Drop for InspectingBackend {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
