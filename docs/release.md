@@ -45,8 +45,9 @@ one line.
 
 ## What gets published
 
-Each release attaches one archive per build target plus a checksum
-file — six archives and `SHA256SUMS.txt`:
+Each release attaches one archive per build target plus the installer,
+the two systemd units and a checksum file — six archives, three
+repository files and `SHA256SUMS.txt`:
 
 ```
 pangolin_v0.3.0_linux_amd64.tar.gz
@@ -55,8 +56,28 @@ pangolin_v0.3.0_macos_arm64.tar.gz
 pangolin_v0.3.0_macos_x64.tar.gz
 pangolin_v0.3.0_windows_amd64.zip
 pangolin_v0.3.0_windows_arm64.zip
+install.sh
+pangolin-ngx.service
+pangolin-tun.service
 SHA256SUMS.txt
 ```
+
+`install.sh` is the repository's root `install.sh`, byte for byte — it
+is the one-liner every operator starts with:
+
+```bash
+curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh
+```
+
+`pangolin-ngx.service` and `pangolin-tun.service` are copies of
+`deploy/playbooks/roles/ngx/files/ngx.service` and
+`deploy/playbooks/roles/tun/files/tun.service`. The repository's files
+are the single source: the publishing job copies them, it does not
+write a second copy that could drift apart.
+
+All three go into `SHA256SUMS.txt` like every other asset, so the
+installer verifies them against the same checksum file as the
+archives.
 
 The policy is "ship every target that compiles", not a curated
 mainstream list. The four `tar.gz` archives contain exactly four
@@ -207,7 +228,7 @@ through to release day.
 | Set | The tag's version is written into `[workspace.package].version` in `Cargo.toml` — the table-scoped rewrite touches that one line and nothing else. The workflow reads the value back and fails if it is not the tag's version. This happens *after* the cargo cache step, so the cache key is computed from the unmodified manifest and stays identical across releases. |
 | Build | Three jobs, one per build shape, each with its own matrix. `build` (linux/amd64, linux/arm64) runs `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `build-mac` (macos/arm64, macos/x64) runs `make build-css` plus `cargo build --release -p ngx -p tun --features openssl/vendored`. `build-tun` (windows/amd64, windows/arm64) runs `cargo build --release -p tun`. All three regenerate or embed the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled — except the Windows build, whose tun binary serves no UI. |
 | Assert | `--version` must report the tagged version on every binary the runner can execute — both Linux entries and macOS arm64 natively, macOS x64 under Rosetta 2, Windows amd64. A mismatched binary fails the job and is never uploaded. |
-| Publish | The six archives and `SHA256SUMS.txt` are attached to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
+| Publish | The publishing job checks the repository out (it needs the installer and the two systemd units), copies them next to the archives, and attaches the six archives, `install.sh`, the two units and `SHA256SUMS.txt` to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
 
 The build jobs run read-only; only the publishing job holds a
 write-scoped token. A failed platform build fails the publishing

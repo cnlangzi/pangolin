@@ -54,7 +54,23 @@ Pangolin 是一个反向代理网关：终结 HTTP/HTTPS，按域名把请求分
 
 ## 30 秒跑起来
 
-下载 Release 归档是最快的路径（下面以 `v0.3.0` 为例，换成你要装的版本号即可）：
+一条命令装好网关（Linux x86_64 / arm64、macOS Apple Silicon / Intel）：
+
+```bash
+curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh
+```
+
+跑完就是一台能直接对外服务的网关：
+
+- 二进制在 `/usr/local/pangolin`（`0755`），配置在同一个目录（`0600`）；
+- Linux 上 `pangolin-ngx` 已经作为 systemd 服务跑起来，监听 `80` / `443`；
+- 管理界面在 `http://<host>:9081/`，默认账号 `admin`、密码 `pangolin`。
+
+脚本会识别平台、下载对应的发布归档、按 release 的 `SHA256SUMS.txt` 校验摘要、改写生产配置（端口、管理密码、ACME 邮箱、日志级别）、建 `pangolin` 系统用户、装 systemd unit 并启动网关。**摘要校验不过就一个字节都不落盘**，失败可以直接重跑。
+
+**装完一定要改**：管理密码（默认的 `pangolin` 是公开的）和管理界面监听地址（默认 `0.0.0.0:9081`，等于对整个网络开放）。完整清单见 [安装与上线](./docs/getting-started.md)。
+
+想手动装（或者用 Windows 的 `.zip`）——下面以 `v0.3.0` 为例，换成你要装的版本号即可：
 
 ```bash
 VERSION=v0.3.0

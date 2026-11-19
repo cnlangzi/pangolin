@@ -273,7 +273,10 @@ fn step_lines<'a>(workflow: &'a str, step_name: &str) -> Vec<&'a str> {
 
 /// The `run:` script of a step, verbatim — the shell body GitHub
 /// Actions would execute.
-fn step_script(workflow: &str, step_name: &str) -> String {
+///
+/// Shared with the installer tests (issue #175), which assert on the
+/// release workflow's own shell steps.
+pub(crate) fn step_script(workflow: &str, step_name: &str) -> String {
     let lines = step_lines(workflow, step_name);
     let run = lines
         .iter()

@@ -42,7 +42,60 @@ password are both `admin`). **Read [Before you go to
 production](#before-you-go-to-production) before putting this in front of
 real traffic.**
 
-### Download a release archive
+### One-line installation
+
+One command installs the gateway (Linux x86_64 / arm64, macOS Apple Silicon /
+Intel):
+
+```bash
+curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh
+```
+
+What the script does, in order:
+
+1. works out the platform (`uname -s` / `uname -m`) and maps it to the
+   release archive's suffix;
+2. resolves the version — the **latest stable release** by default (it
+   follows the redirect of `releases/latest`); `PANGOLIN_VERSION=v0.3.0`
+   pins one;
+3. downloads the archive, `SHA256SUMS.txt` and the two systemd units, and
+   **verifies every digest**;
+4. only then touches the filesystem: unpacks into `/usr/local/pangolin` with
+   the binaries `0755` and the configuration `0600`, and creates `certs/`,
+   `logs/bots/` and `logs/referers/`;
+5. rewrites the five production settings in `ngx.yml` (ports, admin
+   password, ACME address, log level);
+6. on Linux, creates the `pangolin` system user, installs the systemd units
+   and starts the gateway.
+
+A digest that does not match aborts **before anything is written** — the
+install directory stays empty, and running the script again is safe: an
+existing `ngx.yml` / `tun.yml` is kept as it is, an existing binary or
+systemd unit is renamed to `.bak` before it is replaced, and a gateway
+that is already running is restarted with the new binary.
+
+When it finishes, `/usr/local/pangolin` holds a gateway that runs: on Linux
+`pangolin-ngx` is already up as a systemd service, listening on `80` / `443`;
+the admin UI is at `http://<host>:9081/` (default user `admin`, password
+`pangolin`).
+
+The script's environment variables:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `PANGOLIN_VERSION` | empty (the latest stable release) | Pins the version; `0.3.0` and `v0.3.0` both work. Only a release that **ships the packaged configuration (`ngx.yml`) and the systemd units** can be installed this way — install an older one by hand |
+| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | Where the gateway is installed (must be an absolute path) |
+| `PANGOLIN_BASE_URL` | `https://github.com/cnlangzi/pangolin/releases/download` | The download base |
+| `PANGOLIN_LATEST_URL` | `https://github.com/cnlangzi/pangolin/releases/latest` | Where the latest version is resolved from |
+| `PANGOLIN_NO_SERVICE` | unset | `1` skips the user, the units and every `systemctl` call |
+| `PANGOLIN_SYSTEMD_DIR` | `/etc/systemd/system` | Where the units are installed |
+
+macOS has no systemd: the script installs the files, rewrites the
+configuration and prints the start command. Ports `80` / `443` are privileged
+there — run the gateway as root, or put `addr.http` / `addr.https` back to
+`8000` / `8443`.
+
+### Install by hand
 
 Every release publishes one archive per platform plus a checksum file on
 GitHub Releases. Linux (`linux_amd64` / `linux_arm64`) and macOS
@@ -99,20 +152,42 @@ token all have to change. The full list is in
 
 The configuration in the release archive is there so that `make start-ngx`
 runs on a development machine without privileges. **It cannot be used
-unchanged in production.** Change every item, each with its reason:
+unchanged in production.** The one-line installer does part of the work;
+the rest is yours, item by item — each with its reason:
 
-- [ ] **`addr.http` / `addr.https` to `:80` / `:443`.** The archive ships
-  `8000` / `8443`. Ports 80 and 443 are privileged and need root or
-  `CAP_NET_BIND_SERVICE` — the packaged systemd unit grants the latter, so an
-  unprivileged user can still bind them.
-- [ ] **`admin.password` — change it.** The archive ships `admin`. The gateway
-  emits **no** warning about the default, and nothing in the log will tell you.
+### What the one-line installer already did
+
+(If you installed the archive by hand, these are yours to change.)
+
+- [x] **`addr.http` / `addr.https` → `0.0.0.0:80` / `0.0.0.0:443`.** The
+  archive ships `8000` / `8443` (development defaults). Ports 80 and 443 are
+  privileged and need root or `CAP_NET_BIND_SERVICE` — the packaged systemd
+  unit grants the latter, so an unprivileged user can still bind them.
+- [x] **`admin.password` → `pangolin`.** The archive ships `admin`. **But
+  `pangolin` is a published value — still change it, see below.**
+- [x] **`acme.email` → `pangolin@<host>.local`.** The archive ships an empty
+  string. **But that is a placeholder, not a mailbox — still change it, see
+  below.**
+- [x] **`log.level` → `info`.** The archive ships `debug`. A noisy deployment
+  can go down to `warn`.
+- [x] **Installed modes**: the binaries `0755`, `ngx.yml` / `tun.yml` `0600`
+  (they carry the admin password and the bearer token).
+- [x] **Runtime directories**: `certs/`, `logs/bots/`, `logs/referers/`.
+- [x] **The `pangolin` system user, the systemd units and a running gateway**
+  (Linux; on macOS there is no systemd, so the script prints the start
+  command instead).
+
+### What is still left to do
+
+- [ ] **`admin.password` — change it.** The script writes `pangolin`, which is
+  a published value. The gateway emits **no** warning about the default, and
+  nothing in the log will tell you.
 - [ ] **`admin.addr` — narrow it.** The archive ships `0.0.0.0:9081`, which
   exposes the admin UI to the whole network. Use `127.0.0.1:9081` (and reach it
   over an SSH port-forward) or an address that is only reachable from your
   internal network.
-- [ ] **`acme.email` — fill it in.** This is the contact address of the ACME
-  registration, where expiry notices go. The archive ships an empty string.
+- [ ] **`acme.email` — fill in a real address.** The script writes
+  `pangolin@<host>.local` — a placeholder, not an address that receives mail.
 - [ ] **`acme.cert_dir`, `log.file`, `log.bot.dir`, `log.referer.dir` — make
   them absolute paths.** The archive ships relative paths (`./certs`,
   `./logs/bots`, `./logs/referers`) that follow the **working directory**. The
@@ -120,8 +195,6 @@ unchanged in production.** Change every item, each with its reason:
   somewhere you did not expect. `log.file` defaults to an empty string (stderr
   only, nothing on disk); give it an absolute path such as
   `/var/log/pangolin/pangolin.log` if you want a file.
-- [ ] **`log.level` — turn it down.** The archive ships `debug`. Use `info` in
-  production, `warn` on a noisy deployment.
 - [ ] **`tunnel.addr` — point it at the public address, and make UDP 9001
   reachable.** QUIC and the WebSocket/TCP fallback **share the same port
   number** — one over UDP, one over TCP. A firewall rule that opens only TCP
@@ -133,10 +206,11 @@ unchanged in production.** Change every item, each with its reason:
   node's name.
 - [ ] **Create the matching `(name, token)` row in the admin UI.** The gateway
   does **not** auto-register tunnel nodes — a handshake that finds no matching
-  row is refused. The row has to exist before the tun connects.
+  row is refused. The row has to exist before the tun connects; only then can
+  `systemctl enable --now pangolin-tun` bring it up.
 
 Additionally: `ngx.yml` and `tun.yml` hold secrets, so keep their mode at
-`0600` — the archive already does.
+`0600` — the one-line installer and the archive both do.
 
 ## Operations
 
