@@ -5,6 +5,31 @@ Working guidance for AI agents (and humans) contributing to this repo.
 See [README.md](./README.md) for the project overview and terminology, and
 [docs/](./docs/README.md) for the architecture and design detail.
 
+## Naming
+
+Six words carry the project's vocabulary. They are used consistently
+across the code, the documentation and the UI.
+
+- **Pangolin** — a running gateway: the `pangolin-ngx` process. This
+  is what an operator runs and what a fleet consists of. Lives in
+  `crates/ngx/`, `crates/pangolin-core/` and `crates/tun/`.
+- **admin** — the node's own browser interface: the operator-facing
+  UI, served on the `admin.addr` port, with a cookie session and
+  CSRF. Lives in `crates/admin/`.
+- **dashboard** — the central product that manages a fleet of
+  gateways. It is the only legitimate caller of the API. The
+  connection to it is configured on the node's `/settings` page.
+- **API** — the dashboard-facing management interface of one node: a
+  JSON API under `/api/v1/`, on its own listener, with its own
+  authentication. Lives in `crates/api/`, specified in
+  `docs/design/api.md`.
+- **tun** — the tunnel client: the `pangolin-tun` process that opens
+  the tunnel to a gateway. Lives in `crates/tun/` and in the
+  `tun` table.
+- **tunnel node** — one tun instance connected to a gateway: a row
+  of the `tun` table. Lives in `crates/pangolin-core/src/types.rs`
+  (`Tun`) and `crates/pangolin-core/src/db.rs`.
+
 ## Before every commit
 
 Run `make lint` locally before committing. CI runs the same target and

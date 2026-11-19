@@ -15,7 +15,7 @@ New to Pangolin? Start here:
 ## Configuration & operations
 
 - [Configuration](configuration.md) — `ngx.yml` / `tun.yml` field reference, env-var overrides, file lookup, real-world examples
-- [Database schema](schema.md) — the thirteen live tables, field by field, and the `tokens` table that V2 dropped
+- [Database schema](schema.md) — the live tables, field by field, and the `tokens` table that V2 dropped
 - [Database migrations](migrations.md) — how the SQLite schema is versioned and applied (refinery)
 - [Release procedure](release.md) — how a `v*` tag becomes a GitHub Release with `pangolin-ngx` / `pangolin-tun`
 - [Reload API](admin/reload-api.md) — `POST /api/reload` for refreshing the in-memory config after out-of-band DB edits
@@ -23,6 +23,7 @@ New to Pangolin? Start here:
 
 ## Design
 
+- [The management API](design/api.md) — the dashboard-facing JSON API (`/api/v1/`): the signed-request protocol, the error codes, every resource's shape and the per-resource write semantics (issue #185)
 - [Routing and the in-memory index](design/routing-and-index.md) — the wildcard-domain resolution rule, the four in-memory indexes, the reload triggers and the tunnel registration flow
 - [Tunnel](design/tunnel.md) — the tunnel as a byte splice: the two transports (QUIC + WebSocket/TCP), the CONNECT instruction, the certificate and the trust model, the fallback policy
 - [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade

@@ -170,6 +170,7 @@ If the database has fewer rows than files, those migrations are pending and will
 | V12     | `add_badbots_config` | #141 | The IP-reputation configuration (`badbots_config`): the master switch, the evidence policy and the AbuseIPDB / CrowdSec keys; the keys live in the database rather than in `ngx.yml` |
 | V13     | `drop_badbots_feed_refresh_interval` | #151 | Drops `badbots_config.feed_refresh_interval_secs` — the knob controlled when the gateway *asked* the library whether a list was due, not when a list was downloaded, so it controlled nothing the operator can act on |
 | V14     | `rewrite_removed_bot_ids` | #151 | Rewrites the per-site bot lists for crawlers the knownbots registry no longer has: deletes `google-extended` and `cloudflare-alwaysonline` (no successor), and renames `applebot-extended` to `applebot` |
+| V15     | `add_api_config` | #185 | The `api_config` singleton — the runtime state of the dashboard-facing management API: the instance id, the bearer token's SHA-256 hash, the dashboard's address and the enabled switch |
 
 ## Troubleshooting
 

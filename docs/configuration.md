@@ -132,6 +132,30 @@ without an explicit override.
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
 | `password`  | `string` | `admin`          | no       | HTTP basic auth password. **Security**: stored in plaintext in `ngx.yml`; use `NGX_ADMIN__PASSWORD` env var to avoid committing secrets. Restrict port 9081 access via firewall (`ufw` / `iptables`) if exposing to untrusted networks. |
 
+### `[api]` — the dashboard-facing management API
+
+A second bind, next to the admin UI. It serves the JSON API a central
+dashboard calls to manage this node — its own namespace
+(`/api/v1/`), its own authentication and its own router. See
+[design/api.md](design/api.md) for the protocol.
+
+| Field    | Type     | Default        | Required | Notes |
+| -------- | -------- | -------------- | -------- | ----- |
+| `listen` | `string` | `0.0.0.0:9443` | no       | Full `host:port` string for the API server. `":0"` disables the listener entirely. |
+
+**Only the listen address is configuration.** The bearer token, the
+instance id, the dashboard's address and the on/off switch live in the
+`api_config` table, so an operator changes them from the node's
+`/settings` page without restarting the gateway — see
+[schema.md](schema.md#api_config). The `NGX_API__TOKEN` environment
+variable seeds the token on the **first** boot, when the gateway has
+none of its own yet; a token configured afterwards is never
+overwritten by the environment.
+
+**Security**: the API is plaintext HTTP — the dashboard's proxy
+terminates TLS. The only mitigation on the node's side is a firewall
+that limits the port to the dashboard's address.
+
 ### `[cache]` — response cache (parsed, **not implemented**)
 
 The gateway accepts a `cache` section, but **there is no response
