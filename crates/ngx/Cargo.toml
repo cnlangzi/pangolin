@@ -23,6 +23,8 @@ integration = []
 [dependencies]
 pangolin-core = { path = "../pangolin-core" }
 admin = { path = "../admin" }
+# The dashboard-facing management API (issue #185).
+api = { path = "../api" }
 pingora = { workspace = true, features = ["openssl"] }
 pingora-core = "0.8"
 pingora-openssl = "0.8"
