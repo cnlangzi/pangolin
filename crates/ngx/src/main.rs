@@ -18,6 +18,7 @@
 //!    finishes, the pingora thread is joined, and `main` returns.
 
 mod acme;
+mod api_service;
 mod badbots_feed;
 mod dns;
 mod provider_ip;
@@ -211,6 +212,11 @@ fn main() -> anyhow::Result<()> {
             // operator can turn the check on from the dashboard, and
             // the service picks the new instance up on its next tick.
             Box::new(crate::badbots_feed::BadbotsFeedService::new()),
+            // Issue #185: the dashboard-facing management API — its
+            // own listener, its own namespace, its own authentication.
+            Box::new(crate::api_service::ApiService::new(
+                config.api.listen.clone(),
+            )),
         ];
 
         // `ServiceContext` takes ownership of the `App`; keep a

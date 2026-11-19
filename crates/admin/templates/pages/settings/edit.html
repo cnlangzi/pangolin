@@ -288,5 +288,103 @@
     </div>
   </form>
 
+  {# The dashboard API's connection settings (issue #185). A separate
+     form: the token and the switch live in the database, not in
+     `ngx.yml`, and a failure to save them must not block the other
+     cards. #}
+  <form method="POST" action="/settings/dashboard" class="card p-6 mt-6 space-y-6" data-testid="dashboard-form">
+    {% include "components/_csrf.html" %}
+
+    {% if let Some(e) = dashboard_error %}
+    <div class="alert-error text-sm" role="alert" data-testid="dashboard-error">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <span>{{ e }}</span>
+    </div>
+    {% endif %}
+
+    <div>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-1">{{ lang.t("settings.dashboard.title") }}</h2>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        {{ lang.t("settings.dashboard.intro_1") }} <code class="font-mono">/api/v1/</code> {{ lang.t("settings.dashboard.intro_2") }}
+      </p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
+        {{ lang.t("settings.dashboard.switch_1") }} <strong>{{ lang.t("settings.dashboard.switched_off") }}</strong> {{ lang.t("settings.dashboard.switch_2") }} <code class="font-mono">api.listen</code> {{ lang.t("settings.dashboard.switch_3") }} <code class="font-mono">ngx.yml</code> {{ lang.t("settings.dashboard.switch_4") }}<span class="font-mono">{{ dashboard.listen_addr }}</span>{{ lang.t("settings.dashboard.switch_5") }} <strong>{{ lang.t("settings.dashboard.database") }}</strong>{{ lang.t("settings.dashboard.switch_6") }}
+        {% if dashboard.listen_enabled %}
+        {{ lang.t("settings.dashboard.plain_1") }} <strong>{{ lang.t("settings.dashboard.plain_http") }}</strong>{{ lang.t("settings.dashboard.plain_2") }}
+        {% else %}
+        {{ lang.t("settings.dashboard.not_listening_1") }} <code class="font-mono">":0"</code> {{ lang.t("settings.dashboard.not_listening_2") }} <strong>{{ lang.t("settings.dashboard.not_listening_3") }}</strong>{{ lang.t("settings.dashboard.not_listening_4") }} <code class="font-mono">api.listen</code> {{ lang.t("settings.dashboard.not_listening_5") }} <code class="font-mono">ngx.yml</code> {{ lang.t("settings.dashboard.not_listening_6") }}
+        {% endif %}
+      </p>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-instance-id">{{ lang.t("settings.dashboard.instance_id") }}</label>
+        <input type="text" id="dashboard-instance-id" value="{{ dashboard.instance_id }}"
+          readonly spellcheck="false"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          {{ lang.t("settings.dashboard.instance_id_hint") }}
+        </p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-port">{{ lang.t("settings.dashboard.port") }}</label>
+        <input type="number" name="dashboard_port" id="dashboard-port" min="0" max="65535"
+          value="{{ dashboard.dashboard_port }}"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          {{ lang.t("settings.dashboard.port_hint") }}
+          {% if !dashboard.dashboard_ip.is_empty() %}
+          {{ lang.t("settings.dashboard.learned_address") }}
+          <span class="font-mono">{{ dashboard.dashboard_ip }}</span>.
+          {% else %}
+          {{ lang.t("settings.dashboard.learned_address_none") }}
+          {% endif %}
+        </p>
+      </div>
+    </div>
+
+    <div>
+      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
+           form always carries an explicit value. #}
+        <input type="hidden" name="dashboard_enabled" value="false">
+        <input type="checkbox" name="dashboard_enabled" value="true" {% if dashboard.enabled %}checked{% endif %}
+          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <div>
+          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">{{ lang.t("settings.dashboard.accept") }}</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            {{ lang.t("settings.dashboard.accept_hint_1") }} <code class="font-mono">403 api_disabled</code>{% if dashboard.listen_enabled %} {{ lang.t("settings.dashboard.accept_hint_2") }}{% endif %}.
+          </div>
+        </div>
+      </label>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-token">{{ lang.t("settings.dashboard.token") }}</label>
+      <input type="password" name="dashboard_token" id="dashboard-token" autocomplete="off"
+        placeholder="{% if dashboard.has_token %}{{ lang.t("settings.key_configured") }}{% else %}{{ lang.t("settings.key_not_configured") }}{% endif %}"
+        class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      <label class="flex items-center gap-2 mt-2 text-xs text-slate-500 dark:text-slate-400">
+        <input type="checkbox" name="dashboard_token_clear" value="true"
+          class="h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        {{ lang.t("settings.dashboard.remove_token") }}
+      </label>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        {{ lang.t("settings.dashboard.token_hint_1") }} <strong>{{ lang.t("settings.dashboard.write_only") }}</strong>{{ lang.t("settings.dashboard.token_hint_2") }}
+      </p>
+    </div>
+
+    <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
+      <div class="text-xs text-slate-500 dark:text-slate-400">
+        {{ lang.t("settings.dashboard.public_key_hint") }}
+      </div>
+      <div class="flex gap-2">
+        <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">Save</button>
+      </div>
+    </div>
+  </form>
+
 </main>
 {% endblock %}

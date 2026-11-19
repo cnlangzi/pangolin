@@ -9,6 +9,48 @@ for you is in [features.en-US.md](./features.en-US.md).
 
 ## Quick start
 
+### Install with a package manager
+
+Linux's recommended path — the project runs its own apt / yum repository, the packages in it are signed, and `apt upgrade` / `dnf upgrade` follows the version:
+
+```bash
+sudo apt install pangolin-ngx     # Debian / Ubuntu
+sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
+```
+
+The repository has to be added first:
+
+```bash
+# Debian / Ubuntu
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/pangolin-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] https://cnlangzi.github.io/pangolin stable main" \
+  | sudo tee /etc/apt/sources.list.d/pangolin.list
+sudo apt update
+```
+
+```ini
+# RHEL / Rocky / Alma — /etc/yum.repos.d/pangolin.repo
+[pangolin]
+name=Pangolin
+baseurl=https://cnlangzi.github.io/pangolin/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.asc
+```
+
+The installation **does not start the service** — the gateway is enabled for the next boot and started once the configuration is right:
+
+```bash
+sudo systemctl start pangolin-ngx
+```
+
+The tunnel node is a separate package (`sudo apt install pangolin-tun`); it is not even enabled, because it needs a `(name, token)` row in the gateway's admin UI before it can connect.
+
+The full procedure — the key's fingerprint, the supported distributions, upgrading, uninstalling, migrating from `/usr/local/pangolin` and the troubleshooting notes — is in [packaging.en-US.md](./packaging.en-US.md).
+
 ### Build from source
 
 Requires Rust 1.96.

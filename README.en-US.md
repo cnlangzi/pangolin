@@ -53,7 +53,39 @@ It is not another proxy that only forwards requests: before forwarding, it recog
 
 ## Running in 30 seconds
 
-One command installs the gateway (Linux x86_64 / arm64, macOS Apple Silicon / Intel):
+On Linux, install it with the package manager (the project runs its own repository, the packages are signed, `apt upgrade` follows the version):
+
+```bash
+sudo apt install pangolin-ngx     # Debian / Ubuntu
+sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
+```
+
+Add the source first (once):
+
+```bash
+# Debian / Ubuntu
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/pangolin-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] https://cnlangzi.github.io/pangolin stable main" \
+  | sudo tee /etc/apt/sources.list.d/pangolin.list
+sudo apt update
+```
+
+```ini
+# RHEL / Rocky / Alma — /etc/yum.repos.d/pangolin.repo
+[pangolin]
+name=Pangolin
+baseurl=https://cnlangzi.github.io/pangolin/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.asc
+```
+
+The service is **not started** by the installation — change the configuration, then `sudo systemctl start pangolin-ngx`. The full procedure is in [packaging.en-US.md](./docs/packaging.en-US.md).
+
+macOS has no package manager; the one-line installer covers it (and Linux without root, offline, or without the appetite for packages):
 
 ```bash
 curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh

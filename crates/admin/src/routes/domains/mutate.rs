@@ -16,7 +16,127 @@ use crate::routes::helpers::parse_form;
 use crate::templates::{DomainsEditTemplate, DomainsNewTemplate};
 use crate::{App, redirect_response};
 
+use std::collections::HashMap;
+
+use pangolin_core::types::{ChallengeKind, Domain};
+
 type Resp = Response<Full<Bytes>>;
+
+/// The parsed contents of a domain form.
+///
+/// Everything the handler needs to write the domain row.
+pub struct DomainForm {
+    pub site_name: String,
+    pub enabled: bool,
+    pub auto_issue: bool,
+    pub dns_provider: Option<String>,
+    pub challenge_kind: Option<ChallengeKind>,
+}
+
+/// Parse and validate a domain form.
+///
+/// The same parser serves the HTML form and the dashboard-facing JSON
+/// API (issue #185) — a submission the form rejects is rejected here
+/// too, with the same message.
+///
+/// * `domain` — the domain itself: from the form on create, from the
+///   path on update.
+/// * `existing` — the stored row on update, `None` on create. It
+///   decides the defaults of the fields the submission omits and
+///   whether the domain name itself has to be checked.
+/// * `dns_provider_exists` — whether a named DNS provider exists; a
+///   domain that names one that does not exist is rejected.
+pub fn parse_domain_form(
+    params: &HashMap<String, String>,
+    domain: &str,
+    existing: Option<&Domain>,
+    dns_provider_exists: &dyn Fn(&str) -> bool,
+    lang: Lang,
+) -> Result<DomainForm, String> {
+    // The domain name is required on create; on update it is the
+    // primary key and comes from the path.
+    if existing.is_none() && domain.is_empty() {
+        return Err(lang.t("domains.error.name_required").into_owned());
+    }
+    let site_name = match existing {
+        Some(e) => params
+            .get("site_name")
+            .cloned()
+            .unwrap_or_else(|| e.site_name.clone()),
+        None => params.get("site_name").cloned().unwrap_or_default(),
+    };
+    if site_name.is_empty() {
+        return Err(lang.t("domains.error.select_site").into_owned());
+    }
+    if existing.is_none() && !pangolin_core::is_valid_domain(domain) {
+        return Err(lang.t("domains.error.invalid_format").into_owned());
+    }
+    let dns_provider = params
+        .get("dns_provider")
+        .cloned()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let dns_provider = if dns_provider.is_empty() {
+        None
+    } else {
+        Some(dns_provider)
+    };
+    // Per-domain challenge kind (issue #55). The form value is one of
+    // `"auto"` (NULL — planner picks), `"http-01"`, `"dns-01"`,
+    // `"dns-persist-01"`. Anything else (empty, garbage) is treated
+    // as `"auto"` to preserve the legacy behaviour and keep the
+    // form forgiving when the dropdown is missing. The mapping
+    // is delegated to the canonical `FromStr` impl on
+    // `ChallengeKind` so a fourth variant would only need to be
+    // added in one place.
+    let challenge_kind_raw = params
+        .get("challenge_kind")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    let challenge_kind = challenge_kind_raw.parse::<ChallengeKind>().ok();
+
+    // Wildcard domains must have a DNS association (DNS-01 is the only
+    // way to validate `*.example.com`).
+    if domain.starts_with("*.") && dns_provider.is_none() {
+        return Err(lang.t("domains.error.wildcard_needs_dns").into_owned());
+    }
+    // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
+    // with http-01. Reject the combination at save time so the
+    // operator sees a clear error before the ACME server refuses.
+    // The error message MUST contain the literal "RFC 8555 §8.3" —
+    // the planner emits the same string and the admin UI test grep
+    // for it.
+    if domain.starts_with("*.") && matches!(challenge_kind, Some(ChallengeKind::Http01)) {
+        return Err(lang.t("domains.error.wildcard_http01").into_owned());
+    }
+    // If a DNS provider is referenced, verify it exists.
+    if let Some(ref name) = dns_provider
+        && !dns_provider_exists(name)
+    {
+        return Err(lang.tf("domains.error.dns_provider_missing", [("name", name)]));
+    }
+
+    // The checkboxes: present ⇒ true, absent ⇒ the stored value (or
+    // the documented default on create).
+    let enabled = params
+        .get("enabled")
+        .map(|_| true)
+        .unwrap_or_else(|| existing.map(|e| e.enabled).unwrap_or(true));
+    let auto_issue = params
+        .get("auto_issue")
+        .map(|_| true)
+        .unwrap_or_else(|| existing.map(|e| e.auto_issue).unwrap_or(false));
+
+    Ok(DomainForm {
+        site_name,
+        enabled,
+        auto_issue,
+        dns_provider,
+        challenge_kind,
+    })
+}
 
 fn ok_html(body: String) -> http::Result<Resp> {
     Ok(Response::builder()
@@ -34,135 +154,34 @@ pub async fn handle_create(
 ) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
-    let site_name = params.get("site_name").cloned().unwrap_or_default();
-    let auto_issue = params.get("auto_issue").map(|_| true).unwrap_or(false);
-    // New form renders the `enabled` checkbox pre-checked (matches the
-    // historical `enabled: true` default for new domains). Operators
-    // can uncheck it at create time to insert a paused domain.
-    let enabled = params.get("enabled").map(|_| true).unwrap_or(true);
-    let dns_provider = params
-        .get("dns_provider")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let dns_provider = if dns_provider.is_empty() {
-        None
-    } else {
-        Some(dns_provider)
-    };
-    // Per-domain challenge kind (issue #55). Form value is one of
-    // `"auto"` (NULL — planner picks), `"http-01"`, `"dns-01"`,
-    // `"dns-persist-01"`. Anything else (empty, garbage) is treated
-    // as `"auto"` to preserve the legacy behaviour and keep the
-    // form forgiving when the dropdown is missing. The mapping
-    // is delegated to the canonical `FromStr` impl on
-    // `ChallengeKind` so a fourth variant would only need to be
-    // added in one place.
-    let challenge_kind_raw = params
-        .get("challenge_kind")
-        .map(String::as_str)
-        .unwrap_or("")
-        .trim();
-    let challenge_kind = challenge_kind_raw
-        .parse::<pangolin_core::types::ChallengeKind>()
-        .ok();
-
-    if domain.is_empty() {
-        return render_create_page_with_error(
-            app,
-            &lang.t("domains.error.name_required"),
-            csrf,
-            None,
-            lang,
-        )
-        .await;
-    }
-    if site_name.is_empty() {
-        return render_create_page_with_error(
-            app,
-            &lang.t("domains.error.select_site"),
-            csrf,
-            None,
-            lang,
-        )
-        .await;
-    }
-    if !pangolin_core::is_valid_domain(&domain) {
-        return render_create_page_with_error(
-            app,
-            &lang.t("domains.error.invalid_format"),
-            csrf,
-            None,
-            lang,
-        )
-        .await;
-    }
-    // Wildcard domains must have a DNS association (DNS-01 is the only
-    // way to validate `*.example.com`).
-    if domain.starts_with("*.") && dns_provider.is_none() {
-        return render_create_page_with_error(
-            app,
-            "Wildcard domains require a DNS provider for DNS-01 validation. \
-             Add one under DNS first, then assign it to this domain.",
-            csrf,
-            None,
-            lang,
-        )
-        .await;
-    }
-    // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
-    // with http-01. Reject the combination at save time so the
-    // operator sees a clear error before the ACME server refuses.
-    // The error message MUST contain the literal "RFC 8555 §8.3" —
-    // the planner emits the same string and the admin UI test grep
-    // for it.
-    if domain.starts_with("*.")
-        && matches!(
-            challenge_kind,
-            Some(pangolin_core::types::ChallengeKind::Http01)
-        )
-    {
-        return render_create_page_with_error(
-            app,
-            "Wildcard domains cannot use the http-01 challenge (ACME \
-             servers do not offer an http-01 challenge for wildcard \
-             identifiers per RFC 8555 §8.3). Set the challenge kind \
-             to 'dns-01' or 'dns-persist-01', or pick 'auto' (the \
-             planner will resolve to dns-01 when a DNS provider is \
-             linked).",
-            csrf,
-            None,
-            lang,
-        )
-        .await;
-    }
-    // If a DNS provider is referenced, verify it exists.
-    if let Some(ref name) = dns_provider {
+    // The whole form is validated by one shared parser (issue #185):
+    // the JSON API validates through the very same function.
+    let parsed = {
         let db = app.db.lock().await;
-        let exists = pangolin_core::db::get_dns_provider(&db, name)
-            .unwrap_or(None)
-            .is_some();
-        drop(db);
-        if !exists {
-            return render_create_page_with_error(
-                app,
-                &lang.tf("domains.error.dns_provider_missing", [("name", name)]),
-                csrf,
-                None,
-                lang,
-            )
-            .await;
-        }
-    }
+        parse_domain_form(
+            &params,
+            &domain,
+            None,
+            &|name| {
+                pangolin_core::db::get_dns_provider(&db, name)
+                    .unwrap_or(None)
+                    .is_some()
+            },
+            lang,
+        )
+    };
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(msg) => return render_create_page_with_error(app, &msg, csrf, None, lang).await,
+    };
 
     let d = pangolin_core::types::Domain {
         domain,
-        site_name,
-        enabled,
-        auto_issue,
-        dns_provider,
-        challenge_kind,
+        site_name: parsed.site_name,
+        enabled: parsed.enabled,
+        auto_issue: parsed.auto_issue,
+        dns_provider: parsed.dns_provider,
+        challenge_kind: parsed.challenge_kind,
         created_at: chrono::Utc::now(),
     };
 
@@ -242,135 +261,36 @@ pub async fn handle_update(
         return Ok(crate::not_found(lang));
     };
 
-    let site_name = params
-        .get("site_name")
-        .cloned()
-        .unwrap_or_else(|| existing.site_name.clone());
-    if site_name.is_empty() {
-        return render_edit_page_with_error(
-            app,
-            &domain_pk,
-            &lang.t("domains.error.select_site"),
-            csrf,
-            &existing,
-            lang,
-        )
-        .await;
-    }
-    // Form fields:
-    //   site_name     — required, drops through to existing if missing
-    //   enabled       — checkbox: present => true, absent => false
-    //   auto_issue    — checkbox: present => true, absent => false
-    //   dns_provider  — text, empty => None
-    // The form always sends the current value of every field (the
-    // page is a fully-rendered form), so `params.get("enabled")`
-    // being absent only happens on a malformed client; we default to
-    // the existing value to be safe.
-    let enabled = params
-        .get("enabled")
-        .map(|_| true)
-        .unwrap_or(existing.enabled);
-    let auto_issue = params
-        .get("auto_issue")
-        .map(|_| true)
-        .unwrap_or(existing.auto_issue);
-    let dns_provider = params
-        .get("dns_provider")
-        .cloned()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let dns_provider = if dns_provider.is_empty() {
-        None
-    } else {
-        Some(dns_provider)
-    };
-
-    // Per-domain challenge kind (issue #55). The edit form sends the
-    // current value of the dropdown. Same parsing rules as
-    // `handle_create`: `"http-01"` / `"dns-01"` / `"dns-persist-01"`
-    // map to the matching enum variant; `"auto"` or anything else
-    // (empty, missing field) maps to `None` so the planner applies
-    // the auto default — and crucially, an operator can revert an
-    // explicit kind back to the auto default by picking "Auto" in
-    // the dropdown. The mapping is delegated to the canonical
-    // `FromStr` impl on `ChallengeKind`.
-    let challenge_kind_raw = params
-        .get("challenge_kind")
-        .map(String::as_str)
-        .unwrap_or("")
-        .trim();
-    let challenge_kind = challenge_kind_raw
-        .parse::<pangolin_core::types::ChallengeKind>()
-        .ok();
-
-    // Wildcard domains must have a DNS association (DNS-01 is the only
-    // way to validate `*.example.com`). Invariant copied from
-    // `handle_create`.
-    if domain_pk.starts_with("*.") && dns_provider.is_none() {
-        return render_edit_page_with_error(
-            app,
-            &domain_pk,
-            "Wildcard domains require a DNS provider for DNS-01 validation. \
-             Add one under DNS first, then assign it to this domain.",
-            csrf,
-            &existing,
-            lang,
-        )
-        .await;
-    }
-    // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
-    // with http-01. Mirror the save-time check from `handle_create`
-    // so the edit path refuses the same combination.
-    if domain_pk.starts_with("*.")
-        && matches!(
-            challenge_kind,
-            Some(pangolin_core::types::ChallengeKind::Http01)
-        )
-    {
-        return render_edit_page_with_error(
-            app,
-            &domain_pk,
-            "Wildcard domains cannot use the http-01 challenge (ACME \
-             servers do not offer an http-01 challenge for wildcard \
-             identifiers per RFC 8555 §8.3). Set the challenge kind \
-             to 'dns-01' or 'dns-persist-01', or pick 'auto' (the \
-             planner will resolve to dns-01 when a DNS provider is \
-             linked).",
-            csrf,
-            &existing,
-            lang,
-        )
-        .await;
-    }
-    // If a DNS provider is referenced, verify it exists. Invariant
-    // copied from `handle_create`.
-    if let Some(ref name) = dns_provider {
+    // The whole form is validated by one shared parser (issue #185):
+    // the JSON API validates through the very same function.
+    let parsed = {
         let db = app.db.lock().await;
-        let exists = pangolin_core::db::get_dns_provider(&db, name)
-            .unwrap_or(None)
-            .is_some();
-        drop(db);
-        if !exists {
-            return render_edit_page_with_error(
-                app,
-                &domain_pk,
-                &lang.tf("domains.error.dns_provider_missing", [("name", name)]),
-                csrf,
-                &existing,
-                lang,
-            )
-            .await;
+        parse_domain_form(
+            &params,
+            &domain_pk,
+            Some(&existing),
+            &|name| {
+                pangolin_core::db::get_dns_provider(&db, name)
+                    .unwrap_or(None)
+                    .is_some()
+            },
+            lang,
+        )
+    };
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(msg) => {
+            return render_edit_page_with_error(app, &domain_pk, &msg, csrf, &existing, lang).await;
         }
-    }
+    };
 
     let updated = pangolin_core::types::Domain {
         domain: existing.domain.clone(),
-        site_name,
-        enabled,
-        auto_issue,
-        dns_provider,
-        challenge_kind,
+        site_name: parsed.site_name,
+        enabled: parsed.enabled,
+        auto_issue: parsed.auto_issue,
+        dns_provider: parsed.dns_provider,
+        challenge_kind: parsed.challenge_kind,
         // PK and created_at are immutable; preserve them.
         created_at: existing.created_at,
     };

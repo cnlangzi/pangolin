@@ -1,0 +1,36 @@
+# pangolin-tun configuration — installed by the pangolin-tun package.
+#
+# This file is a dpkg/rpm *conffile* (`config|noreplace`): your edits
+# survive an upgrade untouched, and the package never overwrites them.
+#
+# It is NOT the repository's development `tun.yml`: this one carries
+# the absolute paths the packaged service runs with.
+#
+# ⚠  Before you start this tunnel node:
+#
+#   * `token` — empty means the service refuses to start
+#     (`token must not be empty`). It must be the *same* token as the
+#     `(name, token)` row you created in the gateway's admin UI
+#     (Tunnels page, or `POST /api/tun`). The gateway does NOT
+#     auto-register a tunnel node: a node whose row is missing is
+#     rejected at the handshake and the unit restart-loops.
+#   * `server` — the gateway's `tunnel.addr`, not its proxy port.
+#   * `name` — this node's name. It must match `^[a-z0-9_-]+$`, be at
+#     most 32 characters and must not be purely numeric.
+#
+# `pin_path` and `quic_failure_path` are the trust-on-first-use pin
+# file and the record of the last failed QUIC attempt. They are
+# optional: without them the paths are derived from this file's own
+# location, which would be `/etc/pangolin/` — a directory the service
+# user cannot write to. The packaged service therefore names them
+# explicitly, under `/var/lib/pangolin-tun/`.
+#
+# The full field reference is
+# https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
+
+server: 127.0.0.1:9001
+token: ""
+name: local
+transport: auto
+pin_path: /var/lib/pangolin-tun/tun.pins
+quic_failure_path: /var/lib/pangolin-tun/tun.quic-fail

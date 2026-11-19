@@ -14,7 +14,71 @@ use super::pages::{render_create_page_with_error, render_edit_page_with_error};
 use crate::i18n::Lang;
 use crate::routes::helpers::{bad_request_page, parse_form};
 
+use std::collections::HashMap;
+
 type Resp = Response<Full<Bytes>>;
+
+/// The parsed contents of a tun form.
+pub struct TunForm {
+    pub name: String,
+    /// The token the submission carries, if any. `None` means "keep
+    /// the stored token" on update and "generate one" on create.
+    pub token: Option<String>,
+    pub enabled: bool,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parse and validate a tun form.
+///
+/// The same parser serves the HTML form and the dashboard-facing JSON
+/// API (issue #185) — a submission the form rejects is rejected here
+/// too, with the same message.
+///
+/// * `name` — the tun's name: from the form on create, from the path
+///   on update.
+/// * `existing` — the stored row on update, `None` on create. It
+///   supplies the defaults of the fields the submission omits.
+pub fn parse_tun_form(
+    params: &HashMap<String, String>,
+    name: &str,
+    existing: Option<&Tun>,
+    lang: Lang,
+) -> Result<TunForm, String> {
+    // The name is the primary key, so it is only checked when the row
+    // is created — an edit cannot change it.
+    if existing.is_none() {
+        if name.is_empty() {
+            return Err(lang.t("tunnels.error.name_required").into_owned());
+        }
+        if name.len() > 64 {
+            return Err(lang.t("tunnels.error.name_too_long").into_owned());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(lang.t("tunnels.error.name_charset").into_owned());
+        }
+    }
+
+    let token = params.get("token").cloned().filter(|t| !t.is_empty());
+    let enabled = params
+        .get("enabled")
+        .map(|v| v == "1")
+        .unwrap_or_else(|| existing.map(|t| t.enabled).unwrap_or(true));
+    let expires_at = match params.get("expires_at") {
+        Some(raw) if raw.is_empty() => None,
+        Some(raw) => parse_datetime(Some(raw.as_str())),
+        None => existing.and_then(|t| t.expires_at),
+    };
+
+    Ok(TunForm {
+        name: name.to_string(),
+        token,
+        enabled,
+        expires_at,
+    })
+}
 
 pub async fn handle_create(
     app: &Arc<App>,
@@ -25,51 +89,25 @@ pub async fn handle_create(
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
 
-    if name.is_empty() {
-        return render_create_page_with_error(
-            None,
-            &lang.t("tunnels.error.name_required"),
-            csrf,
-            lang,
-        );
-    }
-    if name.len() > 64 {
-        return render_create_page_with_error(
-            None,
-            &lang.t("tunnels.error.name_too_long"),
-            csrf,
-            lang,
-        );
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-')
-    {
-        return render_create_page_with_error(
-            None,
-            &lang.t("tunnels.error.name_charset"),
-            csrf,
-            lang,
-        );
-    }
+    let parsed = match parse_tun_form(&params, &name, None, lang) {
+        Ok(p) => p,
+        Err(e) => return render_create_page_with_error(None, &e, csrf, lang),
+    };
 
-    let token = params
-        .get("token")
-        .cloned()
-        .filter(|t| !t.is_empty())
-        .map(Ok)
-        .unwrap_or_else(generate_token);
-
-    let token = match token {
-        Ok(t) => t,
-        Err(e) => {
-            return render_create_page_with_error(
-                None,
-                &format!("Token generation error: {}", e),
-                csrf,
-                lang,
-            );
-        }
+    // A submission without a token gets a fresh one.
+    let token = match parsed.token {
+        Some(t) => t,
+        None => match generate_token() {
+            Ok(t) => t,
+            Err(e) => {
+                return render_create_page_with_error(
+                    None,
+                    &format!("Token generation error: {}", e),
+                    csrf,
+                    lang,
+                );
+            }
+        },
     };
 
     {
@@ -88,18 +126,15 @@ pub async fn handle_create(
         }
     }
 
-    let enabled = params.get("enabled").map(|v| v == "1").unwrap_or(true);
-    let expires_at = parse_datetime(params.get("expires_at").cloned().as_deref());
-
     let tun = Tun {
-        name: name.clone(),
+        name: parsed.name,
         token: Some(token),
         token_hash: None,
-        enabled,
+        enabled: parsed.enabled,
         online: false,
         registered_at: None,
         last_seen_at: None,
-        expires_at,
+        expires_at: parsed.expires_at,
     };
 
     let db = app.db.lock().await;
@@ -143,22 +178,20 @@ pub async fn handle_update(
         return render_edit_page_with_error(&name, &lang.t("tunnels.error.not_found"), csrf, lang);
     };
 
-    if let Some(new_token) = params.get("token").cloned().filter(|t| !t.is_empty()) {
+    let parsed = match parse_tun_form(&params, &name, Some(&tun), lang) {
+        Ok(p) => p,
+        Err(e) => return render_edit_page_with_error(&name, &e, csrf, lang),
+    };
+
+    if let Some(new_token) = parsed.token {
         tun.token = Some(new_token);
+        // The stored digest belongs to the *old* token: `upsert_tun`
+        // prefers it over the cleartext one, so it has to be dropped
+        // for the rotation to take effect.
+        tun.token_hash = None;
     }
-
-    if let Some(raw) = params.get("expires_at").cloned() {
-        if raw.is_empty() {
-            tun.expires_at = None;
-        } else {
-            tun.expires_at = parse_datetime(Some(raw.as_str()));
-        }
-    }
-
-    tun.enabled = params
-        .get("enabled")
-        .map(|v| v == "1")
-        .unwrap_or(tun.enabled);
+    tun.expires_at = parsed.expires_at;
+    tun.enabled = parsed.enabled;
 
     let db = app.db.lock().await;
     let result = pangolin_core::db::upsert_tun(&db, &tun);

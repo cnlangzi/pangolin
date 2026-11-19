@@ -64,9 +64,23 @@ jobs:
   # ----------------------------------------------------------------
   build:
     name: Build (release compile)
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, not ubuntu-latest: the packaging job below
+    # installs the binaries this job produces on debian:12 (glibc
+    # 2.36) and rockylinux:9 (glibc 2.34), and a binary compiled on
+    # ubuntu-latest (24.04, glibc 2.39) records a glibc floor those
+    # machines do not meet — the package would be refused by its own
+    # dependency.  The release workflow builds on the same image for
+    # the same reason; see docs/release.md.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        # libz-ng-sys compiles C through cmake, openssl-sys is cgo
+        # and needs the OpenSSL headers pkg-config points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -80,12 +94,157 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # The runner label is part of the key: `runner.os` is
+          # `Linux` for every ubuntu image, so a `target/` tree built
+          # on ubuntu-latest would otherwise be restored here — and
+          # the binaries in it would carry the wrong glibc floor.
+          key: ${{ runner.os }}-${{ runner.runs-on }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-1.96-
+            ${{ runner.os }}-${{ runner.runs-on }}-cargo-1.96-
 
       - name: make build
         run: make build
+
+      - name: Upload the binaries
+        # The packaging job below packages these two binaries; the
+        # artifact is the only thing that crosses between the two
+        # jobs.
+        uses: actions/upload-artifact@v6
+        with:
+          name: pangolin-linux-amd64
+          path: |
+            bin/pangolin-ngx
+            bin/pangolin-tun
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Packaging: the packages have to install
+  #
+  # The unit tests check that the *description* of the packages is
+  # right — the file list, the configuration template, the systemd
+  # unit.  This job checks that the packages themselves work: the
+  # repository is built, served over `file://`, and installed on the
+  # two distribution families the packages target.
+  #
+  # The signing key is a throwaway one.  A pull request cannot reach
+  # the archive key — and must not be able to — and the point of the
+  # job is that a *signed* repository installs, not that the archive
+  # key is exercised.
+  # ----------------------------------------------------------------
+  packaging:
+    name: Packaging (apt + rpm)
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 20
+    env:
+      GNUPGHOME: ${{ github.workspace }}/.gnupg
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install the packaging tools
+        # binutils for `objdump`, dpkg-dev for `dpkg-scanpackages`,
+        # createrepo-c for the rpm metadata, rpm for the signatures.
+        # gnupg2 for the `gpg2` binary rpm's gpg macro points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils dpkg-dev createrepo-c rpm gnupg2
+
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.49.0
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pangolin-linux-amd64
+          path: dist
+
+      - name: Build the packages
+        run: |
+          set -euo pipefail
+          # The artifact holds the two binaries themselves, so the
+          # download directory *is* the binary directory.
+          ls -l dist
+          # The workspace version is the placeholder the release
+          # workflow overwrites with the tag's; it is what the
+          # binaries report here.
+          version="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
+          # `VERSION`, in upper case: the next steps read `$VERSION`,
+          # and an environment variable's name is case-sensitive.
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          sh packaging/build-packages.sh \
+            --tag-version "$version" \
+            --arch amd64 \
+            --bin-dir dist \
+            --out-dir dist/packages
+
+      - name: Build and sign the repository
+        run: |
+          set -euo pipefail
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --passphrase '' --quick-generate-key \
+            "Pangolin CI <ci@pangolin.invalid>" rsa2048 sign never
+          # The site carries the key the client trusts.  This
+          # repository is signed with the throwaway key — a pull
+          # request cannot reach the archive key — so the site has to
+          # carry *that* one instead.
+          gpg --armor --export > ci-key.asc
+          sh packaging/publish-repo.sh \
+            --site site \
+            --deb-dir dist/packages \
+            --rpm-dir dist/packages \
+            --version "$VERSION" \
+            --key ci-key.asc \
+            --sign
+
+      - name: Install from the apt repository (debian:12)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/site:/srv:ro" -e EXPECTED_VERSION="v$VERSION" debian:12 bash -c '
+            set -eux
+            apt-get update
+            apt-get install -y --no-install-recommends ca-certificates
+            install -d -m 0755 /etc/apt/keyrings
+            cp /srv/pangolin-archive-keyring.gpg /etc/apt/keyrings/pangolin-archive-keyring.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] file:/srv stable main" > /etc/apt/sources.list.d/pangolin.list
+            apt-get update
+            apt-get install -y pangolin-ngx
+            dpkg -L pangolin-ngx
+            test -f /etc/pangolin/ngx.yml
+            test -f /usr/bin/pangolin-ngx
+            grep -q "^/etc/pangolin/ngx.yml$" /var/lib/dpkg/info/pangolin-ngx.conffiles
+            test -L /etc/systemd/system/multi-user.target.wants/pangolin-ngx.service
+            test ! -e /etc/systemd/system/multi-user.target.wants/pangolin-tun.service
+            /usr/bin/pangolin-ngx --version | grep -q "$EXPECTED_VERSION"
+          '
+
+      - name: Install from the rpm repository (rockylinux:9)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/site:/srv:ro" -e EXPECTED_VERSION="v$VERSION" rockylinux:9 bash -c '
+            set -eux
+            rpm --import /srv/pangolin-archive-keyring.asc
+            printf "[pangolin]\nname=Pangolin\nbaseurl=file:///srv/rpm\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=file:///srv/pangolin-archive-keyring.asc\n" > /etc/yum.repos.d/pangolin.repo
+            dnf install -y pangolin-ngx
+            rpm -q pangolin-ngx
+            # `rpm -K` checks the signature of a *package file*, not of
+            # an installed package name — handed the name, it looks
+            # for a file called "pangolin-ngx" and reports "open
+            # failed".  The file is the one in the repository the
+            # package was installed from.
+            rpm -Kv /srv/rpm/pangolin-ngx-*.rpm
+            test -f /etc/pangolin/ngx.yml
+            /usr/bin/pangolin-ngx --version | grep -q "$EXPECTED_VERSION"
+          '
 
   # ----------------------------------------------------------------
   # Cross-platform compile smoke: macOS (ngx + tun) and Windows

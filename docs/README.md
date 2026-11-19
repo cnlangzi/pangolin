@@ -6,7 +6,8 @@ Reference docs for Pangolin, a Rust reverse-proxy with WebSocket tunnel support.
 
 New to Pangolin? Start here:
 
-- **[安装与上线](getting-started.md)** ([English](getting-started.en-US.md)) — the two installation paths, the go-live checklist, where the configuration files live and how the logs are written
+- **[安装与上线](getting-started.md)** ([English](getting-started.en-US.md)) — the three installation paths, the go-live checklist, where the configuration files live and how the logs are written
+- **[用包管理器安装](packaging.md)** ([English](packaging.en-US.md)) — the apt / yum repository: the client configuration, the key's fingerprint, the supported distributions, upgrading, uninstalling and migrating from `/usr/local/pangolin`
 - **[功能详解](features.md)** ([English](features.en-US.md)) — the glossary, the `backend` field format and the seven things the gateway does that a plain reverse proxy does not, with what each of them looks like in the admin UI
 - **[与 nginx 和 Cloudflare 的对比](comparison.md)** ([English](comparison.en-US.md)) — the capability matrix with a citation and a checked date on every row, plus the honest differences
 - **Local dev setup** → [Configuration: Example A](configuration.md#a-local-development-no-tls-no-acme-no-dns) — run `make start-ngx` and `make start-tun` on your laptop
@@ -15,14 +16,15 @@ New to Pangolin? Start here:
 ## Configuration & operations
 
 - [Configuration](configuration.md) — `ngx.yml` / `tun.yml` field reference, env-var overrides, file lookup, real-world examples
-- [Database schema](schema.md) — the thirteen live tables, field by field, and the `tokens` table that V2 dropped
+- [Database schema](schema.md) — the live tables, field by field, and the `tokens` table that V2 dropped
 - [Database migrations](migrations.md) — how the SQLite schema is versioned and applied (refinery)
-- [Release procedure](release.md) — how a `v*` tag becomes a GitHub Release with `pangolin-ngx` / `pangolin-tun`
+- [Release procedure](release.md) — how a `v*` tag becomes a GitHub Release with `pangolin-ngx` / `pangolin-tun`, and how the deb / rpm packages and the apt / rpm repository are published
 - [Reload API](admin/reload-api.md) — `POST /api/reload` for refreshing the in-memory config after out-of-band DB edits
 - [Admin UI templates](admin/template-guide.md) — how to write the admin UI's Askama templates
 
 ## Design
 
+- [The management API](design/api.md) — the dashboard-facing JSON API (`/api/v1/`): the signed-request protocol, the error codes, every resource's shape and the per-resource write semantics (issue #185)
 - [Routing and the in-memory index](design/routing-and-index.md) — the wildcard-domain resolution rule, the four in-memory indexes, the reload triggers and the tunnel registration flow
 - [Tunnel](design/tunnel.md) — the tunnel as a byte splice: the two transports (QUIC + WebSocket/TCP), the CONNECT instruction, the certificate and the trust model, the fallback policy
 - [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade

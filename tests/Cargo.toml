@@ -13,6 +13,9 @@ path = "src/lib.rs"
 pangolin-core = { path = "../crates/pangolin-core" }
 ngx = { path = "../crates/ngx" }
 tun = { path = "../crates/tun" }
+# The dashboard-facing management API (issue #185). The suite signs
+# with it and drives the server it starts.
+api = { path = "../crates/api" }
 # The tunnel's wire protocol (issue #159) — the suite drives the
 # published crate's codecs, not an in-tree copy.
 pangolin-tun.workspace = true
@@ -43,11 +46,14 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
+hex.workspace = true
 # Signal delivery to the spawned `pangolin-ngx` child — used by the
 # SSE-shutdown-latency e2e test to send SIGINT (not SIGKILL, which
 # `Child::start_kill` provides) so the test can observe the
 # graceful-shutdown path.
 libc = "0.2"
+# The shutdown token the API's listener observes.
+tokio-util.workspace = true
 
 # WebSocket (for Sec-WebSocket-Accept in tests + client side of ws/wss e2e)
 sha1 = "0.10"
@@ -72,3 +78,17 @@ integration = []
 # same `toml` release, or the tree grows a second copy of the crate.
 [dev-dependencies]
 toml = "0.8"
+
+# The packaging regression tests (issue #176) parse the rendered nfpm
+# configuration, which is YAML.  `serde_yaml` is already in the lock
+# file through figment's "yaml" feature, so this adds a dependency
+# edge and not a second copy of the crate.
+serde_yaml = { workspace = true }
+
+# The same tests parse the packaged configuration templates with the
+# *real* parsers.  The parsers themselves (`Config::from_str` /
+# `TunConfig::from_str`) live in the crates that own them, where the
+# environment can be sandboxed; here the YAML layer is merged
+# directly, so the environment — which is process-wide — cannot
+# decide what the test sees.
+figment = { workspace = true }

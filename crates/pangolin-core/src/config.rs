@@ -61,6 +61,15 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    /// The dashboard-facing management API (issue #185).
+    ///
+    /// A **separate** listener from the admin UI: the API has its own
+    /// namespace (`/api/v1/`) and its own authentication (a bearer
+    /// token, a timestamp, a nonce and an Ed25519 signature), and it
+    /// never renders HTML. The admin UI keeps its browser-session auth
+    /// on its own port.
+    #[serde(default)]
+    pub api: ApiConfig,
     /// Parsed, but **not implemented** — the gateway never reads it.
     ///
     /// There is no response cache in the gateway. A configuration
@@ -109,11 +118,13 @@ impl Default for AddrConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelConfig {
     /// Full listen address (`host:port`) for the tun WebSocket
-    /// endpoint. Default `127.0.0.1:9001` — accept only local tun
-    /// clients; safe for dev or SSH-tunneled production use. Set to
-    /// `0.0.0.0:9001` (or a specific interface IP) when tun runs on
-    /// a separate host. This is also the address `tun.yml: server:`
-    /// must point at from the tun client side.
+    /// endpoint. Default `0.0.0.0:9001` — the endpoint accepts tun
+    /// clients on every interface, which is what a deployment with
+    /// the tunnel nodes on separate hosts needs. Narrow it to
+    /// `127.0.0.1:9001` when the tunnel clients are on the same host
+    /// (or reach the gateway over an SSH tunnel). This is also the
+    /// address `tun.yml: server:` must point at from the tun client
+    /// side.
     #[serde(default = "default_tunnel_addr")]
     pub addr: String,
     /// WebSocket endpoint path (e.g. `/tunnel`).
@@ -168,6 +179,7 @@ impl Default for Config {
             workers: None,
             tunnel: TunnelConfig::default(),
             admin: AdminConfig::default(),
+            api: ApiConfig::default(),
             cache: CacheConfig::default(),
             acme: AcmeConfig::default(),
             tls: TlsConfig::default(),
@@ -208,6 +220,40 @@ impl Default for AdminConfig {
             addr: default_admin_addr(),
             username: "admin".into(),
             password: "admin".into(),
+        }
+    }
+}
+
+/// The dashboard-facing management API (issue #185).
+///
+/// The API is a **second, parallel** management surface next to the
+/// admin UI — it gets its own listener, its own `/api/v1/`
+/// namespace and its own authentication, so a central dashboard never
+/// has to speak the admin UI's browser-session dialect.
+///
+/// Only the listen address lives here. Everything else about the
+/// dashboard connection — the bearer token, the instance id, the
+/// dashboard's address — is **runtime state** in the `api_config`
+/// table, so an operator can rotate the token from the admin UI
+/// without restarting the gateway. See `db::ApiConfigRow`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Full listen address (`host:port`) for the management API.
+    /// Default `0.0.0.0:9443` — every interface, because each node
+    /// is managed remotely by the central dashboard. Set it to `":0"`
+    /// to not listen at all.
+    #[serde(default = "default_api_listen")]
+    pub listen: String,
+}
+
+fn default_api_listen() -> String {
+    "0.0.0.0:9443".into()
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_api_listen(),
         }
     }
 }
@@ -774,6 +820,48 @@ mod tests {
         });
     }
 
+    /// The configuration template the `pangolin-ngx` package installs
+    /// has to parse with the real loader.
+    ///
+    /// The package ships this file as a conffile, and the service
+    /// reads it at startup: a template the loader rejects is a package
+    /// that installs a configuration the gateway cannot read, and the
+    /// failure surfaces on the operator's machine at the first start.
+    ///
+    /// The paths are absolute on purpose — a relative path follows the
+    /// service's working directory (`/var/lib/pangolin`) instead of
+    /// meaning what it says.
+    #[test]
+    fn the_packaged_config_template_parses_with_the_real_loader() {
+        let template = include_str!("../../../packaging/config/ngx.yml");
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str(template).expect("the packaged ngx.yml must parse");
+
+            assert_eq!(c.addr.http, "0.0.0.0:80");
+            assert_eq!(c.addr.https, "0.0.0.0:443");
+            assert_eq!(c.acme.cert_dir, "/var/lib/pangolin/certs");
+            assert_eq!(
+                c.acme.acme_directory,
+                "https://acme-v02.api.letsencrypt.org/directory"
+            );
+            assert_eq!(c.acme.renew_threshold_days, 14);
+            assert_eq!(c.acme.renew_check_interval_hours, 6);
+            assert_eq!(c.acme.key_type, "ecdsa");
+            assert_eq!(c.log.bot.dir, PathBuf::from("/var/log/pangolin/bots"));
+            assert_eq!(
+                c.log.bot.cache_dir,
+                PathBuf::from("/var/cache/pangolin/bots")
+            );
+            assert_eq!(
+                c.log.referer.dir,
+                PathBuf::from("/var/log/pangolin/referers")
+            );
+            Ok(())
+        });
+    }
+
     #[test]
     fn retired_bot_enabled_key_still_parses() {
         // Issue #117: the bot log is always on, so `log.bot.enabled`
@@ -936,7 +1024,13 @@ mod tests {
     fn the_shipped_example_config_carries_the_listen_addresses() {
         let document = shipped_ngx_document();
 
-        for key in ["addr.http", "addr.https", "tunnel.addr", "admin.addr"] {
+        for key in [
+            "addr.http",
+            "addr.https",
+            "tunnel.addr",
+            "admin.addr",
+            "api.listen",
+        ] {
             assert!(
                 document.find_value(key).is_ok(),
                 "ngx.yml must carry `{key}` — it is the first knob an operator changes"
@@ -948,6 +1042,27 @@ mod tests {
         assert_eq!(c.addr.https, Config::default().addr.https);
         assert_eq!(c.tunnel.addr, Config::default().tunnel.addr);
         assert_eq!(c.admin.addr, Config::default().admin.addr);
+        assert_eq!(c.api.listen, Config::default().api.listen);
+    }
+
+    /// The API's listen address is the only key the section has, and
+    /// `":0"` — the way the other listeners are switched off — parses
+    /// like any other address.
+    #[test]
+    fn the_api_listen_address_parses_and_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.api.listen, "0.0.0.0:9443");
+            Ok(())
+        });
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("api:\n  listen: \":0\"\n").unwrap();
+            assert_eq!(c.api.listen, ":0");
+            Ok(())
+        });
     }
 
     #[test]

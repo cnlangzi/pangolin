@@ -152,6 +152,26 @@ jobs:
           fi
           echo "tagged commit $(git rev-parse --short HEAD) is on main"
 
+      - name: Assert the dashboard key is not the development placeholder
+        # The dashboard's Ed25519 public key is compiled into the
+        # binary (issue #185). The repository ships a DEVELOPMENT
+        # placeholder whose private half lives in
+        # `tests/fixtures/` — the end-to-end suite needs it to sign a
+        # request — so it must never reach a release.
+        #
+        # The other build jobs compile the same source, so this one
+        # check is enough to stop the whole release.
+        run: |
+          set -euo pipefail
+          key_file=crates/api/src/dashboard.pub
+          placeholder=439a24963d8250a37a685231546de534176238a9b43e7e1ce23c48d01b3795ea
+          key=$(grep -v '^[[:space:]]*#' "$key_file" | tr -d '[:space:]')
+          if [[ "$key" == "$placeholder" ]]; then
+            echo "::error::$key_file still holds the development key — replace it (and tests/fixtures/dashboard_dev_seed.hex) with the production key pair before tagging"
+            exit 1
+          fi
+          echo "the dashboard key is not the development placeholder"
+
       - name: Set the workspace version from the tag
         # The tag is the single source of truth for the release
         # version. The repository carries the placeholder 0.0.0 in
@@ -919,16 +939,118 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------
+  # Package: turn the Linux binaries into deb / rpm packages
+  #
+  # One job per architecture, on the *native* runner of that
+  # architecture.  The native runner is not an accident: the glibc
+  # floor of the package is measured with `objdump -T`, and Ubuntu's
+  # binutils only knows the architecture it was built for — objdump
+  # on an arm64 binary on an amd64 runner says "File format not
+  # recognized", and the floor would have to be guessed.  Guessing it
+  # wrong keeps the package off a host that could run it, or lets it
+  # onto a host that cannot.
+  #
+  # The job has read-only permissions: it runs third-party code (the
+  # nfpm binary) and must not be able to push anything.
+  # ----------------------------------------------------------------
+  package:
+    name: Package (${{ matrix.target }})
+    # The binaries come out of the `build` job's artifact; the
+    # download below only sees artifacts of *completed* jobs.
+    needs: [build]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux/amd64
+            slug: linux-amd64
+            runs-on: ubuntu-22.04
+            arch: amd64
+            rpm-arch: x86_64
+            nfpm-platform: x86_64
+          - target: linux/arm64
+            slug: linux-arm64
+            runs-on: ubuntu-22.04-arm
+            arch: arm64
+            rpm-arch: aarch64
+            nfpm-platform: arm64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install the packaging tools
+        # binutils for `objdump`, which reads the glibc symbol
+        # versions out of the binary.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils
+
+      - name: Install nfpm
+        # The version is pinned: the package layout, the conffile
+        # handling and the dependency syntax all come from nfpm's
+        # schema, and an unpinned tool would change the artefacts
+        # without anybody noticing.
+        env:
+          NFPM_VERSION: 2.49.0
+          NFPM_PLATFORM: ${{ matrix.nfpm-platform }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NFPM_PLATFORM}.tar.gz"
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pangolin-${{ matrix.slug }}
+          path: dist
+
+      - name: Unpack the release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          tar -xzf dist/pangolin_*.tar.gz -C bin
+          ls -l bin
+
+      - name: Build the packages
+        # The tag is the version — the same rule the release job
+        # follows.  `build-packages.sh` turns `v1.2.3-rc1` into the
+        # package version `1.2.3~rc1-1`, which sorts *before* the
+        # release it precedes.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sh packaging/build-packages.sh \
+            --tag-version "${TAG#v}" \
+            --arch "${{ matrix.arch }}" \
+            --rpm-arch "${{ matrix.rpm-arch }}" \
+            --bin-dir bin \
+            --out-dir dist/packages
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: pangolin-packages-${{ matrix.slug }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
   # Release: publish the archives + checksums to the GitHub Release
   # of the pushed tag. No tests run here — the operator tags a commit
   # whose CI run on `main` was already green.
   # ----------------------------------------------------------------
   release:
     name: Publish GitHub Release
-    # All three build jobs. A failed platform fails its `needs` entry,
-    # so this job never runs — a tag can never publish a release that
-    # silently misses a platform.
-    needs: [build, build-mac, build-tun]
+    # All three build jobs plus the packaging job. A failed platform
+    # fails its `needs` entry, so this job never runs — a tag can
+    # never publish a release that silently misses a platform.
+    needs: [build, build-mac, build-tun, package]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Only this job publishes, so only this job needs to write.
@@ -970,7 +1092,8 @@ jobs:
           # relative, so `sha256sum -c SHA256SUMS.txt` works from the
           # directory holding the archives.
           sha256sum pangolin_*.tar.gz pangolin_*.zip \
-            install.sh pangolin-ngx.service pangolin-tun.service > SHA256SUMS.txt
+            install.sh pangolin-ngx.service pangolin-tun.service \
+            *.deb *.rpm > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish release
@@ -982,7 +1105,131 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/install.sh
             dist/pangolin-ngx.service
             dist/pangolin-tun.service
             dist/SHA256SUMS.txt
+
+  # ----------------------------------------------------------------
+  # Deploy-repo: publish the apt / rpm repository
+  #
+  # The site tree lives on the `gh-pages` branch, which GitHub Pages
+  # serves ("Deploy from a branch" → `gh-pages` → root).  The branch
+  # is a *generated artefact*: every release replaces the whole tree,
+  # so a hand-made commit on it is overwritten by the next release.
+  #
+  # This is the only job that holds the archive key.  The key is
+  # imported here, used to sign the repository metadata, and gone
+  # again when the job ends.  It is a separate job from the release
+  # on purpose: a failed branch push turns this tag's CI red and can
+  # be re-run on its own, without marking the Release that already
+  # succeeded as failed.
+  # ----------------------------------------------------------------
+  deploy-repo:
+    name: Publish the package repository
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # Two releases must not push the branch at the same time: the
+    # second one would overwrite the first one's tree halfway
+    # through.  `cancel-in-progress: false` keeps a push that is
+    # already running from being cancelled.
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    env:
+      GNUPGHOME: ${{ github.workspace }}/.gnupg
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history: the branch is pushed from here, and the
+          # push is guarded by `--force-with-lease`, which compares
+          # the remote against what the fetch saw.
+          #
+          # The credentials stay in the git config — this job pushes
+          # the branch, and `persist-credentials: false` would leave
+          # `git push` with no way to authenticate.  The token is
+          # already least-privilege (`contents: write`, and nothing
+          # else), and the job runs the repository's own scripts.
+          fetch-depth: 0
+
+      - name: Install the repository tools
+        # dpkg-dev for `dpkg-scanpackages`, createrepo-c for the rpm
+        # metadata, rpm for the package signatures, gnupg2 for the
+        # `gpg2` binary rpm's gpg macro points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev createrepo-c rpm gnupg2
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Import the archive signing key
+        env:
+          PANGOLIN_REPO_SIGNING_KEY: ${{ secrets.PANGOLIN_REPO_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          # The secret holds the armored private key, base64-encoded
+          # so that it survives the secret store's line handling.
+          printf '%s' "$PANGOLIN_REPO_SIGNING_KEY" | base64 -d > "$GNUPGHOME/archive-key.asc"
+          gpg --batch --import "$GNUPGHOME/archive-key.asc"
+          # The imported copy is removed again: the keyring keeps the
+          # key, and the file on disk would be a second copy of the
+          # private key.
+          rm -f "$GNUPGHOME/archive-key.asc"
+          gpg --list-secret-keys
+
+      - name: Build and sign the repository
+        env:
+          PANGOLIN_SIGNING_PASSPHRASE: ${{ secrets.PANGOLIN_REPO_SIGNING_PASSPHRASE }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sh packaging/publish-repo.sh \
+            --site site \
+            --deb-dir dist \
+            --rpm-dir dist \
+            --version "${TAG#v}" \
+            --sign
+
+      - name: Replace the site tree and push it
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # The branch holds the *previous* site tree; it is replaced
+          # wholesale, not merged into.  The history keeps the older
+          # trees, and the release assets keep the older packages.
+          branch_exists=0
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git checkout -B gh-pages origin/gh-pages
+            branch_exists=1
+          else
+            git checkout --orphan gh-pages
+          fi
+
+          # Everything but `.git` goes: the tree is the generated
+          # site, not the repository.
+          find . -mindepth 1 -maxdepth 1 -not -name .git -not -name site -exec rm -rf {} +
+          cp -a site/. .
+          rm -rf site
+
+          git add -A -f
+          git commit -m "chore(release): publish the package repository for ${GITHUB_REF_NAME}"
+          if [ "$branch_exists" -eq 1 ]; then
+            # `--force-with-lease` refuses the push when somebody else
+            # pushed to the branch in the meantime.
+            git push --force-with-lease origin HEAD:gh-pages
+          else
+            git push origin HEAD:gh-pages
+          fi

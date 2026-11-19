@@ -75,6 +75,17 @@ mod badbots_migrations;
 #[cfg(all(test, unix))]
 mod install_script;
 
+// Packaging regression tests (the deb/rpm packages and the apt/rpm
+// repository, issue #176).  Like the installer tests above, these
+// need neither the `integration` feature nor a real binary: they
+// parse the packaged configuration templates with the real loaders,
+// drive the nfpm renderer, and assert on the release workflow and
+// the repository metadata script.
+//
+// Unix-only: the renderer is a POSIX shell script.
+#[cfg(all(test, unix))]
+mod packaging;
+
 #[cfg(feature = "integration")]
 mod backend;
 
@@ -86,6 +97,15 @@ mod proxy_tunnel;
 
 #[cfg(feature = "integration")]
 mod admin_api;
+
+// The dashboard-facing management API (issue #185). `management_api`
+// drives the server in process over a real port; `api_e2e` drives the
+// real binary.
+#[cfg(feature = "integration")]
+mod management_api;
+
+#[cfg(feature = "integration")]
+mod api_e2e;
 
 #[cfg(feature = "integration")]
 mod admin_reload;

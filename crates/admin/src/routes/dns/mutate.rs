@@ -19,7 +19,57 @@ use super::helpers::is_valid_dns_name;
 use super::pages::build_new_form;
 use crate::routes::helpers::parse_form;
 
+use std::collections::HashMap;
+
 type Resp = Response<Full<Bytes>>;
+
+/// The parsed contents of a DNS provider form.
+pub struct DnsProviderForm {
+    pub name: String,
+    pub kind: DnsProviderKind,
+    pub enabled: bool,
+    /// The kind-specific credential blob, as JSON.
+    pub config: String,
+}
+
+/// Parse and validate a DNS provider form.
+///
+/// The same parser serves the HTML form and the dashboard-facing JSON
+/// API (issue #185) — a submission the form rejects is rejected here
+/// too, with the same message.
+///
+/// * `name` — the provider's name: from the form on create, from the
+///   path on update.
+/// * `existing` — the stored row on update, `None` on create. Its
+///   credentials are what a submission that omits a secret falls back
+///   to.
+pub fn parse_dns_provider_form(
+    params: &HashMap<String, String>,
+    name: &str,
+    existing: Option<&pangolin_core::types::DnsProvider>,
+    lang: Lang,
+) -> Result<DnsProviderForm, String> {
+    // The name is the primary key, so it is only checked when the row
+    // is created — an edit cannot change it.
+    if existing.is_none() {
+        if name.is_empty() {
+            return Err(lang.t("dns.error.name_required").into_owned());
+        }
+        if !is_valid_dns_name(name) {
+            return Err(lang.t("dns.error.name_format").into_owned());
+        }
+    }
+    let kind_str = params.get("kind").cloned().unwrap_or_default();
+    let kind = DnsProviderKind::from_str(&kind_str)?;
+    let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
+    let config = assemble_config(kind, params, existing.map(|p| p.config.as_str()), lang)?;
+    Ok(DnsProviderForm {
+        name: name.to_string(),
+        kind,
+        enabled,
+        config,
+    })
+}
 
 pub async fn handle_create(
     app: &Arc<App>,
@@ -29,31 +79,18 @@ pub async fn handle_create(
 ) -> http::Result<Resp> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
-    let kind_str = params.get("kind").cloned().unwrap_or_default();
-    let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
 
-    if name.is_empty() {
-        return render_create_page_with_error(app, &lang.t("dns.error.name_required"), csrf, lang);
-    }
-    if !is_valid_dns_name(&name) {
-        return render_create_page_with_error(app, &lang.t("dns.error.name_format"), csrf, lang);
-    }
-    let kind = match pangolin_core::DnsProviderKind::from_str(&kind_str) {
-        Ok(k) => k,
-        Err(e) => return render_create_page_with_error(app, &e, csrf, lang),
-    };
-
-    let config = match assemble_config(kind, &params, None, lang) {
-        Ok(c) => c,
+    let parsed = match parse_dns_provider_form(&params, &name, None, lang) {
+        Ok(p) => p,
         Err(e) => return render_create_page_with_error(app, &e, csrf, lang),
     };
 
     let now = chrono::Utc::now();
     let p = pangolin_core::types::DnsProvider {
-        name: name.clone(),
-        kind,
-        enabled,
-        config,
+        name: parsed.name,
+        kind: parsed.kind,
+        enabled: parsed.enabled,
+        config: parsed.config,
         created_at: now,
         updated_at: now,
     };
@@ -80,13 +117,6 @@ pub async fn handle_update(
         return Ok(crate::not_found(lang));
     };
     let params = parse_form(body);
-    let kind_str = params.get("kind").cloned().unwrap_or_default();
-    let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
-
-    let kind = match pangolin_core::DnsProviderKind::from_str(&kind_str) {
-        Ok(k) => k,
-        Err(e) => return Ok(error_response(&e)),
-    };
 
     let existing = {
         let db = app.db.lock().await;
@@ -96,16 +126,16 @@ pub async fn handle_update(
         return Ok(crate::not_found(lang));
     };
 
-    let config = match assemble_config(kind, &params, Some(&existing.config), lang) {
-        Ok(c) => c,
+    let parsed = match parse_dns_provider_form(&params, &name, Some(&existing), lang) {
+        Ok(p) => p,
         Err(e) => return Ok(error_response(&e)),
     };
 
     let updated = pangolin_core::types::DnsProvider {
-        name: name.clone(),
-        kind,
-        enabled,
-        config,
+        name: parsed.name,
+        kind: parsed.kind,
+        enabled: parsed.enabled,
+        config: parsed.config,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -310,7 +340,12 @@ fn error_response(msg: &str) -> Response<Full<Bytes>> {
         .expect("400 response builder is infallible")
 }
 
-fn assemble_config(
+/// Merge the submitted credentials with the stored ones into the
+/// kind-specific JSON blob the `dns_providers.config` column holds.
+///
+/// A secret the submission does not carry keeps the stored value; a
+/// provider that has none and gets none is an error.
+pub fn assemble_config(
     kind: DnsProviderKind,
     params: &std::collections::HashMap<String, String>,
     existing_config: Option<&str>,

@@ -345,6 +345,13 @@ pub async fn handle(
         // Issue #141: the IP reputation settings live in the database,
         // not in `ngx.yml` — the only credential they carry is a
         // provider API key.
+        // Issue #185: the dashboard API's connection settings — the
+        // token, the switch and the dashboard's address. They live in
+        // the database, so a change takes effect without a restart.
+        ("settings/dashboard", "POST") => {
+            routes::settings::handle_update_dashboard(&app, &csrf_token, &merged_params, lang)
+                .await?
+        }
         ("settings/badbots", "POST") => {
             routes::badbots::handle_update_badbots(&app, &csrf_token, &merged_params, lang).await?
         }

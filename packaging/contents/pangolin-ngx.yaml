@@ -1,0 +1,72 @@
+# The file list of the `pangolin-ngx` package.
+#
+# Spliced into `packaging/nfpm.yaml` by `packaging/render-nfpm.sh`,
+# which substitutes the `@@…@@` placeholders below.
+#
+# Two rules the list follows, both of them load-bearing:
+#
+#   * The runtime state is NOT in the package.  `pangolin.db`, the
+#     ACME certificates and the JSONL logs are written by the running
+#     service, and a package that owned them would overwrite them on
+#     every upgrade.  The directories below are empty skeletons; the
+#     service fills them.
+#   * The two packages own disjoint path sets.  dpkg refuses to
+#     install two packages that own the same file, and the gateway
+#     and the tunnel node run on different machines anyway.
+
+- src: @@BINARY@@
+  dst: /usr/bin/pangolin-ngx
+  file_info:
+    mode: 0755
+    owner: root
+    group: root
+
+- src: @@UNIT@@
+  dst: /usr/lib/systemd/system/pangolin-ngx.service
+  file_info:
+    mode: 0644
+    owner: root
+    group: root
+
+- src: @@CONFIG@@
+  dst: /etc/pangolin/ngx.yml
+  type: config|noreplace
+  file_info:
+    mode: 0640
+    owner: root
+    group: pangolin
+
+- src: @@TMPFILES@@
+  dst: /etc/tmpfiles.d/pangolin.conf
+  file_info:
+    mode: 0644
+    owner: root
+    group: root
+
+- type: dir
+  dst: /var/lib/pangolin
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin
+
+- type: dir
+  dst: /var/log/pangolin/bots
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin
+
+- type: dir
+  dst: /var/log/pangolin/referers
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin
+
+- type: dir
+  dst: /var/cache/pangolin/bots
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin

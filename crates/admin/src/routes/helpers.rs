@@ -24,7 +24,7 @@ use crate::i18n::Lang;
 /// The per-resource `parse_form` copies that predate this helper
 /// keep `+` literal; they only ever read space-free fields (names,
 /// hosts, tokens).
-pub(crate) fn parse_form(body: &[u8]) -> HashMap<String, String> {
+pub fn parse_form(body: &[u8]) -> HashMap<String, String> {
     let body_str = std::str::from_utf8(body).unwrap_or("");
     let mut params = HashMap::new();
     for pair in body_str.split('&') {

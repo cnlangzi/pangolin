@@ -50,7 +50,9 @@ pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
-pub use config::{BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger};
+pub use config::{
+    ApiConfig, BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger,
+};
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, host_matches_domains, lookup_site, site_of_host};
