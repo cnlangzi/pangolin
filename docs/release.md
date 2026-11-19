@@ -17,6 +17,15 @@ reports `v0.0.0`, while a release build reports the tag's version in
 `CARGO_PKG_VERSION`, which every workspace member inherits from that
 one line.
 
+0. **Replace the dashboard key pair** (issue #185). The management
+   API verifies every request against the Ed25519 public key compiled
+   into the binary (`crates/api/src/dashboard.pub`). The repository
+   ships a **development** placeholder whose private half lives in
+   `tests/fixtures/dashboard_dev_seed.hex` — the end-to-end suite
+   needs it to sign a request — and the release workflow **refuses to
+   build** while the placeholder is still in place. Generate the
+   production pair out of band and replace both files together.
+
 1. **Merge to `main`.** The release workflow runs no lint and no tests
    of its own, so the tag must point at a commit whose CI run was
    green. It enforces the "on `main`" half of that: the job fails

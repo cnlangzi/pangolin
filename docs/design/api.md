@@ -178,6 +178,7 @@ Every failure answers with the same shape:
 | `<resource>_not_found` | 404 | no such resource (e.g. `site_not_found`) |
 | `<resource>_exists` | 409 | the resource already exists (e.g. `site_exists`) |
 | `<field>_invalid` | 422 | a field failed validation (e.g. `backend_invalid`) |
+| `body_too_large` | 413 | the request body is larger than 1 MiB |
 | `internal_error` | 500 | something the API did not expect |
 
 A successful response is the **resource itself** — a list is a JSON
@@ -397,6 +398,11 @@ one; on create, one is generated.
 (`<scope>|<kind>|<cidr>`) and is what `DELETE
 /api/v1/ip_rules/{id}` takes.
 
+The id carries characters a request target may not (`|` and `/`), so
+it is **percent-encoded** in the path — `global%7Cblacklist%7C10.0.0.0%2F8`
+— and the signature covers the encoded form. The reference client
+(`api::client::ApiClient`) encodes the target for you.
+
 **Write body**:
 
 ```json
@@ -582,7 +588,36 @@ The API validates through the **admin UI's own parsers**, so a body
 the HTML form would reject is rejected here too — with the same
 message. What differs is only what an omitted field means.
 
+### The exceptions
+
+Two places keep the stored value instead of clearing it, because
+clearing it would be a trap:
+
+- **`enabled`** (a site and a domain) — an omitted `enabled` keeps the
+  stored value. A body that only changes the backend must not switch
+  a paused site back on. On create, an omitted `enabled` means `true`.
+- **The site's sub-objects** — `rate_limit`, `rate_limit_bots` and
+  `provider` are writes to the **sub-resources**
+  (`site_rate_limits`, `site_rate_limit_bots`, `site_providers`),
+  each of which has its own endpoint and its own semantics. An
+  omitted sub-object leaves that sub-resource alone; a present one
+  replaces it as the sub-resource's own rule says. The site's own
+  fields — `backend`, `host_mode`, `host_custom` — are replaced.
+
+A `PUT` of a per-site sub-resource for a site that does not exist is
+a `404 site_not_found`: the sub-resource tables carry no foreign key,
+so an orphan row would attach itself to a site of that name created
+later.
+
 ## The logs
+
+## The limits
+
+The request body is capped at **1 MiB**. A body that announces more
+is answered `413 body_too_large` before a byte of it is read — the
+body is read before the authentication gate runs, so an
+unauthenticated client must not be able to make the node buffer an
+arbitrary amount of memory.
 
 The API serves the logs **raw**: the analysis belongs to the
 dashboard.
