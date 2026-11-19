@@ -1,0 +1,58 @@
+# nfpm configuration template.
+#
+# `packaging/render-nfpm.sh` renders this file into one concrete
+# configuration per (package, architecture) pair; `nfpm package` is
+# then run twice per rendered file, once for `deb` and once for
+# `rpm`.  The two formats share every field except the dependency
+# list, which is why there is one template and not two.
+#
+# The placeholders the renderer substitutes:
+#
+#   @@PACKAGE@@      the package name (pangolin-ngx / pangolin-tun)
+#   @@DESCRIPTION@@  the package's one-line description
+#   @@VERSION@@      the release version, e.g. 0.3.0
+#   @@REVISION@@     the package revision — always 1
+#   @@ARCH@@         the deb architecture (amd64 / arm64)
+#   @@RPM_ARCH@@     the rpm architecture (x86_64 / aarch64)
+#   @@GLIBC@@        the measured glibc floor of the packaged binary
+#   @@CONTENTS@@     the file list, from packaging/contents/<package>.yaml
+#   @@SCRIPTS@@      the directory holding the four lifecycle scripts
+#
+# The glibc floor is *measured*, never written down: the renderer
+# reads the highest `GLIBC_x.y` symbol version out of the binary it is
+# about to package and puts that number in the dependency list.  A
+# hardcoded floor either refuses to install on a host that could run
+# the binary, or lets it install on a host that cannot.
+
+name: @@PACKAGE@@
+arch: @@ARCH@@
+platform: linux
+version: @@VERSION@@
+release: @@REVISION@@
+section: net
+priority: optional
+maintainer: Pangolin maintainers <noreply@github.com>
+description: |
+  @@DESCRIPTION@@
+vendor: Pangolin
+homepage: https://github.com/cnlangzi/pangolin
+license: Apache-2.0
+
+scripts:
+  preinstall: @@SCRIPTS@@/preinstall.sh
+  postinstall: @@SCRIPTS@@/postinstall.sh
+  preremove: @@SCRIPTS@@/preremove.sh
+  postremove: @@SCRIPTS@@/postremove.sh
+
+contents:
+@@CONTENTS@@
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= @@GLIBC@@)
+      - ca-certificates
+  rpm:
+    depends:
+      - glibc >= @@GLIBC@@
+      - ca-certificates

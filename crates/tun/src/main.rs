@@ -42,14 +42,22 @@ async fn main() -> Result<()> {
     //
     // The trust-on-first-use pin file and the record of the last
     // failed QUIC attempt live next to the configuration file — see
-    // `TunConfig::pin_path`.
+    // `TunConfig::pin_path`.  A configuration that names the paths
+    // explicitly wins: the packaged deployment keeps its
+    // configuration in `/etc/pangolin/`, which the service user
+    // cannot write to.
+    //
+    // The paths are resolved before the settings are built, because
+    // building them moves the configuration's own fields out.
+    let pin_path = tun_cfg.resolved_pin_path(&args.config);
+    let quic_failure_path = tun_cfg.resolved_quic_failure_path(&args.config);
     let client = TunnelClient::new(TunSettings {
         server: tun_cfg.server,
         token: tun_cfg.token,
         name: tun_cfg.name,
         transport: tun_cfg.transport,
-        pin_path: TunConfig::pin_path(&args.config),
-        quic_failure_path: TunConfig::quic_failure_path(&args.config),
+        pin_path,
+        quic_failure_path,
     });
     client.run().await;
 

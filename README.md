@@ -54,7 +54,39 @@ Pangolin 是一个反向代理网关：终结 HTTP/HTTPS，按域名把请求分
 
 ## 30 秒跑起来
 
-一条命令装好网关（Linux x86_64 / arm64、macOS Apple Silicon / Intel）：
+Linux 上用包管理器装（仓库自己托管，签名，`apt upgrade` 跟着版本走）：
+
+```bash
+sudo apt install pangolin-ngx     # Debian / Ubuntu
+sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
+```
+
+先加源（一次就够）：
+
+```bash
+# Debian / Ubuntu
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/pangolin-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] https://cnlangzi.github.io/pangolin stable main" \
+  | sudo tee /etc/apt/sources.list.d/pangolin.list
+sudo apt update
+```
+
+```ini
+# RHEL / Rocky / Alma —— /etc/yum.repos.d/pangolin.repo
+[pangolin]
+name=Pangolin
+baseurl=https://cnlangzi.github.io/pangolin/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.asc
+```
+
+装完**不会自动启动** —— 改完配置再 `sudo systemctl start pangolin-ngx`。完整步骤见 [用包管理器安装](./docs/packaging.md)。
+
+macOS 没有包管理器，走一键安装脚本（Linux 上没有 root、不联网或者不想装包时也走这条）：
 
 ```bash
 curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh

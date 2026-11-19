@@ -85,6 +85,28 @@ pub struct TunConfig {
     )]
     pub transport: TransportSelector,
 
+    /// Where the trust-on-first-use pin file lives.
+    ///
+    /// Optional.  When it is absent the path is derived from the
+    /// configuration file's own path (see
+    /// [`TunConfig::pin_path`]) — the behaviour every deployment
+    /// had before this key existed.
+    ///
+    /// The packaged deployment needs the explicit form: its
+    /// configuration lives in `/etc/pangolin/tun.yml`, and the
+    /// derived path would put the pin file in `/etc/pangolin/`,
+    /// which the service user cannot write to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_path: Option<PathBuf>,
+
+    /// Where the record of the last failed QUIC attempt lives.
+    ///
+    /// Optional, with the same two shapes as [`pin_path`]: absent
+    /// means "derive it from the configuration file's path", present
+    /// means "use exactly this path".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_failure_path: Option<PathBuf>,
+
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -130,6 +152,30 @@ impl TunConfig {
     /// would probe on every session.
     pub fn quic_failure_path(config_path: &Path) -> PathBuf {
         config_path.with_extension("quic-fail")
+    }
+
+    /// The pin file this configuration actually uses.
+    ///
+    /// The configured `pin_path:` wins; without it the path is
+    /// derived from the configuration file's own path, exactly as it
+    /// was before the key existed.  The two shapes have to stay
+    /// distinguishable: a packaged deployment keeps its
+    /// configuration in `/etc/pangolin/`, which the service user
+    /// cannot write to, so it has to name a writable path
+    /// explicitly.
+    pub fn resolved_pin_path(&self, config_path: &Path) -> PathBuf {
+        self.pin_path
+            .clone()
+            .unwrap_or_else(|| Self::pin_path(config_path))
+    }
+
+    /// The QUIC-failure record this configuration actually uses.
+    ///
+    /// Same two shapes as [`resolved_pin_path`].
+    pub fn resolved_quic_failure_path(&self, config_path: &Path) -> PathBuf {
+        self.quic_failure_path
+            .clone()
+            .unwrap_or_else(|| Self::quic_failure_path(config_path))
     }
 }
 
@@ -310,6 +356,114 @@ mod tests {
         assert_eq!(pins, PathBuf::from("/etc/pangolin/tun.pins"));
         let failed = TunConfig::quic_failure_path(Path::new("/etc/pangolin/tun.yml"));
         assert_eq!(failed, PathBuf::from("/etc/pangolin/tun.quic-fail"));
+    }
+
+    /// A configuration that names neither path keeps the behaviour
+    /// every deployment had before the keys existed: the state
+    /// files are derived from the configuration file's own path.
+    ///
+    /// The packaged deployment is the reason the keys exist at all
+    /// — its configuration lives in `/etc/pangolin/`, which the
+    /// service user cannot write to — so "absent means derived" has
+    /// to stay exactly as it was.
+    #[test]
+    fn absent_state_paths_fall_back_to_the_derived_ones() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: t
+                name: office
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            let config_path = Path::new("/etc/pangolin/tun.yml");
+            assert_eq!(c.pin_path, None);
+            assert_eq!(c.quic_failure_path, None);
+            assert_eq!(
+                c.resolved_pin_path(config_path),
+                PathBuf::from("/etc/pangolin/tun.pins")
+            );
+            assert_eq!(
+                c.resolved_quic_failure_path(config_path),
+                PathBuf::from("/etc/pangolin/tun.quic-fail")
+            );
+            Ok(())
+        });
+    }
+
+    /// A configuration that names the paths uses exactly those paths
+    /// — the derived ones are ignored.
+    #[test]
+    fn configured_state_paths_win_over_the_derived_ones() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                server: gateway.local:8080
+                token: t
+                name: office
+                pin_path: /var/lib/pangolin-tun/tun.pins
+                quic_failure_path: /var/lib/pangolin-tun/tun.quic-fail
+            "#;
+            let c = TunConfig::from_str(s).unwrap();
+            let config_path = Path::new("/etc/pangolin/tun.yml");
+            assert_eq!(
+                c.resolved_pin_path(config_path),
+                PathBuf::from("/var/lib/pangolin-tun/tun.pins")
+            );
+            assert_eq!(
+                c.resolved_quic_failure_path(config_path),
+                PathBuf::from("/var/lib/pangolin-tun/tun.quic-fail")
+            );
+            Ok(())
+        });
+    }
+
+    /// The configuration template the `pangolin-tun` package installs
+    /// has to parse with the real loader.
+    ///
+    /// The package ships this file as a conffile, and the tunnel node
+    /// reads it at startup: a template the loader rejects is a package
+    /// that installs a configuration the service cannot read.
+    ///
+    /// The template ships with an empty `token` — the operator has to
+    /// fill it in — and the loader refuses an empty token.  The
+    /// template is therefore parsed twice: once as it ships, to pin
+    /// that the empty token is the *only* thing that keeps it from
+    /// loading, and once with a token, to prove the rest of the file
+    /// is well formed.
+    #[test]
+    fn the_packaged_config_template_parses_with_the_real_loader() {
+        let template = include_str!("../../../packaging/config/tun.yml");
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+
+            let empty = TunConfig::from_str(template).expect_err("an empty token must be refused");
+            assert!(
+                empty.to_string().contains("token"),
+                "the empty token must be the reason the template does not load: {empty}"
+            );
+
+            let filled = template.replace("token: \"\"", "token: \"a-real-token\"");
+            let c = TunConfig::from_str(&filled).expect("the packaged tun.yml must parse");
+
+            assert_eq!(c.server, "127.0.0.1:9001");
+            assert_eq!(c.name, "local");
+            assert_eq!(c.transport, TransportSelector::Auto);
+            // The pin file and the QUIC-failure record have to live
+            // under /var/lib: the derived path would put them next to
+            // the configuration file in /etc/pangolin, which the
+            // service user cannot write to.
+            assert_eq!(
+                c.resolved_pin_path(Path::new("/etc/pangolin/tun.yml")),
+                PathBuf::from("/var/lib/pangolin-tun/tun.pins")
+            );
+            assert_eq!(
+                c.resolved_quic_failure_path(Path::new("/etc/pangolin/tun.yml")),
+                PathBuf::from("/var/lib/pangolin-tun/tun.quic-fail")
+            );
+            Ok(())
+        });
     }
 
     #[test]

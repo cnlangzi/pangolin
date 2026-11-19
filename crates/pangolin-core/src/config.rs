@@ -774,6 +774,48 @@ mod tests {
         });
     }
 
+    /// The configuration template the `pangolin-ngx` package installs
+    /// has to parse with the real loader.
+    ///
+    /// The package ships this file as a conffile, and the service
+    /// reads it at startup: a template the loader rejects is a package
+    /// that installs a configuration the gateway cannot read, and the
+    /// failure surfaces on the operator's machine at the first start.
+    ///
+    /// The paths are absolute on purpose — a relative path follows the
+    /// service's working directory (`/var/lib/pangolin`) instead of
+    /// meaning what it says.
+    #[test]
+    fn the_packaged_config_template_parses_with_the_real_loader() {
+        let template = include_str!("../../../packaging/config/ngx.yml");
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str(template).expect("the packaged ngx.yml must parse");
+
+            assert_eq!(c.addr.http, "0.0.0.0:80");
+            assert_eq!(c.addr.https, "0.0.0.0:443");
+            assert_eq!(c.acme.cert_dir, "/var/lib/pangolin/certs");
+            assert_eq!(
+                c.acme.acme_directory,
+                "https://acme-v02.api.letsencrypt.org/directory"
+            );
+            assert_eq!(c.acme.renew_threshold_days, 14);
+            assert_eq!(c.acme.renew_check_interval_hours, 6);
+            assert_eq!(c.acme.key_type, "ecdsa");
+            assert_eq!(c.log.bot.dir, PathBuf::from("/var/log/pangolin/bots"));
+            assert_eq!(
+                c.log.bot.cache_dir,
+                PathBuf::from("/var/cache/pangolin/bots")
+            );
+            assert_eq!(
+                c.log.referer.dir,
+                PathBuf::from("/var/log/pangolin/referers")
+            );
+            Ok(())
+        });
+    }
+
     #[test]
     fn retired_bot_enabled_key_still_parses() {
         // Issue #117: the bot log is always on, so `log.bot.enabled`

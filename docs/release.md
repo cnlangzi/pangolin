@@ -45,9 +45,10 @@ one line.
 
 ## What gets published
 
-Each release attaches one archive per build target plus the installer,
-the two systemd units and a checksum file — six archives, three
-repository files and `SHA256SUMS.txt`:
+Each release attaches one archive per build target, the eight
+packages, the installer, the two systemd units and a checksum file —
+six archives, eight packages, three repository files and
+`SHA256SUMS.txt`:
 
 ```
 pangolin_v0.3.0_linux_amd64.tar.gz
@@ -56,11 +57,24 @@ pangolin_v0.3.0_macos_arm64.tar.gz
 pangolin_v0.3.0_macos_x64.tar.gz
 pangolin_v0.3.0_windows_amd64.zip
 pangolin_v0.3.0_windows_arm64.zip
+pangolin-ngx_0.3.0-1_amd64.deb
+pangolin-ngx_0.3.0-1_arm64.deb
+pangolin-ngx-0.3.0-1.x86_64.rpm
+pangolin-ngx-0.3.0-1.aarch64.rpm
+pangolin-tun_0.3.0-1_amd64.deb
+pangolin-tun_0.3.0-1_arm64.deb
+pangolin-tun-0.3.0-1.x86_64.rpm
+pangolin-tun-0.3.0-1.aarch64.rpm
 install.sh
 pangolin-ngx.service
 pangolin-tun.service
 SHA256SUMS.txt
 ```
+
+`SHA256SUMS.txt` covers the six archives and the three repository
+files, exactly as before — the packages are checksummed by the
+repository metadata that carries them, not by the release's checksum
+file.
 
 `install.sh` is the repository's root `install.sh`, byte for byte — it
 is the one-liner every operator starts with:
@@ -228,12 +242,137 @@ through to release day.
 | Set | The tag's version is written into `[workspace.package].version` in `Cargo.toml` — the table-scoped rewrite touches that one line and nothing else. The workflow reads the value back and fails if it is not the tag's version. This happens *after* the cargo cache step, so the cache key is computed from the unmodified manifest and stays identical across releases. |
 | Build | Three jobs, one per build shape, each with its own matrix. `build` (linux/amd64, linux/arm64) runs `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `build-mac` (macos/arm64, macos/x64) runs `make build-css` plus `cargo build --release -p ngx -p tun --features openssl/vendored`. `build-tun` (windows/amd64, windows/arm64) runs `cargo build --release -p tun`. All three regenerate or embed the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled — except the Windows build, whose tun binary serves no UI. |
 | Assert | `--version` must report the tagged version on every binary the runner can execute — both Linux entries and macOS arm64 natively, macOS x64 under Rosetta 2, Windows amd64. A mismatched binary fails the job and is never uploaded. |
-| Publish | The publishing job checks the repository out (it needs the installer and the two systemd units), copies them next to the archives, and attaches the six archives, `install.sh`, the two units and `SHA256SUMS.txt` to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
+| Package | One job per Linux architecture, on the runner of that architecture. It unpacks the binaries, measures the glibc floor, renders the nfpm configuration and builds the four packages of that architecture (a `.deb` and an `.rpm` for each of the two packages). Read-only permissions. |
+| Publish | The publishing job checks the repository out (it needs the installer and the two systemd units), copies them next to the archives, and attaches the six archives, the eight packages, `install.sh`, the two units and `SHA256SUMS.txt` to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
+| Deploy | The repository job builds the site tree, signs it with the archive key and replaces the `gh-pages` branch with it. It is the only job that holds the key. |
 
-The build jobs run read-only; only the publishing job holds a
-write-scoped token. A failed platform build fails the publishing
-job's `needs`, so a tag never publishes a release that silently
-misses a platform.
+The build jobs run read-only; only the publishing job and the
+repository job hold a write-scoped token. A failed platform build
+fails the publishing job's `needs`, so a tag never publishes a
+release that silently misses a platform.
 
 Adding a build target later is one new entry in the matching job's
 `matrix.include:` list.
+
+## Packages and the repository
+
+Besides the six archives, a release publishes eight packages: a
+`.deb` and an `.rpm` for each of the two binaries, in the two Linux
+architectures. They install the gateway (`pangolin-ngx`) and the
+tunnel node (`pangolin-tun`) the way an operator expects — with a
+configuration file, a systemd unit, a system user and the runtime
+directories — and they live in a signed apt / yum repository the
+project hosts itself.
+
+The operator-facing documentation is
+[packaging.md](./packaging.md) (and its English twin). This section
+is about how the release produces them.
+
+### The two jobs
+
+| Job | What it does | Permissions |
+| --- | --- | --- |
+| `package` | Unpacks the two Linux binaries, measures the glibc floor of each, renders the nfpm configuration and runs nfpm — four packages per architecture, eight in total. The packages travel to the next jobs as a workflow artifact. | read-only |
+| `deploy-repo` | Builds the site tree (the apt `Packages` / `Release` metadata and the rpm `repodata`), signs it with the archive key and replaces the `gh-pages` branch with it. | `contents: write` |
+
+The two are separate jobs on purpose. The signing key belongs in one
+job only, and a failed branch push should turn the tag's CI red and
+be re-runnable on its own — without marking the Release that already
+succeeded as failed.
+
+The repository job serializes its pushes with a job-level
+`concurrency` group (`pages-deploy`, `cancel-in-progress: false`):
+two releases pushing the branch at the same time would leave the
+site tree half-written.
+
+### The site tree
+
+The `gh-pages` branch is the site tree, and it is a **generated
+artefact** — every release replaces the whole tree, so a hand-made
+commit on it is overwritten by the next release:
+
+```
+.nojekyll
+index.html
+pangolin-archive-keyring.asc
+pangolin-archive-keyring.gpg
+dists/stable/Release
+dists/stable/Release.gpg
+dists/stable/InRelease
+dists/stable/main/binary-amd64/Packages
+dists/stable/main/binary-amd64/Packages.gz
+dists/stable/main/binary-arm64/Packages
+dists/stable/main/binary-arm64/Packages.gz
+pool/main/p/pangolin-ngx/…
+pool/main/p/pangolin-tun/…
+rpm/…
+rpm/repodata/…
+```
+
+`Packages` is generated with `dpkg-scanpackages --arch <arch>
+--multiversion pool /dev/null`, run from the site root so the
+`Filename:` field is relative to it. `Release` is written by hand:
+`Origin`, `Label`, `Suite`, `Codename`, `Version`, `Architectures`,
+`Components`, `Date` and a `SHA256:` section with one line per
+`Packages` and `Packages.gz`. There is **no `Valid-Until`** — the
+repository is refreshed when a release happens, not on a timer, and
+an expiry date would turn "no release for three months" into "apt
+update fails on every machine".
+
+`Release` is signed twice: `InRelease` is the clearsigned form apt
+prefers, `Release.gpg` the detached form older clients need. Both
+carry the identical `Release` text.
+
+The rpm side is one directory for both architectures: `dnf` picks
+the package that matches the machine out of the same `repodata`. The
+packages are signed *before* the metadata is generated — the metadata
+records the hash of the package, and a hash taken before the
+signature was added does not match the file that ends up in the
+repository, and `gpgcheck=1` would fail.
+
+### The archive key
+
+One RSA-4096 key signs the repository metadata, and nothing else —
+it does not sign the release archives and it is unrelated to any
+personal key.
+
+| Half | Where it lives |
+| --- | --- |
+| Private | the repository secret `PANGOLIN_REPO_SIGNING_KEY`, base64-encoded armored text |
+| Passphrase | the repository secret `PANGOLIN_REPO_SIGNING_PASSPHRASE` |
+| Public | `packaging/keys/pangolin-archive-keyring.asc`, committed, and deployed to the site root in both the armored (`.asc`) and the dearmored (`.gpg`) form |
+
+The fingerprint is **`F8D867A0259991A26F7F1CDD5ECDF720553C84DF`** —
+it is written into [packaging.md](./packaging.md) so an operator can
+check the key they downloaded against the one the documentation
+names, offline.
+
+The private key never enters the repository: the committed file is the
+public half, and the header of an armored PGP private key block may
+not appear anywhere in the tree.  A regression test asserts both.
+
+Rotating the key means generating a new one, committing its public
+half, deploying it to the site root and telling the operators to
+re-import it — the old key stays valid until it is revoked, so the
+two overlap and no operator is locked out in between.
+
+### The glibc floor
+
+The dependency list of a package names the glibc version it needs,
+and that number is **measured, not written down**:
+
+```bash
+objdump -T <binary> | grep -o 'GLIBC_[0-9][0-9.]*' | sort -V | tail -1
+```
+
+The build script runs it on the binary it is about to package and
+writes the result into the rendered nfpm configuration — so
+`libc6 (>= 2.34)` in a `.deb` and `glibc >= 2.34` in an `.rpm` are
+facts about that binary, not a constant somebody remembered.
+
+A hardcoded floor goes stale the moment the toolchain or a
+dependency changes, and a stale floor is worse than none: it either
+keeps the package off a host that could run it, or lets it onto a
+host that cannot. The measurement runs on the runner of the
+architecture being packaged, because Ubuntu's `objdump` only knows
+the architecture it was built for.
