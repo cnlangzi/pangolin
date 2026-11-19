@@ -148,7 +148,7 @@ clap = { version = "4", features = ["derive"] }
 
 # WebSocket (for Sec-WebSocket-Accept computation)
 sha1 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 # Hex encoding — the token digests, the key fingerprints.
 hex = "0.4"
 
