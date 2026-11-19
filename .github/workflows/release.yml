@@ -1139,10 +1139,11 @@ jobs:
 
       - name: Install the repository tools
         # dpkg-dev for `dpkg-scanpackages`, createrepo-c for the rpm
-        # metadata, rpm for the package signatures.
+        # metadata, rpm for the package signatures, gnupg2 for the
+        # `gpg2` binary rpm's gpg macro points at.
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev createrepo-c rpm
+          sudo apt-get install -y dpkg-dev createrepo-c rpm gnupg2
 
       - uses: actions/download-artifact@v7
         with:

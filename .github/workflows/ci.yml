@@ -146,9 +146,10 @@ jobs:
       - name: Install the packaging tools
         # binutils for `objdump`, dpkg-dev for `dpkg-scanpackages`,
         # createrepo-c for the rpm metadata, rpm for the signatures.
+        # gnupg2 for the `gpg2` binary rpm's gpg macro points at.
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils dpkg-dev createrepo-c rpm
+          sudo apt-get install -y binutils dpkg-dev createrepo-c rpm gnupg2
 
       - name: Install nfpm
         env:
@@ -176,7 +177,9 @@ jobs:
           # workflow overwrites with the tag's; it is what the
           # binaries report here.
           version="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
-          echo "version=$version" >> "$GITHUB_ENV"
+          # `VERSION`, in upper case: the next steps read `$VERSION`,
+          # and an environment variable's name is case-sensitive.
+          echo "VERSION=$version" >> "$GITHUB_ENV"
           sh packaging/build-packages.sh \
             --tag-version "$version" \
             --arch amd64 \
