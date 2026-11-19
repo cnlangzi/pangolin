@@ -51,6 +51,7 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::ok_html_with_csrf;
 use crate::templates::logs::referer_subnav;
 use crate::templates::logs::subnav;
@@ -76,7 +77,7 @@ const BOT_TOP_N: usize = 10;
 /// streamed in by the browser over `/api/logs/stream` once the
 /// page loads — so the template only needs the standard
 /// `csrf_token` + `active_nav` slots.
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
     // `app` is currently unused on the page itself; it is still
     // threaded through for symmetry with the other page handlers
     // and so a future iteration can pre-populate recent entries
@@ -87,6 +88,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let tmpl = LogsTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs",
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -114,7 +116,11 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
 /// static shell — the live tail table at the bottom is populated
 /// by the browser's `EventSource('/api/logs/bots/stream')`
 /// connection.
-pub async fn render_bots(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render_bots(
+    app: &Arc<App>,
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Response<Full<Bytes>>> {
     // Snapshot the stats under one `RwLock` acquisition so the
     // summary card and top-N table agree on `total_records` even
     // under live traffic.
@@ -134,6 +140,7 @@ pub async fn render_bots(app: &Arc<App>, csrf: &str) -> http::Result<Response<Fu
         summary,
         top_rows,
         health,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -269,6 +276,7 @@ pub async fn render_bots_history(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     if is_stats_view(merged_params) {
         let p = parse_history_params(merged_params);
@@ -291,6 +299,7 @@ pub async fn render_bots_history(
         filter: page.filter,
         summary: page.summary,
         entries: page.entries,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -475,9 +484,10 @@ pub async fn render_bots_stats(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let dir = app.config.log.bot.dir.clone();
-    let page = build_stats_page(dir.as_path(), merged_params).await;
+    let page = build_stats_page(dir.as_path(), merged_params, lang).await;
 
     let tmpl = BotLogsStatsTemplate {
         csrf_token: csrf.to_string(),
@@ -486,6 +496,7 @@ pub async fn render_bots_stats(
         date_links: page.date_links,
         filter: page.filter,
         stats: page.stats,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -507,7 +518,11 @@ struct StatsPageView {
 /// sidebar already picked the file, so other files are not scanned.
 /// Disk work runs on `spawn_blocking`, same reason as
 /// [`build_history_page`].
-async fn build_stats_page(dir: &std::path::Path, merged_params: &[u8]) -> StatsPageView {
+async fn build_stats_page(
+    dir: &std::path::Path,
+    merged_params: &[u8],
+    lang: Lang,
+) -> StatsPageView {
     let p = parse_history_params(merged_params);
     let available = list_dates(dir).unwrap_or_default();
     let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {
@@ -555,7 +570,7 @@ async fn build_stats_page(dir: &std::path::Path, merged_params: &[u8]) -> StatsP
         }
     };
 
-    let mut stats = present_stats(&filter, raw, &from);
+    let mut stats = present_stats(&filter, raw, &from, lang);
     stats.error = error;
     StatsPageView {
         filter,
@@ -582,6 +597,7 @@ fn present_stats(
     filter: &crate::templates::logs::BotHistoryFilter,
     raw: pangolin_core::bot_log::BotHistoryStats,
     from: &str,
+    lang: Lang,
 ) -> BotHistoryStatsPage {
     use crate::templates::logs::{BotStatsBotRow, BotStatsFocus, BotStatsHostRow, BotStatsUrlRow};
 
@@ -666,7 +682,7 @@ fn present_stats(
         unique_urls: b.unique_urls,
         last_status: b.last_status,
     });
-    let (back_url, back_label) = stats_back_target(filter, from);
+    let (back_url, back_label) = stats_back_target(filter, from, lang);
     BotHistoryStatsPage {
         hosts,
         bots,
@@ -695,24 +711,28 @@ fn present_stats(
 fn stats_back_target(
     filter: &crate::templates::logs::BotHistoryFilter,
     from: &str,
+    lang: Lang,
 ) -> (String, String) {
     if !filter.path.is_empty() && !from.is_empty() {
         (
             stats_page_url(&filter.date, &filter.host, from, ""),
-            format!("Back to {from}"),
+            lang.tf("bots.back_to", [("from", from)]),
         )
     } else if !filter.bot_name.is_empty() && !from.is_empty() {
         (
             stats_page_url(&filter.date, &filter.host, "", from),
-            format!("Back to {from}"),
+            lang.tf("bots.back_to", [("from", from)]),
         )
     } else if !filter.host.is_empty() {
         (
             stats_page_url(&filter.date, &filter.host, "", ""),
-            format!("Back to {}", filter.host),
+            lang.tf("bots.back_to", [("from", filter.host.as_str())]),
         )
     } else {
-        (stats_page_url(&filter.date, "", "", ""), "Back".to_string())
+        (
+            stats_page_url(&filter.date, "", "", ""),
+            lang.t("bots.back").into_owned(),
+        )
     }
 }
 
@@ -970,6 +990,7 @@ pub async fn render_referers(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let enabled = app.config.log.referer.enabled;
     let filter = parse_referer_params(merged_params).filter;
@@ -1024,6 +1045,7 @@ pub async fn render_referers(
         filter,
         site_domains,
         site_scoped,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1046,6 +1068,7 @@ pub async fn render_referers_history(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let enabled = app.config.log.referer.enabled;
     let dir = app.config.log.referer.dir.clone();
@@ -1067,6 +1090,7 @@ pub async fn render_referers_history(
         summary: page.summary,
         entries: page.entries,
         stats_url,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1088,6 +1112,7 @@ pub async fn render_referers_stats(
     app: &Arc<App>,
     csrf: &str,
     merged_params: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let enabled = app.config.log.referer.enabled;
     let dir = app.config.log.referer.dir.clone();
@@ -1107,6 +1132,7 @@ pub async fn render_referers_stats(
         filter: page.filter,
         stats: page.stats,
         history_url,
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -1664,7 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn render_bots_with_empty_stats_returns_valid_html() {
         let (_dir, app) = make_test_app();
-        let resp = render_bots(&app, "csrf-token")
+        let resp = render_bots(&app, "csrf-token", Lang::En)
             .await
             .expect("render_bots should succeed with empty stats");
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -1698,7 +1724,7 @@ mod tests {
         let (_dir, app) = make_test_app();
         record_one_googlebot(&app);
 
-        let resp = render_bots(&app, "csrf-token")
+        let resp = render_bots(&app, "csrf-token", Lang::En)
             .await
             .expect("render_bots should succeed with stats");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -1727,6 +1753,7 @@ mod tests {
         let tmpl = LogsTemplate {
             csrf_token: "csrf".into(),
             active_nav: "logs",
+            lang: Lang::En,
         };
         let html = tmpl.render().expect("LogsTemplate render");
         assert!(html.contains("Access Logs"));
@@ -1743,6 +1770,7 @@ mod tests {
             summary: pangolin_core::bot_stats::BotStatsSummary::default(),
             top_rows: vec![],
             health: BotVerificationHealth::default(),
+            lang: Lang::En,
         };
         let html = tmpl.render().expect("BotLogsTemplate render");
         assert!(html.contains("Bot Logs"));
@@ -1764,6 +1792,7 @@ mod tests {
             summary: pangolin_core::bot_stats::BotStatsSummary::default(),
             top_rows: vec![],
             health,
+            lang: Lang::En,
         };
         tmpl.render().expect("BotLogsTemplate render")
     }
@@ -1806,7 +1835,7 @@ mod tests {
     #[tokio::test]
     async fn render_bots_shows_the_verification_status_panel() {
         let (_dir, app) = make_test_app();
-        let resp = render_bots(&app, "csrf-token")
+        let resp = render_bots(&app, "csrf-token", Lang::En)
             .await
             .expect("render_bots should succeed");
         let html = response_html(resp).await;
@@ -2338,7 +2367,7 @@ mod tests {
         std::fs::create_dir_all(&bot_dir).unwrap();
         let (_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
-        let resp = render_bots_history(&app, "csrf-token", b"")
+        let resp = render_bots_history(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("render_bots_history should succeed on empty dir");
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -2378,7 +2407,7 @@ mod tests {
         let (_file_dir, bot_dir) = seed_history_file(today, &entries);
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
-        let resp = render_bots_history(&app, "csrf-token", b"")
+        let resp = render_bots_history(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("render_bots_history should succeed");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2416,7 +2445,7 @@ mod tests {
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
         let blob = b"bot=Googlebot&path=sitemap&page=1";
-        let resp = render_bots_history(&app, "csrf-token", blob)
+        let resp = render_bots_history(&app, "csrf-token", blob, Lang::En)
             .await
             .expect("render_bots_history should accept filter params");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2502,7 +2531,7 @@ mod tests {
             &[bot_entry_with("Googlebot", "Google", "x.com", "/", 0)],
         );
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
-        let resp = render_bots_history(&app, "csrf-token", b"bot=Googlebot&host=x.com")
+        let resp = render_bots_history(&app, "csrf-token", b"bot=Googlebot&host=x.com", Lang::En)
             .await
             .expect("render_bots_history should succeed");
         let html = response_html(resp).await;
@@ -2533,7 +2562,7 @@ mod tests {
         let (_file_dir, bot_dir) = seed_history_file(today, &entries);
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
-        let resp = render_bots_history(&app, "csrf-token", b"page=2")
+        let resp = render_bots_history(&app, "csrf-token", b"page=2", Lang::En)
             .await
             .expect("render_bots_history should succeed");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2567,7 +2596,7 @@ mod tests {
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
         // page=999999 → must clamp to 2 (the last real page).
-        let resp = render_bots_history(&app, "csrf-token", b"page=999999")
+        let resp = render_bots_history(&app, "csrf-token", b"page=999999", Lang::En)
             .await
             .expect("render_bots_history should succeed");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2602,7 +2631,7 @@ mod tests {
             &[bot_entry_with("Googlebot", "Google", "x.com", "/", 0)],
         );
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
-        let resp = render_bots_history(&app, "csrf-token", b"")
+        let resp = render_bots_history(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("render_bots_history should succeed");
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2649,7 +2678,7 @@ mod tests {
         let (_file_dir, bot_dir) = seed_history_file(today, &entries);
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
-        let detail = render_bots_history(&app, "csrf-token", b"")
+        let detail = render_bots_history(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("detail render");
         let detail_html = response_html(detail).await;
@@ -2670,9 +2699,14 @@ mod tests {
             "history page must not embed the stats view: {detail_html}"
         );
 
-        let day = render_bots_stats(&app, "csrf-token", format!("date={today}").as_bytes())
-            .await
-            .expect("stats render for the whole file");
+        let day = render_bots_stats(
+            &app,
+            "csrf-token",
+            format!("date={today}").as_bytes(),
+            Lang::En,
+        )
+        .await
+        .expect("stats render for the whole file");
         let day_html = response_html(day).await;
         assert!(
             !day_html.contains("By bot") && !day_html.contains("Needs attention"),
@@ -2688,7 +2722,7 @@ mod tests {
         );
 
         let query = format!("date={today}&host=a.com");
-        let stats = render_bots_stats(&app, "csrf-token", query.as_bytes())
+        let stats = render_bots_stats(&app, "csrf-token", query.as_bytes(), Lang::En)
             .await
             .expect("stats render");
         let html = response_html(stats).await;
@@ -2778,7 +2812,7 @@ mod tests {
         );
 
         let narrowed = format!("date={today}&host=a.com&bot=googlebot");
-        let filtered = render_bots_stats(&app, "csrf-token", narrowed.as_bytes())
+        let filtered = render_bots_stats(&app, "csrf-token", narrowed.as_bytes(), Lang::En)
             .await
             .expect("bot path-detail render");
         let filtered_html = response_html(filtered).await;
@@ -2811,7 +2845,7 @@ mod tests {
         );
 
         let nested = format!("date={today}&host=a.com&path=%2Fgone&from=googlebot");
-        let nested_page = render_bots_stats(&app, "csrf-token", nested.as_bytes())
+        let nested_page = render_bots_stats(&app, "csrf-token", nested.as_bytes(), Lang::En)
             .await
             .expect("path opened from a bot");
         let nested_html = response_html(nested_page).await;
@@ -2828,7 +2862,7 @@ mod tests {
         );
 
         let path_drill = format!("date={today}&host=a.com&path=%2Fx");
-        let path_page = render_bots_stats(&app, "csrf-token", path_drill.as_bytes())
+        let path_page = render_bots_stats(&app, "csrf-token", path_drill.as_bytes(), Lang::En)
             .await
             .expect("path bot-detail render");
         let path_html = response_html(path_page).await;
@@ -2864,6 +2898,7 @@ mod tests {
             &app,
             "csrf-token",
             b"view=stats&date=2026-10-01&host=a.com&bot=Googlebot",
+            Lang::En,
         )
         .await
         .expect("redirect");
@@ -2906,7 +2941,7 @@ mod tests {
         // Googlebot on host `a.com` cover the three a.com paths;
         // the URL for `/` must point at History with `exact=1`.
         let stats_query = format!("date={today}&host=a.com&bot=Googlebot");
-        let stats = render_bots_stats(&app, "csrf-token", stats_query.as_bytes())
+        let stats = render_bots_stats(&app, "csrf-token", stats_query.as_bytes(), Lang::En)
             .await
             .expect("stats render");
         let stats_html = response_html(stats).await;
@@ -2956,7 +2991,7 @@ mod tests {
             .map(|(_, q)| q)
             .unwrap_or("")
             .replace("&amp;", "&");
-        let resp = render_bots_history(&app, "csrf-token", query.as_bytes())
+        let resp = render_bots_history(&app, "csrf-token", query.as_bytes(), Lang::En)
             .await
             .expect("history render");
         let html = response_html(resp).await;
@@ -2989,7 +3024,7 @@ mod tests {
         let (_file_dir, bot_dir) = seed_history_file(today, &entries);
         let (_app_dir, app) = make_test_app_with_bot_dir(bot_dir);
 
-        let resp = render_bots_history(&app, "csrf-token", b"host=a&path=/")
+        let resp = render_bots_history(&app, "csrf-token", b"host=a&path=/", Lang::En)
             .await
             .expect("history render");
         let html = response_html(resp).await;
@@ -3128,7 +3163,7 @@ mod tests {
     #[tokio::test]
     async fn render_referers_with_empty_stats_returns_valid_html() {
         let (_dir, app) = make_test_app();
-        let resp = render_referers(&app, "csrf-token", b"")
+        let resp = render_referers(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("render_referers should succeed");
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -3160,7 +3195,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let referer_dir = dir.path().join("referers");
         let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
-        let resp = render_referers_history(&app, "csrf-token", b"")
+        let resp = render_referers_history(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("history render");
         assert_eq!(resp.status(), http::StatusCode::OK);
@@ -3193,9 +3228,14 @@ mod tests {
             ],
         );
 
-        let resp = render_referers_history(&app, "csrf-token", b"referer_host=news.example.org")
-            .await
-            .expect("history render");
+        let resp = render_referers_history(
+            &app,
+            "csrf-token",
+            b"referer_host=news.example.org",
+            Lang::En,
+        )
+        .await
+        .expect("history render");
         let html = response_html(resp).await;
         assert!(html.contains("news.example.org"), "row missing: {html}");
         assert!(
@@ -3222,7 +3262,7 @@ mod tests {
             ],
         );
 
-        let resp = render_referers_stats(&app, "csrf-token", b"")
+        let resp = render_referers_stats(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("stats render");
         let html = response_html(resp).await;
@@ -3274,7 +3314,7 @@ mod tests {
         // Stats: the site scope keeps the two rows that belong to
         // `web` and drops the `shop` one — and the two remaining
         // rows land in ONE referrer row (2 hits), not two.
-        let resp = render_referers_stats(&app, "csrf-token", b"site=web")
+        let resp = render_referers_stats(&app, "csrf-token", b"site=web", Lang::En)
             .await
             .expect("stats render");
         let html = response_html(resp).await;
@@ -3297,7 +3337,7 @@ mod tests {
         );
 
         // History: the site scope keeps the rows of either domain.
-        let resp = render_referers_history(&app, "csrf-token", b"site=web")
+        let resp = render_referers_history(&app, "csrf-token", b"site=web", Lang::En)
             .await
             .expect("history render");
         let html = response_html(resp).await;
@@ -3319,19 +3359,19 @@ mod tests {
 
         for html in [
             response_html(
-                render_referers(&app, "csrf-token", b"")
+                render_referers(&app, "csrf-token", b"", Lang::En)
                     .await
                     .expect("live render"),
             )
             .await,
             response_html(
-                render_referers_history(&app, "csrf-token", b"")
+                render_referers_history(&app, "csrf-token", b"", Lang::En)
                     .await
                     .expect("history render"),
             )
             .await,
             response_html(
-                render_referers_stats(&app, "csrf-token", b"")
+                render_referers_stats(&app, "csrf-token", b"", Lang::En)
                     .await
                     .expect("stats render"),
             )
@@ -3379,7 +3419,7 @@ mod tests {
 
         // "All sites" — every row is in scope, including the one
         // that landed on the other site.
-        let resp = render_referers(&app, "csrf-token", b"")
+        let resp = render_referers(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("live render");
         let html = response_html(resp).await;
@@ -3393,7 +3433,7 @@ mod tests {
         );
 
         // A selected site narrows the scope to that site's domains.
-        let resp = render_referers(&app, "csrf-token", b"site=web")
+        let resp = render_referers(&app, "csrf-token", b"site=web", Lang::En)
             .await
             .expect("live render");
         let html = response_html(resp).await;
@@ -3505,7 +3545,7 @@ mod tests {
         app.push_referer_log(&entry, &hit);
 
         // No site selected → every row is in scope.
-        let resp = render_referers(&app, "csrf-token", b"")
+        let resp = render_referers(&app, "csrf-token", b"", Lang::En)
             .await
             .expect("live render");
         let html = response_html(resp).await;
@@ -3515,7 +3555,7 @@ mod tests {
         );
 
         // An unknown site → no row is in scope.
-        let resp = render_referers(&app, "csrf-token", b"site=nosuchsite")
+        let resp = render_referers(&app, "csrf-token", b"site=nosuchsite", Lang::En)
             .await
             .expect("live render");
         let html = response_html(resp).await;
@@ -3535,9 +3575,10 @@ mod tests {
         let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
         seed_site_with_domains(&app, "web", &["example.com"]).await;
 
-        let resp = render_referers_history(&app, "csrf-token", b"site=web&referer_host=news")
-            .await
-            .expect("history render");
+        let resp =
+            render_referers_history(&app, "csrf-token", b"site=web&referer_host=news", Lang::En)
+                .await
+                .expect("history render");
         let html = response_html(resp).await;
         assert!(
             html.contains("/logs/referers/stats?date=") && html.contains("site=web"),
@@ -3548,9 +3589,10 @@ mod tests {
             "the history→stats link must keep the other filters: {html}"
         );
 
-        let resp = render_referers_stats(&app, "csrf-token", b"site=web&referer_host=news")
-            .await
-            .expect("stats render");
+        let resp =
+            render_referers_stats(&app, "csrf-token", b"site=web&referer_host=news", Lang::En)
+                .await
+                .expect("stats render");
         let html = response_html(resp).await;
         assert!(
             html.contains("/logs/referers/history?date=") && html.contains("site=web"),
@@ -3579,9 +3621,10 @@ mod tests {
             ],
         );
 
-        let resp = render_referers_stats(&app, "csrf-token", b"date=2026-10-01&status=404")
-            .await
-            .expect("stats render");
+        let resp =
+            render_referers_stats(&app, "csrf-token", b"date=2026-10-01&status=404", Lang::En)
+                .await
+                .expect("stats render");
         let html = response_html(resp).await;
         assert!(
             html.contains("news.example.org"),

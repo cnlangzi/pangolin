@@ -9,11 +9,17 @@ use http_body_util::Full;
 use crate::{App, redirect_response};
 
 use super::pages::render_create_page_with_error;
+use crate::i18n::Lang;
 use crate::routes::helpers::parse_form;
 
 type Resp = Response<Full<Bytes>>;
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let cert_file = params.get("cert_file").cloned().unwrap_or_default();
@@ -29,13 +35,17 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     });
 
     if domain.is_empty() {
-        return render_create_page_with_error("Domain is required", csrf);
+        return render_create_page_with_error(&lang.t("certs.error.domain_required"), csrf, lang);
     }
     if cert_file.is_empty() {
-        return render_create_page_with_error("Certificate file path is required", csrf);
+        return render_create_page_with_error(
+            &lang.t("certs.error.cert_file_required"),
+            csrf,
+            lang,
+        );
     }
     if key_file.is_empty() {
-        return render_create_page_with_error("Key file path is required", csrf);
+        return render_create_page_with_error(&lang.t("certs.error.key_file_required"), csrf, lang);
     }
 
     let c = pangolin_core::types::Cert {
@@ -78,7 +88,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
 
     match result {
         Ok(()) => Ok(redirect_response("/certs")),
-        Err(e) => render_create_page_with_error(&format!("Database error: {}", e), csrf),
+        Err(e) => render_create_page_with_error(&format!("Database error: {}", e), csrf, lang),
     }
 }
 
@@ -90,6 +100,7 @@ pub async fn handle_delete(
     app: &Arc<App>,
     domain: Option<String>,
     _csrf: &str,
+    _lang: Lang,
 ) -> http::Result<Resp> {
     if let Some(d) = domain
         && !d.is_empty()
@@ -114,9 +125,14 @@ pub async fn handle_delete(
 /// This is the unified delete endpoint for certs; the form-POST
 /// `/certs/delete` route above is kept for now as a fallback during the
 /// migration window (issue #48).
-pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    domain: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if domain.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_cert(&db, &domain);
@@ -151,7 +167,12 @@ pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> h
 /// the operator's browser doesn't hang. The status row is updated
 /// asynchronously by the spawned task; the UI converges on the next
 /// page load (or the future htmx auto-refresh).
-pub async fn handle_retry(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
+pub async fn handle_retry(
+    app: &Arc<App>,
+    body: &[u8],
+    _csrf: &str,
+    _lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     if domain.is_empty() {

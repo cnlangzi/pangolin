@@ -166,3 +166,33 @@ than asking the route handler to pre-format strings.
    - `<resource>_hx_delete_no_csrf_forbidden` — missing CSRF → 403.
 7. Keep the legacy form-POST endpoint as a fallback and add a
    `// NOTE: legacy form-POST …` comment on its handler.
+## Interface text comes from the i18n catalog
+
+Every operator-facing string — visible text, `title`, `placeholder`,
+`aria-label`, `hx-confirm` — comes from the language catalog, not
+from the template:
+
+```html
+<a href="/sites">{{ lang.t("nav.sites") }}</a>
+<button hx-confirm="{{ lang.tf("sites.delete.confirm", [("name", site.name.as_str())]) }}">
+  Delete
+</button>
+```
+
+Adding a string takes three steps:
+
+1. add the key to `crates/admin/i18n/en.json` with the English text,
+2. reference it in the template with `lang.t()` / `lang.tf()`,
+3. add the translation to every catalog that is not empty.
+
+Technical identifiers stay in the template — `DNS`, `ACME`, `HTTP-01`,
+status codes, provider keys, file paths, host names.
+
+A template struct needs a `pub lang: Lang` field, and the route
+handler that builds it needs a `lang: Lang` parameter that it passes
+on. The catalog gate tests
+(`cargo test -p admin --lib i18n`) fail when a key is referenced but
+missing, or present but never referenced.
+
+See [the i18n guide](./i18n.md) for the key shape, the area list, the
+fallback rules, and the language switcher.

@@ -5,7 +5,7 @@
 <div id="bots-stats-panel">
   {% if let Some(msg) = stats.error %}
     <div class="mb-4 px-4 py-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-200">
-      <strong class="font-semibold">Query failed:</strong> {{ msg }}
+      <strong class="font-semibold">{{ lang.t("bots.query_failed") }}</strong> {{ msg }}
     </div>
   {% endif %}
 
@@ -13,10 +13,10 @@
   <div class="card overflow-hidden mb-6">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          Hosts in this file
+          {{ lang.t("bots.hosts_in_file") }}
         </h2>
         <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-          File <span class="font-mono">{{ filter.date }}</span>
+          {{ lang.t("bots.file_label") }} <span class="font-mono">{{ filter.date }}</span>
           {% if stats.file_bytes > 0 %}
             · {{ stats.file_size_human() }}
           {% endif %}
@@ -26,15 +26,15 @@
         <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Bots</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.host") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("bots.col.bots") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.hosts.is_empty() %}
               <tr>
-                <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400">No bot hits in this file.</td>
+                <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_hits_in_file") }}</td>
               </tr>
             {% else %}
               {% for h in stats.hosts %}
@@ -65,7 +65,7 @@
     <div class="card overflow-hidden">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          Bots
+          {{ lang.t("bots.col.bots_title") }}
           <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.path }}</span>
           {% if !filter.host.is_empty() %}
             <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
@@ -73,25 +73,25 @@
         </h2>
         {% if !filter.host.is_empty() %}
           <a href="{{ stats.clear_host_page_url }}"
-             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("bots.all_hosts") }}</a>
         {% endif %}
       </div>
       <div class="overflow-x-auto scrollbar-thin">
         <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Last seen</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Entries</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.bot") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("bots.col.vendor") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.last_status") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.last_seen") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.entries_col") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.bots.is_empty() %}
               <tr>
-                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No bots hit this path.</td>
+                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_bots_hit_path") }}</td>
               </tr>
             {% else %}
               {% for b in stats.bots %}
@@ -105,7 +105,7 @@
                 <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ b.last_status }}</td>
                 <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400 font-mono text-xs">{{ b.last_seen }}</td>
                 <td class="px-4 py-2 text-right">
-                  <a href="{{ b.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">entries</a>
+                  <a href="{{ b.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("bots.entries_link") }}</a>
                 </td>
               </tr>
               {% endfor %}
@@ -118,7 +118,7 @@
     <div class="card overflow-hidden">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          Paths
+          {{ lang.t("bots.paths_title") }}
           <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.bot_name }}</span>
           {% if !filter.host.is_empty() %}
             <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
@@ -126,19 +126,19 @@
         </h2>
         {% if !filter.host.is_empty() %}
           <a href="{{ stats.clear_host_page_url }}"
-             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+             class="text-xs text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("bots.all_hosts") }}</a>
         {% endif %}
       </div>
       <p class="px-4 py-2 text-xs text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700 tabular-nums">
         {% if stats.url_total == 0 %}
-          No paths.
+          {{ lang.t("bots.no_paths") }}
         {% else if stats.urls.len() < stats.url_total %}
-          Showing {{ stats.urls.len() }} of {{ stats.url_total }} paths, by hit count.
+          {{ lang.tf("bots.paths_showing", [("n", stats.urls.len()), ("total", stats.url_total)]) }}
         {% else %}
-          {{ stats.url_total }} paths.
+          {{ lang.tf("bots.paths_total", [("n", stats.url_total)]) }}
         {% endif %}
         {% if stats.urls_capped %}
-          Path list is capped; hit counts above are complete.
+          {{ lang.t("bots.paths_capped") }}
         {% endif %}
       </p>
       <div class="overflow-x-auto scrollbar-thin">
@@ -146,18 +146,18 @@
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
               {% if filter.host.is_empty() %}
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.host") }}</th>
               {% endif %}
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Entries</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.path") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.last_status") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.entries_col") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.urls.is_empty() %}
               <tr>
-                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths for this bot.</td>
+                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_paths_for_bot") }}</td>
               </tr>
             {% else %}
               {% for u in stats.urls %}
@@ -172,7 +172,7 @@
                 <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.hits }}</td>
                 <td class="px-4 py-2 text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ u.last_status }}</td>
                 <td class="px-4 py-2 text-right">
-                  <a href="{{ u.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">entries</a>
+                  <a href="{{ u.entries_url }}" class="text-xs text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("bots.entries_link") }}</a>
                 </td>
               </tr>
               {% endfor %}
@@ -184,20 +184,20 @@
     {% else if !filter.host.is_empty() %}
     <div id="bots-stats-summary" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
       <div class="card px-4 py-3">
-        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Crawl</p>
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.crawl") }}</p>
         {% if stats.focus.bot_name.is_empty() %}
-          <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">No bot hits.</p>
+          <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_bot_hits") }}</p>
         {% else %}
           <p id="stats-focus" class="mt-1 text-sm text-slate-800 dark:text-slate-100">
             <span class="font-semibold">{{ stats.focus.bot_name }}</span>
-            · {{ stats.focus.hits }} hits
-            · {{ stats.focus.unique_urls }} URLs
-            · last {{ stats.focus.last_status }}
+            {{ lang.tf("bots.focus_hits", [("n", stats.focus.hits)]) }}
+            {{ lang.tf("bots.focus_urls", [("n", stats.focus.unique_urls)]) }}
+            {{ lang.tf("bots.focus_last", [("status", stats.focus.last_status)]) }}
           </p>
         {% endif %}
       </div>
       <div class="card px-4 py-3">
-        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Last status</p>
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.last_status") }}</p>
         <p class="mt-1 text-sm text-slate-700 dark:text-slate-200 tabular-nums">
           404 <span id="stats-404">{{ stats.paths_404 }}</span>
           · 301 <span id="stats-301">{{ stats.paths_301 }}</span>
@@ -205,13 +205,13 @@
         </p>
       </div>
       <div class="card px-4 py-3">
-        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Crawl files</p>
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.crawl_files") }}</p>
         <p id="stats-robots" class="mt-1 text-sm font-mono text-slate-700 dark:text-slate-200">
           {% if stats.robots.seen %}
             <a href="{{ stats.robots.page_url }}" class="text-accent-600 dark:text-accent-400 hover:underline">/robots.txt</a>
             · {{ stats.robots.last_status }}
           {% else %}
-            /robots.txt · not seen
+            /robots.txt {{ lang.t("bots.not_seen") }}
           {% endif %}
         </p>
         <p id="stats-sitemap" class="text-sm font-mono text-slate-700 dark:text-slate-200">
@@ -219,7 +219,7 @@
             <a href="{{ stats.sitemap.page_url }}" class="text-accent-600 dark:text-accent-400 hover:underline">/sitemap.xml</a>
             · {{ stats.sitemap.last_status }}
           {% else %}
-            /sitemap.xml · not seen
+            /sitemap.xml {{ lang.t("bots.not_seen") }}
           {% endif %}
         </p>
       </div>
@@ -228,19 +228,19 @@
     <div class="card overflow-hidden mb-6">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          By bot
+          {{ lang.t("bots.by_bot") }}
           {% if !filter.host.is_empty() %}
             <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
           {% endif %}
         </h2>
         {% if !filter.host.is_empty() %}
           <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-            File <span class="font-mono">{{ filter.date }}</span>
+            {{ lang.t("bots.file_label") }} <span class="font-mono">{{ filter.date }}</span>
             {% if stats.file_bytes > 0 %}
               · {{ stats.file_size_human() }}
             {% endif %}
             <a href="{{ stats.clear_host_page_url }}"
-               class="ml-2 text-accent-600 dark:text-accent-400 hover:underline">All hosts</a>
+               class="ml-2 text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("bots.all_hosts") }}</a>
           </p>
         {% endif %}
       </div>
@@ -248,18 +248,18 @@
         <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">URLs</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Last seen</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.bot") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("bots.col.vendor") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("bots.col.urls") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.last_status") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.last_seen") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.bots.is_empty() %}
               <tr>
-                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No bot hits for this selection.</td>
+                <td colspan="6" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_bot_hits_selection") }}</td>
               </tr>
             {% else %}
               {% for b in stats.bots %}
@@ -284,7 +284,7 @@
     <div class="card overflow-hidden mb-6">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          Needs attention
+          {{ lang.t("bots.needs_attention") }}
           <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
         </h2>
       </div>
@@ -292,16 +292,16 @@
         <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bots</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.path") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("bots.col.bots") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.last_status") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.attention.is_empty() %}
               <tr>
-                <td colspan="4" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths need attention.</td>
+                <td colspan="4" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_paths_need_attention") }}</td>
               </tr>
             {% else %}
               {% for u in stats.attention %}
@@ -324,21 +324,21 @@
     <div class="card overflow-hidden">
       <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
         <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          By path
+          {{ lang.t("bots.by_path") }}
           {% if !filter.host.is_empty() %}
             <span class="font-normal text-slate-500 dark:text-slate-400">· {{ filter.host }}</span>
           {% endif %}
         </h2>
         <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
           {% if stats.healthy_total == 0 %}
-            No paths.
+            {{ lang.t("bots.no_paths") }}
           {% else if stats.urls.len() < stats.healthy_total %}
-            Showing {{ stats.urls.len() }} of {{ stats.healthy_total }} paths, by hit count.
+            {{ lang.tf("bots.paths_showing", [("n", stats.urls.len()), ("total", stats.healthy_total)]) }}
           {% else %}
-            {{ stats.healthy_total }} paths.
+            {{ lang.tf("bots.paths_total", [("n", stats.healthy_total)]) }}
           {% endif %}
           {% if stats.urls_capped %}
-            Path list is capped; bot hit counts above are complete.
+            {{ lang.t("bots.paths_capped_bots") }}
           {% endif %}
         </p>
       </div>
@@ -347,18 +347,18 @@
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
               {% if filter.host.is_empty() %}
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.host") }}</th>
               {% endif %}
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Path</th>
-              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bots</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Last status</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.path") }}</th>
+              <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("bots.col.bots") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+              <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.last_status") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-sm">
             {% if stats.urls.is_empty() %}
               <tr>
-                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">No paths for this selection.</td>
+                <td colspan="{% if filter.host.is_empty() %}5{% else %}4{% endif %}" class="px-4 py-6 text-center text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_paths_selection") }}</td>
               </tr>
             {% else %}
               {% for u in stats.urls %}

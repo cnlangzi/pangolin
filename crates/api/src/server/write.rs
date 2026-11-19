@@ -48,18 +48,24 @@ pub async fn create_site(ctx: &Ctx<'_>) -> ApiResponse {
     let name = dto.name.clone().unwrap_or_default();
     let global_provider = ctx.state.app.system_config.read().await.provider;
     let params = dto.to_params();
-    let parsed =
-        match admin::routes::sites::helpers::parse_site_form(&params, &name, None, global_provider)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                return ApiResponse::error(&ApiError::unprocessable(
-                    site_form_code(&e),
-                    e.message.clone(),
-                    e.field,
-                ));
-            }
-        };
+    let parsed = match admin::routes::sites::helpers::parse_site_form(
+        &params,
+        &name,
+        None,
+        global_provider,
+        // The API is a machine-facing surface: its JSON error
+        // bodies stay in English.
+        admin::i18n::Lang::En,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiResponse::error(&ApiError::unprocessable(
+                site_form_code(&e),
+                e.message.clone(),
+                e.field,
+            ));
+        }
+    };
 
     {
         let db = ctx.state.app.db.lock().await;
@@ -126,6 +132,9 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         name,
         stored_policy.as_ref(),
         global_provider,
+        // The API is a machine-facing surface: its JSON error bodies
+        // stay in English.
+        admin::i18n::Lang::En,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -221,11 +230,19 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
     let params = dto.to_params();
     let parsed = {
         let db = ctx.state.app.db.lock().await;
-        admin::routes::domains::mutate::parse_domain_form(&params, &domain, None, &|name| {
-            pangolin_core::db::get_dns_provider(&db, name)
-                .unwrap_or(None)
-                .is_some()
-        })
+        admin::routes::domains::mutate::parse_domain_form(
+            &params,
+            &domain,
+            None,
+            &|name| {
+                pangolin_core::db::get_dns_provider(&db, name)
+                    .unwrap_or(None)
+                    .is_some()
+            },
+            // The API is a machine-facing surface: its JSON error
+            // bodies stay in English.
+            admin::i18n::Lang::En,
+        )
     };
     let parsed = match parsed {
         Ok(p) => p,
@@ -292,6 +309,9 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
                     .unwrap_or(None)
                     .is_some()
             },
+            // The API is a machine-facing surface: its JSON error
+            // bodies stay in English.
+            admin::i18n::Lang::En,
         )
     };
     let parsed = match parsed {
@@ -343,7 +363,14 @@ pub async fn create_dns_provider(ctx: &Ctx<'_>) -> ApiResponse {
     };
     let name = dto.name.clone().unwrap_or_default();
     let params = dto.to_params();
-    let parsed = match admin::routes::dns::mutate::parse_dns_provider_form(&params, &name, None) {
+    let parsed = match admin::routes::dns::mutate::parse_dns_provider_form(
+        &params,
+        &name,
+        None,
+        // The API is a machine-facing surface: its JSON error bodies
+        // stay in English.
+        admin::i18n::Lang::En,
+    ) {
         Ok(p) => p,
         Err(msg) => {
             return ApiResponse::error(&ApiError::unprocessable("dns_provider_invalid", msg, None));
@@ -394,17 +421,19 @@ pub async fn update_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         ));
     };
     let params = dto.to_params();
-    let parsed =
-        match admin::routes::dns::mutate::parse_dns_provider_form(&params, name, Some(&existing)) {
-            Ok(p) => p,
-            Err(msg) => {
-                return ApiResponse::error(&ApiError::unprocessable(
-                    "dns_provider_invalid",
-                    msg,
-                    None,
-                ));
-            }
-        };
+    let parsed = match admin::routes::dns::mutate::parse_dns_provider_form(
+        &params,
+        name,
+        Some(&existing),
+        // The API is a machine-facing surface: its JSON error
+        // bodies stay in English.
+        admin::i18n::Lang::En,
+    ) {
+        Ok(p) => p,
+        Err(msg) => {
+            return ApiResponse::error(&ApiError::unprocessable("dns_provider_invalid", msg, None));
+        }
+    };
     let provider = pangolin_core::types::DnsProvider {
         name: parsed.name,
         kind: parsed.kind,
@@ -449,7 +478,14 @@ pub async fn create_tun(ctx: &Ctx<'_>) -> ApiResponse {
         Ok(p) => p,
         Err(e) => return ApiResponse::error(&e),
     };
-    let parsed = match admin::routes::tun::mutate::parse_tun_form(&params, &name, None) {
+    let parsed = match admin::routes::tun::mutate::parse_tun_form(
+        &params,
+        &name,
+        None,
+        // The API is a machine-facing surface: its JSON error bodies
+        // stay in English.
+        admin::i18n::Lang::En,
+    ) {
         Ok(p) => p,
         Err(msg) => {
             return ApiResponse::error(&ApiError::unprocessable("tun_invalid", msg, None));
@@ -526,7 +562,14 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         Ok(p) => p,
         Err(e) => return ApiResponse::error(&e),
     };
-    let parsed = match admin::routes::tun::mutate::parse_tun_form(&params, name, Some(&tun)) {
+    let parsed = match admin::routes::tun::mutate::parse_tun_form(
+        &params,
+        name,
+        Some(&tun),
+        // The API is a machine-facing surface: its JSON error bodies
+        // stay in English.
+        admin::i18n::Lang::En,
+    ) {
         Ok(p) => p,
         Err(msg) => {
             return ApiResponse::error(&ApiError::unprocessable("tun_invalid", msg, None));
@@ -593,7 +636,13 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
                 admin::routes::ratelimit::IpRuleFormError::InvalidCidr => "ip_rule_cidr_invalid",
                 admin::routes::ratelimit::IpRuleFormError::UnknownScope => "ip_rule_scope_invalid",
             };
-            return ApiResponse::error(&ApiError::unprocessable(code, e.message(), None));
+            return ApiResponse::error(&ApiError::unprocessable(
+                code,
+                // The API is a machine-facing surface: its JSON error
+                // bodies stay in English.
+                e.message(admin::i18n::Lang::En),
+                None,
+            ));
         }
     };
     {
@@ -737,7 +786,9 @@ pub async fn put_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
     };
     let mut params = crate::dto::write::Params::new();
     dto.write_params(&mut params);
-    let parsed = admin::routes::provider::parse_site_provider(&params);
+    // The API is a machine-facing surface: its JSON error bodies stay
+    // in English.
+    let parsed = admin::routes::provider::parse_site_provider(&params, admin::i18n::Lang::En);
     if let Some(msg) = &parsed.error {
         return ApiResponse::error(&ApiError::unprocessable(
             "provider_invalid",

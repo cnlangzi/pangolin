@@ -277,12 +277,16 @@ pub async fn get_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
 /// `GET /api/v1/providers` — the provider registry and the state of
 /// every provider's range list.
 pub async fn get_providers(ctx: &Ctx<'_>) -> ApiResponse {
-    let statuses = admin::routes::provider::provider_range_statuses(&ctx.state.app).await;
+    // The API is a machine-facing surface: its JSON bodies stay in
+    // English.
+    let statuses =
+        admin::routes::provider::provider_range_statuses(&ctx.state.app, admin::i18n::Lang::En)
+            .await;
     let views = statuses
         .into_iter()
         .map(|s| ProviderStatusView {
             key: s.key.as_str().to_string(),
-            label: s.label,
+            label: pangolin_core::provider::spec(s.key).label,
             description: pangolin_core::provider::spec(s.key).description,
             range_count: s.range_count,
             fetched_at: s.fetched_at,

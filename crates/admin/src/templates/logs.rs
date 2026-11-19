@@ -32,6 +32,8 @@
 //! rollups.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use chrono::NaiveDate;
 use pangolin_core::bot::BotVerificationHealth;
 use pangolin_core::bot_log::BotLogEntry;
@@ -66,6 +68,8 @@ pub struct LogsTemplate<'a> {
     pub csrf_token: String,
     /// Active-nav token. `"logs"` highlights the Logs nav link.
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Full-page template for `GET /logs/bots` (searchenginebots
@@ -109,6 +113,8 @@ pub struct BotLogsTemplate<'a> {
     /// traffic never reaches this page — the panel is what tells the
     /// operator "the crawler is real, our list is not".
     pub health: BotVerificationHealth,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Echo of the current filter form values, so the page can
@@ -256,6 +262,8 @@ pub struct BotLogsHistoryTemplate<'a> {
     pub summary: BotHistorySummary,
     /// Entries for the current page, newest-first.
     pub entries: Vec<BotLogEntry>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Full-page template for `GET /logs/bots/stats`.
@@ -275,6 +283,8 @@ pub struct BotLogsStatsTemplate<'a> {
     pub date_links: Vec<BotHistoryDateLink>,
     pub filter: BotHistoryFilter,
     pub stats: BotHistoryStatsPage,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// One UTC log file in the history date sidebar.
@@ -583,6 +593,8 @@ pub struct RefererLogsTemplate<'a> {
     /// but the scope is still *on* — the page then shows no rows
     /// rather than every site's rows.
     pub site_scoped: bool,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl RefererLogsTemplate<'_> {
@@ -625,6 +637,8 @@ pub struct RefererLogsHistoryTemplate<'a> {
     /// Link to the same day's rollup on the stats page, with every
     /// current filter (including the site scope) carried over.
     pub stats_url: String,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Full-page template for `GET /logs/referers/stats`.
@@ -650,6 +664,8 @@ pub struct RefererLogsStatsTemplate<'a> {
     /// Link to the same day's raw rows on the history page, with every
     /// current filter (including the site scope) carried over.
     pub history_url: String,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl RefererLogsStatsTemplate<'_> {

@@ -22,6 +22,7 @@ use pangolin_core::cidr::CidrSet;
 use pangolin_core::provider::{GlobalProviderConfig, ProviderKey, SiteProviderOverride, spec};
 
 use crate::App;
+use crate::i18n::Lang;
 
 /// How many refresh intervals a range list may be old before the
 /// admin UI marks it stale.
@@ -36,8 +37,8 @@ pub const STALE_INTERVALS: u32 = 3;
 pub struct ProviderRangeStatus {
     /// The provider.
     pub key: ProviderKey,
-    /// The display label of the provider.
-    pub label: &'static str,
+    /// The display label of the provider, in the operator's language.
+    pub label: String,
     /// The number of ranges currently in force (the in-memory set).
     pub range_count: usize,
     /// When the list was last fetched, RFC-3339.
@@ -59,7 +60,7 @@ pub struct ProviderRangeStatus {
 /// A provider that publishes no list (or whose list was never
 /// fetched) is still listed — the operator has to be able to see that
 /// the guard would have nothing to work with.
-pub async fn provider_range_statuses(app: &Arc<App>) -> Vec<ProviderRangeStatus> {
+pub async fn provider_range_statuses(app: &Arc<App>, lang: Lang) -> Vec<ProviderRangeStatus> {
     let stored = {
         let db = app.db.lock().await;
         pangolin_core::db::list_provider_ip_lists(&db).unwrap_or_default()
@@ -109,7 +110,7 @@ pub async fn provider_range_statuses(app: &Arc<App>) -> Vec<ProviderRangeStatus>
                 .unwrap_or(false);
             ProviderRangeStatus {
                 key,
-                label: spec(key).label,
+                label: provider_label(lang, key),
                 range_count,
                 fetched_at: fetched_at.map(|t| t.to_rfc3339()),
                 status,
@@ -184,7 +185,7 @@ pub struct SubmittedProvider {
 ///
 /// A malformed CIDR is reported with a message naming the offending
 /// value; nothing is stored when the parse fails.
-pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
+pub fn parse_site_provider(params: &HashMap<String, String>, lang: Lang) -> ParsedProvider {
     const FIELDS: [&str; 6] = [
         "provider",
         "client_ip_header",
@@ -204,9 +205,12 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
                 return ParsedProvider {
                     over: None,
                     manual_ranges: Vec::new(),
-                    error: Some(format!(
-                        "Invalid provider '{raw}'. Expected one of: {}.",
-                        expected_providers()
+                    error: Some(lang.tf(
+                        "sites.error.invalid_provider",
+                        [
+                            ("provider", raw.to_string()),
+                            ("expected", expected_providers()),
+                        ],
                     )),
                     present,
                     origin_allow_present,
@@ -224,8 +228,9 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
             return ParsedProvider {
                 over: None,
                 manual_ranges: Vec::new(),
-                error: Some(format!(
-                    "Invalid origin_guard '{other}'. Expected inherit, off or on."
+                error: Some(lang.tf(
+                    "sites.error.invalid_origin_guard",
+                    [("value", other.to_string())],
                 )),
                 present,
                 origin_allow_present,
@@ -246,7 +251,10 @@ pub fn parse_site_provider(params: &HashMap<String, String>) -> ParsedProvider {
                 Ok(normalized) => manual_ranges.push(normalized),
                 Err(e) => {
                     if error.is_none() {
-                        error = Some(format!("Invalid source range: {e}"));
+                        error = Some(lang.tf(
+                            "sites.error.invalid_source_range",
+                            [("error", e.to_string())],
+                        ));
                     }
                 }
             }
@@ -348,17 +356,46 @@ pub fn provider_range_count(app: &Arc<App>, key: ProviderKey) -> usize {
         .unwrap_or(0)
 }
 
+/// The label of a provider, in the operator's language.
+///
+/// The match is exhaustive over [`ProviderKey`], so a provider added
+/// to the registry has to get a label in the catalog and the compiler
+/// says so right here — instead of the operator seeing a raw registry
+/// key in the dropdown.
+pub fn provider_label(lang: Lang, key: ProviderKey) -> String {
+    match key {
+        ProviderKey::Direct => lang.t("common.provider.direct.label").into_owned(),
+        ProviderKey::Cloudflare => lang.t("common.provider.cloudflare.label").into_owned(),
+        ProviderKey::CustomLb => lang.t("common.provider.custom_lb.label").into_owned(),
+    }
+}
+
+/// The description of a provider, in the operator's language.
+///
+/// The wording is the admin UI's own, so it comes from the catalog
+/// rather than from the provider registry — the registry speaks for
+/// the gateway, the catalog for the operator.
+pub fn provider_description(lang: Lang, key: ProviderKey) -> String {
+    match key {
+        ProviderKey::Direct => lang.t("common.provider.direct.description").into_owned(),
+        ProviderKey::Cloudflare => lang
+            .t("common.provider.cloudflare.description")
+            .into_owned(),
+        ProviderKey::CustomLb => lang.t("common.provider.custom_lb.description").into_owned(),
+    }
+}
+
 /// Every provider of the registry, as the site form's dropdown shows
 /// them.
-pub fn provider_options() -> Vec<crate::templates::ProviderOption> {
+pub fn provider_options(lang: Lang) -> Vec<crate::templates::ProviderOption> {
     ProviderKey::all()
         .iter()
         .map(|key| {
-            let spec = spec(*key);
+            let key = *key;
             crate::templates::ProviderOption {
-                key: spec.key.as_str(),
-                label: spec.label,
-                description: spec.description,
+                key: key.as_str(),
+                label: provider_label(lang, key),
+                description: provider_description(lang, key),
             }
         })
         .collect()
@@ -525,7 +562,7 @@ mod tests {
         // An API client that predates the feature must keep working:
         // no field → the site's configuration is left alone.
         let params = form(&[("name", "site")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         assert!(!parsed.present);
         assert!(parsed.error.is_none());
         assert!(parsed.over.is_none());
@@ -534,7 +571,7 @@ mod tests {
     #[test]
     fn the_provider_select_is_parsed() {
         let params = form(&[("provider", "cloudflare")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         assert!(parsed.present);
         assert!(parsed.error.is_none());
         let over = parsed.over.expect("an override");
@@ -545,7 +582,7 @@ mod tests {
     #[test]
     fn an_empty_provider_means_inherit() {
         let params = form(&[("provider", "")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         assert!(parsed.error.is_none());
         // Nothing is overridden → no row is written.
         assert!(parsed.over.is_none());
@@ -554,7 +591,7 @@ mod tests {
     #[test]
     fn an_unknown_provider_is_reported_with_the_registry_list() {
         let params = form(&[("provider", "fastly")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         let err = parsed.error.expect("an error");
         assert!(err.contains("fastly"), "{err}");
         assert!(err.contains("direct"), "{err}");
@@ -570,7 +607,7 @@ mod tests {
             ("on", Some(true)),
         ] {
             let params = form(&[("origin_guard", raw)]);
-            let parsed = parse_site_provider(&params);
+            let parsed = parse_site_provider(&params, Lang::En);
             assert!(parsed.error.is_none(), "{:?}", parsed.error);
             assert_eq!(
                 parsed.over.and_then(|o| o.origin_guard_enabled),
@@ -583,7 +620,7 @@ mod tests {
     #[test]
     fn the_manual_ranges_are_normalised_and_a_malformed_one_is_reported() {
         let params = form(&[("origin_allow", "203.0.113.0/24\n\n10.0.0.1\n")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         assert!(parsed.error.is_none(), "{:?}", parsed.error);
         assert_eq!(
             parsed.manual_ranges,
@@ -591,7 +628,7 @@ mod tests {
         );
 
         let params = form(&[("origin_allow", "not-a-cidr")]);
-        let parsed = parse_site_provider(&params);
+        let parsed = parse_site_provider(&params, Lang::En);
         let err = parsed.error.expect("an error");
         assert!(err.contains("not-a-cidr"), "{err}");
     }

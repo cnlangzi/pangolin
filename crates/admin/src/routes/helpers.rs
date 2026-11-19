@@ -11,6 +11,8 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 
+use crate::i18n::Lang;
+
 /// Parse an `application/x-www-form-urlencoded` body into a map.
 ///
 /// The `+` rule of that content type is honoured: `+` in the body
@@ -61,6 +63,30 @@ pub fn redirect(location: &str) -> Response<Full<Bytes>> {
         .header(http::header::LOCATION, location)
         .body(Full::new(Bytes::new()))
         .expect("302 Found response builder should not fail")
+}
+
+/// The 400 page: the operator gets a sentence and a link back to the
+/// list they came from.
+///
+/// The wording comes from the catalog, so the page speaks the
+/// operator's language. The arrow before the link is decoration and
+/// stays as it is.
+pub fn bad_request_page(
+    lang: Lang,
+    message: &str,
+    back_href: &str,
+    back_label: &str,
+) -> Response<Full<Bytes>> {
+    let body = format!(
+        r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">{}</h2><p class="text-red-700 text-sm">{}</p><a href="{}" class="text-sm text-red-700 underline mt-2 inline-block">← {}</a></div></div>"#,
+        lang.t("common.bad_request"),
+        message,
+        back_href,
+        back_label,
+    );
+    let mut resp = Response::new(Full::new(Bytes::from(body)));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
 }
 
 /// Pull a required form-field value out of a form-encoded body.

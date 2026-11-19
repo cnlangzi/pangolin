@@ -19,6 +19,7 @@ use pangolin_core::provider::ProviderKey;
 use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::HostMode;
 
+use crate::i18n::Lang;
 use crate::routes::provider::{ParsedProvider, guard_can_be_enabled, parse_site_provider};
 use crate::routes::ratelimit::{
     CUSTOM_403_FIELD, CUSTOM_429_FIELD, parse_bot_limits, parse_policy,
@@ -185,6 +186,7 @@ pub fn parse_site_form(
     name: &str,
     stored_policy: Option<&RateLimitPolicy>,
     global_provider: ProviderKey,
+    lang: Lang,
 ) -> Result<SiteForm, Box<SiteFormError>> {
     let backend = site_backend_from_form(params);
     let host_mode = params
@@ -195,7 +197,7 @@ pub fn parse_site_form(
 
     // Issue #122: the provider fields (provider, custom header names,
     // the guard tri-state and the manual ranges).
-    let provider = parse_site_provider(params);
+    let provider = parse_site_provider(params, lang);
 
     // Issue #117: the per-site rate-limit policy. A form without any
     // rate-limit field (an API client that predates the feature)
@@ -245,19 +247,19 @@ pub fn parse_site_form(
     } else if name.is_empty() {
         Some((
             SiteFormSection::Field,
-            "Site name is required".to_string(),
+            lang.t("sites.error.name_required").into_owned(),
             Some("name"),
         ))
     } else if backend.is_empty() {
         Some((
             SiteFormSection::Field,
-            "Backend is required — fill in the host:port (or file path) field".to_string(),
+            lang.t("sites.error.backend_required").into_owned(),
             Some("backend"),
         ))
     } else if let Err(e) = pangolin_core::parse::parse_backend(&backend) {
         Some((
             SiteFormSection::Field,
-            format!("Invalid backend: {}", e),
+            lang.tf("sites.error.invalid_backend", [("error", e.to_string())]),
             Some("backend"),
         ))
     } else {

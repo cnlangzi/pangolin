@@ -13,11 +13,12 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::ok_html_with_csrf;
 use crate::routes::helpers::{ok_html, redirect};
 use crate::templates::{TrafficKpisView, TrafficPageTemplate, TrafficTablesView};
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
     let snap = (*app.traffic_snapshot()).clone();
     let spark_bars = snap.spark_bars();
     let tmpl = TrafficPageTemplate {
@@ -25,6 +26,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         spark_bars,
         csrf_token: csrf.to_string(),
         active_nav: "traffic",
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -36,18 +38,24 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     ok_html_with_csrf(html, csrf)
 }
 
-pub async fn api_kpis(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn api_kpis(app: &Arc<App>, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
     let snap = (*app.traffic_snapshot()).clone();
     let spark_bars = snap.spark_bars();
-    let html = TrafficKpisView { snap, spark_bars }
-        .render()
-        .unwrap_or_default();
+    let html = TrafficKpisView {
+        snap,
+        spark_bars,
+        lang,
+    }
+    .render()
+    .unwrap_or_default();
     ok_html(html)
 }
 
-pub async fn api_tables(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
+pub async fn api_tables(app: &Arc<App>, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
     let snap = (*app.traffic_snapshot()).clone();
-    let html = TrafficTablesView { snap }.render().unwrap_or_default();
+    let html = TrafficTablesView { snap, lang }
+        .render()
+        .unwrap_or_default();
     ok_html(html)
 }
 
@@ -80,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn traffic_page_renders_title() {
         let (_dir, app) = make_test_app();
-        let resp = render(&app, "csrf").await.expect("render");
+        let resp = render(&app, "csrf", Lang::En).await.expect("render");
         assert_eq!(resp.status(), 200);
         let snap = (*app.traffic_snapshot()).clone();
         let html = TrafficPageTemplate {
@@ -88,6 +96,7 @@ mod tests {
             snap,
             csrf_token: "csrf".into(),
             active_nav: "traffic",
+            lang: Lang::En,
         }
         .render()
         .expect("template");

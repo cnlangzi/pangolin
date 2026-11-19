@@ -6,6 +6,8 @@
 //! "new" page but is still a field so the shared fragment compiles.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use pangolin_core::types::Tun;
 
 // ─── List page (GET /tun) ──────────────────────────────────────────────────────
@@ -15,6 +17,8 @@ use pangolin_core::types::Tun;
 pub struct TunnelsListTemplate<'a> {
     pub tuns: Vec<Tun>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── New page (GET /tun/new) ───────────────────────────────────────────────────
@@ -29,6 +33,8 @@ pub struct TunnelsNewTemplate<'a> {
     pub action: &'a str,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── Edit page (GET /tun/edit?name=…) ──────────────────────────────────────────
@@ -40,6 +46,8 @@ pub struct TunnelsEditTemplate<'a> {
     pub action: &'a str,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── Form fields view (shared by new + edit) ──────────────────────────────────
@@ -51,4 +59,6 @@ pub struct TunnelsFormFieldsView<'a> {
     pub action: &'a str,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }

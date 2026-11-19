@@ -10,6 +10,8 @@
 use std::collections::BTreeSet;
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use pangolin_core::bot::BotInfo;
 use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{Site, Tun};
@@ -61,6 +63,8 @@ pub struct SiteProviderView {
 pub struct SitesListTemplate<'a> {
     pub sites: Vec<Site>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── New page (GET /sites/new) ────────────────────────────────────────────────
@@ -91,6 +95,8 @@ pub struct SitesNewTemplate<'a> {
     /// Every provider of the registry — the dropdown is built from
     /// this list.
     pub providers: Vec<ProviderOption>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> SitesNewTemplate<'a> {
@@ -172,6 +178,8 @@ pub struct SitesEditTemplate<'a> {
     /// Every provider of the registry — the dropdown is built from
     /// this list.
     pub providers: Vec<ProviderOption>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> SitesEditTemplate<'a> {
@@ -236,6 +244,8 @@ impl<'a> SitesEditTemplate<'a> {
 pub struct SitesTableView<'a> {
     pub sites: Vec<Site>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── Form fields view (shared by new + edit) ──────────────────────────────────
@@ -262,6 +272,8 @@ pub struct SitesFormFieldsView<'a> {
     /// Every provider of the registry — the dropdown is built from
     /// this list.
     pub providers: Vec<ProviderOption>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> SitesFormFieldsView<'a> {

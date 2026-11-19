@@ -11,7 +11,7 @@
      matched the filter". `error` is `None` on success. #}
   {% if let Some(msg) = summary.error %}
     <div class="mb-4 px-4 py-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-sm text-red-800 dark:text-red-200">
-      <strong class="font-semibold">Query failed:</strong> {{ msg }}
+      <strong class="font-semibold">{{ lang.t("referers.query_failed") }}</strong> {{ msg }}
     </div>
   {% endif %}
 
@@ -21,17 +21,17 @@
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
       <p class="text-sm text-slate-600 dark:text-slate-300">
         {% if summary.total_after_filter == 0 %}
-          No matches.
+          {{ lang.t("referers.no_matches") }}
         {% else %}
-          Showing
+          {{ lang.t("referers.showing") }}
           <span class="font-semibold tabular-nums">{{ summary.start_row() }}–{{ summary.end_row() }}</span>
-          of <span class="font-semibold tabular-nums">{{ summary.total_after_filter }}</span>
-          entries
+          {{ lang.t("referers.of") }} <span class="font-semibold tabular-nums">{{ summary.total_after_filter }}</span>
+          {{ lang.t("referers.entries") }}
         {% endif %}
       </p>
       <p class="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
         {% if summary.file_bytes > 0 %}
-          Source file: {{ summary.file_size_human() }}
+          {{ lang.t("referers.source_file") }} {{ summary.file_size_human() }}
         {% endif %}
       </p>
     </div>
@@ -44,12 +44,12 @@
       <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
         <thead class="bg-slate-50 dark:bg-slate-800/50">
           <tr>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Request</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-48">Referrer</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
-            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.time") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.request") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-48">{{ lang.t("common.referrer") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">{{ lang.t("common.host") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.duration") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">{{ lang.t("common.client") }}</th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
@@ -57,9 +57,9 @@
             <tr>
               <td colspan="6" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
                 {% if summary.total_after_filter == 0 %}
-                  No entries match the current filter.
+                  {{ lang.t("referers.no_entries_match") }}
                 {% else %}
-                  No rows on this page.
+                  {{ lang.t("referers.no_rows_on_page") }}
                 {% endif %}
               </td>
             </tr>
@@ -92,24 +92,24 @@
     {% if summary.total_pages > 1 %}
       <div class="px-4 py-3 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between text-sm">
         <p class="text-slate-500 dark:text-slate-400 tabular-nums">
-          Page <span class="font-semibold">{{ summary.page }}</span> of <span class="font-semibold">{{ summary.total_pages }}</span>
+          {{ lang.t("referers.page_label") }} <span class="font-semibold">{{ summary.page }}</span> {{ lang.t("referers.page_of") }} <span class="font-semibold">{{ summary.total_pages }}</span>
         </p>
         <div class="flex items-center gap-1">
           {% if let Some(prev) = summary.prev_url.as_deref() %}
             <a href="{{ prev }}"
                class="inline-flex items-center px-3 py-1.5 rounded border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
-              ‹ Prev
+              {{ lang.t("referers.prev") }}
             </a>
           {% else %}
-            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">‹ Prev</span>
+            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">{{ lang.t("referers.prev") }}</span>
           {% endif %}
           {% if let Some(next) = summary.next_url.as_deref() %}
             <a href="{{ next }}"
                class="inline-flex items-center px-3 py-1.5 rounded border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
-              Next ›
+              {{ lang.t("referers.next") }}
             </a>
           {% else %}
-            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">Next ›</span>
+            <span class="inline-flex items-center px-3 py-1.5 rounded border border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600 cursor-not-allowed">{{ lang.t("referers.next") }}</span>
           {% endif %}
         </div>
       </div>

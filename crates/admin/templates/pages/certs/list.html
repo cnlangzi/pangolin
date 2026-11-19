@@ -1,17 +1,17 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}Certificates — Pangolin{% endblock %}
+{% block title %}{{ lang.t("certs.page_title") }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Certificates</h1>
-      <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">TLS certificates — manually uploaded or ACME-issued</p>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ lang.t("certs.list.title") }}</h1>
+      <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">{{ lang.t("certs.list.subtitle") }}</p>
     </div>
     <a href="/certs/new" class="inline-flex items-center justify-center gap-2 w-full sm:w-auto rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-      Add cert
+      {{ lang.t("certs.list.new") }}
     </a>
   </div>
 
@@ -24,56 +24,56 @@
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "" %}bg-slate-900 text-white border-slate-900 dark:bg-white dark:text-slate-900 dark:border-white
               {% else %}bg-white text-slate-700 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-700 dark:hover:bg-slate-700{% endif %}">
-      All <span class="font-semibold tabular-nums">{{ count_total }}</span>
+      {{ lang.t("certs.status.all") }} <span class="font-semibold tabular-nums">{{ count_total }}</span>
     </a>
     <a href="/certs?status=pending" data-status="pending"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "pending" %}bg-yellow-200 text-yellow-900 border-yellow-400 dark:bg-yellow-900/40 dark:text-yellow-100 dark:border-yellow-700
               {% else %}bg-white text-yellow-700 border-yellow-200 hover:bg-yellow-50 dark:bg-slate-800 dark:text-yellow-300 dark:border-yellow-700/40 dark:hover:bg-yellow-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>
-      Pending <span class="font-semibold tabular-nums">{{ count_pending }}</span>
+      {{ lang.t("certs.status.pending") }} <span class="font-semibold tabular-nums">{{ count_pending }}</span>
     </a>
     <a href="/certs?status=issuing" data-status="issuing"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "issuing" %}bg-blue-200 text-blue-900 border-blue-400 dark:bg-blue-900/40 dark:text-blue-100 dark:border-blue-700
               {% else %}bg-white text-blue-700 border-blue-200 hover:bg-blue-50 dark:bg-slate-800 dark:text-blue-300 dark:border-blue-700/40 dark:hover:bg-blue-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
-      Issuing <span class="font-semibold tabular-nums">{{ count_issuing }}</span>
+      {{ lang.t("certs.status.issuing") }} <span class="font-semibold tabular-nums">{{ count_issuing }}</span>
     </a>
     <a href="/certs?status=issued" data-status="issued"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "issued" %}bg-green-200 text-green-900 border-green-400 dark:bg-green-900/40 dark:text-green-100 dark:border-green-700
               {% else %}bg-white text-green-700 border-green-200 hover:bg-green-50 dark:bg-slate-800 dark:text-green-300 dark:border-green-700/40 dark:hover:bg-green-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
-      Issued <span class="font-semibold tabular-nums">{{ count_issued }}</span>
+      {{ lang.t("certs.status.issued") }} <span class="font-semibold tabular-nums">{{ count_issued }}</span>
     </a>
     <a href="/certs?status=failed" data-status="failed"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "failed" %}bg-red-200 text-red-900 border-red-400 dark:bg-red-900/40 dark:text-red-100 dark:border-red-700
               {% else %}bg-white text-red-700 border-red-200 hover:bg-red-50 dark:bg-slate-800 dark:text-red-300 dark:border-red-700/40 dark:hover:bg-red-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
-      Failed <span class="font-semibold tabular-nums">{{ count_failed }}</span>
+      {{ lang.t("certs.status.failed") }} <span class="font-semibold tabular-nums">{{ count_failed }}</span>
     </a>
     <a href="/certs?status=skipped" data-status="skipped"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "skipped" %}bg-slate-300 text-slate-900 border-slate-400 dark:bg-slate-700 dark:text-slate-100 dark:border-slate-500
               {% else %}bg-white text-slate-600 border-slate-200 hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700 dark:hover:bg-slate-700{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
-      Skipped <span class="font-semibold tabular-nums">{{ count_skipped }}</span>
+      {{ lang.t("certs.status.skipped") }} <span class="font-semibold tabular-nums">{{ count_skipped }}</span>
     </a>
     <a href="/certs?status=rate_limited" data-status="rate_limited"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "rate_limited" %}bg-purple-200 text-purple-900 border-purple-400 dark:bg-purple-900/40 dark:text-purple-100 dark:border-purple-700
               {% else %}bg-white text-purple-700 border-purple-200 hover:bg-purple-50 dark:bg-slate-800 dark:text-purple-300 dark:border-purple-700/40 dark:hover:bg-purple-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>
-      Rate Limited <span class="font-semibold tabular-nums">{{ count_rate_limited }}</span>
+      {{ lang.t("certs.status.rate_limited") }} <span class="font-semibold tabular-nums">{{ count_rate_limited }}</span>
     </a>
     <a href="/certs?status=permanent" data-status="permanent"
        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors
               {% if status_filter_raw == "permanent" %}bg-orange-200 text-orange-900 border-orange-400 dark:bg-orange-900/40 dark:text-orange-100 dark:border-orange-700
               {% else %}bg-white text-orange-700 border-orange-200 hover:bg-orange-50 dark:bg-slate-800 dark:text-orange-300 dark:border-orange-700/40 dark:hover:bg-orange-900/20{% endif %}">
       <span class="w-1.5 h-1.5 rounded-full bg-orange-500"></span>
-      Permanent <span class="font-semibold tabular-nums">{{ count_permanent }}</span>
+      {{ lang.t("certs.status.permanent") }} <span class="font-semibold tabular-nums">{{ count_permanent }}</span>
     </a>
   </div>
 

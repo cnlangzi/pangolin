@@ -2,10 +2,10 @@
   <table class="hidden md:table table-auto w-full">
     <thead class="bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
       <tr>
-        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Domain</th>
-        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Status</th>
-        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Started</th>
-        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Expires</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("common.domain") }}</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("common.status") }}</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("certs.table.started") }}</th>
+        <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("common.expires") }}</th>
         <th class="text-right px-4 py-3"></th>
       </tr>
     </thead>
@@ -23,31 +23,31 @@
           {# link between filter and row is obvious.                      #}
           {% if row.status == "issued" %}
           <span data-status="issued" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>Issued
+            <span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>{{ lang.t("certs.status.issued") }}
           </span>
           {% else if row.status == "failed" %}
           <span data-status="failed" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>Failed
+            <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>{{ lang.t("certs.status.failed") }}
           </span>
           {% else if row.status == "pending" %}
           <span data-status="pending" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>Pending
+            <span class="w-1.5 h-1.5 rounded-full bg-yellow-400"></span>{{ lang.t("certs.status.pending") }}
           </span>
           {% else if row.status == "issuing" %}
           <span data-status="issuing" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>Issuing
+            <span class="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>{{ lang.t("certs.status.issuing") }}
           </span>
           {% else if row.status == "rate_limited" %}
           <span data-status="rate_limited" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>Rate Limited
+            <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>{{ lang.t("certs.status.rate_limited") }}
           </span>
           {% else if row.status == "permanent" %}
           <span data-status="permanent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">
-            <span class="w-1.5 h-1.5 rounded-full bg-orange-500"></span>Permanent
+            <span class="w-1.5 h-1.5 rounded-full bg-orange-500"></span>{{ lang.t("certs.status.permanent") }}
           </span>
           {% else %}
           <span data-status="skipped" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">
-            <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Skipped
+            <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>{{ lang.t("certs.status.skipped") }}
           </span>
           {% endif %}
         </td>
@@ -64,7 +64,7 @@
         </td>
         <td class="px-4 py-3 text-sm text-slate-500 dark:text-slate-400">
           {% if row.next_retry_rel != "" %}
-          <span class="text-purple-600 dark:text-purple-400" title="Next retry scheduled">{{ row.next_retry_rel }}</span>
+          <span class="text-purple-600 dark:text-purple-400" title="{{ lang.t("certs.table.next_retry_title") }}">{{ row.next_retry_rel }}</span>
           {% else if row.expires_at_fmt == "" %}
           —
           {% else if row.expired %}
@@ -81,7 +81,7 @@
               {% include "components/_csrf.html" %}
               <button type="submit"
                 class="text-slate-400 dark:text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 p-1.5 rounded hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors"
-                title="Retry ACME issuance for {{ row.domain }}"
+                title="{{ lang.tf("certs.table.retry_aria", [("name", row.domain.as_str())]) }}"
                 data-action="retry">
                 {# Counter-clockwise arrow — the canonical "retry" glyph. #}
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -92,11 +92,11 @@
             {% endif %}
             <button hx-delete="/api/certs/{{ row.domain }}"
               hx-vals='{"_csrf": "__CSRF__"}'
-              hx-confirm="Delete cert for {{ row.domain }}?"
+              hx-confirm="{{ lang.tf("certs.delete.confirm", [("name", row.domain.as_str())]) }}"
               hx-swap="delete"
               hx-target="closest tr"
               class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-              title="Delete">
+              title="{{ lang.t("common.delete") }}">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
             </button>
           </div>
@@ -110,24 +110,24 @@
         <td colspan="5" class="px-4 py-2 text-xs text-red-700 dark:text-red-300">
           <div class="flex flex-col gap-1">
             <div>
-              <span class="font-medium">Last error:</span>
+              <span class="font-medium">{{ lang.t("certs.table.last_error") }}</span>
               <code data-error="{{ row.domain }}" class="ml-1 break-all">{{ err }}</code>
             </div>
             {% if row.error_class_label != "" %}
             <div>
-              <span class="font-medium">Classification:</span>
+              <span class="font-medium">{{ lang.t("certs.table.classification") }}</span>
               <span class="ml-1">
                 {% if row.error_class_label == "transient" %}
                 <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">
-                  Transient (will retry)
+                  {{ lang.t("certs.class.transient") }}
                 </span>
                 {% else if row.error_class_label == "rate-limited" %}
                 <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">
-                  Rate-limited (retry at {{ row.next_retry_rel }})
+                  {{ lang.tf("certs.class.rate_limited", [("when", row.next_retry_rel.as_str())]) }}
                 </span>
                 {% else if row.error_class_label == "permanent" %}
                 <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">
-                  Permanent (manual intervention required)
+                  {{ lang.t("certs.class.permanent") }}
                 </span>
                 {% endif %}
               </span>
@@ -140,9 +140,9 @@
       {% else %}
       <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">
         {% if status_filter_raw == "" %}
-        No certificates yet. <a href="/certs/new" class="text-accent-500 hover:underline">Add one</a>.
+        {{ lang.t("certs.table.empty_before") }} <a href="/certs/new" class="text-accent-500 hover:underline">{{ lang.t("certs.table.empty_link") }}</a>{{ lang.t("certs.table.empty_after") }}
         {% else %}
-        No certs match this filter. <a href="/certs" class="text-accent-500 hover:underline">Clear filter</a>.
+        {{ lang.t("certs.table.no_match") }} <a href="/certs" class="text-accent-500 hover:underline">{{ lang.t("certs.table.clear_filter") }}</a>{{ lang.t("certs.table.empty_after") }}
         {% endif %}
       </td></tr>
       {% endfor %}
@@ -155,37 +155,37 @@
       <div class="flex items-center justify-between mb-2">
         <code class="text-xs text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded">{{ row.domain }}</code>
         {% if row.status == "issued" %}
-        <span data-status="issued" class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">Issued</span>
+        <span data-status="issued" class="text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">{{ lang.t("certs.status.issued") }}</span>
         {% else if row.status == "failed" %}
-        <span data-status="failed" class="text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">Failed</span>
+        <span data-status="failed" class="text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">{{ lang.t("certs.status.failed") }}</span>
         {% else if row.status == "pending" %}
-        <span data-status="pending" class="text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">Pending</span>
+        <span data-status="pending" class="text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300">{{ lang.t("certs.status.pending") }}</span>
         {% else if row.status == "issuing" %}
-        <span data-status="issuing" class="text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">Issuing</span>
+        <span data-status="issuing" class="text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">{{ lang.t("certs.status.issuing") }}</span>
         {% else if row.status == "rate_limited" %}
-        <span data-status="rate_limited" class="text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">Rate Limited</span>
+        <span data-status="rate_limited" class="text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">{{ lang.t("certs.status.rate_limited") }}</span>
         {% else if row.status == "permanent" %}
-        <span data-status="permanent" class="text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">Permanent</span>
+        <span data-status="permanent" class="text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">{{ lang.t("certs.status.permanent") }}</span>
         {% else %}
-        <span data-status="skipped" class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">Skipped</span>
+        <span data-status="skipped" class="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">{{ lang.t("certs.status.skipped") }}</span>
         {% endif %}
       </div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mb-1">
-        Started {% if row.started_rel == "" %}—{% else %}{{ row.started_rel }}{% endif %}
+        {{ lang.t("certs.table.started_label") }} {% if row.started_rel == "" %}—{% else %}{{ row.started_rel }}{% endif %}
       </div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mb-3">
         {% if row.next_retry_rel != "" %}
-        Next retry {{ row.next_retry_rel }}
+        {{ lang.t("certs.table.next_retry_label") }} {{ row.next_retry_rel }}
         {% else %}
-        Expires {% if row.expires_at_fmt == "" %}never{% else %}{{ row.expires_at_fmt }}{% endif %}
+        {{ lang.t("certs.table.expires_label") }} {% if row.expires_at_fmt == "" %}{{ lang.t("common.never") }}{% else %}{{ row.expires_at_fmt }}{% endif %}
         {% endif %}
       </div>
       {% if let Some(err) = row.last_error %}
       <div class="text-xs text-red-600 dark:text-red-400 mb-2 break-all">
-        <span class="font-medium">Last error:</span> {{ err }}
+        <span class="font-medium">{{ lang.t("certs.table.last_error") }}</span> {{ err }}
         {% if row.error_class_label != "" %}
         <div class="mt-1">
-          <span class="font-medium">Class:</span> {{ row.error_class_label }}
+          <span class="font-medium">{{ lang.t("certs.table.class_short") }}</span> {{ row.error_class_label }}
         </div>
         {% endif %}
       </div>
@@ -196,26 +196,26 @@
           <input type="hidden" name="domain" value="{{ row.domain }}">
           {% include "components/_csrf.html" %}
           <button type="submit" class="w-full text-center text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 border border-blue-200 dark:border-blue-500/30 hover:bg-blue-50 dark:hover:bg-blue-500/10 rounded-lg py-1.5 transition-colors">
-            Retry
+            {{ lang.t("common.retry") }}
           </button>
         </form>
         {% endif %}
         <button hx-delete="/api/certs/{{ row.domain }}"
           hx-vals='{"_csrf": "__CSRF__"}'
-          hx-confirm="Delete cert for {{ row.domain }}?"
+          hx-confirm="{{ lang.tf("certs.delete.confirm", [("name", row.domain.as_str())]) }}"
           hx-swap="delete"
           hx-target="closest .p-4"
           class="flex-1 w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
-          Delete
+          {{ lang.t("common.delete") }}
         </button>
       </div>
     </div>
     {% else %}
     <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm">
       {% if status_filter_raw == "" %}
-      No certificates yet.
+      {{ lang.t("certs.table.empty_before") }}
       {% else %}
-      No certs match this filter. <a href="/certs" class="text-accent-500 hover:underline">Clear filter</a>.
+      {{ lang.t("certs.table.no_match") }} <a href="/certs" class="text-accent-500 hover:underline">{{ lang.t("certs.table.clear_filter") }}</a>{{ lang.t("certs.table.empty_after") }}
       {% endif %}
     </div>
     {% endfor %}

@@ -1,14 +1,14 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}Access Logs — Pangolin{% endblock %}
+{% block title %}{{ lang.t("logs.page_title") }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Access Logs</h1>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ lang.t("logs.title") }}</h1>
       <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
-        Live tail of every proxied request — in-memory, cleared on restart
+        {{ lang.t("logs.subtitle") }}
       </p>
     </div>
     <div class="flex items-center gap-2">
@@ -16,14 +16,14 @@
             class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border
                    bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700">
         <span id="logs-status-dot" class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
-        <span id="logs-status-text">connecting…</span>
+        <span id="logs-status-text">{{ lang.t("logs.status.connecting") }}</span>
       </span>
       <button id="logs-clear-btn" type="button"
               class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">
         <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/>
         </svg>
-        Clear
+        {{ lang.t("logs.clear") }}
       </button>
     </div>
   </div>
@@ -64,18 +64,18 @@
       <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
         <thead class="bg-slate-50 dark:bg-slate-800/50">
           <tr>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Request</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
-            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-72">User-Agent</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.time") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.request") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">{{ lang.t("common.host") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.duration") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-72">{{ lang.t("common.user_agent") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">{{ lang.t("common.client") }}</th>
           </tr>
         </thead>
         <tbody id="logs-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
           <tr id="logs-empty-row">
             <td colspan="6" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
-              Waiting for events…
+              {{ lang.t("logs.empty_waiting") }}
             </td>
           </tr>
         </tbody>
@@ -84,7 +84,7 @@
   </div>
 
   <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
-    Showing entries pushed by the proxy. Bounded buffer (configurable via <code>log.access_log_recent</code>); live channel (configurable via <code>log.access_log_capacity</code>). Restart of <code>pangolin-ngx</code> clears everything. Click a User-Agent cell to expand the full string; the backend is on hover (title attribute).
+    {{ lang.t("logs.footnote_1") }} <code>log.access_log_recent</code>{{ lang.t("logs.footnote_2") }} <code>log.access_log_capacity</code>{{ lang.t("logs.footnote_3") }} <code>pangolin-ngx</code> {{ lang.t("logs.footnote_4") }}
   </p>
 </main>
 
@@ -138,6 +138,7 @@
 <script>
 (function() {
   "use strict";
+  const I18N = window.__PANGOLIN_I18N || {};
   // ── Status pill ────────────────────────────────────────────────────────
   const statusDot = document.getElementById("logs-status-dot");
   const statusText = document.getElementById("logs-status-text");
@@ -266,7 +267,7 @@
 
     // Backend is no longer in the default view; surface it as a
     // tooltip on the host cell instead.
-    const hostTitle = e.backend ? 'Backend: ' + escapeHtml(e.backend) : '';
+    const hostTitle = e.backend ? I18N["js.logs.backend"] + escapeHtml(e.backend) : '';
     const hostHtml = '<td class="px-4 py-2 whitespace-nowrap align-top" title="' + hostTitle + '">' +
       '<span class="text-slate-600 dark:text-slate-300" title="' + hostTitle + '">' + escapeHtml(e.host) + '</span>' +
     '</td>';
@@ -322,7 +323,7 @@
   // will keep retrying — we surface that as a red status pill.
   let es = null;
   function connect() {
-    setStatus("replay", "replaying…");
+    setStatus("replay", I18N["js.status.replaying"]);
     es = new EventSource("/api/logs/stream");
     es.onopen = function() {
       // "open" fires *before* any data, so the first frame(s) you see
@@ -332,13 +333,13 @@
       // For simplicity we just call it "live" on open since the
       // replay frames arrive immediately and the user can't tell the
       // difference.
-      setStatus("live", "live");
+      setStatus("live", I18N["js.status.live"]);
     };
     es.onerror = function() {
       // EventSource auto-retries; surface the problem so the operator
       // knows the stream is broken. 401 keeps the page on a red
       // "disconnected" state until the user re-logs in and reloads.
-      setStatus("error", "disconnected");
+      setStatus("error", I18N["js.status.disconnected"]);
     };
     es.onmessage = function(ev) {
       // Each `data:` frame is one JSON access log entry. The SSE

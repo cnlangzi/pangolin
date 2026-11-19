@@ -4,6 +4,8 @@
 //! `routes/domains.rs` — only file layout changed.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -49,11 +51,12 @@ pub fn parse_domain_form(
     domain: &str,
     existing: Option<&Domain>,
     dns_provider_exists: &dyn Fn(&str) -> bool,
+    lang: Lang,
 ) -> Result<DomainForm, String> {
     // The domain name is required on create; on update it is the
     // primary key and comes from the path.
     if existing.is_none() && domain.is_empty() {
-        return Err("Domain name is required".into());
+        return Err(lang.t("domains.error.name_required").into_owned());
     }
     let site_name = match existing {
         Some(e) => params
@@ -63,10 +66,10 @@ pub fn parse_domain_form(
         None => params.get("site_name").cloned().unwrap_or_default(),
     };
     if site_name.is_empty() {
-        return Err("Please select a site".into());
+        return Err(lang.t("domains.error.select_site").into_owned());
     }
     if existing.is_none() && !pangolin_core::is_valid_domain(domain) {
-        return Err("Invalid domain format (use example.com, no scheme)".into());
+        return Err(lang.t("domains.error.invalid_format").into_owned());
     }
     let dns_provider = params
         .get("dns_provider")
@@ -97,11 +100,7 @@ pub fn parse_domain_form(
     // Wildcard domains must have a DNS association (DNS-01 is the only
     // way to validate `*.example.com`).
     if domain.starts_with("*.") && dns_provider.is_none() {
-        return Err(
-            "Wildcard domains require a DNS provider for DNS-01 validation. \
-             Add one under DNS first, then assign it to this domain."
-                .into(),
-        );
+        return Err(lang.t("domains.error.wildcard_needs_dns").into_owned());
     }
     // Issue #55 / RFC 8555 §8.3: a wildcard SAN cannot be validated
     // with http-01. Reject the combination at save time so the
@@ -110,21 +109,13 @@ pub fn parse_domain_form(
     // the planner emits the same string and the admin UI test grep
     // for it.
     if domain.starts_with("*.") && matches!(challenge_kind, Some(ChallengeKind::Http01)) {
-        return Err("Wildcard domains cannot use the http-01 challenge (ACME \
-             servers do not offer an http-01 challenge for wildcard \
-             identifiers per RFC 8555 §8.3). Set the challenge kind \
-             to 'dns-01' or 'dns-persist-01', or pick 'auto' (the \
-             planner will resolve to dns-01 when a DNS provider is \
-             linked)."
-            .into());
+        return Err(lang.t("domains.error.wildcard_http01").into_owned());
     }
     // If a DNS provider is referenced, verify it exists.
     if let Some(ref name) = dns_provider
         && !dns_provider_exists(name)
     {
-        return Err(format!(
-            "DNS provider '{name}' does not exist; create it under DNS first"
-        ));
+        return Err(lang.tf("domains.error.dns_provider_missing", [("name", name)]));
     }
 
     // The checkboxes: present ⇒ true, absent ⇒ the stored value (or
@@ -155,22 +146,33 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .expect("response builder for 200 OK should not fail"))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function.
     let parsed = {
         let db = app.db.lock().await;
-        parse_domain_form(&params, &domain, None, &|name| {
-            pangolin_core::db::get_dns_provider(&db, name)
-                .unwrap_or(None)
-                .is_some()
-        })
+        parse_domain_form(
+            &params,
+            &domain,
+            None,
+            &|name| {
+                pangolin_core::db::get_dns_provider(&db, name)
+                    .unwrap_or(None)
+                    .is_some()
+            },
+            lang,
+        )
     };
     let parsed = match parsed {
         Ok(p) => p,
-        Err(msg) => return render_create_page_with_error(app, &msg, csrf, None).await,
+        Err(msg) => return render_create_page_with_error(app, &msg, csrf, None, lang).await,
     };
 
     let d = pangolin_core::types::Domain {
@@ -218,7 +220,8 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             Ok(redirect_response("/domains"))
         }
         Err(e) => {
-            render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None).await
+            render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None, lang)
+                .await
         }
     }
 }
@@ -241,9 +244,10 @@ pub async fn handle_update(
     domain: Option<String>,
     body: &[u8],
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(domain_pk) = domain else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let params = parse_form(body);
 
@@ -254,23 +258,29 @@ pub async fn handle_update(
         pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None)
     };
     let Some(existing) = existing else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
 
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function.
     let parsed = {
         let db = app.db.lock().await;
-        parse_domain_form(&params, &domain_pk, Some(&existing), &|name| {
-            pangolin_core::db::get_dns_provider(&db, name)
-                .unwrap_or(None)
-                .is_some()
-        })
+        parse_domain_form(
+            &params,
+            &domain_pk,
+            Some(&existing),
+            &|name| {
+                pangolin_core::db::get_dns_provider(&db, name)
+                    .unwrap_or(None)
+                    .is_some()
+            },
+            lang,
+        )
     };
     let parsed = match parsed {
         Ok(p) => p,
         Err(msg) => {
-            return render_edit_page_with_error(app, &domain_pk, &msg, csrf, &existing).await;
+            return render_edit_page_with_error(app, &domain_pk, &msg, csrf, &existing, lang).await;
         }
     };
 
@@ -327,6 +337,7 @@ pub async fn handle_update(
                 &format!("Database error: {}", e),
                 csrf,
                 &existing,
+                lang,
             )
             .await
         }
@@ -343,6 +354,7 @@ async fn render_edit_page_with_error(
     error: &str,
     csrf: &str,
     existing: &pangolin_core::types::Domain,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -364,6 +376,7 @@ async fn render_edit_page_with_error(
             .challenge_kind
             .map(|k| k.as_str().to_string())
             .unwrap_or_default(),
+        lang,
     }
     .render()
     .unwrap();
@@ -380,6 +393,7 @@ async fn render_create_page_with_error(
     error: &str,
     csrf: &str,
     preselected_site: Option<&str>,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -398,6 +412,7 @@ async fn render_create_page_with_error(
         current_auto_issue: false,
         enabled_checked: true,
         challenge_kind_value: String::new(),
+        lang,
     }
     .render()
     .unwrap();
@@ -412,6 +427,7 @@ pub async fn handle_delete(
     app: &Arc<App>,
     domain: Option<String>,
     _csrf: &str,
+    _lang: Lang,
 ) -> http::Result<Resp> {
     if let Some(d) = domain
         && !d.is_empty()
@@ -431,9 +447,14 @@ pub async fn handle_delete(
 
 /// HTMX DELETE /api/domains/{domain} — returns an empty 200 body so HTMX
 /// (with hx-swap="delete") can drop the row.
-pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    domain: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if domain.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_domain(&db, &domain);

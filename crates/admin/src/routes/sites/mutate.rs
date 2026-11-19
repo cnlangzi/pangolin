@@ -12,17 +12,23 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::redirect_response;
 use crate::routes::ratelimit::{merge_bot_list, renderable_bot_ids};
 use pangolin_core::types::Site;
 
 use super::helpers::{parse_site_form, site_prefill};
 use super::pages::{FormContext, render_create_page_with_error, render_edit_page_with_error};
-use crate::routes::helpers::parse_form;
+use crate::routes::helpers::{bad_request_page, parse_form};
 
 type Resp = Response<Full<Bytes>>;
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
     // The provider of the global configuration — a site that overrides
@@ -31,7 +37,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function, so the
     // two surfaces can never drift apart.
-    let parsed = match parse_site_form(&params, &name, None, global_provider) {
+    let parsed = match parse_site_form(&params, &name, None, global_provider, lang) {
         Ok(p) => p,
         Err(e) => {
             let submitted_bots = e.rate_limit_bots.clone().unwrap_or_default();
@@ -46,6 +52,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                 &e.message,
                 e.field,
                 csrf,
+                lang,
             )
             .await;
         }
@@ -126,6 +133,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                 &format!("Database error: {}", e),
                 None,
                 csrf,
+                lang,
             )
             .await
         }
@@ -137,15 +145,17 @@ pub async fn handle_update(
     name: Option<String>,
     body: &[u8],
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
-            let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing site name.</p><a href="/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
-            )));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            return Ok(resp);
+            return Ok(bad_request_page(
+                lang,
+                &lang.t("sites.error.missing_name"),
+                "/sites",
+                &lang.t("common.back_to_sites"),
+            ));
         }
     };
     let params = parse_form(body);
@@ -173,7 +183,13 @@ pub async fn handle_update(
             .map(|s| s.backend)
     };
     let global_provider = app.system_config.read().await.provider;
-    let parsed = match parse_site_form(&params, &name, stored_policy.as_ref(), global_provider) {
+    let parsed = match parse_site_form(
+        &params,
+        &name,
+        stored_policy.as_ref(),
+        global_provider,
+        lang,
+    ) {
         Ok(p) => p,
         Err(e) => {
             // The bot ids the re-rendered form shows as checked: the
@@ -200,6 +216,7 @@ pub async fn handle_update(
                 &e.message,
                 e.field,
                 csrf,
+                lang,
             )
             .await;
         }
@@ -280,6 +297,7 @@ pub async fn handle_update(
                 &format!("Database error: {}", e),
                 None,
                 csrf,
+                lang,
             )
             .await
         }
@@ -359,6 +377,7 @@ pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
     _csrf: &str,
+    _lang: Lang,
 ) -> http::Result<Resp> {
     if let Some(n) = name
         && !n.is_empty()
@@ -377,9 +396,14 @@ pub async fn handle_delete(
 /// This is the unified delete endpoint for sites; the form-POST
 /// `/sites/delete` route above is kept for now as a fallback during the
 /// migration window (issue #48).
-pub async fn api_handle_delete(app: &Arc<App>, name: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    name: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if name.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_site(&db, &name);
@@ -434,7 +458,7 @@ mod tests {
         let resp = handle_create(
             &app,
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on&rate_limit_bot_ccbot=on",
-            "csrf",
+            "csrf", Lang::En,
         )
         .await
         .unwrap();
@@ -454,7 +478,7 @@ mod tests {
         handle_create(
             &app,
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
-            "csrf",
+            "csrf", Lang::En,
         )
         .await
         .unwrap();
@@ -464,6 +488,7 @@ mod tests {
             Some("a".to_string()),
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_req_limit=10",
             "csrf",
+            Lang::En,
         )
         .await
         .unwrap();
@@ -482,7 +507,7 @@ mod tests {
         handle_create(
             &app,
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
-            "csrf",
+            "csrf", Lang::En,
         )
         .await
         .unwrap();
@@ -492,6 +517,7 @@ mod tests {
             Some("a".to_string()),
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1",
             "csrf",
+            Lang::En,
         )
         .await
         .unwrap();
@@ -526,7 +552,7 @@ mod tests {
         handle_create(
             &app,
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
-            "csrf",
+            "csrf", Lang::En,
         )
         .await
         .unwrap();
@@ -552,6 +578,7 @@ mod tests {
             Some("a".to_string()),
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1",
             "csrf",
+            Lang::En,
         )
         .await
         .unwrap();
@@ -576,13 +603,13 @@ mod tests {
         handle_create(
             &app,
             b"name=a&backend=http://127.0.0.1:8080&rate_limit_bots_applied=1&rate_limit_bot_gptbot=on",
-            "csrf",
+            "csrf", Lang::En,
         )
         .await
         .unwrap();
 
         let body = html_of(
-            super::super::pages::render_edit_page(&app, Some("a".to_string()), "csrf")
+            super::super::pages::render_edit_page(&app, Some("a".to_string()), "csrf", Lang::En)
                 .await
                 .unwrap(),
         )

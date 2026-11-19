@@ -10,6 +10,8 @@
 
 use askama::Template;
 
+use crate::i18n::Lang;
+
 use crate::routes::provider::ProviderRangeStatus;
 
 /// One provider of the registry, as the settings page shows it.
@@ -22,9 +24,9 @@ pub struct ProviderOption {
     /// The registry key (the value the form posts).
     pub key: &'static str,
     /// The display label.
-    pub label: &'static str,
+    pub label: String,
     /// The explanation shown under the label.
-    pub description: &'static str,
+    pub description: String,
 }
 
 /// `/settings` page — operator-facing editor for the system_config
@@ -82,6 +84,8 @@ pub struct SettingsTemplate<'a> {
     pub dashboard_error: Option<&'a str>,
     /// Active-nav tag, always `"settings"`.
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// The IP reputation settings as the settings page renders them.

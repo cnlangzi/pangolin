@@ -10,10 +10,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{Response, StatusCode};
+use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
+use crate::routes::helpers::bad_request_page;
 use crate::routes::provider::{
     ParsedProvider, provider_options, provider_view_from_submitted, site_provider_view,
 };
@@ -31,23 +33,18 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .unwrap())
 }
 
-fn bad_request(message: &str) -> Resp {
-    let body = format!(
-        r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">{}</p><a href="/sites" class="text-sm text-red-700 underline mt-2 inline-block">← Back to sites</a></div></div>"#,
-        message
-    );
-    let mut resp = Response::new(Full::new(Bytes::from(body)));
-    *resp.status_mut() = StatusCode::BAD_REQUEST;
-    resp
+fn bad_request(lang: Lang, message: &str) -> Resp {
+    bad_request_page(lang, message, "/sites", &lang.t("common.back_to_sites"))
 }
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     drop(db);
     let html = SitesListTemplate {
         sites,
         active_nav: "sites",
+        lang,
     }
     .render()
     .unwrap();
@@ -55,7 +52,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
 }
 
 /// Render the New site page.
-pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render_create_page(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
         pangolin_core::db::list_tuns(&db).unwrap_or_default()
@@ -71,7 +68,8 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         known_bots: known_bot_options(app),
         rate_limit_bots: BTreeSet::new(),
         provider_view: site_provider_view(app, None).await,
-        providers: provider_options(),
+        providers: provider_options(lang),
+        lang,
     }
     .render()
     .unwrap();
@@ -83,10 +81,13 @@ pub async fn render_edit_page(
     app: &Arc<App>,
     name: Option<String>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
-        _ => return Ok(bad_request("Missing site name.")),
+        _ => {
+            return Ok(bad_request(lang, &lang.t("sites.error.missing_name")));
+        }
     };
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -113,7 +114,8 @@ pub async fn render_edit_page(
         known_bots: known_bot_options(app),
         rate_limit_bots,
         provider_view: site_provider_view(app, Some(&name)).await,
-        providers: provider_options(),
+        providers: provider_options(lang),
+        lang,
     }
     .render()
     .unwrap();
@@ -146,6 +148,7 @@ pub(super) async fn render_create_page_with_error(
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
@@ -169,7 +172,8 @@ pub(super) async fn render_create_page_with_error(
         known_bots: known_bot_options(app),
         rate_limit_bots: ctx.rate_limit_bots,
         provider_view,
-        providers: provider_options(),
+        providers: provider_options(lang),
+        lang,
     }
     .render()
     .unwrap();
@@ -184,6 +188,7 @@ pub(super) async fn render_edit_page_with_error(
     error: &str,
     field_error: Option<&'static str>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let tunnels = {
         let db = app.db.lock().await;
@@ -212,7 +217,8 @@ pub(super) async fn render_edit_page_with_error(
         known_bots: known_bot_options(app),
         rate_limit_bots: ctx.rate_limit_bots,
         provider_view,
-        providers: provider_options(),
+        providers: provider_options(lang),
+        lang,
     }
     .render()
     .unwrap();

@@ -7,6 +7,10 @@
 //! `DomainsEditTemplate`, and `DomainsFormFieldsView`.
 
 use askama::Template;
+
+use std::borrow::Cow;
+
+use crate::i18n::Lang;
 use pangolin_core::types::{DnsProvider, Domain, Site};
 
 /// True if the form's `challenge_kind_value` matches the given kind.
@@ -35,6 +39,8 @@ pub struct DomainsListTemplate<'a> {
     pub domains: Vec<Domain>,
     pub sites: Vec<Site>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DomainsListTemplate<'a> {
@@ -82,6 +88,8 @@ pub struct DomainsNewTemplate<'a> {
     /// `"dns-01"`, `"dns-persist-01"`. Empty string means
     /// "auto" (the default).
     pub challenge_kind_value: String,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DomainsNewTemplate<'a> {
@@ -102,11 +110,8 @@ impl<'a> DomainsNewTemplate<'a> {
         "/domains/new".to_string()
     }
 
-    pub fn submit_label(&self) -> &'static str {
-        "Save"
-    }
-    pub fn form_title(&self) -> &'static str {
-        "New domain"
+    pub fn submit_label(&self) -> Cow<'static, str> {
+        self.lang.t("common.save")
     }
     pub fn lock_site(&self) -> bool {
         self.preselected_site_name.is_some()
@@ -173,6 +178,8 @@ pub struct DomainsEditTemplate<'a> {
     /// `"dns-01"`, `"dns-persist-01"`. Empty string means
     /// "auto" (the default).
     pub challenge_kind_value: String,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DomainsEditTemplate<'a> {
@@ -190,11 +197,8 @@ impl<'a> DomainsEditTemplate<'a> {
         "/domains/new".to_string()
     }
 
-    pub fn submit_label(&self) -> &'static str {
-        "Save"
-    }
-    pub fn form_title(&self) -> &'static str {
-        "Edit domain"
+    pub fn submit_label(&self) -> Cow<'static, str> {
+        self.lang.t("common.save")
     }
     pub fn lock_site(&self) -> bool {
         self.edit_domain.is_some() || self.preselected_site_name.is_some()
@@ -242,6 +246,8 @@ pub struct SiteDomainsTemplate {
     pub domains: Vec<Domain>,
     pub sites: Vec<Site>,
     pub active_nav: &'static str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl SiteDomainsTemplate {
@@ -277,6 +283,8 @@ fn domain_encoded(domain: &str) -> String {
 pub struct DomainsTableView<'a> {
     pub domains: Vec<Domain>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DomainsTableView<'a> {
@@ -294,6 +302,8 @@ pub struct SiteDomainsTableView<'a> {
     pub domains: Vec<Domain>,
     pub site_name: &'a str,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── Form fields view (shared by new + edit) ──────────────────────────────────
@@ -313,6 +323,8 @@ pub struct DomainsFormFieldsView<'a> {
     pub current_auto_issue: bool,
     pub enabled_checked: bool,
     pub challenge_kind_value: String,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DomainsFormFieldsView<'a> {
@@ -331,15 +343,8 @@ impl<'a> DomainsFormFieldsView<'a> {
         "/domains/new".to_string()
     }
 
-    pub fn submit_label(&self) -> &'static str {
-        "Save"
-    }
-    pub fn form_title(&self) -> &'static str {
-        if self.edit_domain.is_some() {
-            "Edit domain"
-        } else {
-            "New domain"
-        }
+    pub fn submit_label(&self) -> Cow<'static, str> {
+        self.lang.t("common.save")
     }
     pub fn lock_site(&self) -> bool {
         self.edit_domain.is_some() || self.preselected_site_name.is_some()

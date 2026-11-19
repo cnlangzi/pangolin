@@ -1,0 +1,37 @@
+{# components/_lang_switcher.html — the interface-language switcher. #}
+{#                                                                  #}
+{# A dependency-free `<details>` + `<summary>` dropdown: every   #}
+{# language is a plain GET form that posts to `/lang/{code}`, so #}
+{# the switcher works without JavaScript.                            #}
+{#                                                                  #}
+{# The switcher is only rendered when there is more than one       #}
+{# language to choose from — a one-item dropdown is noise. The      #}
+{# decision is `Lang::available().len() >= 2`, and nothing else:  #}
+{# the length grows as soon as a second catalog has text in it.    #}
+{#                                                                  #}
+{# The `next` hidden field is filled in by `assets/app.js` with    #}
+{# the current page, so the operator lands back where they were.  #}
+{# Without JavaScript the field stays empty and the server falls  #}
+{# back to `/` — the language still changes.                        #}
+{#                                                                  #}
+{# The colour is inherited from the container the switcher is     #}
+{# placed in (`text-slate-300` in the dark header, `text-slate-700 #}
+{# dark:text-slate-300` on the light login page), so the same     #}
+{# fragment works in both.                                          #}
+{% if lang.available_langs().len() >= 2 %}
+<details class="relative">
+  <summary class="list-none cursor-pointer px-3 py-2 rounded-lg text-sm hover:bg-black/10 dark:hover:bg-white/10">
+    {{ lang.display_name() }}
+  </summary>
+  <div class="absolute right-0 mt-1 w-44 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-lg py-1 z-50">
+    {% for l in lang.available_langs() %}
+    <form method="GET" action="/lang/{{ l.code() }}">
+      <input type="hidden" name="next" value="" data-lang-next>
+      <button type="submit" class="block w-full text-left px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700">
+        {{ l.display_name() }}
+      </button>
+    </form>
+    {% endfor %}
+  </div>
+</details>
+{% endif %}

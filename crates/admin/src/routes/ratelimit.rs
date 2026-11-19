@@ -22,6 +22,7 @@ use pangolin_core::ratelimit::{
 };
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::ok_html_with_csrf;
 use crate::routes::helpers::{ok_html, parse_form, redirect};
 use crate::templates::{
@@ -50,17 +51,23 @@ pub const MAX_CAPACITY: u32 = 262_144;
 /// `error` is the code of a rejected rule submission (see
 /// [`add_rule_errors`]); it is rendered as a banner so a typo does not
 /// silently drop the rule.
-pub async fn render(app: &Arc<App>, csrf: &str, error: Option<&str>) -> http::Result<Resp> {
+pub async fn render(
+    app: &Arc<App>,
+    csrf: &str,
+    error: Option<&str>,
+    lang: Lang,
+) -> http::Result<Resp> {
     let snap = (*app.ratelimit_snapshot()).clone();
     let (rules, site_names) = load_rules_and_sites(app).await;
     let tmpl = RateLimitPageTemplate {
-        top_over: top_over_rows(&snap),
+        top_over: top_over_rows(&snap, lang),
         snap,
         rules: rules.iter().map(RuleRow::new).collect(),
         site_names,
-        error: error.map(|code| add_rule_errors(code).to_string()),
+        error: error.map(|code| add_rule_errors(code, lang)),
         csrf_token: csrf.to_string(),
         active_nav: "ratelimit",
+        lang,
     };
     let html = match tmpl.render() {
         Ok(s) => s,
@@ -73,19 +80,22 @@ pub async fn render(app: &Arc<App>, csrf: &str, error: Option<&str>) -> http::Re
 }
 
 /// `GET /api/ratelimit/kpis` — the KPI strip.
-pub async fn api_kpis(app: &Arc<App>) -> http::Result<Resp> {
+pub async fn api_kpis(app: &Arc<App>, lang: Lang) -> http::Result<Resp> {
     let snap = (*app.ratelimit_snapshot()).clone();
-    let html = RateLimitKpisView { snap }.render().unwrap_or_default();
+    let html = RateLimitKpisView { snap, lang }
+        .render()
+        .unwrap_or_default();
     ok_html(html)
 }
 
 /// `GET /api/ratelimit/sites` — the per-site table and the top
 /// over-limit clients.
-pub async fn api_sites(app: &Arc<App>) -> http::Result<Resp> {
+pub async fn api_sites(app: &Arc<App>, lang: Lang) -> http::Result<Resp> {
     let snap = (*app.ratelimit_snapshot()).clone();
     let html = RateLimitSitesView {
-        top_over: top_over_rows(&snap),
+        top_over: top_over_rows(&snap, lang),
         snap,
+        lang,
     }
     .render()
     .unwrap_or_default();
@@ -97,11 +107,11 @@ pub async fn api_sites(app: &Arc<App>) -> http::Result<Resp> {
 /// Shared by the page and the HTMX fragment, so both render the same
 /// rows. The relative times are taken against one `now`, so every row
 /// of a render carries the same clock.
-fn top_over_rows(snap: &RateLimitSnapshot) -> Vec<TopOverRow> {
+fn top_over_rows(snap: &RateLimitSnapshot, lang: Lang) -> Vec<TopOverRow> {
     let now = chrono::Utc::now();
     snap.top_over
         .iter()
-        .map(|client| TopOverRow::new(client, now))
+        .map(|client| TopOverRow::new(client, now, lang))
         .collect()
 }
 
@@ -111,10 +121,11 @@ fn top_over_rows(snap: &RateLimitSnapshot) -> Vec<TopOverRow> {
 /// has to be substituted here too — the page polls this fragment
 /// every five seconds, and an unsubstituted `__CSRF__` would make
 /// every delete button fail the CSRF check.
-pub async fn api_rules(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn api_rules(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let (rules, _site_names) = load_rules_and_sites(app).await;
     let html = RateLimitRulesView {
         rules: rules.iter().map(RuleRow::new).collect(),
+        lang,
     }
     .render()
     .unwrap_or_default();
@@ -125,11 +136,14 @@ pub async fn api_rules(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
 /// the dashboard.
 ///
 /// The fragment carries no buttons, so it needs no CSRF token.
-pub async fn api_blocked(app: &Arc<App>) -> http::Result<Resp> {
-    let rows = crate::routes::dashboard::blocked_rows(app);
-    let html = crate::templates::DashboardBlockedView { blocked: rows }
-        .render()
-        .unwrap_or_default();
+pub async fn api_blocked(app: &Arc<App>, lang: Lang) -> http::Result<Resp> {
+    let rows = crate::routes::dashboard::blocked_rows(app, lang);
+    let html = crate::templates::DashboardBlockedView {
+        blocked: rows,
+        lang,
+    }
+    .render()
+    .unwrap_or_default();
     ok_html(html)
 }
 
@@ -158,8 +172,8 @@ impl IpRuleFormError {
     }
 
     /// The message the operator sees.
-    pub fn message(self) -> &'static str {
-        add_rule_errors(self.code())
+    pub fn message(self, lang: Lang) -> String {
+        add_rule_errors(self.code(), lang)
     }
 }
 
@@ -208,7 +222,12 @@ pub fn parse_ip_rule_form(
 ///
 /// Form POST (not HTMX): the rule table is re-read from the database
 /// on the next poll, so a redirect back to the page is enough.
-pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
+pub async fn handle_add_rule(
+    app: &Arc<App>,
+    body: &[u8],
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
 
     let rule = {
@@ -224,7 +243,10 @@ pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::
     let rule = match rule {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("ratelimit: ignoring ip rule submission: {}", e.message());
+            log::warn!(
+                "ratelimit: ignoring ip rule submission: {}",
+                e.message(lang)
+            );
             return Ok(redirect(&format!("/ratelimit?error={}", e.code())));
         }
     };
@@ -248,12 +270,13 @@ pub async fn api_handle_delete_rule(
     kind: String,
     cidr: String,
     _csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(kind) = RuleKind::parse(&kind) else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let Ok(normalized) = normalize_cidr(&cidr) else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let id = rule_id(&scope, kind, &normalized);
     {
@@ -668,14 +691,12 @@ where
 }
 
 /// The messages behind the `?error=` codes of the "add rule" form.
-fn add_rule_errors(code: &str) -> &'static str {
+fn add_rule_errors(code: &str, lang: Lang) -> String {
     match code {
-        "invalid-cidr" => {
-            "The address or CIDR range could not be parsed — use 1.2.3.4 or 10.0.0.0/8."
-        }
-        "invalid-kind" => "The rule kind must be either whitelist or blacklist.",
-        "unknown-scope" => "The scope must be \"global\" or the name of an existing site.",
-        _ => "The rule could not be added.",
+        "invalid-cidr" => lang.t("ratelimit.error.invalid_cidr").into_owned(),
+        "invalid-kind" => lang.t("ratelimit.error.invalid_kind").into_owned(),
+        "unknown-scope" => lang.t("ratelimit.error.unknown_scope").into_owned(),
+        _ => lang.t("ratelimit.error.generic").into_owned(),
     }
 }
 
@@ -931,7 +952,7 @@ mod tests {
         .await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         assert!(html.contains("data-ip=\"198.51.100.9\""), "{html}");
         assert!(html.contains("data-country=\"JP\""), "{html}");
         assert!(html.contains("data-region=\"13\""), "{html}");
@@ -966,7 +987,7 @@ mod tests {
 
         // The full page carries the same table — it includes the
         // fragment, so the columns are there on the first paint too.
-        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        let page = html_of(render(&app, "csrf", None, Lang::En).await.expect("render")).await;
         for column in ["Country", "Region", "Status", "Rejections", "First blocked"] {
             assert!(
                 page.contains(column),
@@ -984,7 +1005,7 @@ mod tests {
         throttle(&app, client, ClientGeo::default()).await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         assert!(html.contains("data-country=\"\""), "{html}");
         assert!(html.contains("data-region=\"\""), "{html}");
         // The country and the region cells render an em dash. The
@@ -1008,7 +1029,7 @@ mod tests {
         throttle_as_bot(&app, client, "googlebot").await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         // The column order — the Bot column sits right after the
         // client IP (R3), and the User-Agent column right after that
         // (issue #149, R7).
@@ -1059,7 +1080,7 @@ mod tests {
         throttle(&app, client, ClientGeo::default()).await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         let row = row_with(&html, "data-bot=\"\"");
         assert!(!row.contains("bg-blue-100"), "{row}");
         // Site, Client IP, User-Agent, Bot, …
@@ -1087,7 +1108,7 @@ mod tests {
         );
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         let row = row_with(&html, "data-ip=\"198.51.100.50\"");
         assert!(
             row.contains("data-badbot=\"bad_address\""),
@@ -1109,7 +1130,7 @@ mod tests {
         throttle_as_bot(&app, client, "googlebot").await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_blocked(&app).await.expect("api_blocked")).await;
+        let html = html_of(api_blocked(&app, Lang::En).await.expect("api_blocked")).await;
         // The column order — the Bot column sits right after the
         // client IP (R3), and the User-Agent column right after that
         // (issue #149, R7).
@@ -1144,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn the_empty_over_limit_table_spans_every_column() {
         let (_dir, app) = make_test_app();
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         assert!(html.contains("colspan=\"10\""), "{html}");
     }
 
@@ -1161,7 +1182,7 @@ mod tests {
             .record_user_agent("a", client, Some("scraper/1.0"));
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         // The raw value rides on the row (R9).
         let row = row_with(&html, "data-ip=\"198.51.100.70\"");
         assert!(row.contains("data-ua=\"scraper/1.0\""), "{row}");
@@ -1181,7 +1202,7 @@ mod tests {
         throttle(&app, client, ClientGeo::default()).await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         let row = row_with(&html, "data-ip=\"198.51.100.71\"");
         assert!(row.contains("data-ua=\"\""), "{row}");
         // The dash of the over-limit table.
@@ -1202,7 +1223,7 @@ mod tests {
             .record_user_agent("a", client, Some("scraper/1.0"));
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_blocked(&app).await.expect("api_blocked")).await;
+        let html = html_of(api_blocked(&app, Lang::En).await.expect("api_blocked")).await;
         let row = row_with(&html, "data-ua=\"scraper/1.0\"");
         assert!(row.contains("data-ua=\"scraper/1.0\""), "{row}");
         let cell = cells_of(row)[1];
@@ -1222,7 +1243,7 @@ mod tests {
             .record_user_agent("a", client, Some(r#"Mozilla/5.0 "<script>" & "x""#));
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         let row = row_with(&html, "data-ip=\"198.51.100.75\"");
         assert!(row.contains("&quot;"), "{row}");
         assert!(row.contains("&amp;"), "{row}");
@@ -1240,7 +1261,7 @@ mod tests {
         throttle(&app, client, ClientGeo::default()).await;
         wait_for_published(&app, &client.to_string(), 1).await;
 
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         let row = row_with(&html, "data-ip=\"198.51.100.73\"");
         let cell = cells_of(row)[1];
         // The dropdown button carries the address of its row.
@@ -1267,7 +1288,7 @@ mod tests {
     #[tokio::test]
     async fn the_lookup_menu_offers_the_four_ip_intelligence_sites() {
         let (_dir, app) = make_test_app();
-        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        let page = html_of(render(&app, "csrf", None, Lang::En).await.expect("render")).await;
         for template in [
             "https://ipinsights.io/ip/{ip}",
             "https://viz.greynoise.io/ips/{ip}",
@@ -1299,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn the_lookup_menu_panel_is_outside_the_refreshed_region() {
         let (_dir, app) = make_test_app();
-        let page = html_of(render(&app, "csrf", None).await.expect("render")).await;
+        let page = html_of(render(&app, "csrf", None, Lang::En).await.expect("render")).await;
         let region = page
             .find("<div id=\"ratelimit-sites\"")
             .expect("the region");
@@ -1380,7 +1401,7 @@ mod tests {
         );
 
         wait_for_published(&app, &client.to_string(), 2).await;
-        let html = html_of(api_sites(&app).await.expect("api_sites")).await;
+        let html = html_of(api_sites(&app, Lang::En).await.expect("api_sites")).await;
         // Both kinds of rejection are counted and shown.
         assert!(html.contains("data-status=\"403+429\""), "{html}");
         assert!(html.contains("data-rejections=\"2\""), "{html}");
@@ -1390,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn page_renders_the_kpis_and_the_rules() {
         let (_dir, app) = make_test_app();
-        let resp = render(&app, "csrf", None).await.expect("render");
+        let resp = render(&app, "csrf", None, Lang::En).await.expect("render");
         assert_eq!(resp.status(), 200);
         let body = resp.into_body();
         let bytes = http_body_util::BodyExt::collect(body)
@@ -1408,7 +1429,9 @@ mod tests {
     async fn adding_a_rule_persists_it_and_a_delete_removes_it() {
         let (_dir, app) = make_test_app();
         let body = b"scope=global&kind=blacklist&cidr=203.0.113.0%2F24&note=scrapers";
-        let resp = handle_add_rule(&app, body, "csrf").await.expect("add rule");
+        let resp = handle_add_rule(&app, body, "csrf", Lang::En)
+            .await
+            .expect("add rule");
         assert_eq!(resp.status(), 302);
 
         {
@@ -1429,6 +1452,7 @@ mod tests {
             "blacklist".into(),
             "203.0.113.0/24".into(),
             "csrf",
+            Lang::En,
         )
         .await
         .expect("delete rule");
@@ -1441,7 +1465,9 @@ mod tests {
     async fn a_malformed_cidr_is_not_stored() {
         let (_dir, app) = make_test_app();
         let body = b"scope=global&kind=blacklist&cidr=not-an-ip";
-        let resp = handle_add_rule(&app, body, "csrf").await.expect("add rule");
+        let resp = handle_add_rule(&app, body, "csrf", Lang::En)
+            .await
+            .expect("add rule");
         assert_eq!(resp.status(), 302);
         let db = app.db.lock().await;
         assert!(pangolin_core::db::list_ip_rules(&db).unwrap().is_empty());
@@ -1453,7 +1479,9 @@ mod tests {
         // apply — the form only offers the existing sites.
         let (_dir, app) = make_test_app();
         let body = b"scope=ghost&kind=blacklist&cidr=203.0.113.0/24";
-        let resp = handle_add_rule(&app, body, "csrf").await.expect("add rule");
+        let resp = handle_add_rule(&app, body, "csrf", Lang::En)
+            .await
+            .expect("add rule");
         assert_eq!(resp.status(), 302);
         let db = app.db.lock().await;
         assert!(pangolin_core::db::list_ip_rules(&db).unwrap().is_empty());

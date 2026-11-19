@@ -39,8 +39,8 @@
 <td class="px-4 py-2 font-mono text-xs" data-asn-ip="{{ ip }}">
   <span class="font-mono text-xs">{{ ip }}</span>
   <button type="button" data-asn-trigger
-          title="lookup IP info — sends this address to ipwhois.app / ipinfo.io"
-          aria-label="Look up IP info (sends this address to ipwhois.app / ipinfo.io)"
+          title="{{ lang.t("components.ip_lookup.title") }}"
+          aria-label="{{ lang.t("components.ip_lookup.aria_label") }}"
           class="ml-1 align-middle text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300">
     <span class="inline-flex items-center justify-center">
       <svg data-asn-icon class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"/></svg>
@@ -49,8 +49,8 @@
   </button>
   <button type="button" data-ip-menu-toggle data-ip="{{ ip }}"
           aria-haspopup="true" aria-expanded="false"
-          title="open an IP lookup site — the address leaves your browser"
-          aria-label="Open an IP lookup site for {{ ip }}"
+          title="{{ lang.t("components.ip_menu.title") }}"
+          aria-label="{{ lang.tf("components.ip_menu.aria_label", [("ip", ip)]) }}"
           class="ml-1 align-middle text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300">▾</button>
   <div data-asn-geo class="hidden mt-0.5 font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
   <div data-asn-asn class="hidden font-sans text-[11px] text-slate-500 dark:text-slate-400"></div>
@@ -83,13 +83,13 @@
 <td class="px-4 py-2 text-xs">
   {% if let Some(c) = code %}
   {% if c == "bad_address" %}
-  <span data-badbot="bad_address" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">bad address</span>
+  <span data-badbot="bad_address" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">{{ lang.t("components.badbot.bad_address") }}</span>
   {% else if c == "bot_user_agent" %}
-  <span data-badbot="bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">bot user-agent</span>
+  <span data-badbot="bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">{{ lang.t("components.badbot.bot_user_agent") }}</span>
   {% else if c == "bad_address_bot_user_agent" %}
-  <span data-badbot="bad_address_bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">bad address + bot user-agent</span>
+  <span data-badbot="bad_address_bot_user_agent" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300">{{ lang.t("components.badbot.bad_address_bot_user_agent") }}</span>
   {% else %}
-  <span data-badbot="unknown" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300">unknown</span>
+  <span data-badbot="unknown" class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300">{{ lang.t("components.badbot.unknown") }}</span>
   {% endif %}
   {% else %}
   <span class="{{ dash_class }}">—</span>

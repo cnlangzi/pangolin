@@ -1,6 +1,8 @@
 //! Certs templates — list, new, table view.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use chrono::{DateTime, Utc};
 use pangolin_core::types::{Cert, CertErrorClass};
 
@@ -45,21 +47,21 @@ impl CertRow {
     /// Build the view-model row from a [`Cert`] and the current time.
     /// Centralised here so the route handler and any future HTMX
     /// fragment share the same string-formatting rules.
-    pub fn from_cert(cert: &Cert, now: DateTime<Utc>) -> Self {
+    pub fn from_cert(cert: &Cert, now: DateTime<Utc>, lang: Lang) -> Self {
         let started_rel = cert
             .started_at
-            .map(|s| super::relative_time(s, now))
+            .map(|s| super::relative_time(s, now, lang))
             .unwrap_or_default();
         let (expires_at_fmt, expired) = match cert.expires_at {
             Some(e) => (e.format("%Y-%m-%d").to_string(), e < now),
             None => (String::new(), false),
         };
         let next_retry_rel = match cert.next_retry_at {
-            Some(t) if t > now => super::relative_time(t, now),
+            Some(t) if t > now => super::relative_time(t, now, lang),
             // If `next_retry_at` is in the past, the loop is about to
             // pick it up on the next iteration — show "any moment now"
             // so the operator doesn't think the row is being ignored.
-            Some(_) => "any moment now".to_string(),
+            Some(_) => lang.t("certs.next_retry_any_moment").into_owned(),
             None => String::new(),
         };
         let error_class_label = match cert.error_class {
@@ -106,6 +108,8 @@ pub struct CertsListTemplate<'a> {
     /// these, but a chip still surfaces them so the operator can
     /// investigate the "stuck on the same error forever" rows.
     pub count_permanent: usize,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 // ─── New page (GET /certs/new) ──────────────────────────────────────────────────
@@ -115,4 +119,6 @@ pub struct CertsListTemplate<'a> {
 pub struct CertsNewTemplate<'a> {
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }

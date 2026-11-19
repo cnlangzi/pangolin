@@ -1,17 +1,17 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}{{ site.name }}: Domains — Pangolin{% endblock %}
+{% block title %}{{ site.name }}: {{ lang.t("domains.page_title") }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   {% include "components/_csrf.html" %}
 
   <div class="flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400 mb-4">
-    <a href="/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">Sites</a>
+    <a href="/sites" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">{{ lang.t("nav.sites") }}</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
     <a href="/sites/edit?name={{ self.site_name_encoded() }}" class="hover:text-accent-600 dark:hover:text-accent-400 transition-colors">{{ site.name }}</a>
     <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
-    <span class="text-slate-800 dark:text-slate-200 font-medium">Domains</span>
+    <span class="text-slate-800 dark:text-slate-200 font-medium">{{ lang.t("nav.domains") }}</span>
   </div>
 
   <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
@@ -26,7 +26,7 @@
       hx-target="#modal-body"
       class="inline-flex items-center justify-center gap-2 w-full sm:w-auto rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 transition">
       <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-      New domain
+      {{ lang.t("domains.list.new") }}
     </button>
   </div>
 
@@ -35,8 +35,8 @@
       <table class="hidden md:table table-auto w-full">
         <thead class="bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
           <tr>
-            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Domain</th>
-            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">Status</th>
+            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("common.domain") }}</th>
+            <th class="text-left text-xs font-semibold text-slate-600 dark:text-slate-200 uppercase tracking-wider px-4 py-3">{{ lang.t("common.status") }}</th>
             <th class="text-right px-4 py-3"></th>
           </tr>
         </thead>
@@ -46,19 +46,19 @@
             <td class="px-4 py-3"><span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span></td>
             <td class="px-4 py-3">
               {% if domain.enabled %}
-              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">enabled</span>
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">{{ lang.t("common.enabled") }}</span>
               {% else %}
-              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">disabled</span>
+              <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">{{ lang.t("common.disabled") }}</span>
               {% endif %}
             </td>
             <td class="px-4 py-3">
               <div class="flex items-center justify-end">
                 <button hx-delete="/api/domains/{{ domain.domain }}"
                   hx-vals='{"_csrf": "__CSRF__"}'
-                  hx-confirm="Delete domain {{ domain.domain }}?"
+                  hx-confirm="{{ lang.tf("domains.delete.confirm", [("name", domain.domain.as_str())]) }}"
                   hx-swap="delete"
                   class="text-slate-400 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 p-1.5 rounded hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-                  title="Delete">
+                  title="{{ lang.t("common.delete") }}">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
                 </button>
               </div>
@@ -66,7 +66,7 @@
           </tr>
           {% else %}
           <tr>
-            <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">No domains for this site yet. <button hx-get="/api/site/{{ site.name }}/domains/new" hx-target="#modal-body" class="text-accent-500 hover:underline">Add one</button>.</td>
+            <td colspan="3" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">{{ lang.t("domains.site_table.empty_before") }} <button hx-get="/api/site/{{ site.name }}/domains/new" hx-target="#modal-body" class="text-accent-500 hover:underline">{{ lang.t("domains.table.empty_link") }}</button>{{ lang.t("domains.table.empty_after") }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -78,27 +78,27 @@
           <div class="flex items-center justify-between mb-2">
             <span class="font-mono text-sm text-slate-800 dark:text-slate-100">{{ domain.domain }}</span>
             {% if domain.enabled %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">enabled</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">{{ lang.t("common.enabled") }}</span>
             {% else %}
-            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">disabled</span>
+            <span class="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 line-through">{{ lang.t("common.disabled") }}</span>
             {% endif %}
           </div>
           <button hx-delete="/api/domains/{{ domain.domain }}"
             hx-vals='{"_csrf": "__CSRF__"}'
-            hx-confirm="Delete domain {{ domain.domain }}?"
+            hx-confirm="{{ lang.tf("domains.delete.confirm", [("name", domain.domain.as_str())]) }}"
             class="w-full text-center text-sm text-red-500 dark:text-red-400 hover:text-red-600 dark:hover:text-red-300 border border-red-100 dark:border-red-500/30 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-lg py-1.5 transition-colors">
-            Delete
+            {{ lang.t("common.delete") }}
           </button>
         </div>
         {% else %}
         <div class="p-8 text-center text-slate-500 dark:text-slate-400 text-sm flex flex-col items-center gap-3">
-          <span>No domains for this site yet.</span>
+          <span>{{ lang.t("domains.site_table.empty_before") }}</span>
           <button type="button"
             hx-get="/api/site/{{ site.name }}/domains/new"
             hx-target="#modal-body"
             class="inline-flex items-center gap-1 text-accent-600 dark:text-accent-400 hover:underline">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
-            Add one
+            {{ lang.t("domains.table.empty_link") }}
           </button>
         </div>
         {% endfor %}

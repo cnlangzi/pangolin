@@ -1,14 +1,14 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}Bot Logs — Pangolin{% endblock %}
+{% block title %}{{ lang.t("bots.page_title") }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Bot Logs</h1>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ lang.t("bots.title") }}</h1>
       <p class="text-slate-600 dark:text-gray-300 text-sm md:text-base mt-1">
-        Crawler, AI, social-link-preview, and monitoring-bot traffic only — in-memory + per-day JSONL
+        {{ lang.t("bots.subtitle") }}
       </p>
     </div>
     <div class="flex items-center gap-2">
@@ -16,7 +16,7 @@
             class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border
                    bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700">
         <span id="bots-status-dot" class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>
-        <span id="bots-status-text">connecting…</span>
+        <span id="bots-status-text">{{ lang.t("bots.status.connecting") }}</span>
       </span>
     </div>
   </div>
@@ -33,7 +33,7 @@
   {# that need attention (the whole registry would bury them). #}
   <div class="card overflow-hidden mb-6">
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Verification status</h2>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("bots.verification_title") }}</h2>
       {# The badge is the unmissable form of the degraded state. A bot #}
       {# whose address list is missing or stale may fail closed — its #}
       {# traffic may never reach the log below — and the counts in the #}
@@ -42,30 +42,30 @@
       {% if health.available && health.not_ready_count() > 0 %}
         <span data-not-ready="{{ health.not_ready_count() }}"
               class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 whitespace-nowrap"
-              title="A bot whose address list is missing or whose last refresh failed may fail closed: its traffic stays out of the log and it gets no rate-limit exemption.">
-          <span class="font-semibold tabular-nums">{{ health.not_ready_count() }}</span> bot lists not ready
+              title="{{ lang.t("bots.not_ready_title") }}">
+          <span class="font-semibold tabular-nums">{{ health.not_ready_count() }}</span> {{ lang.t("bots.not_ready_label") }}
         </span>
       {% endif %}
     </div>
     <div class="p-4">
       {% if !health.available %}
-        <p class="text-sm text-slate-600 dark:text-gray-300">Verification status unavailable</p>
+        <p class="text-sm text-slate-600 dark:text-gray-300">{{ lang.t("bots.verification_unavailable") }}</p>
       {% else %}
         <p class="text-sm text-slate-600 dark:text-gray-300">
-          <span class="font-semibold tabular-nums">{{ health.ready_count() }}</span> ready ·
-          <span class="font-semibold tabular-nums">{{ health.cold_count() }}</span> cold ·
-          <span class="font-semibold tabular-nums">{{ health.failed_count() }}</span> failed
+          <span class="font-semibold tabular-nums">{{ health.ready_count() }}</span> {{ lang.t("bots.ready_label") }}
+          <span class="font-semibold tabular-nums">{{ health.cold_count() }}</span> {{ lang.t("bots.cold_label") }}
+          <span class="font-semibold tabular-nums">{{ health.failed_count() }}</span> {{ lang.t("bots.failed_label") }}
         </p>
         {% if !health.needs_attention() %}
-          <p class="mt-2 text-sm text-green-700 dark:text-green-300">All IP lists loaded</p>
+          <p class="mt-2 text-sm text-green-700 dark:text-green-300">{{ lang.t("bots.all_lists_loaded") }}</p>
         {% else %}
           <div class="mt-3 overflow-x-auto scrollbar-thin">
             <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
               <thead class="bg-slate-50 dark:bg-slate-800/50">
                 <tr>
-                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Bot / file</th>
-                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">State</th>
-                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Detail</th>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("bots.col.bot_file") }}</th>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("bots.col.state") }}</th>
+                  <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("bots.col.detail") }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
@@ -82,7 +82,7 @@
                 {% for err in health.config_errors %}
                 <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
                   <td class="px-4 py-2 whitespace-nowrap font-mono text-slate-900 dark:text-slate-100">{{ err.path }}</td>
-                  <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">config error</td>
+                  <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ lang.t("bots.config_error") }}</td>
                   <td class="px-4 py-2 text-slate-600 dark:text-slate-300">{{ err.message }}</td>
                 </tr>
                 {% endfor %}
@@ -96,7 +96,7 @@
           {# live outage. Later requests are verified normally once #}
           {# the queue drains — only the dropped ones failed closed. #}
           <p class="mt-3 text-xs text-amber-700 dark:text-amber-300">
-            RDNS lookups dropped: <span class="font-semibold tabular-nums">{{ health.rdns_overflow }}</span> since startup — the reverse-DNS work queue was full; those requests failed closed.
+            {{ lang.t("bots.rdns_dropped_before") }} <span class="font-semibold tabular-nums">{{ health.rdns_overflow }}</span> {{ lang.t("bots.rdns_dropped_after") }}
           </p>
         {% endif %}
       {% endif %}
@@ -110,21 +110,21 @@
   {# server-side; the SSE feed below appends new rows in real time. #}
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
     <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Total bot requests</div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.total_requests") }}</div>
       <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
     </div>
     <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Distinct (bot × host) pairs</div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.distinct_pairs") }}</div>
       <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.unique_pairs }}</div>
     </div>
     <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Top bot</div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.top_bot") }}</div>
       <div class="mt-1 text-2xl font-semibold text-slate-900 dark:text-white">
         {% if top_rows.is_empty() %}
-          <span class="text-slate-400 dark:text-slate-500 text-base font-normal">none yet</span>
+          <span class="text-slate-400 dark:text-slate-500 text-base font-normal">{{ lang.t("bots.none_yet") }}</span>
         {% else %}
           {{ top_rows[0].bot_name }}
-          <span class="text-sm text-slate-500 dark:text-slate-400 font-normal ml-1">({{ top_rows[0].hits }} hits)</span>
+          <span class="text-sm text-slate-500 dark:text-slate-400 font-normal ml-1">{{ lang.tf("bots.hits_suffix", [("n", top_rows[0].hits)]) }}</span>
         {% endif %}
       </div>
     </div>
@@ -134,18 +134,18 @@
   {% if !top_rows.is_empty() %}
   <div class="card overflow-hidden mb-6">
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Top bots by hit count</h2>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("bots.top_bots_title") }}</h2>
     </div>
     <div class="overflow-x-auto scrollbar-thin">
       <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
         <thead class="bg-slate-50 dark:bg-slate-800/50">
           <tr>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Bot</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Vendor</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Category</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Host</th>
-            <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Hits</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">Last seen</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("common.bot") }}</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("bots.col.vendor") }}</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("bots.col.category") }}</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.host") }}</th>
+            <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
+            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("common.last_seen") }}</th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
@@ -168,26 +168,26 @@
   {# ── Live tail table (client-side SSE) ───────────────────────────────── #}
   <div id="bots-table" class="card overflow-hidden">
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">Live tail</h2>
-      <span class="text-xs text-slate-500 dark:text-slate-400">Bounded ring buffer; live SSE channel</span>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("bots.live_tail") }}</h2>
+      <span class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("bots.bounded_buffer") }}</span>
     </div>
     <div class="overflow-x-auto scrollbar-thin">
       <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
         <thead class="bg-slate-50 dark:bg-slate-800/50">
           <tr>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">Time</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">Request</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">Bot</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Category</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">Host</th>
-            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">Duration</th>
-            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">Client</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.time") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.request") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("common.bot") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("bots.col.category") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">{{ lang.t("common.host") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.duration") }}</th>
+            <th scope="col" class="px-4 py-2.5 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32 hidden xl:table-cell">{{ lang.t("common.client") }}</th>
           </tr>
         </thead>
         <tbody id="bots-tbody" class="divide-y divide-slate-100 dark:divide-slate-700 font-mono text-xs">
           <tr id="bots-empty-row">
             <td colspan="7" class="px-4 py-8 text-center text-slate-500 dark:text-slate-400 font-sans">
-              Waiting for bot traffic…
+              {{ lang.t("bots.empty_waiting") }}
             </td>
           </tr>
         </tbody>
@@ -196,16 +196,14 @@
   </div>
 
   <p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
-    In-memory ring buffer (configurable via <code>log.bot.recent</code>); live channel (<code>log.bot.capacity</code>).
-    Persistent per-day JSONL under <code>log.bot.dir</code> as <code>bot-YYYY-MM-DD.jsonl</code> — operators tail / inspect
-    directly with <code>jq</code> / <code>DuckDB</code>. Restart of <code>pangolin-ngx</code> clears the in-memory ring but
-    the JSONL files persist (daily rotation, no auto-cleanup in v1).
+    {{ lang.t("bots.footnote_1") }} <code>log.bot.recent</code>{{ lang.t("bots.footnote_2") }}<code>log.bot.capacity</code>){{ lang.t("bots.footnote_3") }} <code>log.bot.dir</code> {{ lang.t("bots.footnote_4") }} <code>bot-YYYY-MM-DD.jsonl</code> {{ lang.t("bots.footnote_5") }} <code>jq</code> / <code>DuckDB</code>{{ lang.t("bots.footnote_6") }} <code>pangolin-ngx</code> {{ lang.t("bots.footnote_7") }}
 </p>
 </main>
 
 <script>
 (function() {
   "use strict";
+  const I18N = window.__PANGOLIN_I18N || {};
   // ── Status pill (status: connecting → replay → live → error/closed) ─
   const statusDot = document.getElementById("bots-status-dot");
   const statusText = document.getElementById("bots-status-text");
@@ -327,18 +325,18 @@
   // ── SSE connection (mirror of /logs but pointing at the bot stream) ─
   let es = null;
   function connect() {
-    setStatus("replay", "replaying…");
+    setStatus("replay", I18N["js.status.replaying"]);
     es = new EventSource("/api/logs/bots/stream");
     es.onopen = function() {
       // Replay frames arrive synchronously with open; flip to "live"
       // immediately — the operator can tell the difference only via
       // the devtools log, and the replay→live transition is rare in
       // practice.
-      setStatus("live", "live");
+      setStatus("live", I18N["js.status.live"]);
     };
     es.onerror = function() {
       // EventSource auto-retries; surface so the operator knows.
-      setStatus("error", "disconnected");
+      setStatus("error", I18N["js.status.disconnected"]);
     };
     es.onmessage = function(ev) {
       // Same shape handling as the access-log stream: ignore

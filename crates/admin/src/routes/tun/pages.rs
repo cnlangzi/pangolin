@@ -4,10 +4,12 @@ use askama::Template;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{Response, StatusCode};
+use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
+use crate::routes::helpers::bad_request_page;
 use crate::templates::{TunnelsEditTemplate, TunnelsListTemplate, TunnelsNewTemplate};
 
 type Resp = Response<Full<Bytes>>;
@@ -20,25 +22,27 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
     drop(db);
     let html = TunnelsListTemplate {
         tuns,
         active_nav: "tun",
+        lang,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn render_create_page(csrf: &str) -> http::Result<Resp> {
+pub async fn render_create_page(csrf: &str, lang: Lang) -> http::Result<Resp> {
     let html = TunnelsNewTemplate {
         tun: None,
         action: "create",
         error: None,
         active_nav: "tun",
+        lang,
     }
     .render()
     .unwrap();
@@ -49,15 +53,17 @@ pub async fn render_edit_page(
     app: &Arc<App>,
     name: Option<String>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
-            let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
-            )));
-            *resp.status_mut() = StatusCode::BAD_REQUEST;
-            return Ok(resp);
+            return Ok(bad_request_page(
+                lang,
+                &lang.t("tunnels.error.missing_name"),
+                "/tun",
+                &lang.t("common.back_to_tunnels"),
+            ));
         }
     };
 
@@ -66,7 +72,7 @@ pub async fn render_edit_page(
     drop(db);
 
     if tun.is_none() {
-        return render_edit_page_with_error(&name, "Tunnel not found", csrf);
+        return render_edit_page_with_error(&name, &lang.t("tunnels.error.not_found"), csrf, lang);
     }
 
     let html = TunnelsEditTemplate {
@@ -74,6 +80,7 @@ pub async fn render_edit_page(
         action: "update",
         error: None,
         active_nav: "tun",
+        lang,
     }
     .render()
     .unwrap();
@@ -84,12 +91,14 @@ pub(super) fn render_create_page_with_error(
     tun: Option<pangolin_core::types::Tun>,
     error: &str,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let html = TunnelsNewTemplate {
         tun,
         action: "create",
         error: Some(error),
         active_nav: "tun",
+        lang,
     }
     .render()
     .unwrap();
@@ -100,6 +109,7 @@ pub(super) fn render_edit_page_with_error(
     name: &str,
     error: &str,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let stub = pangolin_core::types::Tun {
         name: name.to_string(),
@@ -116,6 +126,7 @@ pub(super) fn render_edit_page_with_error(
         action: "update",
         error: Some(error),
         active_nav: "tun",
+        lang,
     }
     .render()
     .unwrap();

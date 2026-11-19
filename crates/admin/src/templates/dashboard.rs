@@ -2,6 +2,8 @@
 
 use askama::Template;
 
+use crate::i18n::Lang;
+
 /// One row in the dashboard "Recent ACME activity" panel.
 ///
 /// Pre-computed in `routes/dashboard.rs` from the [`pangolin_core::EventBuffer`]
@@ -61,6 +63,8 @@ pub struct DashboardBlockedView {
     /// The same shape the dashboard page carries, so the fragment can
     /// be rendered by both.
     pub blocked: Vec<BlockedRow>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Dashboard stats overview.
@@ -91,4 +95,6 @@ pub struct DashboardTemplate<'a> {
     /// The live "blocked clients" list (issue #117).
     pub blocked: Vec<BlockedRow>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }

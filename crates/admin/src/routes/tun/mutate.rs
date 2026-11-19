@@ -11,7 +11,8 @@ use pangolin_core::types::Tun;
 
 use super::helpers::{generate_token, parse_datetime};
 use super::pages::{render_create_page_with_error, render_edit_page_with_error};
-use crate::routes::helpers::parse_form;
+use crate::i18n::Lang;
+use crate::routes::helpers::{bad_request_page, parse_form};
 
 use std::collections::HashMap;
 
@@ -41,21 +42,22 @@ pub fn parse_tun_form(
     params: &HashMap<String, String>,
     name: &str,
     existing: Option<&Tun>,
+    lang: Lang,
 ) -> Result<TunForm, String> {
     // The name is the primary key, so it is only checked when the row
     // is created — an edit cannot change it.
     if existing.is_none() {
         if name.is_empty() {
-            return Err("Name is required".into());
+            return Err(lang.t("tunnels.error.name_required").into_owned());
         }
         if name.len() > 64 {
-            return Err("Name must be 64 characters or less".into());
+            return Err(lang.t("tunnels.error.name_too_long").into_owned());
         }
         if !name
             .chars()
             .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-')
         {
-            return Err("Name may only contain letters, digits, underscores, and hyphens".into());
+            return Err(lang.t("tunnels.error.name_charset").into_owned());
         }
     }
 
@@ -78,13 +80,18 @@ pub fn parse_tun_form(
     })
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
 
-    let parsed = match parse_tun_form(&params, &name, None) {
+    let parsed = match parse_tun_form(&params, &name, None, lang) {
         Ok(p) => p,
-        Err(e) => return render_create_page_with_error(None, &e, csrf),
+        Err(e) => return render_create_page_with_error(None, &e, csrf, lang),
     };
 
     // A submission without a token gets a fresh one.
@@ -97,6 +104,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                     None,
                     &format!("Token generation error: {}", e),
                     csrf,
+                    lang,
                 );
             }
         },
@@ -111,11 +119,9 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             drop(db);
             return render_create_page_with_error(
                 None,
-                &format!(
-                    "Tunnel '{}' already exists; use the edit page to update it",
-                    name
-                ),
+                &lang.tf("tunnels.error.already_exists", [("name", name)]),
                 csrf,
+                lang,
             );
         }
     }
@@ -137,7 +143,9 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
 
     match result {
         Ok(()) => Ok(redirect_response("/tun")),
-        Err(e) => render_create_page_with_error(None, &format!("Database error: {}", e), csrf),
+        Err(e) => {
+            render_create_page_with_error(None, &format!("Database error: {}", e), csrf, lang)
+        }
     }
 }
 
@@ -146,15 +154,17 @@ pub async fn handle_update(
     name: Option<String>,
     body: &[u8],
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
-            let mut resp = Response::new(Full::new(Bytes::from(
-                r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">Bad request</h2><p class="text-red-700 text-sm">Missing tunnel name.</p><a href="/tun" class="text-sm text-red-700 underline mt-2 inline-block">← Back to tunnels</a></div></div>"#,
-            )));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            return Ok(resp);
+            return Ok(bad_request_page(
+                lang,
+                &lang.t("tunnels.error.missing_name"),
+                "/tun",
+                &lang.t("common.back_to_tunnels"),
+            ));
         }
     };
 
@@ -165,12 +175,12 @@ pub async fn handle_update(
     drop(db);
 
     let Some(mut tun) = existing else {
-        return render_edit_page_with_error(&name, "Tunnel not found", csrf);
+        return render_edit_page_with_error(&name, &lang.t("tunnels.error.not_found"), csrf, lang);
     };
 
-    let parsed = match parse_tun_form(&params, &name, Some(&tun)) {
+    let parsed = match parse_tun_form(&params, &name, Some(&tun), lang) {
         Ok(p) => p,
-        Err(e) => return render_edit_page_with_error(&name, &e, csrf),
+        Err(e) => return render_edit_page_with_error(&name, &e, csrf, lang),
     };
 
     if let Some(new_token) = parsed.token {
@@ -189,7 +199,7 @@ pub async fn handle_update(
 
     match result {
         Ok(()) => Ok(redirect_response("/tun")),
-        Err(e) => render_edit_page_with_error(&name, &format!("Database error: {}", e), csrf),
+        Err(e) => render_edit_page_with_error(&name, &format!("Database error: {}", e), csrf, lang),
     }
 }
 
@@ -201,6 +211,7 @@ pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
     _csrf: &str,
+    _lang: Lang,
 ) -> http::Result<Resp> {
     if let Some(n) = name
         && !n.is_empty()
@@ -218,9 +229,14 @@ pub async fn handle_delete(
 /// This is the unified delete endpoint for tun rows; the form-POST
 /// `/tun/delete` route above is kept for now as a fallback during the
 /// migration window (issue #48).
-pub async fn api_handle_delete(app: &Arc<App>, name: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    name: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if name.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_tun(&db, &name);

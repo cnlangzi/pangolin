@@ -8,6 +8,7 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::templates::{ActivityRow, BlockedRow, DashboardTemplate};
 
 /// How many of the most-recent EventBuffer entries to surface in the
@@ -29,7 +30,7 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
         .expect("response builder for 200 OK should not fail"))
 }
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<Bytes>>> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
@@ -63,13 +64,13 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
     let activity: Vec<ActivityRow> = app
         .get_recent_events(DASHBOARD_ACTIVITY_LIMIT)
         .into_iter()
-        .map(|e| activity_row(e, now))
+        .map(|e| activity_row(e, now, lang))
         .collect();
 
     let traffic = app.traffic_snapshot();
     // The live "blocked clients" list (issue #117): the client IPs
     // the rate limiter rejected, most recent first.
-    let blocked = blocked_rows(app);
+    let blocked = blocked_rows(app, lang);
     let dashboard = DashboardTemplate {
         site_count: sites.len(),
         domain_count: domains.len(),
@@ -84,6 +85,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
         traffic_active: traffic.active_requests,
         blocked,
         active_nav: "dashboard",
+        lang,
     };
 
     ok_html(crate::render_with_assets_and_csrf(
@@ -96,7 +98,7 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Response<Full<By
 ///
 /// Reads the rate limiter's published snapshot — the counters are
 /// in-memory and reset when the process restarts.
-pub fn blocked_rows(app: &Arc<App>) -> Vec<BlockedRow> {
+pub fn blocked_rows(app: &Arc<App>, lang: Lang) -> Vec<BlockedRow> {
     app.ratelimit_snapshot()
         .blocked
         .iter()
@@ -109,7 +111,7 @@ pub fn blocked_rows(app: &Arc<App>) -> Vec<BlockedRow> {
             user_agent: c.user_agent.clone(),
             rule_blocks: c.rule_blocks,
             throttled: c.throttled,
-            last_seen: format!("{}s ago", c.last_seen_secs),
+            last_seen: lang.tf("time.seconds_ago", [("n", c.last_seen_secs)]),
         })
         .collect()
 }
@@ -118,29 +120,68 @@ pub fn blocked_rows(app: &Arc<App>) -> Vec<BlockedRow> {
 /// [`ActivityRow`]. Kept here (and not on `EventType`) because the
 /// `kind`/`is_error`/`message` labels are admin-UI vocabulary and
 /// `pangolin-core` shouldn't grow opinions about that.
-fn activity_row(e: pangolin_core::Event, now: chrono::DateTime<chrono::Utc>) -> ActivityRow {
+///
+/// The message wording comes from the language catalog; the `kind` tag
+/// stays a technical identifier, because the template picks the pill
+/// colour off it.
+fn activity_row(
+    e: pangolin_core::Event,
+    now: chrono::DateTime<chrono::Utc>,
+    lang: Lang,
+) -> ActivityRow {
     use pangolin_core::EventType::*;
-    let when = crate::templates::relative_time(e.timestamp, now);
+    let when = crate::templates::relative_time(e.timestamp, now, lang);
     let (kind, message, is_error) = match e.event {
-        TunConnected { name } => ("Tun".into(), format!("connected: {name}"), false),
-        TunDisconnected { name } => ("Tun".into(), format!("disconnected: {name}"), false),
-        CertRenewed { domain } => ("ACME".into(), format!("renewed {domain}"), false),
+        TunConnected { name } => (
+            "Tun".into(),
+            lang.tf("activity.tun_connected", [("name", name.as_str())]),
+            false,
+        ),
+        TunDisconnected { name } => (
+            "Tun".into(),
+            lang.tf("activity.tun_disconnected", [("name", name.as_str())]),
+            false,
+        ),
+        CertRenewed { domain } => (
+            "ACME".into(),
+            lang.tf("activity.cert_renewed", [("domain", domain.as_str())]),
+            false,
+        ),
         CertRenewFailed { domain, error } => (
             "ACME".into(),
-            format!("renew {domain} failed: {error}"),
+            lang.tf(
+                "activity.cert_renew_failed",
+                [("domain", domain.as_str()), ("error", error.as_str())],
+            ),
             true,
         ),
-        SiteUpdated { name } => ("Site".into(), format!("updated: {name}"), false),
+        SiteUpdated { name } => (
+            "Site".into(),
+            lang.tf("activity.site_updated", [("name", name.as_str())]),
+            false,
+        ),
         DomainUpdated { domain, site } => (
             "Domain".into(),
-            format!("upserted {domain} → site {site}"),
+            lang.tf(
+                "activity.domain_updated",
+                [("domain", domain.as_str()), ("site", site.as_str())],
+            ),
             false,
         ),
         Info { message } => ("Info".into(), message, false),
-        CertIssued { domain } => ("ACME".into(), format!("issued {domain}"), false),
-        CertIssuanceSkipped { domain, reason } => {
-            ("ACME".into(), format!("skipped {domain}: {reason}"), true)
-        }
+        CertIssued { domain } => (
+            "ACME".into(),
+            lang.tf("activity.cert_issued", [("domain", domain.as_str())]),
+            false,
+        ),
+        CertIssuanceSkipped { domain, reason } => (
+            "ACME".into(),
+            lang.tf(
+                "activity.cert_renew_skipped",
+                [("domain", domain.as_str()), ("reason", reason.as_str())],
+            ),
+            true,
+        ),
     };
     ActivityRow {
         when,
@@ -174,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn the_dashboard_shows_the_blocked_clients_panel() {
         let (_dir, app) = make_test_app();
-        let resp = render(&app, "csrf").await.expect("render");
+        let resp = render(&app, "csrf", Lang::En).await.expect("render");
         assert_eq!(resp.status(), 200);
         let body = resp.into_body();
         let bytes = http_body_util::BodyExt::collect(body)
