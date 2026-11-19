@@ -143,6 +143,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "api"
+version = "0.0.0"
+dependencies = [
+ "admin",
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "hex",
+ "http 1.4.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "pangolin-core",
+ "parking_lot",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "urlencoding",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,6 +2188,7 @@ version = "0.0.0"
 dependencies = [
  "admin",
  "anyhow",
+ "api",
  "async-trait",
  "badbots",
  "base64 0.22.1",
@@ -2407,6 +2435,7 @@ name = "pangolin-integration-tests"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "api",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -2414,6 +2443,7 @@ dependencies = [
  "env_logger",
  "figment",
  "futures-util",
+ "hex",
  "http-body-util",
  "httpdate",
  "lazy_static",
@@ -2436,6 +2466,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tun",
 ]

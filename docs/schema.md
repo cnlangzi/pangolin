@@ -53,6 +53,7 @@ the tables hold state the gateway reads on every request.
 | [`site_origin_allow`](#site_origin_allow) | Manual source ranges allowed to reach the origin |
 | [`provider_ip_lists`](#provider_ip_lists) | The ranges a provider publishes |
 | [`badbots_config`](#badbots_config) | IP-reputation settings (singleton) |
+| [`api_config`](#api_config) | The dashboard API's connection settings (singleton) |
 
 ## `sites`
 
@@ -302,6 +303,34 @@ The keys are stored in the clear: an upstream key has to be sent to the
 upstream verbatim, so it cannot be hashed the way `tun.token_hash` is. The
 admin UI never renders a stored key back; the form shows whether a key is
 configured and takes a new one to replace it.
+
+## `api_config`
+
+The dashboard API's connection settings, in a singleton row. The
+**listen address** is not here — that is configuration (`api.listen` in
+`ngx.yml`). What is here is everything the operator may need to change
+without restarting the gateway: the bearer token, the switch and the
+dashboard's address.
+
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `id` | INTEGER PRIMARY KEY CHECK (id = 1) | Always `1`. |
+| `instance_id` | TEXT NOT NULL | The id this node is known by in the dashboard. Generated once, on the first boot. |
+| `token_hash` | TEXT NOT NULL | The SHA-256 hex digest of the bearer token. The token itself is never stored — the same convention `tun.token_hash` uses. |
+| `dashboard_port` | INTEGER NOT NULL DEFAULT 0 | The port the dashboard is reachable on, as the operator configured it. `0` means "not configured". |
+| `dashboard_ip` | TEXT | The dashboard's address, learned from the source address of an authenticated call. |
+| `enabled` | INTEGER NOT NULL DEFAULT 0 | Whether the API accepts calls. Off until an operator turns it on. |
+| `updated_at` | TEXT NOT NULL | RFC-3339 UTC timestamp of the last write. |
+
+The row is seeded on the gateway's first boot: a fresh `instance_id`,
+an empty `token_hash` and `enabled = 0` — a gateway that was never
+configured accepts nothing. The operator sets the token, the port and
+the switch on the node's `/settings` page ("Dashboard" card); the
+`NGX_API__TOKEN` environment variable seeds the token on the first
+boot, when the gateway has none of its own yet.
+
+See [design/api.md](design/api.md) for the protocol this table
+belongs to.
 
 ## Removed tables
 

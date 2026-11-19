@@ -1317,6 +1317,176 @@ pub fn upsert_provider_ip_list(conn: &Connection, row: &ProviderIpList) -> rusql
     Ok(())
 }
 
+// ---- api_config (the dashboard-facing management API, issue #185) ----
+
+/// The singleton row of the `api_config` table.
+///
+/// This is the **runtime** state of the management API: everything
+/// the operator may need to change without restarting the gateway.
+/// The listen address is *not* here — that is configuration
+/// (`api.listen` in `ngx.yml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiConfigRow {
+    /// Always 1 — the table is a singleton.
+    pub id: i64,
+    /// The stable id this node is known by in the dashboard.
+    pub instance_id: String,
+    /// SHA-256 hex digest of the bearer token. The token itself is
+    /// never stored.
+    pub token_hash: String,
+    /// The port the dashboard is reachable on, as the operator sees
+    /// it. 0 means "not configured".
+    pub dashboard_port: i64,
+    /// The dashboard's address as learned from the source address of
+    /// the inbound API connection.
+    pub dashboard_ip: Option<String>,
+    /// Whether the API accepts calls at all.
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+/// Read the `api_config` singleton.
+///
+/// `None` means "never configured" — the API then fails closed: no
+/// token, so no request can be authenticated.
+pub fn get_api_config(conn: &Connection) -> rusqlite::Result<Option<ApiConfigRow>> {
+    conn.query_row(
+        "SELECT id, instance_id, token_hash, dashboard_port, dashboard_ip,
+                enabled, updated_at
+         FROM api_config WHERE id = 1",
+        [],
+        |row| {
+            let id: i64 = row.get(0)?;
+            let instance_id: String = row.get(1)?;
+            let token_hash: String = row.get(2)?;
+            let dashboard_port: i64 = row.get(3)?;
+            let dashboard_ip: Option<String> = row.get(4)?;
+            let enabled: i64 = row.get(5)?;
+            let updated_at: String = row.get(6)?;
+            Ok(ApiConfigRow {
+                id,
+                instance_id,
+                token_hash,
+                dashboard_port,
+                dashboard_ip,
+                enabled: enabled != 0,
+                updated_at,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Insert or update the `api_config` singleton.
+///
+/// `id` is forced to 1: the table's CHECK constraint rejects any
+/// other value, and the singleton has no meaningful identity beyond
+/// "the one row".
+pub fn upsert_api_config(conn: &Connection, row: &ApiConfigRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO api_config (
+            id, instance_id, token_hash, dashboard_port, dashboard_ip,
+            enabled, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            instance_id = excluded.instance_id,
+            token_hash = excluded.token_hash,
+            dashboard_port = excluded.dashboard_port,
+            dashboard_ip = excluded.dashboard_ip,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at",
+        params![
+            row.instance_id,
+            row.token_hash,
+            row.dashboard_port,
+            row.dashboard_ip,
+            row.enabled as i64,
+            row.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Create the `api_config` singleton if it does not exist yet, and
+/// return the row that is in the table afterwards.
+///
+/// The first boot of a fresh database has no `api_config` row, so
+/// the API has no token and fails closed until an operator configures
+/// one. This helper makes that first boot explicit: it seeds the row
+/// with the instance id and the token hash derived from the
+/// environment, and leaves an already-configured row alone.
+pub fn ensure_api_config(
+    conn: &Connection,
+    instance_id: &str,
+    token_hash: &str,
+) -> rusqlite::Result<ApiConfigRow> {
+    if let Some(existing) = get_api_config(conn)? {
+        return Ok(existing);
+    }
+    let row = ApiConfigRow {
+        id: 1,
+        instance_id: instance_id.to_string(),
+        token_hash: token_hash.to_string(),
+        dashboard_port: 0,
+        dashboard_ip: None,
+        enabled: false,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    upsert_api_config(conn, &row)?;
+    Ok(row)
+}
+
+/// Remember the dashboard's address, learned from an authenticated
+/// call.
+///
+/// **Only the `dashboard_ip` column is touched.** The other columns
+/// are the operator's, and a write of the whole row from a copy read
+/// before the authentication would revert a token rotation or the
+/// switch that happened in between.
+pub fn update_api_dashboard_ip(conn: &Connection, ip: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config SET dashboard_ip = ?1, updated_at = ?2 WHERE id = 1",
+        params![ip, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Write the bearer token's digest.
+///
+/// **Only the `token_hash` column is touched** — the switch and the
+/// dashboard's address belong to other writers.
+pub fn update_api_token_hash(conn: &Connection, token_hash: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config SET token_hash = ?1, updated_at = ?2 WHERE id = 1",
+        params![token_hash, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Write the operator's dashboard settings.
+///
+/// **Only the three columns the settings form owns are touched**, so
+/// a concurrent write of the learned address is not reverted.
+pub fn update_api_settings(
+    conn: &Connection,
+    enabled: bool,
+    token_hash: &str,
+    dashboard_port: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config
+            SET enabled = ?1, token_hash = ?2, dashboard_port = ?3, updated_at = ?4
+          WHERE id = 1",
+        params![
+            enabled as i64,
+            token_hash,
+            dashboard_port,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 // ---- Row mappers ----
 
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
@@ -1714,7 +1884,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut conn = make_conn();
         // refinery creates a `refinery_schema_history` table — verify
-        // it's there and lists V1..V14 as applied. (V2 merges
+        // it's there and lists V1..V15 as applied. (V2 merges
         // tokens into tun; V3 stores token as sha256; V4 adds the
         // ACME-lifecycle columns on `certs` for issue #45; V5 adds
         // next_retry_at / error_class / attempt_count / order_url for
@@ -1726,15 +1896,16 @@ mod tests {
         // V11 adds the per-site known-bot rate-limit list for issue #131;
         // V12 adds the badbots_config singleton for issue #141; V13
         // drops the list-refresh-interval setting for issue #151; V14
-        // rewrites the per-site bot list for the removed crawlers.)
+        // rewrites the per-site bot list for the removed crawlers; V15
+        // adds the api_config singleton for issue #185.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 14,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 to be applied"
+            count, 15,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 + V15 to be applied"
         );
 
         // Verify V2 is recorded.

@@ -24,7 +24,7 @@ use super::provider::{provider_range_statuses, total_guard_rejections};
 use super::system::{parse_system_config_form_merged, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
-use crate::templates::settings::{BadbotsSettingsView, ProviderOption};
+use crate::templates::settings::{BadbotsSettingsView, DashboardApiView, ProviderOption};
 
 /// Render the settings page. `error` is `None` on the initial
 /// GET and on a successful POST (which 302s back here); it's
@@ -33,6 +33,7 @@ async fn render_page(
     app: &Arc<App>,
     csrf: &str,
     error: Option<&str>,
+    dashboard_error: Option<&str>,
 ) -> http::Result<Response<Full<Bytes>>> {
     let cfg = app.system_config.read().await.clone();
     // The provider radio group is generated from the registry, so a
@@ -84,7 +85,9 @@ async fn render_page(
         guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
         badbots,
+        dashboard: dashboard_view(app).await,
         error,
+        dashboard_error,
         active_nav: "settings",
     };
     ok_html(render_with_assets_and_csrf(
@@ -98,7 +101,134 @@ pub async fn handle_render_settings(
     app: &Arc<App>,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, None).await
+    render_page(app, csrf, None, None).await
+}
+
+/// The dashboard API's connection settings as the page shows them.
+///
+/// A gateway that has never been set up has no row yet — the card
+/// then shows the empty state and the operator has to restart the
+/// gateway once (the row is seeded on the first boot).
+async fn dashboard_view(app: &Arc<App>) -> DashboardApiView {
+    let row = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_api_config(&db).unwrap_or(None)
+    };
+    match row {
+        Some(row) => DashboardApiView {
+            instance_id: row.instance_id,
+            enabled: row.enabled,
+            has_token: !row.token_hash.is_empty(),
+            dashboard_port: row.dashboard_port.clamp(0, u16::MAX as i64) as u16,
+            dashboard_ip: row.dashboard_ip.unwrap_or_default(),
+            listen_addr: app.config.api.listen.clone(),
+            listen_enabled: listener_enabled(&app.config.api.listen),
+        },
+        None => DashboardApiView {
+            instance_id: String::new(),
+            enabled: false,
+            has_token: false,
+            dashboard_port: 0,
+            dashboard_ip: String::new(),
+            listen_addr: app.config.api.listen.clone(),
+            listen_enabled: listener_enabled(&app.config.api.listen),
+        },
+    }
+}
+
+/// Whether the API's listener runs at all.
+///
+/// `api.listen: ":0"` switches it off — the card has to say so,
+/// because turning the API on then changes nothing.
+fn listener_enabled(listen: &str) -> bool {
+    !listen.is_empty() && listen != ":0"
+}
+
+/// `POST /settings/dashboard` — the dashboard API's connection
+/// settings.
+///
+/// The bearer token is **write-only**: the field is empty on every
+/// render, and a submission that leaves it empty keeps the stored
+/// token. The node stores only the token's SHA-256 hash, so the
+/// token cannot be read back — not by the operator, not by the API.
+pub async fn handle_update_dashboard(
+    app: &Arc<App>,
+    csrf: &str,
+    body: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let params = super::helpers::parse_form(body);
+
+    let row = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_api_config(&db).unwrap_or(None)
+    };
+    let Some(row) = row else {
+        return render_with_dashboard_error(
+            app,
+            csrf,
+            "The dashboard API has not been set up on this gateway yet — restart it once.",
+        )
+        .await;
+    };
+
+    // The switch. The form pairs the checkbox with a hidden "false",
+    // so the field is always present and its value decides.
+    let enabled = super::helpers::param_bool(body, "dashboard_enabled", false);
+
+    // The token: an empty field keeps the stored one, the "remove"
+    // checkbox clears it.
+    let token_hash = if super::helpers::param_bool(body, "dashboard_token_clear", false) {
+        String::new()
+    } else if let Some(token) = params
+        .get("dashboard_token")
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
+        pangolin_core::db::sha256_hex(token)
+    } else {
+        row.token_hash.clone()
+    };
+
+    // The dashboard's port.
+    let dashboard_port = match params
+        .get("dashboard_port")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+    {
+        Some(port) => match port.parse::<u16>() {
+            Ok(p) => p as i64,
+            Err(_) => {
+                return render_with_dashboard_error(
+                    app,
+                    csrf,
+                    "The dashboard port must be a number between 0 and 65535.",
+                )
+                .await;
+            }
+        },
+        None => row.dashboard_port,
+    };
+
+    {
+        let db = app.db.lock().await;
+        // Only the three columns this form owns are written: the
+        // instance id and the learned address belong to other writers.
+        if let Err(e) =
+            pangolin_core::db::update_api_settings(&db, enabled, &token_hash, dashboard_port)
+        {
+            return render_with_dashboard_error(
+                app,
+                csrf,
+                &format!("Writing the dashboard settings failed: {e}"),
+            )
+            .await;
+        }
+    }
+    Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(http::header::LOCATION, "/settings")
+        .body(Full::new(Bytes::new()))
+        .expect("302 redirect response builder should not fail"))
 }
 
 /// `POST /settings` — validate, persist, redirect; or re-render
@@ -114,7 +244,7 @@ pub async fn handle_update_settings(
             // without re-cloning the SystemConfig.
             let cfg: SystemConfig = parsed;
             if let Err(msg) = save_system_config(app, cfg).await {
-                return render_page(app, csrf, Some(&msg)).await;
+                return render_page(app, csrf, Some(&msg), None).await;
             }
             // Success: PRG (Post-Redirect-Get) so a refresh
             // doesn't re-submit the form.
@@ -124,7 +254,7 @@ pub async fn handle_update_settings(
                 .body(Full::new(Bytes::new()))
                 .expect("302 redirect response builder should not fail"))
         }
-        Err(msg) => render_page(app, csrf, Some(&msg)).await,
+        Err(msg) => render_page(app, csrf, Some(&msg), None).await,
     }
 }
 
@@ -142,5 +272,19 @@ pub async fn render_with_error(
     csrf: &str,
     error: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, Some(error)).await
+    render_page(app, csrf, Some(error), None).await
+}
+
+/// Render the settings page with an error message in the **dashboard**
+/// card.
+///
+/// The dashboard form has a slot of its own: a message about the
+/// bearer token belongs next to the token field, not in a card the
+/// operator did not submit.
+pub async fn render_with_dashboard_error(
+    app: &Arc<App>,
+    csrf: &str,
+    error: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    render_page(app, csrf, None, Some(error)).await
 }

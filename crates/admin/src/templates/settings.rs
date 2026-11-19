@@ -69,10 +69,17 @@ pub struct SettingsTemplate<'a> {
     /// The settings live in the database, not in `ngx.yml` — the only
     /// credential they carry is a provider API key.
     pub badbots: BadbotsSettingsView,
+    /// The dashboard API's connection settings (issue #185).
+    pub dashboard: DashboardApiView,
     /// `Some(msg)` when the page is re-rendered after a failed POST;
     /// `None` on the initial GET and on successful POST (which 302s
     /// back to this URL).
     pub error: Option<&'a str>,
+    /// The error of the **dashboard** card, when its own form was
+    /// rejected. The first card's error is `error` — a page with
+    /// three forms needs one slot per form, or the message ends up
+    /// in a card the operator did not submit.
+    pub dashboard_error: Option<&'a str>,
     /// Active-nav tag, always `"settings"`.
     pub active_nav: &'a str,
 }
@@ -94,4 +101,31 @@ pub struct BadbotsSettingsView {
     pub crowdsec_key_configured: bool,
     /// RFC-3339 timestamp of the last successful update.
     pub updated_at: String,
+}
+
+/// The dashboard API's connection settings as the settings page
+/// renders them (issue #185).
+///
+/// The bearer token is **not** part of this view: the form shows
+/// whether one is configured and takes a new one to replace it. The
+/// stored token never leaves the database — the node keeps only its
+/// SHA-256 hash.
+#[derive(Clone, Debug)]
+pub struct DashboardApiView {
+    /// The id this node is known by in the dashboard.
+    pub instance_id: String,
+    /// Whether the API accepts calls at all.
+    pub enabled: bool,
+    /// Whether a bearer token is configured.
+    pub has_token: bool,
+    /// The dashboard's port, as the operator configured it.
+    pub dashboard_port: u16,
+    /// The dashboard's address, as learned from the inbound calls.
+    /// Empty when the dashboard has not called yet.
+    pub dashboard_ip: String,
+    /// The address the API itself listens on.
+    pub listen_addr: String,
+    /// Whether the API listens at all — `api.listen: ":0"` switches
+    /// the listener off.
+    pub listen_enabled: bool,
 }

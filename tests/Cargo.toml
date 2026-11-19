@@ -13,6 +13,9 @@ path = "src/lib.rs"
 pangolin-core = { path = "../crates/pangolin-core" }
 ngx = { path = "../crates/ngx" }
 tun = { path = "../crates/tun" }
+# The dashboard-facing management API (issue #185). The suite signs
+# with it and drives the server it starts.
+api = { path = "../crates/api" }
 # The tunnel's wire protocol (issue #159) — the suite drives the
 # published crate's codecs, not an in-tree copy.
 pangolin-tun.workspace = true
@@ -43,11 +46,14 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 sha2 = "0.10"
+hex.workspace = true
 # Signal delivery to the spawned `pangolin-ngx` child — used by the
 # SSE-shutdown-latency e2e test to send SIGINT (not SIGKILL, which
 # `Child::start_kill` provides) so the test can observe the
 # graceful-shutdown path.
 libc = "0.2"
+# The shutdown token the API's listener observes.
+tokio-util.workspace = true
 
 # WebSocket (for Sec-WebSocket-Accept in tests + client side of ws/wss e2e)
 sha1 = "0.10"

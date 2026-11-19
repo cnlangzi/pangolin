@@ -1,0 +1,56 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pangolin dashboard-facing management API (issue #185)"
+
+[lib]
+name = "api"
+path = "src/lib.rs"
+
+[dependencies]
+pangolin-core = { path = "../pangolin-core" }
+# The admin UI's form parsers. The API validates through the very same
+# functions the HTML forms use, so a submission the form rejects is
+# rejected by the API too — with the same message (issue #185, R11).
+#
+# The dependency goes the other way round too — the admin crate knows
+# nothing about the API — and the API calls **only** the `parse_*`
+# functions of `admin::routes`. The admin's HTTP handlers are not part
+# of the API's surface: they render HTML, they expect a CSRF token,
+# and they would answer a request that never passed the signature
+# gate.
+admin = { path = "../admin" }
+
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true }
+log.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+
+# HTTP plumbing for the standalone listener.
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+hyper = { version = "1.10", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+
+# Ed25519 — the dashboard's request signature. `ring` is already in the
+# tree (rustls' provider), so this adds no new crate to the build.
+ring = "0.17"
+
+# The nonce cache's lock — sync, non-poisoning, no hot path.
+parking_lot.workspace = true
+
+# base64url for the signature header, hex for the key fingerprint.
+base64.workspace = true
+hex.workspace = true
+
+# Percent-encoding for the form bodies the admin parsers read.
+urlencoding = "2"

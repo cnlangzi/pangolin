@@ -5,6 +5,7 @@ members = [
     "crates/ngx",
     "crates/tun",
     "crates/admin",
+    "crates/api",
     "tests",
 ]
 
@@ -159,6 +160,8 @@ clap = { version = "4", features = ["derive"] }
 # WebSocket (for Sec-WebSocket-Accept computation)
 sha1 = "0.10"
 base64 = "0.22"
+# Hex encoding — the token digests, the key fingerprints.
+hex = "0.4"
 
 # Test (ACME test server pebble)
 wiremock = "0.6"
