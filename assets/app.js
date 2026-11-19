@@ -19,6 +19,29 @@
 (function () {
   'use strict';
 
+  // ── Interface language ─────────────────────────────────────────────────
+  // The catalog the server rendered for the current language. Every
+  // page that loads this script extends the base layout, which writes
+  // the dictionary into `window.__PANGOLIN_I18N`; the empty object is
+  // only a guard for a page that does not.
+  var I18N = window.__PANGOLIN_I18N || {};
+
+  // ── Language switcher ──────────────────────────────────────────────────
+  // The switcher's forms carry a hidden `next` field. Filling it with
+  // the current page makes the server send the operator back where
+  // they were instead of to the dashboard. Without JavaScript the
+  // field stays empty and the server falls back to `/` — the language
+  // still changes.
+  function fillLangSwitcherNext() {
+    var loc = window.location || {};
+    var next = (loc.pathname || '/') + (loc.search || '');
+    var fields = document.querySelectorAll('input[data-lang-next]');
+    for (var i = 0; i < fields.length; i++) {
+      fields[i].value = next;
+    }
+  }
+  fillLangSwitcherNext();
+
   // ── Mobile nav toggle ─────────────────────────────────────────────────
   document.addEventListener('click', function (e) {
     var btn = e.target.closest('#menu-toggle');
@@ -157,7 +180,7 @@
         // fields via setTestResult's textContent path.
         var httpStatus = body.status != null ? body.status : resp.status;
         if (resp.ok && body.ok) {
-          setTestResult(resultEl, 'ok', 'Credentials verified');
+          setTestResult(resultEl, 'ok', I18N['js.credentials_verified']);
         } else {
           var msg = body.error || ('HTTP ' + (httpStatus != null ? httpStatus : 'error'));
           setTestResult(resultEl, 'err', msg);
@@ -166,7 +189,7 @@
       .catch(function (err) {
         // Network failure (DNS resolution, abort, CORS, etc.). Never inject
         // err.message into HTML — textContent via setTestResult handles it.
-        setTestResult(resultEl, 'err', err && err.message ? err.message : 'request failed');
+        setTestResult(resultEl, 'err', err && err.message ? err.message : I18N['js.request_failed']);
       })
       .finally(function () {
         btn.disabled = false;
@@ -227,7 +250,7 @@
         var proto2 = protocolSelect ? protocolSelect.value : 'http';
         var host2 = hostInput ? hostInput.value.trim() : '';
         value = tun + ':' + assembleUrl(proto2, host2);
-        if (preview) preview.textContent = value || '(empty)';
+        if (preview) preview.textContent = value || I18N['js.empty'];
       }
       hidden.value = value;
     }
@@ -295,7 +318,7 @@
       updateHidden();
       if (!hidden.value || hidden.value === '://' || hidden.value.endsWith('://')) {
         e.preventDefault();
-        showBackendError('Backend is required — fill in the host:port (or file path) field');
+        showBackendError(I18N['js.backend_required']);
         if (directInput && !directFields.classList.contains('hidden') && !directInput.value.trim()) {
           directInput.focus();
         } else if (hostInput && !hostInput.value.trim()) {

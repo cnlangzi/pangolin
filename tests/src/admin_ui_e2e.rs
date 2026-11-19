@@ -4317,3 +4317,125 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
         "the rejected client must be listed with its user agent: {html}"
     );
 }
+
+// ── §N — Interface language (issue #178) ─────────────────────────────────────
+
+/// The language switcher remembers the operator's choice and sends
+/// them back to the dashboard.
+#[tokio::test]
+async fn admin_ui_lang_switcher_sets_cookie_and_redirects() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/lang/zh-CN"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cookie.contains("pangolin_lang=zh-CN"),
+        "the language cookie must be set, got: {cookie}"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(location, "/", "the switcher must land on the dashboard");
+}
+
+/// An unknown language code is a 404 — the switcher never offers one,
+/// so a request for it is a mistake, not a preference.
+#[tokio::test]
+async fn admin_ui_lang_unknown_code_is_404() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client.get(&ngx.admin_url("/lang/xx")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+/// The switcher must not become an open redirect.
+#[tokio::test]
+async fn admin_ui_lang_next_rejects_external_url() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    for next in ["https://evil.com", "//evil.com", "/\\evil.com", "evil.com"] {
+        let resp = client
+            .get(&ngx.admin_url(&format!("/lang/zh-CN?next={next}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 302);
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/", "next={next} must fall back to the dashboard");
+    }
+}
+
+/// A same-site path is followed.
+#[tokio::test]
+async fn admin_ui_lang_next_keeps_a_local_path() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/lang/zh-CN?next=/sites/edit?name=a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(location, "/sites/edit?name=a");
+}
+
+/// The browser's language preference selects the interface language
+/// when the request carries no language cookie.
+#[tokio::test]
+async fn admin_ui_lang_accept_language_header_selects_locale() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/login"))
+        .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="zh-CN">"#),
+        "the accept-language header must select the locale: {body}"
+    );
+}
+
+/// The cookie is the operator's explicit choice — it wins over the
+/// browser's preference.
+#[tokio::test]
+async fn admin_ui_lang_cookie_overrides_accept_language() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/login"))
+        .header("accept-language", "zh-CN")
+        .header("cookie", "pangolin_lang=en")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="en">"#),
+        "the language cookie must win over accept-language: {body}"
+    );
+}

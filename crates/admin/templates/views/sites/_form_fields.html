@@ -25,12 +25,12 @@
 
     {% if action == "update" %}
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">Name</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">{{ lang.t("common.name") }}</label>
       <div class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm text-slate-600 dark:text-slate-300 font-mono">{% if let Some(s) = site %}{{ s.name }}{% endif %}</div>
     </div>
     {% else %}
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-name">Name</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-name">{{ lang.t("common.name") }}</label>
       <input type="text" name="name" id="site-name" required
         value="{% if let Some(s) = site %}{{ s.name }}{% endif %}"
         class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
@@ -47,10 +47,10 @@
           {{ e }}
         </p>
         {% else %}
-        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.name_hint") }}</p>
         {% endif %}
       {% else %}
-      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Lowercase letters, digits, or hyphens (1-32 chars)</p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.name_hint") }}</p>
       {% endif %}
     </div>
     {% endif %}
@@ -61,27 +61,27 @@
        Step 3: backend host:port
        JS assembles the final URL into #site-backend-hidden before submit. #}
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">Backend URL</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">{{ lang.t("sites.form.backend_url") }}</label>
 
       <div class="space-y-3">
         {# Step 1: Route via #}
         <div>
-          <span class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5">Route via</span>
+          <span class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5">{{ lang.t("sites.form.route_via") }}</span>
           <div class="grid grid-cols-2 gap-2">
             <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
               <input type="radio" name="route_mode" value="direct" class="mt-0.5 text-accent-600 focus:ring-accent-500"
                 {% if self.initial_route_mode() == "direct" %}checked{% endif %}>
               <div class="flex-1 min-w-0">
-                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Direct</div>
-                <div class="text-xs text-slate-500 dark:text-slate-400">Connect straight to the URL — no tunnel</div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">{{ lang.t("sites.form.direct") }}</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("sites.form.direct_hint") }}</div>
               </div>
             </label>
             <label class="relative flex items-start gap-2 px-3 py-2.5 border border-slate-300 dark:border-slate-600 dark:bg-slate-800 rounded-lg cursor-pointer hover:border-accent-400 transition-colors has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50/50 dark:has-[:checked]:bg-accent-500/10">
               <input type="radio" name="route_mode" value="tunnel" class="mt-0.5 text-accent-600 focus:ring-accent-500"
                 {% if self.initial_route_mode() == "tunnel" %}checked{% endif %}>
               <div class="flex-1 min-w-0">
-                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">Tunnel</div>
-                <div class="text-xs text-slate-500 dark:text-slate-400">Forward through a registered tunnel node</div>
+                <div class="text-sm font-medium text-slate-800 dark:text-slate-100">{{ lang.t("sites.form.tunnel") }}</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("sites.form.tunnel_hint") }}</div>
               </div>
             </label>
           </div>
@@ -93,7 +93,7 @@
         <div id="backend-direct-fields" {% if self.initial_route_mode() != "direct" %}class="hidden"{% endif %}>
           <div class="grid grid-cols-3 gap-2">
             <div>
-              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">Protocol</label>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct-protocol">{{ lang.t("common.protocol") }}</label>
               <select id="site-backend-direct-protocol" name="direct_protocol"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
@@ -107,7 +107,7 @@
               </select>
             </div>
             <div class="col-span-2">
-              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">Host:port</label>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-direct">{{ lang.t("common.host_port") }}</label>
               <input type="text" id="site-backend-direct" name="direct_host"
                 value="{% if let Some(s) = site %}{% if self.initial_route_mode() == "direct" %}{{ self.initial_host_port() }}{% endif %}{% endif %}"
                 class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
@@ -127,7 +127,7 @@
             </p>
             {% endif %}
           {% else %}
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">e.g. <code class="font-mono">http://127.0.0.1:8080</code> or <code class="font-mono">file:///var/www/static</code></p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.backend_example_before") }} <code class="font-mono">http://127.0.0.1:8080</code> {{ lang.t("sites.form.backend_example_or") }} <code class="font-mono">file:///var/www/static</code></p>
           {% endif %}
         </div>
 
@@ -135,12 +135,12 @@
         <div id="backend-tunnel-fields" {% if self.initial_route_mode() != "tunnel" %}class="hidden"{% endif %}>
           {% if tunnels.is_empty() %}
           <div class="mb-2 px-3 py-2 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 rounded-lg text-sm text-amber-800 dark:text-amber-200">
-            No tunnel nodes registered yet. <a href="/tun" class="underline">Register a tunnel</a> first.
+            {{ lang.t("sites.form.no_tunnels_before") }} <a href="/tun" class="underline">{{ lang.t("sites.form.no_tunnels_link") }}</a> {{ lang.t("sites.form.no_tunnels_after") }}
           </div>
           {% endif %}
           <div class="grid grid-cols-3 gap-2">
             <div>
-              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">Tunnel</label>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-tunnel">{{ lang.t("sites.form.tunnel") }}</label>
               <select id="site-backend-tunnel" name="tun_name"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
@@ -149,16 +149,16 @@
   border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:border-accent-500 focus:ring-accent-500
                   {% endif %}">
                 {% if tunnels.is_empty() %}
-                <option value="" disabled selected>— no tunnels registered —</option>
+                <option value="" disabled selected>{{ lang.t("sites.form.no_tunnels_option") }}</option>
                 {% else %}
                 {% for t in tunnels %}
-                <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} (online){% else %} (offline){% endif %}</option>
+                <option value="{{ t.name }}"{% if t.name == self.initial_tun_name() %} selected{% endif %}>{{ t.name }}{% if t.online %} {{ lang.t("tunnels.form.online_option") }}{% else %} {{ lang.t("tunnels.form.offline_option") }}{% endif %}</option>
                 {% endfor %}
                 {% endif %}
               </select>
             </div>
             <div>
-              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-protocol">Protocol</label>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-protocol">{{ lang.t("common.protocol") }}</label>
               <select id="site-backend-protocol" name="tunnel_protocol"
                 class="w-full rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1
                   {% if self.backend_has_error() %}
@@ -172,7 +172,7 @@
               </select>
             </div>
             <div>
-              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-host">Host:port</label>
+              <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1.5" for="site-backend-host">{{ lang.t("common.host_port") }}</label>
               <input type="text" id="site-backend-host" name="tunnel_host"
                 value="{{ self.initial_host_port() }}"
                 class="w-full rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1
@@ -191,33 +191,33 @@
               {{ e }}
             </p>
             {% else %}
-            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.assembled_as") }} <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
             {% endif %}
           {% else %}
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Assembled as <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.assembled_as") }} <code class="font-mono" id="backend-preview">{{ self.initial_tun_name() }}:{{ self.initial_scheme() }}://{{ self.initial_host_port() }}</code></p>
           {% endif %}
         </div>
       </div>
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">回源 Host 模式</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-mode">{{ lang.t("sites.form.host_mode") }}</label>
       <select name="host_mode" id="host-mode"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-        <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>透传 — 使用客户访问的 Host</option>
-        <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>回源 — 使用 backend URL 的 host</option>
-        <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>自定义 — 使用下面的值</option>
+        <option value="passthrough" {% if let Some(s) = site %}{% if s.is_host_mode_passthrough() %}selected{% endif %}{% else %}selected{% endif %}>{{ lang.t("sites.form.host_mode_passthrough") }}</option>
+        <option value="backend" {% if let Some(s) = site %}{% if s.is_host_mode_backend() %}selected{% endif %}{% endif %}>{{ lang.t("sites.form.host_mode_backend") }}</option>
+        <option value="custom" {% if let Some(s) = site %}{% if s.is_host_mode_custom() %}selected{% endif %}{% endif %}>{{ lang.t("sites.form.host_mode_custom") }}</option>
       </select>
     </div>
 
     <div id="host-custom-wrapper" {% if !self.show_host_custom() %}class="hidden"{% endif %}>
       <div>
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">自定义 Host 值</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="host-custom">{{ lang.t("sites.form.host_custom") }}</label>
         <input type="text" name="host_custom" id="host-custom"
           value="{{ self.host_custom_value() }}"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500"
           placeholder="e.g. internal.example.com">
-        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">请求会使用此 Host，并附加 X-Forwarded-Host 记录客户原始访问地址</p>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.host_custom_hint") }}</p>
       </div>
     </div>
 
@@ -227,74 +227,71 @@
         <input type="checkbox" name="rate_limit_enabled" id="rate-limit-enabled"
           {% if rate_limit.enabled %}checked{% endif %}
           class="w-4 h-4 rounded border-slate-300 dark:border-slate-600 text-accent-500 focus:ring-accent-500">
-        Enable rate limiting for this site
+        {{ lang.t("sites.form.rate_limit_enabled") }}
       </label>
       <p class="text-xs text-slate-500 dark:text-slate-400 mb-4">
-        Counters are per client IP and live in memory only — they are cleared when the process restarts.
-        Verified known bots are exempt unless they are listed below. A limit of <code>0</code> turns that dimension off.
+        {{ lang.t("sites.form.rate_limit_hint_1") }} <code>0</code> {{ lang.t("sites.form.rate_limit_hint_2") }}
       </p>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-limit">Request limit</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-limit">{{ lang.t("sites.form.rate_limit_req_limit") }}</label>
           <input type="number" name="rate_limit_req_limit" id="rate-limit-req-limit" min="0" max="1000000"
             value="{{ rate_limit.req_limit }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">requests per client IP per window (0 = off)</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_req_limit_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-window">Request window (s)</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-req-window">{{ lang.t("sites.form.rate_limit_req_window") }}</label>
           <input type="number" name="rate_limit_req_window_secs" id="rate-limit-req-window" min="1" max="86400"
             value="{{ rate_limit.req_window_secs }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">length of the counting window</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_req_window_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-limit">Distinct page limit</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-limit">{{ lang.t("sites.form.rate_limit_page_limit") }}</label>
           <input type="number" name="rate_limit_page_limit" id="rate-limit-page-limit" min="0" max="1000000"
             value="{{ rate_limit.page_limit }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">distinct URLs (path + query) per client IP (0 = off)</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_page_limit_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-window">Page window (s)</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-page-window">{{ lang.t("sites.form.rate_limit_page_window") }}</label>
           <input type="number" name="rate_limit_page_window_secs" id="rate-limit-page-window" min="1" max="86400"
             value="{{ rate_limit.page_window_secs }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">length of the page counting window</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_page_window_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-ip-capacity">Tracked clients</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-ip-capacity">{{ lang.t("sites.form.rate_limit_ip_capacity") }}</label>
           <input type="number" name="rate_limit_ip_capacity" id="rate-limit-ip-capacity" min="1" max="262144"
             value="{{ rate_limit.ip_capacity }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">client-IP slots per ring (1 – 262144)</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_ip_capacity_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-capacity">Penalty box size</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-capacity">{{ lang.t("sites.form.rate_limit_throttle_capacity") }}</label>
           <input type="number" name="rate_limit_throttle_capacity" id="rate-limit-throttle-capacity" min="1" max="262144"
             value="{{ rate_limit.throttle_capacity }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">how many throttled clients are remembered</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_throttle_capacity_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-secs">Block window (s)</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-throttle-secs">{{ lang.t("sites.form.rate_limit_throttle_secs") }}</label>
           <input type="number" name="rate_limit_throttle_secs" id="rate-limit-throttle-secs" min="1" max="86400"
             value="{{ rate_limit.throttle_secs }}"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">how long a throttled client stays blocked</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.rate_limit_throttle_secs_hint") }}</p>
         </div>
       </div>
 
       <div class="mt-4">
         <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
-          Bots subject to this site's limits
+          {{ lang.t("sites.form.rate_limit_bots") }}
         </label>
         <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
-          A verified known bot is exempt from every limit by default. Tick the bots that must be
-          counted against this site's limits instead — an AI scraper that walks the whole site,
-          for example. The bot keeps its identity everywhere else (the
-          <code class="font-mono">P-Known-Bot</code> header and the bot log).
+          {{ lang.t("sites.form.rate_limit_bots_hint_before") }}
+          <code class="font-mono">P-Known-Bot</code> {{ lang.t("sites.form.rate_limit_bots_hint_after") }}
         </p>
         {# The marker tells the server that this submission carries the list at
            all, so un-checking every box empties the list instead of being
@@ -314,24 +311,22 @@
       </div>
 
       <div class="mt-4">
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-custom-429">Custom 429 page (HTML)</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="rate-limit-custom-429">{{ lang.t("sites.form.custom_429") }}</label>
         <textarea name="rate_limit_custom_429_body" id="rate-limit-custom-429" rows="10"
           placeholder="&lt;h1&gt;Too many requests&lt;/h1&gt;"
           class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{% if let Some(b) = rate_limit.custom_429_body.as_deref() %}{{ b }}{% endif %}</textarea>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          Raw HTML served as the body of this site's 429 responses — write the whole page, it is sent verbatim.
-          Leave it empty to use the built-in default page.
+          {{ lang.t("sites.form.custom_429_hint") }}
         </p>
       </div>
 
       <div class="mt-4">
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="custom-403">Custom 403 page (HTML)</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="custom-403">{{ lang.t("sites.form.custom_403") }}</label>
         <textarea name="custom_403_body" id="custom-403" rows="10"
           placeholder="&lt;h1&gt;Forbidden&lt;/h1&gt;"
           class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{% if let Some(b) = rate_limit.custom_403_body.as_deref() %}{{ b }}{% endif %}</textarea>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          Raw HTML served as the body of every 403 this gateway produces for this site — the
-          origin guard and the IP blacklist. Leave it empty to use the built-in default page.
+          {{ lang.t("sites.form.custom_403_hint") }}
         </p>
       </div>
     </div>
@@ -339,91 +334,87 @@
     {# ── Front CDN / origin guard (issue #122) ────────────────────────── #}
     <div class="border-t border-slate-200 dark:border-slate-700 pt-4">
       <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">
-        Front CDN
+        {{ lang.t("sites.form.front_cdn") }}
       </label>
       <p class="text-xs text-slate-500 dark:text-slate-400 mb-4">
-        Which CDN or load balancer forwards the visitor's request to pangolin. The provider
-        decides both where the visitor's IP is read from and where the published source-IP
-        ranges come from, so the two can never disagree.
+        {{ lang.t("sites.form.front_cdn_hint") }}
       </p>
 
       <div>
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-provider">Provider</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-provider">{{ lang.t("common.provider") }}</label>
         <select name="provider" id="site-provider"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
           <option value="" {% if provider_view.provider.is_empty() %}selected{% endif %}>
-            Inherit the global default ({{ provider_view.global_provider }})
+            {{ lang.tf("sites.form.provider_inherit", [("provider", provider_view.global_provider.as_str())]) }}
           </option>
           {%- for p in providers %}
           <option value="{{ p.key }}" {% if provider_view.provider == p.key %}selected{% endif %}>{{ p.label }}</option>
           {%- endfor %}
         </select>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          Effective provider: <span class="font-mono">{{ provider_view.effective_provider }}</span> —
-          {{ provider_view.effective_range_count }} published range(s) in force,
-          last fetched {% if provider_view.effective_last_fetch.is_empty() %}never{% else %}{{ provider_view.effective_last_fetch }}{% endif %};
-          {{ provider_view.manual_range_count }} manual range(s).
+          {{ lang.t("sites.form.provider_effective_before") }} <span class="font-mono">{{ provider_view.effective_provider }}</span>
+          {{ lang.tf("sites.form.provider_effective_ranges", [("n", provider_view.effective_range_count)]) }}
+          {{ lang.t("sites.form.provider_effective_last") }}
+          {% if provider_view.effective_last_fetch.is_empty() %}{{ lang.t("common.never") }}{% else %}{{ provider_view.effective_last_fetch }}{% endif %};
+          {{ lang.tf("sites.form.provider_effective_manual", [("n", provider_view.manual_range_count)]) }}
         </p>
         {%- if provider_view.effective_guard_enabled && provider_view.allowlist_empty %}
         <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
-          The origin guard is on but the allowlist is empty, so it is not rejecting anything.
-          Add the provider's source ranges or the site's manual ranges below.
+          {{ lang.t("sites.form.guard_empty_hint") }}
         </p>
         {%- endif %}
       </div>
 
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-client-ip-header">Client IP header</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-client-ip-header">{{ lang.t("sites.form.client_ip_header") }}</label>
           <input type="text" name="client_ip_header" id="site-client-ip-header"
             value="{{ provider_view.client_ip_header }}"
             placeholder="X-Client-IP"
             spellcheck="false"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.header_inherit_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-country-header">Country header</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-country-header">{{ lang.t("sites.form.country_header") }}</label>
           <input type="text" name="country_header" id="site-country-header"
             value="{{ provider_view.country_header }}"
             placeholder="X-Client-Country"
             spellcheck="false"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.header_inherit_hint") }}</p>
         </div>
         <div>
-          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-region-header">Region header</label>
+          <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="site-region-header">{{ lang.t("sites.form.region_header") }}</label>
           <input type="text" name="region_header" id="site-region-header"
             value="{{ provider_view.region_header }}"
             placeholder="X-Client-Region"
             spellcheck="false"
             class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">empty = inherit the global name</p>
+          <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("sites.form.header_inherit_hint") }}</p>
         </div>
       </div>
 
       <div class="mt-4">
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-guard">Origin guard</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-guard">{{ lang.t("sites.form.origin_guard") }}</label>
         <select name="origin_guard" id="origin-guard"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <option value="inherit" {% if provider_view.origin_guard == "inherit" %}selected{% endif %}>Inherit the global default</option>
-          <option value="off" {% if provider_view.origin_guard == "off" %}selected{% endif %}>Off</option>
-          <option value="on" {% if provider_view.origin_guard == "on" %}selected{% endif %}>On</option>
+          <option value="inherit" {% if provider_view.origin_guard == "inherit" %}selected{% endif %}>{{ lang.t("sites.form.origin_guard_inherit") }}</option>
+          <option value="off" {% if provider_view.origin_guard == "off" %}selected{% endif %}>{{ lang.t("sites.form.origin_guard_off") }}</option>
+          <option value="on" {% if provider_view.origin_guard == "on" %}selected{% endif %}>{{ lang.t("sites.form.origin_guard_on") }}</option>
         </select>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          When the guard is on, a request whose <strong>TCP peer</strong> is outside the
-          allowlist is answered <code>403</code> and never reaches the backend.
+          {{ lang.t("sites.form.origin_guard_hint_before") }} <strong>TCP peer</strong> {{ lang.t("sites.form.origin_guard_hint_after") }} <code>403</code> {{ lang.t("sites.form.origin_guard_hint_end") }}
         </p>
       </div>
 
       <div class="mt-4">
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-allow">Manual source ranges (one CIDR per line)</label>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="origin-allow">{{ lang.t("sites.form.origin_allow") }}</label>
         <textarea name="origin_allow" id="origin-allow" rows="4"
           placeholder="203.0.113.0/24"
           class="w-full rounded-lg px-3 py-2 text-sm font-mono border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:ring-1 focus:border-accent-500 focus:ring-accent-500">{{ provider_view.origin_allow }}</textarea>
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          Unioned with the provider's published ranges — the allowlist is both. A provider that
-          publishes no list (a customer-owned load balancer) uses these ranges only.
+          {{ lang.t("sites.form.origin_allow_hint") }}
         </p>
       </div>
     </div>

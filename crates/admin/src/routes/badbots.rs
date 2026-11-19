@@ -21,6 +21,7 @@ use http_body_util::Full;
 use pangolin_core::{App, BadbotsEvidencePolicy, BadbotsSettings};
 
 use super::helpers::{param_bool, redirect};
+use crate::i18n::Lang;
 
 /// Parse the form-encoded body of the reputation form.
 ///
@@ -112,6 +113,7 @@ pub async fn handle_update_badbots(
     app: &Arc<App>,
     csrf: &str,
     body: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let current = match app.badbots_settings().await {
         Ok(c) => c,
@@ -120,16 +122,17 @@ pub async fn handle_update_badbots(
                 app,
                 csrf,
                 &format!("Reading the current settings failed: {e}"),
+                lang,
             )
             .await;
         }
     };
     let parsed = match parse_badbots_form(body, &current) {
         Ok(p) => p,
-        Err(msg) => return super::settings::render_with_error(app, csrf, &msg).await,
+        Err(msg) => return super::settings::render_with_error(app, csrf, &msg, lang).await,
     };
     if let Err(msg) = save_badbots_settings(app, parsed).await {
-        return super::settings::render_with_error(app, csrf, &msg).await;
+        return super::settings::render_with_error(app, csrf, &msg, lang).await;
     }
     Ok(redirect("/settings"))
 }

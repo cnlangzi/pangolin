@@ -9,6 +9,7 @@ use http_body_util::Full;
 use pangolin_core::CertStatus;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::templates::{CertRow, CertsListTemplate, CertsNewTemplate};
 
 type Resp = Response<Full<Bytes>>;
@@ -30,7 +31,12 @@ fn ok_html(body: String) -> http::Result<Resp> {
 /// unknown values are silently dropped (the chip-bar in the template
 /// only emits valid ones, and an operator pasting `status=garbage`
 /// gets the empty-list fallback rather than a 400).
-pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> http::Result<Resp> {
+pub async fn render(
+    app: &Arc<App>,
+    status_filter: Option<&str>,
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let parsed: Vec<CertStatus> = parse_status_filter(status_filter);
     let db = app.db.lock().await;
     let certs = if parsed.is_empty() {
@@ -46,7 +52,10 @@ pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> 
     // of Rust path expressions (Askama's expression parser can't follow
     // `crate::templates::relative_time(...)` or
     // `pangolin_core::CertStatus::Failed`).
-    let rows: Vec<CertRow> = certs.iter().map(|c| CertRow::from_cert(c, now)).collect();
+    let rows: Vec<CertRow> = certs
+        .iter()
+        .map(|c| CertRow::from_cert(c, now, lang))
+        .collect();
     let html = CertsListTemplate {
         rows,
         active_nav: "certs",
@@ -59,26 +68,33 @@ pub async fn render(app: &Arc<App>, status_filter: Option<&str>, csrf: &str) -> 
         count_skipped: counts.get(&CertStatus::Skipped).copied().unwrap_or(0),
         count_rate_limited: counts.get(&CertStatus::RateLimited).copied().unwrap_or(0),
         count_permanent: counts.get(&CertStatus::Permanent).copied().unwrap_or(0),
+        lang,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn render_create_page(csrf: &str) -> http::Result<Resp> {
+pub async fn render_create_page(csrf: &str, lang: Lang) -> http::Result<Resp> {
     let html = CertsNewTemplate {
         error: None,
         active_nav: "certs",
+        lang,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub(super) fn render_create_page_with_error(error: &str, csrf: &str) -> http::Result<Resp> {
+pub(super) fn render_create_page_with_error(
+    error: &str,
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let html = CertsNewTemplate {
         error: Some(error),
         active_nav: "certs",
+        lang,
     }
     .render()
     .unwrap();

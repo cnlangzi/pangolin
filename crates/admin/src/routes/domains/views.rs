@@ -14,6 +14,7 @@ use http_body_util::Full;
 use askama::Template;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::templates::SiteDomainsTableView;
 
 type Resp = Response<Full<Bytes>>;
@@ -35,6 +36,7 @@ pub async fn render_table_for_site(
     app: &Arc<App>,
     site_name: &str,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let all_domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
@@ -49,6 +51,7 @@ pub async fn render_table_for_site(
         domains,
         site_name,
         active_nav: "domains",
+        lang,
     }
     .render()
     .unwrap();

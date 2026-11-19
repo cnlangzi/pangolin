@@ -8,6 +8,7 @@ use http::Response;
 use http_body_util::Full;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::templates::{
     DomainsEditTemplate, DomainsListTemplate, DomainsNewTemplate, SiteDomainsTemplate,
 };
@@ -22,7 +23,7 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .unwrap())
 }
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -31,13 +32,14 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
         domains,
         sites,
         active_nav: "domains",
+        lang,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render_create_page(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
     let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
@@ -55,6 +57,7 @@ pub async fn render_create_page(app: &Arc<App>, csrf: &str) -> http::Result<Resp
         current_auto_issue: false,
         enabled_checked: true,
         challenge_kind_value: String::new(),
+        lang,
     }
     .render()
     .unwrap();
@@ -73,12 +76,13 @@ pub async fn render_edit_page(
     app: &Arc<App>,
     domain: Option<String>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(domain_pk) = domain else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     if domain_pk.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -87,7 +91,7 @@ pub async fn render_edit_page(
     drop(db);
 
     let Some(existing) = existing else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
 
     let html = DomainsEditTemplate {
@@ -109,6 +113,7 @@ pub async fn render_edit_page(
             .challenge_kind
             .map(|k| k.as_str().to_string())
             .unwrap_or_default(),
+        lang,
     }
     .render()
     .unwrap();
@@ -118,7 +123,12 @@ pub async fn render_edit_page(
 /// Render the site-specific domains sub-page (`/site/{name}/domains`).
 /// This shows domains mapped to a single site with a per-row delete
 /// button.
-pub async fn render_for_site(app: &Arc<App>, site_name: &str, csrf: &str) -> http::Result<Resp> {
+pub async fn render_for_site(
+    app: &Arc<App>,
+    site_name: &str,
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let all_domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -134,9 +144,10 @@ pub async fn render_for_site(app: &Arc<App>, site_name: &str, csrf: &str) -> htt
     let site = match site {
         Some(s) => s,
         None => {
-            let mut resp = Response::new(Full::new(Bytes::from(
-                "<p class='text-red-500 text-sm'>Site not found</p>",
-            )));
+            let mut resp = Response::new(Full::new(Bytes::from(format!(
+                "<p class='text-red-500 text-sm'>{}</p>",
+                lang.t("domains.error.site_not_found")
+            ))));
             *resp.status_mut() = http::StatusCode::NOT_FOUND;
             return Ok(resp);
         }
@@ -147,6 +158,7 @@ pub async fn render_for_site(app: &Arc<App>, site_name: &str, csrf: &str) -> htt
         domains,
         sites,
         active_nav: "domains",
+        lang,
     }
     .render()
     .unwrap();
@@ -160,6 +172,7 @@ pub async fn api_render_form_new(
     site_name: &str,
     _body: &[u8],
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     use crate::templates::DomainsNewTemplate;
     use askama::Template;
@@ -181,6 +194,7 @@ pub async fn api_render_form_new(
         current_auto_issue: false,
         enabled_checked: true,
         challenge_kind_value: String::new(),
+        lang,
     }
     .render()
     .unwrap();

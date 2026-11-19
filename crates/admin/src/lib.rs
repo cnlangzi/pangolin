@@ -23,6 +23,7 @@
 
 pub mod app;
 pub mod assets;
+pub mod i18n;
 pub mod routes;
 pub mod state;
 pub mod templates;
@@ -34,18 +35,35 @@ use http::{Response, StatusCode, header};
 use http_body_util::Full;
 
 pub use app::App;
+use i18n::Lang;
 
 /// Unified entry point for all admin HTTP requests.
 /// Called from ngx `serve.rs`.
+///
+/// `accept_language` is the raw `Accept-Language` request header. It
+/// is only consulted when the request carries no language cookie — the
+/// cookie is the operator's explicit choice and always wins.
+// The request has grown a parameter per input the admin UI reads;
+// the alternative (a request struct) would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     app: Arc<App>,
     sessions: &state::SessionStore,
     path: &str,
     method: &str,
     cookie_header: Option<&str>,
+    accept_language: Option<&str>,
     _body: Bytes,
     merged_params: Bytes,
 ) -> http::Result<Response<Full<Bytes>>> {
+    // The interface language of this request: the cookie first (the
+    // operator's explicit choice), then the browser's preference, then
+    // the default. Resolved per request and never written back — only
+    // the switcher writes the cookie.
+    let lang = i18n::parse_lang_cookie(cookie_header)
+        .or_else(|| i18n::parse_accept_language(accept_language))
+        .unwrap_or(Lang::En);
+
     // ── Static assets: serve immediately without auth ──────────────
     // Static resources (CSS, JS, images) are served directly from the
     // embedded public/ directory without requiring authentication.
@@ -54,7 +72,7 @@ pub async fn handle(
     if trimmed_path.starts_with("assets/") {
         return Ok(match serve_static_asset(trimmed_path) {
             Some(resp) => resp,
-            None => not_found(),
+            None => not_found(lang),
         });
     }
 
@@ -66,10 +84,13 @@ pub async fn handle(
     };
 
     // Only the login page is publicly accessible. Everything else (UI, /api)
-    // requires a session.
+    // requires a session. The language switcher is public too: it has
+    // to work on the login page, where the operator cannot sign in
+    // yet.
     let is_auth_page = path == "/login" || path == "/login/";
+    let is_lang_switch = path.starts_with("/lang/");
 
-    if session_token.is_none() && !is_auth_page {
+    if session_token.is_none() && !is_auth_page && !is_lang_switch {
         let next = if path == "/" || path.is_empty() {
             "/".to_string()
         } else {
@@ -124,6 +145,17 @@ pub async fn handle(
     // without decoding it.
     let path = percent_decode_path(path);
 
+    // ── Language switcher ───────────────────────────────────────────
+    // `GET /lang/{code}` — remember the operator's language choice and
+    // send them back where they came from. It is public: the switcher
+    // has to work on the login page, where nobody can sign in yet.
+    if let Some(code) = path.strip_prefix("lang/") {
+        if method != "GET" {
+            return Ok(not_found(lang));
+        }
+        return Ok(lang_switch_response(code, &merged_params, lang));
+    }
+
     // Look up the CSRF token for the current session (if any). For unauthenticated
     // requests (login page), this is empty.
     let csrf_token: String = if let Some(ref st) = session_token {
@@ -140,17 +172,18 @@ pub async fn handle(
         // (All /api/* routes are dispatched via the prefix branch below.)
 
         // ── UI HTML pages at root ──────────────────────────────────
-        ("" | "dashboard", "GET") => routes::dashboard::render(&app, &csrf_token).await?,
-        ("sites", "GET") => routes::sites::render(&app, &csrf_token).await?,
-        ("sites/new", "GET") => routes::sites::render_create_page(&app, &csrf_token).await?,
+        ("" | "dashboard", "GET") => routes::dashboard::render(&app, &csrf_token, lang).await?,
+        ("sites", "GET") => routes::sites::render(&app, &csrf_token, lang).await?,
+        ("sites/new", "GET") => routes::sites::render_create_page(&app, &csrf_token, lang).await?,
         ("sites/new", "POST") => {
-            routes::sites::handle_create(&app, &merged_params, &csrf_token).await?
+            routes::sites::handle_create(&app, &merged_params, &csrf_token, lang).await?
         }
         ("sites/edit", "GET") => {
             routes::sites::render_edit_page(
                 &app,
                 query_param_opt(&merged_params, "name"),
                 &csrf_token,
+                lang,
             )
             .await?
         }
@@ -160,19 +193,27 @@ pub async fn handle(
                 query_param_opt(&merged_params, "name"),
                 &merged_params,
                 &csrf_token,
+                lang,
             )
             .await?
         }
         // DEPRECATED: use DELETE /api/sites/{name}. Kept as a fallback during the
         // migration window (issue #48).
         ("sites/delete", "POST") => {
-            routes::sites::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
-                .await?
+            routes::sites::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+                lang,
+            )
+            .await?
         }
-        ("domains", "GET") => routes::domains::render(&app, &csrf_token).await?,
-        ("domains/new", "GET") => routes::domains::render_create_page(&app, &csrf_token).await?,
+        ("domains", "GET") => routes::domains::render(&app, &csrf_token, lang).await?,
+        ("domains/new", "GET") => {
+            routes::domains::render_create_page(&app, &csrf_token, lang).await?
+        }
         ("domains/new", "POST") => {
-            routes::domains::handle_create(&app, &merged_params, &csrf_token).await?
+            routes::domains::handle_create(&app, &merged_params, &csrf_token, lang).await?
         }
         // DEPRECATED: use DELETE /api/domains/{domain}. Kept as a fallback during the
         // migration window (issue #48).
@@ -181,19 +222,21 @@ pub async fn handle(
                 &app,
                 query_param_opt(&merged_params, "domain"),
                 &csrf_token,
+                lang,
             )
             .await?
         }
-        ("tun", "GET") => routes::tun::render(&app, &csrf_token).await?,
-        ("tun/new", "GET") => routes::tun::render_create_page(&csrf_token).await?,
+        ("tun", "GET") => routes::tun::render(&app, &csrf_token, lang).await?,
+        ("tun/new", "GET") => routes::tun::render_create_page(&csrf_token, lang).await?,
         ("tun/new", "POST") => {
-            routes::tun::handle_create(&app, &merged_params, &csrf_token).await?
+            routes::tun::handle_create(&app, &merged_params, &csrf_token, lang).await?
         }
         ("tun/edit", "GET") => {
             routes::tun::render_edit_page(
                 &app,
                 query_param_opt(&merged_params, "name"),
                 &csrf_token,
+                lang,
             )
             .await?
         }
@@ -203,24 +246,31 @@ pub async fn handle(
                 query_param_opt(&merged_params, "name"),
                 &merged_params,
                 &csrf_token,
+                lang,
             )
             .await?
         }
         // DEPRECATED: use DELETE /api/tun/{name}. Kept as a fallback during the
         // migration window (issue #48).
         ("tun/delete", "POST") => {
-            routes::tun::handle_delete(&app, query_param_opt(&merged_params, "name"), &csrf_token)
-                .await?
+            routes::tun::handle_delete(
+                &app,
+                query_param_opt(&merged_params, "name"),
+                &csrf_token,
+                lang,
+            )
+            .await?
         }
         ("certs", "GET") => {
             routes::certs::render(
                 &app,
                 query_param_opt(&merged_params, "status").as_deref(),
                 &csrf_token,
+                lang,
             )
             .await?
         }
-        ("traffic", "GET") => routes::traffic::render(&app, &csrf_token).await?,
+        ("traffic", "GET") => routes::traffic::render(&app, &csrf_token, lang).await?,
         ("traffic/reset", "POST") => routes::traffic::handle_reset(&app).await?,
         // ── Rate limits + IP rules (issue #117) ───────────────────
         ("ratelimit", "GET") => {
@@ -228,36 +278,37 @@ pub async fn handle(
                 &app,
                 &csrf_token,
                 query_param_opt(&merged_params, "error").as_deref(),
+                lang,
             )
             .await?
         }
         ("ratelimit/rules", "POST") => {
-            routes::ratelimit::handle_add_rule(&app, &merged_params, &csrf_token).await?
+            routes::ratelimit::handle_add_rule(&app, &merged_params, &csrf_token, lang).await?
         }
-        ("logs", "GET") => routes::logs::render(&app, &csrf_token).await?,
-        ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token).await?,
+        ("logs", "GET") => routes::logs::render(&app, &csrf_token, lang).await?,
+        ("logs/bots", "GET") => routes::logs::render_bots(&app, &csrf_token, lang).await?,
         ("logs/bots/history", "GET") => {
-            routes::logs::render_bots_history(&app, &csrf_token, &merged_params).await?
+            routes::logs::render_bots_history(&app, &csrf_token, &merged_params, lang).await?
         }
         ("logs/bots/stats", "GET") => {
-            routes::logs::render_bots_stats(&app, &csrf_token, &merged_params).await?
+            routes::logs::render_bots_stats(&app, &csrf_token, &merged_params, lang).await?
         }
         // Referer log — inbound external referrals.
         ("logs/referers", "GET") => {
-            routes::logs::render_referers(&app, &csrf_token, &merged_params).await?
+            routes::logs::render_referers(&app, &csrf_token, &merged_params, lang).await?
         }
         ("logs/referers/history", "GET") => {
-            routes::logs::render_referers_history(&app, &csrf_token, &merged_params).await?
+            routes::logs::render_referers_history(&app, &csrf_token, &merged_params, lang).await?
         }
         ("logs/referers/stats", "GET") => {
-            routes::logs::render_referers_stats(&app, &csrf_token, &merged_params).await?
+            routes::logs::render_referers_stats(&app, &csrf_token, &merged_params, lang).await?
         }
-        ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token).await?,
+        ("certs/new", "GET") => routes::certs::render_create_page(&csrf_token, lang).await?,
         ("certs/new", "POST") => {
-            routes::certs::handle_create(&app, &merged_params, &csrf_token).await?
+            routes::certs::handle_create(&app, &merged_params, &csrf_token, lang).await?
         }
         ("certs/retry", "POST") => {
-            routes::certs::handle_retry(&app, &merged_params, &csrf_token).await?
+            routes::certs::handle_retry(&app, &merged_params, &csrf_token, lang).await?
         }
         // DEPRECATED: use DELETE /api/certs/{domain}. Kept as a fallback during the
         // migration window (issue #48).
@@ -266,16 +317,17 @@ pub async fn handle(
                 &app,
                 query_param_opt(&merged_params, "domain"),
                 &csrf_token,
+                lang,
             )
             .await?
         }
         ("api/certs/summary", "GET") => routes::certs::handle_summary(&app).await?,
-        ("dns", "GET") => routes::dns::render(&app, &csrf_token).await?,
-        ("dns/new", "GET") => routes::dns::render_create_page(&app, &csrf_token).await?,
+        ("dns", "GET") => routes::dns::render(&app, &csrf_token, lang).await?,
+        ("dns/new", "GET") => routes::dns::render_create_page(&app, &csrf_token, lang).await?,
         ("dns/new", "POST") => {
-            routes::dns::handle_create(&app, &merged_params, &csrf_token).await?
+            routes::dns::handle_create(&app, &merged_params, &csrf_token, lang).await?
         }
-        ("dns/test", "POST") => routes::dns::handle_test(&app, &merged_params).await?,
+        ("dns/test", "POST") => routes::dns::handle_test(&app, &merged_params, lang).await?,
 
         // ── System operations ───────────────────────────────────────
         ("api/reload", "POST") => routes::system::handle_reload(&app).await?,
@@ -283,23 +335,29 @@ pub async fn handle(
         ("api/system/config", "POST") => {
             routes::system::handle_update_system_config(&app, &merged_params).await?
         }
-        ("settings", "GET") => routes::settings::handle_render_settings(&app, &csrf_token).await?,
+        ("settings", "GET") => {
+            routes::settings::handle_render_settings(&app, &csrf_token, lang).await?
+        }
         ("settings", "POST") => {
-            routes::settings::handle_update_settings(&app, &csrf_token, &merged_params).await?
+            routes::settings::handle_update_settings(&app, &csrf_token, &merged_params, lang)
+                .await?
         }
         // Issue #141: the IP reputation settings live in the database,
         // not in `ngx.yml` — the only credential they carry is a
         // provider API key.
         ("settings/badbots", "POST") => {
-            routes::badbots::handle_update_badbots(&app, &csrf_token, &merged_params).await?
+            routes::badbots::handle_update_badbots(&app, &csrf_token, &merged_params, lang).await?
         }
         ("api/badbots/config", "GET") => routes::badbots::handle_get_badbots_config(&app).await?,
 
         // ── Auth ────────────────────────────────────────────────────
         ("login", "GET") => {
-            routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref()).await?
+            routes::auth::render_login(query_param_opt(&merged_params, "next").as_deref(), lang)
+                .await?
         }
-        ("login", "POST") => routes::auth::handle_login(&app, sessions, &merged_params).await?,
+        ("login", "POST") => {
+            routes::auth::handle_login(&app, sessions, &merged_params, lang).await?
+        }
         ("logout", "POST") => {
             routes::auth::handle_logout(sessions, &session_token.unwrap(), &merged_params).await?
         }
@@ -311,12 +369,13 @@ pub async fn handle(
                 if let Some((site_name, suffix)) = rest.split_once('/') {
                     match suffix {
                         "domains" => {
-                            routes::domains::render_for_site(&app, site_name, &csrf_token).await?
+                            routes::domains::render_for_site(&app, site_name, &csrf_token, lang)
+                                .await?
                         }
-                        _ => not_found(),
+                        _ => not_found(lang),
                     }
                 } else {
-                    not_found()
+                    not_found(lang)
                 }
             } else if let Some(rest) = path.strip_prefix("api/") {
                 // /api/site/{name}/domains       GET   (HTML partial: site-specific domain table rows)
@@ -330,8 +389,13 @@ pub async fn handle(
                     if let Some((site_name, suffix)) = rest2.split_once('/') {
                         match (suffix, method) {
                             ("domains", "GET") => {
-                                routes::domains::render_table_for_site(&app, site_name, &csrf_token)
-                                    .await?
+                                routes::domains::render_table_for_site(
+                                    &app,
+                                    site_name,
+                                    &csrf_token,
+                                    lang,
+                                )
+                                .await?
                             }
                             ("domains/new", "GET") => {
                                 routes::domains::api_render_form_new(
@@ -339,26 +403,27 @@ pub async fn handle(
                                     site_name,
                                     &merged_params,
                                     &csrf_token,
+                                    lang,
                                 )
                                 .await?
                             }
-                            _ => not_found(),
+                            _ => not_found(lang),
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else if rest == "traffic/kpis" && method == "GET" {
-                    routes::traffic::api_kpis(&app).await?
+                    routes::traffic::api_kpis(&app, lang).await?
                 } else if rest == "traffic/tables" && method == "GET" {
-                    routes::traffic::api_tables(&app).await?
+                    routes::traffic::api_tables(&app, lang).await?
                 } else if rest == "ratelimit/kpis" && method == "GET" {
-                    routes::ratelimit::api_kpis(&app).await?
+                    routes::ratelimit::api_kpis(&app, lang).await?
                 } else if rest == "ratelimit/sites" && method == "GET" {
-                    routes::ratelimit::api_sites(&app).await?
+                    routes::ratelimit::api_sites(&app, lang).await?
                 } else if rest == "ratelimit/rules" && method == "GET" {
-                    routes::ratelimit::api_rules(&app, &csrf_token).await?
+                    routes::ratelimit::api_rules(&app, &csrf_token, lang).await?
                 } else if rest == "ratelimit/blocked" && method == "GET" {
-                    routes::ratelimit::api_blocked(&app).await?
+                    routes::ratelimit::api_blocked(&app, lang).await?
                 } else if rest == "ratelimit/rules" && method == "DELETE" {
                     routes::ratelimit::api_handle_delete_rule(
                         &app,
@@ -366,17 +431,19 @@ pub async fn handle(
                         query_param(&merged_params, "kind"),
                         query_param(&merged_params, "cidr"),
                         &csrf_token,
+                        lang,
                     )
                     .await?
                 } else if let Some(domain) = rest.strip_prefix("domains/") {
                     if method == "DELETE" {
                         if domain.is_empty() {
-                            not_found()
+                            not_found(lang)
                         } else {
                             routes::domains::api_handle_delete(
                                 &app,
                                 domain.to_string(),
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
@@ -389,68 +456,89 @@ pub async fn handle(
                         // with the dns/tun resource pattern.
                         if let Some((name, suffix)) = domain.split_once('/') {
                             if name.is_empty() || suffix != "edit" {
-                                not_found()
+                                not_found(lang)
                             } else {
                                 routes::domains::handle_update(
                                     &app,
                                     Some(name.to_string()),
                                     &merged_params,
                                     &csrf_token,
+                                    lang,
                                 )
                                 .await?
                             }
                         } else {
-                            not_found()
+                            not_found(lang)
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else if let Some(name) = rest.strip_prefix("sites/") {
                     if method == "DELETE" {
                         if name.is_empty() {
-                            not_found()
+                            not_found(lang)
                         } else {
-                            routes::sites::api_handle_delete(&app, name.to_string(), &csrf_token)
-                                .await?
+                            routes::sites::api_handle_delete(
+                                &app,
+                                name.to_string(),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else if let Some(domain) = rest.strip_prefix("certs/") {
                     if method == "DELETE" {
                         if domain.is_empty() {
-                            not_found()
+                            not_found(lang)
                         } else {
-                            routes::certs::api_handle_delete(&app, domain.to_string(), &csrf_token)
-                                .await?
+                            routes::certs::api_handle_delete(
+                                &app,
+                                domain.to_string(),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else if let Some(name) = rest.strip_prefix("tun/") {
                     if method == "DELETE" {
                         if name.is_empty() {
-                            not_found()
+                            not_found(lang)
                         } else {
-                            routes::tun::api_handle_delete(&app, name.to_string(), &csrf_token)
-                                .await?
+                            routes::tun::api_handle_delete(
+                                &app,
+                                name.to_string(),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else if let Some(name) = rest.strip_prefix("dns/") {
                     if method == "DELETE" {
                         if name.is_empty() {
-                            not_found()
+                            not_found(lang)
                         } else {
-                            routes::dns::api_handle_delete(&app, name.to_string(), &csrf_token)
-                                .await?
+                            routes::dns::api_handle_delete(
+                                &app,
+                                name.to_string(),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                     } else {
-                        not_found()
+                        not_found(lang)
                     }
                 } else {
-                    not_found()
+                    not_found(lang)
                 }
             } else if let Some(rest) = path.strip_prefix("domains/") {
                 // /domains/{domain}/edit   GET   (render edit form — issue #57)
@@ -466,6 +554,7 @@ pub async fn handle(
                                 &app,
                                 Some(name.to_string()),
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
@@ -475,6 +564,7 @@ pub async fn handle(
                                 Some(name.to_string()),
                                 &merged_params,
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
@@ -485,13 +575,14 @@ pub async fn handle(
                                 &app,
                                 Some(name.to_string()),
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
-                        _ => not_found(),
+                        _ => not_found(lang),
                     }
                 } else {
-                    not_found()
+                    not_found(lang)
                 }
             } else if let Some(rest) = path.strip_prefix("dns/") {
                 // /dns/{name}/edit   GET   (render edit form)
@@ -500,8 +591,13 @@ pub async fn handle(
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
-                            routes::dns::render_edit_page(&app, Some(name.to_string()), &csrf_token)
-                                .await?
+                            routes::dns::render_edit_page(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                         ("edit", "POST") => {
                             routes::dns::handle_update(
@@ -509,19 +605,25 @@ pub async fn handle(
                                 Some(name.to_string()),
                                 &merged_params,
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
                         // DEPRECATED: use DELETE /api/dns/{name}. Kept as a fallback during
                         // the migration window (issue #48).
                         ("delete", "POST") => {
-                            routes::dns::handle_delete(&app, Some(name.to_string()), &csrf_token)
-                                .await?
+                            routes::dns::handle_delete(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
-                        _ => not_found(),
+                        _ => not_found(lang),
                     }
                 } else {
-                    not_found()
+                    not_found(lang)
                 }
             } else if let Some(rest) = path.strip_prefix("tun/") {
                 // /tun/{name}/edit   GET   (render edit form)
@@ -530,8 +632,13 @@ pub async fn handle(
                 if let Some((name, suffix)) = rest.split_once('/') {
                     match (suffix, method) {
                         ("edit", "GET") => {
-                            routes::tun::render_edit_page(&app, Some(name.to_string()), &csrf_token)
-                                .await?
+                            routes::tun::render_edit_page(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
                         ("edit", "POST") => {
                             routes::tun::handle_update(
@@ -539,22 +646,28 @@ pub async fn handle(
                                 Some(name.to_string()),
                                 &merged_params,
                                 &csrf_token,
+                                lang,
                             )
                             .await?
                         }
                         // DEPRECATED: use DELETE /api/tun/{name}. Kept as a fallback during
                         // the migration window (issue #48).
                         ("delete", "POST") => {
-                            routes::tun::handle_delete(&app, Some(name.to_string()), &csrf_token)
-                                .await?
+                            routes::tun::handle_delete(
+                                &app,
+                                Some(name.to_string()),
+                                &csrf_token,
+                                lang,
+                            )
+                            .await?
                         }
-                        _ => not_found(),
+                        _ => not_found(lang),
                     }
                 } else {
-                    not_found()
+                    not_found(lang)
                 }
             } else {
-                not_found()
+                not_found(lang)
             }
         }
     };
@@ -671,14 +784,51 @@ fn percent_decode_path(path: &str) -> String {
     out
 }
 
-fn not_found() -> Response<Full<Bytes>> {
+/// The 404 page.
+///
+/// The wording comes from the catalog, so a Chinese operator reads a
+/// Chinese "page not found" — the page is the only thing they see
+/// when they mistype a URL.
+fn not_found(lang: Lang) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header("Content-Type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(
-            r#"<div class="p-6 text-slate-500">Page not found</div>"#,
-        )))
+        .body(Full::new(Bytes::from(format!(
+            r#"<div class="p-6 text-slate-500">{}</div>"#,
+            lang.t("common.page_not_found")
+        ))))
         .unwrap()
+}
+
+/// Answer `GET /lang/{code}`: remember the language and redirect back.
+///
+/// The cookie is the only state — there is no database migration and
+/// no server-side session. An unknown language code is a **404**, not
+/// a silent fall back to the default: the switcher never offers one,
+/// so a request for it is a mistake rather than a preference.
+///
+/// The `next` parameter is sanitised: only a same-site absolute path
+/// is followed, so the switcher cannot be turned into an open
+/// redirect.
+fn lang_switch_response(
+    code: &str,
+    merged_params: &Bytes,
+    request_lang: Lang,
+) -> Response<Full<Bytes>> {
+    let Some(lang) = Lang::from_code(code) else {
+        return not_found(request_lang);
+    };
+    let next_raw = query_param_opt(merged_params, "next");
+    let next = i18n::sanitize_next(next_raw.as_deref());
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::FOUND;
+    let location = header::HeaderValue::from_str(next)
+        .unwrap_or_else(|_| header::HeaderValue::from_static("/"));
+    resp.headers_mut().insert(header::LOCATION, location);
+    if let Ok(cookie) = header::HeaderValue::from_str(&i18n::make_lang_cookie(lang)) {
+        resp.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    resp
 }
 
 /// Return a 302 Found redirect to the given path.

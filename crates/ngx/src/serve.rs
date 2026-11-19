@@ -260,6 +260,16 @@ async fn serve_admin_ui_one_shot(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // The browser's language preference. The admin UI negotiates the
+    // interface language from it when the request carries no language
+    // cookie of its own.
+    let accept_language = session
+        .req_header()
+        .headers
+        .get("accept-language")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Extract query string from URI
     let query_string = session.req_header().uri.query().unwrap_or("").to_string();
 
@@ -299,6 +309,7 @@ async fn serve_admin_ui_one_shot(
         path,
         method,
         cookie.as_deref(),
+        accept_language.as_deref(),
         body_bytes,
         merged_bytes,
     )

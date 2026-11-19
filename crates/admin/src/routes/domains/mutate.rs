@@ -4,6 +4,8 @@
 //! `routes/domains.rs` — only file layout changed.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -24,7 +26,12 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .expect("response builder for 200 OK should not fail"))
 }
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let domain = params.get("domain").cloned().unwrap_or_default();
     let site_name = params.get("site_name").cloned().unwrap_or_default();
@@ -62,17 +69,32 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         .ok();
 
     if domain.is_empty() {
-        return render_create_page_with_error(app, "Domain name is required", csrf, None).await;
+        return render_create_page_with_error(
+            app,
+            &lang.t("domains.error.name_required"),
+            csrf,
+            None,
+            lang,
+        )
+        .await;
     }
     if site_name.is_empty() {
-        return render_create_page_with_error(app, "Please select a site", csrf, None).await;
+        return render_create_page_with_error(
+            app,
+            &lang.t("domains.error.select_site"),
+            csrf,
+            None,
+            lang,
+        )
+        .await;
     }
     if !pangolin_core::is_valid_domain(&domain) {
         return render_create_page_with_error(
             app,
-            "Invalid domain format (use example.com, no scheme)",
+            &lang.t("domains.error.invalid_format"),
             csrf,
             None,
+            lang,
         )
         .await;
     }
@@ -85,6 +107,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
              Add one under DNS first, then assign it to this domain.",
             csrf,
             None,
+            lang,
         )
         .await;
     }
@@ -110,6 +133,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
              linked).",
             csrf,
             None,
+            lang,
         )
         .await;
     }
@@ -123,9 +147,10 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
         if !exists {
             return render_create_page_with_error(
                 app,
-                &format!("DNS provider '{name}' does not exist; create it under DNS first"),
+                &lang.tf("domains.error.dns_provider_missing", [("name", name)]),
                 csrf,
                 None,
+                lang,
             )
             .await;
         }
@@ -176,7 +201,8 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             Ok(redirect_response("/domains"))
         }
         Err(e) => {
-            render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None).await
+            render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None, lang)
+                .await
         }
     }
 }
@@ -199,9 +225,10 @@ pub async fn handle_update(
     domain: Option<String>,
     body: &[u8],
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(domain_pk) = domain else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let params = parse_form(body);
 
@@ -212,7 +239,7 @@ pub async fn handle_update(
         pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None)
     };
     let Some(existing) = existing else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
 
     let site_name = params
@@ -223,9 +250,10 @@ pub async fn handle_update(
         return render_edit_page_with_error(
             app,
             &domain_pk,
-            "Please select a site",
+            &lang.t("domains.error.select_site"),
             csrf,
             &existing,
+            lang,
         )
         .await;
     }
@@ -287,6 +315,7 @@ pub async fn handle_update(
              Add one under DNS first, then assign it to this domain.",
             csrf,
             &existing,
+            lang,
         )
         .await;
     }
@@ -310,6 +339,7 @@ pub async fn handle_update(
              linked).",
             csrf,
             &existing,
+            lang,
         )
         .await;
     }
@@ -325,9 +355,10 @@ pub async fn handle_update(
             return render_edit_page_with_error(
                 app,
                 &domain_pk,
-                &format!("DNS provider '{name}' does not exist; create it under DNS first"),
+                &lang.tf("domains.error.dns_provider_missing", [("name", name)]),
                 csrf,
                 &existing,
+                lang,
             )
             .await;
         }
@@ -386,6 +417,7 @@ pub async fn handle_update(
                 &format!("Database error: {}", e),
                 csrf,
                 &existing,
+                lang,
             )
             .await
         }
@@ -402,6 +434,7 @@ async fn render_edit_page_with_error(
     error: &str,
     csrf: &str,
     existing: &pangolin_core::types::Domain,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -423,6 +456,7 @@ async fn render_edit_page_with_error(
             .challenge_kind
             .map(|k| k.as_str().to_string())
             .unwrap_or_default(),
+        lang,
     }
     .render()
     .unwrap();
@@ -439,6 +473,7 @@ async fn render_create_page_with_error(
     error: &str,
     csrf: &str,
     preselected_site: Option<&str>,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let db = app.db.lock().await;
     let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
@@ -457,6 +492,7 @@ async fn render_create_page_with_error(
         current_auto_issue: false,
         enabled_checked: true,
         challenge_kind_value: String::new(),
+        lang,
     }
     .render()
     .unwrap();
@@ -471,6 +507,7 @@ pub async fn handle_delete(
     app: &Arc<App>,
     domain: Option<String>,
     _csrf: &str,
+    _lang: Lang,
 ) -> http::Result<Resp> {
     if let Some(d) = domain
         && !d.is_empty()
@@ -490,9 +527,14 @@ pub async fn handle_delete(
 
 /// HTMX DELETE /api/domains/{domain} — returns an empty 200 body so HTMX
 /// (with hx-swap="delete") can drop the row.
-pub async fn api_handle_delete(app: &Arc<App>, domain: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    domain: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if domain.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     let db = app.db.lock().await;
     let _ = pangolin_core::db::delete_domain(&db, &domain);

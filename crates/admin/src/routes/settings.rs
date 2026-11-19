@@ -14,17 +14,19 @@
 use std::sync::Arc;
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::Full;
 use pangolin_core::{App, SystemConfig};
 
 use super::helpers::ok_html;
-use super::provider::{provider_range_statuses, total_guard_rejections};
+use super::provider::{provider_options, provider_range_statuses, total_guard_rejections};
 use super::system::{parse_system_config_form_merged, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
-use crate::templates::settings::{BadbotsSettingsView, ProviderOption};
+use crate::templates::settings::BadbotsSettingsView;
 
 /// Render the settings page. `error` is `None` on the initial
 /// GET and on a successful POST (which 302s back here); it's
@@ -33,21 +35,12 @@ async fn render_page(
     app: &Arc<App>,
     csrf: &str,
     error: Option<&str>,
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let cfg = app.system_config.read().await.clone();
     // The provider radio group is generated from the registry, so a
     // provider added to it appears without touching the template.
-    let providers = pangolin_core::ProviderKey::all()
-        .iter()
-        .map(|key| {
-            let spec = pangolin_core::provider::spec(*key);
-            ProviderOption {
-                key: spec.key.as_str(),
-                label: spec.label,
-                description: spec.description,
-            }
-        })
-        .collect();
+    let providers = provider_options(lang);
     // The IP reputation settings (issue #141) live in the database.
     // A read failure must not take the whole settings page down — the
     // card falls back to the documented defaults.
@@ -80,12 +73,13 @@ async fn render_page(
         client_country_header: cfg.client_country_header.as_deref().unwrap_or(""),
         client_region_header: cfg.client_region_header.as_deref().unwrap_or(""),
         origin_guard_enabled: cfg.origin_guard_enabled,
-        provider_ranges: provider_range_statuses(app).await,
+        provider_ranges: provider_range_statuses(app, lang).await,
         guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
         badbots,
         error,
         active_nav: "settings",
+        lang,
     };
     ok_html(render_with_assets_and_csrf(
         template.render().unwrap(),
@@ -97,8 +91,9 @@ async fn render_page(
 pub async fn handle_render_settings(
     app: &Arc<App>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, None).await
+    render_page(app, csrf, None, lang).await
 }
 
 /// `POST /settings` — validate, persist, redirect; or re-render
@@ -107,6 +102,7 @@ pub async fn handle_update_settings(
     app: &Arc<App>,
     csrf: &str,
     body: &[u8],
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     match parse_system_config_form_merged(app, body).await {
         Ok(parsed) => {
@@ -114,7 +110,7 @@ pub async fn handle_update_settings(
             // without re-cloning the SystemConfig.
             let cfg: SystemConfig = parsed;
             if let Err(msg) = save_system_config(app, cfg).await {
-                return render_page(app, csrf, Some(&msg)).await;
+                return render_page(app, csrf, Some(&msg), lang).await;
             }
             // Success: PRG (Post-Redirect-Get) so a refresh
             // doesn't re-submit the form.
@@ -124,7 +120,7 @@ pub async fn handle_update_settings(
                 .body(Full::new(Bytes::new()))
                 .expect("302 redirect response builder should not fail"))
         }
-        Err(msg) => render_page(app, csrf, Some(&msg)).await,
+        Err(msg) => render_page(app, csrf, Some(&msg), lang).await,
     }
 }
 
@@ -141,6 +137,7 @@ pub async fn render_with_error(
     app: &Arc<App>,
     csrf: &str,
     error: &str,
+    lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, Some(error)).await
+    render_page(app, csrf, Some(error), lang).await
 }

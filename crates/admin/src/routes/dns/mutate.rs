@@ -2,6 +2,8 @@
 
 use anyhow::Context;
 use askama::Template;
+
+use crate::i18n::Lang;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -19,30 +21,31 @@ use crate::routes::helpers::parse_form;
 
 type Resp = Response<Full<Bytes>>;
 
-pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Result<Resp> {
+pub async fn handle_create(
+    app: &Arc<App>,
+    body: &[u8],
+    csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     let params = parse_form(body);
     let name = params.get("name").cloned().unwrap_or_default();
     let kind_str = params.get("kind").cloned().unwrap_or_default();
     let enabled = params.get("enabled").map(|_| true).unwrap_or(false);
 
     if name.is_empty() {
-        return render_create_page_with_error(app, "Name is required", csrf);
+        return render_create_page_with_error(app, &lang.t("dns.error.name_required"), csrf, lang);
     }
     if !is_valid_dns_name(&name) {
-        return render_create_page_with_error(
-            app,
-            "Name must be lowercase letters, digits, underscore, or dash (1-64 chars)",
-            csrf,
-        );
+        return render_create_page_with_error(app, &lang.t("dns.error.name_format"), csrf, lang);
     }
     let kind = match pangolin_core::DnsProviderKind::from_str(&kind_str) {
         Ok(k) => k,
-        Err(e) => return render_create_page_with_error(app, &e, csrf),
+        Err(e) => return render_create_page_with_error(app, &e, csrf, lang),
     };
 
-    let config = match assemble_config(kind, &params, None) {
+    let config = match assemble_config(kind, &params, None, lang) {
         Ok(c) => c,
-        Err(e) => return render_create_page_with_error(app, &e, csrf),
+        Err(e) => return render_create_page_with_error(app, &e, csrf, lang),
     };
 
     let now = chrono::Utc::now();
@@ -62,7 +65,7 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
             app.reload_indexes().await;
             Ok(redirect_response("/dns"))
         }
-        Err(e) => render_create_page_with_error(app, &format!("Database error: {e}"), csrf),
+        Err(e) => render_create_page_with_error(app, &format!("Database error: {e}"), csrf, lang),
     }
 }
 
@@ -71,9 +74,10 @@ pub async fn handle_update(
     name: Option<String>,
     body: &[u8],
     _csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(name) = name else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let params = parse_form(body);
     let kind_str = params.get("kind").cloned().unwrap_or_default();
@@ -89,10 +93,10 @@ pub async fn handle_update(
         pangolin_core::db::get_dns_provider(&db, &name).unwrap_or(None)
     };
     let Some(existing) = existing else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
 
-    let config = match assemble_config(kind, &params, Some(&existing.config)) {
+    let config = match assemble_config(kind, &params, Some(&existing.config), lang) {
         Ok(c) => c,
         Err(e) => return Ok(error_response(&e)),
     };
@@ -117,13 +121,16 @@ pub async fn handle_update(
     }
 }
 
-pub async fn handle_test(app: &Arc<App>, body: &[u8]) -> http::Result<Resp> {
+pub async fn handle_test(app: &Arc<App>, body: &[u8], lang: Lang) -> http::Result<Resp> {
     let params = parse_form(body);
     let kind_str = params.get("kind").cloned().unwrap_or_default();
     let kind = match DnsProviderKind::from_str(&kind_str) {
         Ok(k) => k,
         Err(e) => {
-            return Ok(test_json(false, &format!("Invalid provider kind: {e}")));
+            return Ok(test_json(
+                false,
+                &lang.tf("dns.error.invalid_kind", [("error", e.to_string())]),
+            ));
         }
     };
 
@@ -138,12 +145,12 @@ pub async fn handle_test(app: &Arc<App>, body: &[u8]) -> http::Result<Resp> {
         None
     };
 
-    let config = match assemble_config(kind, &params, existing_config.as_deref()) {
+    let config = match assemble_config(kind, &params, existing_config.as_deref(), lang) {
         Ok(c) => c,
         Err(e) => return Ok(test_json(false, &e)),
     };
 
-    if let Err(e) = static_validate_config(kind, &config) {
+    if let Err(e) = static_validate_config(kind, &config, lang) {
         return Ok(test_json(false, &e));
     }
     Ok(test_json(true, ""))
@@ -170,9 +177,10 @@ pub async fn handle_delete(
     app: &Arc<App>,
     name: Option<String>,
     _csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(name) = name else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     match delete_provider_txn(app, &name).await {
         Ok(upd) => {
@@ -194,9 +202,14 @@ pub async fn handle_delete(
 /// This is the unified delete endpoint for DNS providers; the form-POST
 /// `/dns/{name}/delete` route above is kept for now as a fallback during
 /// the migration window (issue #48).
-pub async fn api_handle_delete(app: &Arc<App>, name: String, _csrf: &str) -> http::Result<Resp> {
+pub async fn api_handle_delete(
+    app: &Arc<App>,
+    name: String,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
     if name.is_empty() {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     }
     match delete_provider_txn(app, &name).await {
         Ok(upd) => {
@@ -234,8 +247,13 @@ async fn delete_provider_txn(app: &Arc<App>, name: &str) -> anyhow::Result<usize
     Ok(upd)
 }
 
-fn render_create_page_with_error(_app: &Arc<App>, err: &str, _csrf: &str) -> http::Result<Resp> {
-    let html = build_new_form(Some(err)).render().unwrap();
+fn render_create_page_with_error(
+    _app: &Arc<App>,
+    err: &str,
+    _csrf: &str,
+    lang: Lang,
+) -> http::Result<Resp> {
+    let html = build_new_form(Some(err), lang).render().unwrap();
     Ok(Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
@@ -243,15 +261,15 @@ fn render_create_page_with_error(_app: &Arc<App>, err: &str, _csrf: &str) -> htt
         .expect("response builder for 200 OK should not fail"))
 }
 
-fn static_validate_config(kind: DnsProviderKind, config: &str) -> Result<(), String> {
-    let v: serde_json::Value =
-        serde_json::from_str(config).map_err(|e| format!("config is not valid JSON: {e}"))?;
+fn static_validate_config(kind: DnsProviderKind, config: &str, lang: Lang) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(config)
+        .map_err(|e| lang.tf("dns.error.config_not_json", [("error", e.to_string())]))?;
     let non_empty = |s: &str| !s.is_empty();
     match kind {
         DnsProviderKind::Cloudflare => {
             let t = v.get("api_token").and_then(|x| x.as_str()).unwrap_or("");
             if !non_empty(t) {
-                return Err("api_token is required".into());
+                return Err(lang.tf("dns.error.field_required", [("field", "api_token")]));
             }
         }
         DnsProviderKind::Aliyun => {
@@ -264,14 +282,20 @@ fn static_validate_config(kind: DnsProviderKind, config: &str) -> Result<(), Str
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
             if !non_empty(ak) || !non_empty(sk) {
-                return Err("access_key_id and access_key_secret are required".into());
+                return Err(lang.tf(
+                    "dns.error.fields_required",
+                    [("fields", "access_key_id and access_key_secret")],
+                ));
             }
         }
         DnsProviderKind::Tencent => {
             let id = v.get("secret_id").and_then(|x| x.as_str()).unwrap_or("");
             let key = v.get("secret_key").and_then(|x| x.as_str()).unwrap_or("");
             if !non_empty(id) || !non_empty(key) {
-                return Err("secret_id and secret_key are required".into());
+                return Err(lang.tf(
+                    "dns.error.fields_required",
+                    [("fields", "secret_id and secret_key")],
+                ));
             }
         }
     }
@@ -290,6 +314,7 @@ fn assemble_config(
     kind: DnsProviderKind,
     params: &std::collections::HashMap<String, String>,
     existing_config: Option<&str>,
+    lang: Lang,
 ) -> Result<String, String> {
     let existing: serde_json::Value = existing_config
         .and_then(|s| serde_json::from_str(s).ok())
@@ -306,24 +331,28 @@ fn assemble_config(
             } else if let Some(prev) = existing.get(existing_field).and_then(|x| x.as_str()) {
                 Ok(prev.to_string())
             } else {
-                Err(format!("{} is required", label))
+                Err(lang.tf("dns.error.field_required", [("field", label)]))
             }
         };
 
     let v = match kind {
         DnsProviderKind::Cloudflare => {
-            let token = merge_secret("api_token", "api_token", "API token")?;
+            let token = merge_secret(
+                "api_token",
+                "api_token",
+                &lang.t("dns.error.label_api_token"),
+            )?;
             serde_json::json!({ "api_token": token })
         }
         DnsProviderKind::Aliyun => {
             let ak = params.get("access_key_id").cloned().unwrap_or_default();
             if ak.is_empty() {
-                return Err("Access Key ID is required".to_string());
+                return Err(lang.t("dns.error.access_key_id_required").into_owned());
             }
             let sk = merge_secret(
                 "access_key_secret",
                 "access_key_secret",
-                "Access Key Secret",
+                &lang.t("dns.error.label_access_key_secret"),
             )?;
             let region = params
                 .get("region")
@@ -338,9 +367,13 @@ fn assemble_config(
         DnsProviderKind::Tencent => {
             let id = params.get("secret_id").cloned().unwrap_or_default();
             if id.is_empty() {
-                return Err("Secret ID is required".to_string());
+                return Err(lang.t("dns.error.secret_id_required").into_owned());
             }
-            let key = merge_secret("secret_key", "secret_key", "Secret Key")?;
+            let key = merge_secret(
+                "secret_key",
+                "secret_key",
+                &lang.t("dns.error.label_secret_key"),
+            )?;
             serde_json::json!({
                 "secret_id": id,
                 "secret_key": key,

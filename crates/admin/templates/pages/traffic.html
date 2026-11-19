@@ -1,28 +1,28 @@
 {% extends "layouts/base.html" %}
 
-{% block title %}Traffic — Pangolin{% endblock %}
+{% block title %}{{ lang.t("traffic.page_title") }} — Pangolin{% endblock %}
 
 {% block content %}
 <main class="px-4 py-6 md:px-6 lg:px-8 max-w-7xl mx-auto">
   <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <div>
-      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">Traffic</h1>
+      <h1 class="text-2xl md:text-3xl font-bold text-slate-900 dark:text-white">{{ lang.t("traffic.title") }}</h1>
       <p class="text-slate-600 dark:text-slate-300 text-sm md:text-base mt-1">
-        In-memory Network and Request stats — cleared on restart. Body bytes only (headers not counted). TLS handshake failures are not included.
+        {{ lang.t("traffic.subtitle") }}
       </p>
     </div>
     <form method="POST" action="/traffic/reset">
       {% include "components/_csrf.html" %}
       <button type="submit"
               class="px-3 py-1.5 rounded-lg text-sm font-medium border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800">
-        Reset counters
+        {{ lang.t("traffic.reset") }}
       </button>
     </form>
   </div>
 
   {% if !snap.enabled %}
   <div class="mb-4 rounded-lg border border-yellow-300 dark:border-yellow-700 bg-yellow-50 dark:bg-yellow-900/20 px-4 py-3 text-sm text-yellow-800 dark:text-yellow-200">
-    Traffic stats are disabled (<code>log.traffic.enabled = false</code>).
+    {{ lang.t("traffic.disabled_before") }}<code>log.traffic.enabled = false</code>{{ lang.t("traffic.disabled_after") }}
   </div>
   {% endif %}
 

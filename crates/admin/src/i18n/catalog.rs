@@ -1,0 +1,181 @@
+//! The language catalogs.
+//!
+//! One JSON file per language, embedded at compile time with
+//! `include_str!` and parsed once per process into a
+//! `HashMap<String, String>`. A file that is not valid JSON is logged
+//! and treated as an empty catalog — the interface then falls back
+//! to English instead of failing the request.
+//!
+//! The English catalog is the fallback for every other language: a
+//! key a translation has not covered yet still renders in English.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use super::Lang;
+
+/// The English catalog. Also the fallback for every other language.
+const EN_JSON: &str = include_str!("../../i18n/en.json");
+
+/// The Simplified Chinese catalog.
+///
+/// Empty in issue #178: that issue delivers the framework only, so
+/// the interface renders in English until the translation issues
+/// land.
+const ZH_CN_JSON: &str = include_str!("../../i18n/zh-CN.json");
+
+/// A parsed catalog: key → text.
+pub type Catalog = HashMap<String, String>;
+
+static EN: OnceLock<Catalog> = OnceLock::new();
+static ZH_CN: OnceLock<Catalog> = OnceLock::new();
+
+/// The areas a catalog key may live in.
+///
+/// The list is closed on purpose: a key that names an area nobody
+/// declared is a typo, and the gate test turns it red.
+pub const AREAS: &[&str] = &[
+    "nav",
+    "common",
+    "login",
+    "dashboard",
+    "components",
+    "sites",
+    "domains",
+    "tunnels",
+    "certs",
+    "dns",
+    "ratelimit",
+    "settings",
+    "logs",
+    "bots",
+    "referers",
+    "traffic",
+    "time",
+    "activity",
+    "lang",
+    "js",
+];
+
+/// The areas whose translation is complete.
+///
+/// A translation issue adds its areas here once every key of the area
+/// exists in every non-empty catalog. The completeness gate test then
+/// fails if one of those keys goes missing — so "translated" cannot
+/// silently rot into "half translated".
+///
+/// Empty in issue #178: no area is translated yet.
+pub const COMPLETED_AREAS: &[&str] = &[];
+
+/// The catalog of one language.
+pub fn catalog_for(lang: Lang) -> &'static Catalog {
+    match lang {
+        Lang::En => en(),
+        Lang::ZhCn => zh_cn(),
+    }
+}
+
+/// The English catalog.
+pub fn en() -> &'static Catalog {
+    EN.get_or_init(|| parse(EN_JSON, "en"))
+}
+
+/// The Simplified Chinese catalog.
+pub fn zh_cn() -> &'static Catalog {
+    ZH_CN.get_or_init(|| parse(ZH_CN_JSON, "zh-CN"))
+}
+
+/// Parse a catalog file. A malformed file is an empty catalog, not a
+/// panic: the request must still render (in English, not a panic).
+fn parse(source: &str, label: &str) -> Catalog {
+    match serde_json::from_str::<Catalog>(source) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            log::error!("i18n: catalog {label} is not valid JSON: {err}");
+            Catalog::new()
+        }
+    }
+}
+
+/// Whether `key` has the shape every catalog key must have.
+///
+/// `area.item`, lower-case snake_case, at least two segments. The
+/// first segment starts with a letter, the others may start with a
+/// digit or an underscore.
+pub fn is_valid_key(key: &str) -> bool {
+    let mut segments = key.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let mut first_chars = first.chars();
+    match first_chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    if !first_chars.all(is_key_char) {
+        return false;
+    }
+    let mut seen_rest = false;
+    for segment in segments {
+        if segment.is_empty() || !segment.chars().all(is_key_char) {
+            return false;
+        }
+        seen_rest = true;
+    }
+    seen_rest
+}
+
+/// Whether `c` may appear in a catalog key.
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
+}
+
+/// The area of a key — the part before the first dot.
+pub fn area_of(key: &str) -> &str {
+    key.split('.').next().unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_shape_is_enforced() {
+        assert!(is_valid_key("nav.sites"));
+        assert!(is_valid_key("sites.delete.confirm"));
+        assert!(is_valid_key("time.seconds_ago"));
+        assert!(is_valid_key("a.b"));
+        // A single segment is not a key.
+        assert!(!is_valid_key("nav"));
+        assert!(!is_valid_key(""));
+        // The first segment must start with a letter.
+        assert!(!is_valid_key("_nav.sites"));
+        assert!(!is_valid_key("1nav.sites"));
+        // Upper case, spaces and dashes are not allowed.
+        assert!(!is_valid_key("Nav.sites"));
+        assert!(!is_valid_key("nav.my key"));
+        assert!(!is_valid_key("nav.my-key"));
+        // An empty segment is not a key.
+        assert!(!is_valid_key("nav..sites"));
+        assert!(!is_valid_key("nav."));
+    }
+
+    #[test]
+    fn catalogs_parse() {
+        // Both files are embedded at compile time; an empty JSON
+        // object is a valid catalog.
+        assert!(en().contains_key("nav.sites"));
+        assert_eq!(zh_cn().len(), 0);
+    }
+
+    #[test]
+    fn english_catalog_keys_are_well_formed() {
+        for key in en().keys() {
+            assert!(is_valid_key(key), "key {key} does not match the key shape");
+            assert!(
+                AREAS.contains(&area_of(key)),
+                "key {key} names an area that is not declared"
+            );
+        }
+    }
+}

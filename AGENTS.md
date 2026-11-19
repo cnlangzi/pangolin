@@ -433,6 +433,13 @@ Match the surrounding code:
 - Async: `tokio` everywhere. Don't mix `async-std` or `smol`.
 - Imports: grouped std / external / internal, alphabetised within
   each group. `rustfmt` enforces this; don't fight it.
+- Admin UI text: every operator-facing string comes from the i18n
+  catalog (`crates/admin/i18n/<code>.json`), never from the template
+  or from Rust. A new template struct carries a `pub lang: Lang`
+  field, and the route handler that builds it takes a `lang: Lang`
+  parameter and passes it on. Technical identifiers (protocol names,
+  status codes, provider keys, file paths, host names) stay as they
+  are. See `docs/admin/i18n.md`.
 
 ## Pebble
 

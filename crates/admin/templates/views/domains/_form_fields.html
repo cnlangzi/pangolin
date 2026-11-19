@@ -8,14 +8,14 @@
     <input type="hidden" name="next" value="{{ self.next_redirect() }}">
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-name">Domain name</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-name">{{ lang.t("domains.form.domain_name") }}</label>
       {% if self.lock_domain() %}
         {# Edit mode: domain is the primary key, render as read-only text + hidden field. #}
         <div class="flex items-center gap-2">
           <code class="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm font-mono text-slate-700 dark:text-slate-200 flex-1 truncate">{{ self.edit_domain_value() }}</code>
         </div>
         <input type="hidden" name="domain" value="{{ self.edit_domain_value() }}">
-        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">The domain name is the primary key and cannot be changed.</p>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("domains.form.domain_locked") }}</p>
       {% else %}
         <input type="text" name="domain" id="domain-name" required
           placeholder="example.com"
@@ -24,7 +24,7 @@
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-site">Site</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-site">{{ lang.t("common.site") }}</label>
       {% if self.lock_site() %}
         {# Site is locked when editing, or when invoked from a site-specific
            sub-page. Render as read-only text + hidden field so the value
@@ -33,11 +33,11 @@
           {{ self.preselected_site_name_value() }}
         </div>
         <input type="hidden" name="site_name" value="{{ self.preselected_site_name_value() }}">
-        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">Site is fixed for this form.</p>
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("domains.form.site_fixed") }}</p>
       {% else %}
         <select name="site_name" id="domain-site" required
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-          <option value="">Select a site...</option>
+          <option value="">{{ lang.t("domains.form.select_site") }}</option>
           {% for site in sites %}
           <option value="{{ site.name }}"{% if self.is_site_preselected(site.name) %} selected{% endif %}>{{ site.name }} — {{ site.backend }}</option>
           {% endfor %}
@@ -46,42 +46,42 @@
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-enabled">Status</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-enabled">{{ lang.t("common.status") }}</label>
       <label class="inline-flex items-center gap-2">
         <input type="checkbox" name="enabled" value="1" id="domain-enabled"
           {% if self.enabled_checked() %}checked{% endif %}
           class="rounded border-slate-300 text-accent-600 focus:ring-accent-500">
         <span class="text-sm text-slate-700 dark:text-slate-200">
-          Enabled
-          <span class="text-xs text-slate-500 dark:text-slate-400">(uncheck to pause traffic and cert issuance for this domain)</span>
+          {{ lang.t("domains.form.enabled") }}
+          <span class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("domains.form.enabled_hint") }}</span>
         </span>
       </label>
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-auto-issue">Cert management</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-auto-issue">{{ lang.t("domains.form.cert_management") }}</label>
       <label class="inline-flex items-center gap-2">
         <input type="checkbox" name="auto_issue" value="1" id="domain-auto-issue"
           {% if auto_issue_checked %}checked{% endif %}
           class="rounded border-slate-300 text-accent-600 focus:ring-accent-500">
         <span class="text-sm text-slate-700 dark:text-slate-200">
-          Auto-issue cert via ACME
-          <span class="text-xs text-slate-500 dark:text-slate-400">(uncheck for manual upload; required for wildcard domains)</span>
+          {{ lang.t("domains.form.auto_issue") }}
+          <span class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("domains.form.auto_issue_hint") }}</span>
         </span>
       </label>
     </div>
 
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-dns-provider">DNS provider (DNS-01 challenge)</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-dns-provider">{{ lang.t("domains.form.dns_provider") }}</label>
       <select name="dns_provider" id="domain-dns-provider"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-        <option value="">(none — use HTTP-01)</option>
+        <option value="">{{ lang.t("domains.form.no_dns_provider") }}</option>
         {% for p in dns_providers %}
         <option value="{{ p.name }}"{% if self.is_dns_provider_selected(p.name) %} selected{% endif %}>{{ p.name }} ({{ p.kind }})</option>
         {% endfor %}
       </select>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-        Required for wildcard domains. Manage providers under <a href="/dns" class="text-accent-600 dark:text-accent-400 hover:underline">DNS</a>.
+        {{ lang.t("domains.form.dns_provider_hint_before") }} <a href="/dns" class="text-accent-600 dark:text-accent-400 hover:underline">{{ lang.t("domains.form.dns_provider_hint_after") }}
       </p>
     </div>
 
@@ -97,17 +97,16 @@
        disabled state in sync with the domain-name input for the "new"
        form (where the input is editable). #}
     <div>
-      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-challenge-kind">ACME challenge kind</label>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="domain-challenge-kind">{{ lang.t("domains.form.challenge_kind") }}</label>
       <select name="challenge_kind" id="domain-challenge-kind"
         class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
-        <option value="auto"{% if self.is_challenge_kind_selected("auto") %} selected{% endif %}>Auto (NULL — planner picks)</option>
-        <option value="http-01"{% if self.is_challenge_kind_selected("http-01") %} selected{% endif %}{% if self.http01_disabled() %} disabled{% endif %}>HTTP-01{% if self.http01_disabled() %} (not valid for wildcards — RFC 8555 §8.3){% endif %}</option>
-        <option value="dns-01"{% if self.is_challenge_kind_selected("dns-01") %} selected{% endif %}>DNS-01 (requires a DNS provider)</option>
-        <option value="dns-persist-01"{% if self.is_challenge_kind_selected("dns-persist-01") %} selected{% endif %}>DNS-PERSIST-01 (IETF draft — staging only on Let's Encrypt)</option>
+        <option value="auto"{% if self.is_challenge_kind_selected("auto") %} selected{% endif %}>{{ lang.t("domains.form.challenge_auto") }}</option>
+        <option value="http-01"{% if self.is_challenge_kind_selected("http-01") %} selected{% endif %}{% if self.http01_disabled() %} disabled{% endif %}>HTTP-01{% if self.http01_disabled() %} {{ lang.t("domains.form.challenge_http01_note") }}{% endif %}</option>
+        <option value="dns-01"{% if self.is_challenge_kind_selected("dns-01") %} selected{% endif %}>{{ lang.t("domains.form.challenge_dns01") }}</option>
+        <option value="dns-persist-01"{% if self.is_challenge_kind_selected("dns-persist-01") %} selected{% endif %}>{{ lang.t("domains.form.challenge_dnspersist01") }}</option>
       </select>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-        Auto picks the right kind per domain: <code class="px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">dns-01</code> if a DNS provider is linked, otherwise <code class="px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">http-01</code>.
-        Wildcard SANs cannot use HTTP-01 (RFC 8555 §8.3).
+        {{ lang.t("domains.form.challenge_hint_before") }} <code class="px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">dns-01</code> {{ lang.t("domains.form.challenge_hint_mid") }} <code class="px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">http-01</code>{{ lang.t("domains.form.challenge_hint_after") }}
       </p>
     </div>
 

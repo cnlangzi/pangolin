@@ -1,9 +1,9 @@
 {# UTC JSONL dates. Each `link.href` is a full-page GET for the
    page that included this sidebar (history or stats). #}
 <aside class="card p-4 h-fit">
-  <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3">Available dates</h2>
+  <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-3">{{ lang.t("bots.available_dates") }}</h2>
   {% if date_links.is_empty() %}
-    <p class="text-xs text-slate-500 dark:text-slate-400">No JSONL files yet. Once a bot hits the gateway the file for that UTC day will appear here.</p>
+    <p class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("bots.no_jsonl_yet") }}</p>
   {% else %}
     <ul class="space-y-1 text-sm">
       {% for link in date_links %}

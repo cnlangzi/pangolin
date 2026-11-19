@@ -1,6 +1,8 @@
 //! Templates for `/ratelimit` and its HTMX fragments.
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use pangolin_core::ratelimit::{IpRule, OverLimitClient, RateLimitSnapshot};
 
 /// One row of the IP rules table.
@@ -86,7 +88,7 @@ impl TopOverRow {
     /// `now` is the reference point of the relative time — the caller
     /// reads the whole table at one instant, so every row of a render
     /// carries the same clock.
-    pub fn new(client: &OverLimitClient, now: chrono::DateTime<chrono::Utc>) -> Self {
+    pub fn new(client: &OverLimitClient, now: chrono::DateTime<chrono::Utc>, lang: Lang) -> Self {
         let status = match (client.rule_blocks > 0, client.throttled > 0) {
             (true, true) => "403+429",
             (true, false) => "403",
@@ -105,7 +107,7 @@ impl TopOverRow {
             user_agent: client.user_agent.clone(),
             status: status.to_string(),
             rejections: client.rule_blocks.saturating_add(client.throttled),
-            first_seen_rel: super::relative_time(client.first_seen_at, now),
+            first_seen_rel: super::relative_time(client.first_seen_at, now, lang),
             first_seen_at: client.first_seen_at.to_rfc3339(),
         }
     }
@@ -126,6 +128,8 @@ pub struct RateLimitPageTemplate<'a> {
     pub error: Option<String>,
     pub csrf_token: String,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// KPI strip swapped every 2s (`GET /api/ratelimit/kpis`).
@@ -133,6 +137,8 @@ pub struct RateLimitPageTemplate<'a> {
 #[template(path = "views/ratelimit/_kpis.html")]
 pub struct RateLimitKpisView {
     pub snap: RateLimitSnapshot,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// Per-site table + top over-limit clients (`GET /api/ratelimit/sites`).
@@ -142,6 +148,8 @@ pub struct RateLimitSitesView {
     pub snap: RateLimitSnapshot,
     /// The rows of the "top over-limit clients" table.
     pub top_over: Vec<TopOverRow>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 /// IP rules table (`GET /api/ratelimit/rules`).
@@ -149,6 +157,8 @@ pub struct RateLimitSitesView {
 #[template(path = "views/ratelimit/_rules.html")]
 pub struct RateLimitRulesView {
     pub rules: Vec<RuleRow>,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 #[cfg(test)]
@@ -175,17 +185,20 @@ mod tests {
     #[test]
     fn the_status_is_derived_from_the_two_counters() {
         let now = Utc::now();
-        assert_eq!(TopOverRow::new(&client(3, 0), now).status, "403");
-        assert_eq!(TopOverRow::new(&client(0, 7), now).status, "429");
-        assert_eq!(TopOverRow::new(&client(3, 7), now).status, "403+429");
+        assert_eq!(TopOverRow::new(&client(3, 0), now, Lang::En).status, "403");
+        assert_eq!(TopOverRow::new(&client(0, 7), now, Lang::En).status, "429");
+        assert_eq!(
+            TopOverRow::new(&client(3, 7), now, Lang::En).status,
+            "403+429"
+        );
     }
 
     #[test]
     fn the_rejections_are_the_total_of_the_two_counters() {
         let now = Utc::now();
-        assert_eq!(TopOverRow::new(&client(3, 7), now).rejections, 10);
-        assert_eq!(TopOverRow::new(&client(3, 0), now).rejections, 3);
-        assert_eq!(TopOverRow::new(&client(0, 7), now).rejections, 7);
+        assert_eq!(TopOverRow::new(&client(3, 7), now, Lang::En).rejections, 10);
+        assert_eq!(TopOverRow::new(&client(3, 0), now, Lang::En).rejections, 3);
+        assert_eq!(TopOverRow::new(&client(0, 7), now, Lang::En).rejections, 7);
     }
 
     #[test]
@@ -193,7 +206,7 @@ mod tests {
         let now = Utc::now();
         let mut c = client(0, 7);
         c.first_seen_at = now - Duration::minutes(12);
-        let row = TopOverRow::new(&c, now);
+        let row = TopOverRow::new(&c, now, Lang::En);
         assert_eq!(row.first_seen_rel, "12m ago");
         assert_eq!(row.first_seen_at, c.first_seen_at.to_rfc3339());
     }
@@ -206,11 +219,11 @@ mod tests {
         let mut c = client(0, 7);
         c.bot_name = Some("googlebot".into());
         assert_eq!(
-            TopOverRow::new(&c, now).bot_name.as_deref(),
+            TopOverRow::new(&c, now, Lang::En).bot_name.as_deref(),
             Some("googlebot")
         );
         // A client that is not a verified known bot has no name.
-        assert_eq!(TopOverRow::new(&client(0, 7), now).bot_name, None);
+        assert_eq!(TopOverRow::new(&client(0, 7), now, Lang::En).bot_name, None);
     }
 
     /// The user agent of the client is carried into the row (issue
@@ -221,10 +234,13 @@ mod tests {
         let mut c = client(0, 7);
         c.user_agent = Some("scraper/1.0".into());
         assert_eq!(
-            TopOverRow::new(&c, now).user_agent.as_deref(),
+            TopOverRow::new(&c, now, Lang::En).user_agent.as_deref(),
             Some("scraper/1.0")
         );
         // A client that never sent a user agent has none.
-        assert_eq!(TopOverRow::new(&client(0, 7), now).user_agent, None);
+        assert_eq!(
+            TopOverRow::new(&client(0, 7), now, Lang::En).user_agent,
+            None
+        );
     }
 }

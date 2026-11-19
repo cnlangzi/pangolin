@@ -80,50 +80,101 @@ pub use tun::{
 /// Granularity: the smallest unit whose value is ≥1; future timestamps
 /// (clock skew) get an "in the future" string rather than a negative
 /// number so the column never reads as garbage.
+///
+/// The wording comes from the language catalog, so the column reads in
+/// the operator's language.
 pub fn relative_time(
     then: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
+    lang: crate::i18n::Lang,
 ) -> String {
     let secs = (now - then).num_seconds();
     if secs < 0 {
-        return "in the future".to_string();
+        return lang.t("time.in_the_future").into_owned();
     }
     if secs < 60 {
-        return format!("{}s ago", secs);
+        return lang.tf("time.seconds_ago", [("n", secs)]);
     }
     let mins = secs / 60;
     if mins < 60 {
-        return format!("{}m ago", mins);
+        return lang.tf("time.minutes_ago", [("n", mins)]);
     }
     let hours = mins / 60;
     if hours < 24 {
-        return format!("{}h ago", hours);
+        return lang.tf("time.hours_ago", [("n", hours)]);
     }
     let days = hours / 24;
-    format!("{}d ago", days)
+    lang.tf("time.days_ago", [("n", days)])
 }
 
 #[cfg(test)]
 mod tests {
     use super::relative_time;
+    use crate::i18n::Lang;
     use chrono::{Duration, Utc};
 
     #[test]
     fn relative_time_buckets() {
         let now = Utc::now();
-        assert_eq!(relative_time(now - Duration::seconds(5), now), "5s ago");
-        assert_eq!(relative_time(now - Duration::seconds(59), now), "59s ago");
-        assert_eq!(relative_time(now - Duration::seconds(60), now), "1m ago");
-        assert_eq!(relative_time(now - Duration::minutes(59), now), "59m ago");
-        assert_eq!(relative_time(now - Duration::minutes(60), now), "1h ago");
-        assert_eq!(relative_time(now - Duration::hours(23), now), "23h ago");
-        assert_eq!(relative_time(now - Duration::hours(24), now), "1d ago");
-        assert_eq!(relative_time(now - Duration::days(30), now), "30d ago");
+        // The English wording must not change.
+        assert_eq!(
+            relative_time(now - Duration::seconds(5), now, Lang::En),
+            "5s ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::seconds(59), now, Lang::En),
+            "59s ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::seconds(60), now, Lang::En),
+            "1m ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::minutes(59), now, Lang::En),
+            "59m ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::minutes(60), now, Lang::En),
+            "1h ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::hours(23), now, Lang::En),
+            "23h ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::hours(24), now, Lang::En),
+            "1d ago"
+        );
+        assert_eq!(
+            relative_time(now - Duration::days(30), now, Lang::En),
+            "30d ago"
+        );
         // Clock skew falls back to a literal string rather than printing
         // a negative number.
         assert_eq!(
-            relative_time(now + Duration::seconds(10), now),
+            relative_time(now + Duration::seconds(10), now, Lang::En),
             "in the future"
         );
+    }
+
+    #[test]
+    fn relative_time_buckets_in_every_language() {
+        let now = Utc::now();
+        // Every language renders the same buckets; a language without a
+        // translation falls back to English.
+        for lang in Lang::ALL {
+            assert_eq!(
+                relative_time(now - Duration::seconds(5), now, lang),
+                "5s ago"
+            );
+            assert_eq!(
+                relative_time(now - Duration::hours(24), now, lang),
+                "1d ago"
+            );
+            assert_eq!(
+                relative_time(now + Duration::seconds(10), now, lang),
+                "in the future"
+            );
+        }
     }
 }

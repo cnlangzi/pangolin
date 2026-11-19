@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 
 use askama::Template;
+
+use crate::i18n::Lang;
 use pangolin_core::types::DnsProvider;
 
 // ─── List page (GET /dns) ──────────────────────────────────────────────────────
@@ -20,6 +22,8 @@ pub struct DnsProvidersListTemplate<'a> {
     /// Map of provider name → number of domains currently using it.
     pub domain_counts: HashMap<String, usize>,
     pub active_nav: &'a str,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DnsProvidersListTemplate<'a> {
@@ -37,8 +41,6 @@ pub struct DnsProvidersNewTemplate<'a> {
     /// `views/dns/_form_fields.html` compiles in the new context.
     pub provider: Option<DnsProvider>,
     pub action: &'a str,
-    pub form_title: &'a str,
-    pub submit_label: &'a str,
     pub is_edit: bool,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
@@ -51,6 +53,8 @@ pub struct DnsProvidersNewTemplate<'a> {
     pub tencent_secret_id: Option<String>,
     pub tencent_secret_key: Option<String>,
     pub tencent_secret_key_set: bool,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DnsProvidersNewTemplate<'a> {
@@ -92,8 +96,6 @@ impl<'a> DnsProvidersNewTemplate<'a> {
 pub struct DnsProvidersEditTemplate<'a> {
     pub provider: Option<DnsProvider>,
     pub action: &'a str,
-    pub form_title: &'a str,
-    pub submit_label: &'a str,
     pub is_edit: bool,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
@@ -106,6 +108,8 @@ pub struct DnsProvidersEditTemplate<'a> {
     pub tencent_secret_id: Option<String>,
     pub tencent_secret_key: Option<String>,
     pub tencent_secret_key_set: bool,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DnsProvidersEditTemplate<'a> {
@@ -147,8 +151,6 @@ impl<'a> DnsProvidersEditTemplate<'a> {
 pub struct DnsProvidersFormFieldsView<'a> {
     pub provider: Option<DnsProvider>,
     pub action: &'a str,
-    pub form_title: &'a str,
-    pub submit_label: &'a str,
     pub is_edit: bool,
     pub error: Option<&'a str>,
     pub active_nav: &'a str,
@@ -161,6 +163,8 @@ pub struct DnsProvidersFormFieldsView<'a> {
     pub tencent_secret_id: Option<String>,
     pub tencent_secret_key: Option<String>,
     pub tencent_secret_key_set: bool,
+    /// The interface language this page is rendered in.
+    pub lang: Lang,
 }
 
 impl<'a> DnsProvidersFormFieldsView<'a> {

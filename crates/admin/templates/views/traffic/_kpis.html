@@ -1,6 +1,6 @@
 {% if snap.dropped_samples > 0 %}
 <div class="mb-4 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
-  Side-channel dropped <span class="font-semibold tabular-nums">{{ snap.dropped_samples }}</span> sample(s). The proxy was not delayed — the aggregator is behind.
+  {{ lang.t("traffic.dropped_before") }} <span class="font-semibold tabular-nums">{{ snap.dropped_samples }}</span> {{ lang.t("traffic.dropped_after") }}
 </div>
 {% endif %}
 
@@ -8,51 +8,51 @@
   <div class="card p-4">
     <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">RPS</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.rps_display() }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">last complete second</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.last_second") }}</div>
   </div>
   <div class="card p-4">
-    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Requests</div>
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("traffic.requests") }}</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.requests_total }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">since start · {{ snap.uptime_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.since_start") }} {{ snap.uptime_display() }}</div>
   </div>
   <div class="card p-4">
-    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Body out</div>
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("traffic.body_out") }}</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.bytes_out_display() }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">in {{ snap.bytes_in_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.body_in") }} {{ snap.bytes_in_display() }}</div>
   </div>
   <div class="card p-4">
-    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">Error rate</div>
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("traffic.error_rate") }}</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.error_pct_display() }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">15s {{ snap.error_15s_pct_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.error_15s") }} {{ snap.error_15s_pct_display() }}</div>
   </div>
   <div class="card p-4">
     <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">p95</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.p95_display() }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">p50 {{ snap.p50_display() }} · p99 {{ snap.p99_display() }}</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.p50") }} {{ snap.p50_display() }} {{ lang.t("traffic.p99") }} {{ snap.p99_display() }}</div>
   </div>
   <div class="card p-4">
-    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">In-flight</div>
+    <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("traffic.in_flight") }}</div>
     <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ snap.active_requests }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">requests, not connections</div>
+    <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ lang.t("traffic.in_flight_hint") }}</div>
   </div>
 </div>
 
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
   <div class="card p-4">
-    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Network</h2>
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">{{ lang.t("traffic.network") }}</h2>
     <div class="grid grid-cols-3 gap-3 text-sm">
       <div>
-        <div class="text-xs text-slate-500 dark:text-slate-400">Direct</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.direct") }}</div>
         <div class="tabular-nums font-medium">{{ snap.route_direct_req }}</div>
         <div class="text-xs text-slate-500">{{ snap.route_direct_bytes }} B</div>
       </div>
       <div>
-        <div class="text-xs text-slate-500 dark:text-slate-400">Tunnel</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.tunnel") }}</div>
         <div class="tabular-nums font-medium">{{ snap.route_tunnel_req }}</div>
         <div class="text-xs text-slate-500">{{ snap.route_tunnel_bytes }} B</div>
       </div>
       <div>
-        <div class="text-xs text-slate-500 dark:text-slate-400">File</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.file") }}</div>
         <div class="tabular-nums font-medium">{{ snap.route_file_req }}</div>
         <div class="text-xs text-slate-500">{{ snap.route_file_bytes }} B</div>
       </div>
@@ -62,7 +62,7 @@
     </div>
   </div>
   <div class="card p-4">
-    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Request status</h2>
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">{{ lang.t("traffic.request_status") }}</h2>
     <div class="grid grid-cols-5 gap-2 text-sm">
       <div>
         <div class="text-xs text-emerald-600 dark:text-emerald-400">2xx</div>
@@ -81,7 +81,7 @@
         <div class="tabular-nums font-medium">{{ snap.status_5xx }}</div>
       </div>
       <div>
-        <div class="text-xs text-slate-500">other</div>
+        <div class="text-xs text-slate-500">{{ lang.t("traffic.other") }}</div>
         <div class="tabular-nums font-medium">{{ snap.status_other }}</div>
       </div>
     </div>
@@ -92,7 +92,7 @@
 </div>
 
 <div class="card p-4">
-  <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">Requests per minute (last hour)</h2>
+  <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">{{ lang.t("traffic.requests_per_minute") }}</h2>
   <div class="flex items-end gap-px h-16">
     {% for h in spark_bars %}
     <div class="flex-1 bg-accent-500/70 dark:bg-accent-400/70 rounded-t-sm" style="height: {{ h }}%"></div>

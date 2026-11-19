@@ -11,6 +11,7 @@ use http_body_util::Full;
 use pangolin_core::DnsProviderKind;
 
 use crate::App;
+use crate::i18n::Lang;
 use crate::templates::{
     DnsProvidersEditTemplate, DnsProvidersListTemplate, DnsProvidersNewTemplate,
 };
@@ -25,7 +26,7 @@ fn ok_html(body: String) -> http::Result<Resp> {
         .expect("response builder for 200 OK should not fail"))
 }
 
-pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
+pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let providers = {
         let db = app.db.lock().await;
         pangolin_core::db::list_dns_providers(&db).unwrap_or_default()
@@ -43,14 +44,15 @@ pub async fn render(app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
         providers,
         domain_counts,
         active_nav: "dns",
+        lang,
     }
     .render()
     .unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
-pub async fn render_create_page(_app: &Arc<App>, csrf: &str) -> http::Result<Resp> {
-    let html = build_new_form(None).render().unwrap();
+pub async fn render_create_page(_app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
+    let html = build_new_form(None, lang).render().unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
@@ -58,29 +60,31 @@ pub async fn render_edit_page(
     app: &Arc<App>,
     name: Option<String>,
     csrf: &str,
+    lang: Lang,
 ) -> http::Result<Resp> {
     let Some(name) = name else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
     let provider = {
         let db = app.db.lock().await;
         pangolin_core::db::get_dns_provider(&db, &name).unwrap_or(None)
     };
     let Some(provider) = provider else {
-        return Ok(crate::not_found());
+        return Ok(crate::not_found(lang));
     };
-    let html = build_edit_form(&provider).render().unwrap();
+    let html = build_edit_form(&provider, lang).render().unwrap();
     ok_html(crate::render_with_assets_and_csrf(html, csrf))
 }
 
 /// Build a DnsProvidersNewTemplate populated with no provider (new mode).
 /// Optionally carries an error message to display at the top of the form.
-pub(super) fn build_new_form<'a>(error: Option<&'a str>) -> DnsProvidersNewTemplate<'a> {
+pub(super) fn build_new_form<'a>(
+    error: Option<&'a str>,
+    lang: Lang,
+) -> DnsProvidersNewTemplate<'a> {
     DnsProvidersNewTemplate {
         provider: None,
         action: "/dns/new",
-        form_title: "New DNS Provider",
-        submit_label: "Create",
         is_edit: false,
         error,
         active_nav: "dns",
@@ -93,6 +97,7 @@ pub(super) fn build_new_form<'a>(error: Option<&'a str>) -> DnsProvidersNewTempl
         tencent_secret_id: None,
         tencent_secret_key: None,
         tencent_secret_key_set: false,
+        lang,
     }
 }
 
@@ -102,6 +107,7 @@ pub(super) fn build_new_form<'a>(error: Option<&'a str>) -> DnsProvidersNewTempl
 /// `routes/dns.rs`.
 pub(super) fn build_edit_form(
     provider: &pangolin_core::types::DnsProvider,
+    lang: Lang,
 ) -> DnsProvidersEditTemplate<'_> {
     let v: serde_json::Value = serde_json::from_str(&provider.config).unwrap_or_default();
     let (
@@ -188,8 +194,6 @@ pub(super) fn build_edit_form(
     DnsProvidersEditTemplate {
         provider: Some(provider.clone()),
         action: "/dns/edit",
-        form_title: "Edit DNS Provider",
-        submit_label: "Save",
         is_edit: true,
         error: None,
         active_nav: "dns",
@@ -202,5 +206,6 @@ pub(super) fn build_edit_form(
         tencent_secret_id,
         tencent_secret_key,
         tencent_secret_key_set,
+        lang,
     }
 }
