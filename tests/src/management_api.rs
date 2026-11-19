@@ -165,6 +165,19 @@ fn error_code(json: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Create a site.
+async fn create_site(server: &ApiServer, name: &str) {
+    let body = serde_json::json!({
+        "name": name,
+        "backend": "http://127.0.0.1:8080",
+    })
+    .to_string();
+    let (status, json) = server
+        .send_json(client().post("/api/v1/sites", body.as_bytes()))
+        .await;
+    assert_eq!(status, 201, "{json}");
+}
+
 // ── The round trip ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -420,6 +433,7 @@ async fn the_system_config_is_merged() {
 #[tokio::test]
 async fn the_bot_list_is_replaced() {
     let server = start_api().await;
+    create_site(&server, "example").await;
     let body = serde_json::json!({ "bots": ["gptbot", "ccbot"] }).to_string();
     let (status, json) = server
         .send_json(client().put("/api/v1/site_rate_limit_bots/example", body.as_bytes()))
@@ -439,6 +453,7 @@ async fn the_bot_list_is_replaced() {
 #[tokio::test]
 async fn the_origin_allow_list_is_replaced() {
     let server = start_api().await;
+    create_site(&server, "example").await;
     let body = serde_json::json!({ "cidrs": ["1.2.3.0/24"] }).to_string();
     let (status, json) = server
         .send_json(client().put("/api/v1/site_origin_allow/example", body.as_bytes()))
@@ -561,6 +576,104 @@ async fn the_access_log_is_empty_when_nothing_happened() {
 }
 
 // ── The switch ──────────────────────────────────────────────────────────
+
+// ── The guards the review found ─────────────────────────────────────────
+
+#[tokio::test]
+async fn a_rotated_token_is_the_one_the_tunnel_uses() {
+    // The stored digest has to follow the new token: `upsert_tun`
+    // prefers the digest it already has, so a rotation that does not
+    // drop it leaves the tunnel on the old credential.
+    let server = start_api().await;
+    let body = serde_json::json!({ "name": "office" }).to_string();
+    let (status, json) = server
+        .send_json(client().post("/api/v1/tun", body.as_bytes()))
+        .await;
+    assert_eq!(status, 201, "{json}");
+    let old_token = json["token"].as_str().expect("the token is returned").to_string();
+
+    let body = serde_json::json!({ "token": "the-new-token" }).to_string();
+    let (status, json) = server
+        .send_json(client().put("/api/v1/tun/office", body.as_bytes()))
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["token"], "the-new-token");
+
+    let db = server.app.db.lock().await;
+    assert!(
+        pangolin_core::db::auth_tun(&db, "office", "the-new-token")
+            .expect("the lookup")
+            .is_some(),
+        "the rotated token has to be the stored one"
+    );
+    assert!(
+        pangolin_core::db::auth_tun(&db, "office", &old_token)
+            .expect("the lookup")
+            .is_none(),
+        "the old token has to stop working"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_body_is_refused() {
+    // The body is read before the authentication gate runs, so an
+    // unauthenticated client must not be able to make the node buffer
+    // an arbitrary amount of memory.
+    let server = start_api().await;
+    let body = vec![b'x'; api::http::MAX_BODY_BYTES + 1];
+    let (status, _) = server.send(client().post("/api/v1/sites", &body)).await;
+    assert_eq!(status, 413);
+}
+
+#[tokio::test]
+async fn an_ip_rule_is_deleted_by_its_natural_key() {
+    // The id is `<scope>|<kind>|<cidr>` and a CIDR contains a `/`, so
+    // the id is the rest of the path.
+    let server = start_api().await;
+    let body = serde_json::json!({
+        "name": "example",
+        "backend": "http://127.0.0.1:8080",
+    })
+    .to_string();
+    let (status, _) = server
+        .send_json(client().post("/api/v1/sites", body.as_bytes()))
+        .await;
+    assert_eq!(status, 201);
+
+    let body = serde_json::json!({
+        "scope": "example",
+        "kind": "blacklist",
+        "cidr": "10.0.0.0/8",
+    })
+    .to_string();
+    let (status, json) = server
+        .send_json(client().post("/api/v1/ip_rules", body.as_bytes()))
+        .await;
+    assert_eq!(status, 201, "{json}");
+    assert_eq!(json["id"], "example|blacklist|10.0.0.0/8");
+
+    let (status, json) = server
+        .send_json(client().delete("/api/v1/ip_rules/example|blacklist|10.0.0.0/8"))
+        .await;
+    assert_eq!(status, 200, "{json}");
+
+    let (status, json) = server.send_json(client().get("/api/v1/ip_rules")).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json, serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_per_site_write_for_a_site_that_does_not_exist_is_refused() {
+    // The sub-resource tables carry no foreign key, so an orphan row
+    // would attach itself to a site of that name created later.
+    let server = start_api().await;
+    let body = serde_json::json!({ "enabled": true }).to_string();
+    let (status, json) = server
+        .send_json(client().put("/api/v1/site_rate_limits/nope", body.as_bytes()))
+        .await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(error_code(&json), "site_not_found");
+}
 
 #[tokio::test]
 async fn a_disabled_api_refuses_every_call() {

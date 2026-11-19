@@ -434,3 +434,153 @@ async fn settings_post_reputation_rejects_a_bad_policy_inline() {
         .expect("the row exists");
     assert_eq!(policy, "lenient", "a rejected form must not write");
 }
+
+// ── The dashboard card (issue #185) ─────────────────────────────────────────
+//
+// The management API's connection settings live in the database, not
+// in `ngx.yml`: the operator sets the bearer token, the dashboard's
+// port and the switch from this card, and the change takes effect
+// without a restart.
+
+/// The settings page shows the dashboard card, with the instance id
+/// and the listen address — and never the token.
+#[tokio::test]
+async fn settings_page_renders_the_dashboard_card() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(r#"action="/settings/dashboard""#),
+        "the dashboard form must be present"
+    );
+    for field in [
+        "dashboard_enabled",
+        "dashboard_token",
+        "dashboard_port",
+        "dashboard_instance_id",
+    ] {
+        if field == "dashboard_instance_id" {
+            continue;
+        }
+        assert!(
+            body.contains(&format!(r#"name="{field}""#)),
+            "{field} input missing"
+        );
+    }
+    // The instance id is shown — it is how the dashboard knows the
+    // node.
+    assert!(
+        body.contains(r#"id="dashboard-instance-id""#),
+        "the instance id must be shown"
+    );
+    // The token is write-only: the stored token never comes back.
+    assert!(
+        !body.contains("dashboard_token_clear\" value=\"true\" checked"),
+        "the token must not be echoed"
+    );
+}
+
+/// The dashboard form writes the row — and the token is stored as a
+/// digest, never in the clear.
+#[tokio::test]
+async fn settings_post_dashboard_saves_the_row_without_echoing_the_token() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_enabled", "true"),
+                ("dashboard_token", "the-operator-token"),
+                ("dashboard_port", "8443"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "a successful save redirects back to the settings page"
+    );
+
+    // The row carries the new settings.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let (enabled, token_hash, port): (i64, String, i64) = conn
+        .query_row(
+            "SELECT enabled, token_hash, dashboard_port FROM api_config WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("the row exists");
+    assert_eq!(enabled, 1, "the API must be switched on");
+    assert_eq!(port, 8443, "the dashboard's port must be stored");
+    assert_eq!(
+        token_hash,
+        pangolin_core::db::sha256_hex("the-operator-token"),
+        "the token must be stored as a digest"
+    );
+    assert!(
+        !token_hash.contains("the-operator-token"),
+        "the token must not be stored in the clear"
+    );
+
+    // And the page never renders it back.
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        !body.contains("the-operator-token"),
+        "the token must not be echoed back"
+    );
+}
+
+/// A rejected dashboard form re-renders with the message in the
+/// dashboard card — and writes nothing.
+#[tokio::test]
+async fn settings_post_dashboard_rejects_a_bad_port_without_writing() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_enabled", "true"),
+                ("dashboard_port", "not-a-port"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("must be a number between 0 and 65535"),
+        "the error must name the offending value: {body}"
+    );
+    assert!(
+        body.contains(r#"data-testid="dashboard-error""#),
+        "the error must be shown in the dashboard card: {body}"
+    );
+
+    // The row is unchanged — a rejected form never writes.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let enabled: i64 = conn
+        .query_row("SELECT enabled FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(enabled, 0, "a rejected form must not write");
+}

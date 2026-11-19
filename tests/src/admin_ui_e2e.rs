@@ -105,17 +105,20 @@ async fn login_correct_sets_cookies() {
     assert!(has_csrf, "missing pangolin_csrf cookie");
 }
 
-// ── §5 — Dashboard renders after login ──────────────────────────────────────
+// ── §5 — The overview page renders after login ──────────────────────────────
+//
+// The nav entry and the page itself are both called "Overview" (issue
+// #185) — "dashboard" is the central product's name, not this page's.
 
 #[tokio::test]
-async fn dashboard_renders_after_login() {
+async fn overview_renders_after_login() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
     let resp = client.get("/").await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("Dashboard"), "missing Dashboard text");
+    assert!(body.contains("Overview"), "missing Overview text");
 }
 
 // ── §6 — Sites list (empty) ──────────────────────────────────────────────────
