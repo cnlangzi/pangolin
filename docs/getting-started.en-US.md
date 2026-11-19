@@ -44,8 +44,9 @@ real traffic.**
 
 ### Download a release archive
 
-Every release publishes an archive and a checksum file on GitHub Releases. The
-archive contains four files:
+Every release publishes one archive per platform plus a checksum file on
+GitHub Releases. Linux (`linux_amd64` / `linux_arm64`) and macOS
+(`macos_arm64` / `macos_x64`) ship as `.tar.gz` containing four files:
 
 | File | What it is |
 | --- | --- |
@@ -53,6 +54,10 @@ archive contains four files:
 | `pangolin-tun` | The tunnel-node binary |
 | `ngx.yml` | Gateway configuration template (holds the admin password, mode 0600) |
 | `tun.yml` | Tunnel-node configuration template (holds the bearer token, mode 0600) |
+
+Windows (`windows_amd64` / `windows_arm64`) ships as a `.zip` holding only
+`pangolin-tun.exe` and `tun.yml` — the gateway depends on Unix-only APIs,
+so there is no Windows build of it.
 
 Download, verify and unpack (`v0.3.0` below is an example — substitute the
 version you want to install):
@@ -84,8 +89,11 @@ production configuration — the ports, the admin password, the paths and the
 token all have to change. The full list is in
 [Before you go to production](#before-you-go-to-production).
 
-> The release pipeline currently builds `linux/amd64` only — the other
-> architectures have to be compiled by hand.
+> The example above is Linux amd64; on the other platforms substitute
+> `linux_arm64` / `macos_arm64` / `macos_x64` for `linux_amd64` in the file
+> name. The Windows `.zip` unpacks with Explorer or
+> `tar -xf pangolin_${VERSION}_windows_amd64.zip`. The full artifact list
+> and the platform policy are in [the release procedure](release.md).
 
 ## Before you go to production
 

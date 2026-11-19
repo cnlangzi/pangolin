@@ -35,7 +35,7 @@ make start-ngx
 
 ### 下载发布归档
 
-每次发布会在 GitHub Releases 上放一个归档和一份校验和。归档里有四个文件：
+每次发布会在 GitHub Releases 上按平台放一组归档和一份校验和。Linux（`linux_amd64` / `linux_arm64`）和 macOS（`macos_arm64` / `macos_x64`）是 `.tar.gz`，里面有四个文件：
 
 | 文件 | 说明 |
 | --- | --- |
@@ -43,6 +43,8 @@ make start-ngx
 | `pangolin-tun` | 隧道节点二进制 |
 | `ngx.yml` | 网关配置模板（含管理密码，权限 0600） |
 | `tun.yml` | 隧道节点配置模板（含 bearer token，权限 0600） |
+
+Windows（`windows_amd64` / `windows_arm64`）是 `.zip`，只含 `pangolin-tun.exe` 和 `tun.yml` —— 网关依赖 Unix-only API，没有 Windows 版。
 
 下载、校验、解包（下面用 `v0.3.0` 举例，把它换成你要安装的版本号）：
 
@@ -68,7 +70,7 @@ cd /usr/local/pangolin
 
 归档里的 `ngx.yml` / `tun.yml` 是**开发默认值**，不是生产配置 —— 端口、管理密码、路径、token 全都要改，清单见[上线前必改](#上线前必改)。
 
-> 发布流程目前只构建 `linux/amd64`，其他架构要自己编译。
+> 上面是 Linux amd64 的例子；其他平台把文件名里的 `linux_amd64` 换成 `linux_arm64` / `macos_arm64` / `macos_x64` 即可。Windows 的 `.zip` 用资源管理器或 `tar -xf pangolin_${VERSION}_windows_amd64.zip` 解包。完整产物清单和平台策略见 [release 流程](release.md)。
 
 ## 上线前必改
 
