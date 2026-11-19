@@ -97,7 +97,6 @@ RUN cat /tmp/cargo-mirror.toml /tmp/cargo-config.toml > /usr/local/cargo/config.
 # cargo-chef — installed binary, versioned so the layer survives until
 # someone deliberately bumps the version.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo install cargo-chef --locked --version 0.1.71
 
 # sccache — the compiler cache used by the build stages.  Version-pinned
@@ -108,7 +107,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # compilation for backends this build never uses.  `redis` is kept so a
 # shared cache backend remains available.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo install sccache --locked --version 0.19.0 --no-default-features --features redis
 
 # Compiler cache wiring.  These must come AFTER the sccache install:
@@ -145,7 +143,6 @@ COPY tests ./tests
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     cargo chef prepare --recipe-path recipe.json
 
 # ── Stage C: cook all third-party dependencies ─────────────────────────────
@@ -165,7 +162,6 @@ COPY --from=planner /pangolin/recipe.json recipe.json
 # runs on the same machine and are dropped by `docker builder prune`.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/pangolin/target,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
@@ -192,7 +188,6 @@ RUN tailwindcss -i ./assets/tailwindcss.css -o ./assets/app.css --minify && \
 # once.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry/index,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/pangolin/target,sharing=locked \
     cargo build --release -p ngx -p tun && \

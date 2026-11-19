@@ -87,7 +87,6 @@ jobs:
         with:
           path: |
             ~/.cargo/registry
-            ~/.cargo/git
             target
           # The runner label is part of the key: `runner.os` is
           # `Linux` for every ubuntu image, so a target/ tree built
@@ -373,7 +372,6 @@ jobs:
         with:
           path: |
             ~/.cargo/registry
-            ~/.cargo/git
             target
           # Same key shape as the `build` job, plus `cargo-target`:
           # `target/<triple>/` keeps the two builds' outputs apart on
@@ -618,7 +616,7 @@ jobs:
   # Build-tun: Windows binaries (tun only — no ngx)
   #
   # There is no Windows ngx: pingora 0.9 needs Unix-only APIs (Unix
-  # sockets, daemonize, sendfile) and `crates/ngx` carries
+  # sockets, daemonize, systemd socket activation) and `crates/ngx` carries
   # `#[cfg(unix)]` code of its own — that is a port, not a matrix
   # entry. The Windows archive therefore holds exactly
   # `pangolin-tun.exe` + `tun.yml` (no `ngx.yml`, it would be dead
@@ -686,7 +684,6 @@ jobs:
         with:
           path: |
             ~/.cargo/registry
-            ~/.cargo/git
             target
           # Same key shape as the `build` job, plus `cargo-target`:
           # `target/<triple>/` keeps the two builds' outputs apart on
