@@ -512,11 +512,15 @@ violation. `transport` is optional and defaults to `auto`.
 | `token`    | `string` | —       | **yes**  | Non-empty. Hashed with SHA-256 and matched against `tun.token_hash` in the gateway's `tun` table (the v2 schema has no separate `tokens` table). Write the real token directly in this file, or override at runtime with `TUN_TOKEN=…` (see "Environment variable override" above). |
 | `name`     | `string` | —       | **yes**  | `^[a-z0-9_-]+$`, 1–32 chars, **not purely numeric**. The name is the tun's primary key on the ngx side; the validator refuses to start if the name collides with another online tun or violates the rule. |
 | `transport` | `string` | `auto`  | no       | `auto`, `quic` or `tcp`. `auto` (the default) tries QUIC first with a five-second handshake timeout and falls back to the WebSocket/TCP transport; after a failed QUIC attempt it does not probe QUIC again for ten minutes. `quic` and `tcp` pin the tun to one transport. Override at runtime with `TUN_TRANSPORT=quic`. |
+| `pin_path` | `string` | derived | no       | Where the trust-on-first-use pin file lives. Absent, the path is derived from the configuration file's own path (`tun.yml` → `tun.pins`). Name it explicitly when the configuration file sits in a directory the tun cannot write to — which is the case for the packaged deployment, whose configuration lives in `/etc/pangolin/` and whose state lives in `/var/lib/pangolin-tun/`. |
+| `quic_failure_path` | `string` | derived | no       | Where the record of the last failed QUIC attempt lives. Absent, the path is derived from the configuration file's own path (`tun.yml` → `tun.quic-fail`). Same reason as `pin_path`. |
 
 ### State files next to `tun.yml`
 
-The tun writes two files next to its configuration file. They are
-state, not configuration — do not edit them by hand except to re-pin.
+The tun writes two files next to its configuration file — or next to
+the paths `pin_path` and `quic_failure_path` name, when the
+configuration sets them. They are state, not configuration — do not
+edit them by hand except to re-pin.
 
 **The directory has to be writable by the tun's user.** The tun
 cannot record a pin it cannot write, and a trust failure is fatal by

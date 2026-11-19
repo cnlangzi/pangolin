@@ -109,11 +109,13 @@ impl Default for AddrConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelConfig {
     /// Full listen address (`host:port`) for the tun WebSocket
-    /// endpoint. Default `127.0.0.1:9001` — accept only local tun
-    /// clients; safe for dev or SSH-tunneled production use. Set to
-    /// `0.0.0.0:9001` (or a specific interface IP) when tun runs on
-    /// a separate host. This is also the address `tun.yml: server:`
-    /// must point at from the tun client side.
+    /// endpoint. Default `0.0.0.0:9001` — the endpoint accepts tun
+    /// clients on every interface, which is what a deployment with
+    /// the tunnel nodes on separate hosts needs. Narrow it to
+    /// `127.0.0.1:9001` when the tunnel clients are on the same host
+    /// (or reach the gateway over an SSH tunnel). This is also the
+    /// address `tun.yml: server:` must point at from the tun client
+    /// side.
     #[serde(default = "default_tunnel_addr")]
     pub addr: String,
     /// WebSocket endpoint path (e.g. `/tunnel`).

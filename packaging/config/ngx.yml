@@ -17,13 +17,14 @@
 #   * `admin.addr` — `0.0.0.0:9081` exposes the admin UI to every
 #     network the host can reach. Narrow it to `127.0.0.1:9081` (and
 #     use an SSH tunnel) or to an internal address.
-#   * `acme.email` — empty means the ACME account is registered
-#     without a contact address, so you get no expiry notices. Put a
-#     real mailbox in.
-#   * `tunnel.addr` — the default below only accepts tunnel clients
-#     from the same host. Set it to the address the tunnel nodes
-#     connect to, and make sure UDP 9001 is reachable (QUIC and the
-#     TCP fallback share the port number).
+#   * `acme.email` — the address the ACME account is registered
+#     with. It is empty here; put a real mailbox in.
+#   * `tunnel.addr` — the tunnel endpoint is NOT in this file, so it
+#     keeps its built-in default, `0.0.0.0:9001`: the gateway accepts
+#     tunnel clients on every interface. Add a `tunnel:` section with
+#     `addr: 127.0.0.1:9001` when the tunnel nodes are on the same
+#     host, and make sure UDP 9001 is reachable from the ones that are
+#     not (QUIC and the TCP fallback share the port number).
 #
 # The full field reference is
 # https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
