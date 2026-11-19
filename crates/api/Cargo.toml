@@ -39,14 +39,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 ring = "0.17"
 
 # The nonce cache's lock — sync, non-poisoning, no hot path.
-parking_lot = "0.12"
+parking_lot.workspace = true
 
 # base64url for the signature header, hex for the key fingerprint.
-base64 = "0.22"
-hex = "0.4"
+base64.workspace = true
+hex.workspace = true
 
 # Percent-encoding for the form bodies the admin parsers read.
 urlencoding = "2"
-
-[dev-dependencies]
-tempfile = { workspace = true }

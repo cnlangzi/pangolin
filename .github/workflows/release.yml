@@ -152,6 +152,26 @@ jobs:
           fi
           echo "tagged commit $(git rev-parse --short HEAD) is on main"
 
+      - name: Assert the dashboard key is not the development placeholder
+        # The dashboard's Ed25519 public key is compiled into the
+        # binary (issue #185). The repository ships a DEVELOPMENT
+        # placeholder whose private half lives in
+        # `tests/fixtures/` — the end-to-end suite needs it to sign a
+        # request — so it must never reach a release.
+        #
+        # The other build jobs compile the same source, so this one
+        # check is enough to stop the whole release.
+        run: |
+          set -euo pipefail
+          key_file=crates/api/src/dashboard.pub
+          placeholder=439a24963d8250a37a685231546de534176238a9b43e7e1ce23c48d01b3795ea
+          key=$(grep -v '^[[:space:]]*#' "$key_file" | tr -d '[:space:]')
+          if [[ "$key" == "$placeholder" ]]; then
+            echo "::error::$key_file still holds the development key — replace it (and tests/fixtures/dashboard_dev_seed.hex) with the production key pair before tagging"
+            exit 1
+          fi
+          echo "the dashboard key is not the development placeholder"
+
       - name: Set the workspace version from the tag
         # The tag is the single source of truth for the release
         # version. The repository carries the placeholder 0.0.0 in
