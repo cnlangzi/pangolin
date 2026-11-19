@@ -57,7 +57,7 @@ tokio-util.workspace = true
 
 # WebSocket (for Sec-WebSocket-Accept in tests + client side of ws/wss e2e)
 sha1 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # Manual TLS connector for wss:// tests where we drive a custom
 # rustls ClientConfig (trusting a per-test self-signed cert).
