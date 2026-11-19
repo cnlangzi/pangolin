@@ -46,12 +46,19 @@ fi
 
 if ! user_exists "$PANGOLIN_USER"; then
     if command -v useradd >/dev/null 2>&1; then
-        # `--user-group` asks for the group explicitly.  `useradd`
-        # only creates a same-named group where USERGROUPS_ENAB is
-        # yes (Debian); on the RHEL family the user would land in the
-        # default group instead, and the unit's `Group=pangolin`
-        # would then name a group the user is not in.
-        useradd --system --no-create-home --user-group \
+        # `--gid` names the primary group explicitly.  It has to:
+        # `useradd` only creates a same-named group where
+        # USERGROUPS_ENAB is yes (Debian) — on the RHEL family the
+        # user would land in the default group instead, and the
+        # unit's `Group=pangolin` would then name a group the user
+        # is not in.
+        #
+        # `--user-group` is *not* an option here: it asks useradd to
+        # create the group, and useradd refuses when a group of that
+        # name already exists — which it does, two lines above (and
+        # on a host where the Ansible role or `install.sh` created
+        # it first).  The install would abort on every machine.
+        useradd --system --no-create-home --gid "$PANGOLIN_GROUP" \
             --home-dir "$PANGOLIN_HOME" --shell "$PANGOLIN_SHELL" \
             "$PANGOLIN_USER"
     elif command -v adduser >/dev/null 2>&1; then

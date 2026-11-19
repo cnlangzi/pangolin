@@ -37,6 +37,20 @@ PANGOLIN_GROUP=pangolin
 NGX_UNIT=pangolin-ngx.service
 TUN_UNIT=pangolin-tun.service
 
+# Is this an upgrade rather than a first install?
+#
+# dpkg calls `postinst configure` on a first install and
+# `postinst configure <old-version>` on an upgrade; rpm's `%post`
+# gets `$1=1` for an install and `$1=2` for an upgrade.  The two
+# conventions are handled side by side, because the same four
+# scripts serve both formats.
+is_upgrade() {
+    if [ "${1:-}" = "2" ]; then
+        return 0
+    fi
+    [ -n "${2:-}" ]
+}
+
 say() {
     echo "pangolin: $*"
 }
@@ -138,11 +152,34 @@ else
     warn "systemctl was not found — the unit is installed but not registered"
 fi
 
+# On an upgrade the binary has been replaced, but the running process
+# still holds the old executable: `Restart=on-failure` never fires,
+# so the new binary would not take effect until the operator
+# restarted the service by hand.  `try-restart` restarts the unit
+# only when it is *running* — it never starts anything, so the "the
+# package never starts the service" contract holds.
+if is_upgrade "$@"; then
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in "$NGX_UNIT" "$TUN_UNIT"; do
+            unit_path "$unit" >/dev/null 2>&1 || continue
+            systemctl try-restart "$unit" >/dev/null 2>&1 || true
+        done
+    fi
+fi
+
 # Only the gateway is enabled.  The tunnel node stays disabled: it
 # needs a `(name, token)` row in the gateway's admin UI before it can
 # connect, and starting it without one is a restart loop.
+#
+# An upgrade does not re-enable: an operator who deliberately ran
+# `systemctl disable` must not find the unit enabled again after the
+# next package upgrade.
 if unit_path "$NGX_UNIT" >/dev/null 2>&1; then
-    enable_unit "$NGX_UNIT"
+    if is_upgrade "$@"; then
+        say "upgrade: leaving $NGX_UNIT's enable state alone"
+    else
+        enable_unit "$NGX_UNIT"
+    fi
 fi
 
 # ── an older installation on the same host ─────────────────────────────────

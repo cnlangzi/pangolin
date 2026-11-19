@@ -167,11 +167,13 @@ sudo apt update && sudo apt upgrade        # Debian / Ubuntu
 sudo dnf upgrade                           # RHEL / Rocky / Alma
 ```
 
-升级会换掉二进制和 unit，配置文件原样保留。服务**不会**被自动重启 —— 升级之后：
+升级会换掉二进制和 unit，配置文件原样保留。**已经在跑**的服务会被重启（`systemctl try-restart`）—— 没在跑的服务不会被启动，所以升级不会替你抢下 80/443。想自己挑时间重启：
 
 ```bash
 sudo systemctl restart pangolin-ngx
 ```
+
+升级不会改动 unit 的 enable 状态：你手动 `systemctl disable` 过的服务，升级后仍然是关的。
 
 ## 卸载
 
@@ -184,6 +186,12 @@ sudo dnf remove pangolin-ngx               # RHEL / Rocky / Alma
 
 ```bash
 sudo rm -rf /var/lib/pangolin
+```
+
+配置文件（`/etc/pangolin/ngx.yml`，里面是管理密码和 ACME 账户）在普通的卸载里也会留下 —— 这是 conffile 的规矩，改过的配置要能扛住重装。`purge` 才会把它一起删掉：
+
+```bash
+sudo apt purge pangolin-ngx      # Debian / Ubuntu
 ```
 
 ## 从 `/usr/local/pangolin` 迁移
@@ -264,7 +272,7 @@ sudo journalctl -u pangolin-ngx -n 50
 
 1. **80 / 443 被别的服务占了** —— 包不会自动起服务，所以冲突只会在你手动 `start` 的时候才出现。`sudo ss -tlnp | grep ':80'` 看看是谁。
 2. **`admin.password` 还是默认值** —— 网关不会对这个告警，但管理界面暴露在 `0.0.0.0:9081` 上是实打实的风险。改 `/etc/pangolin/ngx.yml`。
-3. **`acme.email` 是空的** —— ACME 账户注册时不带联系地址，收不到到期通知。
+3. **`acme.email` 是空的** —— 它是 ACME 账户注册时用的联系地址，填一个真邮箱。
 
 ### 隧道节点反复重启
 

@@ -33,6 +33,20 @@ say() {
     echo "pangolin: $*"
 }
 
+# dpkg's `purge` is the "remove everything, including the
+# configuration" step: a plain `remove` deliberately leaves the
+# conffiles alone, so the operator's edited configuration survives a
+# reinstall.  The configuration carries the admin password and the
+# ACME account, so it goes only when the operator asks for it.
+if [ "${1:-}" = "purge" ]; then
+    for config in "$root/etc/pangolin/ngx.yml" "$root/etc/pangolin/tun.yml"; do
+        if [ -f "$config" ]; then
+            rm -f "$config" 2>/dev/null || true
+            say "removed ${config#"$root"}"
+        fi
+    done
+fi
+
 unit_installed() {
     for dir in "$root/usr/lib/systemd/system" "$root/lib/systemd/system" "$root/etc/systemd/system"; do
         if [ -f "$dir/$1" ]; then
@@ -59,12 +73,21 @@ stop_and_disable() {
 stop_and_disable pangolin-ngx.service
 stop_and_disable pangolin-tun.service
 
-for state in "$root/var/lib/pangolin" "$root/var/lib/pangolin-tun"; do
-    if [ -d "$state" ]; then
-        say "${state#"$root"} was left in place — it holds the database, the certificates"
-        say "and the logs.  Remove it by hand once you are sure you do not"
-        say "need them any more."
-    fi
-done
+# The two state directories hold different things, and the operator
+# has to be told which is which: the gateway's holds the database and
+# the ACME certificates, the tunnel node's holds the trust-on-first-use
+# pin file and the record of the last failed QUIC attempt.  The tunnel
+# node writes no logs to disk at all.
+if [ -d "$root/var/lib/pangolin" ]; then
+    say "/var/lib/pangolin was left in place — it holds the database and the"
+    say "ACME certificates.  Remove it by hand once you are sure you do not"
+    say "need them any more."
+fi
+
+if [ -d "$root/var/lib/pangolin-tun" ]; then
+    say "/var/lib/pangolin-tun was left in place — it holds the trust-on-first-use"
+    say "pin file and the record of the last failed QUIC attempt.  Remove it by"
+    say "hand once you are sure you do not need them any more."
+fi
 
 exit 0

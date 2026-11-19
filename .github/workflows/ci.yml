@@ -64,9 +64,23 @@ jobs:
   # ----------------------------------------------------------------
   build:
     name: Build (release compile)
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, not ubuntu-latest: the packaging job below
+    # installs the binaries this job produces on debian:12 (glibc
+    # 2.36) and rockylinux:9 (glibc 2.34), and a binary compiled on
+    # ubuntu-latest (24.04, glibc 2.39) records a glibc floor those
+    # machines do not meet — the package would be refused by its own
+    # dependency.  The release workflow builds on the same image for
+    # the same reason; see docs/release.md.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        # libz-ng-sys compiles C through cmake, openssl-sys is cgo
+        # and needs the OpenSSL headers pkg-config points at.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -80,9 +94,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # The runner label is part of the key: `runner.os` is
+          # `Linux` for every ubuntu image, so a `target/` tree built
+          # on ubuntu-latest would otherwise be restored here — and
+          # the binaries in it would carry the wrong glibc floor.
+          key: ${{ runner.os }}-${{ runner.runs-on }}-cargo-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-1.96-
+            ${{ runner.os }}-${{ runner.runs-on }}-cargo-1.96-
 
       - name: make build
         run: make build
@@ -151,8 +169,9 @@ jobs:
       - name: Build the packages
         run: |
           set -euo pipefail
-          mkdir -p bin
-          tar -xzf dist/pangolin_*.tar.gz -C bin
+          # The artifact holds the two binaries themselves, so the
+          # download directory *is* the binary directory.
+          ls -l dist
           # The workspace version is the placeholder the release
           # workflow overwrites with the tag's; it is what the
           # binaries report here.
@@ -161,8 +180,7 @@ jobs:
           sh packaging/build-packages.sh \
             --tag-version "$version" \
             --arch amd64 \
-            --rpm-arch x86_64 \
-            --bin-dir bin \
+            --bin-dir dist \
             --out-dir dist/packages
 
       - name: Build and sign the repository
@@ -172,18 +190,18 @@ jobs:
           chmod 700 "$GNUPGHOME"
           gpg --batch --passphrase '' --quick-generate-key \
             "Pangolin CI <ci@pangolin.invalid>" rsa2048 sign never
+          # The site carries the key the client trusts.  This
+          # repository is signed with the throwaway key — a pull
+          # request cannot reach the archive key — so the site has to
+          # carry *that* one instead.
+          gpg --armor --export > ci-key.asc
           sh packaging/publish-repo.sh \
             --site site \
             --deb-dir dist/packages \
             --rpm-dir dist/packages \
             --version "$VERSION" \
+            --key ci-key.asc \
             --sign
-          # The site carries the *archive* key, which is the one the
-          # operator trusts.  This repository was signed with the
-          # throwaway key, so the site has to carry that one instead.
-          gpg --armor --export > site/pangolin-archive-keyring.asc
-          gpg --dearmor --yes --output site/pangolin-archive-keyring.gpg \
-            site/pangolin-archive-keyring.asc
 
       - name: Install from the apt repository (debian:12)
         run: |

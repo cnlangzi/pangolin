@@ -167,11 +167,13 @@ sudo apt update && sudo apt upgrade        # Debian / Ubuntu
 sudo dnf upgrade                           # RHEL / Rocky / Alma
 ```
 
-An upgrade replaces the binary and the unit and leaves the configuration alone. The service is **not** restarted automatically — after the upgrade:
+An upgrade replaces the binary and the unit and leaves the configuration alone. A service that is **already running** is restarted (`systemctl try-restart`) — one that is not running is not started, so an upgrade never grabs 80/443 behind your back. To restart it yourself, at a time of your choosing:
 
 ```bash
 sudo systemctl restart pangolin-ngx
 ```
+
+An upgrade leaves the enable state alone: a unit you disabled with `systemctl disable` stays disabled.
 
 ## Uninstalling
 
@@ -184,6 +186,12 @@ The uninstall stops the service and takes the unit out of the boot sequence, but
 
 ```bash
 sudo rm -rf /var/lib/pangolin
+```
+
+The configuration file (`/etc/pangolin/ngx.yml`, with the admin password and the ACME account in it) survives a plain uninstall too — that is what a conffile does: your edits have to survive a reinstall. Only `purge` removes it:
+
+```bash
+sudo apt purge pangolin-ngx      # Debian / Ubuntu
 ```
 
 ## Migrating from `/usr/local/pangolin`
@@ -266,7 +274,7 @@ The three usual causes:
 
 1. **80 / 443 are taken** — the package never starts the service, so the conflict only shows up when you `start` it yourself. `sudo ss -tlnp | grep ':80'` shows who has it.
 2. **`admin.password` is still the default** — the gateway does not warn about it, but an admin UI on `0.0.0.0:9081` is a real exposure. Change `/etc/pangolin/ngx.yml`.
-3. **`acme.email` is empty** — the ACME account is registered without a contact address, so nobody gets the expiry notices.
+3. **`acme.email` is empty** — it is the address the ACME account is registered with; put a real mailbox in.
 
 ### The tunnel node restarts in a loop
 

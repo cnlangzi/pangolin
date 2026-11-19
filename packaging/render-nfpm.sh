@@ -10,13 +10,16 @@
 # Usage:
 #
 #   render-nfpm.sh --package <name> --version <ver> --revision <rev> \
-#                  --arch <deb-arch> --rpm-arch <rpm-arch> \
-#                  --glibc <x.y> --binary <path> --out <path>
+#                  --arch <arch> --glibc <x.y> --binary <path> \
+#                  --out <path>
 #
 # `--package` is `pangolin-ngx` or `pangolin-tun`; it selects the
 # file list from `packaging/contents/<package>.yaml` and the
 # configuration template and the unit from `packaging/config/` and
 # `packaging/systemd/`.
+#
+# The architecture is written once: nfpm derives the rpm's own
+# nomenclature from it and names both output files after it.
 
 set -eu
 
@@ -27,15 +30,14 @@ package=""
 version=""
 revision=""
 arch=""
-rpm_arch=""
 glibc=""
 binary=""
 out=""
 
 usage() {
     echo "usage: render-nfpm.sh --package <name> --version <ver> --revision <rev>" >&2
-    echo "                       --arch <deb-arch> --rpm-arch <rpm-arch>" >&2
-    echo "                       --glibc <x.y> --binary <path> --out <path>" >&2
+    echo "                       --arch <arch> --glibc <x.y> --binary <path>" >&2
+    echo "                       --out <path>" >&2
     exit 2
 }
 
@@ -55,10 +57,6 @@ while [ $# -gt 0 ]; do
             ;;
         --arch)
             arch="$2"
-            shift 2
-            ;;
-        --rpm-arch)
-            rpm_arch="$2"
             shift 2
             ;;
         --glibc)
@@ -83,10 +81,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for required in package version revision arch rpm_arch glibc binary out; do
-    eval "value=\$$required"
+# The flags and the variables they fill, so that the "you forgot one"
+# message names the flag the caller actually typed.
+for required in package:package version:version revision:revision \
+                arch:arch glibc:glibc binary:binary out:out
+do
+    flag=${required%%:*}
+    variable=${required#*:}
+    eval "value=\$$variable"
     if [ -z "$value" ]; then
-        echo "render-nfpm.sh: missing --$required" >&2
+        echo "render-nfpm.sh: missing --$flag" >&2
         usage
     fi
 done
@@ -179,7 +183,6 @@ for pair in \
     "VERSION:$version" \
     "REVISION:$revision" \
     "ARCH:$arch" \
-    "RPM_ARCH:$rpm_arch" \
     "GLIBC:$glibc" \
     "SCRIPTS:$scripts_dir"
 do

@@ -71,10 +71,17 @@ pangolin-tun.service
 SHA256SUMS.txt
 ```
 
-`SHA256SUMS.txt` covers the six archives and the three repository
-files, exactly as before — the packages are checksummed by the
-repository metadata that carries them, not by the release's checksum
-file.
+`SHA256SUMS.txt` covers every one of those files — the six archives,
+the eight packages, the installer and the two units — so an operator
+can verify a download the same way for all of them:
+
+```bash
+cd dist && sha256sum -c SHA256SUMS.txt
+```
+
+The packages carry a second, independent checksum: the apt
+repository's `Release` file lists the hash of every `.deb` it serves,
+and the rpm repository's `repodata` does the same for the `.rpm`.
 
 `install.sh` is the repository's root `install.sh`, byte for byte — it
 is the one-liner every operator starts with:
@@ -242,7 +249,7 @@ through to release day.
 | Set | The tag's version is written into `[workspace.package].version` in `Cargo.toml` — the table-scoped rewrite touches that one line and nothing else. The workflow reads the value back and fails if it is not the tag's version. This happens *after* the cargo cache step, so the cache key is computed from the unmodified manifest and stays identical across releases. |
 | Build | Three jobs, one per build shape, each with its own matrix. `build` (linux/amd64, linux/arm64) runs `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `build-mac` (macos/arm64, macos/x64) runs `make build-css` plus `cargo build --release -p ngx -p tun --features openssl/vendored`. `build-tun` (windows/amd64, windows/arm64) runs `cargo build --release -p tun`. All three regenerate or embed the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled — except the Windows build, whose tun binary serves no UI. |
 | Assert | `--version` must report the tagged version on every binary the runner can execute — both Linux entries and macOS arm64 natively, macOS x64 under Rosetta 2, Windows amd64. A mismatched binary fails the job and is never uploaded. |
-| Package | One job per Linux architecture, on the runner of that architecture. It unpacks the binaries, measures the glibc floor, renders the nfpm configuration and builds the four packages of that architecture (a `.deb` and an `.rpm` for each of the two packages). Read-only permissions. |
+| Package | One job per Linux architecture, on the runner of that architecture. It unpacks the binaries, measures the glibc floor, renders the nfpm configuration and builds the four packages of that architecture (a `.deb` and an `.rpm` for each of the two packages). nfpm names the files itself, so the name and the architecture inside the package cannot drift apart. Read-only permissions. |
 | Publish | The publishing job checks the repository out (it needs the installer and the two systemd units), copies them next to the archives, and attaches the six archives, the eight packages, `install.sh`, the two units and `SHA256SUMS.txt` to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
 | Deploy | The repository job builds the site tree, signs it with the archive key and replaces the `gh-pages` branch with it. It is the only job that holds the key. |
 

@@ -935,6 +935,9 @@ jobs:
   # ----------------------------------------------------------------
   package:
     name: Package (${{ matrix.target }})
+    # The binaries come out of the `build` job's artifact; the
+    # download below only sees artifacts of *completed* jobs.
+    needs: [build]
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 15
     strategy:
@@ -1069,7 +1072,8 @@ jobs:
           # relative, so `sha256sum -c SHA256SUMS.txt` works from the
           # directory holding the archives.
           sha256sum pangolin_*.tar.gz pangolin_*.zip \
-            install.sh pangolin-ngx.service pangolin-tun.service > SHA256SUMS.txt
+            install.sh pangolin-ngx.service pangolin-tun.service \
+            *.deb *.rpm > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish release
@@ -1125,8 +1129,13 @@ jobs:
           # Full history: the branch is pushed from here, and the
           # push is guarded by `--force-with-lease`, which compares
           # the remote against what the fetch saw.
+          #
+          # The credentials stay in the git config — this job pushes
+          # the branch, and `persist-credentials: false` would leave
+          # `git push` with no way to authenticate.  The token is
+          # already least-privilege (`contents: write`, and nothing
+          # else), and the job runs the repository's own scripts.
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Install the repository tools
         # dpkg-dev for `dpkg-scanpackages`, createrepo-c for the rpm

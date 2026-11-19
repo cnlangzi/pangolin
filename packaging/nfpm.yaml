@@ -4,7 +4,8 @@
 # configuration per (package, architecture) pair; `nfpm package` is
 # then run twice per rendered file, once for `deb` and once for
 # `rpm`.  The two formats share every field except the dependency
-# list, which is why there is one template and not two.
+# list — `section` and `priority` are deb-only, and the rpm gets its
+# group from the `rpm:` block below.
 #
 # The placeholders the renderer substitutes:
 #
@@ -12,17 +13,22 @@
 #   @@DESCRIPTION@@  the package's one-line description
 #   @@VERSION@@      the release version, e.g. 0.3.0
 #   @@REVISION@@     the package revision — always 1
-#   @@ARCH@@         the deb architecture (amd64 / arm64)
-#   @@RPM_ARCH@@     the rpm architecture (x86_64 / aarch64)
+#   @@ARCH@@         the architecture (amd64 / arm64)
 #   @@GLIBC@@        the measured glibc floor of the packaged binary
 #   @@CONTENTS@@     the file list, from packaging/contents/<package>.yaml
 #   @@SCRIPTS@@      the directory holding the four lifecycle scripts
 #
-# The glibc floor is *measured*, never written down: the renderer
-# reads the highest `GLIBC_x.y` symbol version out of the binary it is
-# about to package and puts that number in the dependency list.  A
-# hardcoded floor either refuses to install on a host that could run
-# the binary, or lets it install on a host that cannot.
+# The architecture is written once: nfpm derives the rpm's own
+# nomenclature from it (`amd64` → `x86_64`, `arm64` → `aarch64`) and
+# names both output files after it.  Writing the rpm architecture
+# separately would be a second place where the two could drift apart.
+#
+# The glibc floor is *measured*, never written down:
+# `packaging/build-packages.sh` reads the highest `GLIBC_x.y` symbol
+# version out of the binary it is about to package and puts that
+# number into the dependency list.  A hardcoded floor either refuses
+# to install on a host that could run the binary, or lets it install
+# on a host that cannot.
 
 name: @@PACKAGE@@
 arch: @@ARCH@@
@@ -37,6 +43,11 @@ description: |
 vendor: Pangolin
 homepage: https://github.com/cnlangzi/pangolin
 license: Apache-2.0
+
+# The rpm's package group.  nfpm has no deb counterpart for it —
+# the deb's `section` is the field that plays the same role.
+rpm:
+  group: net
 
 scripts:
   preinstall: @@SCRIPTS@@/preinstall.sh

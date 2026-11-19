@@ -7,9 +7,8 @@
 #
 # Usage:
 #
-#   build-packages.sh --tag-version <v1.2.3> --arch <deb-arch> \
-#                     --rpm-arch <rpm-arch> --bin-dir <dir> \
-#                     --out-dir <dir> [--revision <rev>]
+#   build-packages.sh --tag-version <v1.2.3> --arch <arch> \
+#                     --bin-dir <dir> --out-dir <dir> [--revision <rev>]
 #
 # `--tag-version` is the version *without* the leading `v` — the same
 # string the release workflow reads out of the pushed tag.  The
@@ -24,6 +23,11 @@
 # not appear in the upstream part of a Debian version, so a
 # pre-release that carries one (`1.2.3-rc-1`) has it folded into a
 # `+`.
+#
+# The architecture is given once: nfpm derives the rpm's own
+# nomenclature from it and names both output files after it, so the
+# file name and the architecture inside the package cannot drift
+# apart.
 #
 # The glibc floor in the dependency list is *measured*, per binary:
 # the highest `GLIBC_x.y` symbol version the binary records is read
@@ -40,15 +44,14 @@ packaging_dir="$script_dir"
 tag_version=""
 revision=1
 arch=""
-rpm_arch=""
 bin_dir=""
 out_dir=""
 nfpm_bin="${NFPM:-nfpm}"
 
 usage() {
-    echo "usage: build-packages.sh --tag-version <ver> --arch <deb-arch>" >&2
-    echo "                          --rpm-arch <rpm-arch> --bin-dir <dir>" >&2
-    echo "                          --out-dir <dir> [--revision <rev>]" >&2
+    echo "usage: build-packages.sh --tag-version <ver> --arch <arch>" >&2
+    echo "                          --bin-dir <dir> --out-dir <dir>" >&2
+    echo "                          [--revision <rev>]" >&2
     exit 2
 }
 
@@ -64,10 +67,6 @@ while [ $# -gt 0 ]; do
             ;;
         --arch)
             arch="$2"
-            shift 2
-            ;;
-        --rpm-arch)
-            rpm_arch="$2"
             shift 2
             ;;
         --bin-dir)
@@ -88,10 +87,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for required in tag_version arch rpm_arch bin_dir out_dir; do
-    eval "value=\$$required"
+# The flags and the variables they fill, so that the "you forgot one"
+# message names the flag the caller actually typed.
+for required in tag-version:tag_version arch:arch bin-dir:bin_dir \
+                out-dir:out_dir
+do
+    flag=${required%%:*}
+    variable=${required#*:}
+    eval "value=\$$variable"
     if [ -z "$value" ]; then
-        echo "build-packages.sh: missing --$required" >&2
+        echo "build-packages.sh: missing --$flag" >&2
         usage
     fi
 done
@@ -128,6 +133,9 @@ fi
 
 mkdir -p "$out_dir"
 out_dir=$(CDPATH= cd -- "$out_dir" && pwd)
+# Absolute: nfpm runs in a staging directory, and the binary it
+# packages has to be found from there.
+bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd)
 
 # ── the glibc floor ─────────────────────────────────────────────────────────
 
@@ -171,24 +179,32 @@ for package in pangolin-ngx pangolin-tun; do
         --version "$package_version" \
         --revision "$revision" \
         --arch "$arch" \
-        --rpm-arch "$rpm_arch" \
         --glibc "$glibc" \
         --binary "$binary" \
         --out "$config" >/dev/null
 
-    deb_target="$out_dir/${package}_${package_version}-${revision}_${arch}.deb"
-    rpm_target="$out_dir/${package}-${package_version}-${revision}.${rpm_arch}.rpm"
+    # nfpm names the packages itself, from the version and the
+    # architecture in the configuration: `pangolin-ngx_0.3.0-1_amd64.deb`
+    # and `pangolin-ngx-0.3.0-1.x86_64.rpm`.  Letting it do that is
+    # what keeps the file name and the architecture inside the
+    # package from drifting apart.
+    #
+    # They are built in a staging directory and moved afterwards: nfpm
+    # writes into the current directory, and the output directory may
+    # already hold the packages of another architecture.
+    stage="$work/stage-$package"
+    mkdir -p "$stage"
+    (cd "$stage" && "$nfpm_bin" package --packager deb --config "$config")
+    (cd "$stage" && "$nfpm_bin" package --packager rpm --config "$config")
 
-    "$nfpm_bin" package --packager deb --config "$config" --target "$deb_target"
-    "$nfpm_bin" package --packager rpm --config "$config" --target "$rpm_target"
-
-    for produced in "$deb_target" "$rpm_target"; do
-        if [ ! -f "$produced" ]; then
-            echo "build-packages.sh: nfpm did not produce $produced" >&2
-            exit 1
-        fi
-    done
-    echo "built $(basename "$deb_target") and $(basename "$rpm_target")"
+    built=$(find "$stage" -maxdepth 1 -type f | wc -l)
+    if [ "$built" -ne 2 ]; then
+        echo "build-packages.sh: nfpm produced $built file(s) for $package, expected a deb" \
+             "and an rpm" >&2
+        exit 1
+    fi
+    mv "$stage"/* "$out_dir"/
+    echo "built the deb and the rpm of $package in $out_dir"
 done
 
 ls -l "$out_dir"

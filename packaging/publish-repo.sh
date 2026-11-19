@@ -20,10 +20,16 @@
 # Usage:
 #
 #   publish-repo.sh --site <dir> --deb-dir <dir> --rpm-dir <dir> \
-#                   --version <ver> [--sign]
+#                   --version <ver> [--sign] [--key <path>]
 #
 # The architectures are derived from the `.deb` file names, so the
 # caller does not have to keep a list in sync with what it built.
+#
+# `--key` names the public key the clients are told to trust.  It
+# defaults to the committed one, and it has to be the key that signs
+# the repository — the script compares the fingerprints and refuses to
+# publish a repository nobody could verify.  The CI job passes its own
+# throwaway key, because a pull request cannot reach the archive key.
 #
 # Signing is opt-in (`--sign`) and needs a secret key in the current
 # GnuPG home.  The passphrase — when the key has one — is read from
@@ -44,11 +50,12 @@ site=""
 deb_dir=""
 rpm_dir=""
 version=""
+key_file=""
 do_sign=0
 
 usage() {
     echo "usage: publish-repo.sh --site <dir> --deb-dir <dir> --rpm-dir <dir>" >&2
-    echo "                          --version <ver> [--sign]" >&2
+    echo "                          --version <ver> [--sign] [--key <path>]" >&2
     exit 2
 }
 
@@ -73,6 +80,10 @@ while [ $# -gt 0 ]; do
         --sign)
             do_sign=1
             shift
+            ;;
+        --key)
+            key_file="$2"
+            shift 2
             ;;
         -h | --help)
             usage
@@ -143,6 +154,60 @@ gpg_run() {
     fi
 }
 
+# ── the public key ──────────────────────────────────────────────────────────
+
+# The key the client trusts — by default the *committed* one, the
+# file the operator downloads and whose fingerprint the documentation
+# names.  The signing key comes from the secret, so the two have to be
+# the same key: if they ever diverge, every signature in the
+# published repository is unverifiable (`NO_PUBKEY` on `apt update`)
+# while the publishing job still reports success.  The check below is
+# what catches that.
+key_src="${key_file:-$packaging_dir/keys/pangolin-archive-keyring.asc}"
+
+fingerprint_of() {
+    # The primary key's fingerprint, from an armored public key file.
+    gpg --show-keys --with-colons "$1" 2>/dev/null \
+        | awk -F: '/^fpr:/ { print $10; exit }'
+}
+
+if [ ! -f "$key_src" ]; then
+    echo "publish-repo.sh: $key_src is missing — the repository would be published" \
+         "without a key the client could verify it with" >&2
+    exit 1
+fi
+
+committed_fingerprint=$(fingerprint_of "$key_src")
+if [ "$do_sign" -eq 1 ]; then
+    # The fingerprint of the key that is *actually* signing — the one
+    # named by `PANGOLIN_SIGNING_KEY`, or the only secret key in the
+    # keyring when there is no name.
+    if [ -n "$signing_key" ]; then
+        signing_fingerprint=$(gpg --list-secret-keys --with-colons "$signing_key" 2>/dev/null \
+            | awk -F: '/^fpr:/ { print $10; exit }')
+    else
+        signing_fingerprint=$(gpg --list-secret-keys --with-colons 2>/dev/null \
+            | awk -F: '/^fpr:/ { print $10; exit }')
+    fi
+    if [ -z "$signing_fingerprint" ]; then
+        echo "publish-repo.sh: the signing key has no fingerprint — cannot check it" >&2
+        exit 1
+    fi
+    if [ "$committed_fingerprint" != "$signing_fingerprint" ]; then
+        echo "publish-repo.sh: the committed key ($committed_fingerprint) is not the key" \
+             "that signed the repository ($signing_fingerprint) — every client would fail" \
+             "with NO_PUBKEY" >&2
+        exit 1
+    fi
+fi
+
+cp "$key_src" "$site/pangolin-archive-keyring.asc"
+# The dearmored form is what apt's `signed-by=` wants: it is a
+# keyring, not an armored block.
+if command -v gpg >/dev/null 2>&1; then
+    gpg --dearmor --yes --output "$site/pangolin-archive-keyring.gpg" "$key_src"
+fi
+
 # ── the apt repository ──────────────────────────────────────────────────────
 
 pool="$site/pool/$component"
@@ -207,7 +272,10 @@ release="$dists/Release"
     # `$architectures` already carries the leading space.
     echo "Architectures:$architectures"
     echo "Components: $component"
-    echo "Date: $(date -u '+%a, %d %b %Y %H:%M:%S +0000')"
+    # `LC_ALL=C`: the day and month names have to be the English ones
+    # — RFC 2822 says so, and apt refuses a `Release` file whose date
+    # it cannot parse.
+    echo "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
     echo "SHA256:"
     for arch in $architectures; do
         for file in "$component/binary-$arch/Packages" "$component/binary-$arch/Packages.gz"; do
@@ -298,18 +366,6 @@ if [ "$do_sign" -eq 1 ]; then
     gpg_run --detach-sign --armor \
         --output "$rpm_root/repodata/repomd.xml.asc" \
         "$rpm_root/repodata/repomd.xml"
-fi
-
-# ── the public key ──────────────────────────────────────────────────────────
-
-key_src="$packaging_dir/keys/pangolin-archive-keyring.asc"
-if [ -f "$key_src" ]; then
-    cp "$key_src" "$site/pangolin-archive-keyring.asc"
-    # The dearmored form is what apt's `signed-by=` wants: it is a
-    # keyring, not an armored block.
-    if command -v gpg >/dev/null 2>&1; then
-        gpg --dearmor --yes --output "$site/pangolin-archive-keyring.gpg" "$key_src"
-    fi
 fi
 
 # ── the site's front door ───────────────────────────────────────────────────
