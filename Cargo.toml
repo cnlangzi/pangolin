@@ -5,6 +5,7 @@ members = [
     "crates/ngx",
     "crates/tun",
     "crates/admin",
+    "crates/api",
     "tests",
 ]
 

@@ -61,6 +61,15 @@ pub struct Config {
     pub tunnel: TunnelConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    /// The dashboard-facing management API (issue #185).
+    ///
+    /// A **separate** listener from the admin UI: the API has its own
+    /// namespace (`/api/v1/`) and its own authentication (a bearer
+    /// token, a timestamp, a nonce and an Ed25519 signature), and it
+    /// never renders HTML. The admin UI keeps its browser-session auth
+    /// on its own port.
+    #[serde(default)]
+    pub api: ApiConfig,
     /// Parsed, but **not implemented** — the gateway never reads it.
     ///
     /// There is no response cache in the gateway. A configuration
@@ -168,6 +177,7 @@ impl Default for Config {
             workers: None,
             tunnel: TunnelConfig::default(),
             admin: AdminConfig::default(),
+            api: ApiConfig::default(),
             cache: CacheConfig::default(),
             acme: AcmeConfig::default(),
             tls: TlsConfig::default(),
@@ -208,6 +218,40 @@ impl Default for AdminConfig {
             addr: default_admin_addr(),
             username: "admin".into(),
             password: "admin".into(),
+        }
+    }
+}
+
+/// The dashboard-facing management API (issue #185).
+///
+/// The API is a **second, parallel** management surface next to the
+/// admin UI — it gets its own listener, its own `/api/v1/`
+/// namespace and its own authentication, so a central dashboard never
+/// has to speak the admin UI's browser-session dialect.
+///
+/// Only the listen address lives here. Everything else about the
+/// dashboard connection — the bearer token, the instance id, the
+/// dashboard's address — is **runtime state** in the `api_config`
+/// table, so an operator can rotate the token from the admin UI
+/// without restarting the gateway. See `db::ApiConfigRow`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Full listen address (`host:port`) for the management API.
+    /// Default `0.0.0.0:9443` — every interface, because each node
+    /// is managed remotely by the central dashboard. Set it to `":0"`
+    /// to not listen at all.
+    #[serde(default = "default_api_listen")]
+    pub listen: String,
+}
+
+fn default_api_listen() -> String {
+    "0.0.0.0:9443".into()
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_api_listen(),
         }
     }
 }
@@ -936,7 +980,13 @@ mod tests {
     fn the_shipped_example_config_carries_the_listen_addresses() {
         let document = shipped_ngx_document();
 
-        for key in ["addr.http", "addr.https", "tunnel.addr", "admin.addr"] {
+        for key in [
+            "addr.http",
+            "addr.https",
+            "tunnel.addr",
+            "admin.addr",
+            "api.listen",
+        ] {
             assert!(
                 document.find_value(key).is_ok(),
                 "ngx.yml must carry `{key}` — it is the first knob an operator changes"
@@ -948,6 +998,27 @@ mod tests {
         assert_eq!(c.addr.https, Config::default().addr.https);
         assert_eq!(c.tunnel.addr, Config::default().tunnel.addr);
         assert_eq!(c.admin.addr, Config::default().admin.addr);
+        assert_eq!(c.api.listen, Config::default().api.listen);
+    }
+
+    /// The API's listen address is the only key the section has, and
+    /// `":0"` — the way the other listeners are switched off — parses
+    /// like any other address.
+    #[test]
+    fn the_api_listen_address_parses_and_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").unwrap();
+            assert_eq!(c.api.listen, "0.0.0.0:9443");
+            Ok(())
+        });
+
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("api:\n  listen: \":0\"\n").unwrap();
+            assert_eq!(c.api.listen, ":0");
+            Ok(())
+        });
     }
 
     #[test]

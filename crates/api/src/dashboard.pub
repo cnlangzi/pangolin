@@ -1,0 +1,19 @@
+# The dashboard's Ed25519 public key (issue #185).
+#
+# The API verifies every request against this key. It is embedded in
+# the binary at compile time: there is no runtime path that reads a
+# key file, and no configuration knob that replaces it. Changing the
+# dashboard's key therefore means a new release.
+#
+# The value is the raw 32-byte public key in lower-case hex — NOT a
+# PEM file and NOT a DER SubjectPublicKeyInfo: the key is the last
+# thing that needs a parser.
+#
+# ── DEVELOPMENT PLACEHOLDER ──────────────────────────────────────────────
+# This is a **development** key. It belongs to no dashboard and must be
+# replaced with the real one before the first release that ships this
+# feature; the matching seed lives in `tests/fixtures/` so the end-to-
+# end suite can sign requests against the built binary. Both files are
+# replaced together when the production key is put in place.
+# ────────────────────────────────────────────────────────────────────────
+439a24963d8250a37a685231546de534176238a9b43e7e1ce23c48d01b3795ea
