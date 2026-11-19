@@ -46,14 +46,21 @@ one line.
 ## What gets published
 
 Each release attaches one archive per build target plus a checksum
-file:
+file — six archives and `SHA256SUMS.txt`:
 
 ```
 pangolin_v0.3.0_linux_amd64.tar.gz
+pangolin_v0.3.0_linux_arm64.tar.gz
+pangolin_v0.3.0_macos_arm64.tar.gz
+pangolin_v0.3.0_macos_x64.tar.gz
+pangolin_v0.3.0_windows_amd64.zip
+pangolin_v0.3.0_windows_arm64.zip
 SHA256SUMS.txt
 ```
 
-The archive contains exactly four files, at its root:
+The policy is "ship every target that compiles", not a curated
+mainstream list. The four `tar.gz` archives contain exactly four
+files, at their root:
 
 ```
 pangolin-ngx
@@ -61,6 +68,21 @@ pangolin-tun
 ngx.yml
 tun.yml
 ```
+
+The two Windows `.zip` archives contain exactly two files:
+
+```
+pangolin-tun.exe
+tun.yml
+```
+
+There is no Windows `ngx`: pingora 0.8 depends on Unix-only APIs
+(Unix sockets, daemonize, sendfile) and `crates/ngx` carries
+`#[cfg(unix)]` code of its own — a Windows ngx is a porting project,
+not a build target. The Windows archives therefore also omit
+`ngx.yml`: it would be dead configuration next to a binary that
+does not exist. Windows gets a `.zip` per platform convention; every
+other platform gets a `.tar.gz`.
 
 `ngx.yml` and `tun.yml` are the repository's own configuration files,
 copied into the archive byte for byte — the same files
@@ -79,6 +101,9 @@ of prose the repository keeps moving.
 The two configuration files are stored with mode `0600`, not `0644`:
 `tun.yml` carries the tun's bearer token and `ngx.yml` the admin
 password, and both say so themselves. The binaries are stored `0755`.
+(A `.zip` carries no Unix permission bits, so this applies to the
+`tar.gz` archives; the Windows files extract with the extractor's
+defaults.)
 
 Verify a download with:
 
@@ -122,6 +147,54 @@ uses Rust 1.96 — the same toolchain as `.github/workflows/ci.yml` —
 and the native build lands on a glibc 2.35 floor, one notch below
 the Docker image's.
 
+The linux/arm64 archive is built the same way on the
+`ubuntu-22.04-arm` runner — the same 22.04 image line, so the same
+glibc 2.35 floor, natively compiled with no cross toolchain.
+
+## macOS and Windows builds
+
+Both macOS archives are built on `macos-15` (Apple Silicon): arm64
+natively, x64 as a `--target x86_64-apple-darwin` cross compile on
+the same runner — clang is natively multi-arch, so no Intel runner
+is needed. macOS builds use the vendored OpenSSL
+(`--features openssl/vendored`, compiled from source) for both
+entries: the runner's Homebrew `openssl@3` is arm64-only and cannot
+serve the x64 cross link. Only macOS goes vendored — Linux keeps the
+system OpenSSL (`libssl-dev`). The macOS build runs `make build-css`
+instead of the full `make build` (which accepts neither `--features`
+nor `--target`), so the binary still embeds the minified
+`assets/app.css`.
+
+Both Windows archives hold `pangolin-tun.exe` only and are built on
+`windows-latest`: amd64 natively, arm64 as a
+`--target aarch64-pc-windows-msvc` cross compile — there is no
+public Windows-on-ARM runner. ring (via quinn/rustls) compiles its C
+with the clang-cl the runner image ships, and the job probes for the
+optional VS2022 ARM64 C++ component and installs it when missing.
+
+Every archive carries its configuration files byte-identically to
+the repository — each build job reads them back *out of the archive*
+and diffs them against the checkout (`tar -xzO` for `tar.gz`,
+bsdtar `tar -xO` for `.zip`), and a mismatch fails the job before
+upload. The binaries' `--version` output is asserted against the tag
+on every target that can execute them: both Linux entries, macOS
+arm64 natively, macOS x64 under Rosetta 2 (degrading to a
+file-non-empty check if a future image drops it) and Windows amd64.
+The Windows arm64 binary cannot execute on an x64 runner, so it is
+verified by the file check plus the archive read-back — all six
+targets share the same version-stamping script, which the five
+executable targets prove correct.
+
+The same four non-Linux targets are compiled on every pull request
+by the `smoke-cross` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+(macos-15 × arm64/x64 for ngx + tun, windows-latest × amd64/arm64
+for tun), so a PR that introduces a platform-incompatible dependency
+turns the PR checks red instead of the release run. The smoke job
+uses `cargo build`, not `cargo check`: under a cross `--target`,
+`check` never links, and link-time failures in the C dependencies
+(ring, rusqlite's bundled sqlite, the vendored OpenSSL) would slip
+through to release day.
+
 ## What the workflow does
 
 | Stage | Detail |
@@ -129,12 +202,14 @@ the Docker image's.
 | Assert | The tag must match `v<semver>`, and the version must be one cargo can parse — `v1.2.3-01` (a numeric pre-release identifier with a leading zero) is rejected here rather than in the build. A tag that does not fails the job before anything is compiled. |
 | Assert | The tagged commit must be an ancestor of `origin/main`. |
 | Set | The tag's version is written into `[workspace.package].version` in `Cargo.toml` — the table-scoped rewrite touches that one line and nothing else. The workflow reads the value back and fails if it is not the tag's version. This happens *after* the cargo cache step, so the cache key is computed from the unmodified manifest and stays identical across releases. |
-| Build | `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `make build` also regenerates the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled. |
-| Assert | `./bin/pangolin-ngx --version` and `./bin/pangolin-tun --version` must report the tagged version. A mismatched binary fails the job and is never uploaded. |
-| Publish | The archive and `SHA256SUMS.txt` are attached to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
+| Build | Three jobs, one per build shape, each with its own matrix. `build` (linux/amd64, linux/arm64) runs `make build` on the runner (native deps: `cmake`, `libssl-dev`, `pkg-config`). `build-mac` (macos/arm64, macos/x64) runs `make build-css` plus `cargo build --release -p ngx -p tun --features openssl/vendored`. `build-tun` (windows/amd64, windows/arm64) runs `cargo build --release -p tun`. All three regenerate or embed the minified `assets/app.css` that rust-embed snapshots into the binary, so the admin UI is styled — except the Windows build, whose tun binary serves no UI. |
+| Assert | `--version` must report the tagged version on every binary the runner can execute — both Linux entries and macOS arm64 natively, macOS x64 under Rosetta 2, Windows amd64. A mismatched binary fails the job and is never uploaded. |
+| Publish | The six archives and `SHA256SUMS.txt` are attached to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
 
-The build job runs read-only; only the publishing job holds a
-write-scoped token.
+The build jobs run read-only; only the publishing job holds a
+write-scoped token. A failed platform build fails the publishing
+job's `needs`, so a tag never publishes a release that silently
+misses a platform.
 
-Adding a build target later is one new entry in the workflow's
+Adding a build target later is one new entry in the matching job's
 `matrix.include:` list.

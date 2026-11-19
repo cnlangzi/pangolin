@@ -80,6 +80,123 @@ jobs:
         run: make build
 
   # ----------------------------------------------------------------
+  # Cross-platform compile smoke: macOS (ngx + tun) and Windows
+  # (tun) debug builds. A PR that introduces a platform-incompatible
+  # dependency — e.g. a Unix-only crate — fails here, not on release
+  # day when .github/workflows/release.yml compiles the same targets.
+  #
+  # `cargo build`, not `cargo check`: under a cross `--target`,
+  # `check` never links, so link-time failures in the C dependencies
+  # (ring, rusqlite's bundled sqlite, the vendored OpenSSL) would
+  # slip through to the release workflow.
+  #
+  # Linux needs no smoke entry — the `build` job above already
+  # compiles ngx + tun on ubuntu-latest. Windows compiles only
+  # `tun`: `ngx` is Unix-only (pingora needs Unix sockets,
+  # daemonize, sendfile; `crates/ngx` carries `#[cfg(unix)]` code of
+  # its own), which is also why the release ships no Windows ngx
+  # archive. macOS uses `--features openssl/vendored` to match the
+  # release build exactly (the runner's Homebrew OpenSSL cannot
+  # serve the x64 cross link).
+  # ----------------------------------------------------------------
+  smoke-cross:
+    name: Compile smoke (${{ matrix.slug }})
+    runs-on: ${{ matrix.runs-on }}
+    # A cold vendored-OpenSSL compile is the long pole; everything
+    # else is incremental-friendly. Mirrors the release jobs.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # `cargo-target` empty = native compile on the runner's arch.
+        include:
+          - slug: macos-arm64
+            runs-on: macos-15
+            packages: -p ngx -p tun
+            features: --features openssl/vendored
+            cargo-target: ''
+          - slug: macos-x64
+            runs-on: macos-15
+            packages: -p ngx -p tun
+            features: --features openssl/vendored
+            cargo-target: x86_64-apple-darwin
+          - slug: windows-amd64
+            runs-on: windows-latest
+            packages: -p tun
+            features: ''
+            cargo-target: ''
+          - slug: windows-arm64
+            runs-on: windows-latest
+            packages: -p tun
+            features: ''
+            cargo-target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96
+
+      - name: Add the cross target
+        if: matrix.cargo-target != ''
+        run: rustup target add ${{ matrix.cargo-target }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Same key shape as the release workflow's macOS/Windows
+          # jobs: `cargo-target` keeps the native and cross snapshots
+          # apart (`target/<triple>/` already does so on disk).
+          key: ${{ runner.os }}-${{ matrix.runs-on }}-${{ matrix.cargo-target }}-cargo-smoke-1.96-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.runs-on }}-${{ matrix.cargo-target }}-cargo-smoke-1.96-
+
+      - name: Ensure the MSVC ARM64 build tools are installed
+        if: matrix.cargo-target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        # Same probe as the release workflow's build-tun job: ring
+        # (via quinn/rustls) compiles C for aarch64-pc-windows-msvc
+        # with clang-cl and links with the MSVC ARM64 libraries, an
+        # optional VS2022 component. Install only when missing.
+        run: |
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vswhere = "$installer\vswhere.exe"
+          $have = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if ($have) {
+            Write-Output "MSVC ARM64 build tools already installed at $have"
+          } else {
+            $vsPath = & $vswhere -latest -products * -property installationPath
+            Write-Output "Installing Microsoft.VisualStudio.Component.VC.Tools.ARM64 into $vsPath"
+            & "$installer\vs_installer.exe" modify `
+              --installPath "$vsPath" `
+              --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+              --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0) { throw "vs_installer modify failed with exit code $LASTEXITCODE" }
+          }
+          # ring's build script looks clang-cl / llvm-lib up on PATH;
+          # the runner image ships LLVM here.
+          Write-Output "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
+      - name: cargo build
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          FEATURES: ${{ matrix.features }}
+          CARGO_TARGET: ${{ matrix.cargo-target }}
+        run: |
+          set -euo pipefail
+          # Deliberately unquoted: the matrix values are fixed strings
+          # defined above, and word-splitting is what turns them into
+          # separate cargo arguments. ${CARGO_TARGET:+...} expands to
+          # nothing on the native entries.
+          cargo build $PACKAGES $FEATURES ${CARGO_TARGET:+--target "$CARGO_TARGET"}
+
+  # ----------------------------------------------------------------
   # Unit tests (no integration feature)
   # ----------------------------------------------------------------
   tests:
