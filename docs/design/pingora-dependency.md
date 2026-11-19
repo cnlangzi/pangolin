@@ -125,6 +125,11 @@ the compiler:
   framing is rejected.
 - an HTTP/1 connection is not reused after an incomplete response, and
   HTTP/1.1 downstream request pipelining is now supported upstream.
+- an **absolute-form** request target (RFC 9112 §3.2.2) is accepted
+  and forwarded in origin-form. pingora 0.8 rejected it outright, so
+  there is no previous behaviour to preserve; the gateway's
+  `prepend_base_path` (which prefixes a tunnelled backend's path)
+  rewrites such a target to origin-form with the prefix applied.
 
 The gateway's own source barely moves between pingora releases: the
 surfaces it uses (`ProxyHttp`, `Session`, `RequestHeader` /

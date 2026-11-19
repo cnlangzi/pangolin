@@ -32,7 +32,10 @@ repository = "https://github.com/cnlangzi/pangolin"
 pingora = { version = "0.9", features = ["lb"] }
 # pingora-core is the lower-level crate behind pingora's own HTTP
 # client. Declared without features so the rest of the workspace
-# doesn't pick up unwanted TLS backends.
+# doesn't pick up unwanted TLS backends. `crates/ngx` names the same
+# line directly (it needs the crate for the protocol types and the
+# `pingora-openssl` helpers), so the two have to be bumped together —
+# `tests/src/pingora_dependency.rs` pins that.
 pingora-core = { version = "0.9" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }

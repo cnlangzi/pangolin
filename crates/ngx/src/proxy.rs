@@ -1133,6 +1133,13 @@ fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()
     // left alone (pingora 0.9 dropped `DerefMut` on `RequestHeader`;
     // `set_uri` is its replacement, and it drops the stored target
     // bytes along with it).
+    //
+    // An **absolute-form** target (RFC 9112 §3.2.2) *is* rewritten:
+    // `set_uri` drops the verbatim absolute-form target, and the
+    // request goes upstream in origin-form with the prefix applied.
+    // pingora 0.8 rejected absolute-form targets outright, so there
+    // is no pre-0.9 behaviour to preserve here — see the behaviour
+    // deltas in `docs/design/pingora-dependency.md`.
     if !upstream.raw_path_is_utf8() {
         return Ok(());
     }
@@ -1680,5 +1687,28 @@ mod tests {
             legal_header_value("P-Known-Bot", ""),
             HeaderValue::from_static("")
         );
+    }
+
+    /// A UTF-8 request target gets the backend's path prefix, and
+    /// keeps its query string.
+    #[test]
+    fn prepend_base_path_prefixes_a_utf8_target() {
+        let mut header = RequestHeader::build("GET", b"/api/users?page=2", None).unwrap();
+        prepend_base_path(&mut header, "/apis").unwrap();
+        assert_eq!(header.raw_path(), b"/apis/api/users?page=2");
+    }
+
+    /// A request target that is not valid UTF-8 is forwarded byte for
+    /// byte: the prefix is **not** applied, because applying it would
+    /// replace the original bytes with their lossy rendering.
+    ///
+    /// This is the one branch the pingora 0.9 migration added
+    /// (issue #189) — `set_uri` drops the stored target bytes, so the
+    /// guard has to keep the request alone.
+    #[test]
+    fn prepend_base_path_leaves_a_non_utf8_target_alone() {
+        let mut header = RequestHeader::build("GET", b"/\xff", None).unwrap();
+        prepend_base_path(&mut header, "/apis").unwrap();
+        assert_eq!(header.raw_path(), b"/\xff");
     }
 }

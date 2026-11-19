@@ -48,12 +48,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::{debug, warn};
-// The `pingora` crate re-exports its own `pingora-core` — the fork's
-// copy, reached through a path dependency inside the git checkout.
-// The workspace's `[patch.crates-io]` does not apply to that path
-// dependency, so `pingora_core::…` and `pingora::…` are two distinct
-// crates here. The L4 seam is defined in the *fork's* copy, so this
-// module must name the types through `pingora::`.
+// The `pingora` crate re-exports `pingora-core` (`pub use
+// pingora_core::*`), so `pingora::…` and `pingora_core::…` name the
+// same crate and the same types. The L4 seam is named through
+// `pingora::` because that is the crate the gateway depends on
+// directly — the L4 types it needs (`L4Connect`, `Stream`) are
+// re-exported from there.
 use pingora::connectors::L4Connect;
 use pingora::prelude::*;
 use pingora::protocols::l4::stream::Stream;
