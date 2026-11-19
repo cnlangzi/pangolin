@@ -590,7 +590,10 @@ async fn a_rotated_token_is_the_one_the_tunnel_uses() {
         .send_json(client().post("/api/v1/tun", body.as_bytes()))
         .await;
     assert_eq!(status, 201, "{json}");
-    let old_token = json["token"].as_str().expect("the token is returned").to_string();
+    let old_token = json["token"]
+        .as_str()
+        .expect("the token is returned")
+        .to_string();
 
     let body = serde_json::json!({ "token": "the-new-token" }).to_string();
     let (status, json) = server

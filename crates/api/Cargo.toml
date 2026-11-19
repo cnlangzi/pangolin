@@ -15,6 +15,13 @@ pangolin-core = { path = "../pangolin-core" }
 # The admin UI's form parsers. The API validates through the very same
 # functions the HTML forms use, so a submission the form rejects is
 # rejected by the API too — with the same message (issue #185, R11).
+#
+# The dependency goes the other way round too — the admin crate knows
+# nothing about the API — and the API calls **only** the `parse_*`
+# functions of `admin::routes`. The admin's HTTP handlers are not part
+# of the API's surface: they render HTML, they expect a CSRF token,
+# and they would answer a request that never passed the signature
+# gate.
 admin = { path = "../admin" }
 
 serde = { workspace = true }

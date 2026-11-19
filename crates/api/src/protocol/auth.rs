@@ -236,7 +236,6 @@ impl Authenticator {
         };
         let message = super::canonical::canonical_string(&canonical);
         if !signature::verify(&self.verifying_key, message.as_bytes(), &creds.signature) {
-
             return Err(ApiError::unauthorized(
                 codes::INVALID_SIGNATURE,
                 "the request signature does not verify",
