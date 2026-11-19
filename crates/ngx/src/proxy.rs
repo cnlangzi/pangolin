@@ -1124,6 +1124,18 @@ fn tunnel_peer(app: &Arc<App>, tun_name: &str, target: &BackendTarget) -> Result
 /// tunnel path joined it: the prefix without its trailing slash, then
 /// the request path as it arrived.
 fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()> {
+    // A request target that is not valid UTF-8 is kept verbatim by
+    // pingora and written to the wire byte for byte; the URI only
+    // carries its lossy rendering.  Rewriting the URI would replace
+    // those bytes with the replacement characters, so the prefix is
+    // not applied — the same outcome the pre-0.9 code had, where the
+    // URI was assigned through `DerefMut` while the raw target was
+    // left alone (pingora 0.9 dropped `DerefMut` on `RequestHeader`;
+    // `set_uri` is its replacement, and it drops the stored target
+    // bytes along with it).
+    if !upstream.raw_path_is_utf8() {
+        return Ok(());
+    }
     let prefix = base_path.trim_end_matches('/');
     let path = upstream.uri.path();
     let query = upstream.uri.query();
@@ -1138,8 +1150,10 @@ fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()
             .parse()
             .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?,
     );
-    upstream.uri = http::Uri::from_parts(parts)
-        .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?;
+    upstream.set_uri(
+        http::Uri::from_parts(parts)
+            .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad base path: {e}")))?,
+    );
     Ok(())
 }
 

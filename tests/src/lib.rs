@@ -57,6 +57,14 @@ mod knownbots_dependency;
 #[cfg(test)]
 mod pangolin_tun_dependency;
 
+// Dependency-swap regression tests (pingora moved from the
+// `cnlangzi/pingora` fork to the published crates.io release, issue
+// #189).  Like the dependency tests above, these need neither the
+// `integration` feature nor a real binary: they parse the manifests
+// and the lockfile.
+#[cfg(test)]
+mod pingora_dependency;
+
 // Migration regression tests for the badbots / knownbots upgrade
 // (issue #151).  Like the dependency tests above, these need neither
 // the `integration` feature nor a real binary: they drive refinery
@@ -184,6 +192,13 @@ mod referer_log_e2e;
 
 #[cfg(feature = "integration")]
 mod traffic_e2e;
+
+// Hop-by-hop header handling against the real gateway (issue #189).
+// pingora 0.9 strips the headers a request's own `Connection` header
+// nominates; this pins that, and that the gateway's own headers
+// still reach the backend.
+#[cfg(feature = "integration")]
+mod hop_by_hop_e2e;
 
 #[cfg(feature = "integration")]
 mod ratelimit;

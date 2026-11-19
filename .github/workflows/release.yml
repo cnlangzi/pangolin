@@ -617,7 +617,7 @@ jobs:
   # ----------------------------------------------------------------
   # Build-tun: Windows binaries (tun only — no ngx)
   #
-  # There is no Windows ngx: pingora 0.8 needs Unix-only APIs (Unix
+  # There is no Windows ngx: pingora 0.9 needs Unix-only APIs (Unix
   # sockets, daemonize, sendfile) and `crates/ngx` carries
   # `#[cfg(unix)]` code of its own — that is a port, not a matrix
   # entry. The Windows archive therefore holds exactly

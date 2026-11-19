@@ -20,34 +20,20 @@ rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/cnlangzi/pangolin"
 
-# Use our forked pingora with as_http1_mut() patch for WebSocket upgrades
-# Branch: pangolin — tracks upstream releases, contains our custom API additions
-[patch.crates-io]
-pingora = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-core = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-proxy = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-error = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-http = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-pool = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-runtime = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-timeout = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-lru = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-load-balancing = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-cache = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-pingora-header-serde = { git = "https://github.com/cnlangzi/pingora", branch = "pangolin" }
-
 [workspace.dependencies]
 # Web framework / proxy
-pingora = { version = "0.8", features = ["lb"] }
-# pingora-core is the lower-level crate that the tun side
-# uses for the HTTP client. We patch it from the same
-# fork as pingora (see [patch.crates-io] above). Tun-only;
-# declared without features so the rest of the workspace
+#
+# pingora is consumed from crates.io — the published release, not a
+# fork (issue #189). The fork's only patch (`take_stream()`) became
+# dead code with the tunnel splice rewrite (issues #153 / #154), and
+# a registry dependency is served by the crates.io mirror in
+# `build/cargo-mirror.toml` instead of a build-time git fetch.
+# See docs/design/pingora-dependency.md for the policy.
+pingora = { version = "0.9", features = ["lb"] }
+# pingora-core is the lower-level crate behind pingora's own HTTP
+# client. Declared without features so the rest of the workspace
 # doesn't pick up unwanted TLS backends.
-pingora-core = { version = "0.8" }
-# pingora-http hosts the RequestHeader / ResponseHeader
-# types used by both ngx and the tun-side pingora client.
-pingora-http = { version = "0.8" }
+pingora-core = { version = "0.9" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }

@@ -32,7 +32,7 @@ use crate::common::{parse_toml, read_repo_file};
 ///
 /// The dependency is written as a *multi-line* inline table on
 /// purpose.  The repository's own dependencies are single-line
-/// (`pingora = { version = "0.8", … }`), where the `version` key never
+/// (`pingora = { version = "0.9", … }`), where the `version` key never
 /// starts a line — so a substitution anchored at the start of a line
 /// would miss them and the table scoping would look unnecessary.  A
 /// multi-line table puts the key at the start of a line, which is
@@ -44,7 +44,7 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
-pingora = { version = "0.8", features = ["lb"] }
+pingora = { version = "0.9", features = ["lb"] }
 tokio = {
   version = "1",
   features = ["full"],
@@ -577,7 +577,7 @@ fn release_workflow_rewrite_only_touches_the_workspace_package_version() {
         "the tag's version must land in [workspace.package].version:\n{after}"
     );
     assert!(
-        after.contains("pingora = { version = \"0.8\", features = [\"lb\"] }")
+        after.contains("pingora = { version = \"0.9\", features = [\"lb\"] }")
             && after.contains("  version = \"1\",\n"),
         "the dependency versions must not be rewritten:\n{after}"
     );
@@ -620,7 +620,7 @@ fn release_workflow_rewrite_works_on_the_repository_manifest() {
     );
     // The dependency versions of the real manifest are untouched.
     for expected in [
-        "pingora = { version = \"0.8\", features = [\"lb\"] }",
+        "pingora = { version = \"0.9\", features = [\"lb\"] }",
         "rustls = { version = \"0.23.40\", default-features = false, features = [\"ring\", \"std\"] }",
     ] {
         assert!(
