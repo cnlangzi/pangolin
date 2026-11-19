@@ -33,6 +33,7 @@ async fn render_page(
     app: &Arc<App>,
     csrf: &str,
     error: Option<&str>,
+    dashboard_error: Option<&str>,
 ) -> http::Result<Response<Full<Bytes>>> {
     let cfg = app.system_config.read().await.clone();
     // The provider radio group is generated from the registry, so a
@@ -86,6 +87,7 @@ async fn render_page(
         badbots,
         dashboard: dashboard_view(app).await,
         error,
+        dashboard_error,
         active_nav: "settings",
     };
     ok_html(render_with_assets_and_csrf(
@@ -99,7 +101,7 @@ pub async fn handle_render_settings(
     app: &Arc<App>,
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, None).await
+    render_page(app, csrf, None, None).await
 }
 
 /// The dashboard API's connection settings as the page shows them.
@@ -120,6 +122,7 @@ async fn dashboard_view(app: &Arc<App>) -> DashboardApiView {
             dashboard_port: row.dashboard_port.clamp(0, u16::MAX as i64) as u16,
             dashboard_ip: row.dashboard_ip.unwrap_or_default(),
             listen_addr: app.config.api.listen.clone(),
+            listen_enabled: listener_enabled(&app.config.api.listen),
         },
         None => DashboardApiView {
             instance_id: String::new(),
@@ -128,8 +131,17 @@ async fn dashboard_view(app: &Arc<App>) -> DashboardApiView {
             dashboard_port: 0,
             dashboard_ip: String::new(),
             listen_addr: app.config.api.listen.clone(),
+            listen_enabled: listener_enabled(&app.config.api.listen),
         },
     }
+}
+
+/// Whether the API's listener runs at all.
+///
+/// `api.listen: ":0"` switches it off — the card has to say so,
+/// because turning the API on then changes nothing.
+fn listener_enabled(listen: &str) -> bool {
+    !listen.is_empty() && listen != ":0"
 }
 
 /// `POST /settings/dashboard` — the dashboard API's connection
@@ -150,8 +162,8 @@ pub async fn handle_update_dashboard(
         let db = app.db.lock().await;
         pangolin_core::db::get_api_config(&db).unwrap_or(None)
     };
-    let Some(mut row) = row else {
-        return render_with_error(
+    let Some(row) = row else {
+        return render_with_dashboard_error(
             app,
             csrf,
             "The dashboard API has not been set up on this gateway yet — restart it once.",
@@ -161,41 +173,50 @@ pub async fn handle_update_dashboard(
 
     // The switch. The form pairs the checkbox with a hidden "false",
     // so the field is always present and its value decides.
-    row.enabled = super::helpers::param_bool(body, "dashboard_enabled", false);
+    let enabled = super::helpers::param_bool(body, "dashboard_enabled", false);
 
-    // The token: an empty field keeps the stored one.
-    if let Some(token) = params
+    // The token: an empty field keeps the stored one, the "remove"
+    // checkbox clears it.
+    let token_hash = if super::helpers::param_bool(body, "dashboard_token_clear", false) {
+        String::new()
+    } else if let Some(token) = params
         .get("dashboard_token")
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
     {
-        row.token_hash = pangolin_core::db::sha256_hex(token);
-    }
+        pangolin_core::db::sha256_hex(token)
+    } else {
+        row.token_hash.clone()
+    };
 
     // The dashboard's port.
-    if let Some(port) = params
+    let dashboard_port = match params
         .get("dashboard_port")
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
     {
-        match port.parse::<u16>() {
-            Ok(p) => row.dashboard_port = p as i64,
+        Some(port) => match port.parse::<u16>() {
+            Ok(p) => p as i64,
             Err(_) => {
-                return render_with_error(
+                return render_with_dashboard_error(
                     app,
                     csrf,
                     "The dashboard port must be a number between 0 and 65535.",
                 )
                 .await;
             }
-        }
-    }
+        },
+        None => row.dashboard_port,
+    };
 
-    row.updated_at = chrono::Utc::now().to_rfc3339();
     {
         let db = app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_api_config(&db, &row) {
-            return render_with_error(
+        // Only the three columns this form owns are written: the
+        // instance id and the learned address belong to other writers.
+        if let Err(e) =
+            pangolin_core::db::update_api_settings(&db, enabled, &token_hash, dashboard_port)
+        {
+            return render_with_dashboard_error(
                 app,
                 csrf,
                 &format!("Writing the dashboard settings failed: {e}"),
@@ -223,7 +244,7 @@ pub async fn handle_update_settings(
             // without re-cloning the SystemConfig.
             let cfg: SystemConfig = parsed;
             if let Err(msg) = save_system_config(app, cfg).await {
-                return render_page(app, csrf, Some(&msg)).await;
+                return render_page(app, csrf, Some(&msg), None).await;
             }
             // Success: PRG (Post-Redirect-Get) so a refresh
             // doesn't re-submit the form.
@@ -233,7 +254,7 @@ pub async fn handle_update_settings(
                 .body(Full::new(Bytes::new()))
                 .expect("302 redirect response builder should not fail"))
         }
-        Err(msg) => render_page(app, csrf, Some(&msg)).await,
+        Err(msg) => render_page(app, csrf, Some(&msg), None).await,
     }
 }
 
@@ -251,5 +272,19 @@ pub async fn render_with_error(
     csrf: &str,
     error: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
-    render_page(app, csrf, Some(error)).await
+    render_page(app, csrf, Some(error), None).await
+}
+
+/// Render the settings page with an error message in the **dashboard**
+/// card.
+///
+/// The dashboard form has a slot of its own: a message about the
+/// bearer token belongs next to the token field, not in a card the
+/// operator did not submit.
+pub async fn render_with_dashboard_error(
+    app: &Arc<App>,
+    csrf: &str,
+    error: &str,
+) -> http::Result<Response<Full<Bytes>>> {
+    render_page(app, csrf, None, Some(error)).await
 }

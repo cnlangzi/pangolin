@@ -113,7 +113,14 @@ pub async fn handle_create(app: &Arc<App>, body: &[u8], csrf: &str) -> http::Res
                 FormContext {
                     site: Some(site_prefill(&params, &name)),
                     rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
-                    rate_limit_bots: parsed.rate_limit_bots.clone().unwrap_or_default(),
+                    // A submission that carried no list leaves the
+                    // stored one alone — the re-render has to show
+                    // it, or the operator would uncheck every box by
+                    // accident.
+                    rate_limit_bots: parsed
+                        .rate_limit_bots
+                        .clone()
+                        .unwrap_or_else(|| stored_bots.clone()),
                     provider: Some(&parsed.provider),
                 },
                 &format!("Database error: {}", e),
@@ -260,7 +267,14 @@ pub async fn handle_update(
                 FormContext {
                     site: Some(prefill),
                     rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
-                    rate_limit_bots: parsed.rate_limit_bots.clone().unwrap_or_default(),
+                    // A submission that carried no list leaves the
+                    // stored one alone — the re-render has to show
+                    // it, or the operator would uncheck every box by
+                    // accident.
+                    rate_limit_bots: parsed
+                        .rate_limit_bots
+                        .clone()
+                        .unwrap_or_else(|| stored_bots.clone()),
                     provider: Some(&parsed.provider),
                 },
                 &format!("Database error: {}", e),

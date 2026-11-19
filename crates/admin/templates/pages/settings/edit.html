@@ -313,6 +313,14 @@
   <form method="POST" action="/settings/dashboard" class="card p-6 mt-6 space-y-6" data-testid="dashboard-form">
     {% include "components/_csrf.html" %}
 
+    {% if let Some(e) = dashboard_error %}
+    <div class="alert-error text-sm" role="alert" data-testid="dashboard-error">
+      <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      <span>{{ e }}</span>
+    </div>
+    {% endif %}
+
     <div>
       <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-1">Dashboard</h2>
       <p class="text-xs text-slate-500 dark:text-slate-400">
@@ -327,6 +335,16 @@
         (<span class="font-mono">{{ dashboard.listen_addr }}</span>) — the token and the switch
         live in the <strong>database</strong>, so a change takes effect immediately, without a
         restart.
+        {% if dashboard.listen_enabled %}
+        The listener is <strong>plain HTTP</strong>: the token and the request body cross the
+        network in clear text. Put the port behind the dashboard's TLS-terminating proxy, or
+        behind a firewall that limits it to the dashboard's address.
+        {% else %}
+        The listen address is <code class="font-mono">":0"</code> — <strong>the API does not
+        listen at all</strong>, so turning the switch on below changes nothing. Set
+        <code class="font-mono">api.listen</code> in <code class="font-mono">ngx.yml</code> to
+        an address and restart the gateway.
+        {% endif %}
       </p>
     </div>
 
@@ -368,8 +386,7 @@
           <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Accept dashboard calls</div>
           <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
             While this is off, every call to the API is answered with
-            <code class="font-mono">403 api_disabled</code> — the listener still runs, so turning
-            the API on needs no restart.
+            <code class="font-mono">403 api_disabled</code>{% if dashboard.listen_enabled %} — the listener still runs, so turning the API on needs no restart{% endif %}.
           </div>
         </div>
       </label>
@@ -380,6 +397,11 @@
       <input type="password" name="dashboard_token" id="dashboard-token" autocomplete="off"
         placeholder="{% if dashboard.has_token %}configured — type to replace{% else %}not configured{% endif %}"
         class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      <label class="flex items-center gap-2 mt-2 text-xs text-slate-500 dark:text-slate-400">
+        <input type="checkbox" name="dashboard_token_clear" value="true"
+          class="h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        Remove the stored token
+      </label>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
         The token the dashboard authenticates with. It is <strong>write-only</strong>: the node
         keeps only its SHA-256 hash, so the token cannot be read back — leave the field empty to

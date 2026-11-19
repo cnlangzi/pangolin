@@ -75,6 +75,11 @@ pub struct SettingsTemplate<'a> {
     /// `None` on the initial GET and on successful POST (which 302s
     /// back to this URL).
     pub error: Option<&'a str>,
+    /// The error of the **dashboard** card, when its own form was
+    /// rejected. The first card's error is `error` — a page with
+    /// three forms needs one slot per form, or the message ends up
+    /// in a card the operator did not submit.
+    pub dashboard_error: Option<&'a str>,
     /// Active-nav tag, always `"settings"`.
     pub active_nav: &'a str,
 }
@@ -120,4 +125,7 @@ pub struct DashboardApiView {
     pub dashboard_ip: String,
     /// The address the API itself listens on.
     pub listen_addr: String,
+    /// Whether the API listens at all — `api.listen: ":0"` switches
+    /// the listener off.
+    pub listen_enabled: bool,
 }

@@ -175,6 +175,10 @@ pub async fn handle_update(
 
     if let Some(new_token) = parsed.token {
         tun.token = Some(new_token);
+        // The stored digest belongs to the *old* token: `upsert_tun`
+        // prefers it over the cleartext one, so it has to be dropped
+        // for the rotation to take effect.
+        tun.token_hash = None;
     }
     tun.expires_at = parsed.expires_at;
     tun.enabled = parsed.enabled;
