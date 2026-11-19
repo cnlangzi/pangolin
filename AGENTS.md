@@ -150,6 +150,46 @@ into the binary by `rust-embed` (`crates/admin/src/assets.rs`,
   become necessary, wire `esbuild` into `dev-ui` (watch mode) so dev
   keeps working without re-running a manual build step.
 
+## The one-line installer is POSIX `sh`
+
+`install.sh` in the repository root is the operator's first contact
+with a release — `curl -fsSL …/install.sh | sudo sh` has to produce a
+gateway that actually runs.  It is published as a release asset and
+copied byte for byte, so **the file in the repository is the file
+everybody runs**; there is no second copy to keep in sync.
+
+Three rules, all of them load-bearing:
+
+- **POSIX `sh`, not bash.**  macOS ships bash 3.2 and Linux bash 5.x,
+  and a bashism breaks the installer on one of the two platforms it
+  exists to serve.  `sh -n install.sh` has to pass, and `[[`, `source`,
+  arrays, `${var,,}`, `$RANDOM`, `mapfile` and `readarray` must not
+  appear in it.  The regression test enforces this.
+- **Verify before writing.**  Every download — the archive, the
+  checksum file and the two units — is verified against
+  `SHA256SUMS.txt` *before* the install directory is touched.  A
+  failed checksum must leave nothing behind, so a failed install can
+  simply be run again.
+- **Never overwrite the operator's configuration.**  An existing
+  `ngx.yml` / `tun.yml` is kept byte for byte; an existing binary is
+  renamed to `<name>.bak` first — the same rolling-backup convention
+  the Ansible role uses.
+
+The script's knobs are environment variables (`PANGOLIN_VERSION`,
+`PANGOLIN_INSTALL_DIR`, `PANGOLIN_BASE_URL`, `PANGOLIN_LATEST_URL`,
+`PANGOLIN_NO_SERVICE`, `PANGOLIN_SYSTEMD_DIR`), so the regression
+test in `tests/src/install_script.rs` can drive the whole thing
+against a local HTTP server that impersonates a GitHub Release.
+`PANGOLIN_SYSTEMD_DIR` exists for that test — it is where the units
+are installed, `/etc/systemd/system` in production.
+
+Changing the script means changing the release workflow too: the
+publishing job copies `install.sh` and the two units out of the
+repository into `dist/`, and `SHA256SUMS.txt` covers all three.  The
+same test file asserts that the units the release publishes are the
+repository's own files — the release copies them, it does not write a
+second copy that could drift apart.
+
 ## Local development: targeted tests, not the full e2e suite
 
 `make test-e2e` builds release binaries and runs the **entire**

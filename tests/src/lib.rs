@@ -65,6 +65,16 @@ mod pangolin_tun_dependency;
 #[cfg(test)]
 mod badbots_migrations;
 
+// One-line installer regression tests (issue #175).  Like the mirror
+// tests above, these need neither the `integration` feature nor a
+// real binary: they drive the repository's `install.sh` against a
+// local HTTP server that impersonates a GitHub Release.
+//
+// Unix-only: the assertions are about file modes and about a POSIX
+// shell script.
+#[cfg(all(test, unix))]
+mod install_script;
+
 #[cfg(feature = "integration")]
 mod backend;
 

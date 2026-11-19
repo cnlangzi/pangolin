@@ -33,7 +33,41 @@ make start-ngx
 
 网关会读当前目录的 `./ngx.yml`，监听 `8000` / `8443`，管理界面在 `http://127.0.0.1:9081/`（默认账号密码都是 `admin`）。**上生产之前请先看[上线前必改](#上线前必改)。**
 
-### 下载发布归档
+### 一键安装
+
+一条命令装好网关（Linux x86_64 / arm64、macOS Apple Silicon / Intel）：
+
+```bash
+curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh
+```
+
+脚本做的事，按顺序：
+
+1. 识别平台（`uname -s` / `uname -m`），映射到发布归档的后缀；
+2. 解析版本 —— 默认取**最新稳定版**（跟随 `releases/latest` 的跳转地址），`PANGOLIN_VERSION=v0.3.0` 可以钉死版本；
+3. 下载归档、`SHA256SUMS.txt` 和两个 systemd unit，**逐个校验摘要**；
+4. 校验通过之后才落盘：解包到 `/usr/local/pangolin`，二进制 `0755`、配置 `0600`，建 `certs/`、`logs/bots/`、`logs/referers/`；
+5. 改写 `ngx.yml` 里的五个生产配置（端口、管理密码、ACME 邮箱、日志级别）；
+6. Linux 上建 `pangolin` 系统用户、装 systemd unit、启动网关。
+
+摘要对不上就在**动文件系统之前**退出，安装目录一个字节都不会留下；重跑脚本是安全的 —— 已有的 `ngx.yml` / `tun.yml` 原样保留，已有的二进制先改名成 `.bak` 再换新的。
+
+装完 `/usr/local/pangolin` 里就是能跑的网关：Linux 上 `pangolin-ngx` 已经作为 systemd 服务起来，监听 `80` / `443`；管理界面在 `http://<host>:9081/`（默认账号 `admin`、密码 `pangolin`）。
+
+脚本的环境变量：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `PANGOLIN_VERSION` | 空（= 最新稳定版） | 钉死目标版本，`0.3.0` 和 `v0.3.0` 都认 |
+| `PANGOLIN_INSTALL_DIR` | `/usr/local/pangolin` | 安装目录 |
+| `PANGOLIN_BASE_URL` | `https://github.com/cnlangzi/pangolin/releases/download` | 下载基址 |
+| `PANGOLIN_LATEST_URL` | `https://github.com/cnlangzi/pangolin/releases/latest` | 最新版解析地址 |
+| `PANGOLIN_NO_SERVICE` | 未设置 | 设为 `1` 时跳过建用户、装 unit、`systemctl` 全套 |
+| `PANGOLIN_SYSTEMD_DIR` | `/etc/systemd/system` | unit 装到哪儿 |
+
+macOS 上没有 systemd：脚本只落盘、改配置，然后打印启动命令；`80` / `443` 是特权端口，要么用 root 跑，要么把 `addr.http` / `addr.https` 改回 `8000` / `8443`。
+
+### 手动安装
 
 每次发布会在 GitHub Releases 上按平台放一组归档和一份校验和。Linux（`linux_amd64` / `linux_arm64`）和 macOS（`macos_arm64` / `macos_x64`）是 `.tar.gz`，里面有四个文件：
 
@@ -74,19 +108,31 @@ cd /usr/local/pangolin
 
 ## 上线前必改
 
-发布归档里的配置是为了让 `make start-ngx` 在开发机上不用提权就能跑起来的。**它不能原样上生产。** 逐条改，每条都有原因：
+发布归档里的配置是为了让 `make start-ngx` 在开发机上不用提权就能跑起来的。**它不能原样上生产。** 一键安装已经替你做掉了一部分，剩下的逐条改 —— 每条都有原因：
 
-- [ ] **`addr.http` / `addr.https` 改成 `:80` / `:443`。** 归档里是 `8000` / `8443`。80 和 443 是特权端口，需要 root 或者 `CAP_NET_BIND_SERVICE` —— 仓库里打包好的 systemd unit 已经授予了后者，非特权用户也能绑。
-- [ ] **`admin.password` 换掉。** 归档里是 `admin`。网关**不会**对这个默认值发任何告警，日志里也看不出来。
+### 一键安装已经替你做了
+
+（手动安装归档的话，下面这几条要自己改。）
+
+- [x] **`addr.http` / `addr.https` → `0.0.0.0:80` / `0.0.0.0:443`。** 归档里是 `8000` / `8443`（开发默认值）。80 和 443 是特权端口，需要 root 或者 `CAP_NET_BIND_SERVICE` —— 仓库里打包好的 systemd unit 已经授予了后者，非特权用户也能绑。
+- [x] **`admin.password` → `pangolin`。** 归档里是 `admin`。**但 `pangolin` 是公开值，还是得换 —— 见下面。**
+- [x] **`acme.email` → `pangolin@<主机名>.local`。** 归档里是空字符串。**但这不是真邮箱，还是得换 —— 见下面。**
+- [x] **`log.level` → `info`。** 归档里是 `debug`。嘈杂的部署可以再降到 `warn`。
+- [x] **落盘权限**：二进制 `0755`，`ngx.yml` / `tun.yml` `0600`（里面是管理密码和 bearer token）。
+- [x] **运行目录**：`certs/`、`logs/bots/`、`logs/referers/`。
+- [x] **`pangolin` 系统用户、systemd unit、启动网关**（Linux；macOS 上没有 systemd，改为打印启动命令）。
+
+### 仍然要手工做的
+
+- [ ] **`admin.password` 换掉。** 脚本写的是 `pangolin`，这是公开值。网关**不会**对这个默认值发任何告警，日志里也看不出来。
 - [ ] **`admin.addr` 收窄。** 归档里是 `0.0.0.0:9081`，等于把管理界面暴露在整个网络上。改成 `127.0.0.1:9081`（走 SSH 端口转发访问）或者放到只对内网开放的地址上。
-- [ ] **`acme.email` 填上。** 这是 ACME 注册时的联系邮箱，证书到期通知发到这里。归档里是空字符串。
+- [ ] **`acme.email` 填真的邮箱。** 脚本写的是 `pangolin@<主机名>.local` —— 这只是个占位，不是能收信的地址。
 - [ ] **`acme.cert_dir`、`log.file`、`log.bot.dir`、`log.referer.dir` 全部改成绝对路径。** 归档里是相对路径（`./certs`、`./logs/bots`、`./logs/referers`），跟着**工作目录**走。systemd unit 的工作目录是 `/usr/local/pangolin`，日志会散落在你没想到的地方。`log.file` 默认是空字符串（只写 stderr，不落盘），要留文件的话给一个绝对路径，例如 `/var/log/pangolin/pangolin.log`。
-- [ ] **`log.level` 调低。** 归档里是 `debug`。生产用 `info`，嘈杂的部署用 `warn`。
 - [ ] **`tunnel.addr` 改成对外地址，并且 UDP 9001 必须可达。** QUIC 和 WebSocket/TCP 回退**共用同一个端口号** —— 一个走 UDP、一个走 TCP。只放行 TCP 的防火墙规则会让 QUIC 握手失败，隧道被迫退回到未加密的回退路径上。
 - [ ] **`tun.yml` 的 `server`、`token`、`name` 全部换掉。** 归档里分别是 `127.0.0.1:9001`、`dev`、`local`。`server` 要指向网关的 `tunnel.addr`；`token` 必须是一个真 token；`name` 是这个隧道节点的名字。
-- [ ] **在管理界面里创建对应的 `(name, token)` 行。** 网关**不会**自动注册隧道节点 —— 握手时拿不到匹配的行就直接拒绝。这一行必须在 tun 连上来之前就建好。
+- [ ] **在管理界面里创建对应的 `(name, token)` 行。** 网关**不会**自动注册隧道节点 —— 握手时拿不到匹配的行就直接拒绝。这一行必须在 tun 连上来之前就建好。建好之后 `systemctl enable --now pangolin-tun` 才起得来。
 
-另外：`ngx.yml` 和 `tun.yml` 里都有密钥，权限设成 `0600`；归档里已经是这个权限了。
+另外：`ngx.yml` 和 `tun.yml` 里都有密钥，权限保持 `0600`；一键安装和归档都已经是这个权限了。
 
 ## 运维
 

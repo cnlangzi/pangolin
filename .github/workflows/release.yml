@@ -935,10 +935,32 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The release carries three assets that are not build outputs:
+      # the one-line installer and the two systemd units.  The units
+      # are the repository's own files — `deploy/playbooks/roles/*/files/`
+      # is the single source and the release copies them, so the two
+      # cannot drift apart.
+      #
+      # The checkout runs BEFORE the artefact download: `actions/checkout`
+      # cleans the workspace by default, and a `git clean` after the
+      # download would throw the archives away.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
       - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
+
+      - name: Stage the installer and the systemd units
+        run: |
+          set -euo pipefail
+          install -m 0755 install.sh dist/install.sh
+          install -m 0644 deploy/playbooks/roles/ngx/files/ngx.service dist/pangolin-ngx.service
+          install -m 0644 deploy/playbooks/roles/tun/files/tun.service dist/pangolin-tun.service
+          ls -l dist
 
       - name: Generate checksums
         working-directory: dist
@@ -947,7 +969,8 @@ jobs:
           # Running inside dist/ is what keeps the recorded paths
           # relative, so `sha256sum -c SHA256SUMS.txt` works from the
           # directory holding the archives.
-          sha256sum pangolin_*.tar.gz pangolin_*.zip > SHA256SUMS.txt
+          sha256sum pangolin_*.tar.gz pangolin_*.zip \
+            install.sh pangolin-ngx.service pangolin-tun.service > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish release
@@ -959,4 +982,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/install.sh
+            dist/pangolin-ngx.service
+            dist/pangolin-tun.service
             dist/SHA256SUMS.txt

@@ -53,7 +53,23 @@ It is not another proxy that only forwards requests: before forwarding, it recog
 
 ## Running in 30 seconds
 
-Download a release archive — the fastest path (`v0.3.0` below is an example; substitute the version you want):
+One command installs the gateway (Linux x86_64 / arm64, macOS Apple Silicon / Intel):
+
+```bash
+curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install.sh | sudo sh
+```
+
+When it finishes, the machine is a gateway that can face the internet:
+
+- the binaries are in `/usr/local/pangolin` (`0755`), the configuration next to them (`0600`);
+- on Linux `pangolin-ngx` runs as a systemd service, listening on `80` / `443`;
+- the admin UI is at `http://<host>:9081/`, with the default user `admin` and the password `pangolin`.
+
+The script works out the platform, downloads the matching release archive, verifies it against the release's `SHA256SUMS.txt`, rewrites the configuration for production (ports, admin password, ACME address, log level), creates the `pangolin` system user, installs the systemd units and starts the gateway. **A failed checksum leaves nothing behind** — the install directory is not touched until every download has been verified.
+
+**Two things have to change afterwards**: the admin password (the shipped `pangolin` is public) and the admin interface's listen address (`0.0.0.0:9081` exposes it to the whole network). The full checklist is in [getting-started.en-US.md](./docs/getting-started.en-US.md).
+
+Prefer to install by hand (or you are on Windows with the `.zip`)? `v0.3.0` below is an example; substitute the version you want:
 
 ```bash
 VERSION=v0.3.0
