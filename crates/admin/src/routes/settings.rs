@@ -24,7 +24,7 @@ use super::provider::{provider_range_statuses, total_guard_rejections};
 use super::system::{parse_system_config_form_merged, save_system_config};
 use crate::render_with_assets_and_csrf;
 use crate::templates::SettingsTemplate;
-use crate::templates::settings::{BadbotsSettingsView, ProviderOption};
+use crate::templates::settings::{BadbotsSettingsView, DashboardApiView, ProviderOption};
 
 /// Render the settings page. `error` is `None` on the initial
 /// GET and on a successful POST (which 302s back here); it's
@@ -84,6 +84,7 @@ async fn render_page(
         guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
         badbots,
+        dashboard: dashboard_view(app).await,
         error,
         active_nav: "settings",
     };
@@ -99,6 +100,114 @@ pub async fn handle_render_settings(
     csrf: &str,
 ) -> http::Result<Response<Full<Bytes>>> {
     render_page(app, csrf, None).await
+}
+
+/// The dashboard API's connection settings as the page shows them.
+///
+/// A gateway that has never been set up has no row yet — the card
+/// then shows the empty state and the operator has to restart the
+/// gateway once (the row is seeded on the first boot).
+async fn dashboard_view(app: &Arc<App>) -> DashboardApiView {
+    let row = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_api_config(&db).unwrap_or(None)
+    };
+    match row {
+        Some(row) => DashboardApiView {
+            instance_id: row.instance_id,
+            enabled: row.enabled,
+            has_token: !row.token_hash.is_empty(),
+            dashboard_port: row.dashboard_port.clamp(0, u16::MAX as i64) as u16,
+            dashboard_ip: row.dashboard_ip.unwrap_or_default(),
+            listen_addr: app.config.api.listen.clone(),
+        },
+        None => DashboardApiView {
+            instance_id: String::new(),
+            enabled: false,
+            has_token: false,
+            dashboard_port: 0,
+            dashboard_ip: String::new(),
+            listen_addr: app.config.api.listen.clone(),
+        },
+    }
+}
+
+/// `POST /settings/dashboard` — the dashboard API's connection
+/// settings.
+///
+/// The bearer token is **write-only**: the field is empty on every
+/// render, and a submission that leaves it empty keeps the stored
+/// token. The node stores only the token's SHA-256 hash, so the
+/// token cannot be read back — not by the operator, not by the API.
+pub async fn handle_update_dashboard(
+    app: &Arc<App>,
+    csrf: &str,
+    body: &[u8],
+) -> http::Result<Response<Full<Bytes>>> {
+    let params = super::helpers::parse_form(body);
+
+    let row = {
+        let db = app.db.lock().await;
+        pangolin_core::db::get_api_config(&db).unwrap_or(None)
+    };
+    let Some(mut row) = row else {
+        return render_with_error(
+            app,
+            csrf,
+            "The dashboard API has not been set up on this gateway yet — restart it once.",
+        )
+        .await;
+    };
+
+    // The switch. The form pairs the checkbox with a hidden "false",
+    // so the field is always present and its value decides.
+    row.enabled = super::helpers::param_bool(body, "dashboard_enabled", false);
+
+    // The token: an empty field keeps the stored one.
+    if let Some(token) = params
+        .get("dashboard_token")
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    {
+        row.token_hash = pangolin_core::db::sha256_hex(token);
+    }
+
+    // The dashboard's port.
+    if let Some(port) = params
+        .get("dashboard_port")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+    {
+        match port.parse::<u16>() {
+            Ok(p) => row.dashboard_port = p as i64,
+            Err(_) => {
+                return render_with_error(
+                    app,
+                    csrf,
+                    "The dashboard port must be a number between 0 and 65535.",
+                )
+                .await;
+            }
+        }
+    }
+
+    row.updated_at = chrono::Utc::now().to_rfc3339();
+    {
+        let db = app.db.lock().await;
+        if let Err(e) = pangolin_core::db::upsert_api_config(&db, &row) {
+            return render_with_error(
+                app,
+                csrf,
+                &format!("Writing the dashboard settings failed: {e}"),
+            )
+            .await;
+        }
+    }
+    Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(http::header::LOCATION, "/settings")
+        .body(Full::new(Bytes::new()))
+        .expect("302 redirect response builder should not fail"))
 }
 
 /// `POST /settings` — validate, persist, redirect; or re-render

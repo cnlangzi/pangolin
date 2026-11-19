@@ -2,7 +2,7 @@
 
 use rand::Rng;
 /// Generate a random 32-byte hex token (64 hex characters).
-pub(super) fn generate_token() -> Result<String, String> {
+pub fn generate_token() -> Result<String, String> {
     let mut buf = [0u8; 32];
     rand::rngs::OsRng.fill(&mut buf);
     Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())

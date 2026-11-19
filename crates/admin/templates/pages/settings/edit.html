@@ -306,5 +306,97 @@
     </div>
   </form>
 
+  {# The dashboard API's connection settings (issue #185). A separate
+     form: the token and the switch live in the database, not in
+     `ngx.yml`, and a failure to save them must not block the other
+     cards. #}
+  <form method="POST" action="/settings/dashboard" class="card p-6 mt-6 space-y-6" data-testid="dashboard-form">
+    {% include "components/_csrf.html" %}
+
+    <div>
+      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-1">Dashboard</h2>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        The management API is the second interface of this gateway: a
+        JSON API under <code class="font-mono">/api/v1/</code> that a central dashboard calls to
+        manage this node. It listens on its own port, authenticates every call with a bearer
+        token, a timestamp, a nonce and an Ed25519 signature, and never renders HTML.
+      </p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
+        The API is <strong>switched off</strong> until you turn it on here. The listen address
+        is the <code class="font-mono">api.listen</code> key of <code class="font-mono">ngx.yml</code>
+        (<span class="font-mono">{{ dashboard.listen_addr }}</span>) — the token and the switch
+        live in the <strong>database</strong>, so a change takes effect immediately, without a
+        restart.
+      </p>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-instance-id">Instance id</label>
+        <input type="text" id="dashboard-instance-id" value="{{ dashboard.instance_id }}"
+          readonly spellcheck="false"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          How the dashboard knows this node. It is generated once and never changes.
+        </p>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-port">Dashboard port</label>
+        <input type="number" name="dashboard_port" id="dashboard-port" min="0" max="65535"
+          value="{{ dashboard.dashboard_port }}"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          The port the dashboard is reachable on, as this node sees it.
+          {% if !dashboard.dashboard_ip.is_empty() %}
+          Its address was learned from the calls it made:
+          <span class="font-mono">{{ dashboard.dashboard_ip }}</span>.
+          {% else %}
+          Its address is learned from the calls it makes.
+          {% endif %}
+        </p>
+      </div>
+    </div>
+
+    <div>
+      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
+        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
+           form always carries an explicit value. #}
+        <input type="hidden" name="dashboard_enabled" value="false">
+        <input type="checkbox" name="dashboard_enabled" value="true" {% if dashboard.enabled %}checked{% endif %}
+          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
+        <div>
+          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">Accept dashboard calls</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            While this is off, every call to the API is answered with
+            <code class="font-mono">403 api_disabled</code> — the listener still runs, so turning
+            the API on needs no restart.
+          </div>
+        </div>
+      </label>
+    </div>
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-token">Bearer token</label>
+      <input type="password" name="dashboard_token" id="dashboard-token" autocomplete="off"
+        placeholder="{% if dashboard.has_token %}configured — type to replace{% else %}not configured{% endif %}"
+        class="w-full rounded-lg px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        The token the dashboard authenticates with. It is <strong>write-only</strong>: the node
+        keeps only its SHA-256 hash, so the token cannot be read back — leave the field empty to
+        keep the stored one.
+      </p>
+    </div>
+
+    <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
+      <div class="text-xs text-slate-500 dark:text-slate-400">
+        The API also needs the dashboard's Ed25519 public key, which is compiled into the
+        binary. Changing it means a new release.
+      </div>
+      <div class="flex gap-2">
+        <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">Save</button>
+      </div>
+    </div>
+  </form>
+
 </main>
 {% endblock %}

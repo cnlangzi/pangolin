@@ -133,50 +133,100 @@ pub async fn api_blocked(app: &Arc<App>) -> http::Result<Resp> {
     ok_html(html)
 }
 
-/// `POST /ratelimit/rules` — add an IP rule.
+/// Why an IP-rule form was rejected.
 ///
-/// Form POST (not HTMX): the rule table is re-read from the database
-/// on the next poll, so a redirect back to the page is enough.
-pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
-    let params = parse_form(body);
+/// The variants mirror the `?error=` codes the HTML form redirects
+/// with, so both surfaces answer with the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpRuleFormError {
+    /// The kind is neither `whitelist` nor `blacklist`.
+    InvalidKind,
+    /// The address / range could not be parsed.
+    InvalidCidr,
+    /// The scope is neither `global` nor an existing site.
+    UnknownScope,
+}
+
+impl IpRuleFormError {
+    /// The `?error=` code the HTML form redirects with.
+    pub fn code(self) -> &'static str {
+        match self {
+            IpRuleFormError::InvalidKind => "invalid-kind",
+            IpRuleFormError::InvalidCidr => "invalid-cidr",
+            IpRuleFormError::UnknownScope => "unknown-scope",
+        }
+    }
+
+    /// The message the operator sees.
+    pub fn message(self) -> &'static str {
+        add_rule_errors(self.code())
+    }
+}
+
+/// Parse and validate an IP-rule form.
+///
+/// The same parser serves the HTML form and the dashboard-facing JSON
+/// API (issue #185) — a submission the form rejects is rejected here
+/// too, with the same reason.
+///
+/// * `scope_exists` — whether a scope names an existing site; the
+///   global scope always exists.
+pub fn parse_ip_rule_form(
+    params: &HashMap<String, String>,
+    scope_exists: &dyn Fn(&str) -> bool,
+) -> Result<IpRule, IpRuleFormError> {
     let scope = params
         .get("scope")
         .cloned()
         .unwrap_or_else(|| GLOBAL_SCOPE.to_string());
     let Some(kind) = params.get("kind").and_then(|k| RuleKind::parse(k)) else {
-        return Ok(redirect("/ratelimit?error=invalid-kind"));
+        return Err(IpRuleFormError::InvalidKind);
     };
     let cidr = params.get("cidr").cloned().unwrap_or_default();
     let note = params.get("note").cloned().filter(|n| !n.is_empty());
 
     // Normalise the address / range and reject a malformed value.
-    let normalized = match normalize_cidr(&cidr) {
-        Ok(c) => c,
-        Err(_) => return Ok(redirect("/ratelimit?error=invalid-cidr")),
-    };
+    let normalized = normalize_cidr(&cidr).map_err(|_| IpRuleFormError::InvalidCidr)?;
 
     // The scope must be "global" or the name of an existing site — a
     // rule scoped to a site that does not exist would never apply.
-    {
-        let db = app.db.lock().await;
-        let known = scope == GLOBAL_SCOPE
-            || pangolin_core::db::list_sites(&db)
-                .unwrap_or_default()
-                .iter()
-                .any(|s| s.name == scope);
-        if !known {
-            log::warn!("ratelimit: ignoring ip rule for unknown scope {scope:?}");
-            return Ok(redirect("/ratelimit?error=unknown-scope"));
-        }
+    if scope != GLOBAL_SCOPE && !scope_exists(&scope) {
+        return Err(IpRuleFormError::UnknownScope);
     }
 
-    let rule = IpRule {
+    Ok(IpRule {
         id: rule_id(&scope, kind, &normalized),
         scope,
         kind,
         cidr: normalized,
         note,
         created_at: chrono::Utc::now(),
+    })
+}
+
+/// `POST /ratelimit/rules` — add an IP rule.
+///
+/// Form POST (not HTMX): the rule table is re-read from the database
+/// on the next poll, so a redirect back to the page is enough.
+pub async fn handle_add_rule(app: &Arc<App>, body: &[u8], _csrf: &str) -> http::Result<Resp> {
+    let params = parse_form(body);
+
+    let rule = {
+        let db = app.db.lock().await;
+        let known_sites = pangolin_core::db::list_sites(&db)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>();
+        parse_ip_rule_form(&params, &|scope| known_sites.iter().any(|s| s == scope))
+    };
+
+    let rule = match rule {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("ratelimit: ignoring ip rule submission: {}", e.message());
+            return Ok(redirect(&format!("/ratelimit?error={}", e.code())));
+        }
     };
 
     {
