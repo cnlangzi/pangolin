@@ -1,0 +1,54 @@
+# pangolin-ngx configuration — installed by the pangolin-ngx package.
+#
+# This file is a dpkg/rpm *conffile* (`config|noreplace`): your edits
+# survive an upgrade untouched, and the package never overwrites them.
+#
+# It is NOT the repository's development `ngx.yml`. That one carries
+# relative paths, the non-privileged development ports (8000/8443) and
+# a few retired keys; this one carries the paths and the ports the
+# packaged service actually runs with. Every path here is absolute —
+# a relative path would follow the service's working directory
+# (`/var/lib/pangolin`) instead of meaning what it says.
+#
+# ⚠  Before you put this gateway on the public internet:
+#
+#   * `admin.password` — the default below is `admin`, a public
+#     value. Change it.
+#   * `admin.addr` — `0.0.0.0:9081` exposes the admin UI to every
+#     network the host can reach. Narrow it to `127.0.0.1:9081` (and
+#     use an SSH tunnel) or to an internal address.
+#   * `acme.email` — the address the ACME account is registered
+#     with. It is empty here; put a real mailbox in.
+#   * `tunnel.addr` — the tunnel endpoint is NOT in this file, so it
+#     keeps its built-in default, `0.0.0.0:9001`: the gateway accepts
+#     tunnel clients on every interface. Add a `tunnel:` section with
+#     `addr: 127.0.0.1:9001` when the tunnel nodes are on the same
+#     host, and make sure UDP 9001 is reachable from the ones that are
+#     not (QUIC and the TCP fallback share the port number).
+#
+# The full field reference is
+# https://github.com/cnlangzi/pangolin/blob/main/docs/configuration.md
+
+addr:
+  http: 0.0.0.0:80
+  https: 0.0.0.0:443
+
+admin:
+  addr: 0.0.0.0:9081
+  username: admin
+  password: admin
+
+acme:
+  email: ""
+  cert_dir: /var/lib/pangolin/certs
+  acme_directory: https://acme-v02.api.letsencrypt.org/directory
+  renew_threshold_days: 14
+  renew_check_interval_hours: 6
+  key_type: ecdsa
+
+log:
+  bot:
+    dir: /var/log/pangolin/bots
+    cache_dir: /var/cache/pangolin/bots
+  referer:
+    dir: /var/log/pangolin/referers

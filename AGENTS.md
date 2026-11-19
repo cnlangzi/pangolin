@@ -210,6 +210,66 @@ same test file asserts that the units the release publishes are the
 repository's own files — the release copies them, it does not write a
 second copy that could drift apart.
 
+## Packaging conventions
+
+The `packaging/` tree builds the deb / rpm packages and the apt /
+rpm repository.  Four rules, all of them load-bearing.
+
+**Runtime state never enters a package.**  A package holds the
+binary, the systemd unit, the configuration template and empty
+directory skeletons.  The SQLite database, the ACME certificates,
+the JSONL logs, the knownbots cache and the tunnel node's pin file
+are written by the running service: a package that owned them would
+overwrite them on every upgrade, and `/usr/local`-style layouts lose
+the data on the first package upgrade.  The regression test
+(`tests/src/packaging.rs`) pins the file list of each package
+against the documented layout, so a file that sneaks in fails the
+build.
+
+**The configuration templates are their own files.**
+`packaging/config/ngx.yml` and `packaging/config/tun.yml` are *not*
+the repository's root `ngx.yml` / `tun.yml`.  The root files are
+development defaults — relative paths, the non-privileged ports, and
+a few retired keys — and the configuration loader does **not** refuse
+unknown keys, so a stale key in the template would be silently
+ignored with a warning the operator never sees.  The packaged
+templates carry absolute paths, and the test asserts that they
+carry no `./` and no retired key.
+
+**The glibc floor is measured, never written down.**  The
+dependency list of a package names the glibc version the binary
+needs, and the build reads it out of the binary itself:
+
+```bash
+objdump -T <binary> | grep -o 'GLIBC_[0-9][0-9.]*' | sort -V | tail -1
+```
+
+A hardcoded floor goes stale the moment the toolchain or a
+dependency changes, and a stale floor is worse than none — it keeps
+the package off a host that could run it, or lets it onto a host
+that cannot.  The measurement runs on the runner of the
+architecture being packaged: Ubuntu's `objdump` only knows the
+architecture it was built for, and says "File format not recognized"
+for the other one.
+
+**The `gh-pages` branch is a generated artefact.**  It holds the
+site tree the repository serves, and every release replaces the
+whole tree — a hand-made commit on it is overwritten by the next
+release.  Never commit to it by hand, and never treat it as a
+source of truth: the packages in it are built artefacts, and the
+release assets are where a specific version lives.
+
+Two smaller ones, for the same reason:
+
+- **The configuration files are conffiles** (`config|noreplace`).
+  The operator's edits have to survive an upgrade untouched and
+  without an interactive prompt, and a deleted file has to come
+  back.  Changing the type changes that contract.
+- **The packaging scripts are POSIX `sh`.**  dpkg runs maintainer
+  scripts with `/bin/sh`, and so does rpm's scriptlet interpreter —
+  a bashism breaks the installation on the distribution that matters.
+  `sh -n` has to pass.
+
 ## Local development: targeted tests, not the full e2e suite
 
 `make test-e2e` builds release binaries and runs the **entire**

@@ -97,3 +97,9 @@ test-support/
 # governs `cargo fmt` — all tiny, all low churn, all "normal code", so they
 # stay.  (`.env.example` is a dotfile, so `**/.*` above does drop it; it is
 # only ever read by `make env-show` on the host.)
+#
+# `packaging/` is the deb/rpm packaging tree.  The image does not build the
+# packages — `packaging/config/*.yml` is read by `include_str!` from the
+# *test* modules of `crates/pangolin-core` and `crates/tun`, and the rest
+# is read by the release workflow.  It is a few KB, it churns little, and
+# excluding it would break `cargo test` in the image for no gain.

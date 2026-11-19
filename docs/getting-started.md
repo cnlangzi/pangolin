@@ -6,6 +6,48 @@
 
 ## 快速开始
 
+### 用包管理器安装
+
+Linux 上的推荐路径：仓库自己托管 apt / yum 源，包在仓库里签名，`apt upgrade` / `dnf upgrade` 跟着版本走。
+
+```bash
+sudo apt install pangolin-ngx     # Debian / Ubuntu
+sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
+```
+
+先加源：
+
+```bash
+# Debian / Ubuntu
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/pangolin-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pangolin-archive-keyring.gpg] https://cnlangzi.github.io/pangolin stable main" \
+  | sudo tee /etc/apt/sources.list.d/pangolin.list
+sudo apt update
+```
+
+```ini
+# RHEL / Rocky / Alma —— /etc/yum.repos.d/pangolin.repo
+[pangolin]
+name=Pangolin
+baseurl=https://cnlangzi.github.io/pangolin/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://cnlangzi.github.io/pangolin/pangolin-archive-keyring.asc
+```
+
+安装**不会启动服务** —— 网关只是被 enable 了，改完配置再起：
+
+```bash
+sudo systemctl start pangolin-ngx
+```
+
+隧道节点是另一个包（`sudo apt install pangolin-tun`），它连 enable 都不做：它得先在网关的管理界面里建好 `(name, token)` 行才能连上。
+
+完整流程 —— 公钥指纹、受支持的发行版、升级、卸载、从 `/usr/local/pangolin` 迁移、故障排查 —— 见 [用包管理器安装](./packaging.md)。
+
 ### 从源码构建
 
 需要 Rust 1.96。

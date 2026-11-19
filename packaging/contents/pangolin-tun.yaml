@@ -1,0 +1,44 @@
+# The file list of the `pangolin-tun` package.
+#
+# Spliced into `packaging/nfpm.yaml` by `packaging/render-nfpm.sh`,
+# which substitutes the `@@…@@` placeholders below.
+#
+# The tunnel node has no logs on disk: its log lines go to stderr and
+# from there into the journal, so there is no `/var/log/pangolin-tun`
+# and no tmpfiles rule either.  What it does keep on disk is the
+# trust-on-first-use pin file and the record of the last failed QUIC
+# attempt — both named by `/etc/pangolin/tun.yml` and both living
+# under `/var/lib/pangolin-tun/`.
+#
+# The two packages own disjoint path sets, so a source host can
+# install the tunnel node next to its own web server without the
+# gateway's files getting in the way.
+
+- src: @@BINARY@@
+  dst: /usr/bin/pangolin-tun
+  file_info:
+    mode: 0755
+    owner: root
+    group: root
+
+- src: @@UNIT@@
+  dst: /usr/lib/systemd/system/pangolin-tun.service
+  file_info:
+    mode: 0644
+    owner: root
+    group: root
+
+- src: @@CONFIG@@
+  dst: /etc/pangolin/tun.yml
+  type: config|noreplace
+  file_info:
+    mode: 0640
+    owner: root
+    group: pangolin
+
+- type: dir
+  dst: /var/lib/pangolin-tun
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin
