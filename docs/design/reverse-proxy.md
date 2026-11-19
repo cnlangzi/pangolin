@@ -386,7 +386,7 @@ HTTP client. We evaluated switching to `pingora-core::Connector` +
 | Concern | Resolution |
 |---|---|
 | `reqwest` is a friendly API; pingora-as-client is lower-level | A thin `HttpClientPool` (~50 LOC) wraps `Connector::get_http_session` / `release_http_session` and exposes an `execute_http`-shaped API |
-| `reqwest` manages keepalive, H1/H2, TLS for us | `Connector` does the same (see [`connectors/http/mod.rs`](https://docs.rs/pingora-core/0.8.1/pingora_core/connectors/http/index.html)) |
+| `reqwest` manages keepalive, H1/H2, TLS for us | `Connector` does the same (see [`connectors/http/mod.rs`](https://docs.rs/pingora-core/0.9.1/pingora_core/connectors/http/index.html)) |
 | Error mapping | `pingora_error::Error` → our `ProxyError` via a ~20-LOC adapter |
 | WebSocket upgrade | **pingora has it built in** — `is_upgrade_req()`, `was_upgraded()`, `maybe_upgrade_body_writer()`. `reqwest` does not, and would force us to pull in `tungstenite` or `hyper` |
 | TLS (mTLS, SNI, custom CAs) | `HttpPeer::new(addr, true, sni)` + `PeerOptions` cover all of it |
@@ -565,10 +565,14 @@ These are the testable contracts. Each row gets a unit test in
 
 To keep the scope tight:
 
-- **No new fork of pingora.** We already maintain a fork
-  (issue [#7](https://github.com/cnlangzi/pangolin/issues/7) for
-  `as_http1_mut`). `pingora-core` 0.8's `Connector` /
-  `HttpSession` API is sufficient.
+- **No fork of pingora.** The gateway depends on the published
+  crates.io release of pingora, not on a fork — see
+  [pingora-dependency.md](pingora-dependency.md) (issue #189). The
+  fork this repository used to maintain (issue
+  [#7](https://github.com/cnlangzi/pangolin/issues/7), for
+  `as_http1_mut`) became dead code with the splice rewrite (issues
+  #153 / #154) and is not consumed any more. `pingora-core` 0.9's
+  `Connector` / `HttpSession` API is sufficient.
 - **No msgpack frame format.** The yamux stream carries
   per-request `HttpRequest` bytes plus a small policy prefix.
   This matches the in-flight migration in

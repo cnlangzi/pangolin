@@ -23,7 +23,7 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-use crate::common::{parse_toml, read_repo_file};
+use crate::common::{dependency_tables, parse_toml, read_repo_file, workspace_members};
 
 /// A stand-in for the repository manifest, shaped so that the rewrite
 /// is not trivial: a `[workspace.package]` table that owns the version
@@ -32,7 +32,7 @@ use crate::common::{parse_toml, read_repo_file};
 ///
 /// The dependency is written as a *multi-line* inline table on
 /// purpose.  The repository's own dependencies are single-line
-/// (`pingora = { version = "0.8", … }`), where the `version` key never
+/// (`pingora = { version = "0.9", … }`), where the `version` key never
 /// starts a line — so a substitution anchored at the start of a line
 /// would miss them and the table scoping would look unnecessary.  A
 /// multi-line table puts the key at the start of a line, which is
@@ -44,54 +44,12 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
-pingora = { version = "0.8", features = ["lb"] }
+pingora = { version = "0.9", features = ["lb"] }
 tokio = {
   version = "1",
   features = ["full"],
 }
 "#;
-
-/// One workspace member: its package name, its path in the tree and
-/// its parsed manifest.
-struct Member {
-    name: String,
-    path: String,
-    manifest: toml::Value,
-}
-
-/// Every workspace member, read from the root manifest.
-///
-/// Derived, not hardcoded: a member that pins its own version, or one
-/// that is added to the workspace later, has to be caught by the
-/// checks below — a list written out by hand would let both slip
-/// through.
-fn workspace_members() -> Vec<Member> {
-    let manifest = parse_toml("Cargo.toml");
-    let members = manifest
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-        .expect("[workspace] members");
-
-    members
-        .iter()
-        .map(|path| {
-            let path = path.as_str().expect("a member path");
-            let member = parse_toml(&format!("{path}/Cargo.toml"));
-            let name = member
-                .get("package")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or_else(|| panic!("{path} declares no package name"))
-                .to_string();
-            Member {
-                name,
-                path: path.to_string(),
-                manifest: member,
-            }
-        })
-        .collect()
-}
 
 /// The workspace version — the single line every member inherits.
 fn workspace_version() -> String {
@@ -102,26 +60,6 @@ fn workspace_version() -> String {
         .and_then(|v| v.as_str())
         .expect("[workspace.package].version")
         .to_string()
-}
-
-/// Every dependency table of a manifest, at any depth.
-///
-/// A `[target.'cfg(unix)'.dependencies]` section is a dependency table
-/// too, and a pinned version in one breaks the release exactly like a
-/// pinned version in `[dependencies]` does.
-fn dependency_tables<'a>(value: &'a toml::Value, out: &mut Vec<&'a toml::Value>) {
-    let Some(table) = value.as_table() else {
-        return;
-    };
-    for (key, child) in table {
-        if matches!(
-            key.as_str(),
-            "dependencies" | "dev-dependencies" | "build-dependencies"
-        ) {
-            out.push(child);
-        }
-        dependency_tables(child, out);
-    }
 }
 
 // ── the manifest ────────────────────────────────────────────────────────────
@@ -577,7 +515,7 @@ fn release_workflow_rewrite_only_touches_the_workspace_package_version() {
         "the tag's version must land in [workspace.package].version:\n{after}"
     );
     assert!(
-        after.contains("pingora = { version = \"0.8\", features = [\"lb\"] }")
+        after.contains("pingora = { version = \"0.9\", features = [\"lb\"] }")
             && after.contains("  version = \"1\",\n"),
         "the dependency versions must not be rewritten:\n{after}"
     );
@@ -620,7 +558,7 @@ fn release_workflow_rewrite_works_on_the_repository_manifest() {
     );
     // The dependency versions of the real manifest are untouched.
     for expected in [
-        "pingora = { version = \"0.8\", features = [\"lb\"] }",
+        "pingora = { version = \"0.9\", features = [\"lb\"] }",
         "rustls = { version = \"0.23.40\", default-features = false, features = [\"ring\", \"std\"] }",
     ] {
         assert!(

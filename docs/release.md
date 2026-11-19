@@ -127,8 +127,8 @@ pangolin-tun.exe
 tun.yml
 ```
 
-There is no Windows `ngx`: pingora 0.8 depends on Unix-only APIs
-(Unix sockets, daemonize, sendfile) and `crates/ngx` carries
+There is no Windows `ngx`: pingora 0.9 depends on Unix-only APIs
+(Unix sockets, daemonize, systemd socket activation) and `crates/ngx` carries
 `#[cfg(unix)]` code of its own — a Windows ngx is a porting project,
 not a build target. The Windows archives therefore also omit
 `ngx.yml`: it would be dead configuration next to a binary that

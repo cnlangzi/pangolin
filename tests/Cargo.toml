@@ -85,6 +85,13 @@ toml = "0.8"
 # edge and not a second copy of the crate.
 serde_yaml = { workspace = true }
 
+# The dependency-swap tests (issue #189) compare the locked crate
+# versions against the advisory floors with the real semver rules —
+# a pre-release of the floor version is *below* it.  `semver` is
+# already in the lock file through cargo-chef's tree, so this adds a
+# dependency edge and not a second copy of the crate.
+semver = "1"
+
 # The same tests parse the packaged configuration templates with the
 # *real* parsers.  The parsers themselves (`Config::from_str` /
 # `TunConfig::from_str`) live in the crates that own them, where the

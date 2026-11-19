@@ -26,8 +26,8 @@ admin = { path = "../admin" }
 # The dashboard-facing management API (issue #185).
 api = { path = "../api" }
 pingora = { workspace = true, features = ["openssl"] }
-pingora-core = "0.8"
-pingora-openssl = "0.8"
+pingora-core = "0.9"
+pingora-openssl = "0.9"
 rusqlite.workspace = true
 http-body = "1"
 async-trait.workspace = true

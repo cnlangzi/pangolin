@@ -32,8 +32,11 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 
 [net]
-# Faster git fetches for git-source dependencies (e.g. the forked
-# `pingora` declared in the workspace [patch.crates-io] section).
+# Faster git fetches for git-source dependencies.  The tree has none
+# at the moment — pingora comes from the crates.io mirror (issue
+# #189) — but the setting costs nothing, and cargo's built-in git
+# implementation fails on some hosts (SSH setups, proxies) where the
+# CLI does not.
 git-fetch-with-cli = true
 
 # More attempts before a download is given up on.  The mirror can stall
