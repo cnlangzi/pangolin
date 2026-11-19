@@ -18,6 +18,8 @@
 //!   remembers the operator's choice.
 //! - [`sanitize_next`] — the guard on the `next` parameter of the
 //!   language switcher (an open-redirect guard).
+//! - [`quality`] — the gates that keep the Chinese catalog from
+//!   rotting into a machine translation.
 //!
 //! ## The fallback chain
 //!
@@ -27,6 +29,7 @@
 //! panic inside a request handler becomes a 500.
 
 pub mod catalog;
+pub mod quality;
 
 use std::borrow::Cow;
 
@@ -425,15 +428,23 @@ mod tests {
     #[test]
     fn t_falls_back_to_en_then_to_missing_marker() {
         // A key that only the English catalog has falls back to
-        // English for every other language.
-        let key = catalog_for(Lang::En)
-            .keys()
-            .next()
-            .expect("en catalog is not empty");
-        assert_eq!(
-            Lang::ZhCn.t(key).as_ref(),
-            catalog_for(Lang::En).get(key).unwrap()
-        );
+        // English for every other language.  The key is picked
+        // deterministically — the first English key the Chinese
+        // catalog does not have — because the Chinese catalog is
+        // translated area by area, and the fallback is what carries
+        // the areas that are not translated yet.
+        let chinese = catalog_for(Lang::ZhCn);
+        let english = catalog_for(Lang::En);
+        let mut keys: Vec<&String> = english.keys().collect();
+        keys.sort();
+        // When the Chinese catalog covers every key there is nothing
+        // left to fall back on, and nothing left to assert.
+        if let Some(key) = keys.iter().find(|key| !chinese.contains_key(**key)) {
+            assert_eq!(
+                Lang::ZhCn.t(key.as_str()).as_ref(),
+                english.get(*key).unwrap()
+            );
+        }
         // A key nobody has is a visible marker, not a panic. The key
         // is built at runtime so the catalog gate test does not read
         // it as a reference to a key that does not exist.
