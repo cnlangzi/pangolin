@@ -84,40 +84,36 @@ impl Service for ApiService {
 /// gateway has no token of its own yet.
 async fn seed_api_config(app: &Arc<App>, env_token: Option<&str>) {
     let db = app.db.lock().await;
-    let existing = pangolin_core::db::get_api_config(&db).unwrap_or(None);
-    match existing {
-        Some(mut row) => {
-            if row.token_hash.is_empty()
-                && let Some(token) = env_token
-            {
-                row.token_hash = pangolin_core::db::sha256_hex(token);
-                row.updated_at = chrono::Utc::now().to_rfc3339();
-                if let Err(e) = pangolin_core::db::upsert_api_config(&db, &row) {
-                    log::warn!("api: storing the token from {ENV_TOKEN} failed: {e}");
-                } else {
-                    log::info!("api: the bearer token came from {ENV_TOKEN}");
-                }
-            }
-        }
-        None => {
-            let row = pangolin_core::db::ApiConfigRow {
-                id: 1,
-                instance_id: api::generate_instance_id(),
-                token_hash: env_token
-                    .map(pangolin_core::db::sha256_hex)
-                    .unwrap_or_default(),
-                dashboard_port: 0,
-                dashboard_ip: None,
-                // Off until an operator turns it on — a gateway that
-                // was never configured accepts nothing.
-                enabled: false,
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            };
-            if let Err(e) = pangolin_core::db::upsert_api_config(&db, &row) {
+    let env_hash = env_token
+        .map(pangolin_core::db::sha256_hex)
+        .unwrap_or_default();
+    let existed = pangolin_core::db::get_api_config(&db)
+        .unwrap_or(None)
+        .is_some();
+    // The row is created on the first boot: a fresh instance id, the
+    // token the environment offers and the API **switched off** — a
+    // gateway that was never configured accepts nothing.
+    let row =
+        match pangolin_core::db::ensure_api_config(&db, &api::generate_instance_id(), &env_hash) {
+            Ok(row) => row,
+            Err(e) => {
                 log::warn!("api: seeding the API configuration failed: {e}");
-            } else {
-                log::info!("api: the management API is seeded and switched off");
+                return;
             }
+        };
+    if !existed {
+        log::info!("api: the management API is seeded and switched off");
+    }
+    // The environment only seeds the token of a gateway that has none
+    // of its own yet — a token configured afterwards is never
+    // overwritten.
+    if row.token_hash.is_empty()
+        && let Some(hash) = env_token.map(pangolin_core::db::sha256_hex)
+    {
+        if let Err(e) = pangolin_core::db::update_api_token_hash(&db, &hash) {
+            log::warn!("api: storing the token from {ENV_TOKEN} failed: {e}");
+        } else {
+            log::info!("api: the bearer token came from {ENV_TOKEN}");
         }
     }
 }

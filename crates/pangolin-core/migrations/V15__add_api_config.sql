@@ -7,8 +7,11 @@
 -- this node by, and whether the API is enabled at all.
 --
 -- The table is a **singleton** — `id` is pinned to 1 by a CHECK
--- constraint, so there is exactly one row per gateway and a second
--- INSERT cannot create a rival configuration.
+-- constraint, so there is **at most** one row per gateway and a
+-- second INSERT cannot create a rival configuration. The row itself
+-- is created on the gateway's first boot (the API service seeds it
+-- with the instance id), because a meaningful `instance_id` cannot
+-- be written by a migration.
 --
 -- `token_hash` holds the SHA-256 hex digest of the bearer token,
 -- never the token itself (the same convention `tun.token_hash`

@@ -1436,6 +1436,57 @@ pub fn ensure_api_config(
     Ok(row)
 }
 
+/// Remember the dashboard's address, learned from an authenticated
+/// call.
+///
+/// **Only the `dashboard_ip` column is touched.** The other columns
+/// are the operator's, and a write of the whole row from a copy read
+/// before the authentication would revert a token rotation or the
+/// switch that happened in between.
+pub fn update_api_dashboard_ip(conn: &Connection, ip: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config SET dashboard_ip = ?1, updated_at = ?2 WHERE id = 1",
+        params![ip, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Write the bearer token's digest.
+///
+/// **Only the `token_hash` column is touched** — the switch and the
+/// dashboard's address belong to other writers.
+pub fn update_api_token_hash(conn: &Connection, token_hash: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config SET token_hash = ?1, updated_at = ?2 WHERE id = 1",
+        params![token_hash, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Write the operator's dashboard settings.
+///
+/// **Only the three columns the settings form owns are touched**, so
+/// a concurrent write of the learned address is not reverted.
+pub fn update_api_settings(
+    conn: &Connection,
+    enabled: bool,
+    token_hash: &str,
+    dashboard_port: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE api_config
+            SET enabled = ?1, token_hash = ?2, dashboard_port = ?3, updated_at = ?4
+          WHERE id = 1",
+        params![
+            enabled as i64,
+            token_hash,
+            dashboard_port,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 // ---- Row mappers ----
 
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<Site> {
