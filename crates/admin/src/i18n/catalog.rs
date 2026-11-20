@@ -19,9 +19,9 @@ const EN_JSON: &str = include_str!("../../i18n/en.json");
 
 /// The Simplified Chinese catalog.
 ///
-/// Empty in issue #178: that issue delivers the framework only, so
-/// the interface renders in English until the translation issues
-/// land.
+/// Translated area by area: the areas that are done are listed in
+/// [`COMPLETED_AREAS`], and every other area falls back to the
+/// English catalog until its translation issue lands.
 const ZH_CN_JSON: &str = include_str!("../../i18n/zh-CN.json");
 
 /// A parsed catalog: key → text.

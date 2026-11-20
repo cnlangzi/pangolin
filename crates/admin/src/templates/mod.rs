@@ -163,11 +163,18 @@ mod tests {
         // Every language renders the same buckets; only the wording
         // differs. The English wording is pinned by
         // `relative_time_buckets`, the Chinese one by the table below.
-        let wording = [
-            (Lang::En, "5s ago", "1d ago", "in the future"),
-            (Lang::ZhCn, "5 秒前", "1 天前", "时间在未来"),
-        ];
-        for (lang, seconds, days, future) in wording {
+        //
+        // The lookup is an exhaustive `match` on purpose: a new
+        // `Lang` variant does not compile until it comes with its
+        // wording, so a third language cannot slip past this test.
+        let wording = |lang: Lang| -> (&'static str, &'static str, &'static str) {
+            match lang {
+                Lang::En => ("5s ago", "1d ago", "in the future"),
+                Lang::ZhCn => ("5 秒前", "1 天前", "时间在未来"),
+            }
+        };
+        for lang in Lang::ALL {
+            let (seconds, days, future) = wording(lang);
             assert_eq!(
                 relative_time(now - Duration::seconds(5), now, lang),
                 seconds

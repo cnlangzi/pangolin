@@ -55,7 +55,7 @@
   "common.provider.cloudflare.label": "Cloudflare",
   "common.provider.custom_lb.description": "读取下方配置的请求头名称，每个名称对应一个值。未设置的名称返回空值。负载均衡器不发布 IP 段列表，因此源站防护只使用站点手动配置的 IP 段。",
   "common.provider.custom_lb.label": "自定义 LB",
-  "common.provider.direct.description": "TCP 对端地址就是访客，不需要查请求头。当 pangolin 被直接访问时使用（没有 CDN / LB）。",
+  "common.provider.direct.description": "TCP 对端地址就是访客，不需要查请求头。当 Pangolin 被直接访问时使用（没有 CDN / LB）。",
   "common.provider.direct.label": "直连",
   "common.referrer": "来源",
   "common.region": "地区",

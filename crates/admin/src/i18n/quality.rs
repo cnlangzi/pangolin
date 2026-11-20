@@ -14,8 +14,9 @@
 //! 2. **标点** — a Chinese value may not contain half-width
 //!    punctuation.  Chinese typography uses the full-width forms
 //!    （），？！；：.
-//! 3. **空格** — a Chinese character glued to an ASCII letter reads
-//!    badly ("DNS记录").  "DNS 记录" is the Chinese way.
+//! 3. **空格** — a Chinese character glued to a Latin word, a number
+//!    or a placeholder reads badly ("DNS记录", "共3条").  "DNS 记录"
+//!    is the Chinese way.
 //!
 //! What the gates deliberately do **not** check: whether the Chinese
 //! is *good*.  A regex cannot tell "最近 {n} 条事件" from "最后 {n}
@@ -26,6 +27,13 @@
 //! technical identifier (`DNS`, `User-Agent`, `Cloudflare`) has no
 //! Chinese punctuation to convert and no Chinese word to space out.
 //! Such a value still has to be whitelisted for gate 1.
+//!
+//! The predicates are free functions over a *value*, and the catalog
+//! walkers call them.  That split is what makes the gates testable on
+//! their own: a gate that reads the shipped catalog can only ever be
+//! exercised by the data it is checking, so a broken predicate would
+//! leave the suite green.  The unit tests below therefore feed the
+//! predicates synthetic strings.
 
 use crate::i18n::Lang;
 use crate::i18n::catalog::catalog_for;
@@ -45,7 +53,7 @@ use crate::i18n::catalog::catalog_for;
 /// - `login.tagline` — the Chinese project tagline; the English
 ///   catalog already carries it, so translating it again would only
 ///   invent a second spelling of the same slogan.
-pub const IDENTICAL_OK: &[&str] = &[
+const IDENTICAL_OK: &[&str] = &[
     "common.provider.cloudflare.label",
     "common.user_agent",
     "login.tagline",
@@ -62,7 +70,7 @@ const HALF_WIDTH_PUNCTUATION: &[char] = &['(', ')', ',', '?', '!', ';', ':'];
 /// A hint, not a failure: some sentences are naturally long, and a
 /// hard limit would push the translator into writing an incomplete
 /// sentence just to pass the test.
-pub const LONG_TEXT_HANZI: usize = 20;
+const LONG_TEXT_HANZI: usize = 20;
 
 /// Whether `c` is a Chinese ideograph.
 ///
@@ -81,6 +89,35 @@ fn has_hanzi(value: &str) -> bool {
 /// The number of Chinese ideographs in `value`.
 fn hanzi_count(value: &str) -> usize {
     value.chars().filter(|c| is_hanzi(*c)).count()
+}
+
+/// Whether `value` is a Chinese text that still carries half-width
+/// punctuation.
+///
+/// A value without a Chinese character is exempt: a technical
+/// identifier has no Chinese punctuation to convert.
+fn has_half_width_punctuation(value: &str) -> bool {
+    has_hanzi(value) && value.chars().any(|c| HALF_WIDTH_PUNCTUATION.contains(&c))
+}
+
+/// Whether `value` glues a Chinese character to an ASCII word, a number
+/// or a placeholder.
+///
+/// The ASCII side is "printable, not a space": a Latin word
+/// ("DNS记录"), a digit ("共3条") and a placeholder brace ("共{n}条")
+/// all read badly without the half-width space Chinese typography
+/// puts between a Chinese character and a foreign one.
+///
+/// A value without a Chinese character is exempt.
+fn needs_space(value: &str) -> bool {
+    if !has_hanzi(value) {
+        return false;
+    }
+    let chars: Vec<char> = value.chars().collect();
+    chars.windows(2).any(|window| {
+        let (left, right) = (window[0], window[1]);
+        (is_hanzi(left) && right.is_ascii_graphic()) || (left.is_ascii_graphic() && is_hanzi(right))
+    })
 }
 
 /// One key of the Chinese catalog, with the English text it was
@@ -115,7 +152,7 @@ fn shared_keys() -> Vec<Pair> {
 
 /// The keys whose Chinese text is identical to the English one and
 /// that are not whitelisted — the untranslated strings.
-pub fn untranslated_keys() -> Vec<&'static str> {
+fn untranslated_keys() -> Vec<&'static str> {
     shared_keys()
         .into_iter()
         .filter(|pair| pair.chinese == pair.english && !IDENTICAL_OK.contains(&pair.key))
@@ -124,42 +161,27 @@ pub fn untranslated_keys() -> Vec<&'static str> {
 }
 
 /// The keys whose Chinese text contains half-width punctuation.
-pub fn half_width_punctuation_keys() -> Vec<&'static str> {
+fn half_width_punctuation_keys() -> Vec<&'static str> {
     shared_keys()
         .into_iter()
-        .filter(|pair| {
-            has_hanzi(pair.chinese)
-                && pair
-                    .chinese
-                    .chars()
-                    .any(|c| HALF_WIDTH_PUNCTUATION.contains(&c))
-        })
+        .filter(|pair| has_half_width_punctuation(pair.chinese))
         .map(|pair| pair.key)
         .collect()
 }
 
 /// The keys whose Chinese text glues a Chinese character to an ASCII
-/// letter without a space.
-pub fn missing_space_keys() -> Vec<&'static str> {
+/// word, a number or a placeholder without a space.
+fn missing_space_keys() -> Vec<&'static str> {
     shared_keys()
         .into_iter()
-        .filter(|pair| {
-            if !has_hanzi(pair.chinese) {
-                return false;
-            }
-            let chars: Vec<char> = pair.chinese.chars().collect();
-            chars.windows(2).any(|window| {
-                (is_hanzi(window[0]) && window[1].is_ascii_alphabetic())
-                    || (window[0].is_ascii_alphabetic() && is_hanzi(window[1]))
-            })
-        })
+        .filter(|pair| needs_space(pair.chinese))
         .map(|pair| pair.key)
         .collect()
 }
 
 /// The keys whose Chinese text holds more than [`LONG_TEXT_HANZI`]
 /// Chinese characters, with the count.
-pub fn long_keys() -> Vec<(&'static str, usize)> {
+fn long_keys() -> Vec<(&'static str, usize)> {
     shared_keys()
         .into_iter()
         .filter_map(|pair| {
@@ -223,10 +245,46 @@ mod tests {
         let keys = missing_space_keys();
         assert!(
             keys.is_empty(),
-            "these Chinese strings glue a Chinese character to a Latin word \
-             without a space:\n{}",
+            "these Chinese strings glue a Chinese character to a Latin word, a \
+             number or a placeholder without a space:\n{}",
             offenders(&keys)
         );
+    }
+
+    /// The predicates on their own.
+    ///
+    /// The gates above read the shipped catalog, so a broken predicate
+    /// would leave them green: the punctuation gate would find
+    /// nothing because nothing was classified as Chinese.  These
+    /// tests pin the predicates against synthetic values, so a
+    /// predicate that stops working turns *this* red.
+    #[test]
+    fn the_punctuation_predicate_sees_half_width_punctuation() {
+        assert!(has_half_width_punctuation("登录管理后台 (test)"));
+        assert!(has_half_width_punctuation("错误: connection refused"));
+        assert!(!has_half_width_punctuation("登录管理后台（测试）"));
+        assert!(!has_half_width_punctuation("DNS 记录"));
+        // A pure ASCII value is exempt — it has no Chinese
+        // punctuation to convert.
+        assert!(!has_half_width_punctuation("DNS"));
+        assert!(!has_half_width_punctuation("User-Agent"));
+    }
+
+    /// The space predicate on its own — see
+    /// `the_punctuation_predicate_sees_half_width_punctuation` for
+    /// why the predicates need their own tests.
+    #[test]
+    fn the_space_predicate_sees_glued_words() {
+        // A Latin word.
+        assert!(needs_space("DNS记录"));
+        // A number.
+        assert!(needs_space("共3条"));
+        // A placeholder.
+        assert!(needs_space("共{n}条"));
+        assert!(!needs_space("DNS 记录"));
+        assert!(!needs_space("共 {n} 条"));
+        // A pure ASCII value is exempt.
+        assert!(!needs_space("DNS"));
     }
 
     /// The whitelist has to stay honest: an entry that names a key
@@ -266,6 +324,13 @@ mod tests {
     ///
     /// A hint, not a failure: the test prints the offending keys so a
     /// reviewer can look at them, and it always passes.
+    ///
+    /// libtest swallows the output of a *passing* test, so the report
+    /// only shows up with `--nocapture`:
+    ///
+    /// ```text
+    /// cargo test -p admin --lib i18n::quality -- --nocapture
+    /// ```
     #[test]
     fn long_chinese_strings_are_reported() {
         for (key, count) in long_keys() {
