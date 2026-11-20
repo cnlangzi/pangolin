@@ -5053,9 +5053,9 @@ async fn admin_ui_access_and_bot_log_pages_render_chinese() {
         !body.contains("Verification status"),
         "the English verification panel title must be gone: {body}"
     );
-    // The sub-nav is pinned in markup, not as a bare word: the page
-    // title carries "统计" too, so a plain substring would still pass
-    // if the sub-nav label fell back to English.
+    // The sub-nav is pinned in markup, not as a bare word: the
+    // assertion then names the link that carries the label, so it
+    // cannot be satisfied by some other element that repeats it.
     assert!(
         body.contains(">统计</a>"),
         "the Chinese sub-nav label must be rendered: {body}"
@@ -5134,8 +5134,9 @@ async fn admin_ui_referer_log_and_traffic_pages_render_chinese() {
         "the English page title must be gone: {body}"
     );
     // The sub-nav is pinned in markup, not as a bare word: the page
-    // title carries "统计" too, so a plain substring would still pass
-    // if the sub-nav label fell back to English.
+    // subtitle carries "统计" too ("只统计顶层跳转"), so a plain
+    // substring would still pass if the sub-nav label fell back to
+    // English.
     for (needle, what) in [
         (">实时</a>", "the live sub-nav label"),
         (">历史</a>", "the history sub-nav label"),

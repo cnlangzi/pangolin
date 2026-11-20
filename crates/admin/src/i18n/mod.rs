@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn t_falls_back_to_en_then_to_missing_marker() {
+    fn t_renders_a_missing_marker_for_an_unknown_key() {
         // A key nobody has is a visible marker, not a panic. The key
         // is built at runtime so the catalog gate test does not read
         // it as a reference to a key that does not exist.
