@@ -3,14 +3,13 @@
 //! Implementations: Cloudflare, Aliyun DNS, Tencent DNSPod.
 
 use base64::Engine;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts, ServerGroup};
+use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
 use pangolin_core::DnsProviderKind;
@@ -852,36 +851,20 @@ fn is_zone_not_on_account(err: &str) -> bool {
 // TXT propagation check via hickory-resolver
 // ---------------------------------------------------------------------------
 
-/// The public Cloudflare resolvers the DNS-01 TXT check queries.
-///
-/// hickory-resolver 0.26 removed the `ResolverConfig::cloudflare()` preset
-/// that 0.24 offered, so the same addresses are spelled out here. The set
-/// is identical to 0.24's `CLOUDFLARE_IPS`, which the old preset used for
-/// plain UDP + TCP on port 53.
-fn txt_nameservers() -> Vec<IpAddr> {
-    vec![
-        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
-        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
-    ]
-}
-
 /// The resolver configuration for the DNS-01 TXT propagation check.
+///
+/// hickory-resolver 0.26 removed the `ResolverConfig::cloudflare()`
+/// *constructor* that 0.24 offered, but kept the address set it used as the
+/// `config::CLOUDFLARE` server group — the same four Cloudflare resolvers
+/// (`1.1.1.1`, `1.0.0.1` and their IPv6 counterparts). Building on that
+/// group keeps the TXT check querying exactly the servers 0.24 queried, over
+/// plain UDP + TCP on port 53.
 ///
 /// Kept apart from `wait_for_txt_propagation` so the nameserver set can be
 /// asserted in a unit test without touching the network — the behaviour we
 /// have to preserve is *which* servers we ask, not that we can reach them.
 fn txt_resolver_config() -> ResolverConfig {
-    let ips = txt_nameservers();
-    let group = ServerGroup {
-        ips: &ips,
-        // Only consulted by the TLS / HTTPS / QUIC transports; plain
-        // UDP + TCP needs neither.
-        server_name: "",
-        path: "",
-    };
-    ResolverConfig::udp_and_tcp(&group)
+    ResolverConfig::udp_and_tcp(&CLOUDFLARE)
 }
 
 /// Poll for TXT record visibility using hickory-resolver querying
@@ -1009,19 +992,20 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
 
 #[cfg(test)]
 mod tests {
-    use super::{chain_message, is_zone_not_on_account, scrub_url_query, txt_nameservers};
+    use super::{chain_message, is_zone_not_on_account, scrub_url_query};
     use hickory_resolver::config::ProtocolConfig;
     use std::net::IpAddr;
 
     #[test]
-    fn txt_nameservers_are_the_cloudflare_public_resolvers() {
+    fn txt_resolver_config_queries_exactly_the_cloudflare_resolvers() {
         // hickory-resolver 0.26 dropped the `ResolverConfig::cloudflare()`
-        // preset, so the DNS-01 TXT check now spells the addresses out
-        // itself. This pins the set: swapping in another resolver, or
-        // dropping one of the four, silently changes where DNS-01
-        // validation queries go — the TXT would then be checked against a
-        // different view of the zone than the CA uses.
-        let ips = txt_nameservers();
+        // constructor but kept its address set as `config::CLOUDFLARE`. This
+        // pins the four servers the DNS-01 TXT check queries: swapping in
+        // another resolver group, or an upstream change to the group, would
+        // silently check the TXT against a different view of the zone than
+        // the CA uses.
+        let config = super::txt_resolver_config();
+        let ips: Vec<IpAddr> = config.name_servers.iter().map(|ns| ns.ip).collect();
         let expected: Vec<IpAddr> = vec![
             "1.1.1.1".parse().expect("valid IPv4"),
             "1.0.0.1".parse().expect("valid IPv4"),
