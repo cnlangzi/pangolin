@@ -4321,7 +4321,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §23 — Interface language (issues #178, #179) ─────────────────────────────
+// ── §23 — Interface language (issues #178, #179, #180) ───────────────────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
@@ -4519,4 +4519,239 @@ async fn admin_ui_login_page_renders_chinese() {
         !body.contains(">Username<"),
         "the English login page must not be rendered: {body}"
     );
+}
+
+/// Fetch a page and return its body.
+async fn page_body(client: &AdminClient, path: &str) -> String {
+    client.get(path).await.unwrap().text().await.unwrap()
+}
+
+/// A signed-in client whose interface is Chinese.
+///
+/// The switcher writes the language cookie and the cookie store keeps
+/// it, so every request the client makes afterwards is answered in
+/// Chinese.
+async fn chinese_client(ngx: &NgxProcess) -> AdminClient {
+    let client = AdminClient::new(ngx);
+    client.login("admin", "admin").await.unwrap();
+    let resp = client.get("/lang/zh-CN").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+    client
+}
+
+/// The sites, the domains and the tunnels are translated (issue
+/// #180).
+///
+/// The three objects an operator touches every day have to be in
+/// Chinese too — not just the navigation around them.  The test walks
+/// the three list pages and the three "new" forms and asserts that
+/// the Chinese copy of the area is rendered and that the English copy
+/// is gone.
+///
+/// The Chinese literals are the shipped copy, pinned on purpose: a
+/// translation change is a change to what the operator reads, and it
+/// has to show up in the diff.  A later copy edit updates them here
+/// too.
+#[tokio::test]
+async fn admin_ui_site_domain_and_tunnel_pages_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // ── the sites ──
+    let body = page_body(&client, "/sites").await;
+    assert!(
+        body.contains("暂无站点"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        body.contains("新建站点"),
+        "the Chinese \"new site\" button must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No sites yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = page_body(&client, "/sites/new").await;
+    for (needle, what) in [
+        ("路由方式", "route-mode label"),
+        ("跟随域名", "host-mode option"),
+        ("源站防护", "origin guard"),
+        ("前置 CDN", "front CDN block"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Route via"),
+        "the English route-mode label must be gone: {body}"
+    );
+
+    // ── the domains ──
+    let body = page_body(&client, "/domains").await;
+    assert!(
+        body.contains("暂无域名"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No domains yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = page_body(&client, "/domains/new").await;
+    assert!(
+        body.contains("ACME 验证方式"),
+        "the Chinese challenge-kind label must be rendered: {body}"
+    );
+    assert!(
+        body.contains("DNS 服务商（DNS-01 验证）"),
+        "the Chinese DNS-provider label must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("ACME challenge kind"),
+        "the English challenge-kind label must be gone: {body}"
+    );
+
+    // ── the tunnels ──
+    let body = page_body(&client, "/tun").await;
+    assert!(
+        body.contains("暂无隧道节点"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No tunnel nodes registered yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = page_body(&client, "/tun/new").await;
+    assert!(
+        body.contains("令牌到期时间"),
+        "the Chinese expiry label must be rendered: {body}"
+    );
+    assert!(
+        body.contains("留空则自动生成"),
+        "the Chinese token hint must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("Token expires at"),
+        "the English expiry label must be gone: {body}"
+    );
+}
+
+/// The validation errors of the three areas are translated too (issue
+/// #180) — they are the messages the operator reads when the form
+/// rejects the submission.
+///
+/// The wrapper is translated, the quoted diagnostic is not: the error
+/// keeps the underlying text in its placeholder, so the operator still
+/// sees what the parser actually complained about.
+#[tokio::test]
+async fn admin_ui_site_domain_and_tunnel_validation_errors_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // A site whose backend cannot be parsed.
+    let page = page_body(&client, "/sites/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "notaurl"),
+                ("name", "zh-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("后端地址错误"),
+        "the Chinese backend error must be rendered: {body}"
+    );
+    // The diagnostic itself stays English — it is quoted from the
+    // parser, not translated.
+    assert!(
+        body.contains("unsupported URL scheme"),
+        "the quoted diagnostic must survive inside the translated wrapper: {body}"
+    );
+
+    // A domain without a name.
+    let page = page_body(&client, "/domains/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[("site_name", "zh-site"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("请填写域名"),
+        "the Chinese domain-name error must be rendered: {body}"
+    );
+
+    // A tunnel name with characters the name does not allow.
+    let page = page_body(&client, "/tun/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form("/tun/new", &[("name", "bad name!"), ("_csrf", &csrf)])
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("名称只能包含字母、数字、下划线和连字符"),
+        "the Chinese name error must be rendered: {body}"
+    );
+}
+
+/// The domains form's "manage providers under DNS" link must not
+/// swallow the challenge-kind control (issue #180).
+///
+/// The link used to be left unterminated in the template, so the
+/// browser's HTML parser reconstructed it over the block that follows:
+/// the challenge-kind label and its dropdown ended up *inside* a link
+/// to /dns — clicking the label navigated away instead of opening the
+/// dropdown, on the wildcard flow the form exists for.
+///
+/// The catalog value used to smuggle a closing tag in to compensate;
+/// askama escapes `{{ }}`, so the tag was shown as text instead of
+/// closing the link.  Both are fixed; this test pins the result.
+#[tokio::test]
+async fn admin_ui_domain_form_dns_link_does_not_swallow_the_challenge_kind() {
+    let ngx = start_ngx().await;
+
+    for chinese in [false, true] {
+        let client = AdminClient::new(&ngx);
+        client.login("admin", "admin").await.unwrap();
+        if chinese {
+            let resp = client.get("/lang/zh-CN").await.unwrap();
+            assert_eq!(resp.status().as_u16(), 302);
+        }
+        let body = page_body(&client, "/domains/new").await;
+
+        // The challenge-kind control is not inside a link.
+        let doc = Html::parse_document(&body);
+        for selector in [
+            "a select#domain-challenge-kind",
+            "a label[for=domain-challenge-kind]",
+        ] {
+            let sel = Selector::parse(selector).unwrap();
+            assert!(
+                doc.select(&sel).next().is_none(),
+                "{selector} must not be inside a link (chinese={chinese}): {body}"
+            );
+        }
+
+        // The hint shows the link text, not a tag.  The page's own
+        // closing tags are of course there; what must not be there is
+        // an *escaped* one — the artifact a value carried as text.
+        assert!(
+            !body.contains("&lt;/a&gt;"),
+            "the hint must not render a tag as text (chinese={chinese}): {body}"
+        );
+    }
 }

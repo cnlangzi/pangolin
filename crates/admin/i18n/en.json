@@ -324,7 +324,7 @@
   "domains.form.challenge_http01_note": "(not valid for wildcards — RFC 8555 §8.3)",
   "domains.form.challenge_kind": "ACME challenge kind",
   "domains.form.dns_provider": "DNS provider (DNS-01 challenge)",
-  "domains.form.dns_provider_hint_after": "DNS</a>.",
+  "domains.form.dns_provider_hint_after": "DNS.",
   "domains.form.dns_provider_hint_before": "Required for wildcard domains. Manage providers under",
   "domains.form.domain_locked": "The domain name is the primary key and cannot be changed.",
   "domains.form.domain_name": "Domain name",
