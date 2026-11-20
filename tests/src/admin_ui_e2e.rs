@@ -5095,3 +5095,139 @@ async fn admin_ui_access_and_bot_log_pages_render_chinese() {
         "the English subtitle must be gone: {body}"
     );
 }
+
+/// The referer log and the traffic page are translated (issue #183).
+///
+/// These are the two "look at the numbers" pages: the referer log
+/// answers "which external site sent this visit, and which pages did
+/// it land on", the traffic page answers "how much is the gateway
+/// serving right now".  They are translated in one issue because they
+/// share their vocabulary — a host, a path, a hit count — and a term
+/// that is translated two ways on two pages is how an interface
+/// starts to feel untranslated.
+///
+/// The Chinese literals are the shipped copy, pinned on purpose: a
+/// translation change is a change to what the operator reads, and it
+/// has to show up in the diff.  A later copy edit updates them here
+/// too.
+#[tokio::test]
+async fn admin_ui_referer_log_and_traffic_pages_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // ── the referer log (live) ──
+    let body = page_body(&client, "/logs/referers").await;
+    for (needle, what) in [
+        ("来源日志", "the page title"),
+        ("引荐总次数", "the total-hits card"),
+        ("命中最多的来源", "the top-referrer card"),
+        ("正在等待外部引荐流量", "the empty state"),
+        ("实时日志", "the live-tail table"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Referer Logs"),
+        "the English page title must be gone: {body}"
+    );
+    // The sub-nav is pinned in markup, not as a bare word: the page
+    // title carries "统计" too, so a plain substring would still pass
+    // if the sub-nav label fell back to English.
+    for (needle, what) in [
+        (">实时</a>", "the live sub-nav label"),
+        (">历史</a>", "the history sub-nav label"),
+        (">统计</a>", "the stats sub-nav label"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+
+    // ── the referer-log history ──
+    let body = page_body(&client, "/logs/referers/history").await;
+    for (needle, what) in [
+        ("可用日期", "the date sidebar"),
+        ("暂无 JSONL 文件", "the empty date sidebar"),
+        ("暂无匹配记录", "the empty result"),
+        ("数据来自", "the footnote"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Available dates"),
+        "the English date sidebar must be gone: {body}"
+    );
+
+    // ── the referer-log stats ──
+    let body = page_body(&client, "/logs/referers/stats").await;
+    for (needle, what) in [
+        ("来源日志 —— 统计", "the page title"),
+        ("一天一个站点", "the subtitle"),
+        ("引荐次数", "the referral-hits card"),
+        ("独立来源数", "the distinct-referrers card"),
+        ("独立访客数", "the distinct-visitors card"),
+        ("按来源", "the by-referrer table"),
+        ("按落地路径", "the by-landing-path table"),
+        ("暂无外部引荐。", "the empty by-referrer table"),
+        ("暂无路径。", "the empty by-landing-path table"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("One day and one site"),
+        "the English subtitle must be gone: {body}"
+    );
+
+    // ── the traffic page ──
+    let body = page_body(&client, "/traffic").await;
+    for (needle, what) in [
+        (">流量</h1>", "the page title"),
+        ("内存中的网络与请求统计", "the subtitle"),
+        ("重置计数", "the reset button"),
+        ("出站流量", "the body-out card"),
+        ("错误率", "the error-rate card"),
+        ("处理中请求", "the in-flight card"),
+        (
+            "每分钟请求数（最近一小时）",
+            "the requests-per-minute chart",
+        ),
+        ("按主机", "the by-host table"),
+        ("热门路径", "the top-paths table"),
+        ("暂无已知主机的流量。", "the empty by-host table"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Reset counters"),
+        "the English reset button must be gone: {body}"
+    );
+    assert!(
+        !body.contains("Top paths"),
+        "the English top-paths table title must be gone: {body}"
+    );
+    // The technical identifiers survive the translation: the
+    // operator reads the same notation in every other tool.
+    for (needle, what) in [
+        ("p95", "the latency card"),
+        ("RPS", "the requests-per-second card"),
+        ("4xx", "the status-class column"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the {what} must keep its identifier: {body}"
+        );
+    }
+}

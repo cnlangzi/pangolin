@@ -66,6 +66,10 @@ use crate::i18n::catalog::catalog_for;
 ///   database and in the rule matcher; the Chinese explanation lives
 ///   in the long form next to it.
 /// - `ratelimit.sites.throttled` — the HTTP status code.
+/// - `traffic.p50` / `traffic.p99` — the percentile labels. The
+///   traffic card shows `p95` next to them, hard-coded in the
+///   template, and the operator reads the whole family as one
+///   notation; translating two of the three would break the series.
 const IDENTICAL_OK: &[&str] = &[
     "common.provider.cloudflare.label",
     "common.user_agent",
@@ -81,6 +85,8 @@ const IDENTICAL_OK: &[&str] = &[
     "ratelimit.kind_blacklist_short",
     "ratelimit.kind_whitelist_short",
     "ratelimit.sites.throttled",
+    "traffic.p50",
+    "traffic.p99",
 ];
 
 /// The half-width punctuation a Chinese value may not contain.
