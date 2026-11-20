@@ -177,7 +177,11 @@ fn seed_tun_with_token(
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(token.as_bytes());
-    let hash = format!("{:x}", h.finalize());
+    // `hex::encode` rather than `format!("{:x}", …)` — see the same
+    // note in `sse_e2e.rs`: the digest 0.11 output type has no
+    // zero-padding `LowerHex` impl, so the hash has to be built the
+    // way `pangolin_core::db::sha256_hex` builds it.
+    let hash = hex::encode(h.finalize());
     conn.execute(
         "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?6)",

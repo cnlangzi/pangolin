@@ -62,7 +62,12 @@ fn seed_tun(conn: &Connection, name: &str, enabled: bool) {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"test-token");
-    let hash = format!("{:x}", h.finalize());
+    // `hex::encode` rather than `format!("{:x}", …)`: the digest 0.10
+    // output type (generic-array) had a zero-padding `LowerHex` impl,
+    // the digest 0.11 one (hybrid-array) has none, and core's
+    // `[u8]: LowerHex` does NOT pad — the seeded `token_hash` has to
+    // stay byte-identical to `pangolin_core::db::sha256_hex`.
+    let hash = hex::encode(h.finalize());
     conn.execute(
         "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
          VALUES (?1, 'test-token', ?2, ?3, 0, ?4, ?4, NULL)",
