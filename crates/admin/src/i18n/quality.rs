@@ -53,10 +53,34 @@ use crate::i18n::catalog::catalog_for;
 /// - `login.tagline` — the Chinese project tagline; the English
 ///   catalog already carries it, so translating it again would only
 ///   invent a second spelling of the same slogan.
+/// - the DNS provider credential fields (`dns.form.access_key_id`,
+///   `dns.form.access_key_secret`, `dns.form.secret_id`,
+///   `dns.form.secret_key` and their error labels) — they are the
+///   field names of the cloud vendor's own console, so the operator
+///   has to find the very same words there.
+/// - `dns.form.tencent_hint` — the Tencent credential hint, the same
+///   field names in a shorter spelling.
+/// - `dns.form.permission_2` — the Cloudflare permission path.
+/// - `ratelimit.kind_whitelist_short` / `ratelimit.kind_blacklist_short`
+///   — the rule kind is an enumeration value that lands in the
+///   database and in the rule matcher; the Chinese explanation lives
+///   in the long form next to it.
+/// - `ratelimit.sites.throttled` — the HTTP status code.
 const IDENTICAL_OK: &[&str] = &[
     "common.provider.cloudflare.label",
     "common.user_agent",
+    "dns.error.label_access_key_secret",
+    "dns.error.label_secret_key",
+    "dns.form.access_key_id",
+    "dns.form.access_key_secret",
+    "dns.form.permission_2",
+    "dns.form.secret_id",
+    "dns.form.secret_key",
+    "dns.form.tencent_hint",
     "login.tagline",
+    "ratelimit.kind_blacklist_short",
+    "ratelimit.kind_whitelist_short",
+    "ratelimit.sites.throttled",
 ];
 
 /// The half-width punctuation a Chinese value may not contain.
