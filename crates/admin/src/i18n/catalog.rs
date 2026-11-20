@@ -204,4 +204,41 @@ mod tests {
             );
         }
     }
+
+    /// Whether a value looks like it carries an HTML tag.
+    ///
+    /// A `<` followed by a letter or a slash — not a comparison
+    /// operator, not a stray arrow.
+    fn contains_html_tag(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes
+            .windows(2)
+            .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || w[1] == b'/'))
+    }
+
+    /// A catalog value is plain text — it carries no HTML.
+    ///
+    /// askama escapes `{{ }}`, so a tag in a value is *shown* to the
+    /// operator as text instead of doing what it looks like it does.
+    /// The domains form's DNS hint once smuggled a closing `</a>` into
+    /// the English value to compensate for a tag the template forgot:
+    /// the tag in the value did nothing (it was escaped) and the
+    /// operator read a literal "</a>." on the page.
+    #[test]
+    fn no_catalog_value_carries_html() {
+        for (lang, catalog) in [(Lang::En, en()), (Lang::ZhCn, zh_cn())] {
+            for (key, value) in catalog {
+                assert!(
+                    !contains_html_tag(value),
+                    "the {} catalog carries HTML in {key}: {value:?}",
+                    lang.code()
+                );
+            }
+        }
+        // The predicate itself: a tag is a tag, a comparison is not.
+        assert!(contains_html_tag("</a>"));
+        assert!(contains_html_tag("<b>bold</b>"));
+        assert!(!contains_html_tag("a < b"));
+        assert!(!contains_html_tag("<= 5"));
+    }
 }
