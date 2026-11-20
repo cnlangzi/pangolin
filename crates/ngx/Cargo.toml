@@ -79,8 +79,8 @@ time = "0.3"
 # DNS-01 challenge
 hickory-resolver = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
 # Utilities
@@ -88,7 +88,7 @@ bytes = "1"
 httpdate = "1"
 
 # WebSocket
-sha1 = "0.10"
+sha1.workspace = true
 base64 = "0.23"
 urlencoding = "2"
 

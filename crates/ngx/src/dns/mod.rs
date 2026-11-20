@@ -358,7 +358,12 @@ impl AliyunDnsProvider {
     }
 
     fn sign(&self, params: &mut HashMap<String, String>) {
-        use hmac::{Hmac, Mac};
+        // digest 0.11 moved `new_from_slice` off the `Mac` trait and
+        // onto `KeyInit` (`hmac 0.13` is the first release on that
+        // trait), so the import is load-bearing — without it the
+        // constructor does not resolve.  `Mac` still provides
+        // `update` / `finalize`.
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
 
         let mut sorted: Vec<_> = params.iter().collect();
@@ -519,7 +524,9 @@ impl TencentDnsProvider {
     /// the required header. Operators saw "find_zone failed" with no clue
     /// it was our signer.
     fn sign_tc3(&self, date: &str, timestamp: i64, action_lower: &str, body_json: &str) -> String {
-        use hmac::{Hmac, Mac};
+        // `KeyInit` carries `new_from_slice` since `hmac 0.13` — see the
+        // Aliyun signer above for the same reason.
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::{Digest, Sha256};
         type HmacSha256 = Hmac<Sha256>;
 
@@ -992,9 +999,96 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
 
 #[cfg(test)]
 mod tests {
-    use super::{chain_message, is_zone_not_on_account, scrub_url_query};
+    use super::{
+        AliyunDnsProvider, TencentDnsProvider, chain_message, is_zone_not_on_account,
+        scrub_url_query,
+    };
     use hickory_resolver::config::ProtocolConfig;
+    use std::collections::HashMap;
     use std::net::IpAddr;
+
+    /// The Aliyun signer produces the RPC API's authentication value —
+    /// the provider rejects a request whose `Signature` does not
+    /// match, so a byte change here is a silent credential rotation.
+    ///
+    /// The expected value was produced by the **pre-upgrade**
+    /// implementation (`hmac 0.12` / `digest 0.10`) and hard-coded
+    /// here, so the test cannot certify itself: the digest 0.11
+    /// migration (issue #200) changed the output *container* type
+    /// (generic-array → hybrid-array) and the `new_from_slice`
+    /// constructor, and nothing else.  The parameters mirror what
+    /// `do_request` assembles — the common RPC envelope plus the
+    /// call's own arguments.
+    ///
+    /// **What this pin is not:** it pins *our* bytes, not Aliyun's
+    /// published algorithm.  `sign()` keys the HMAC with the bare
+    /// `access_key_secret` and signs the sorted query on its own,
+    /// whereas Aliyun's RPC spec signs
+    /// `"<METHOD>&%2F&" + percentEncode(query)` under the key
+    /// `access_key_secret + "&"`.  That deviation predates issue
+    /// #200 and is out of its scope — the issue pins the bytes, it
+    /// does not redesign the algorithm — but the value below must
+    /// not be read as "spec-correct".  Correcting the algorithm is a
+    /// separate change, and it has to move this constant with it.
+    #[test]
+    fn aliyun_signature_is_unchanged_by_the_digest_0_11_migration() {
+        let mut params = HashMap::new();
+        params.insert("Action".to_string(), "DescribeDomainRecords".to_string());
+        params.insert("Format".to_string(), "JSON".to_string());
+        params.insert("Version".to_string(), "2015-01-09".to_string());
+        params.insert("AccessKeyId".to_string(), "test-access-key-id".to_string());
+        params.insert("SignatureMethod".to_string(), "HMAC-SHA1".to_string());
+        params.insert("SignatureVersion".to_string(), "1.0".to_string());
+        params.insert(
+            "SignatureNonce".to_string(),
+            "3f7c1b2a-0000-4a1b-9c8d-0123456789ab".to_string(),
+        );
+        params.insert("Timestamp".to_string(), "2026-01-02T03:04:05Z".to_string());
+        params.insert("RegionId".to_string(), "cn-hangzhou".to_string());
+        params.insert("DomainName".to_string(), "example.com".to_string());
+        params.insert("RR".to_string(), "_acme-challenge".to_string());
+        params.insert("Type".to_string(), "TXT".to_string());
+        params.insert(
+            "Value".to_string(),
+            "challenge token/with+special=chars".to_string(),
+        );
+        params.insert("TTL".to_string(), "600".to_string());
+
+        let provider = AliyunDnsProvider::new(
+            "test-access-key-id".to_string(),
+            "test-access-key-secret".to_string(),
+            "cn-hangzhou".to_string(),
+        );
+        provider.sign(&mut params);
+
+        assert_eq!(
+            params.get("Signature").map(String::as_str),
+            Some("vHcjunAwXce3jGejq6t/CsiNCAY=")
+        );
+    }
+
+    /// The same pin for the Tencent TC3-HMAC-SHA256 signer: the
+    /// `Authorization` header carries the signature, so a byte change
+    /// here turns every DNSPod call into an `AuthFailure` the operator
+    /// cannot explain.
+    ///
+    /// The expected value was produced by the **pre-upgrade**
+    /// implementation (`hmac 0.12` / `digest 0.10`).
+    #[test]
+    fn tencent_tc3_signature_is_unchanged_by_the_digest_0_11_migration() {
+        let provider =
+            TencentDnsProvider::new("test-secret-id".to_string(), "test-secret-key".to_string());
+        let signature = provider.sign_tc3(
+            "2026-01-02",
+            1767322445,
+            "createrecord",
+            r#"{"Domain":"example.com","SubDomain":"_acme-challenge","RecordType":"TXT","RecordLine":"默认","Value":"challenge-token","TTL":600}"#,
+        );
+        assert_eq!(
+            signature,
+            "1e3ed317917b3cff18fbfc35d6c312a1f1e3cd911850f58a875d464d9ba55f8f"
+        );
+    }
 
     #[test]
     fn txt_resolver_config_queries_exactly_the_cloudflare_resolvers() {

@@ -173,11 +173,8 @@ fn seed_tun_with_token(
     // value — `tun.token_hash = sha256(token)` is. The WS server
     // hashes the inbound bearer and matches against the hash.
     // Compute it here so the test exercises the same path as
-    // production.
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(token.as_bytes());
-    let hash = format!("{:x}", h.finalize());
+    // production — `db::sha256_hex` is that path.
+    let hash = db::sha256_hex(token);
     conn.execute(
         "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, ?6)",

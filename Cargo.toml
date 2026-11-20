@@ -86,7 +86,21 @@ serde_yaml = "0.9"
 figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 
 # Hashing — issue #39 stores `tun.token` as `sha256(token)` hex (V3 migration).
-sha2 = "0.10"
+#
+# 0.11 is the digest-0.11 ecosystem (issue #200): the output type moved
+# from generic-array to hybrid-array's `Array`, and `hmac 0.13` needs
+# the matching `EagerHash` implementations.  Every crate in *this*
+# workspace takes the hash crates from here, so our own code sits on
+# one version and never straddles the two digest ecosystems.
+#
+# The lock file still carries a `digest 0.10` alongside `digest 0.11`,
+# but every edge into it is a third-party crate we do not control:
+# `pangolin-tun 0.1` (published), `fastwebsockets 0.10` and
+# `tungstenite 0.24` (sha1 0.10), `rust-embed-utils 8.11` (sha2
+# 0.10) and `pingora-cache`'s `blake2 0.10` (digest 0.10).  The two
+# `digest` versions never meet at a type boundary here — no public
+# API of ours mentions a digest type.
+sha2 = "0.11"
 
 # CIDR parsing / matching for the IP rules (issue #117). The
 # knownbots crate already depends on it for its official IP ranges.
@@ -147,7 +161,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 
 # WebSocket (for Sec-WebSocket-Accept computation)
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.23"
 # Hex encoding — the token digests, the key fingerprints.
 hex = "0.4"
