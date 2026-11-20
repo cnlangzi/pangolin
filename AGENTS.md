@@ -110,7 +110,7 @@ breaks a contract an operator already depends on.
    ([development](docs/development.md))
 
 15. **The Docker build context is an allow-list:** source files are never
-   excluded, and `docker builder prune` clears the three cache mounts, so the
+   excluded, and `docker builder prune` clears the three cache locations, so the
    next image build recompiles everything. ([development](docs/development.md))
 
 ### Style

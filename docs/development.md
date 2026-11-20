@@ -230,13 +230,19 @@ end-to-end check.
 
 ## The BuildKit cache mounts
 
-Three cache mounts carry the build's expensive state between runs:
+Three cache locations carry the build's expensive state between runs:
 
-| Mount | Holds |
+| Cache location | Holds |
 | --- | --- |
 | `/usr/local/cargo/registry` | the downloaded crate sources and the registry index |
 | `/pangolin/target` | the cargo target dir — the bulk of the compilation reuse |
 | `/root/.cache/sccache` | the sccache compiler cache |
+
+The Dockerfile mounts the cargo registry and its index **separately**
+(`/usr/local/cargo/registry` and `/usr/local/cargo/registry/index`), so
+it declares four `--mount=type=cache` targets for the three locations
+above. `tests/src/cargo_mirror.rs` pins that list against the
+Dockerfile.
 
 They survive across `docker build` runs on the same machine, and they
 are **cleared by `docker builder prune`** — which also empties the

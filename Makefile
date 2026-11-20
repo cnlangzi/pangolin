@@ -182,10 +182,9 @@ ESBUILD_VERSION  := 0.28.0
 # `mv same-file` errors out and aborts the Make target.
 #
 # Depends on `build-css` so the local binary embeds the minified
-# `assets/app.css` — matching what the Docker `builder` stage
-# produces. Without this dependency the binary serves an empty
-# stylesheet and the admin UI looks unstyled, even though the
-# code compiled fine. docs/development.md explains the chain.
+# `assets/app.css`, matching what the Docker `builder` stage produces —
+# without it the admin UI ships unstyled. See "The dependency chain" in
+# docs/development.md.
 build: build-css
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx -p tun
