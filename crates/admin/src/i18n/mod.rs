@@ -438,8 +438,8 @@ mod tests {
         // picked out of the catalog would make the assertion vacuous
         // the day the last area is translated, and the fallback would
         // lose its only test without anyone noticing. Move the pin
-        // when the `bots` area is translated.
-        const UNTRANSLATED: &str = "bots.back";
+        // when the `referers` area is translated.
+        const UNTRANSLATED: &str = "referers.title";
         let chinese = catalog_for(Lang::ZhCn);
         let english = catalog_for(Lang::En);
         assert!(
