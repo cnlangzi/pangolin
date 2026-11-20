@@ -83,8 +83,9 @@ pub const AREAS: &[&str] = &[
 /// Issue #182 translated the logs: the live access log and the bot
 /// logs with their history and their stats. The two live in one
 /// issue because they share the same vocabulary — a request, a bot,
-/// a status code, a referrer — and a term that is translated two
-/// ways on two pages is how an interface starts to feel untranslated.
+/// a status code, a host, a duration — and a term that is translated
+/// two ways on two pages is how an interface starts to feel
+/// untranslated.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
     "bots",

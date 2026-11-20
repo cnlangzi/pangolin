@@ -5053,6 +5053,13 @@ async fn admin_ui_access_and_bot_log_pages_render_chinese() {
         !body.contains("Verification status"),
         "the English verification panel title must be gone: {body}"
     );
+    // The sub-nav is pinned in markup, not as a bare word: the page
+    // title carries "统计" too, so a plain substring would still pass
+    // if the sub-nav label fell back to English.
+    assert!(
+        body.contains(">统计</a>"),
+        "the Chinese sub-nav label must be rendered: {body}"
+    );
 
     // ── the bot-log history ──
     let body = page_body(&client, "/logs/bots/history").await;
@@ -5074,7 +5081,7 @@ async fn admin_ui_access_and_bot_log_pages_render_chinese() {
     // ── the bot-log stats ──
     let body = page_body(&client, "/logs/bots/stats").await;
     for (needle, what) in [
-        ("统计", "the sub-nav"),
+        ("爬虫日志 —— 统计", "the page title"),
         ("一天一个主机", "the subtitle"),
         ("计数来自", "the footnote"),
     ] {
