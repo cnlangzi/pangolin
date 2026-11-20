@@ -4827,8 +4827,12 @@ async fn admin_ui_cert_dns_ratelimit_and_settings_pages_render_chinese() {
         "the Chinese test-connection button must be rendered: {body}"
     );
     assert!(
-        body.contains("凭据"),
+        body.contains("② 凭据"),
         "the Chinese credentials heading must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("Credentials"),
+        "the English credentials heading must be gone: {body}"
     );
     // The credential field names stay English — they are the field
     // names of the cloud vendor's own console.
@@ -4850,23 +4854,32 @@ async fn admin_ui_cert_dns_ratelimit_and_settings_pages_render_chinese() {
     for (needle, what) in [
         ("添加 IP 规则", "add-rule heading"),
         ("各站点策略", "per-site policy heading"),
-        ("IP 规则", "rules heading"),
     ] {
         assert!(
             body.contains(needle),
             "the Chinese {what} must be rendered: {body}"
         );
     }
+    // The rules heading is "IP 规则" — a substring of the add-rule
+    // heading above and of the empty state, so the needle pins the
+    // element boundary: only the heading itself renders as "…>IP 规则<".
+    assert!(
+        body.contains(">IP 规则<"),
+        "the Chinese rules heading must be rendered: {body}"
+    );
     assert!(
         !body.contains("Add an IP rule"),
         "the English add-rule heading must be gone: {body}"
+    );
+    assert!(
+        !body.contains("IP rules"),
+        "the English rules heading must be gone: {body}"
     );
 
     // ── the settings ──
     let body = page_body(&client, "/settings").await;
     for (needle, what) in [
         ("客户端 IP 取源", "client-IP card title"),
-        ("源站防护", "origin-guard card title"),
         ("IP 信誉", "IP-reputation card title"),
     ] {
         assert!(
@@ -4874,9 +4887,20 @@ async fn admin_ui_cert_dns_ratelimit_and_settings_pages_render_chinese() {
             "the Chinese {what} must be rendered: {body}"
         );
     }
+    // The origin-guard card title is "源站防护" — a substring of the
+    // rejection counter below it ("源站防护累计拒绝次数：") and of the
+    // provider descriptions, so the needle pins the element boundary.
+    assert!(
+        body.contains(">源站防护<"),
+        "the Chinese origin-guard card title must be rendered: {body}"
+    );
     assert!(
         !body.contains("Client IP resolution"),
         "the English client-IP card title must be gone: {body}"
+    );
+    assert!(
+        !body.contains("Origin guard"),
+        "the English origin-guard card title must be gone: {body}"
     );
 }
 
@@ -4884,9 +4908,9 @@ async fn admin_ui_cert_dns_ratelimit_and_settings_pages_render_chinese() {
 /// #181) — they are the messages the operator reads when the form
 /// rejects the submission.
 ///
-/// The wrapper is translated, the quoted diagnostic is not: the error
-/// keeps the underlying text in its placeholder, so the operator still
-/// sees what the parser actually complained about.
+/// The message is translated; the credential field name it quotes is
+/// not: "Access Key ID" is the field name of the cloud vendor's own
+/// console, so the operator has to find the very same words there.
 #[tokio::test]
 async fn admin_ui_cert_and_dns_validation_errors_render_chinese() {
     let ngx = start_ngx().await;
@@ -4940,5 +4964,26 @@ async fn admin_ui_cert_and_dns_validation_errors_render_chinese() {
     assert!(
         body.contains("名称只能是小写字母、数字、下划线或连字符"),
         "the Chinese name error must be rendered: {body}"
+    );
+
+    // A DNS provider without its Secret ID: the message is Chinese,
+    // the field name inside it stays English.
+    let page = page_body(&client, "/dns/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/dns/new",
+            &[
+                ("name", "zh-tencent"),
+                ("kind", "tencent"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("请填写 Secret ID"),
+        "the Chinese Secret-ID error must be rendered: {body}"
     );
 }
