@@ -19,9 +19,9 @@ const EN_JSON: &str = include_str!("../../i18n/en.json");
 
 /// The Simplified Chinese catalog.
 ///
-/// Empty in issue #178: that issue delivers the framework only, so
-/// the interface renders in English until the translation issues
-/// land.
+/// Translated area by area: the areas that are done are listed in
+/// [`COMPLETED_AREAS`], and every other area falls back to the
+/// English catalog until its translation issue lands.
 const ZH_CN_JSON: &str = include_str!("../../i18n/zh-CN.json");
 
 /// A parsed catalog: key → text.
@@ -64,8 +64,24 @@ pub const AREAS: &[&str] = &[
 /// fails if one of those keys goes missing — so "translated" cannot
 /// silently rot into "half translated".
 ///
-/// Empty in issue #178: no area is translated yet.
-pub const COMPLETED_AREAS: &[&str] = &[];
+/// Issue #179 translated the global chrome: the navigation, the
+/// shared labels, the login page, the dashboard, the shared
+/// components, the relative times, the activity feed and the
+/// client-side strings. The `lang` area is listed too: the language
+/// switcher shows every language in its own name, so there is
+/// nothing to translate in it — but the two catalogs have to agree
+/// about that.
+pub const COMPLETED_AREAS: &[&str] = &[
+    "activity",
+    "common",
+    "components",
+    "dashboard",
+    "js",
+    "lang",
+    "login",
+    "nav",
+    "time",
+];
 
 /// The catalog of one language.
 pub fn catalog_for(lang: Lang) -> &'static Catalog {
@@ -165,7 +181,10 @@ mod tests {
         // Both files are embedded at compile time; an empty JSON
         // object is a valid catalog.
         assert!(en().contains_key("nav.sites"));
-        assert_eq!(zh_cn().len(), 0);
+        // The Chinese catalog has text: the areas issue #179
+        // translated are in it, and the switcher only shows the
+        // language when its catalog is not empty.
+        assert!(zh_cn().contains_key("nav.sites"));
     }
 
     #[test]

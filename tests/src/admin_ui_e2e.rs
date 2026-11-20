@@ -4321,7 +4321,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §23 — Interface language (issue #178) ────────────────────────────────────
+// ── §23 — Interface language (issues #178, #179) ─────────────────────────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
@@ -4440,5 +4440,83 @@ async fn admin_ui_lang_cookie_overrides_accept_language() {
     assert!(
         body.contains(r#"<html lang="en">"#),
         "the language cookie must win over accept-language: {body}"
+    );
+    // The English wording is rendered — the cookie really did pick the
+    // language, not just the `<html lang>` attribute.
+    assert!(
+        body.contains("Username"),
+        "the English login page must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("用户名"),
+        "the Chinese login page must not be rendered: {body}"
+    );
+}
+
+/// The switcher is on the page and it really switches the interface
+/// to Chinese (issue #179).
+#[tokio::test]
+async fn admin_ui_lang_switcher_is_visible_and_switches_to_chinese() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The switcher is rendered as soon as there is more than one
+    // language to choose from.
+    let resp = client.get("/").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/lang/"),
+        "the language switcher must be rendered: {body}"
+    );
+
+    // The switcher writes the cookie; the cookie store keeps it.
+    let resp = client.get("/lang/zh-CN").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let resp = client.get("/").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="zh-CN">"#),
+        "the switched page must declare the Chinese locale: {body}"
+    );
+    // The navigation is Chinese — "站点" is the `nav.sites` entry.
+    assert!(
+        body.contains("站点"),
+        "the Chinese navigation must be rendered: {body}"
+    );
+    assert!(
+        !body.contains(">Sites<"),
+        "the English navigation must be gone: {body}"
+    );
+}
+
+/// The login page is translated too — the operator has to be able to
+/// sign in before the switcher is reachable behind the login.
+#[tokio::test]
+async fn admin_ui_login_page_renders_chinese() {
+    let ngx = start_ngx().await;
+    let client = new_client_no_redirect();
+    let resp = client
+        .get(&ngx.admin_url("/login"))
+        .header("accept-language", "zh-CN")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="zh-CN">"#),
+        "the accept-language header must select the locale: {body}"
+    );
+    assert!(
+        body.contains("用户名"),
+        "the Chinese login page must be rendered: {body}"
+    );
+    assert!(
+        !body.contains(">Username<"),
+        "the English login page must not be rendered: {body}"
     );
 }

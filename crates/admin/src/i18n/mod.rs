@@ -18,6 +18,9 @@
 //!   remembers the operator's choice.
 //! - [`sanitize_next`] — the guard on the `next` parameter of the
 //!   language switcher (an open-redirect guard).
+//! - the `quality` module — the gates that keep the Chinese catalog
+//!   from rotting into a machine translation. They are a test-only
+//!   module: nothing in the running process needs them.
 //!
 //! ## The fallback chain
 //!
@@ -27,6 +30,9 @@
 //! panic inside a request handler becomes a 500.
 
 pub mod catalog;
+
+#[cfg(test)]
+mod quality;
 
 use std::borrow::Cow;
 
@@ -425,14 +431,24 @@ mod tests {
     #[test]
     fn t_falls_back_to_en_then_to_missing_marker() {
         // A key that only the English catalog has falls back to
-        // English for every other language.
-        let key = catalog_for(Lang::En)
-            .keys()
-            .next()
-            .expect("en catalog is not empty");
+        // English for every other language — that fallback is what
+        // carries the areas that are not translated yet.
+        //
+        // The key is *pinned*, not derived from the catalog: a key
+        // picked out of the catalog would make the assertion vacuous
+        // the day the last area is translated, and the fallback would
+        // lose its only test without anyone noticing. Move the pin
+        // when the `bots` area is translated.
+        const UNTRANSLATED: &str = "bots.back";
+        let chinese = catalog_for(Lang::ZhCn);
+        let english = catalog_for(Lang::En);
+        assert!(
+            !chinese.contains_key(UNTRANSLATED),
+            "{UNTRANSLATED} is translated now — pin another key for the fallback test"
+        );
         assert_eq!(
-            Lang::ZhCn.t(key).as_ref(),
-            catalog_for(Lang::En).get(key).unwrap()
+            Lang::ZhCn.t(UNTRANSLATED).as_ref(),
+            english.get(UNTRANSLATED).unwrap()
         );
         // A key nobody has is a visible marker, not a panic. The key
         // is built at runtime so the catalog gate test does not read
