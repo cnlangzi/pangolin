@@ -132,4 +132,4 @@ sudo mkdir -p /usr/local/pangolin && sudo tar -xzf "pangolin_${VERSION}_linux_am
 
 ## 开发
 
-需要 **Rust 1.96**。提交前请跑 `make lint`；贡献代码前请读 [`AGENTS.md`](./AGENTS.md) —— 里面写了提交前必须跑什么、迁移文件为什么不能改、管理界面资源如何构建。
+需要 **Rust 1.96**。提交前请跑 `make lint`；贡献代码前请读 [`AGENTS.md`](./AGENTS.md) —— 里面是规则清单，每条规则都指向说明细节的文档（索引见 [`docs/`](./docs/README.md)）。

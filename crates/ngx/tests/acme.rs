@@ -13,7 +13,8 @@
 //! otherwise-valid anti-replay nonces by default, and instant-acme
 //! only retries a badNonce three times — so without it these tests
 //! flake roughly 1 run in 250 with "JWS has an invalid anti-replay
-//! nonce".  See the Pebble section in AGENTS.md.
+//! nonce".  See the `PEBBLE_WFE_NONCEREJECT=0` section of
+//! docs/development.md.
 //!
 //! Run with: cargo test --features integration -p ngx
 

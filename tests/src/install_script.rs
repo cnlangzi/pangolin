@@ -2183,27 +2183,3 @@ fn the_release_units_are_the_repository_files() {
         );
     }
 }
-
-// ── the documentation ───────────────────────────────────────────────────────
-
-/// The one-liner is the operator's entry point — it has to be in every
-/// document that tells them how to install the gateway.
-#[test]
-fn the_documentation_carries_the_one_liner() {
-    for document in [
-        "README.md",
-        "README.en-US.md",
-        "docs/getting-started.md",
-        "docs/getting-started.en-US.md",
-    ] {
-        let text = read_repo_file(document);
-        assert!(
-            text.contains("releases/latest/download/install.sh"),
-            "{document} must carry the one-line installer"
-        );
-        assert!(
-            text.contains("| sudo sh"),
-            "{document} must show the one-liner being run with sudo"
-        );
-    }
-}

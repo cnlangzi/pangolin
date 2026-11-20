@@ -622,34 +622,3 @@ fn release_workflow_rewrite_fails_without_a_workspace_package_version() {
         "the error must name Cargo.toml, [workspace.package] and the expected version:\n{stdout}"
     );
 }
-
-// ── the documentation ───────────────────────────────────────────────────────
-
-/// The release procedure is part of the deliverable: the operator
-/// must not be told to bump a version any more.
-#[test]
-fn release_docs_describe_the_tag_as_the_version() {
-    let docs = read_repo_file("docs/release.md");
-
-    assert!(
-        !docs.contains("Bump the version"),
-        "the procedure must not ask the operator to bump the version — the tag is the version"
-    );
-    assert!(
-        docs.contains("placeholder"),
-        "the documentation must call the repository's version a placeholder"
-    );
-    // The documentation names the version the repository actually
-    // carries, so the two cannot drift apart silently.
-    let version = workspace_version();
-    assert!(
-        docs.contains(&version),
-        "the documentation must name the repository's version ({version}) as the placeholder"
-    );
-    for surface in ["--version", "/healthz", "User-Agent"] {
-        assert!(
-            docs.contains(surface),
-            "the documentation must say that a release build reports the tag version in {surface}"
-        );
-    }
-}

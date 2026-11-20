@@ -1,14 +1,15 @@
 # AGENTS.md
 
-Working guidance for AI agents (and humans) contributing to this repo.
+Pangolin is a reverse-proxy gateway: this repository builds the
+`pangolin-ngx` process, the `pangolin-tun` tunnel client and the admin
+UI. Every rule below binds the change you are making — check it before
+you edit. [README.md](./README.md) is the project overview;
+[docs/README.md](./docs/README.md) is the documentation index.
 
-See [README.md](./README.md) for the project overview and terminology, and
-[docs/](./docs/README.md) for the architecture and design detail.
+## Glossary
 
-## Naming
-
-Six words carry the project's vocabulary. They are used consistently
-across the code, the documentation and the UI.
+Six words carry the project's vocabulary. Use them consistently across
+the code, the documentation and the UI.
 
 - **Pangolin** — a running gateway: the `pangolin-ngx` process. This
   is what an operator runs and what a fleet consists of. Lives in
@@ -22,7 +23,7 @@ across the code, the documentation and the UI.
 - **API** — the dashboard-facing management interface of one node: a
   JSON API under `/api/v1/`, on its own listener, with its own
   authentication. Lives in `crates/api/`, specified in
-  `docs/design/api.md`.
+  [docs/design/api.md](docs/design/api.md).
 - **tun** — the tunnel client: the `pangolin-tun` process that opens
   the tunnel to a gateway. Lives in `crates/tun/` and in the
   `tun` table.
@@ -30,562 +31,163 @@ across the code, the documentation and the UI.
   of the `tun` table. Lives in `crates/pangolin-core/src/types.rs`
   (`Tun`) and `crates/pangolin-core/src/db.rs`.
 
-## Before every commit
+## Design principles
 
-Run `make lint` locally before committing. CI runs the same target and
-fails the build on any warning — including `clippy::useless_format`,
-unused imports, and rustfmt diffs. A lint that passes locally but
-fails in CI costs ~10 minutes of round-trip per attempt.
+Seven invariants shape the gateway. A change that breaks one of them
+breaks a contract an operator already depends on.
 
-```bash
-make lint          # fmt-check + clippy --workspace --all-targets + test
-```
-
-If `make lint` complains, fix the code and re-run — do **not** ship a
-commit just because `cargo build` works. `cargo build` does not run
-clippy or fmt-check.
-
-## Every new feature and bug fix must ship with a regression test
-
-Code without a test is a code path that will silently rot. Every
-non-trivial change — a new feature, a bug fix, a refactor that
-touches observable behaviour — ships with at least one test that
-would have failed before the change and passes after it. Pick the
-right tier for the change:
-
-- **Unit test** (`#[cfg(test)] mod tests` in the same file, or a
-  sibling test file): pure-logic functions, parsers, helpers, the
-  shared `pangolin_core::is_streaming_request`-style heuristics.
-  Cheapest to run; ideal for any change that doesn't need a real
-  process or network.
-- **Integration test** (`tests/src/<topic>.rs`, harness-style):
-  multi-component behaviour that still runs entirely in-process —
-  e.g. a request-filter branch that needs the proxy machinery but
-  not a real subprocess. Uses the `harness.rs` helpers
-  (`init_pangolin_db`, `seed_site`, …) without spawning the binary.
-- **E2E test** (`real_e2e_*` in `tests/src/`): anything that needs
-  the real `pangolin-ngx` / `pangolin-tun` binaries, real TCP,
-  real ACME, real filesystem, or a real signal. Gate behind
-  `--features integration` so day-to-day `cargo test --lib` skips
-  them.
-- **Client-side test** (`tests/js/*.test.js`): behaviour of
-  `assets/app.js`. The admin UI has no browser automation, so the
-  test drives the script itself in a `vm` context with a DOM stub —
-  that way it exercises the file that is served to the operator
-  instead of a copy of its logic. Run with `make test-js` (node's
-  built-in test runner, no dependencies; skipped when node is
-  missing).
-
-The test should be named so the regression it pins is obvious from
-the function name — `real_e2e_direct_sse_streams_through` is better
-than `sse_test_3`. When you find a bug, the fix commit and the
-regression test go in the same PR; the test description explains
-*what* the bug was and *why* the test would have caught it, so the
-next person reading the diff knows what the test is for without
-running it.
-
-If a fix is genuinely untestable (e.g. it depends on a kernel
-quirk you can't reproduce in CI), say so in the PR description —
-don't silently ship an unverified change.
-
-## Migrations are append-only — never rename or edit an applied .sql
-
-[`refinery`] records every applied migration as a
-`(version, name, checksum)` row in `refinery_schema_history`. Once a
-migration has shipped — i.e. is in any DB, dev box or production —
-the file is immutable for the lifetime of that DB:
-
-- **Never rename** `V{N}__foo.sql` → `V{M}__bar.sql`. Every DB that
-  already ran the old name stores a row keyed to `(N, foo)`, and on
-  next startup the binary fails with
-  `applied migration V{N}__foo is different than filesystem one
-  V{M}__bar` and refuses to launch. Production included.
-- **Never edit** the SQL body of an applied migration. Even an
-  added comment changes the SipHasher-13 checksum that refinery
-  baked into the history table, and the same checksum-mismatch
-  failure fires on every existing DB.
-- To change the schema, **add a new migration** at the next version
-  number — `V{N+1}__fix_foo.sql` doing a forward-only `ALTER TABLE` —
-  not a rewrite of the old file.
-
-To insert a new feature *between* two existing migrations in the
-narrative sense, give it a number **higher than anything already
-shipped** (`V{N+1}`, `V{N+2}` …). The history must be append-only
-from the first commit that introduced migrations. Renumbering old
-files to "make room" is what caused the `V5__add_domain_challenge_kind`
-vs `V5__cert_error_class` collision that bricked a dev DB on
-2026-09-19 and would have bricked all four production hosts the
-next time they pulled.
-
-If you ever hit the mismatch error on a dev box, the local DB has
-drifted from canonical history. The fix is local-only — production
-DBs at the correct version are unaffected:
-
-```bash
-rm -f pangolin.db pangolin.db-shm pangolin.db-wal   # local dev only
-make start-ngx                                    # re-applies V1..V{N}
-```
-
-Never `UPDATE refinery_schema_history` or hand-run an `ALTER TABLE`
-to silence the checksum mismatch — that hides the real bug and
-breaks the next fresh DB that tries to apply the canonical history.
-
-[`refinery`]: https://docs.rs/refinery
-
-## Admin UI assets: single source, Docker-minified, host minifies for local binaries
-
-All admin UI assets live in `assets/` at the repo root, snapshotted
-into the binary by `rust-embed` (`crates/admin/src/assets.rs`,
-`#[folder = "../../assets/"]`):
-
-| File | Tracked? | Role |
+| # | Invariant | Design documents |
 | --- | --- | --- |
-| `assets/tailwindcss.css` | yes | Tailwind CLI input (has `@tailwind` directives) |
-| `assets/app.js`           | yes | Hand-written JS source, no imports |
-| `assets/app.css`          | **no** | Tailwind CLI output. Generated by the Docker `builder` stage (`--minify`) and by `make build-css` on the host. |
+| 1 | **One forwarding path.** A direct backend and a tun backend go through the same pingora machinery; the tun is a byte splice and does not speak HTTP. | [tunnel](docs/design/tunnel.md), [reverse-proxy](docs/design/reverse-proxy.md) |
+| 2 | **One HTTP client on the data plane.** pingora carries every forwarded request; `reqwest` in the gateway is control plane (the DNS provider API, the provider range fetch), and the DNS-01 TXT check goes through hickory-resolver. | [reverse-proxy](docs/design/reverse-proxy.md) |
+| 3 | **Configuration in YAML, state in SQLite, only derived data in memory.** The indexes over domains, limits, providers, certs and tuns are rebuilt after the admin writes them; a new process-local cache has to say how it reconciles with the database. | [routing-and-index](docs/design/routing-and-index.md) |
+| 4 | **admin and API are two listeners with two authentication schemes.** admin is the node's own browser interface (cookie session plus CSRF); the API is the dashboard-facing JSON interface with its own authentication; the dashboard is not a caller of admin and the two must not share a session. | [api](docs/design/api.md) |
+| 5 | **Side channels do not take part in the forwarding decision.** The access log, bot log, referer log and traffic counters are in-memory ring buffers plus side files; their failure must not affect request forwarding. | [access-log](docs/design/access-log.md), [bot-log](docs/design/bot-log.md), [referer-log](docs/design/referer-log.md), [traffic](docs/design/traffic.md) |
+| 6 | **Failures stay local.** A tun going offline, a site that fails to resolve, a missing certificate, a provider list that fails to download — none of them may take the gateway down. | [rate-limit](docs/design/rate-limit.md), [cert-link](docs/design/cert-link.md), [provider](docs/design/provider.md) |
+| 7 | **What is published is a contract.** The tun wire protocol, the API contract, the configuration keys and the database schema are interfaces that have shipped; changing them is a breaking change that needs a version and a migration note. | [tunnel](docs/design/tunnel.md), [api](docs/design/api.md), [migrations](docs/migrations.md) |
 
-- `make build-css` runs `bin/tailwindcss --minify` to produce the
-  same `assets/app.css` that the Docker `builder` stage would
-  produce — the same command, the same CLI version, the same
-  output. The output is gitignored; it is regenerated every time
-  the Makefile target runs.
-- `make build-ngx`, `make start-ngx`, and (transitively)
-  `make install-ngx` all depend on `build-css` so the local
-  binary embeds a styled `app.css`. Without this chain the
-  admin UI renders unstyled and the operator can't tell that
-  their fix took effect.
-- `make build` (the unified `ngx + tun` build) also depends on
-  `build-css` — same reason. `make build-dist` does **not**:
-  the Docker `builder` stage runs the same Tailwind command
-  inside the image, so the host doesn't need to download the
-  CLI just to produce a Docker artefact. See
-  `build/docker/dist.dockerfile`.
-- `make build-ui` (and `make dev-ui`) is the **dev convenience**
-  target: unminified Tailwind output so the local binary serves
-  readable CSS for hand-tuning. It is **not** a substitute for
-  `build-css` in `build-ngx` — `build-ngx` always runs the
-  minified form.
-- The `install-ngx` chain reaching `build-css` means `sudo make
-  install-ngx` on a host without network access will fail when
-  `download-ui-tools` tries to fetch the tailwindcss / esbuild
-  CLIs. Build the binary on a networked host and copy
-  `bin/pangolin-ngx` over instead.
-- When adding a new hand-written JS source, prefer keeping it
-  import-free so dev can serve the raw file directly. If imports
-  become necessary, wire `esbuild` into `dev-ui` (watch mode) so dev
-  keeps working without re-running a manual build step.
+## Rules
 
-## The one-line installer is POSIX `sh`
+### Process
 
-`install.sh` in the repository root is the operator's first contact
-with a release — `curl -fsSL …/install.sh | sudo sh` has to produce a
-gateway that actually runs.  It is published as a release asset and
-copied byte for byte, so **the file in the repository is the file
-everybody runs**; there is no second copy to keep in sync.
+1. **Run `make lint` before every commit.** CI runs the same target and fails on
+   any warning — including `clippy::useless_format`, unused imports and rustfmt
+   diffs. (`make lint`: fmt-check + clippy `--workspace --all-targets` + test.)
 
-Three rules, all of them load-bearing:
+2. **Every change ships a regression test** that would have failed before it.
+   Name the test so the regression it pins is obvious from the function name
+   (`real_e2e_direct_sse_streams_through`, not `sse_test_3`).
 
-- **POSIX `sh`, not bash.**  macOS ships bash 3.2 and Linux bash 5.x,
-  and a bashism breaks the installer on one of the two platforms it
-  exists to serve.  `sh -n install.sh` has to pass, and `[[`, `source`,
-  arrays, `${var,,}`, `$RANDOM`, `mapfile` and `readarray` must not
-  appear in it.  The regression test enforces this.
-- **Verify before writing.**  Every download — the archive, the
-  checksum file and the two units — is verified against
-  `SHA256SUMS.txt` *before* the install directory is touched.  A
-  failed checksum must leave nothing behind, so a failed install can
-  simply be run again.
-- **Never overwrite the operator's configuration.**  An existing
-  `ngx.yml` / `tun.yml` is kept byte for byte; an existing binary or
-  systemd unit is renamed to `<name>.bak` first — the same
-  rolling-backup convention the Ansible role uses.
+3. **A behaviour change updates the document that describes that behaviour** in
+   the same pull request; the `docs/design/*` documents are written first. (See
+   [Documentation Rules](#documentation-rules).)
 
-Two more that the Ansible role taught us the hard way:
+4. **One issue, one branch, one pull request.** The pull request title is a
+   Conventional Commits subject, the body names the regression the test pins,
+   and the issue is closed when the change lands.
 
-- **The `pangolin` user needs a group of its own.**  The unit says
-  `Group=pangolin` and the install directory is handed over to
-  `pangolin:pangolin`, but `useradd` only creates a same-named group
-  where `USERGROUPS_ENAB` is yes — on the RHEL family it is not, and
-  the user lands in the default group.  The installer passes
-  `--user-group` for that reason.
-- **A re-run has to restart a running gateway.**  `systemctl enable
-  --now` leaves an active unit alone, so the freshly installed binary
-  would not be the one serving.  The installer restarts the unit when
-  it was already active, and waits for a freshly started one to come
-  up before it claims success.
+5. **Iterate with the narrowest test that covers the change**, and run the full
+   end-to-end suite before opening a pull request.
+   ([development](docs/development.md))
 
-The script's knobs are environment variables (`PANGOLIN_VERSION`,
-`PANGOLIN_INSTALL_DIR`, `PANGOLIN_BASE_URL`, `PANGOLIN_LATEST_URL`,
-`PANGOLIN_NO_SERVICE`, `PANGOLIN_SYSTEMD_DIR`), so the regression
-test in `tests/src/install_script.rs` can drive the whole thing
-against a local HTTP server that impersonates a GitHub Release.
-`PANGOLIN_SYSTEMD_DIR` exists for that test — it is where the units
-are installed, `/etc/systemd/system` in production.
+### Invariants
 
-Only a release that ships the **packaged configuration and the
-systemd units** can be installed with the script — the releases
-before them carry the two binaries only, and the installer says so
-instead of installing a gateway that would run on its built-in
-development defaults.
+6. **Migrations are append-only.** Never rename or edit an applied `.sql`; add
+   `V{N+1}__…` instead. ([migrations](docs/migrations.md))
 
-Changing the script means changing the release workflow too: the
-publishing job copies `install.sh` and the two units out of the
-repository into `dist/`, and `SHA256SUMS.txt` covers all three.  The
-same test file asserts that the units the release publishes are the
-repository's own files — the release copies them, it does not write a
-second copy that could drift apart.
+7. **Dependencies come from published releases** — no third-party fork is kept
+   here. A `[patch]` entry that does not satisfy the requirement is ignored by
+   cargo. ([pingora-dependency](docs/design/pingora-dependency.md))
 
-## Packaging conventions
+8. **The tun wire protocol is a compatibility contract.** Changing it means
+   bumping the protocol version in the `pangolin-tun` crate and shipping the
+   gateway and the tunnel together. ([tunnel](docs/design/tunnel.md))
 
-The `packaging/` tree builds the deb / rpm packages and the apt /
-rpm repository.  Four rules, all of them load-bearing.
+9. **The `/api/v1/` signing protocol, error codes and resource shapes are
+   published to the dashboard**; changing them is a breaking change.
+   ([api](docs/design/api.md))
 
-**Runtime state never enters a package.**  A package holds the
-binary, the systemd unit, the configuration template and empty
-directory skeletons.  The SQLite database, the ACME certificates,
-the JSONL logs, the knownbots cache and the tunnel node's pin file
-are written by the running service: a package that owned them would
-overwrite them on every upgrade, and `/usr/local`-style layouts lose
-the data on the first package upgrade.  The regression test
-(`tests/src/packaging.rs`) pins the file list of each package
-against the documented layout, so a file that sneaks in fails the
-build.
+10. **`.env` stays out of the repository; `.env.example` is committed.** The
+   tracked test material `crates/ngx/tests/pebble-root.pem` and
+   `tests/fixtures/dashboard_dev_seed.hex` may look secret; keep them.
 
-**The configuration templates are their own files.**
-`packaging/config/ngx.yml` and `packaging/config/tun.yml` are *not*
-the repository's root `ngx.yml` / `tun.yml`.  The root files are
-development defaults — relative paths, the non-privileged ports, and
-a few retired keys — and the configuration loader does **not** refuse
-unknown keys, so a stale key in the template would be silently
-ignored with a warning the operator never sees.  The packaged
-templates carry absolute paths, and the test asserts that they
-carry no `./` and no retired key.
+11. **Generated artefacts are never edited by hand:** `assets/app.css` and the
+   `gh-pages` branch are produced by the build.
+   ([development](docs/development.md), [release](docs/release.md))
 
-**The glibc floor is measured, never written down.**  The
-dependency list of a package names the glibc version the binary
-needs, and the build reads it out of the binary itself:
+### Hard constraints
 
-```bash
-objdump -T <binary> | grep -o 'GLIBC_[0-9][0-9.]*' | sort -V | tail -1
-```
+12. **`install.sh` and the packaging maintainer scripts are POSIX `sh`**;
+   `sh -n` has to pass on them. ([release](docs/release.md))
 
-A hardcoded floor goes stale the moment the toolchain or a
-dependency changes, and a stale floor is worse than none — it keeps
-the package off a host that could run it, or lets it onto a host
-that cannot.  The measurement runs on the runner of the
-architecture being packaged: Ubuntu's `objdump` only knows the
-architecture it was built for, and says "File format not recognized"
-for the other one.
+13. **A package carries no runtime state,** and the configuration template
+   inside a package is the packaged one, not the repository-root development
+   default. ([release](docs/release.md))
 
-**The `gh-pages` branch is a generated artefact.**  It holds the
-site tree the repository serves, and every release replaces the
-whole tree — a hand-made commit on it is overwritten by the next
-release.  Never commit to it by hand, and never treat it as a
-source of truth: the packages in it are built artefacts, and the
-release assets are where a specific version lives.
+14. **The crates.io mirror block lives in `build/cargo-mirror.toml`;**
+   `make cargo-mirror` / `make cargo-mirror-off` install and remove it in the
+   host cargo config — generated, never hand-edited.
+   ([development](docs/development.md))
 
-Two smaller ones, for the same reason:
+15. **The Docker build context is an allow-list:** source files are never
+   excluded, and `docker builder prune` clears the three cache locations, so the
+   next image build recompiles everything. ([development](docs/development.md))
 
-- **The configuration files are conffiles** (`config|noreplace`).
-  The operator's edits have to survive an upgrade untouched and
-  without an interactive prompt, and a deleted file has to come
-  back.  Changing the type changes that contract.
-- **The packaging scripts are POSIX `sh`.**  dpkg runs maintainer
-  scripts with `/bin/sh`, and so does rpm's scriptlet interpreter —
-  a bashism breaks the installation on the distribution that matters.
-  `sh -n` has to pass.
+### Style
 
-## Local development: targeted tests, not the full e2e suite
+16. **Style:** `snake_case` / `CamelCase` / `SCREAMING_SNAKE`, local convention
+   over the Rust default; `anyhow::Result` at module boundaries, `thiserror` in
+   core types, never `unwrap`; `tokio` everywhere; imports grouped std /
+   external / internal, alphabetised. [Comment Rules](#comment-rules).
 
-`make test-e2e` builds release binaries and runs the **entire**
-integration suite (~3-5 min cold, ~40s warm). Reserve it for:
+17. **Operator-facing admin UI strings come from the i18n catalog**
+   (`crates/admin/i18n/<code>.json`), never from a template or from Rust; a new
+   template struct carries `pub lang: Lang`, its handler takes `lang: Lang`.
+   ([i18n](docs/admin/i18n.md))
 
-- Before opening a PR
-- After touching `proxy.rs`, `tunnel.rs`, `tls.rs`, or anything in
-  `crates/admin` that touches routing/auth
-- When you've made multiple unrelated changes
+## Documentation Rules
 
-For day-to-day iteration on a single feature, run only the test(s)
-that exercise it. Patterns:
+1. **The document is the source of truth, the code follows it.** A behaviour
+   change updates the document describing it: `docs/design/*`,
+   `docs/configuration.md`, `docs/release.md`, `docs/migrations.md`.
 
-```bash
-# Unit tests in the crate you changed — fastest feedback (<1s):
-cargo test -p ngx --lib
+2. **`AGENTS.md` holds rules and pointers only.** Detail belongs in `docs/`,
+   linked from the rule; a rule longer than three lines has its remainder moved
+   out. *(This binds the documentation's maintainer, not the task's agent.)*
 
-# A single test file under crates/ngx/tests/:
-cargo test --features integration -p ngx acme::tests::acme_issue_ecdsa_single_domain
+3. **One fact, one place.** The same rule is not written twice — once in
+   `AGENTS.md` and once under `docs/`; changing one side changes the other.
 
-# A single e2e test under tests/src/real_e2e.rs:
-cargo test --features integration -p pangolin-integration-tests real_e2e_acme_http01
+4. **The operator-facing documents have `.en-US.md` twins** —
+   `docs/getting-started.md`, `docs/packaging.md`, `docs/features.md` and
+   `docs/comparison.md` — and changing the Chinese original changes the twin.
 
-# Run by substring (matches the test fn name):
-cargo test --features integration -p pangolin-integration-tests real_e2e_tunnel
-```
+5. **Documentation is reviewed, not tested.** No test asserts a document
+   contains a particular string. Tests cover code and the contract artefacts:
+   manifests, lockfiles, CI workflows, scripts, packaged file lists.
 
-`--features integration` is required for everything that talks to a
-binary or to Pebble. Without it, those tests are filtered out
-(quietly — no error).
+6. **Write for whoever hits it next.** Say when the problem occurs and why the
+   decision was made, then give the steps; do not restate the code or what
+   `README.md` already says.
 
-When you change only one crate, scope clippy to that crate:
+7. **A new document enters the index.** A new document under `docs/` is listed
+   in [docs/README.md](docs/README.md).
 
-```bash
-cargo clippy -p ngx --all-targets -- -D warnings
-```
+## Comment Rules
 
-This is ~10× faster than `clippy --workspace --all-targets` and
-catches the same issues for your code.
+1. A comment explains *why*, not *what*; every non-trivial function gets a doc
+   comment saying why it is shaped the way it is and what the trap is.
 
-### Host-side sccache (optional)
+2. Non-obvious behaviour is pinned to a regression test by name (for example
+   `// see real_e2e_tunnel_get_without_content_length`), so the next reader can
+   find the evidence directly.
 
-The Docker release build compiles inside the image with its own
-sccache (see `build/docker/dist.dockerfile`).  Host-side builds get
-no compiler cache unless you set one up yourself:
+3. Every reference in a comment is real: paths, functions, commands and document
+   sections use names that exist in the repository; a comment that points at a
+   document points at the document where the fact now lives.
 
-```bash
-cargo install sccache
-# then, in ~/.cargo/config.toml (NOT in this repository):
-#   [build]
-#   rustc-wrapper = "sccache"
-```
+4. A comment carries no more than three lines of rule-like content; the rest
+   moves into `docs/` and the comment keeps a pointer.
 
-The wrapper is configured in the user's own `~/.cargo/config.toml`
-because cargo fails the build when the wrapper binary is missing,
-which would break every developer who has not installed sccache.
-The repository also excludes `.cargo/` from the Docker build context
-(`.dockerignore`), so a repository-level file would not reach the
-image anyway.
+5. No TODO without an owner: either it says why it is not done now and who owns
+   it, or it is done.
 
-Host and image caches never interoperate: sccache's cache key embeds
-the compiler version, the host builds with rustc 1.96.0 and the image
-with 1.98.1, so entries written by one side are never hits on the
-other.
+6. Comments are reviewed together with the code, so a claim about behaviour in a
+   comment is either backed by a test or marked as an unverified observation.
 
-### The crates.io mirror lives in `build/cargo-mirror.toml`
+## Where to look
 
-`build/cargo-mirror.toml` is the **single canonical mirror block**.
-Two consumers read it:
-
-- the Docker image concatenates it with `build/docker/cargo-config.toml`
-  into `/usr/local/cargo/config.toml` (`build/docker/dist.dockerfile`);
-- `build/cargo-mirror.sh` injects the same file into the host's
-  `${CARGO_HOME:-$HOME/.cargo}/config.toml` — `make cargo-mirror`
-  installs the block, `make cargo-mirror-off` removes it.
-
-One file, two consumers, so the host and the image resolve the same
-crates from the same source.  The two files are complementary, not
-duplicates: `build/cargo-mirror.toml` holds the mirror, and
-`build/docker/cargo-config.toml` holds the Docker-only settings (the
-clang/mold linker and the network tuning).
-
-**The mirror must be configured through cargo's `[source]` tables.**
-`replace-with` under `[registries.crates-io]` is *ignored* by the
-resolver — silently, with no warning — so every build resolves against
-the real crates.io.  That is exactly what happened here until issue
-#126: the mirror had been configured in the `[registries]` form and was
-therefore never in effect.  The `[registries]` tables are for
-*additional* registries (publish targets, tokens); source replacement
-is `[source.crates-io] replace-with` plus `[source.<name>] registry`.
-
-`build/cargo-mirror.toml` therefore contains **only** `[source.*]`
-tables.  That is what makes it safe to inject into a host config the
-user also edits by hand: the block cannot collide with the host's own
-`[net]` / `[url.*]` tables, and TOML forbids defining the same table
-twice — a duplicate would make cargo fail to parse the whole file and
-break every cargo command on the machine.  For the same reason the
-installer refuses to touch a host config that already defines a
-`[source.*]` table it does not manage.
-
-The managed block is delimited by `# >>> pangolin cargo mirror >>>`
-and `# <<< pangolin cargo mirror <<<` marker lines and is **appended
-at the end** of the host config.  The end, not the beginning: TOML
-binds a table-less key to the most recent table header, so a block in
-front of the host's own tables would swallow the host's root-level
-keys (`credential-provider` and friends) and silently drop them.
-Appending keeps every host key where it was, and makes removing the
-block the exact inverse — the host config comes back byte-for-byte,
-including whether it ended with a newline.  Installing twice leaves
-exactly one block.
-
-The installer refuses to touch a host config whose markers are
-malformed (an end marker without a start marker, a start marker
-without an end marker, or content after the block): a half-understood
-block means the file's real content is unknown, and guessing it would
-delete the user's cargo config.
-
-Switching the default mirror is a one-line edit of `replace-with` in
-`build/cargo-mirror.toml`; `rsproxy`, `sjtu`, `ustc` and `tuna` are
-all defined there.
-
-### The Docker build context is an allow-list, not a deny-list
-
-`build/docker/dist.dockerfile` copies the *whole* repo into the `builder`
-stage (`COPY . .`), so everything not filtered by `.dockerignore` is
-uploaded on every build and baked into a layer.
-
-**The rule: exclude only what is 100 % certain the build never reads, and
-that either churns a lot or is per-machine state.**  Source-level files
-are never excluded — not even ones that look like junk.  A template
-askama embeds, a YAML `include_str!` reads, a SQL migration
-`include_str!` embeds, a fixture a test `include_bytes!`s: if it goes
-missing the build breaks, or worse, produces a subtly wrong binary.  A few
-KB of context is cheap insurance against a silent break.
-
-The build needs exactly this much:
-
-| Path | Needed by |
+| I am … | Read |
 | --- | --- |
-| `Cargo.toml`, `Cargo.lock` | cargo (every workspace member's manifest must parse, including `tests`) |
-| `crates/` | the workspace crates; `crates/admin/templates/` is also Tailwind's content glob |
-| `tests/` | workspace member `tests` |
-| `assets/tailwindcss.css`, `assets/app.js` | `rust-embed` snapshot (`#[folder = "../../assets/"]`) |
-| `tailwind.config.js` | Tailwind CLI — **without it the build still succeeds but the admin UI ships unstyled**, because Tailwind scans no content globs |
-| `build/cargo-mirror.toml` | the shared crates.io mirror block — concatenated into `/usr/local/cargo/config.toml` and injected into the host cargo config by `build/cargo-mirror.sh` |
-| `build/docker/cargo-config.toml` | Docker-only cargo settings (mold linker, network tuning) |
-
-The `Makefile`, `ngx.yml`, `tun.yml` and `rustfmt.toml` ride along too,
-although nothing in the image reads them — they are tiny, low-churn,
-"normal code", and keeping them means the container's view of the repo
-matches a developer's checkout.  Everything *else* outside the table is
-host-side tooling, runtime state, or a local secret — `.env` alone holds
-`NGX_ADMIN__PASSWORD` and `TUN_TOKEN`.  `.codegraph/` alone was ~15 MB
-of sqlite, ~85 % of the context.
-
-Two Docker-specific traps, both of which have bitten this repo:
-
-- **`.dockerignore` is not gitignore.** A pattern without a slash matches
-  the repo ROOT only, not every level.  `*.md` does not exclude
-  `tests/CHECKLIST.md`; `certs/` does not exclude
-  `crates/admin/src/routes/certs/` (which is *source*, not a certificate
-  dump).  Use an explicit `**/` prefix when you mean every level.
-- **A missing input can fail silently.** The tailwind case above compiles
-  fine and produces a broken binary, so "the build passed" is not proof
-  that the context was complete.
-
-Hidden files are excluded as one class — `**/.*` — rather than a list of
-names, so a dot-tool nobody has installed yet cannot slip through.  If the
-build ever *does* need a dotfile, re-include it explicitly rather than
-weakening the rule.
-
-When you change `.dockerignore`, verify it by hand with the same probe
-the build uses — no tooling needed:
-
-```bash
-printf 'FROM scratch\nCOPY . /ctx\n' > /tmp/probe.dockerfile
-docker build --no-cache -q -f /tmp/probe.dockerfile -t ctxprobe . >/dev/null
-docker create --name ctxprobe-ctr ctxprobe true >/dev/null
-docker export ctxprobe-ctr | tar -tf - | sed -n 's|^ctx/||p' | grep -v '/$' \
-    | LC_ALL=C sort
-```
-
-That listing is exactly what Docker uploads.  Check it against the
-allow-list above: the top-level entries must match, every row of the
-table must be present, and nothing hidden, generated, or secret may
-appear.  Then re-run `make build-dist` — the builder stage is the real
-end-to-end check.
-
-### BuildKit cache mounts survive across builds — until `docker builder prune`
-
-Three cache mounts carry the build's expensive state between runs:
-
-| Mount | Holds |
-| --- | --- |
-| `/usr/local/cargo/registry` | the downloaded crate sources and the registry index |
-| `/pangolin/target` | the cargo target dir — the bulk of the compilation reuse |
-| `/root/.cache/sccache` | the sccache compiler cache |
-
-They survive across `docker build` runs on the same machine, and they
-are **cleared by `docker builder prune`** — which also empties the
-builder's cargo cache mount, so the next build re-downloads and
-recompiles everything.  Editing either cargo config file
-(`build/cargo-mirror.toml` or `build/docker/cargo-config.toml`)
-invalidates the `COPY` layer that assembles
-`/usr/local/cargo/config.toml`, so the two `cargo install` steps
-(`cargo-chef`, `sccache`) re-run once.
-
-## Style
-
-Match the surrounding code:
-
-- Comment density: every non-trivial function gets a doc comment
-  explaining *why*, not *what*. Pin non-obvious behaviour to a
-  regression-test name (e.g. `// see real_e2e_tunnel_get_without_content_length`).
-- Naming: `snake_case` for fns/vars, `CamelCase` for types, `SCREAMING_SNAKE`
-  for consts. Match local conventions (e.g. `tun_name`, `cert_dir`)
-  rather than the Rust idiomatic default.
-- Error handling: prefer `anyhow::Result` at module boundaries,
-  structured errors with `thiserror` inside core types. Never `unwrap`
-  in library code; `expect` only when the invariant is locally provable.
-- Async: `tokio` everywhere. Don't mix `async-std` or `smol`.
-- Imports: grouped std / external / internal, alphabetised within
-  each group. `rustfmt` enforces this; don't fight it.
-- Admin UI text: every operator-facing string comes from the i18n
-  catalog (`crates/admin/i18n/<code>.json`), never from the template
-  or from Rust. A new template struct carries a `pub lang: Lang`
-  field, and the route handler that builds it takes a `lang: Lang`
-  parameter and passes it on. Technical identifiers (protocol names,
-  status codes, provider keys, file paths, host names) stay as they
-  are. See `docs/admin/i18n.md`.
-
-## Pebble
-
-Pebble is the local ACME test server. The CI service runs it with
-`PEBBLE_VA_ALWAYS_VALID=1`, which silently accepts every challenge
-without actually performing the HTTP fetch. That mode is fine for
-*client-side* ACME tests (cert issuance, blob write, account
-persistence). It is **not** a regression check for the *server-side*
-handler — that's what `real_e2e_acme_http01_*` tests are for.
-
-Strict-mode Pebble (`PEBBLE_VA_ALWAYS_VALID=0`) hardcodes port 80 for
-HTTP-01 and cannot run in CI. The corresponding e2e test is
-`#[ignore]`'d; run it locally with:
-
-```bash
-sudo echo "127.0.0.1 localhost.test" >> /etc/hosts
-podman run --rm -d --name pebble \
-  -p 80:80 -p 14000:14000 -p 5001:5001 \
-  -e PEBBLE_VA_NOSLEEP=1 \
-  -e PEBBLE_VA_ALWAYS_VALID=0 \
-  -e PEBBLE_WFE_OVERRIDE_DNS=127.0.0.1 \
-  -e PEBBLE_WFE_NONCEREJECT=0 \
-  ghcr.io/letsencrypt/pebble:latest
-cargo test --features integration -p pangolin-integration-tests \
-    real_e2e_acme_http01_full_pebble_flow -- --ignored --nocapture
-```
-
-### `PEBBLE_WFE_NONCEREJECT=0` is mandatory, not optional
-
-**Pebble rejects 5 % of otherwise-valid anti-replay nonces by default**
-(`defaultNonceReject = 5` in `wfe/wfe.go`). It is a deliberate fault
-injector: it exists so ACME *clients* can be tested against a hostile
-server.  Every rejected request comes back as
-`urn:ietf:params:acme:error:badNonce` — "JWS has an invalid anti-replay
-nonce".
-
-`instant-acme` retries a `badNonce` three times (each retry picks up
-the fresh `Replay-Nonce` that Pebble attaches to the error response),
-so the residual failure rate is `(5 %)³ ≈ 1 in 8000` **per ACME
-request**.  A CI run makes ~30 such requests, which is roughly a
-**1-in-250 chance of a red build** — and it lands on a random one of
-the ACME tests (`acme_issue_multi_san_blob_copy`,
-`acme_issue_rsa_variant_filename`, `acme_account_persistence_across_restart`,
-…).
-
-Set `PEBBLE_WFE_NONCEREJECT=0` on the Pebble container — the CI
-service does this in `.github/workflows/ci.yml`, and any local Pebble
-you start for `crates/ngx/tests/acme.rs` must do the same.  With the
-injector off, the ACME tests are deterministic; with it on, expect a
-handful of failures per hundred runs and do **not** chase them as
-regressions in the ACME code.
-
-To reproduce the flake deliberately:
-
-```bash
-# 30 % rejection → most runs fail with badNonce
-docker run --rm -d --name pebble -p 14000:14000 -p 15000:15000 \
-  -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_VA_ALWAYS_VALID=1 \
-  -e PEBBLE_WFE_NONCEREJECT=30 \
-  ghcr.io/letsencrypt/pebble:latest
-```
+| understanding a subsystem | [docs/design/*.md](docs/design/) |
+| changing the schema | [docs/migrations.md](docs/migrations.md) |
+| changing the admin UI | [docs/admin/template-guide.md](docs/admin/template-guide.md), [docs/admin/i18n.md](docs/admin/i18n.md), [docs/vi/README.md](docs/vi/README.md) |
+| building, running and testing | [docs/development.md](docs/development.md) |
+| changing `install.sh`, the packaging or the release | [docs/release.md](docs/release.md) |
+| changing the pingora dependency | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) |
+| changing the API | [docs/design/api.md](docs/design/api.md) |
+| debugging at trace level | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) — its HTTP/1 client panics on a non-UTF-8 response header in the trace log |
+| looking up a configuration key | [docs/configuration.md](docs/configuration.md) |
 
 ## Memory
 

@@ -392,3 +392,108 @@ keeps the package off a host that could run it, or lets it onto a
 host that cannot. The measurement runs on the runner of the
 architecture being packaged, because Ubuntu's `objdump` only knows
 the architecture it was built for.
+
+## The installer contract
+
+`install.sh` in the repository root is the operator's first contact
+with a release — `curl -fsSL …/install.sh | sudo sh` has to produce a
+gateway that actually runs. It is published as a release asset and
+copied byte for byte, so **the file in the repository is the file
+everybody runs**; there is no second copy to keep in sync.
+
+The rules below are the contract the installer upholds. Each one is
+load-bearing.
+
+- **POSIX `sh`, not bash.** macOS ships bash 3.2 and Linux bash 5.x,
+  and a bashism breaks the installer on one of the two platforms it
+  exists to serve. `sh -n install.sh` has to pass, and `[[`, `source`,
+  arrays, `${var,,}`, `$RANDOM`, `mapfile` and `readarray` must not
+  appear in it. The regression test enforces this.
+- **Verify before writing.** Every download — the archive, the checksum
+  file and the two units — is verified against `SHA256SUMS.txt`
+  *before* the install directory is touched. A failed checksum must
+  leave nothing behind, so a failed install can simply be run again.
+- **Never overwrite the operator's configuration.** An existing
+  `ngx.yml` / `tun.yml` is kept byte for byte; an existing binary or
+  systemd unit is renamed to `<name>.bak` first — the same
+  rolling-backup convention the Ansible role uses.
+- **The `pangolin` user needs a group of its own.** The unit says
+  `Group=pangolin` and the install directory is handed over to
+  `pangolin:pangolin`, but `useradd` only creates a same-named group
+  where `USERGROUPS_ENAB` is yes — on the RHEL family it is not, and
+  the user lands in the default group. The installer passes
+  `--user-group` for that reason.
+- **A re-run has to restart a running gateway.** `systemctl enable
+  --now` leaves an active unit alone, so the freshly installed binary
+  would not be the one serving. The installer restarts the unit when it
+  was already active, and waits for a freshly started one to come up
+  before it claims success.
+
+The script's knobs are environment variables (`PANGOLIN_VERSION`,
+`PANGOLIN_INSTALL_DIR`, `PANGOLIN_BASE_URL`, `PANGOLIN_LATEST_URL`,
+`PANGOLIN_NO_SERVICE`, `PANGOLIN_SYSTEMD_DIR`), so the regression test
+in `tests/src/install_script.rs` can drive the whole thing against a
+local HTTP server that impersonates a GitHub Release.
+`PANGOLIN_SYSTEMD_DIR` exists for that test — it is where the units
+are installed, `/etc/systemd/system` in production.
+
+Only a release that ships the **packaged configuration and the systemd
+units** can be installed with the script — the releases before them
+carry the two binaries only, and the installer says so instead of
+installing a gateway that would run on its built-in development
+defaults.
+
+Changing the script means changing the release workflow too: the
+publishing job copies `install.sh` and the two units out of the
+repository into `dist/`, and `SHA256SUMS.txt` covers all three. The
+same test file asserts that the units the release publishes are the
+repository's own files — the release copies them, it does not write a
+second copy that could drift apart.
+
+## The packaging build rules
+
+The `packaging/` tree builds the deb / rpm packages and the apt / rpm
+repository. The rules the build obeys:
+
+- **Runtime state never enters a package.** A package holds the binary,
+  the systemd unit, the configuration template and empty directory
+  skeletons. The SQLite database, the ACME certificates, the JSONL
+  logs, the knownbots cache and the tunnel node's pin file are written
+  by the running service: a package that owned them would overwrite
+  them on every upgrade, and `/usr/local`-style layouts lose the data
+  on the first package upgrade. The regression test
+  (`tests/src/packaging.rs`) pins the file list of each package against
+  the documented layout, so a file that sneaks in fails the build.
+- **The configuration templates are their own files.**
+  `packaging/config/ngx.yml` and `packaging/config/tun.yml` are *not*
+  the repository's root `ngx.yml` / `tun.yml`. The root files are
+  development defaults — relative paths, the non-privileged ports, and
+  a few retired keys — and the configuration loader does **not** refuse
+  unknown keys, so a stale key in the template would be silently
+  ignored with a warning the operator never sees. The packaged
+  templates carry absolute paths, and the test asserts that they carry
+  no `./` and no retired key.
+- **The glibc floor is measured, never written down:**
+
+  ```bash
+  objdump -T <binary> | grep -o 'GLIBC_[0-9][0-9.]*' | sort -V | tail -1
+  ```
+
+  The measurement runs on the runner of the architecture being
+  packaged — Ubuntu's `objdump` only knows the architecture it was
+  built for, and says "File format not recognized" for the other one.
+  See [The glibc floor](#the-glibc-floor).
+- **The configuration files are conffiles** (`config|noreplace`). The
+  operator's edits have to survive an upgrade untouched and without an
+  interactive prompt, and a deleted file has to come back. Changing the
+  type changes that contract.
+- **The packaging scripts are POSIX `sh`.** dpkg runs maintainer
+  scripts with `/bin/sh`, and so does rpm's scriptlet interpreter — a
+  bashism breaks the installation on the distribution that matters.
+  `sh -n` has to pass.
+- **The `gh-pages` branch is a generated artefact.** It holds the site
+  tree the repository serves, and every release replaces the whole tree
+  — a hand-made commit on it is overwritten by the next release. Never
+  commit to it by hand, and never treat it as a source of truth: the
+  packages in it are built artefacts, and the release assets are where a
+  specific version lives. See [The site tree](#the-site-tree).

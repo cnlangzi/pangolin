@@ -435,7 +435,8 @@ jobs:
   # 5% of otherwise-valid anti-replay nonces by default, and
   # instant-acme retries a badNonce only 3 times, so the residual
   # failure rate is (5%)^3 per ACME request — about 1 in 250 CI runs,
-  # landing on a random ACME test.  See the Pebble section of AGENTS.md.
+  # landing on a random ACME test.  See the `PEBBLE_WFE_NONCEREJECT=0`
+  # section of docs/development.md.
   # ----------------------------------------------------------------
   e2e:
     name: E2E tests (Pebble)

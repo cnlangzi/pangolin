@@ -270,6 +270,42 @@ fn dockerfile_assembles_the_cargo_config_before_the_cargo_install_steps() {
     );
 }
 
+/// The cache mounts carry the build's expensive state between runs —
+/// `docker builder prune` drops them, and the next image build
+/// recompiles everything.  The cargo registry and its index are
+/// mounted *separately*, so the three cache locations are four
+/// `--mount` targets.
+///
+/// The Dockerfile is the contract here: it is what the build reads,
+/// and the documentation under `docs/development.md` describes it.
+/// Pinning the list in the Dockerfile keeps the two from drifting.
+#[test]
+fn dockerfile_mounts_the_four_cache_targets() {
+    let text = read_repo_file("build/docker/dist.dockerfile");
+    // Comment lines are excluded for the same reason as in the test
+    // above: the comments name the mounts, but the *instructions*
+    // are what the build uses.
+    let mut mounts: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(|l| l.split("--mount=type=cache,target=").skip(1))
+        .map(|rest| rest.split([',', ' ']).next().unwrap_or_default())
+        .collect();
+    mounts.sort_unstable();
+    mounts.dedup();
+
+    assert_eq!(
+        mounts,
+        vec![
+            "/pangolin/target",
+            "/root/.cache/sccache",
+            "/usr/local/cargo/registry",
+            "/usr/local/cargo/registry/index",
+        ],
+        "the Dockerfile must mount exactly these four cache targets"
+    );
+}
+
 // ── the host installer ─────────────────────────────────────────────────────
 
 /// A throwaway `CARGO_HOME` plus a helper to run the installer
@@ -621,31 +657,5 @@ fn makefile_exposes_the_mirror_targets() {
     assert!(
         text.contains("\ncargo-mirror-off:\n"),
         "the Makefile must expose a `cargo-mirror-off` target"
-    );
-}
-
-/// The documentation is part of the deliverable: the shared file, the
-/// host target and the cache-mount behaviour are all recorded in
-/// AGENTS.md.
-#[test]
-fn agents_md_documents_the_shared_mirror_configuration() {
-    let text = read_repo_file("AGENTS.md");
-    assert!(
-        text.contains("build/cargo-mirror.toml"),
-        "AGENTS.md must document the shared mirror configuration"
-    );
-    assert!(
-        text.contains("cargo-mirror"),
-        "AGENTS.md must document the host installer target"
-    );
-    assert!(
-        text.contains("/usr/local/cargo/registry")
-            && text.contains("/pangolin/target")
-            && text.contains("/root/.cache/sccache"),
-        "AGENTS.md must document the BuildKit cache mounts"
-    );
-    assert!(
-        text.contains("docker builder prune"),
-        "AGENTS.md must document that `docker builder prune` clears the cache mounts"
     );
 }
