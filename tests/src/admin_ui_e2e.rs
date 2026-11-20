@@ -4321,7 +4321,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §23 — Interface language (issues #178, #179) ─────────────────────────────
+// ── §23 — Interface language (issues #178, #179, #180) ───────────────────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
@@ -4518,5 +4518,172 @@ async fn admin_ui_login_page_renders_chinese() {
     assert!(
         !body.contains(">Username<"),
         "the English login page must not be rendered: {body}"
+    );
+}
+
+/// The sites, the domains and the tunnels are translated (issue
+/// #180).
+///
+/// The three objects an operator touches every day have to be in
+/// Chinese too — not just the navigation around them.  The test walks
+/// the three list pages and the three "new" forms and asserts that
+/// the Chinese copy of the area is rendered and that the English copy
+/// is gone.
+#[tokio::test]
+async fn admin_ui_site_domain_and_tunnel_pages_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The switcher writes the language cookie; the cookie store keeps it.
+    let resp = client.get("/lang/zh-CN").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // ── the sites ──
+    let body = client.get("/sites").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains("暂无站点"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        body.contains("新建站点"),
+        "the Chinese \"new site\" button must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No sites yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for (needle, what) in [
+        ("路由方式", "route-mode label"),
+        ("跟随域名", "host-mode option"),
+        ("源站防护", "origin guard"),
+        ("前置 CDN", "front CDN block"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Route via"),
+        "the English route-mode label must be gone: {body}"
+    );
+
+    // ── the domains ──
+    let body = client.get("/domains").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains("暂无域名"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No domains yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = client
+        .get("/domains/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("ACME 验证方式"),
+        "the Chinese challenge-kind label must be rendered: {body}"
+    );
+    assert!(
+        body.contains("DNS 服务商（DNS-01 验证）"),
+        "the Chinese DNS-provider label must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("ACME challenge kind"),
+        "the English challenge-kind label must be gone: {body}"
+    );
+
+    // ── the tunnels ──
+    let body = client.get("/tun").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains("暂无隧道节点"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No tunnel nodes registered yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = client.get("/tun/new").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains("令牌到期时间"),
+        "the Chinese expiry label must be rendered: {body}"
+    );
+    assert!(
+        body.contains("留空则自动生成"),
+        "the Chinese token hint must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("Token expires at"),
+        "the English expiry label must be gone: {body}"
+    );
+}
+
+/// The validation errors of the three areas are translated too (issue
+/// #180) — they are the messages the operator reads when the form
+/// rejects the submission.
+///
+/// The wrapper is translated, the quoted diagnostic is not: the error
+/// keeps the underlying text in its placeholder.
+#[tokio::test]
+async fn admin_ui_site_and_tunnel_validation_errors_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    let resp = client.get("/lang/zh-CN").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    // A site whose backend cannot be parsed.
+    let page = client
+        .get("/sites/new")
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "notaurl"),
+                ("name", "zh-site"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("后端地址错误"),
+        "the Chinese backend error must be rendered: {body}"
+    );
+
+    // A tunnel name with characters the name does not allow.
+    let page = client.get("/tun/new").await.unwrap().text().await.unwrap();
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form("/tun/new", &[("name", "bad name!"), ("_csrf", &csrf)])
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("名称只能包含字母、数字、下划线和连字符"),
+        "the Chinese name error must be rendered: {body}"
     );
 }

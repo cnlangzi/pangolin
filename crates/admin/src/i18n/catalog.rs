@@ -71,16 +71,23 @@ pub const AREAS: &[&str] = &[
 /// switcher shows every language in its own name, so there is
 /// nothing to translate in it — but the two catalogs have to agree
 /// about that.
+///
+/// Issue #180 translated the core configuration objects: the sites,
+/// the domains and the tunnels — their forms, their tables and the
+/// validation errors the routes report back to the operator.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
     "common",
     "components",
     "dashboard",
+    "domains",
     "js",
     "lang",
     "login",
     "nav",
+    "sites",
     "time",
+    "tunnels",
 ];
 
 /// The catalog of one language.
