@@ -79,7 +79,7 @@ time = "0.3"
 # DNS-01 challenge
 hickory-resolver = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 
