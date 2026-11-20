@@ -1707,7 +1707,7 @@ mod tests {
             "base.html layout not applied: {html}"
         );
         assert!(html.contains("Bots</a>"), "nav Bots link missing: {html}");
-        // CSRF / asset placeholders substituted (per AGENTS.md).
+        // CSRF / asset placeholders substituted (per docs/admin/template-guide.md).
         assert!(
             !html.contains("__CSRF__"),
             "csrf placeholder leaked: {html}"
@@ -2387,7 +2387,7 @@ mod tests {
             html.contains("History</a>"),
             "History sub-nav missing: {html}"
         );
-        // CSRF / asset placeholders substituted (per AGENTS.md).
+        // CSRF / asset placeholders substituted (per docs/admin/template-guide.md).
         assert!(!html.contains("__CSRF__"), "csrf leaked: {html}");
         // Empty-state hint visible — no files yet.
         assert!(

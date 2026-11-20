@@ -185,7 +185,7 @@ ESBUILD_VERSION  := 0.28.0
 # `assets/app.css` — matching what the Docker `builder` stage
 # produces. Without this dependency the binary serves an empty
 # stylesheet and the admin UI looks unstyled, even though the
-# code compiled fine. AGENTS.md explains the chain.
+# code compiled fine. docs/development.md explains the chain.
 build: build-css
 	mkdir -p $(OUT_DIR)
 	$(CARGO) build --release -p ngx -p tun

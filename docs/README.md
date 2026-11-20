@@ -22,6 +22,10 @@ New to Pangolin? Start here:
 - [Reload API](admin/reload-api.md) — `POST /api/reload` for refreshing the in-memory config after out-of-band DB edits
 - [Admin UI templates](admin/template-guide.md) — how to write the admin UI's Askama templates
 
+## Development
+
+- [Development](development.md) — the build chain, the admin asset pipeline, the crates.io mirror, the Docker build context, the test tiers and the Pebble test server
+
 ## Design
 
 - [The management API](design/api.md) — the dashboard-facing JSON API (`/api/v1/`): the signed-request protocol, the error codes, every resource's shape and the per-resource write semantics (issue #185)

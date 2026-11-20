@@ -139,4 +139,4 @@ Every document is listed in [`docs/README.md`](./docs/README.md). The thirteen t
 
 ## Development
 
-Requires **Rust 1.96**. Run `make lint` before committing; read [`AGENTS.md`](./AGENTS.md) before contributing — it says what has to run before a commit, why migration files must not be edited and how the admin UI assets are built.
+Requires **Rust 1.96**. Run `make lint` before committing; read [`AGENTS.md`](./AGENTS.md) before contributing — it holds the rules, and every rule points at the document that carries its detail (the index is [`docs/`](./docs/README.md)).

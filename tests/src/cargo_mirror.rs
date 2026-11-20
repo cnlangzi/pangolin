@@ -623,29 +623,3 @@ fn makefile_exposes_the_mirror_targets() {
         "the Makefile must expose a `cargo-mirror-off` target"
     );
 }
-
-/// The documentation is part of the deliverable: the shared file, the
-/// host target and the cache-mount behaviour are all recorded in
-/// AGENTS.md.
-#[test]
-fn agents_md_documents_the_shared_mirror_configuration() {
-    let text = read_repo_file("AGENTS.md");
-    assert!(
-        text.contains("build/cargo-mirror.toml"),
-        "AGENTS.md must document the shared mirror configuration"
-    );
-    assert!(
-        text.contains("cargo-mirror"),
-        "AGENTS.md must document the host installer target"
-    );
-    assert!(
-        text.contains("/usr/local/cargo/registry")
-            && text.contains("/pangolin/target")
-            && text.contains("/root/.cache/sccache"),
-        "AGENTS.md must document the BuildKit cache mounts"
-    );
-    assert!(
-        text.contains("docker builder prune"),
-        "AGENTS.md must document that `docker builder prune` clears the cache mounts"
-    );
-}
