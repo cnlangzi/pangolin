@@ -6,9 +6,12 @@ use base64::Engine;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 use pangolin_core::DnsProviderKind;
 
 /// Flatten an error and its `source()` chain into a single
@@ -855,25 +858,51 @@ fn is_zone_not_on_account(err: &str) -> bool {
 // TXT propagation check via hickory-resolver
 // ---------------------------------------------------------------------------
 
-/// Poll for TXT record visibility using hickory-resolver querying 8.8.8.8/1.1.1.1.
+/// The resolver configuration for the DNS-01 TXT propagation check.
+///
+/// hickory-resolver 0.26 removed the `ResolverConfig::cloudflare()`
+/// *constructor* that 0.24 offered, but kept the address set it used as the
+/// `config::CLOUDFLARE` server group — the same four Cloudflare resolvers
+/// (`1.1.1.1`, `1.0.0.1` and their IPv6 counterparts). Building on that
+/// group keeps the TXT check querying exactly the servers 0.24 queried, over
+/// plain UDP + TCP on port 53.
+///
+/// Kept apart from `wait_for_txt_propagation` so the nameserver set can be
+/// asserted in a unit test without touching the network — the behaviour we
+/// have to preserve is *which* servers we ask, not that we can reach them.
+fn txt_resolver_config() -> ResolverConfig {
+    ResolverConfig::udp_and_tcp(&CLOUDFLARE)
+}
+
+/// Poll for TXT record visibility using hickory-resolver querying
+/// Cloudflare's public resolvers (1.1.1.1 / 1.0.0.1 and their IPv6
+/// counterparts) over plain UDP + TCP.
 pub async fn wait_for_txt_propagation(
     fqdn: &str,
     expected_value: &str,
     timeout_secs: u64,
     poll_interval_secs: u64,
 ) -> Result<bool> {
-    let resolver = TokioAsyncResolver::tokio(
-        hickory_resolver::config::ResolverConfig::cloudflare(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+    let resolver =
+        TokioResolver::builder_with_config(txt_resolver_config(), TokioRuntimeProvider::default())
+            .with_options(ResolverOpts::default())
+            .build()
+            .context("failed to build the DNS-01 TXT resolver")?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
         match resolver.txt_lookup(fqdn).await {
             Ok(lookup) => {
-                for rdata in lookup.iter() {
-                    for txt_slice in rdata.txt_data() {
+                // 0.24 answered a TXT query with a `TxtLookup` whose
+                // iterator yielded the TXT rdata directly; 0.26 answers
+                // with the generic `Lookup`, so the TXT records are picked
+                // out of the answer set here — same records, same order.
+                for record in lookup.answers() {
+                    let RData::TXT(txt) = &record.data else {
+                        continue;
+                    };
+                    for txt_slice in txt.txt_data.iter() {
                         if let Ok(txt_str) = std::str::from_utf8(txt_slice)
                             && txt_str.contains(expected_value)
                         {
@@ -974,7 +1003,9 @@ mod tests {
         AliyunDnsProvider, TencentDnsProvider, chain_message, is_zone_not_on_account,
         scrub_url_query,
     };
+    use hickory_resolver::config::ProtocolConfig;
     use std::collections::HashMap;
+    use std::net::IpAddr;
 
     /// The Aliyun signer produces the RPC API's authentication value —
     /// the provider rejects a request whose `Signature` does not
@@ -1057,6 +1088,44 @@ mod tests {
             signature,
             "1e3ed317917b3cff18fbfc35d6c312a1f1e3cd911850f58a875d464d9ba55f8f"
         );
+    }
+
+    #[test]
+    fn txt_resolver_config_queries_exactly_the_cloudflare_resolvers() {
+        // hickory-resolver 0.26 dropped the `ResolverConfig::cloudflare()`
+        // constructor but kept its address set as `config::CLOUDFLARE`. This
+        // pins the four servers the DNS-01 TXT check queries: swapping in
+        // another resolver group, or an upstream change to the group, would
+        // silently check the TXT against a different view of the zone than
+        // the CA uses.
+        let config = super::txt_resolver_config();
+        let ips: Vec<IpAddr> = config.name_servers.iter().map(|ns| ns.ip).collect();
+        let expected: Vec<IpAddr> = vec![
+            "1.1.1.1".parse().expect("valid IPv4"),
+            "1.0.0.1".parse().expect("valid IPv4"),
+            "2606:4700:4700::1111".parse().expect("valid IPv6"),
+            "2606:4700:4700::1001".parse().expect("valid IPv6"),
+        ];
+        assert_eq!(ips, expected);
+    }
+
+    #[test]
+    fn txt_resolver_config_uses_plain_udp_and_tcp_only() {
+        // The 0.24 `cloudflare()` preset talked plain UDP + TCP on port 53.
+        // Keep it that way: DoT / DoH / DoQ would change the wire
+        // behaviour and need TLS trust roots the gateway does not
+        // configure.
+        let config = super::txt_resolver_config();
+        assert_eq!(config.name_servers.len(), 4, "one server per address");
+        for ns in &config.name_servers {
+            let protocols: Vec<&ProtocolConfig> =
+                ns.connections.iter().map(|c| &c.protocol).collect();
+            assert_eq!(protocols.len(), 2, "expected UDP + TCP: {protocols:?}");
+            assert!(matches!(protocols[0], ProtocolConfig::Udp), "{protocols:?}");
+            assert!(matches!(protocols[1], ProtocolConfig::Tcp), "{protocols:?}");
+            assert_eq!(ns.connections[0].port, 53);
+            assert_eq!(ns.connections[1].port, 53);
+        }
     }
 
     #[test]
