@@ -3,12 +3,16 @@
 //! Implementations: Cloudflare, Aliyun DNS, Tencent DNSPod.
 
 use base64::Engine;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts, ServerGroup};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 use pangolin_core::DnsProviderKind;
 
 /// Flatten an error and its `source()` chain into a single
@@ -848,25 +852,67 @@ fn is_zone_not_on_account(err: &str) -> bool {
 // TXT propagation check via hickory-resolver
 // ---------------------------------------------------------------------------
 
-/// Poll for TXT record visibility using hickory-resolver querying 8.8.8.8/1.1.1.1.
+/// The public Cloudflare resolvers the DNS-01 TXT check queries.
+///
+/// hickory-resolver 0.26 removed the `ResolverConfig::cloudflare()` preset
+/// that 0.24 offered, so the same addresses are spelled out here. The set
+/// is identical to 0.24's `CLOUDFLARE_IPS`, which the old preset used for
+/// plain UDP + TCP on port 53.
+fn txt_nameservers() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+    ]
+}
+
+/// The resolver configuration for the DNS-01 TXT propagation check.
+///
+/// Kept apart from `wait_for_txt_propagation` so the nameserver set can be
+/// asserted in a unit test without touching the network — the behaviour we
+/// have to preserve is *which* servers we ask, not that we can reach them.
+fn txt_resolver_config() -> ResolverConfig {
+    let ips = txt_nameservers();
+    let group = ServerGroup {
+        ips: &ips,
+        // Only consulted by the TLS / HTTPS / QUIC transports; plain
+        // UDP + TCP needs neither.
+        server_name: "",
+        path: "",
+    };
+    ResolverConfig::udp_and_tcp(&group)
+}
+
+/// Poll for TXT record visibility using hickory-resolver querying
+/// Cloudflare's public resolvers (1.1.1.1 / 1.0.0.1 and their IPv6
+/// counterparts) over plain UDP + TCP.
 pub async fn wait_for_txt_propagation(
     fqdn: &str,
     expected_value: &str,
     timeout_secs: u64,
     poll_interval_secs: u64,
 ) -> Result<bool> {
-    let resolver = TokioAsyncResolver::tokio(
-        hickory_resolver::config::ResolverConfig::cloudflare(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+    let resolver =
+        TokioResolver::builder_with_config(txt_resolver_config(), TokioRuntimeProvider::default())
+            .with_options(ResolverOpts::default())
+            .build()
+            .context("failed to build the DNS-01 TXT resolver")?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
         match resolver.txt_lookup(fqdn).await {
             Ok(lookup) => {
-                for rdata in lookup.iter() {
-                    for txt_slice in rdata.txt_data() {
+                // 0.24 answered a TXT query with a `TxtLookup` whose
+                // iterator yielded the TXT rdata directly; 0.26 answers
+                // with the generic `Lookup`, so the TXT records are picked
+                // out of the answer set here — same records, same order.
+                for record in lookup.answers() {
+                    let RData::TXT(txt) = &record.data else {
+                        continue;
+                    };
+                    for txt_slice in txt.txt_data.iter() {
                         if let Ok(txt_str) = std::str::from_utf8(txt_slice)
                             && txt_str.contains(expected_value)
                         {
@@ -963,7 +1009,46 @@ pub fn from_kind_config(kind: DnsProviderKind, config_json: &str) -> Result<Arc<
 
 #[cfg(test)]
 mod tests {
-    use super::{chain_message, is_zone_not_on_account, scrub_url_query};
+    use super::{chain_message, is_zone_not_on_account, scrub_url_query, txt_nameservers};
+    use hickory_resolver::config::ProtocolConfig;
+    use std::net::IpAddr;
+
+    #[test]
+    fn txt_nameservers_are_the_cloudflare_public_resolvers() {
+        // hickory-resolver 0.26 dropped the `ResolverConfig::cloudflare()`
+        // preset, so the DNS-01 TXT check now spells the addresses out
+        // itself. This pins the set: swapping in another resolver, or
+        // dropping one of the four, silently changes where DNS-01
+        // validation queries go — the TXT would then be checked against a
+        // different view of the zone than the CA uses.
+        let ips = txt_nameservers();
+        let expected: Vec<IpAddr> = vec![
+            "1.1.1.1".parse().expect("valid IPv4"),
+            "1.0.0.1".parse().expect("valid IPv4"),
+            "2606:4700:4700::1111".parse().expect("valid IPv6"),
+            "2606:4700:4700::1001".parse().expect("valid IPv6"),
+        ];
+        assert_eq!(ips, expected);
+    }
+
+    #[test]
+    fn txt_resolver_config_uses_plain_udp_and_tcp_only() {
+        // The 0.24 `cloudflare()` preset talked plain UDP + TCP on port 53.
+        // Keep it that way: DoT / DoH / DoQ would change the wire
+        // behaviour and need TLS trust roots the gateway does not
+        // configure.
+        let config = super::txt_resolver_config();
+        assert_eq!(config.name_servers.len(), 4, "one server per address");
+        for ns in &config.name_servers {
+            let protocols: Vec<&ProtocolConfig> =
+                ns.connections.iter().map(|c| &c.protocol).collect();
+            assert_eq!(protocols.len(), 2, "expected UDP + TCP: {protocols:?}");
+            assert!(matches!(protocols[0], ProtocolConfig::Udp), "{protocols:?}");
+            assert!(matches!(protocols[1], ProtocolConfig::Tcp), "{protocols:?}");
+            assert_eq!(ns.connections[0].port, 53);
+            assert_eq!(ns.connections[1].port, 53);
+        }
+    }
 
     #[test]
     fn scrub_url_query_strips_query_string() {
