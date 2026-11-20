@@ -75,16 +75,24 @@ pub const AREAS: &[&str] = &[
 /// Issue #180 translated the core configuration objects: the sites,
 /// the domains and the tunnels — their forms, their tables and the
 /// validation errors the routes report back to the operator.
+///
+/// Issue #181 translated the infrastructure and the policy: the
+/// certificates, the DNS providers, the rate limit and the system
+/// settings — the pages an operator reads when something went wrong.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
+    "certs",
     "common",
     "components",
     "dashboard",
+    "dns",
     "domains",
     "js",
     "lang",
     "login",
     "nav",
+    "ratelimit",
+    "settings",
     "sites",
     "time",
     "tunnels",

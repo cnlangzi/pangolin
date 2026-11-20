@@ -4321,7 +4321,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §23 — Interface language (issues #178, #179, #180) ───────────────────────
+// ── §23 — Interface language (issues #178, #179, #180, #181) ─────────────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
@@ -4754,4 +4754,191 @@ async fn admin_ui_domain_form_dns_link_does_not_swallow_the_challenge_kind() {
             "the hint must not render a tag as text (chinese={chinese}): {body}"
         );
     }
+}
+
+/// The infrastructure and the policy pages are translated too (issue
+/// #181) — the certificates, the DNS providers, the rate limit and the
+/// settings.
+///
+/// These four are where an operator lands when something went wrong: a
+/// certificate that was not issued, a DNS provider that rejects its
+/// credentials, a rule that blocks the wrong client.  A page that
+/// still answers in English there is a page the operator cannot read
+/// while they are debugging.
+///
+/// The Chinese literals are the shipped copy, pinned on purpose: a
+/// translation change is a change to what the operator reads, and it
+/// has to show up in the diff.  A later copy edit updates them here
+/// too.
+#[tokio::test]
+async fn admin_ui_cert_dns_ratelimit_and_settings_pages_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // ── the certificates ──
+    let body = page_body(&client, "/certs").await;
+    assert!(
+        body.contains("暂无证书"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        body.contains("添加证书"),
+        "the Chinese \"add cert\" button must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No certificates yet"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = page_body(&client, "/certs/new").await;
+    for (needle, what) in [
+        ("证书文件（PEM）", "certificate-file label"),
+        ("私钥文件（PEM）", "key-file label"),
+        ("到期时间", "expiry label"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Certificate file (PEM)"),
+        "the English certificate-file label must be gone: {body}"
+    );
+
+    // ── the DNS providers ──
+    let body = page_body(&client, "/dns").await;
+    assert!(
+        body.contains("暂无 DNS 服务商"),
+        "the Chinese empty state must be rendered: {body}"
+    );
+    assert!(
+        body.contains("新建 DNS 服务商"),
+        "the Chinese \"new provider\" button must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("No DNS providers configured"),
+        "the English empty state must be gone: {body}"
+    );
+
+    let body = page_body(&client, "/dns/new").await;
+    assert!(
+        body.contains("测试连接"),
+        "the Chinese test-connection button must be rendered: {body}"
+    );
+    assert!(
+        body.contains("凭据"),
+        "the Chinese credentials heading must be rendered: {body}"
+    );
+    // The credential field names stay English — they are the field
+    // names of the cloud vendor's own console.
+    assert!(
+        body.contains("Access Key ID"),
+        "the vendor's field name must survive the translation: {body}"
+    );
+    assert!(
+        !body.contains("访问密钥"),
+        "the vendor's field name must not be translated: {body}"
+    );
+    assert!(
+        !body.contains("Test connection"),
+        "the English test-connection button must be gone: {body}"
+    );
+
+    // ── the rate limit ──
+    let body = page_body(&client, "/ratelimit").await;
+    for (needle, what) in [
+        ("添加 IP 规则", "add-rule heading"),
+        ("各站点策略", "per-site policy heading"),
+        ("IP 规则", "rules heading"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Add an IP rule"),
+        "the English add-rule heading must be gone: {body}"
+    );
+
+    // ── the settings ──
+    let body = page_body(&client, "/settings").await;
+    for (needle, what) in [
+        ("客户端 IP 取源", "client-IP card title"),
+        ("源站防护", "origin-guard card title"),
+        ("IP 信誉", "IP-reputation card title"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Client IP resolution"),
+        "the English client-IP card title must be gone: {body}"
+    );
+}
+
+/// The validation errors of the four areas are translated too (issue
+/// #181) — they are the messages the operator reads when the form
+/// rejects the submission.
+///
+/// The wrapper is translated, the quoted diagnostic is not: the error
+/// keeps the underlying text in its placeholder, so the operator still
+/// sees what the parser actually complained about.
+#[tokio::test]
+async fn admin_ui_cert_and_dns_validation_errors_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // A certificate without a domain.
+    let page = page_body(&client, "/certs/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form("/certs/new", &[("_csrf", &csrf)])
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("请填写域名"),
+        "the Chinese domain error must be rendered: {body}"
+    );
+
+    // A certificate without a certificate file.
+    let page = page_body(&client, "/certs/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/certs/new",
+            &[("domain", "zh.example.com"), ("_csrf", &csrf)],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("请填写证书文件路径"),
+        "the Chinese certificate-file error must be rendered: {body}"
+    );
+
+    // A DNS provider whose name carries characters the name does not
+    // allow.
+    let page = page_body(&client, "/dns/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/dns/new",
+            &[
+                ("name", "Bad Name"),
+                ("kind", "cloudflare"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("名称只能是小写字母、数字、下划线或连字符"),
+        "the Chinese name error must be rendered: {body}"
+    );
 }
