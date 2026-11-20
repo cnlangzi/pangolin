@@ -79,8 +79,15 @@ pub const AREAS: &[&str] = &[
 /// Issue #181 translated the infrastructure and the policy: the
 /// certificates, the DNS providers, the rate limit and the system
 /// settings — the pages an operator reads when something went wrong.
+///
+/// Issue #182 translated the logs: the live access log and the bot
+/// logs with their history and their stats. The two live in one
+/// issue because they share the same vocabulary — a request, a bot,
+/// a status code, a referrer — and a term that is translated two
+/// ways on two pages is how an interface starts to feel untranslated.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
+    "bots",
     "certs",
     "common",
     "components",
@@ -90,6 +97,7 @@ pub const COMPLETED_AREAS: &[&str] = &[
     "js",
     "lang",
     "login",
+    "logs",
     "nav",
     "ratelimit",
     "settings",

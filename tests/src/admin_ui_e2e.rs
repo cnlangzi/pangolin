@@ -4321,7 +4321,7 @@ async fn a_rejected_client_shows_up_with_its_user_agent() {
     );
 }
 
-// ── §23 — Interface language (issues #178, #179, #180, #181) ─────────────────
+// ── §23 — Interface language (issues #178, #179, #180, #181, #182) ───────────
 
 /// The language switcher remembers the operator's choice and sends
 /// them back to the dashboard.
@@ -4985,5 +4985,106 @@ async fn admin_ui_cert_and_dns_validation_errors_render_chinese() {
     assert!(
         body.contains("请填写 Secret ID"),
         "the Chinese Secret-ID error must be rendered: {body}"
+    );
+}
+
+/// The access log and the bot logs are translated (issue #182).
+///
+/// These are the pages that answer "did a crawler come last night,
+/// which pages did it fetch, what status did it get" — the question
+/// the README promises the product answers.  A page that still
+/// answers in English there is a page the operator cannot read while
+/// they are chasing it.
+///
+/// The four pages share their vocabulary — a request, a bot, a
+/// status code — so the test walks all four and asserts that the
+/// Chinese copy of the area is rendered and that the English copy is
+/// gone.
+///
+/// The Chinese literals are the shipped copy, pinned on purpose: a
+/// translation change is a change to what the operator reads, and it
+/// has to show up in the diff.  A later copy edit updates them here
+/// too.
+#[tokio::test]
+async fn admin_ui_access_and_bot_log_pages_render_chinese() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // ── the access log ──
+    let body = page_body(&client, "/logs").await;
+    for (needle, what) in [
+        ("访问日志", "the page title"),
+        ("正在等待事件", "the empty state"),
+        ("清空", "the clear button"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Access Logs"),
+        "the English page title must be gone: {body}"
+    );
+    assert!(
+        !body.contains("Waiting for events"),
+        "the English empty state must be gone: {body}"
+    );
+
+    // ── the bot log ──
+    let body = page_body(&client, "/logs/bots").await;
+    for (needle, what) in [
+        ("爬虫日志", "the page title"),
+        ("验证状态", "the verification panel"),
+        ("爬虫请求总数", "the total-requests card"),
+        ("实时日志", "the live-tail table"),
+        ("正在等待爬虫流量", "the empty state"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Bot Logs"),
+        "the English page title must be gone: {body}"
+    );
+    assert!(
+        !body.contains("Verification status"),
+        "the English verification panel title must be gone: {body}"
+    );
+
+    // ── the bot-log history ──
+    let body = page_body(&client, "/logs/bots/history").await;
+    for (needle, what) in [
+        ("可用日期", "the date sidebar"),
+        ("暂无匹配记录", "the empty result"),
+        ("数据来自", "the footnote"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("Available dates"),
+        "the English date sidebar must be gone: {body}"
+    );
+
+    // ── the bot-log stats ──
+    let body = page_body(&client, "/logs/bots/stats").await;
+    for (needle, what) in [
+        ("统计", "the sub-nav"),
+        ("一天一个主机", "the subtitle"),
+        ("计数来自", "the footnote"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("One day and one host"),
+        "the English subtitle must be gone: {body}"
     );
 }
