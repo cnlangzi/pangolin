@@ -59,15 +59,11 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
 
 fn seed_tun(conn: &Connection, name: &str, enabled: bool) {
     let now = Utc::now().to_rfc3339();
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"test-token");
-    // `hex::encode` rather than `format!("{:x}", …)`: the digest 0.10
-    // output type (generic-array) had a zero-padding `LowerHex` impl,
-    // the digest 0.11 one (hybrid-array) has none, and core's
-    // `[u8]: LowerHex` does NOT pad — the seeded `token_hash` has to
-    // stay byte-identical to `pangolin_core::db::sha256_hex`.
-    let hash = hex::encode(h.finalize());
+    // `db::sha256_hex` is the helper production derives `tun.token_hash`
+    // with (issue #39), so the seeded hash is byte-identical by
+    // construction — not by a second implementation of the same
+    // algorithm that has to be kept in step with it.
+    let hash = pangolin_core::db::sha256_hex("test-token");
     conn.execute(
         "INSERT INTO tun (name, token, token_hash, enabled, online, registered_at, last_seen_at, expires_at)
          VALUES (?1, 'test-token', ?2, ?3, 0, ?4, ?4, NULL)",

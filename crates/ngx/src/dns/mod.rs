@@ -355,10 +355,11 @@ impl AliyunDnsProvider {
     }
 
     fn sign(&self, params: &mut HashMap<String, String>) {
-        // `hmac 0.13` moved `new_from_slice` off the inherent impl and
-        // onto the `KeyInit` trait (it is a digest-0.11 trait), so the
-        // import is load-bearing — without it the constructor does not
-        // resolve.  `Mac` still provides `update` / `finalize`.
+        // digest 0.11 moved `new_from_slice` off the `Mac` trait and
+        // onto `KeyInit` (`hmac 0.13` is the first release on that
+        // trait), so the import is load-bearing — without it the
+        // constructor does not resolve.  `Mac` still provides
+        // `update` / `finalize`.
         use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -987,6 +988,17 @@ mod tests {
     /// constructor, and nothing else.  The parameters mirror what
     /// `do_request` assembles — the common RPC envelope plus the
     /// call's own arguments.
+    ///
+    /// **What this pin is not:** it pins *our* bytes, not Aliyun's
+    /// published algorithm.  `sign()` keys the HMAC with the bare
+    /// `access_key_secret` and signs the sorted query on its own,
+    /// whereas Aliyun's RPC spec signs
+    /// `"<METHOD>&%2F&" + percentEncode(query)` under the key
+    /// `access_key_secret + "&"`.  That deviation predates issue
+    /// #200 and is out of its scope — the issue pins the bytes, it
+    /// does not redesign the algorithm — but the value below must
+    /// not be read as "spec-correct".  Correcting the algorithm is a
+    /// separate change, and it has to move this constant with it.
     #[test]
     fn aliyun_signature_is_unchanged_by_the_digest_0_11_migration() {
         let mut params = HashMap::new();
