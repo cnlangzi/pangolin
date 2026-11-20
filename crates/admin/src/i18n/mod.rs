@@ -120,13 +120,8 @@ impl Lang {
     /// `[missing:key]` marker, so a translation gap never blanks the
     /// interface — and never panics.
     pub fn t(self, key: &str) -> Cow<'static, str> {
-        if let Some(text) = catalog_for(self).get(key) {
-            return Cow::Borrowed(text.as_str());
-        }
-        if self != Lang::En
-            && let Some(text) = catalog_for(Lang::En).get(key)
-        {
-            return Cow::Borrowed(text.as_str());
+        if let Some(text) = lookup(catalog_for(self), catalog_for(Lang::En), key) {
+            return Cow::Borrowed(text);
         }
         log::error!("i18n: missing key {key} for language {}", self.code());
         Cow::Owned(format!("[missing:{key}]"))
@@ -212,6 +207,20 @@ impl Lang {
         out.push('}');
         out
     }
+}
+
+/// The text of `key` in `catalog`, falling back to `fallback`.
+///
+/// The fallback is the English catalog: a key a translation has not
+/// covered yet still renders in English. The lookup lives in its own
+/// function so that the fallback can be tested on its own — the
+/// shipped catalogs cover every key today, so a test that pinned a
+/// shipped key would assert nothing.
+fn lookup<'a>(catalog: &'a Catalog, fallback: &'a Catalog, key: &str) -> Option<&'a str> {
+    catalog
+        .get(key)
+        .or_else(|| fallback.get(key))
+        .map(String::as_str)
 }
 
 /// A value that can be substituted into a catalog placeholder.
@@ -429,33 +438,46 @@ mod tests {
     }
 
     #[test]
-    fn t_falls_back_to_en_then_to_missing_marker() {
-        // A key that only the English catalog has falls back to
-        // English for every other language — that fallback is what
-        // carries the areas that are not translated yet.
-        //
-        // The key is *pinned*, not derived from the catalog: a key
-        // picked out of the catalog would make the assertion vacuous
-        // the day the last area is translated, and the fallback would
-        // lose its only test without anyone noticing. Move the pin
-        // when the `referers` area is translated.
-        const UNTRANSLATED: &str = "referers.title";
-        let chinese = catalog_for(Lang::ZhCn);
-        let english = catalog_for(Lang::En);
-        assert!(
-            !chinese.contains_key(UNTRANSLATED),
-            "{UNTRANSLATED} is translated now — pin another key for the fallback test"
-        );
-        assert_eq!(
-            Lang::ZhCn.t(UNTRANSLATED).as_ref(),
-            english.get(UNTRANSLATED).unwrap()
-        );
+    fn t_renders_a_missing_marker_for_an_unknown_key() {
         // A key nobody has is a visible marker, not a panic. The key
         // is built at runtime so the catalog gate test does not read
         // it as a reference to a key that does not exist.
         let missing = format!("no.such.{}", "key");
         assert_eq!(Lang::En.t(&missing), format!("[missing:{missing}]"));
         assert_eq!(Lang::ZhCn.t(&missing), format!("[missing:{missing}]"));
+    }
+
+    /// The fallback chain: the target language first, English second.
+    ///
+    /// The catalogs are built here instead of being read from the
+    /// shipped ones: the Chinese catalog covers every key by now, and
+    /// a test that pinned a shipped key would assert nothing. The
+    /// fallback is what carries a key a *later* translation has not
+    /// covered yet, so it has to keep its own test.
+    #[test]
+    fn the_fallback_prefers_the_target_language() {
+        let english = Catalog::from([("a.b".to_string(), "English".to_string())]);
+        let chinese = Catalog::from([("a.b".to_string(), "中文".to_string())]);
+        // The target language wins.
+        assert_eq!(lookup(&chinese, &english, "a.b"), Some("中文"));
+        // A key the target language does not have falls back to English.
+        assert_eq!(lookup(&Catalog::new(), &english, "a.b"), Some("English"));
+        // A key neither catalog has is not found at all.
+        assert_eq!(lookup(&Catalog::new(), &english, "c.d"), None);
+    }
+
+    /// The Chinese catalog is the one that gets rendered.
+    ///
+    /// The fallback must not win over a translation that exists.
+    #[test]
+    fn the_chinese_catalog_wins_over_the_english_one() {
+        for (key, text) in catalog_for(Lang::ZhCn) {
+            assert_eq!(
+                Lang::ZhCn.t(key).as_ref(),
+                text.as_str(),
+                "the Chinese catalog must be rendered for {key}"
+            );
+        }
     }
 
     #[test]

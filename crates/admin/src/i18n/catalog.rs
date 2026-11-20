@@ -86,6 +86,11 @@ pub const AREAS: &[&str] = &[
 /// a status code, a host, a duration — and a term that is translated
 /// two ways on two pages is how an interface starts to feel
 /// untranslated.
+///
+/// Issue #183 translated the last two areas: the referer logs (the
+/// live tail, the history and the stats) and the traffic page. They
+/// share one issue for the same reason — a host, a path, a hit count
+/// are the same words on both pages.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
     "bots",
@@ -101,9 +106,11 @@ pub const COMPLETED_AREAS: &[&str] = &[
     "logs",
     "nav",
     "ratelimit",
+    "referers",
     "settings",
     "sites",
     "time",
+    "traffic",
     "tunnels",
 ];
 
