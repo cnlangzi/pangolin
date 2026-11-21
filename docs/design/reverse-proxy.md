@@ -508,6 +508,7 @@ These are the testable contracts. Each row gets a unit test in
 | I-25 | Every forwarded request carries exactly one of each `P-*` gateway header | `real_e2e_proxy_injects_x_forwarded_headers_all_paths`, `real_e2e_gateway_headers_reach_the_backend_through_the_tunnel` |
 | I-26 | A client-supplied `P-*` header is replaced by pangolin's value | `real_e2e_gateway_headers_replace_client_supplied_values` |
 | I-27 | `X-Real-IP` is never emitted | `apply_proxy_policy_appends_peer_ip_to_xff_chain`, `real_e2e_proxy_injects_x_forwarded_headers_all_paths` |
+| I-28 | An upgrade outranks the streaming marker: a request carrying both `Upgrade: websocket` and `Accept: text/event-stream` is still an upgrade (101), and it is accounted as `Websocket`, not `Stream` | `traffic_kind_for_ranks_the_upgrade_over_the_streaming_marker`, `real_e2e_tunnel_ws_upgrade_survives_event_stream_accept`, `real_e2e_direct_ws_upgrade_survives_event_stream_accept` |
 
 ---
 
