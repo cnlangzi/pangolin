@@ -38,6 +38,39 @@ use std::borrow::Cow;
 
 pub use catalog::{AREAS, COMPLETED_AREAS, Catalog, catalog_for};
 
+/// The root of the admin crate.
+///
+/// The catalog gates walk the templates and the Rust sources, so they
+/// need to know where the crate starts.
+#[cfg(test)]
+pub(crate) fn crate_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Every file under `dir` whose extension is in `extensions`.
+#[cfg(test)]
+pub(crate) fn files_with_extension(
+    dir: &std::path::Path,
+    extensions: &[&str],
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_with_extension(&path, extensions));
+        } else if extensions.iter().any(|extension| {
+            path.extension()
+                .is_some_and(|e| e == std::ffi::OsStr::new(extension))
+        }) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// Name of the cookie that carries the operator's chosen language.
 ///
 /// The cookie is written by the server and read by the server, so it
@@ -580,33 +613,8 @@ mod tests {
 mod gate {
     use super::Lang;
     use super::catalog::{AREAS, COMPLETED_AREAS, area_of, catalog_for, is_valid_key};
+    use super::{crate_root, files_with_extension};
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
-
-    /// The root of the admin crate.
-    fn crate_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    }
-
-    /// Every file under `dir` whose extension is in `extensions`.
-    fn files_with_extension(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(files_with_extension(&path, extensions));
-            } else if extensions.iter().any(|extension| {
-                path.extension()
-                    .is_some_and(|e| e == std::ffi::OsStr::new(extension))
-            }) {
-                out.push(path);
-            }
-        }
-        out
-    }
 
     /// Whether `c` can be part of an identifier.
     fn is_ident(c: u8) -> bool {
@@ -697,29 +705,37 @@ mod gate {
         let english = catalog_for(Lang::En);
         let chinese = catalog_for(Lang::ZhCn);
 
-        // A translation may not invent a key the English catalog does
-        // not have — it would never be rendered.
-        let extra: Vec<&String> = chinese
-            .keys()
-            .filter(|key| !english.contains_key(*key))
-            .collect();
+        // The two catalogs carry the same keys: a key only one of them
+        // has is either a string nobody translated (the Chinese
+        // catalog falls back to English) or a key nobody renders (the
+        // English catalog is the fallback for every language).
+        let english_keys: BTreeSet<&String> = english.keys().collect();
+        let chinese_keys: BTreeSet<&String> = chinese.keys().collect();
+
+        let missing: Vec<&&String> = english_keys.difference(&chinese_keys).collect();
+        assert!(
+            missing.is_empty(),
+            "the zh-CN catalog does not have these keys the English catalog has: \
+             {missing:?}"
+        );
+
+        let extra: Vec<&&String> = chinese_keys.difference(&english_keys).collect();
         assert!(
             extra.is_empty(),
             "the zh-CN catalog has keys the English catalog does not: {extra:?}"
         );
 
-        // An area that is declared complete has to be complete: the
-        // same keys, in both catalogs.
-        for area in COMPLETED_AREAS {
-            let english_keys: BTreeSet<&String> =
-                english.keys().filter(|key| area_of(key) == *area).collect();
-            let chinese_keys: BTreeSet<&String> =
-                chinese.keys().filter(|key| area_of(key) == *area).collect();
-            assert_eq!(
-                english_keys, chinese_keys,
-                "the area {area} is declared complete but the catalogs disagree"
-            );
-        }
+        // Every area is translated, so every area is declared
+        // complete: an area that is not in the list would be a gap
+        // the completeness assertion above cannot see.
+        let undeclared: Vec<&&str> = AREAS
+            .iter()
+            .filter(|area| !COMPLETED_AREAS.contains(area))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "these areas are not declared complete: {undeclared:?}"
+        );
     }
 
     #[test]

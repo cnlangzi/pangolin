@@ -4,7 +4,9 @@
 //! punctuation is half-width, the Latin words are glued to the Chinese
 //! ones, or the string was simply not translated at all.  Three of
 //! those four are decidable by a machine, so they are decided by a
-//! machine — here.
+//! machine — here.  The fourth gate looks the other way: the
+//! *templates* must not spell English prose out instead of asking the
+//! catalog for it.
 //!
 //! What the gates check:
 //!
@@ -17,6 +19,11 @@
 //! 3. **空格** — a Chinese character glued to a Latin word, a number
 //!    or a placeholder reads badly ("DNS记录", "共3条").  "DNS 记录"
 //!    is the Chinese way.
+//! 4. **残留英文** — a template that carries English prose the
+//!    catalog was never asked for.  The whitelist
+//!    [`ALLOWED_ENGLISH_TEXT`] holds the literals that are *meant* to
+//!    stay English: the brand name, the protocol abbreviations, the
+//!    third-party site names, the configuration keys.
 //!
 //! What the gates deliberately do **not** check: whether the Chinese
 //! is *good*.  A regex cannot tell "最近 {n} 条事件" from "最后 {n}
@@ -37,56 +44,223 @@
 
 use crate::i18n::Lang;
 use crate::i18n::catalog::catalog_for;
+use crate::i18n::{crate_root, files_with_extension};
 
 /// The keys whose Chinese text is deliberately identical to the English
-/// one.
+/// one, and why.
 ///
 /// The list is keyed, not valued: a new key that happens to carry an
 /// untranslatable string has to be registered here **once**, which
 /// forces the translator to look at it.  A whitelist of values would
 /// let a new key slip through for free.
 ///
-/// Every entry needs a reason:
+/// Every entry carries its reason, so a reviewer can tell a
+/// deliberate decision from an accident — and so an entry that has
+/// stopped being true is obvious.
+const IDENTICAL_OK: &[(&str, &str)] = &[
+    // The product name of the DNS provider.
+    ("common.provider.cloudflare.label", "the product's own name"),
+    // The name of the HTTP request header.
+    ("common.user_agent", "the name of the HTTP header"),
+    // The cloud vendor's own console field names: the operator has to
+    // find the very same words there.
+    (
+        "dns.error.label_access_key_secret",
+        "the cloud vendor's console field name",
+    ),
+    (
+        "dns.error.label_secret_key",
+        "the cloud vendor's console field name",
+    ),
+    (
+        "dns.form.access_key_id",
+        "the cloud vendor's console field name",
+    ),
+    (
+        "dns.form.access_key_secret",
+        "the cloud vendor's console field name",
+    ),
+    (
+        "dns.form.secret_id",
+        "the cloud vendor's console field name",
+    ),
+    (
+        "dns.form.secret_key",
+        "the cloud vendor's console field name",
+    ),
+    // The same two field names, in the shorter spelling the Tencent
+    // console uses.
+    (
+        "dns.form.tencent_hint",
+        "the cloud vendor's console field name",
+    ),
+    // The Cloudflare permission path — an API path, not prose.
+    ("dns.form.permission_2", "the API path of the permission"),
+    // The project's own tagline: the English catalog already carries
+    // it, so translating it again would only invent a second spelling
+    // of the same slogan.
+    ("login.tagline", "the project tagline, already in Chinese"),
+    // The rule kind is an enumeration value that lands in the database
+    // and in the rule matcher; the Chinese explanation lives in the
+    // long form next to it.
+    (
+        "ratelimit.kind_blacklist_short",
+        "the rule kind's enumeration value",
+    ),
+    (
+        "ratelimit.kind_whitelist_short",
+        "the rule kind's enumeration value",
+    ),
+    // The HTTP status code.
+    ("ratelimit.sites.throttled", "the HTTP status code"),
+    // The percentile labels. The traffic card shows `p95` next to them,
+    // hard-coded in the template, and the operator reads the whole
+    // family as one notation; translating two of the three would break
+    // the series.
+    ("traffic.p50", "the percentile label, part of one notation"),
+    ("traffic.p99", "the percentile label, part of one notation"),
+];
+
+/// The literal strings that may appear in a template in English.
 ///
-/// - `common.provider.cloudflare.label` — the product name.
-/// - `common.user_agent` — the name of the HTTP header.
-/// - `login.tagline` — the Chinese project tagline; the English
-///   catalog already carries it, so translating it again would only
-///   invent a second spelling of the same slogan.
-/// - the DNS provider credential fields (`dns.form.access_key_id`,
-///   `dns.form.access_key_secret`, `dns.form.secret_id`,
-///   `dns.form.secret_key` and their error labels) — they are the
-///   field names of the cloud vendor's own console, so the operator
-///   has to find the very same words there.
-/// - `dns.form.tencent_hint` — the Tencent credential hint, the same
-///   field names in a shorter spelling.
-/// - `dns.form.permission_2` — the Cloudflare permission path.
-/// - `ratelimit.kind_whitelist_short` / `ratelimit.kind_blacklist_short`
-///   — the rule kind is an enumeration value that lands in the
-///   database and in the rule matcher; the Chinese explanation lives
-///   in the long form next to it.
-/// - `ratelimit.sites.throttled` — the HTTP status code.
-/// - `traffic.p50` / `traffic.p99` — the percentile labels. The
-///   traffic card shows `p95` next to them, hard-coded in the
-///   template, and the operator reads the whole family as one
-///   notation; translating two of the three would break the series.
-const IDENTICAL_OK: &[&str] = &[
-    "common.provider.cloudflare.label",
-    "common.user_agent",
-    "dns.error.label_access_key_secret",
-    "dns.error.label_secret_key",
-    "dns.form.access_key_id",
-    "dns.form.access_key_secret",
-    "dns.form.permission_2",
-    "dns.form.secret_id",
-    "dns.form.secret_key",
-    "dns.form.tencent_hint",
-    "login.tagline",
-    "ratelimit.kind_blacklist_short",
-    "ratelimit.kind_whitelist_short",
-    "ratelimit.sites.throttled",
-    "traffic.p50",
-    "traffic.p99",
+/// The residual-English gate is a whitelist and a failure, not a
+/// hint: the point of the gate is to *kill* the residue.  Every entry
+/// here is therefore one explicit confirmation that the literal is
+/// meant to stay English — the brand name, a protocol abbreviation, a
+/// third-party site name, a configuration key, a file name.
+///
+/// The list holds **literals**, not patterns.  A literal may be
+/// matched as a whole (a whole text node, or a whole attribute
+/// value) or as one word of a text node: "— Pangolin" is allowed
+/// because "Pangolin" is, and "&lt;h1&gt;Forbidden&lt;/h1&gt;" is
+/// allowed because it is listed as a whole.
+///
+/// The entries are grouped by what they are; the group comment is the
+/// reason.
+const ALLOWED_ENGLISH_TEXT: &[&str] = &[
+    // The brand and the interface's own name.
+    "Pangolin",
+    // The example user name on the login form.
+    "admin",
+    // The separator the page titles use.
+    "—",
+    // Protocol and algorithm abbreviations.
+    "ACME",
+    "DNS",
+    "HTTP",
+    "IP",
+    "TCP",
+    "TLS",
+    // HTTP methods.
+    "DELETE",
+    "GET",
+    "HEAD",
+    "PATCH",
+    "POST",
+    "PUT",
+    // HTTP header names.
+    "Referer",
+    "User-Agent",
+    // Units and notations the operator reads as one family.
+    "RPS",
+    "UTC",
+    "ms",
+    "p50",
+    "p95",
+    "p99",
+    // HTTP status code families.
+    "2xx",
+    "3xx",
+    "4xx",
+    "5xx",
+    // The third-party sites and products the operator looks up.
+    "AbuseIPDB",
+    "Cloudflare",
+    "DuckDB",
+    "GreyNoise",
+    "Scamalytics",
+    "ipinsights.io",
+    "jq",
+    // The DNS providers and the Aliyun regions.
+    "Aliyun",
+    "DNSPod",
+    "Tencent",
+    "cn-beijing",
+    "cn-qingdao",
+    "cn-shanghai",
+    "cn-shenzhen",
+    "us-west-1",
+    // The ACME challenge kinds.
+    "HTTP-01",
+    "dns-01",
+    "http-01",
+    // The URL schemes a site's backend may use.
+    "file",
+    "http",
+    "https",
+    // The configuration keys and the environment variable the log
+    // pages quote.
+    "NGX_LOG__REFERER__ENABLED=true",
+    "api.listen",
+    "api_disabled",
+    "client_ip",
+    "dns_providers.config",
+    "domains.dns_provider",
+    "log.access_log_capacity",
+    "log.access_log_recent",
+    "log.bot.capacity",
+    "log.bot.dir",
+    "log.bot.recent",
+    "log.referer.capacity",
+    "log.referer.dir",
+    "log.referer.recent",
+    "log.traffic.enabled",
+    // The gateway's own request headers.
+    "P-Client-Country",
+    "P-Client-Ip",
+    "P-Client-Region",
+    "P-Known-Bot",
+    "X-Client-Country",
+    "X-Client-IP",
+    "X-Client-Region",
+    // The files and the binary the log pages name.
+    "bot-.jsonl",
+    "bot-YYYY-MM-DD.jsonl",
+    "ngx.yml",
+    "pangolin-ngx",
+    "referer-.jsonl",
+    "referer-YYYY-MM-DD.jsonl",
+    // The paths the pages quote.
+    "/api/v1/",
+    "/robots.txt",
+    "/sitemap.xml",
+    // The enumeration values the configuration stores.
+    "global",
+    "lenient",
+    // The technical terms the pages emphasize.
+    "database",
+    "peer",
+    "token",
+    // The examples the forms carry as placeholders.
+    "AKID...",
+    "LTAI...",
+    "example.com",
+    "internal.example.com",
+    "main-cf",
+    "my-site",
+    "office-node",
+    "/etc/ssl/certs/example.crt",
+    "/etc/ssl/private/example.key",
+    "file:///var/www/static",
+    "http://127.0.0.1:8080",
+    // The examples the forms carry whole — the wording is part of the
+    // example, so the whole string is listed.
+    "&lt;h1&gt;Forbidden&lt;/h1&gt;",
+    "&lt;h1&gt;Too many requests&lt;/h1&gt;",
+    "203.0.113.7 or 10.0.0.0/8",
+    // The configuration snippets the log pages quote as they are.
+    "log.referer.enabled: true",
+    "log.traffic.enabled = false",
 ];
 
 /// The half-width punctuation a Chinese value may not contain.
@@ -111,12 +285,47 @@ fn is_hanzi(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
+/// Whether `c` belongs to a Chinese, a Japanese or a Korean script.
+///
+/// Wider than [`is_hanzi`]: the residual-English gate has to exempt a
+/// text node that carries *any* CJK character, not only Han ones.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3400..=0x4dbf      // CJK extension A
+        | 0x4e00..=0x9fff    // CJK unified ideographs
+        | 0xf900..=0xfaff    // CJK compatibility ideographs
+        | 0x3040..=0x30ff    // hiragana and katakana
+        | 0xac00..=0xd7af    // hangul syllables
+    )
+}
+
 /// Whether `value` contains at least one Chinese ideograph.
 fn has_hanzi(value: &str) -> bool {
     value.chars().any(is_hanzi)
 }
 
-/// The number of Chinese ideographs in `value`.
+/// Whether `value` contains at least one CJK character.
+fn has_cjk(value: &str) -> bool {
+    value.chars().any(is_cjk)
+}
+
+/// Whether `value` holds two ASCII letters next to each other.
+///
+/// Two is the threshold: a single letter is a variable or a unit
+/// ("p95", "5 s"), two are the beginning of a word.
+fn has_letter_run(value: &str) -> bool {
+    let mut previous = false;
+    for c in value.chars() {
+        let letter = c.is_ascii_alphabetic();
+        if letter && previous {
+            return true;
+        }
+        previous = letter;
+    }
+    false
+}
+
+/// The number of Chinese characters in `value`.
 fn hanzi_count(value: &str) -> usize {
     value.chars().filter(|c| is_hanzi(*c)).count()
 }
@@ -185,7 +394,9 @@ fn shared_keys() -> Vec<Pair> {
 fn untranslated_keys() -> Vec<&'static str> {
     shared_keys()
         .into_iter()
-        .filter(|pair| pair.chinese == pair.english && !IDENTICAL_OK.contains(&pair.key))
+        .filter(|pair| {
+            pair.chinese == pair.english && !IDENTICAL_OK.iter().any(|(key, _)| *key == pair.key)
+        })
         .map(|pair| pair.key)
         .collect()
 }
@@ -219,6 +430,226 @@ fn long_keys() -> Vec<(&'static str, usize)> {
             (count > LONG_TEXT_HANZI).then_some((pair.key, count))
         })
         .collect()
+}
+
+/// The end of the region that starts with `open` and ends with
+/// `close`, if the region is there at all.
+fn skip_region(text: &str, open: &str, close: &str) -> Option<usize> {
+    let start = text.strip_prefix(open)?;
+    let end = start.find(close)?;
+    Some(open.len() + end + close.len())
+}
+
+/// The end of a `<script>` or a `<style>` element, body included.
+fn skip_element(text: &str) -> Option<usize> {
+    let name = if text.starts_with("<script") {
+        "script"
+    } else {
+        "style"
+    };
+    let open_end = text.find('>')? + 1;
+    let close = format!("</{name}");
+    let close_at = text[open_end..].find(&close)? + open_end;
+    Some(close_at + close.len())
+}
+
+/// The newlines of a skipped region.
+///
+/// The regions are replaced by their newlines so a finding can be
+/// reported with the line it is on.
+fn newlines(text: &str) -> String {
+    "\n".repeat(text.matches('\n').count())
+}
+
+/// The template with everything that is not operator-visible text
+/// removed: the HTML comments, the askama comments, the script and the
+/// style bodies, and the template expressions.
+///
+/// The template expressions go first: they may hold a `>` or a `<` that
+/// would otherwise be read as a tag.
+fn strip_non_text(body: &str) -> String {
+    const REGIONS: &[(&str, &str)] = &[("<!--", "-->"), ("{#", "#}"), ("{{", "}}"), ("{%", "%}")];
+    let mut out = String::with_capacity(body.len());
+    let mut index = 0usize;
+    while index < body.len() {
+        let rest = &body[index..];
+        let skipped = REGIONS
+            .iter()
+            .find_map(|(open, close)| skip_region(rest, open, close));
+        if let Some(end) = skipped {
+            out.push_str(&newlines(&rest[..end]));
+            index += end;
+            continue;
+        }
+        if (rest.starts_with("<script") || rest.starts_with("<style"))
+            && let Some(end) = skip_element(rest)
+        {
+            out.push_str(&newlines(&rest[..end]));
+            index += end;
+            continue;
+        }
+        let c = rest.chars().next().expect("the rest is not empty");
+        out.push(c);
+        index += c.len_utf8();
+    }
+    out
+}
+
+/// The values of the operator-facing attributes, with the offset of
+/// each value.
+///
+/// The four attributes are the ones that carry text the operator
+/// reads: the tooltip, the input hint, the accessible name and the
+/// confirmation dialog.
+fn attribute_values(body: &str) -> Vec<(usize, &str)> {
+    const ATTRIBUTES: &[&str] = &["title", "placeholder", "aria-label", "hx-confirm"];
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        // The scan walks the bytes but only ever slices at a character
+        // boundary.
+        let cursor = index;
+        let mut found = None;
+        for name in ATTRIBUTES {
+            if !body[cursor..].starts_with(name) {
+                continue;
+            }
+            // The name must not be the tail of a longer attribute
+            // (`data-title`).
+            if cursor > 0
+                && (bytes[cursor - 1].is_ascii_alphanumeric()
+                    || bytes[cursor - 1] == b'-'
+                    || bytes[cursor - 1] == b'_')
+            {
+                continue;
+            }
+            let mut after = cursor + name.len();
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            if after >= bytes.len() || bytes[after] != b'=' {
+                continue;
+            }
+            after += 1;
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            if after >= bytes.len() || bytes[after] != b'"' {
+                continue;
+            }
+            found = Some(after + 1);
+            break;
+        }
+        if let Some(start) = found {
+            let Some(rel_end) = body[start..].find('"') else {
+                break;
+            };
+            let end = start + rel_end;
+            out.push((start, &body[start..end]));
+            index = end;
+            continue;
+        }
+        // Advance by a whole character.
+        let c = body[index..].chars().next().expect("the rest is not empty");
+        index += c.len_utf8();
+    }
+    out
+}
+
+/// The text nodes of a template body — the parts that are not inside a
+/// tag — with the offset of each node.
+fn text_nodes(body: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'<' {
+            let node = &body[start..index];
+            if !node.trim().is_empty() {
+                out.push((start, node));
+            }
+            index = body[index..]
+                .find('>')
+                .map_or(body.len(), |at| index + at + 1);
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+    let node = &body[start..];
+    if !node.trim().is_empty() {
+        out.push((start, node));
+    }
+    out
+}
+
+/// The text of a node with its whitespace collapsed.
+fn normalize(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a piece of text is English prose the catalog should have
+/// provided.
+///
+/// A text node is English when it holds two ASCII letters next to each
+/// other and no CJK character at all: a node that carries a Chinese
+/// character is a mixed sentence ("Pangolin — 内网穿透与反向代理"),
+/// and that is allowed.
+fn is_english_residue(value: &str) -> bool {
+    has_letter_run(value) && !has_cjk(value)
+}
+
+/// Whether a piece of English may stay in a template.
+///
+/// A literal is allowed when the whole text is whitelisted, or when
+/// every word of it that holds letters is: "— Pangolin" is allowed
+/// because "Pangolin" is.
+fn is_allowed_english(value: &str) -> bool {
+    if ALLOWED_ENGLISH_TEXT.contains(&value) {
+        return true;
+    }
+    value
+        .split_whitespace()
+        .filter(|word| has_letter_run(word))
+        .all(|word| ALLOWED_ENGLISH_TEXT.contains(&word))
+}
+
+/// The line an offset is on.
+fn line_of(body: &str, offset: usize) -> usize {
+    body[..offset].matches('\n').count() + 1
+}
+
+/// The English the templates carry instead of asking the catalog for
+/// it: the file, the line and the text.
+fn template_residue() -> Vec<(String, usize, String)> {
+    let mut residue = Vec::new();
+    for path in files_with_extension(&crate_root().join("templates"), &["html"]) {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cleaned = strip_non_text(&body);
+        let file = path
+            .strip_prefix(crate_root())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let mut findings: Vec<(usize, String)> = Vec::new();
+        for (offset, value) in attribute_values(&cleaned) {
+            findings.push((offset, normalize(value)));
+        }
+        for (offset, node) in text_nodes(&cleaned) {
+            findings.push((offset, normalize(node)));
+        }
+        for (offset, value) in findings {
+            if !is_english_residue(&value) || is_allowed_english(&value) {
+                continue;
+            }
+            residue.push((file.clone(), line_of(&cleaned, offset), value));
+        }
+    }
+    residue
 }
 
 #[cfg(test)]
@@ -281,6 +712,28 @@ mod tests {
         );
     }
 
+    /// Gate 4 — 残留英文扫描.
+    ///
+    /// Every operator-facing string comes from the catalog.  A
+    /// template that spells English out instead of asking for it is
+    /// the residue this gate kills; the literals that are meant to stay
+    /// English are listed in `ALLOWED_ENGLISH_TEXT`.
+    #[test]
+    fn no_template_carries_english_prose() {
+        let residue = template_residue();
+        let report = residue
+            .iter()
+            .map(|(file, line, text)| format!("{file}:{line}: {text:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            residue.is_empty(),
+            "these templates carry English the catalog should provide — replace \
+             it with a `lang.t(…)` reference, or add the literal to \
+             ALLOWED_ENGLISH_TEXT:\n{report}"
+        );
+    }
+
     /// The predicates on their own.
     ///
     /// The gates above read the shipped catalog, so a broken predicate
@@ -317,6 +770,63 @@ mod tests {
         assert!(!needs_space("DNS"));
     }
 
+    /// The residue predicate on its own.
+    #[test]
+    fn the_residue_predicate_sees_english_without_chinese() {
+        assert!(is_english_residue("Save"));
+        assert!(is_english_residue("Delete site foo?"));
+        // One letter is not a word.
+        assert!(!is_english_residue("5 s"));
+        // A mixed sentence is not residue.
+        assert!(!is_english_residue("Pangolin — 内网穿透与反向代理"));
+        assert!(!is_english_residue("保存"));
+    }
+
+    /// The whitelist of the literal English.
+    #[test]
+    fn the_english_whitelist_accepts_whole_and_word_wise() {
+        // A whole literal.
+        assert!(is_allowed_english("Pangolin"));
+        // A word of a longer text.
+        assert!(is_allowed_english("— Pangolin"));
+        // A whole value that is listed as a whole.
+        assert!(is_allowed_english("&lt;h1&gt;Forbidden&lt;/h1&gt;"));
+        // Prose is not.
+        assert!(!is_allowed_english("Delete site foo?"));
+        assert!(!is_allowed_english("Save"));
+    }
+
+    /// The scanner on its own — a synthetic template, so the shape of
+    /// the scan is pinned independently of what the templates hold.
+    #[test]
+    fn the_scanner_finds_the_english_in_a_template() {
+        let template = "\
+<!-- a comment with Delete site foo? -->
+<button title=\"Delete site foo?\">Save</button>
+<p>{{ lang.t(\"nav.sites\") }}</p>
+<script>var x = \"Delete site foo?\";</script>
+";
+        let cleaned = strip_non_text(template);
+        // The comment, the script body and the expression are gone.
+        assert!(!cleaned.contains("comment"));
+        assert!(!cleaned.contains("var x"));
+        assert!(!cleaned.contains("lang.t"));
+        // The button's text and its tooltip are there.
+        let nodes: Vec<String> = text_nodes(&cleaned)
+            .into_iter()
+            .map(|(_, node)| normalize(node))
+            .collect();
+        assert!(nodes.contains(&"Save".to_string()));
+        let attributes: Vec<String> = attribute_values(&cleaned)
+            .into_iter()
+            .map(|(_, value)| normalize(value))
+            .collect();
+        assert!(attributes.contains(&"Delete site foo?".to_string()));
+        // Both are residue.
+        assert!(is_english_residue("Save"));
+        assert!(is_english_residue("Delete site foo?"));
+    }
+
     /// The whitelist has to stay honest: an entry that names a key
     /// which is *not* identical any more is a stale entry, and a stale
     /// entry hides the next untranslated string.
@@ -324,7 +834,11 @@ mod tests {
     fn the_whitelist_names_only_identical_strings() {
         let chinese = catalog_for(Lang::ZhCn);
         let english = catalog_for(Lang::En);
-        for key in IDENTICAL_OK {
+        for (key, reason) in IDENTICAL_OK {
+            assert!(
+                !reason.is_empty(),
+                "the whitelist names {key} without saying why"
+            );
             assert!(
                 chinese.contains_key(*key),
                 "the whitelist names {key}, which the Chinese catalog does not have"
@@ -342,7 +856,7 @@ mod tests {
     #[test]
     fn the_whitelist_names_keys_of_the_catalog() {
         let english = catalog_for(Lang::En);
-        for key in IDENTICAL_OK {
+        for (key, _) in IDENTICAL_OK {
             assert!(
                 english.contains_key(*key),
                 "the whitelist names {key}, which is not a catalog key"
