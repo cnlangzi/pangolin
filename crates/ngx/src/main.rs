@@ -322,7 +322,8 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // listener runs a dynamic callback that picks h1 for tunnel
         // sites and follows `config.tls.enable_h2` for everything else.
         // See `tls::install_dynamic_alpn` for the policy and
-        // `pangolin_core::App::tunnel_domains` for the data it consults.
+        // `pangolin_core::App::tunnel_classification` for the data it
+        // consults.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
         let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), app.clone())?;
         proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);

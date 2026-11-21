@@ -765,7 +765,7 @@ mod tests {
 
     /// Drive a client over the request limit of the seeded site.
     async fn throttle(app: &Arc<App>, client: std::net::IpAddr, geo: ClientGeo<'_>) {
-        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
         assert_eq!(
             app.rate_limiter
                 .check("a", &cfg, Some(client), None, Some("/"), geo),
@@ -802,7 +802,7 @@ mod tests {
     /// Drive a client that claims a bot identity over the request
     /// limit of the seeded site.
     async fn throttle_as_bot(app: &Arc<App>, client: std::net::IpAddr, bot: &str) {
-        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
         assert_eq!(
             app.rate_limiter.check(
                 "a",
@@ -1354,7 +1354,7 @@ mod tests {
             pangolin_core::db::upsert_ip_rule(&db, &rule).unwrap();
         }
         app.reload_indexes().await;
-        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
         assert_eq!(
             app.rate_limiter.check(
                 "a",
@@ -1373,7 +1373,7 @@ mod tests {
             pangolin_core::db::delete_ip_rule(&db, &rule.id).unwrap();
         }
         app.reload_indexes().await;
-        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
         assert_eq!(
             app.rate_limiter.check(
                 "a",

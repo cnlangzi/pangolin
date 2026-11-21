@@ -13,7 +13,7 @@
 //! `auth_tun(name, token)` SQL query against the `tun` table, so there
 //! is no need to mirror tokens into memory on startup.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::normalize::normalize_host;
@@ -29,9 +29,10 @@ struct SiteWithDomains {
     domains: Vec<Arc<Domain>>,
 }
 
-/// All in-memory indexes. Wrapped in `Arc<RwLock<Indexes>>` in
-/// `App::indexes` at the `pangolin-core` layer, for concurrent reads
-/// + atomic reload (see `docs/design/routing-and-index.md`).
+/// All in-memory indexes. Wrapped in
+/// `Arc<parking_lot::RwLock<Arc<Indexes>>>` in `App::indexes` at the
+/// `pangolin-core` layer, for concurrent reads + atomic reload (see
+/// `docs/design/routing-and-index.md`).
 #[derive(Debug, Default, Clone)]
 pub struct Indexes {
     /// domain (exact or `*.wildcard` literal) → Site
@@ -56,6 +57,20 @@ pub struct Indexes {
     /// configuration together. One entry per site; a site without an
     /// override inherits the global defaults.
     pub providers: HashMap<String, Arc<SiteProviderConfig>>,
+    /// The domains that route through a tunnel — the subset of
+    /// `domain` whose owning site has a `tun_name:` backend prefix.
+    ///
+    /// The set holds the **exact domain literals** of `domain`
+    /// (wildcard literals included); the suffix match happens at
+    /// lookup time in [`host_matches_set`].
+    ///
+    /// It lives inside the routing revision on purpose: the TLS ALPN
+    /// callback reads it on the handshake path and the request path
+    /// reads `domain`, and both have to agree on whether a host is
+    /// tunnel-backed. Publishing them together removes the window in
+    /// which the routing table already knew about a tunnel site while
+    /// the handshake still classified it as direct (issue #212).
+    pub tunnel_domains: Arc<HashSet<String>>,
 }
 
 impl Indexes {
@@ -176,13 +191,55 @@ impl Indexes {
         //    with the global defaults filled in.
         let providers = build_provider_configs(&site_names, site_providers, site_ranges, global);
 
+        // 7. tunnel_domains: the domains of `domain_idx` whose owning
+        //    site routes through a tunnel. Derived from the map that
+        //    was just built, so the classification can never disagree
+        //    with the routing table it belongs to.
+        let tunnel_domains = build_tunnel_domain_set(&domain_idx);
+
         Self {
             domain: domain_idx,
             tun: tun_idx,
             limits,
             providers,
+            tunnel_domains: Arc::new(tunnel_domains),
         }
     }
+}
+
+/// Build the set of all domain strings (exact + wildcard literals)
+/// whose owning site has a `tun_name:` backend prefix.
+///
+/// The output contains the exact strings stored in `Indexes.domain`;
+/// wildcard suffix matching is done at lookup time by
+/// [`host_matches_set`].
+///
+/// The decision belongs to the **site**, not to the domain: a site's
+/// backend is parsed once and the answer reused for all of its
+/// domains, so the pass costs one parse per site rather than one per
+/// domain.
+///
+/// Sites whose `backend` cannot be parsed are skipped silently —
+/// the same policy used in [`rebuild_tun_index`]. Any startup-time
+/// parse errors have already failed-fast at boot, so a per-reload
+/// silent skip is safe.
+fn build_tunnel_domain_set(domain: &HashMap<String, Arc<Site>>) -> HashSet<String> {
+    let mut out = HashSet::new();
+    // Site name → is the site tunnel-backed? A domain's owner is
+    // decided once, no matter how many domains the site has.
+    let mut tunnel_sites: HashMap<&str, bool> = HashMap::new();
+    for (domain, site) in domain {
+        let is_tunnel = *tunnel_sites.entry(site.name.as_str()).or_insert_with(|| {
+            matches!(
+                crate::parse::parse_backend(&site.backend),
+                Ok((ref tun, _)) if !tun.is_empty()
+            )
+        });
+        if is_tunnel {
+            out.insert(domain.clone());
+        }
+    }
+    out
 }
 
 /// Build the effective provider configuration of every site.
@@ -676,5 +733,101 @@ mod tests {
         // (the wildcard deformation only strips labels).
         let s = set(&["*.example.com"]);
         assert!(!host_matches_set(&s, "example.com"));
+    }
+
+    // ── tunnel_domains tests (the ALPN classification) ──
+
+    /// The tunnel classification is derived from the same domain map
+    /// the routing table is built from, so a mixed topology has to
+    /// classify exactly the tunnel-backed domains — no more, no
+    /// less. A direct backend, a `file://` backend, an unparseable
+    /// backend, a disabled site and a disabled domain are all
+    /// excluded; a wildcard literal of a tunnel site is included.
+    #[test]
+    fn tunnel_domains_collects_exactly_the_tunnel_backed_domains() {
+        let mut disabled_site = make_site("disabled", "office:http://10.0.0.9:8080");
+        disabled_site.enabled = false;
+        let mut disabled_domain = make_domain("disabled-domain.example.com", "tun");
+        disabled_domain.enabled = false;
+
+        let sites = vec![
+            make_site("direct", "http://127.0.0.1:8080"),
+            make_site("tun", "office:http://10.0.0.1:8080"),
+            make_site("file", "file:///srv/static"),
+            make_site("bad", "ftp://x:21"),
+            disabled_site,
+        ];
+        let domains = vec![
+            make_domain("direct.example.com", "direct"),
+            make_domain("tun.example.com", "tun"),
+            make_domain("*.wild.example.com", "tun"),
+            make_domain("file.example.com", "file"),
+            make_domain("bad.example.com", "bad"),
+            make_domain("disabled.example.com", "disabled"),
+            disabled_domain,
+        ];
+
+        let idx = Indexes::build(sites, domains);
+
+        let expected: HashSet<String> = ["tun.example.com", "*.wild.example.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(*idx.tunnel_domains, expected);
+    }
+
+    /// The migrated mirror tests: the classification is a property of
+    /// the routing revision, so it is asserted through
+    /// `indexes.tunnel_domains` instead of a separate set.
+    #[test]
+    fn build_tunnel_domain_set_collects_only_tunnel_sites() {
+        let sites = vec![
+            make_site("direct", "http://127.0.0.1:8080"),
+            make_site("tun", "office:http://10.0.0.1:8080"),
+            make_site("file", "file:///srv/static"),
+        ];
+        let domains = vec![
+            make_domain("direct.example.com", "direct"),
+            make_domain("tun.example.com", "tun"),
+            make_domain("file.example.com", "file"),
+        ];
+        let idx = Indexes::build(sites, domains);
+        assert_eq!(idx.tunnel_domains.len(), 1);
+        assert!(idx.tunnel_domains.contains("tun.example.com"));
+        assert!(!idx.tunnel_domains.contains("direct.example.com"));
+        assert!(!idx.tunnel_domains.contains("file.example.com"));
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_includes_wildcard_literals() {
+        let sites = vec![make_site("tun", "office:http://10.0.0.1:8080")];
+        let domains = vec![make_domain("*.example.com", "tun")];
+        let idx = Indexes::build(sites, domains);
+        // The literal `*.example.com` is stored as-is so the TLS callback
+        // can match SNI `foo.example.com` via the wildcard deformation.
+        assert!(idx.tunnel_domains.contains("*.example.com"));
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_skips_disabled_sites() {
+        // Indexes::build already excludes disabled sites from `domain`,
+        // so the classification follows the same filter.
+        let mut disabled = make_site("tun", "office:http://10.0.0.1:8080");
+        disabled.enabled = false;
+        let sites = vec![disabled];
+        let domains = vec![make_domain("tun.example.com", "tun")];
+        let idx = Indexes::build(sites, domains);
+        assert!(idx.tunnel_domains.is_empty());
+    }
+
+    #[test]
+    fn build_tunnel_domain_set_skips_invalid_backends() {
+        // Bad backend → parse fails → domain excluded from the
+        // classification. Same policy as the tun index pass in
+        // `Indexes::build`.
+        let sites = vec![make_site("bad", "ftp://x:21")];
+        let domains = vec![make_domain("bad.example.com", "bad")];
+        let idx = Indexes::build(sites, domains);
+        assert!(idx.tunnel_domains.is_empty());
     }
 }

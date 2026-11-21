@@ -212,7 +212,7 @@ async fn index_merges_global_and_site_scoped_rules() {
     }
     app.reload_indexes().await;
 
-    let indexes = app.indexes.read().await;
+    let indexes = app.indexes.read().clone();
     let a = indexes.limits.get("a").expect("site a has a limit config");
     let b = indexes.limits.get("b").expect("site b has a limit config");
 
@@ -241,7 +241,7 @@ async fn limiter_throttles_over_the_request_limit() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let client = ip(198, 51, 100, 10);
 
     assert_eq!(
@@ -295,7 +295,7 @@ async fn limiter_counts_distinct_pages() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let client = ip(198, 51, 100, 11);
 
     // Five distinct URLs stay inside the limit.
@@ -363,7 +363,7 @@ async fn limiter_exempts_a_verified_known_bot() {
     let verifier = app.bot_verifier.as_ref().expect("bot verifier");
     verifier.seed_prefix("googlebot", "66.249.64.0/19").unwrap();
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let bot = ip(66, 249, 66, 1);
     let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
 
@@ -418,7 +418,7 @@ async fn a_listed_bot_is_counted_against_the_sites_limits() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let bot = ip(66, 249, 66, 1);
 
     // The listed bot: the first request fits the limit of 1 per
@@ -482,7 +482,7 @@ async fn a_throttled_known_bot_reaches_the_snapshot_with_its_name() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let bot = ip(66, 249, 66, 1);
     // The first request fits the limit of 1, the second one is over it.
     assert_eq!(
@@ -575,7 +575,7 @@ async fn the_bot_list_takes_effect_through_the_reload_path() {
     let bot = ip(66, 249, 66, 1);
     // Before the site lists the bot it is exempt.
     {
-        let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+        let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
         for _ in 0..5 {
             assert_eq!(
                 app.rate_limiter.check(
@@ -599,7 +599,7 @@ async fn the_bot_list_takes_effect_through_the_reload_path() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     assert_eq!(
         app.rate_limiter.check(
             "a",
@@ -651,7 +651,7 @@ async fn limiter_blocks_a_blacklisted_ip() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     assert_eq!(
         app.rate_limiter.check(
             "a",
@@ -688,7 +688,7 @@ async fn reload_indexes_picks_up_a_changed_policy() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let client = ip(198, 51, 100, 14);
     assert_eq!(
         app.rate_limiter.check(
@@ -719,7 +719,7 @@ async fn reload_indexes_picks_up_a_changed_policy() {
         db::upsert_site_rate_limit(&db, "a", &policy(100, 0)).unwrap();
     }
     app.reload_indexes().await;
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     assert_eq!(cfg.policy.req_limit, 100);
     assert_eq!(
         app.rate_limiter.check(
@@ -748,7 +748,6 @@ async fn deleting_a_site_stops_its_policy() {
     assert!(
         app.indexes
             .read()
-            .await
             .limits
             .get("a")
             .expect("site a is limited")
@@ -763,7 +762,7 @@ async fn deleting_a_site_stops_its_policy() {
     }
     app.reload_indexes().await;
 
-    let indexes = app.indexes.read().await;
+    let indexes = app.indexes.read().clone();
     assert!(indexes.limits.get("a").is_none());
     assert!(
         pangolin_core::index::lookup_site(&indexes, "a.test").is_none(),
@@ -834,7 +833,7 @@ async fn a_policy_row_without_a_site_is_ignored() {
     }
     app.reload_indexes().await;
     assert!(
-        app.indexes.read().await.limits.get("ghost").is_none(),
+        app.indexes.read().limits.get("ghost").is_none(),
         "a policy of a site that does not exist must be ignored"
     );
 }
@@ -850,7 +849,7 @@ async fn unknown_client_ip_is_neither_counted_nor_limited() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     for _ in 0..10 {
         assert_eq!(
             app.rate_limiter
@@ -875,10 +874,9 @@ async fn two_sites_have_independent_counters() {
     }
     app.reload_indexes().await;
 
-    let indexes = app.indexes.read().await;
+    let indexes = app.indexes.read().clone();
     let cfg_a = indexes.limits.get("a").cloned().unwrap();
     let cfg_b = indexes.limits.get("b").cloned().unwrap();
-    drop(indexes);
 
     let client = ip(198, 51, 100, 15);
     assert_eq!(
@@ -941,7 +939,7 @@ async fn a_rejected_client_reaches_the_snapshot_with_its_geo() {
     }
     app.reload_indexes().await;
 
-    let cfg = app.indexes.read().await.limits.get("a").cloned().unwrap();
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
     let client = ip(198, 51, 100, 20);
     let geo = ClientGeo {
         country: Some("JP"),

@@ -122,8 +122,15 @@ rule; the two must stay in sync.
 ## The in-memory indexes
 
 `Indexes` is built once from the SQL tables and held behind an
-`Arc<RwLock<…>>`, so a request takes a read lock and an admin change
-takes a write lock that swaps the whole struct.
+`Arc<parking_lot::RwLock<Arc<Indexes>>>`. A request clones the published
+revision out of the lock and reads it; an admin change builds a new
+revision and swaps it in with a single write.
+
+The lock is a **sync** `parking_lot` lock because the TLS ALPN callback
+runs inside the OpenSSL handshake, in a sync C context, and cannot
+await. The inner `Arc` is what keeps the request path safe: the reader
+clones the revision and releases the lock immediately, so no lock guard
+is ever held across an `.await` and every request future stays `Send`.
 
 | Index | Type | Key → value |
 | --- | --- | --- |
@@ -131,18 +138,40 @@ takes a write lock that swaps the whole struct.
 | `tun` | `HashMap<String, Vec<Arc<Domain>>>` | tunnel node name → the domains that route through it |
 | `limits` | `HashMap<String, Arc<SiteLimitConfig>>` | site name → the effective rate-limit policy and IP rules |
 | `providers` | `HashMap<String, Arc<SiteProviderConfig>>` | site name → the effective provider configuration and allow ranges |
+| `tunnel_domains` | `Arc<HashSet<String>>` | the domains of `domain` whose owning site is tunnel-backed |
 
 A single `domain` map holds both exact and wildcard literals; there is no
 separate wildcard list. The earlier `domainIndex + wildcardList` design
 was over-engineered and was removed.
 
-Alongside `Indexes` the gateway keeps three more derived views:
+Alongside `Indexes` the gateway keeps two more derived views:
 
 | View | What it is |
 | --- | --- |
 | `dns_index` | The DNS provider registry plus the per-domain provider assignment, read by the ACME planner. |
-| `tunnel_domains` | Every domain that resolves to a tunnel-backed site. The TLS ALPN callback consults it on the handshake path. |
 | `cert_links` | The pre-computed domain → certificate map the SNI callback reads. See [`cert-link.md`](cert-link.md). |
+
+### The tunnel classification
+
+`tunnel_domains` is the set of domain literals whose owning site has a
+`tun_name:` backend prefix. The TLS ALPN callback consults it on the
+handshake path: a tunnel site must negotiate HTTP/1.1 only, because
+`tokio-yamux 0.3.18` has a stream-state race that breaks the h2 +
+tunnel path (issue #66 / commit `0c35ede`).
+
+The set is derived from the **same** `domain` map the routing table is
+built from, and it lives **inside** the routing revision. That is the
+point: the request path resolves a host through `domain`, and the
+handshake path classifies the same host through `tunnel_domains`. Two
+separately published views would leave a window in which the routing
+table already knows a site is tunnel-backed while the handshake still
+classifies it as direct — the handshake would then advertise `h2` and
+the request would enter the yamux path (issue #212).
+
+Publishing them together makes that window impossible: a reader takes
+one revision, and that revision is self-consistent by construction.
+(The two views still resolve a host with two different rules — see
+[below](#one-publication-per-reload).)
 
 ### One build, one revision
 
@@ -151,10 +180,11 @@ the site list, the rate-limit policies, the IP rules, the per-site bot
 lists, the provider overrides, the manual allow ranges and the global
 defaults — and assembles them in a single pass.
 
-That is deliberate. A reload swaps the routing table, the limits and the
-provider configuration together, so a request never sees the site of one
-revision and the limits of another. Splitting the build into per-feature
-passes would let a half-applied configuration reach the hot path.
+That is deliberate. A reload swaps the routing table, the limits, the
+provider configuration and the tunnel classification together, so a
+request never sees the site of one revision and the limits of another.
+Splitting the build into per-feature passes would let a half-applied
+configuration reach the hot path.
 
 ### The tunnel index
 
@@ -223,6 +253,37 @@ Two details matter for correctness:
   in-memory value in place and logs a warning, rather than emptying the
   index. The next reload catches up.
 
+### One publication per reload
+
+A reload publishes **one** routing revision, with a single write to
+`App::indexes`. Everything the hot paths read from that revision —
+the routing table, the tunnel classification, the rate limits and the
+provider configuration — becomes visible at the same instant.
+
+This is what keeps the handshake path and the request path in step.
+The ALPN callback reads the tunnel classification of the published
+revision; the request path resolves the host in the routing table of
+the published revision. One publication means the two views always
+come from the same revision, so a reload can never expose a routing
+table from one revision next to a classification from another
+(issue #212).
+
+**The window that remains is the connection's lifetime.** A connection
+that negotiated `h2` while its host was direct keeps that protocol
+after the host is re-pointed at a tunnel; the next request on it then
+runs the yamux path over `h2`. That window belongs to the established
+connection, not to the publication, and is tracked separately.
+
+**The two views also use two host rules.** The request path resolves a
+host with `lookup_site` (exact match first, then the longest wildcard
+suffix), the handshake path classifies it with `host_matches_set` (any
+matching wildcard, and it stops before a bare TLD). For a host that
+sits under a wildcard the two can answer differently — for example a
+direct site owning `a.example.com` next to a tunnel site owning
+`*.example.com`. The classification is the conservative answer there
+(`h1`), and the mismatch predates this document; it is a property of
+keeping a host-keyed set next to a site-keyed routing table.
+
 ## The tunnel registration flow
 
 A tunnel node connects and authenticates before it is given any work.
@@ -278,7 +339,8 @@ retries.
 ## Where this is used
 
 - `crates/pangolin-core/src/index.rs` — `Indexes`, `lookup_site`,
-  `site_of_host`, `wildcard_candidates`, `rebuild_tun_index`
+  `site_of_host`, `wildcard_candidates`, `rebuild_tun_index`,
+  `build_tunnel_domain_set`
 - `crates/pangolin-core/src/normalize.rs` — `normalize_host`
 - `crates/pangolin-core/src/parse.rs` — `parse_backend`,
   `is_valid_domain`
