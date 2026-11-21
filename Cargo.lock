@@ -2430,12 +2430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nohash-hasher"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2655,9 +2649,9 @@ dependencies = [
 
 [[package]]
 name = "pangolin-tun"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "becd40f4e2de655c0ddc6bbe538bae8c49b5ecea9efc7c16b0847ef8d4118082"
+checksum = "cc1e713ae145330353e2bade1af80e331823f7e48874e1b045b8aa3c97ea03bb"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4473,14 +4467,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-yamux"
-version = "0.3.18"
+version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6489207fc5dedea9723f5dc1c3ab96103c001449fa6056ca6cdba74ffbd84512"
+checksum = "1203db1ac9762aaf041ba62d4fade5959b89af1abd057c5e9bc54ae3e7f00c4b"
 dependencies = [
  "bytes",
  "futures",
  "log",
- "nohash-hasher",
  "tokio",
  "tokio-util",
  "web-time",
