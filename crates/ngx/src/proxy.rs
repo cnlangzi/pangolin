@@ -301,14 +301,14 @@ impl ProxyHttp for AppProxy {
         // ── Site lookup ────────────────────────────────────────
         //
         // The site, its rate-limit configuration and its provider
-        // configuration are read in **one** index-lock scope: the
+        // configuration are read from **one** routing revision: the
         // visitor IP has to be resolved with the site's own
         // provider, and the guard needs the same provider's range
         // set. Reading them together keeps the number of lookups
-        // and of lock acquisitions per request unchanged.
+        // per request unchanged.
         let host = host_from_session(session);
 
-        let indexes = self.app.indexes.read().await;
+        let indexes = self.app.indexes.read().clone();
         let site = match pangolin_core::index::lookup_site(&indexes, &host) {
             Some(s) => s.clone(),
             None => {
@@ -317,8 +317,8 @@ impl ProxyHttp for AppProxy {
                 return Ok(true);
             }
         };
-        // Issue #117: fetch the site's rate-limit configuration in
-        // the same lock scope as the routing entry, so the policy and
+        // Issue #117: fetch the site's rate-limit configuration from
+        // the same revision as the routing entry, so the policy and
         // the IP rules always come from the same revision.
         let limit_cfg = indexes.limits.get(&site.name).cloned();
         // Issue #122: the site's effective provider configuration
@@ -336,11 +336,11 @@ impl ProxyHttp for AppProxy {
         //
         // The verdict needs two things that both live in the index:
         // the *current* site (just resolved above) and the *owning*
-        // site of the referer host. Resolving it here — inside the
-        // lock scope `request_filter` already holds — is what keeps
-        // the logging path from taking the index lock a second time.
-        // `App::push_access_log` is synchronous and could not await
-        // the async index lock anyway.
+        // site of the referer host. Resolving it here — from the
+        // revision `request_filter` already holds — keeps the
+        // logging path from taking the index lock a second time and
+        // from resolving the referer host against a *newer* revision
+        // than the one that served the request.
         //
         // A referral is external when the referer host belongs to a
         // different site of ours — or to no site of ours at all. A
@@ -348,7 +348,6 @@ impl ProxyHttp for AppProxy {
         // recorded.
         ctx.referer_hit = classify_referer(ctx, &site.name, &indexes.domain);
 
-        drop(indexes);
         // The host is known from here on — a rate-limited request is
         // still attributed to its host in the traffic side-channel.
         ctx.host_known = true;
@@ -854,12 +853,11 @@ impl ProxyHttp for AppProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let host = host_from_session(session);
-        let indexes = self.app.indexes.read().await;
+        let indexes = self.app.indexes.read().clone();
         let site = match pangolin_core::index::lookup_site(&indexes, &host) {
             Some(s) => s.clone(),
             None => return Err(Error::new_str("site not found")),
         };
-        drop(indexes);
         let (tun, target) = parse_backend_to_target(&site.backend)
             .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad backend: {e}")))?;
         if !tun.is_empty() {
@@ -897,7 +895,7 @@ impl ProxyHttp for AppProxy {
             Some("https") => Scheme::Https,
             _ => Scheme::Http,
         };
-        let indexes = self.app.indexes.read().await;
+        let indexes = self.app.indexes.read().clone();
         let site = match pangolin_core::index::lookup_site(&indexes, &original_host) {
             Some(s) => s.clone(),
             None => {
@@ -909,7 +907,6 @@ impl ProxyHttp for AppProxy {
                 return Ok(());
             }
         };
-        drop(indexes);
 
         // Build ctx.
         let ctx = ProxyCtx {

@@ -239,9 +239,10 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, Vec<String>)> {
 /// C context, on a pingora tokio worker thread. The callback:
 ///
 /// 1. Reads the SNI from the in-progress `SslRef`.
-/// 2. Looks up the SNI in `app.tunnel_domains` (sync `parking_lot` mirror
-///    of the in-memory `Indexes`; the mirror is rebuilt atomically on
-///    every admin-triggered `App::reload_indexes`).
+/// 2. Looks up the SNI in the tunnel classification of the currently
+///    published routing revision (`App::tunnel_classification`; the
+///    revision is swapped atomically on every admin-triggered
+///    `App::reload_indexes`).
 /// 3. Picks the target protocol: `http/1.1` for tunnel sites, `h2` for
 ///    non-tunnel sites if `config.tls.enable_h2`, otherwise `http/1.1`.
 /// 4. Walks the client-offered ALPN list and returns the first match;
@@ -293,11 +294,12 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
         // sees the same string.
         let sni = sni.trim_end_matches('.');
 
-        // 2. Sync lookup: is this SNI a tunnel site?
-        let is_tunnel = {
-            let guard = app.tunnel_domains.read();
-            pangolin_core::index::host_matches_set(&guard, sni)
-        };
+        // 2. Sync lookup: is this SNI a tunnel site? The set comes
+        //    from the currently published routing revision, so it
+        //    always agrees with the routing table the request path
+        //    will use for this host (issue #212).
+        let tunnel_domains = app.tunnel_classification();
+        let is_tunnel = pangolin_core::index::host_matches_set(&tunnel_domains, sni);
 
         select_alpn(is_tunnel, global_enable_h2, alpn_in)
     });

@@ -58,7 +58,7 @@ For the corresponding config keys, see
                      proxy.rs (ngx)
   request_filter
     ├─ capture Referer / Sec-Fetch-Dest / Accept      (next to ctx.user_agent)
-    ├─ site lookup (existing indexes.read() scope)  ──► site: Arc<Site>
+    ├─ site lookup (published routing revision)  ──► site: Arc<Site>
     ├─ classify_referer(ctx, &site.name, &indexes.domain)
     │        └─ core::referer::parse_referer
     │        └─ core::referer::is_document_request
@@ -76,15 +76,23 @@ For the corresponding config keys, see
 
 ## Why the classification lives in the proxy
 
-`App::push_access_log` is synchronous and `App::indexes` is a
-`tokio::sync::RwLock`, so a synchronous side-channel cannot await the index.
-The bot channel avoids this because bot detection needs only the UA and the
-client IP, both already carried on the access-log entry. The referer channel
-needs the *current site* and the *owning site of the referer host* — both live
-in the index.
+The referer verdict needs the *current site* (the one serving the request)
+and the *owning site of the referer host* — both live in the routing
+revision. `App::push_access_log` is synchronous and is handed only the
+values the proxy already resolved, so the classification is computed in
+the proxy and travels on the context as a value.
 
-So the proxy resolves the verdict while it already holds the lock, and hands
-the finished result to the core side-channel. Two consequences:
+Computing it in the side channel instead would mean a second lookup
+against the index, and that lookup could resolve against a *newer*
+revision than the one that served the request — the log would then
+attribute a referral to a different site than the one that handled it.
+
+The bot channel does not need this: bot detection needs only the UA and
+the client IP, both already carried on the access-log entry.
+
+So the proxy resolves the verdict while it already holds the routing
+revision, and hands the finished result to the core side-channel. Two
+consequences:
 
 - The detection path never takes the index lock a second time.
 - The referer data does **not** travel through `AccessLogEntry`, so that

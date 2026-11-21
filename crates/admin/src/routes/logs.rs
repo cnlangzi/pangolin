@@ -1199,10 +1199,10 @@ fn parse_referer_params(merged_params: &[u8]) -> RefererHistoryParams {
 /// its owning site; grouping the keys by site name yields the
 /// site → domains mapping the selector needs.
 async fn site_options(app: &Arc<App>, selected: &str) -> Vec<RefererSiteOption> {
-    // The read guard is scoped to the collection loop so it is
-    // released before the (synchronous) sort below.
+    // The published routing revision is cloned out of the index lock
+    // before the (synchronous) grouping and sort below.
     let by_site: std::collections::HashMap<String, Vec<String>> = {
-        let indexes = app.indexes.read().await;
+        let indexes = app.indexes.read().clone();
         let mut by_site: std::collections::HashMap<String, Vec<String>> = Default::default();
         for (domain, site) in indexes.domain.iter() {
             by_site
@@ -1286,10 +1286,10 @@ async fn build_referer_history_page(
 
     // The scope travels into the blocking read: only the selected
     // site's own domain entries are copied (a handful of small
-    // `Arc<Site>` clones), so the reader never has to take the index
-    // lock — and the *whole* index is not cloned for it.
+    // `Arc<Site>` clones). The routing revision is cloned by handle,
+    // so the *whole* index is not copied for it.
     let scope = {
-        let indexes = app.indexes.read().await;
+        let indexes = app.indexes.read().clone();
         site_scope(&indexes.domain, &filter.site)
     };
 
@@ -1400,7 +1400,7 @@ async fn build_referer_stats_page(
     filter.date = date.to_string();
 
     let scope = {
-        let indexes = app.indexes.read().await;
+        let indexes = app.indexes.read().clone();
         site_scope(&indexes.domain, &filter.site)
     };
 
