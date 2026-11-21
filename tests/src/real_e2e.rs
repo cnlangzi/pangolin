@@ -3854,23 +3854,26 @@ async fn open_ws_client(
     tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     tokio_tungstenite::tungstenite::handshake::client::Response,
 ) {
-    use tokio_tungstenite::client_async;
-    use tokio_tungstenite::tungstenite::handshake::client::Request;
-    let url = format!("ws://127.0.0.1:{}{}", port, path);
-    let req = Request::builder()
-        .method("GET")
-        .uri(&url)
-        .header("Host", public_host)
-        .header("Upgrade", "websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") // matches RFC 6455 vector
-        .body(())
-        .expect("build WS request");
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    open_ws_client_with_headers(port, public_host, path, &[]).await
+}
+
+/// [`open_ws_client`] with extra handshake headers.
+///
+/// The extra headers ride on the same request as the upgrade — the
+/// point of the variant is a request that carries **both** an
+/// `Upgrade` and a streaming marker (issue #91).
+async fn open_ws_client_with_headers(
+    port: u16,
+    public_host: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+) {
+    try_open_ws_client_with_headers(port, public_host, path, extra_headers)
         .await
-        .expect("tcp connect");
-    client_async(req, tcp).await.expect("WS handshake")
+        .expect("WS handshake")
 }
 
 /// Open a WS connection against the proxy, returning the handshake
@@ -3890,19 +3893,41 @@ async fn try_open_ws_client(
     ),
     tokio_tungstenite::tungstenite::Error,
 > {
+    try_open_ws_client_with_headers(port, public_host, path, &[]).await
+}
+
+/// [`try_open_ws_client`] with extra handshake headers.
+///
+/// The caller gets the tungstenite error, so a failed handshake can be
+/// reported with the **actual** status code the proxy answered — the
+/// regression signature of issue #91 was a 200 instead of a 101.
+async fn try_open_ws_client_with_headers(
+    port: u16,
+    public_host: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
     use tokio_tungstenite::client_async;
     use tokio_tungstenite::tungstenite::handshake::client::Request;
     let url = format!("ws://127.0.0.1:{}{}", port, path);
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("GET")
         .uri(&url)
         .header("Host", public_host)
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
         .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") // matches RFC 6455 vector
-        .body(())
-        .expect("build WS request");
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="); // matches RFC 6455 vector
+    for (name, value) in extra_headers {
+        req = req.header(*name, *value);
+    }
+    let req = req.body(()).expect("build WS request");
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("tcp connect");
@@ -4253,6 +4278,225 @@ async fn real_e2e_tunnel_ws_upgrade_path_preserved() {
         header_lookup("Host").as_deref(),
         Some("office.test"),
         "Passthrough host_mode must leave Host as the public host"
+    );
+
+    ws.close(None).await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Test: an upgrade outranks the streaming marker (issue #91)
+// ---------------------------------------------------------------------------
+
+/// **Issue #91 — an upgrade outranks the streaming marker (tunnelled
+/// backend).**
+///
+/// A client that sends `Upgrade: websocket` **and**
+/// `Accept: text/event-stream` in the same request is doing a
+/// WebSocket handshake; the streaming marker must not take the request
+/// over. The proxy answers 101 Switching Protocols and the frames
+/// flow.
+///
+/// This is the regression test for the original #91 report, where the
+/// streaming byte-pump on the tunnel path answered 200 chunked and the
+/// upgrade never completed. That pump is gone since issue #153 (the
+/// tunnel became a byte splice) — this test pins the invariant so a
+/// future short-circuit cannot bring it back.
+///
+/// On success the test locks in:
+///   1. The proxy answers 101 for the dual-header request.
+///   2. The backend saw **both** headers.
+///   3. A text frame round-trips through the tunnel.
+#[tokio::test]
+async fn real_e2e_tunnel_ws_upgrade_survives_event_stream_accept() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_tun(&conn, "office", true);
+            seed_site(
+                &conn,
+                "office-ws-site",
+                &format!("office:http://{backend_addr}"),
+            );
+            seed_domain(&conn, "office.test", "office-ws-site");
+        }
+    })
+    .await;
+
+    let tun = TunProcess::start(&ngx, "office", "test-token").await;
+
+    // The status code is the point of the test, so a failed handshake
+    // has to name it: before issue #153 the proxy answered 200 here.
+    let (mut ws, response) = match try_open_ws_client_with_headers(
+        ngx.http_port,
+        "office.test",
+        "/chat",
+        &[("Accept", "text/event-stream")],
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => panic!(
+            "proxy must answer 101 Switching Protocols, got HTTP {}\n\
+             ngx log:\n{}\n-- tun log --\n{}",
+            resp.status(),
+            ngx.log_string(),
+            tun.log_string()
+        ),
+        Err(e) => panic!(
+            "WS handshake failed: {e}\nngx log:\n{}\n-- tun log --\n{}",
+            ngx.log_string(),
+            tun.log_string()
+        ),
+    };
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "tun WS relay must answer 101, got {}\nngx log:\n{}\n-- tun log --\n{}",
+        response.status(),
+        ngx.log_string(),
+        tun.log_string()
+    );
+
+    // The backend must have seen **both** headers: the request was
+    // forwarded as an upgrade that also carries a streaming marker,
+    // not rewritten into a plain SSE request.
+    let h = backend.handshake().await.expect("backend saw WS upgrade");
+    let header_lookup = |name: &str| -> Option<String> {
+        h.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        header_lookup("Upgrade").as_deref(),
+        Some("websocket"),
+        "backend must see Upgrade: websocket over the tun"
+    );
+    assert_eq!(
+        header_lookup("Accept").as_deref(),
+        Some("text/event-stream"),
+        "backend must see Accept: text/event-stream over the tun"
+    );
+
+    // The upgraded connection must still carry frames.
+    ws.send(Message::Text("dual-header-over-tun".into()))
+        .await
+        .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .unwrap_or_else(|e| {
+            panic!(
+                "ws error: {e}\nngx log:\n{}\n-- tun log --\n{}",
+                ngx.log_string(),
+                tun.log_string()
+            )
+        });
+    let payload = match msg {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text echo, got {other:?}"),
+    };
+    assert_eq!(
+        payload, "dual-header-over-tun",
+        "echoed frame must round-trip"
+    );
+
+    ws.close(None).await.ok();
+}
+
+/// **Issue #91 — an upgrade outranks the streaming marker (direct
+/// backend).**
+///
+/// The same invariant as
+/// `real_e2e_tunnel_ws_upgrade_survives_event_stream_accept`, on the
+/// other kind of backend: a request carrying both `Upgrade: websocket`
+/// and `Accept: text/event-stream` is still an upgrade, so the proxy
+/// answers 101 and the frames flow.
+#[tokio::test]
+async fn real_e2e_direct_ws_upgrade_survives_event_stream_accept() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let backend = MockWsBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "ws-direct-site", &format!("http://{backend_addr}"));
+        seed_domain(&conn, "wsdirect.test", "ws-direct-site");
+    })
+    .await;
+
+    let (mut ws, response) = match try_open_ws_client_with_headers(
+        ngx.http_port,
+        "wsdirect.test",
+        "/chat",
+        &[("Accept", "text/event-stream")],
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => panic!(
+            "proxy must answer 101 Switching Protocols, got HTTP {}\nngx log:\n{}",
+            resp.status(),
+            ngx.log_string()
+        ),
+        Err(e) => panic!("WS handshake failed: {e}\nngx log:\n{}", ngx.log_string()),
+    };
+    assert_eq!(
+        response.status().as_u16(),
+        101,
+        "proxy must answer 101 Switching Protocols for the dual-header request, got {}\n\
+         ngx log:\n{}",
+        response.status(),
+        ngx.log_string()
+    );
+
+    // The backend must have seen **both** headers.
+    let h = backend.handshake().await.expect("backend saw handshake");
+    let header_lookup = |name: &str| -> Option<String> {
+        h.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        header_lookup("Upgrade").as_deref(),
+        Some("websocket"),
+        "backend must see Upgrade: websocket"
+    );
+    assert_eq!(
+        header_lookup("Accept").as_deref(),
+        Some("text/event-stream"),
+        "backend must see Accept: text/event-stream"
+    );
+
+    // The upgraded connection must still carry frames.
+    ws.send(Message::Text("dual-header-direct".into()))
+        .await
+        .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame timeout")
+        .expect("ws stream end")
+        .unwrap_or_else(|e| panic!("ws error: {e}\nngx log:\n{}", ngx.log_string()));
+    let payload = match msg {
+        Message::Text(t) => t.to_string(),
+        other => panic!("expected text echo, got {other:?}"),
+    };
+    assert_eq!(
+        payload, "dual-header-direct",
+        "echoed frame must round-trip"
     );
 
     ws.close(None).await.ok();

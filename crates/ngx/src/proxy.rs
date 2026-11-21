@@ -431,8 +431,12 @@ impl ProxyHttp for AppProxy {
         // histogram — the connection's lifetime is the upgrade's,
         // not a request's. Since issue #153 both the direct and the
         // tunnelled upgrade go through pingora's normal path.
+        //
+        // The class comes from `traffic_kind_for` — the one place
+        // that ranks an upgrade above the streaming marker
+        // (issue #91) — so the two assignment sites cannot disagree.
         if is_upgrade {
-            ctx.traffic_kind = pangolin_core::TrafficKind::Websocket;
+            ctx.traffic_kind = traffic_kind_for(is_upgrade, is_streaming);
         }
 
         // ── Origin guard (issue #122) ──────────────────────────
@@ -729,7 +733,13 @@ impl ProxyHttp for AppProxy {
             }
             // Mark Stream so the traffic histogram / RPS rings
             // ignore the hang time of a long-lived SSE response.
-            ctx.traffic_kind = pangolin_core::TrafficKind::Stream;
+            //
+            // The assignment stays **after** the `file://` refusal
+            // above on purpose: a rejected SSE request is counted as
+            // plain HTTP, not as a stream. An upgrade keeps its own
+            // class — `traffic_kind_for` ranks it above the
+            // streaming marker (issue #91).
+            ctx.traffic_kind = traffic_kind_for(is_upgrade, is_streaming);
             debug!(
                 "SSE: pingora-native streaming {} → {}",
                 host,
@@ -1061,6 +1071,24 @@ impl ProxyHttp for AppProxy {
         ctx: &mut Self::CTX,
     ) {
         self.app.traffic.on_finish(traffic_sample(session, ctx));
+    }
+}
+
+/// The traffic class of a request.
+///
+/// An upgrade outranks the streaming marker: a client that sends both
+/// `Upgrade: websocket` and `Accept: text/event-stream` is doing a
+/// WebSocket handshake, not an SSE stream (issue #91). Both classes
+/// are excluded from the latency histogram and the RPS rings, so the
+/// only difference is the `ws_req` / `stream_req` counters on the
+/// traffic page.
+fn traffic_kind_for(is_upgrade: bool, is_streaming: bool) -> pangolin_core::TrafficKind {
+    if is_upgrade {
+        pangolin_core::TrafficKind::Websocket
+    } else if is_streaming {
+        pangolin_core::TrafficKind::Stream
+    } else {
+        pangolin_core::TrafficKind::Http
     }
 }
 
@@ -1662,6 +1690,23 @@ fn host_from_session(session: &Session) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upgrade outranks the streaming marker (issue #91): a client
+    /// that sends `Upgrade: websocket` **and** `Accept:
+    /// text/event-stream` is doing a WebSocket handshake, so it is
+    /// accounted as a WebSocket and not as an SSE stream.
+    ///
+    /// The other three cells pin the classes that must not drift:
+    /// an upgrade alone is a WebSocket, the streaming marker alone is
+    /// a Stream, and a plain request is plain HTTP.
+    #[test]
+    fn traffic_kind_for_ranks_the_upgrade_over_the_streaming_marker() {
+        use pangolin_core::TrafficKind;
+        assert_eq!(traffic_kind_for(true, true), TrafficKind::Websocket);
+        assert_eq!(traffic_kind_for(true, false), TrafficKind::Websocket);
+        assert_eq!(traffic_kind_for(false, true), TrafficKind::Stream);
+        assert_eq!(traffic_kind_for(false, false), TrafficKind::Http);
+    }
 
     /// The four gateway headers are always written — an illegal value
     /// must not make the header disappear, because a backend cannot
