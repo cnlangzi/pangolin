@@ -382,6 +382,10 @@ impl TunnelProxy {
         Self { addr, tasks }
     }
 
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
     /// Cut every connection the proxy is carrying.
     ///
     /// Both ends go down with the task, so the tun and the gateway
@@ -795,6 +799,12 @@ async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
 ///   tunnel's byte stream ends when the session dies, and an
 ///   end-of-stream says "the tun finished sending" — that is what
 ///   lets the tun hand the backend a request that was cut short.
+///
+/// The **gateway's log** is what pins the third one: the bytes on
+/// the wire are the same either way — a dead session and a finished
+/// one both reach pingora as the end of the response — so the client
+/// cannot tell them apart.  The crate reports the death as an error,
+/// and the gateway says so.
 #[tokio::test]
 async fn real_e2e_tunnel_a_dead_session_is_reported_as_an_error() {
     let backend = TruncatingBackend::start().await;
@@ -822,7 +832,8 @@ async fn real_e2e_tunnel_a_dead_session_is_reported_as_an_error() {
     // what reports the end of a stream.  The QUIC transport never
     // touches yamux, so it cannot show this failure at all.
     let proxy = TunnelProxy::start(format!("127.0.0.1:{}", ngx.tunnel_port)).await;
-    let tun = TunProcess::start_with_transport_at(&proxy.addr, "office", "test-token", "tcp").await;
+    let tun =
+        TunProcess::start_with_transport_at(proxy.addr(), "office", "test-token", "tcp").await;
 
     // The request goes out; the backend has it and waits.
     let addr = format!("127.0.0.1:{}", ngx.http_port);
@@ -830,7 +841,12 @@ async fn real_e2e_tunnel_a_dead_session_is_reported_as_an_error() {
         tokio::spawn(
             async move { raw_request(&addr, "office.test", "GET", "/api/echo", b"").await },
         );
-    backend.wait_for_request().await;
+    // The request has to reach the backend before the tunnel dies, or
+    // the test would prove nothing.  The wait is bounded: a request
+    // that never arrives must fail the test, not hang it.
+    tokio::time::timeout(Duration::from_secs(5), backend.wait_for_request())
+        .await
+        .expect("the request must reach the backend");
 
     // The tunnel's connection dies while the request is in flight.
     proxy.cut().await;

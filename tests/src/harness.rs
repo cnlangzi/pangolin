@@ -837,6 +837,8 @@ impl TunProcess {
         token: &str,
         transport: &str,
     ) -> Self {
+        // The **tunnel** port (where ngx's WS tunnel server listens),
+        // not the admin port.
         let server = format!("127.0.0.1:{}", ngx.tunnel_port);
         Self::start_with_transport_at(&server, name, token, transport).await
     }
@@ -864,9 +866,9 @@ impl TunProcess {
         }
         // tun now reads its config from `tun.yml` (the old
         // `--server` / `--name` / `--token` CLI args were removed
-        // when the configs were split). The address here is the
-        // **tunnel** port (where ngx's WS tunnel server listens),
-        // not the admin port.
+        // when the configs were split). The `server:` key takes the
+        // gateway's tunnel port — or a proxy in front of it — never
+        // the admin port.
         let tun_config = format!(
             r#"
 server: {server}

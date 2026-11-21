@@ -308,10 +308,18 @@ async fn bridge_tunnel_to_socket(tunnel: TunnelStream, socket: TcpStream) {
             // would be relayed as if it were whole; the crate reports
             // the death of a session as an error instead, so the
             // failure is visible here (issue #211).
+            //
+            // The bytes on the wire are the same either way — the
+            // half-close below still reaches pingora as a clean end
+            // of the response — so what the error buys is the
+            // *report*: a session that died under a request is an
+            // event the operator has to see, and one that reads as
+            // "the tun finished sending" is not one.
             warn!("tunnel: the tunnel stream failed: {e}");
         }
     });
-    // The request direction: pingora → the tun.
+    // The request direction: pingora → the tun.  Its failure is
+    // pingora's own (the client is gone), so it is dropped.
     let _ = copy_half(socket_read, tunnel_write).await;
     // pingora closed its side — the tunnel stream is done with.
     response.abort();
@@ -324,10 +332,10 @@ async fn bridge_tunnel_to_socket(tunnel: TunnelStream, socket: TcpStream) {
 /// reading, so a response that only arrives after the request is
 /// complete still reaches the client.
 ///
-/// A **failed read** is a different ending, and it is reported: the
+/// A **failed read** is a different ending, and it is returned: the
 /// bytes that were still to come will never come.  A failed *write*
-/// is not reported — the peer is gone, and the half-close that
-/// follows says as much.
+/// is not — the peer is gone, and the half-close that follows says
+/// as much.
 async fn copy_half<R, W>(mut reader: R, mut writer: W) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,

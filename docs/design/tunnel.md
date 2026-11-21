@@ -290,9 +290,20 @@ death of a session as an **error**, and the gateway logs it:
 tunnel: the tunnel stream failed: the tunnel session ended
 ```
 
-The request that was in flight fails with the gateway's own error —
-the **502** above — and never with the backend's answer to a request
-the backend never received whole.
+A request whose response has not started yet fails with the gateway's
+own error — the **502** above — and never with the backend's answer to
+a request the backend never received whole.
+
+What the client sees depends on how the backend frames its response.
+A response that is framed by its length (`Content-Length` or chunked)
+is cut short by the session's death, and pingora reports the short
+read as a broken upstream — the client gets the **502**. A response
+that is **close-delimited** — no `Content-Length`, the body ends when
+the connection ends — is the one shape pingora cannot tell apart from
+a whole one: it reads the end of the connection as the end of the
+body, so the client receives the truncated body under the backend's
+own status. The gateway's log is what tells the operator that the
+session died.
 
 ### The backend's path prefix
 
