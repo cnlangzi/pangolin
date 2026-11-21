@@ -79,6 +79,10 @@ impl CertLinkCache {
     /// new one — never an empty or half-filled table. A failure
     /// anywhere in the rebuild returns before the swap, leaving the
     /// live table with every link it already had (issue #213).
+    ///
+    /// The caller must serialize this against `relink_for_domain` /
+    /// `relink_for_cert` — the cache does not order an entry write
+    /// against a rebuild. See `docs/design/cert-link.md` §5.
     pub fn reload_from_db(&self, conn: &Connection) -> crate::Result<()> {
         let new_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let mut stmt = conn.prepare("SELECT domain FROM domains")?;
@@ -142,11 +146,9 @@ impl CertLinkCache {
     /// update — no DB I/O.
     pub fn relink_for_domain(&self, conn: &Connection, domain: &str) -> crate::Result<()> {
         let new_link = find_best_cert_for(conn, domain)?;
-        // The read lock guards the swap, not the entry: the entry is
-        // mutated in place through the DashMap's own interior
-        // mutability. Holding the lock means the write lands either
-        // entirely before or entirely after a concurrent rebuild's
-        // swap — never in the middle of one.
+        // The read lock guards the swap, not the entry — it does not
+        // order this write against a rebuild. The caller must
+        // serialize the two; see `docs/design/cert-link.md` §5.
         let map = self.map.read();
         match new_link {
             Some(c) => {
@@ -195,12 +197,13 @@ impl CertLinkCache {
     }
 
     /// Number of entries in the cache. Useful for tests and admin
-    /// introspection. Cheap (DashMap exposes shard counts).
+    /// introspection. Cheap (one read lock plus the DashMap's shard
+    /// counts).
     pub fn len(&self) -> usize {
         self.map.read().len()
     }
 
-    /// Whether the cache has any entries. Cheap.
+    /// Whether the cache has any entries. Cheap (one read lock).
     pub fn is_empty(&self) -> bool {
         self.map.read().is_empty()
     }
@@ -660,5 +663,50 @@ mod tests {
         // The links that were already there survive the failed rebuild.
         assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn lookup_never_sees_a_missing_link_while_a_rebuild_runs() {
+        // The property issue #213 is about: a handshake that runs
+        // while the cache is being rebuilt must resolve the link on
+        // every read. An in-place rebuild (clear, then refill) leaves
+        // a window where the lookup misses; the swap-pointer rebuild
+        // never does, because the live table is never emptied.
+        //
+        // The reader runs on its own thread against a clone (the SNI
+        // callback's situation) while the main thread rebuilds. The
+        // rebuild's write lock is taken only for the swap — after the
+        // new table is fully built — so the reader is never blocked
+        // for the duration of the rebuild either.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let conn = setup_db();
+        insert_domain(&conn, "example.com");
+        insert_cert(&conn, "example.com", &["*.example.com"], "issued");
+
+        let cache = CertLinkCache::load_from_db(&conn).unwrap();
+        let reader_cache = cache.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !reader_stop.load(Ordering::Relaxed) {
+                assert_eq!(
+                    reader_cache.lookup("example.com").as_deref(),
+                    Some("example.com"),
+                    "a lookup during a rebuild must not miss a live link"
+                );
+                reads += 1;
+            }
+            reads
+        });
+
+        for _ in 0..200 {
+            cache.reload_from_db(&conn).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("the reader thread must not panic");
+        assert!(reads > 0, "the reader must have observed the table");
     }
 }

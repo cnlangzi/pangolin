@@ -40,8 +40,8 @@ The TLS handshake is reduced to:
 sni  →  cache.lookup(sni)  →  cert_dir/{value}  →  load + install cert
 ```
 
-Single DashMap lookup + one filesystem `stat()`. The SNI callback no
-longer makes a policy decision — the decision was made when the
+One read lock, a single DashMap lookup and one filesystem `stat()`.
+The SNI callback no longer makes a policy decision — the decision was made when the
 domain or cert was last touched, and is now just a map entry.
 
 The cache is a **derived view** of the (already-existing) `domains`
@@ -77,7 +77,7 @@ the DB at any time with no information loss.
 | Goal | Notes |
 | ---- | ----- |
 | Wildcard certs (`*.example.com`) cover subdomains at handshake time | The user-expected behavior, matches certbot/Caddy. |
-| Hot path is O(1) | Single DashMap lookup per SNI. The policy decision ("which cert covers this domain") is pre-computed. |
+| Hot path is O(1) | One read lock plus a single DashMap lookup per SNI. The policy decision ("which cert covers this domain") is pre-computed. |
 | DB schema is unchanged | Link is derived data, not a primary fact. No migration, no `linked_cert_domain` column. |
 | Survives restart | `load_from_db` rebuilds the cache from `domains` × `certs` at startup. |
 | Stays in sync under CRUD | Domain/cert changes call `relink_for_*` to maintain the cache. |
@@ -178,6 +178,26 @@ done with it.
 A rebuild that fails (a DB read error) returns **before** the swap, so
 the live table keeps every link it already had. `App::reload_indexes`
 logs the error and carries on — handshakes are unaffected.
+
+### The caller has to serialize entry writes against a rebuild
+
+The cache does **not** order an entry-level write against a rebuild.
+A rebuild derives its table from a DB snapshot taken *before* it takes
+the write lock, so an entry written into the live table while a
+rebuild is in flight is discarded when the new table is published. The
+caller must serialize the two.
+
+In production that serialization is `App::db` — the mutex over the
+SQLite connection:
+
+- every relink site holds it across its DB write **and** its relink
+  (`admin/src/routes/domains/mutate.rs`, `admin/src/routes/certs/mutate.rs`,
+  `ngx/src/acme.rs`), and
+- `App::reload_indexes` holds the same mutex across the snapshot and
+  the swap.
+
+A call site that relinks without holding `App::db` loses its update
+until the next rebuild re-derives it from the DB.
 
 - `lookup(sni)` — exact match, then walk up the labels looking for
   `*.X` keys. Stops when the suffix is a single label (e.g. `*.com`
@@ -336,6 +356,7 @@ domains and a hundred certs that's well under a second.
 | Process restart in middle of an issuance | Startup `load_from_db` reads `certs`; the in-flight issuance either committed (so the cert is visible) or didn't (so it's not). No half-state. |
 | The rebuild fails part-way (transient DB error) | The new table is discarded before it is published, so the live table keeps every link it already had. `App::reload_indexes` logs a warning and continues — handshakes are unaffected. |
 | A rebuild overlaps a TLS handshake | The handshake holds the read lock for its whole lookup, so it resolves against one complete table — the old one before the swap, the new one after. It never sees an empty or half-filled table. |
+| The cert-link table is published independently of the routing revision | `App::reload_indexes` publishes the routing revision first and the cert-link table second. For a domain added by that same reload there is a window where the domain is routable but has no cert link, so its TLS handshake fails until the swap lands. The two are separate derived views; the routing table and the tunnel classification are published atomically with each other (issue #212), the cert-link table is not. |
 | Cert on disk deleted out-of-band (no `certs` row change) | SNI callback's `is_file()` returns false → handshake fails with a debug log. User is told via the log that the link is stale. |
 | `App::new` cannot build the cache at startup (DB unreachable, cert table corrupt) | `App::new` fails and the process refuses to start. This is intentional: a process that booted with a broken cache would silently serve the wrong certs (or no certs) on the TLS hot path, which is harder to debug than a loud startup failure. Operator must fix the DB and restart. |
 | Out-of-band DB edit (e.g., manual SQL adds a cert row, bypassing the admin API) | The cache is not rebuilt until the next CRUD event for that cert, or until the next process restart. If the operator wants the change live immediately, they can call `POST /api/reload` (when that endpoint is extended to refresh `cert_links`) or restart. |
