@@ -880,10 +880,16 @@ impl App {
         // (before the index build) so the effective provider of every
         // site could be resolved against it.
         *self.system_config.write().await = system_config;
-        // Rebuild cert_links (fix/cert_www). Best-effort: if the
-        // rebuild fails (e.g. a transient DB error), log and keep
-        // the existing cache. The cache is a derived view and will
-        // catch up on the next reload.
+        // Rebuild cert_links (fix/cert_www). The rebuild builds a new
+        // table and publishes it under one write lock, so a handshake
+        // sees either the whole old table or the whole new one —
+        // never an empty or half-filled one (issue #213).
+        //
+        // Best-effort: if the rebuild fails (e.g. a transient DB
+        // error), it returns before the swap, so the live table keeps
+        // every link it already had. We log the error and carry on;
+        // the cache is a derived view and catches up on the next
+        // reload.
         if let Err(e) = self.cert_links.reload_from_db(&conn) {
             log::warn!("cert_links: reload from DB failed: {}", e);
         }

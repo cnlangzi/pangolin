@@ -152,13 +152,38 @@ So:
 
 ```rust
 pub struct CertLinkCache {
-    map: Arc<DashMap<String, String>>,  // domain → linked cert primary
+    // The live table, behind a swap pointer. A rebuild builds a new
+    // `DashMap` and replaces the inner `Arc` under one write lock.
+    map: Arc<parking_lot::RwLock<Arc<DashMap<String, String>>>>,
 }
 ```
 
+The cache holds **one live table** — a `DashMap<domain, cert primary>` —
+behind a swap pointer. The `RwLock` guards the *replacement* of that
+table, not the entries inside it. Two kinds of write reach the cache:
+
+| Write | Mechanism | What a concurrent reader sees |
+| --- | --- | --- |
+| `relink_for_domain` / `relink_for_cert` / `remove_domain` (one entry) | The entry is mutated in place through the DashMap's own interior mutability, while the read lock is held. | That one entry changes; every other entry is untouched. |
+| `reload_from_db` (full rebuild) | A **new** `DashMap` is built off to the side and published by replacing the inner `Arc` under one write lock. | Either the whole old table or the whole new one — never an empty or half-filled table. |
+
+The second row is why the table sits behind a swap pointer. A rebuild
+is O(domains × certs) and takes a while, and the SNI callback must not
+observe the cache mid-rebuild: a half-filled cache is "handshake fails
+for every domain that has not been re-derived yet", which is worse than
+a stale link. Before the swap a reader sees the old table, after it the
+new one; the `Arc` keeps the old table alive until its last reader is
+done with it.
+
+A rebuild that fails (a DB read error) returns **before** the swap, so
+the live table keeps every link it already had. `App::reload_indexes`
+logs the error and carries on — handshakes are unaffected.
+
 - `lookup(sni)` — exact match, then walk up the labels looking for
   `*.X` keys. Stops when the suffix is a single label (e.g. `*.com`
-  is never consulted because wildcard certs cannot cover TLDs).
+  is never consulted because wildcard certs cannot cover TLDs). The
+  whole walk holds one read lock, so the exact match and the wildcard
+  candidates are resolved against the same table.
 - `relink_for_domain(domain)` — recompute one entry. Used after a
   domain row is inserted/updated.
 - `relink_for_cert(cert_domain)` — recompute all entries that could
@@ -309,6 +334,8 @@ domains and a hundred certs that's well under a second.
 | Cert row's `sans` JSON is malformed | `serde_json::from_str` fails → we log a warning naming the cert's primary and treat the SAN list as empty. The cert "covers nothing" beyond an exact `cert.domain` match, so it rarely wins a relink. The warning is per cert per `relink_for_*` call — not "once" — because a transient DB edit could re-introduce a malformed row, and we want the warning to be re-emitted each time we see it. |
 | Two wildcard certs both cover the same domain (e.g. `*.example.com` and `*.foo.example.com` for `api.foo.example.com`) | `cert_covers_domain` returns `Wildcard` for both, `find_best_cert_for` returns the first scanned. Deterministic by `certs.domain` order. |
 | Process restart in middle of an issuance | Startup `load_from_db` reads `certs`; the in-flight issuance either committed (so the cert is visible) or didn't (so it's not). No half-state. |
+| The rebuild fails part-way (transient DB error) | The new table is discarded before it is published, so the live table keeps every link it already had. `App::reload_indexes` logs a warning and continues — handshakes are unaffected. |
+| A rebuild overlaps a TLS handshake | The handshake holds the read lock for its whole lookup, so it resolves against one complete table — the old one before the swap, the new one after. It never sees an empty or half-filled table. |
 | Cert on disk deleted out-of-band (no `certs` row change) | SNI callback's `is_file()` returns false → handshake fails with a debug log. User is told via the log that the link is stale. |
 | `App::new` cannot build the cache at startup (DB unreachable, cert table corrupt) | `App::new` fails and the process refuses to start. This is intentional: a process that booted with a broken cache would silently serve the wrong certs (or no certs) on the TLS hot path, which is harder to debug than a loud startup failure. Operator must fix the DB and restart. |
 | Out-of-band DB edit (e.g., manual SQL adds a cert row, bypassing the admin API) | The cache is not rebuilt until the next CRUD event for that cert, or until the next process restart. If the operator wants the change live immediately, they can call `POST /api/reload` (when that endpoint is extended to refresh `cert_links`) or restart. |
