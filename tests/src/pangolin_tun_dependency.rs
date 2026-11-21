@@ -33,12 +33,12 @@ const CRATE: &str = "pangolin-tun";
 /// The published artefact's checksum — the `sha256` of the `.crate`
 /// file on crates.io.
 ///
-/// A re-publish of 0.1.0 under different content would not resolve to
+/// A re-publish of 0.2.0 under different content would not resolve to
 /// the same checksum, and cargo would refuse the lockfile.
-const CHECKSUM: &str = "becd40f4e2de655c0ddc6bbe538bae8c49b5ecea9efc7c16b0847ef8d4118082";
+const CHECKSUM: &str = "cc1e713ae145330353e2bade1af80e331823f7e48874e1b045b8aa3c97ea03bb";
 
 /// The version the lockfile must resolve.
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 /// Every Rust file under `dir`, recursively.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
@@ -141,9 +141,10 @@ fn no_crate_imports_the_in_tree_tunnel_module() {
 /// The workspace depends on the **published** crate: a version
 /// requirement, not a path.
 ///
-/// The requirement is a caret on the 0.1 line — a future 0.2
-/// release would carry a protocol change, so it must not be picked
-/// up silently.  A `path` key would mean the in-tree copy crept
+/// The requirement is a caret on the 0.2 line (issue #211).  0.2.0
+/// is the release that binds the session-end signal to the streams,
+/// so a dying tunnel session reads as an error instead of as a clean
+/// end-of-file.  A `path` key would mean the in-tree copy crept
 /// back.
 #[test]
 fn the_workspace_depends_on_the_published_crate() {
@@ -164,8 +165,8 @@ fn the_workspace_depends_on_the_published_crate() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
     assert!(
-        version.starts_with("0.1"),
-        "the {CRATE} dependency must ask for the 0.1 line, got {version:?}"
+        version.starts_with("0.2"),
+        "the {CRATE} dependency must ask for the 0.2 line, got {version:?}"
     );
 }
 

@@ -97,7 +97,7 @@ figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 #
 # The lock file still carries a `digest 0.10` alongside `digest 0.11`,
 # but every edge into it is a third-party crate we do not control:
-# `pangolin-tun 0.1` (published), `fastwebsockets 0.10` and
+# `pangolin-tun 0.2` (published), `fastwebsockets 0.10` and
 # `tungstenite 0.24` (sha1 0.10), `rust-embed-utils 8.11` (sha2
 # 0.10) and `pingora-cache`'s `blake2 0.10` (digest 0.10).  The two
 # `digest` versions never meet at a type boundary here — no public
@@ -135,8 +135,17 @@ badbots = { version = "0.1.4", features = ["full"] }
 # the client all live there, and this repository consumes them from
 # the registry the way it consumes `knownbots` and `badbots`.
 #
-# The requirement is a caret on the 0.1 line — a future 0.2 release
-# would carry a protocol change, so it must not be picked up silently.
+# The requirement is a caret on the 0.2 line (issue #211). 0.2.0 is
+# the release that binds the session-end signal to the streams of the
+# WebSocket/TCP transport: a dying tunnel session now reads as an
+# error instead of as a clean end-of-file, so the tun closes the
+# backend socket with an error instead of handing it a truncated
+# request. The change is a **Rust API** change — `open_stream()` and
+# `accept_stream()` return the crate's own stream wrapper instead of
+# `yamux::StreamHandle` — and it stays behind the `TunnelTransport`
+# trait, so no source file here had to change. The *wire* protocol is
+# untouched: `TUNNEL_PROTOCOL_VERSION` stays 2, and a gateway and a
+# tun that were not upgraded together still interoperate.
 #
 # The crate pins `base64 0.23` and `thiserror 2` while this workspace
 # asks for `base64 0.22` and `thiserror 1`, so the tree carries two
@@ -145,7 +154,7 @@ badbots = { version = "0.1.4", features = ["full"] }
 # never meet at a type boundary. Aligning the workspace on the
 # crate's versions would remove the duplication but is a workspace-wide
 # change that belongs in its own pull request.
-pangolin-tun = { version = "0.1" }
+pangolin-tun = { version = "0.2" }
 
 log = "0.4"
 env_logger = "0.11"
