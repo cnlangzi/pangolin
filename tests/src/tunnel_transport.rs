@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
+use crate::real_e2e::seed_cert;
 
 // ---------------------------------------------------------------------------
 // Mock backends
@@ -207,20 +208,6 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
         rusqlite::params![domain, site_name, now],
     )
     .expect("insert domain");
-}
-
-/// Seed the `certs` row so the in-memory `CertLinkCache` has a link
-/// for the domain — the TLS listener resolves the SNI through it. The
-/// certificate blob itself is written to the cert dir afterwards.
-fn seed_cert(conn: &Connection, domain: &str) {
-    let now = chrono::Utc::now().to_rfc3339();
-    let sans_json = serde_json::to_string(&vec![domain.to_string()]).expect("serialize sans");
-    conn.execute(
-        "INSERT INTO certs (domain, cert_file, key_file, created_at, sans, source, status)
-         VALUES (?1, '/dev/null', '/dev/null', ?2, ?3, 'manual', 'issued')",
-        rusqlite::params![domain, now, sans_json],
-    )
-    .expect("insert cert");
 }
 
 /// Issue a raw HTTP/1.1 request and return the status and the body.
@@ -682,6 +669,14 @@ async fn real_e2e_tunnel_quic_negotiates_h2() {
 
     let tun = TunProcess::start_with_transport(&ngx, "office", "test-token", "quic").await;
 
+    // Wait for the **gateway** to report the session before the
+    // handshake. The tun's own "connected to ngx" line fires on the
+    // AUTH reply, which the gateway sends *before* it registers the
+    // session — and the ALPN decision reads the registered transport.
+    // Without this wait the handshake could land in that window, see
+    // no transport and answer h1.
+    assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
+
     // A self-signed certificate for the vhost, in the autocert blob
     // layout the SNI callback reads.
     crate::harness::gen_self_signed(&["office.test"], "office.test", &ngx.cert_dir());
@@ -765,8 +760,4 @@ async fn real_e2e_tunnel_quic_negotiates_h2() {
         "the request line must survive the splice byte-exact, got {:?}",
         seen[0]
     );
-
-    // The gateway must report that the session came up over QUIC —
-    // the transport the h2 decision was made on.
-    assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
 }

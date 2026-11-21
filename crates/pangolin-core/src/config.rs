@@ -386,7 +386,7 @@ impl Default for ProviderConfig {
 /// TLS listener tuning.
 ///
 /// ALPN selection is decided **per connection, per SNI** in
-/// `ngx::tls::build_sni_settings`. The runtime rule is:
+/// `crates/ngx/src/tls.rs`. The runtime rule is:
 ///
 /// - If the SNI resolves to a site with a `tun_name:` backend
 ///   prefix, the listener looks at the **transport** that site's

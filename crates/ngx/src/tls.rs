@@ -353,6 +353,15 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
 /// - If neither h2 nor http/1.1 is offered, return `NOACK` so openssl
 ///   sends a fatal alert (matches `prefer_h2` / `h1_only` in vendored
 ///   pingora).
+///
+/// **The decision is per connection, the transport is per session.** A
+/// tun that fails over from QUIC to the WebSocket/TCP fallback
+/// changes the policy for the *next* handshake; a connection that
+/// already negotiated `h2` keeps it, and its requests then travel
+/// over the fallback's yamux session. That window belongs to the
+/// established connection, not to the policy — the same window a
+/// direct site that is re-pointed at a tunnel opens. See
+/// `docs/design/routing-and-index.md`.
 fn select_alpn(
     is_tunnel: bool,
     transport: Option<TransportKind>,
@@ -361,8 +370,10 @@ fn select_alpn(
 ) -> Result<&[u8], AlpnError> {
     // 3a. A tunnel on the WebSocket/yamux fallback — and a tunnel with
     //     no live session, whose transport is therefore unknown —
-    //     stay on http/1.1. See the policy above.
-    if is_tunnel && transport != Some(TransportKind::Quic) {
+    //     stay on http/1.1. See the policy above. A transport the
+    //     gateway does not know yet falls into this branch too: the
+    //     conservative answer is the safe one.
+    if is_tunnel && !matches!(transport, Some(TransportKind::Quic)) {
         return pick_protocol(alpn_in, b"http/1.1").ok_or(AlpnError::NOACK);
     }
 

@@ -947,7 +947,7 @@ mod tests {
     /// the routing revision, so it is asserted through
     /// `indexes.tunnel_domains` instead of a separate set.
     #[test]
-    fn build_tunnel_domain_set_collects_only_tunnel_sites() {
+    fn build_tunnel_classification_collects_only_tunnel_sites() {
         let sites = vec![
             make_site("direct", "http://127.0.0.1:8080"),
             make_site("tun", "office:http://10.0.0.1:8080"),
@@ -966,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tunnel_domain_set_includes_wildcard_literals() {
+    fn build_tunnel_classification_includes_wildcard_literals() {
         let sites = vec![make_site("tun", "office:http://10.0.0.1:8080")];
         let domains = vec![make_domain("*.example.com", "tun")];
         let idx = Indexes::build(sites, domains);
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tunnel_domain_set_skips_disabled_sites() {
+    fn build_tunnel_classification_skips_disabled_sites() {
         // Indexes::build already excludes disabled sites from `domain`,
         // so the classification follows the same filter.
         let mut disabled = make_site("tun", "office:http://10.0.0.1:8080");
@@ -988,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tunnel_domain_set_skips_invalid_backends() {
+    fn build_tunnel_classification_skips_invalid_backends() {
         // Bad backend → parse fails → domain excluded from the
         // classification. Same policy as the tun index pass in
         // `Indexes::build`.

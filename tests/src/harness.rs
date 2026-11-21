@@ -896,12 +896,20 @@ log:
         // the cleanest readiness signal — it fires AFTER the
         // transport session is up (the WebSocket upgrade succeeded, or
         // the QUIC handshake and the AUTH control line both went
-        // through), which is exactly the moment the proxy side will
-        // start honouring `app.tun_sessions[name]`. Earlier we waited
-        // for "connected to ngx", which fires after the TCP/WS
-        // handshake but before the yamux open-stream exchange —
-        // on cold CI runners that gap is enough for the test's first
-        // request to race ahead and hit "Tun <name> not online" (503).
+        // through). Earlier we waited for "connected to ngx", which
+        // fires after the TCP/WS handshake but before the yamux
+        // open-stream exchange — on cold CI runners that gap is
+        // enough for the test's first request to race ahead and hit
+        // "Tun <name> not online" (503).
+        //
+        // It is *not* the moment the gateway starts honouring
+        // `app.tun_sessions[name]`: the gateway answers the tun's
+        // AUTH/upgrade **before** it registers the session, so a
+        // request that lands in that (short) window still sees the
+        // tun as offline. A test that depends on the *registered*
+        // state — the transport the ALPN callback reads — must wait
+        // for the gateway's own "connected over <transport>" line
+        // instead (see `real_e2e_tunnel_quic_negotiates_h2`).
         //
         // 5s → 15s deadline: cold-cache CI runners routinely take 6-8s
         // to reach this state (DNS + cert verify + dynamic loader +

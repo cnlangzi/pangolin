@@ -91,11 +91,13 @@ acme:
   # is preserved for inventory compatibility but no longer mapped.
 
 tls:
-  enable_h2: false      # advertise HTTP/2 via ALPN for non-tunnel sites.
-                        # Tunnel sites (backend with `tun_name:` prefix) always
-                        # negotiate h1 at runtime, regardless of this field —
-                        # see TlsConfig docs in crates/pangolin-core/src/config.rs
-                        # and the upstream tokio-yamux 0.3.18 issue it works around.
+  enable_h2: false      # advertise HTTP/2 via ALPN for direct sites and for
+                        # tunnel sites whose tun is on the QUIC transport.
+                        # A tunnel on the WebSocket/TCP fallback (backend with a
+                        # `tun_name:` prefix) negotiates h1 at runtime — the
+                        # upstream tokio-yamux 0.3.18 issue it works around —
+                        # and so does a tunnel that is offline.
+                        # See TlsConfig docs in crates/pangolin-core/src/config.rs
 
 log:
   level: {{ ngx_log_level | default('info') }}

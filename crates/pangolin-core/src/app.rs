@@ -524,7 +524,7 @@ pub struct App {
     /// Domain → cert pre-computed link (fix/cert_www). Built once
     /// at startup from the `domains` × `certs` tables, then
     /// maintained by the domain/cert CRUD hooks. Read on every
-    /// TLS handshake by the SNI callback in `ngx::tls`. See
+    /// TLS handshake by the SNI callback in `crates/ngx/src/tls.rs`. See
     /// `docs/design/cert-link.md` for the full design.
     pub cert_links: CertLinkCache,
     /// Per-site rate limiting (issue #117). Owns the in-memory

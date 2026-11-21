@@ -291,6 +291,21 @@ after the host is re-pointed at a tunnel; the next request on it then
 runs the yamux path over `h2`. That window belongs to the established
 connection, not to the publication, and is tracked separately.
 
+**The same window opens when the transport changes.** The ALPN
+decision is taken once per TLS connection, while the transport is a
+property of the tunnel's *session*. A tun that fails over from QUIC
+to the WebSocket/TCP fallback changes the policy for the **next**
+handshake — but a connection that already negotiated `h2` keeps it,
+and its requests then travel over the fallback's yamux session, where
+the `tokio-yamux` race lives. The h1-only policy of the fallback is
+therefore guaranteed for every connection whose handshake saw a
+fallback (or no) session, not for the connections that were
+established while the tun was on QUIC. Revoking the negotiated
+protocol mid-connection is not something the listener can do, so the
+window is closed by the crate-side fix
+(`cnlangzi/pangolin-tun#14`), which turns the fallback's failure mode
+into an explicit error.
+
 **The two views also use two host rules.** The request path resolves a
 host with `lookup_site` (exact match first, then the longest wildcard
 suffix), the handshake path classifies it with `host_matches_set` (any

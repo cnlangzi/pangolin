@@ -143,7 +143,10 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
 /// `certs.domain` and `certs.sans`. The actual blob on disk is
 /// written separately by the test, post-startup, so the SNI callback
 /// can find it via `cert_dir/{domain}`.
-fn seed_cert(conn: &Connection, domain: &str) {
+///
+/// Shared with `tunnel_transport.rs`, so the two suites cannot drift
+/// apart on the `certs` row.
+pub(crate) fn seed_cert(conn: &Connection, domain: &str) {
     let now = Utc::now().to_rfc3339();
     let sans_json = serde_json::to_string(&vec![domain.to_string()]).expect("serialize sans");
     conn.execute(
@@ -728,14 +731,14 @@ async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
 /// Why this test catches it: we drive a real HTTPS request through
 /// curl (`--http2`, no `--http2-prior-knowledge`) against the
 /// proxy's TLS port. The tun uses the default transport selector
-/// (QUIC first), and the dynamic ALPN callback in
-/// `ngx::tls::build_sni_settings` negotiates h2 for a QUIC-tunneled
-/// site (issue #210) — so the request arrives as h2 and the path has
-/// to survive the h2 → tunnel hand-off. The mock backend records the
-/// path it actually received; the assertion `path == "/api/profile"`
-/// (not `path == "/https://office.test/api/profile"`) catches a
-/// regression in `path_and_query()` regardless of which protocol
-/// the request actually used.
+/// (QUIC first), so the request may arrive as h2 — the dynamic ALPN
+/// callback negotiates h2 for a QUIC-tunneled site (issue #210) —
+/// and the path has to survive the h2 → tunnel hand-off. The mock
+/// backend records the path it actually received; the assertion
+/// `path == "/api/profile"` (not
+/// `path == "/https://office.test/api/profile"`) catches a regression
+/// in `path_and_query()` regardless of which protocol the request
+/// actually used.
 #[tokio::test]
 async fn real_e2e_tunnel_h2_path_preserved() {
     use std::process::Stdio;
@@ -799,13 +802,13 @@ async fn real_e2e_tunnel_h2_path_preserved() {
     .expect("write cert blob");
 
     // `--http2` (no `--http2-prior-knowledge`): curl honours the
-    // server's ALPN advertisement. Since the dynamic ALPN callback
-    // in `ngx::tls::build_sni_settings` forces h1 for tunnel sites,
-    // curl will silently fall back to h1 — the request still
-    // exercises the path-construction path through `request_filter`
-    // (just over h1 instead of h2). This keeps the regression value
-    // of the test without requiring us to force h2 across the
-    // handshake.
+    // server's ALPN advertisement. The dynamic ALPN callback in
+    // `crates/ngx/src/tls.rs` offers h2 for a QUIC-tunneled site and
+    // h1 for a WebSocket-tunneled one, so the protocol this request
+    // ends up on depends on the transport the tun picked. The test
+    // does not care: it pins the *path* the backend sees, and that
+    // is the same either way. The protocol itself is pinned by
+    // `real_e2e_tunnel_quic_negotiates_h2`.
     //
     // `--resolve` so we don't touch /etc/hosts; `--insecure` because
     // the cert is self-signed.
@@ -898,7 +901,7 @@ async fn real_e2e_tunnel_h2_path_preserved() {
 /// pingora fall back to `400 Bad Request: missing required Host
 /// header`.
 ///
-/// Post-fix: `ngx::tls::build_sni_settings` installs a per-SNI ALPN
+/// Post-fix: `crates/ngx/src/tls.rs` installs a per-SNI ALPN
 /// callback that offers h2 only where it is safe — a direct site, or
 /// a tunnel whose session runs on the QUIC transport (issue #210).
 /// The WebSocket/TCP fallback still layers `tokio-yamux` over the
@@ -1125,7 +1128,7 @@ async fn real_e2e_h2_tunnel_tcp_fallback_stays_on_http11() {
 /// h2 must still be advertised so the client can use multiplexing.
 ///
 /// This is the symmetric counterpart to
-/// `real_e2e_h2_tunnel_auto_fallback_to_h1`. The dynamic ALPN
+/// `real_e2e_h2_tunnel_tcp_fallback_stays_on_http11`. The dynamic ALPN
 /// callback must:
 ///   - Not affect non-tunnel sites (still offer h2).
 ///   - Still successfully proxy over h2.

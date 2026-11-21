@@ -64,7 +64,7 @@ futures-util = "0.3"
 #     routing revision it classifies the SNI against and the per-tun
 #     transport map it reads must use sync locks). See
 #     `pangolin-core::App::tunnel_classification`,
-#     `pangolin-core::App::tun_kind` and `ngx::tls::build_sni_settings`.
+#     `pangolin-core::App::tun_kind` and `crates/ngx/src/tls.rs`.
 #   - App's in-memory access-log ring buffer (issue #73). Sync,
 #     non-poisoning, fast-path acquire — the response_filter hot path
 #     holds it for a single VecDeque bound check + push_back.
