@@ -288,8 +288,10 @@ table from one revision next to a classification from another
 **The window that remains is the connection's lifetime.** A connection
 that negotiated `h2` while its host was direct keeps that protocol
 after the host is re-pointed at a tunnel; the next request on it then
-runs the yamux path over `h2`. That window belongs to the established
-connection, not to the publication, and is tracked separately.
+runs the tunnel path over `h2` — the yamux path when the tun is on
+the WebSocket/TCP fallback. That window belongs to the established
+connection, not to the publication, and is described in
+[`tunnel.md` → Known limitations](tunnel.md#known-limitations).
 
 **The same window opens when the transport changes.** The ALPN
 decision is taken once per TLS connection, while the transport is a

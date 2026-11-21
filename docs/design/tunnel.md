@@ -343,3 +343,103 @@ The end-to-end suite covers, with the real `pangolin-ngx` and
 
 Each test asserts the transport that was actually used, so a tun that
 silently fell back cannot make the QUIC tests pass.
+
+## Known limitations
+
+### The window between the handshake and the request
+
+Two moments decide whether a request crosses the tunnel, and they are
+not the same moment.
+
+- **At the handshake**, the TLS listener picks the protocol. The
+  per-SNI ALPN callback in `crates/ngx/src/tls.rs` reads the tunnel
+  classification of the published routing revision, resolves the tun
+  that serves the SNI, asks which transport its live session runs on,
+  and offers `h2` or `http/1.1`. The choice is made **once per
+  connection**; ALPN is settled in the handshake and is not
+  renegotiable.
+- **At the request**, the proxy resolves the host in the routing table
+  and parses `site.backend`: a `tun_name:` prefix sends the request
+  into the tunnel, anything else dials the backend directly
+  (`crates/ngx/src/proxy.rs`, `upstream_peer`).
+
+Nothing binds the two. A connection keeps the protocol it negotiated
+while its requests are routed by whatever the routing table says when
+they arrive.
+
+**The scenario.** An operator re-points a site from a direct backend
+to a tunnel backend — `site.backend` changes from
+`http://10.0.0.1:8080` to `office:http://10.0.0.1:8080` — while
+clients still hold connections to it. The connections established
+before the change negotiated `h2`, because the site was a direct site
+then and the listener followed `tls.enable_h2` (the default). They
+keep `h2` for their whole life. The next request on such a connection
+is routed into the tunnel, and it now travels over the tunnel — over
+the tunnel's `tokio-yamux` session when the tun is on the
+WebSocket/TCP fallback. That combination is the one that trips the
+stream-state race of issue #66 and answers `400 Bad Request: missing
+required Host header` instead of the backend's response.
+
+The window lasts **as long as the connection lives**: the client has
+to reconnect before the new classification is consulted again. A
+browser that reconnects negotiates `http/1.1` for the same host — the
+fallback's policy — and the site works again. A connection that stays
+idle never notices, and a client that already speaks HTTP/1.1 never
+notices at all.
+
+**Which tunnels are affected.** The hazard needs the *yamux* path, so
+the tun's live session has to run on the **WebSocket/TCP fallback**. A
+tun on **QUIC** carries one bidirectional stream per request and no
+multiplexer, so an `h2` client connection is safe there — the
+listener offers `h2` for a QUIC tunnel in the first place. The same
+window opens when a tun *changes* transport: a tun that fails over
+from QUIC to the fallback changes the policy for the next handshake
+only, and the connections that already negotiated `h2` keep it.
+
+**What the atomic publication does not buy.** The routing table and
+the tunnel classification are published as one revision (see
+[`routing-and-index.md`](routing-and-index.md)), so the handshake
+path and the request path never read two different revisions. That
+removes the *tearing* window — the one in which the routing table
+already knew a site was tunnel-backed while the handshake still
+classified it as direct (issue #212). It cannot remove this one: the
+mismatch is not between two views of the configuration but between a
+decision taken at handshake time and a decision taken at request time,
+separated by the lifetime of the connection.
+
+**Turning a site back.** Re-pointing a tunnel site at a direct backend
+opens the same window without the failure: the connections that
+negotiated `http/1.1` (a tunnel on the fallback) keep `h1` and are
+served directly, which is correct but leaves the client on `h1` until
+it reconnects.
+
+### Directions for a fix
+
+Both directions below change the gateway's protocol behaviour, so each
+needs its own change, its own regression test and its own release
+note. Neither may turn `h2` off globally: a direct site and a QUIC
+tunnel both benefit from it, and this window does not reach them.
+
+1. **Refuse the request on a connection that no longer matches.** The
+   gateway sees a request on an `h2` client connection whose routing
+   says "tunnel", and closes the connection instead of forwarding the
+   request. The client reconnects, the handshake re-reads the
+   classification, and the new connection negotiates `http/1.1`. This
+   works on the **client ↔ gateway leg**: it makes the two decisions
+   meet again by throwing the stale one away. What it costs is one
+   failed request and one reconnect per affected connection, and it
+   needs a rule for the idle case — a connection that sends no further
+   request stays stale until it times out.
+2. **Make the tunnel leg independent of the client leg.** The peer for
+   a tunnel backend is pinned to HTTP/1.1 explicitly, and nothing
+   about the client connection's protocol is allowed to shape what is
+   written into the tunnel's byte stream. This works on the **gateway
+   ↔ tunnel leg**: it removes the coupling between the two legs
+   instead of catching the connection that slipped through, and it
+   holds for every connection, established or not. Pinning the
+   protocol alone is not enough to conclude that: the tunnel already
+   writes HTTP/1.1 on the wire (the peer options default to it), and
+   the race is still reachable through the window above — so a fix on
+   this leg has to show that the client's `h2` cannot reach the
+   `tokio-yamux` stream at all, not merely that the request bytes
+   look like HTTP/1.1.
