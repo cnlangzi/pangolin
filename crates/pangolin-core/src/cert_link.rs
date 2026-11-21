@@ -11,8 +11,10 @@
 //! So we move the policy decision to write time. The cache is
 //! `(domain → cert.domain)`, derived from the existing
 //! `domains` and `certs` tables. No new column, no migration.
-//! The cache is a DashMap for lock-free reads under handshake
-//! contention.
+//! The cache is a DashMap behind a swap pointer: a lookup takes one
+//! read lock and then hits the DashMap's lock-free path, and a full
+//! rebuild publishes a *new* table under one write lock instead of
+//! clearing the live one.
 //!
 //! CRUD hooks (`relink_for_domain` / `relink_for_cert` /
 //! `remove_domain`) maintain the cache. `load_from_db` rebuilds
@@ -25,6 +27,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use rusqlite::{Connection, params};
 
 use crate::types::CertStatus;
@@ -34,9 +37,15 @@ use crate::types::CertStatus;
 /// Cheap to clone (the inner `DashMap` is `Arc`-shared). The SNI
 /// callback and the admin handlers each hold their own clone; they
 /// both point at the same backing storage.
+///
+/// The `RwLock` is the *swap pointer*, not an entry lock: it only
+/// guards the replacement of the live table by a rebuild (issue
+/// #213). Entry-level writes go through the DashMap's own interior
+/// mutability, so a rebuild never has to clear the live table and a
+/// reader never observes an empty or half-filled one.
 #[derive(Clone, Default)]
 pub struct CertLinkCache {
-    map: Arc<DashMap<String, String>>,
+    map: Arc<RwLock<Arc<DashMap<String, String>>>>,
 }
 
 impl CertLinkCache {
@@ -57,22 +66,43 @@ impl CertLinkCache {
         Ok(cache)
     }
 
-    /// Drop every entry and rebuild from the DB. Used by
-    /// `App::reload_indexes` to make the cache consistent after an
-    /// out-of-band edit (e.g. `INSERT INTO certs` by hand, or a
-    /// test that writes a cert blob and inserts the matching row
+    /// Rebuild from the DB and publish the result as a new table.
+    /// Used by `App::reload_indexes` to make the cache consistent
+    /// after an out-of-band edit (e.g. `INSERT INTO certs` by hand,
+    /// or a test that writes a cert blob and inserts the matching row
     /// after the process has already started). Cheap — O(domains ×
     /// certs), see `relink_for_cert` for the perf note.
+    ///
+    /// The rebuild is atomic for readers: the new table is built off
+    /// to the side and only then swapped in under one write lock, so
+    /// a TLS handshake sees either the whole old table or the whole
+    /// new one — never an empty or half-filled table. A failure
+    /// anywhere in the rebuild returns before the swap, leaving the
+    /// live table with every link it already had (issue #213).
+    ///
+    /// The caller must serialize this against `relink_for_domain` /
+    /// `relink_for_cert` — the cache does not order an entry write
+    /// against a rebuild. See `docs/design/cert-link.md` §5.
     pub fn reload_from_db(&self, conn: &Connection) -> crate::Result<()> {
-        self.map.clear();
+        let new_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         let mut stmt = conn.prepare("SELECT domain FROM domains")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         for row in rows {
             let domain = row?;
             if let Some(cert_domain) = find_best_cert_for(conn, &domain)? {
-                self.map.insert(domain, cert_domain);
+                new_map.insert(domain, cert_domain);
             }
         }
+        // One write lock, one swap. The outgoing table is moved out
+        // of the lock before it is dropped: freeing it tears down the
+        // map's buckets, and doing that under the write lock would
+        // park every reader (each TLS handshake) for the whole
+        // teardown.
+        let previous = {
+            let mut slot = self.map.write();
+            std::mem::replace(&mut *slot, new_map)
+        };
+        drop(previous);
         Ok(())
     }
 
@@ -83,9 +113,15 @@ impl CertLinkCache {
     /// The SNI is trimmed of any trailing dot first; some clients
     /// (and some resolvers in front of them) include one in the
     /// server_name.
+    ///
+    /// The whole walk holds one read lock, so the exact match and
+    /// the wildcard candidates are all resolved against the same
+    /// table. A rebuild that swaps the table mid-walk would
+    /// otherwise make the walk mix two revisions.
     pub fn lookup(&self, sni: &str) -> Option<String> {
         let sni = sni.trim_end_matches('.');
-        if let Some(c) = self.map.get(sni) {
+        let map = self.map.read();
+        if let Some(c) = map.get(sni) {
             return Some(c.value().clone());
         }
         // Walk up: api.v2.example.com → *.v2.example.com → *.example.com
@@ -98,7 +134,7 @@ impl CertLinkCache {
                 break;
             }
             let wc = format!("*.{}", rest);
-            if let Some(c) = self.map.get(&wc) {
+            if let Some(c) = map.get(&wc) {
                 return Some(c.value().clone());
             }
         }
@@ -110,12 +146,16 @@ impl CertLinkCache {
     /// update — no DB I/O.
     pub fn relink_for_domain(&self, conn: &Connection, domain: &str) -> crate::Result<()> {
         let new_link = find_best_cert_for(conn, domain)?;
+        // The read lock guards the swap, not the entry — it does not
+        // order this write against a rebuild. The caller must
+        // serialize the two; see `docs/design/cert-link.md` §5.
+        let map = self.map.read();
         match new_link {
             Some(c) => {
-                self.map.insert(domain.to_string(), c);
+                map.insert(domain.to_string(), c);
             }
             None => {
-                self.map.remove(domain);
+                map.remove(domain);
             }
         }
         Ok(())
@@ -152,18 +192,20 @@ impl CertLinkCache {
     /// Does not touch any cert row — the cert may still be on disk
     /// and serving other domains; it just stops serving this one.
     pub fn remove_domain(&self, domain: &str) {
-        self.map.remove(domain);
+        let map = self.map.read();
+        map.remove(domain);
     }
 
     /// Number of entries in the cache. Useful for tests and admin
-    /// introspection. Cheap (DashMap exposes shard counts).
+    /// introspection. Cheap (one read lock plus the DashMap's shard
+    /// counts).
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.read().len()
     }
 
-    /// Whether the cache has any entries. Cheap.
+    /// Whether the cache has any entries. Cheap (one read lock).
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.read().is_empty()
     }
 }
 
@@ -259,8 +301,11 @@ mod tests {
 
     fn cache_with(entries: &[(&str, &str)]) -> CertLinkCache {
         let c = CertLinkCache::new();
-        for (k, v) in entries {
-            c.map.insert((*k).to_string(), (*v).to_string());
+        {
+            let map = c.map.read();
+            for (k, v) in entries {
+                map.insert((*k).to_string(), (*v).to_string());
+            }
         }
         c
     }
@@ -554,5 +599,114 @@ mod tests {
         cache.remove_domain("example.com");
         assert!(cache.is_empty());
         assert!(cache.lookup("example.com").is_none());
+    }
+
+    // ---- Atomic rebuild (issue #213) ----
+
+    #[test]
+    fn reload_from_db_publishes_a_new_table_and_leaves_the_old_one_intact() {
+        // The rebuild must not clear the live table: it builds a new
+        // one and swaps it in. A reader that still holds the old
+        // table keeps seeing the whole old table.
+        let conn = setup_db();
+        insert_domain(&conn, "example.com");
+        insert_cert(&conn, "example.com", &["*.example.com"], "issued");
+
+        let cache = CertLinkCache::load_from_db(&conn).unwrap();
+        let old_table = cache.map.read().clone();
+        assert_eq!(old_table.len(), 1);
+
+        // A second domain makes the rebuild produce a different table.
+        insert_domain(&conn, "api.example.com");
+        cache.reload_from_db(&conn).unwrap();
+
+        let new_table = cache.map.read().clone();
+        assert!(
+            !Arc::ptr_eq(&old_table, &new_table),
+            "the rebuild must publish a new table instead of mutating the live one"
+        );
+        // The old table was never cleared in place.
+        assert_eq!(old_table.len(), 1);
+        assert_eq!(
+            old_table.get("example.com").map(|v| v.value().clone()),
+            Some("example.com".to_string())
+        );
+        // The new table carries both domains.
+        assert_eq!(new_table.len(), 2);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.lookup("api.example.com").as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn reload_from_db_failure_keeps_the_previous_links() {
+        // A rebuild that fails must leave the live table exactly as it
+        // was — not empty, not half-filled. The failure happens
+        // before the swap, so the old links survive.
+        let conn = setup_db();
+        insert_domain(&conn, "example.com");
+        insert_cert(&conn, "example.com", &[], "issued");
+
+        let cache = CertLinkCache::load_from_db(&conn).unwrap();
+        assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
+
+        // A connection without the `domains` table makes the rebuild
+        // fail on its first query.
+        let broken = Connection::open_in_memory().unwrap();
+        assert!(
+            cache.reload_from_db(&broken).is_err(),
+            "the rebuild must report the DB error"
+        );
+
+        // The links that were already there survive the failed rebuild.
+        assert_eq!(cache.lookup("example.com").as_deref(), Some("example.com"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn lookup_never_sees_a_missing_link_while_a_rebuild_runs() {
+        // The property issue #213 is about: a handshake that runs
+        // while the cache is being rebuilt must resolve the link on
+        // every read. An in-place rebuild (clear, then refill) leaves
+        // a window where the lookup misses; the swap-pointer rebuild
+        // never does, because the live table is never emptied.
+        //
+        // The reader runs on its own thread against a clone (the SNI
+        // callback's situation) while the main thread rebuilds. The
+        // rebuild's write lock is taken only for the swap — after the
+        // new table is fully built — so the reader is never blocked
+        // for the duration of the rebuild either.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let conn = setup_db();
+        insert_domain(&conn, "example.com");
+        insert_cert(&conn, "example.com", &["*.example.com"], "issued");
+
+        let cache = CertLinkCache::load_from_db(&conn).unwrap();
+        let reader_cache = cache.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !reader_stop.load(Ordering::Relaxed) {
+                assert_eq!(
+                    reader_cache.lookup("example.com").as_deref(),
+                    Some("example.com"),
+                    "a lookup during a rebuild must not miss a live link"
+                );
+                reads += 1;
+            }
+            reads
+        });
+
+        for _ in 0..200 {
+            cache.reload_from_db(&conn).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("the reader thread must not panic");
+        assert!(reads > 0, "the reader must have observed the table");
     }
 }
