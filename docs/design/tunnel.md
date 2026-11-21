@@ -273,6 +273,27 @@ session drops mid-request. The pre-#153 code answered **503** for a
 tun that was not online; the distinction is gone, because the tunnel
 no longer has a hand-written path that could pick its own status.
 
+### A session that dies mid-request
+
+A tunnel session that dies while a request is in flight is an
+**error** on that request, not the end of a response.
+
+The tunnel's byte stream ends when its session dies, and an
+end-of-stream says "the tun finished sending". The tun would then
+shut the backend socket's write side down, the backend would read the
+request as cut short, and the `400` it answers to a request that never
+carried its `Host` header would travel back as if the backend had
+rejected the request. The tunnel's byte stream therefore reports the
+death of a session as an **error**, and the gateway logs it:
+
+```
+tunnel: the tunnel stream failed: the tunnel session ended
+```
+
+The request that was in flight fails with the gateway's own error —
+the **502** above — and never with the backend's answer to a request
+the backend never received whole.
+
 ### The backend's path prefix
 
 A tunnelled backend's URL may carry a path prefix
@@ -305,7 +326,9 @@ The end-to-end suite covers, with the real `pangolin-ngx` and
 - a WebSocket upgrade over a tun pinned to `quic`;
 - the same request over a tun pinned to `tcp`;
 - a tun whose QUIC attempt fails, serving the request over the
-  fallback.
+  fallback;
+- a tunnel session that dies mid-request, answered with the
+  gateway's own error.
 
 Each test asserts the transport that was actually used, so a tun that
 silently fell back cannot make the QUIC tests pass.
