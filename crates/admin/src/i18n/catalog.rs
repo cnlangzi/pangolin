@@ -19,9 +19,10 @@ const EN_JSON: &str = include_str!("../../i18n/en.json");
 
 /// The Simplified Chinese catalog.
 ///
-/// Translated area by area: the areas that are done are listed in
-/// [`COMPLETED_AREAS`], and every other area falls back to the
-/// English catalog until its translation issue lands.
+/// The catalog is complete: it carries every key of the English
+/// catalog, and every area is listed in [`COMPLETED_AREAS`]. The
+/// completeness gate rejects a key that one catalog has and the other
+/// does not, so the Chinese interface never falls back to English.
 const ZH_CN_JSON: &str = include_str!("../../i18n/zh-CN.json");
 
 /// A parsed catalog: key → text.

@@ -4689,7 +4689,7 @@ async fn admin_ui_chinese_pages_carry_no_english_prose() {
     // ── the site domains page: the domain count ──
     let page = page_body(&client, "/sites/new").await;
     let csrf = client.csrf_token(&page).unwrap_or_default();
-    client
+    let resp = client
         .post_form(
             "/sites/new",
             &[
@@ -4700,9 +4700,14 @@ async fn admin_ui_chinese_pages_carry_no_english_prose() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the site must be created — the count below needs it"
+    );
     let domains_page = page_body(&client, "/domains").await;
     let csrf = client.csrf_token(&domains_page).unwrap_or_default();
-    client
+    let resp = client
         .post_form(
             "/domains/new",
             &[
@@ -4713,6 +4718,11 @@ async fn admin_ui_chinese_pages_carry_no_english_prose() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the domain must be created — the count below needs it"
+    );
 
     let body = page_body(&client, "/site/no-english-test/domains").await;
     assert!(

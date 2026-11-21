@@ -736,6 +736,17 @@ mod gate {
             undeclared.is_empty(),
             "these areas are not declared complete: {undeclared:?}"
         );
+
+        // And the list names no area that does not exist — a typo
+        // there would leave a real area undeclared without saying so.
+        let unknown: Vec<&&str> = COMPLETED_AREAS
+            .iter()
+            .filter(|area| !AREAS.contains(area))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these completed areas are not declared areas: {unknown:?}"
+        );
     }
 
     #[test]

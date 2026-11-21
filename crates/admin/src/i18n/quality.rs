@@ -369,9 +369,10 @@ struct Pair {
 
 /// The keys that exist in both catalogs, sorted by key.
 ///
-/// A key only the English catalog has is not translated *yet* — that
-/// is the normal state of a partially translated catalog and not the
-/// gate's business.
+/// The two catalogs carry the same key set — `catalog_completeness`
+/// rejects a key that exists in only one of them — so this list walks
+/// the whole catalog. It exists to feed the gates that look at the
+/// *values*.
 fn shared_keys() -> Vec<Pair> {
     let english = catalog_for(Lang::En);
     let chinese = catalog_for(Lang::ZhCn);
@@ -535,14 +536,16 @@ fn attribute_values(body: &str) -> Vec<(usize, &str)> {
             while after < bytes.len() && bytes[after].is_ascii_whitespace() {
                 after += 1;
             }
-            if after >= bytes.len() || bytes[after] != b'"' {
+            // Both quote styles are valid HTML, and a template that
+            // uses the other one must not slip past the gate.
+            if after >= bytes.len() || (bytes[after] != b'"' && bytes[after] != b'\'') {
                 continue;
             }
-            found = Some(after + 1);
+            found = Some((after + 1, bytes[after] as char));
             break;
         }
-        if let Some(start) = found {
-            let Some(rel_end) = body[start..].find('"') else {
+        if let Some((start, quote)) = found {
+            let Some(rel_end) = body[start..].find(quote) else {
                 break;
             };
             let end = start + rel_end;
@@ -825,6 +828,36 @@ mod tests {
         // Both are residue.
         assert!(is_english_residue("Save"));
         assert!(is_english_residue("Delete site foo?"));
+    }
+
+    /// The attribute scan reads both quote styles.
+    ///
+    /// HTML allows either, and a template that uses the other one must
+    /// not slip past the gate.
+    #[test]
+    fn the_attribute_scan_reads_both_quote_styles() {
+        let template = "\
+<button title=\"Delete site foo?\">Save</button>
+<button title='Delete site foo?'>Save</button>
+<button placeholder='Place holder'>Save</button>
+";
+        let cleaned = strip_non_text(template);
+        let attributes: Vec<String> = attribute_values(&cleaned)
+            .into_iter()
+            .map(|(_, value)| normalize(value))
+            .collect();
+        assert_eq!(
+            attributes
+                .iter()
+                .filter(|value| *value == "Delete site foo?")
+                .count(),
+            2,
+            "both quote styles must be read: {attributes:?}"
+        );
+        assert!(
+            attributes.contains(&"Place holder".to_string()),
+            "a single-quoted placeholder must be read: {attributes:?}"
+        );
     }
 
     /// The whitelist has to stay honest: an entry that names a key
