@@ -303,7 +303,7 @@ impl ProxyHttp for AppProxy {
         // The site, its rate-limit configuration and its provider
         // configuration are read from **one** routing revision: the
         // visitor IP has to be resolved with the site's own
-        // provider, and the guard needs the same provider's range
+        // provider, and the revision needs the same provider's range
         // set. Reading them together keeps the number of lookups
         // per request unchanged.
         let host = host_from_session(session);

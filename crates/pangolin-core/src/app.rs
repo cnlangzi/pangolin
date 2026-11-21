@@ -319,10 +319,10 @@ pub struct App {
     /// limits, the provider configuration).
     ///
     /// Rebuilt from the DB on startup and after each admin write. A
-    /// reload publishes a **new** revision with a single write, so a
-    /// reader always sees a self-consistent revision — the request
-    /// path and the TLS handshake path can never disagree about
-    /// whether a host is tunnel-backed (issue #212).
+    /// reload publishes a **new** revision with a single write, so
+    /// the routing table and the tunnel classification are never
+    /// visible in different states: a reader that holds a revision
+    /// sees a self-consistent one (issue #212).
     ///
     /// The lock is a **sync** `parking_lot::RwLock` because the ALPN
     /// callback runs in a sync C context inside the handshake and
@@ -862,9 +862,19 @@ impl App {
         self.rate_limiter.reconfigure(&indexes.limits);
         // Publish the new routing revision. One write, one revision:
         // the routing table and the tunnel classification the ALPN
-        // callback reads travel together, so a handshake and a request
-        // can never see half-updated configuration (issue #212).
-        *self.indexes.write() = Arc::new(indexes);
+        // callback reads are never visible in different states
+        // (issue #212).
+        //
+        // The outgoing revision is moved out of the lock before it is
+        // dropped: freeing it tears down five hash maps and their
+        // `Arc` reference counts, and doing that under the write lock
+        // would park every reader (each request and each handshake)
+        // for the whole teardown.
+        let previous = {
+            let mut slot = self.indexes.write();
+            std::mem::replace(&mut *slot, Arc::new(indexes))
+        };
+        drop(previous);
         *self.dns_index.write().await = dns_index;
         // fix-client-ip: publish the singleton. It was read above
         // (before the index build) so the effective provider of every
@@ -895,10 +905,15 @@ impl App {
     ///
     /// The set is returned by handle — the caller gets the very
     /// allocation the revision holds, so the TLS ALPN callback can
-    /// release the index lock before it looks at it. It is read from
-    /// the same revision the request path routes with, so the
-    /// handshake and the request can never classify a host
-    /// differently (issue #212).
+    /// release the index lock before it looks at it. It comes from
+    /// the same publication as the routing table, so a reload can
+    /// never expose a routing table from one revision next to a
+    /// classification from another (issue #212).
+    ///
+    /// Note what this does **not** cover: a connection that already
+    /// negotiated `h2` keeps that protocol after its host is
+    /// re-pointed at a tunnel. That window belongs to the
+    /// connection's lifetime, not to the publication.
     ///
     /// Sync on purpose: the ALPN callback runs inside the OpenSSL
     /// handshake and cannot await.

@@ -877,7 +877,6 @@ async fn two_sites_have_independent_counters() {
     let indexes = app.indexes.read().clone();
     let cfg_a = indexes.limits.get("a").cloned().unwrap();
     let cfg_b = indexes.limits.get("b").cloned().unwrap();
-    drop(indexes);
 
     let client = ip(198, 51, 100, 15);
     assert_eq!(

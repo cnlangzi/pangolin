@@ -994,7 +994,7 @@ pub async fn render_referers(
 ) -> http::Result<Response<Full<Bytes>>> {
     let enabled = app.config.log.referer.enabled;
     let filter = parse_referer_params(merged_params).filter;
-    let sites = site_options(app, &filter.site).await;
+    let sites = site_options(app, &filter.site);
     // "A site is selected" is a separate fact from "the selected site
     // has domains": a `?site=` naming a site that does not exist (or
     // one whose domains are all disabled) resolves to an empty domain
@@ -1198,7 +1198,7 @@ fn parse_referer_params(merged_params: &[u8]) -> RefererHistoryParams {
 /// The index maps a domain literal (exact FQDN or `*.wildcard`) to
 /// its owning site; grouping the keys by site name yields the
 /// site → domains mapping the selector needs.
-async fn site_options(app: &Arc<App>, selected: &str) -> Vec<RefererSiteOption> {
+fn site_options(app: &Arc<App>, selected: &str) -> Vec<RefererSiteOption> {
     // The published routing revision is cloned out of the index lock
     // before the (synchronous) grouping and sort below.
     let by_site: std::collections::HashMap<String, Vec<String>> = {
@@ -1265,7 +1265,7 @@ async fn build_referer_history_page(
     merged_params: &[u8],
 ) -> RefererHistoryPageView {
     let p = parse_referer_params(merged_params);
-    let sites = site_options(app, &p.filter.site).await;
+    let sites = site_options(app, &p.filter.site);
 
     let available = referer_list_dates(dir);
     let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {
@@ -1385,7 +1385,7 @@ async fn build_referer_stats_page(
     merged_params: &[u8],
 ) -> RefererStatsPageView {
     let p = parse_referer_params(merged_params);
-    let sites = site_options(app, &p.filter.site).await;
+    let sites = site_options(app, &p.filter.site);
 
     let available = referer_list_dates(dir);
     let date = if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.filter.date, "%Y-%m-%d") {

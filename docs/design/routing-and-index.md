@@ -170,6 +170,8 @@ the request would enter the yamux path (issue #212).
 
 Publishing them together makes that window impossible: a reader takes
 one revision, and that revision is self-consistent by construction.
+(The two views still resolve a host with two different rules — see
+[below](#one-publication-per-reload).)
 
 ### One build, one revision
 
@@ -261,9 +263,26 @@ provider configuration — becomes visible at the same instant.
 This is what keeps the handshake path and the request path in step.
 The ALPN callback reads the tunnel classification of the published
 revision; the request path resolves the host in the routing table of
-the published revision. One revision means one answer to "is this host
-tunnel-backed?", so a connection can never negotiate `h2` for a host
-that the request path then routes into a yamux tunnel (issue #212).
+the published revision. One publication means the two views always
+come from the same revision, so a reload can never expose a routing
+table from one revision next to a classification from another
+(issue #212).
+
+**The window that remains is the connection's lifetime.** A connection
+that negotiated `h2` while its host was direct keeps that protocol
+after the host is re-pointed at a tunnel; the next request on it then
+runs the yamux path over `h2`. That window belongs to the established
+connection, not to the publication, and is tracked separately.
+
+**The two views also use two host rules.** The request path resolves a
+host with `lookup_site` (exact match first, then the longest wildcard
+suffix), the handshake path classifies it with `host_matches_set` (any
+matching wildcard, and it stops before a bare TLD). For a host that
+sits under a wildcard the two can answer differently — for example a
+direct site owning `a.example.com` next to a tunnel site owning
+`*.example.com`. The classification is the conservative answer there
+(`h1`), and the mismatch predates this document; it is a property of
+keeping a host-keyed set next to a site-keyed routing table.
 
 ## The tunnel registration flow
 

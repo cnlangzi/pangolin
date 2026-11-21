@@ -295,9 +295,9 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
         let sni = sni.trim_end_matches('.');
 
         // 2. Sync lookup: is this SNI a tunnel site? The set comes
-        //    from the currently published routing revision, so it
-        //    always agrees with the routing table the request path
-        //    will use for this host (issue #212).
+        //    from the currently published routing revision — the same
+        //    publication the request path's routing table comes from,
+        //    so the two views are never out of step (issue #212).
         let tunnel_domains = app.tunnel_classification();
         let is_tunnel = pangolin_core::index::host_matches_set(&tunnel_domains, sni);
 

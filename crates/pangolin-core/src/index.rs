@@ -214,21 +214,29 @@ impl Indexes {
 /// wildcard suffix matching is done at lookup time by
 /// [`host_matches_set`].
 ///
+/// The decision belongs to the **site**, not to the domain: a site's
+/// backend is parsed once and the answer reused for all of its
+/// domains, so the pass costs one parse per site rather than one per
+/// domain.
+///
 /// Sites whose `backend` cannot be parsed are skipped silently —
 /// the same policy used in [`rebuild_tun_index`]. Any startup-time
 /// parse errors have already failed-fast at boot, so a per-reload
 /// silent skip is safe.
 fn build_tunnel_domain_set(domain: &HashMap<String, Arc<Site>>) -> HashSet<String> {
     let mut out = HashSet::new();
+    // Site name → is the site tunnel-backed? A domain's owner is
+    // decided once, no matter how many domains the site has.
+    let mut tunnel_sites: HashMap<&str, bool> = HashMap::new();
     for (domain, site) in domain {
-        match crate::parse::parse_backend(&site.backend) {
-            Ok((tun_name, _url)) if !tun_name.is_empty() => {
-                out.insert(domain.clone());
-            }
-            _ => {
-                // Direct backend, or unparseable (skipped). Either way
-                // this domain does not route through a tunnel.
-            }
+        let is_tunnel = *tunnel_sites.entry(site.name.as_str()).or_insert_with(|| {
+            matches!(
+                crate::parse::parse_backend(&site.backend),
+                Ok((ref tun, _)) if !tun.is_empty()
+            )
+        });
+        if is_tunnel {
+            out.insert(domain.clone());
         }
     }
     out
