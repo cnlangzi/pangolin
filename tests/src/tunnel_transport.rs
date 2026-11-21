@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
+use crate::real_e2e::seed_cert;
 
 // ---------------------------------------------------------------------------
 // Mock backends
@@ -782,6 +783,140 @@ async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
     // to fall back is the crate's business — `pangolin-tun`'s own
     // suite asserts that (`tests/fallback.rs`).
     assert_log_contains(&ngx.log, "gateway", "serving the WebSocket/TCP tunnel only").await;
+}
+
+/// An **h2** request through a tun pinned to **QUIC** reaches the
+/// backend and succeeds.
+///
+/// The QUIC transport carries one bidirectional stream per request and
+/// no multiplexer in between, so the `tokio-yamux` race that forced
+/// every tunnel-backed vhost onto HTTP/1.1 cannot happen there — the
+/// gateway may negotiate h2 for a QUIC-tunneled vhost (issue #210).
+///
+/// The client is `curl --http2`: it offers h2 in the ALPN extension
+/// and uses whatever the server picks. `%{http_version}` reports the
+/// protocol that was actually negotiated, so a `2` means the
+/// handshake really was h2 — not a silent fallback to h1.
+///
+/// The **backend** still sees HTTP/1.1: the gateway terminates the
+/// client's h2 and writes the request into the tunnel stream in
+/// HTTP/1.1, because the tunnel is a byte splice.
+#[tokio::test]
+async fn real_e2e_tunnel_quic_negotiates_h2() {
+    use std::process::Stdio;
+
+    let backend = EchoBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+        // The TLS listener resolves the SNI through the cert link, so
+        // the cert row has to exist before the gateway starts.
+        seed_cert(&conn, "office.test");
+    })
+    .await;
+
+    let tun = TunProcess::start_with_transport(&ngx, "office", "test-token", "quic").await;
+
+    // Wait for the **gateway** to report the session before the
+    // handshake. The tun's own "connected to ngx" line fires on the
+    // AUTH reply, which the gateway sends *before* it registers the
+    // session — and the ALPN decision reads the registered transport.
+    // Without this wait the handshake could land in that window, see
+    // no transport and answer h1.
+    assert_log_contains(&ngx.log, "gateway", "connected over quic").await;
+
+    // A self-signed certificate for the vhost, in the autocert blob
+    // layout the SNI callback reads.
+    crate::harness::gen_self_signed(&["office.test"], "office.test", &ngx.cert_dir());
+
+    let url = format!("https://office.test:{}/api/echo?x=1", ngx.tls_port);
+    let output = tokio::process::Command::new("curl")
+        .arg("--http2")
+        .arg("--insecure")
+        .arg("--max-time")
+        .arg("10")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg("-")
+        .arg("--write-out")
+        .arg("HTTP_CODE:%{http_code}\nHTTP_VERSION:%{http_version}\n")
+        .arg("--resolve")
+        .arg(format!("office.test:{}:127.0.0.1", ngx.tls_port))
+        .arg(&url)
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn curl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (body, meta) = stdout.split_once("HTTP_CODE:").unwrap_or_else(|| {
+        panic!(
+            "curl did not emit HTTP_CODE marker. exit={:?}\nstdout: {stdout}\nstderr: {stderr}\nngx log:\n{}",
+            output.status,
+            ngx.log_string()
+        )
+    });
+    let status: u16 = meta
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .expect("parse http_code");
+    assert_eq!(
+        status,
+        200,
+        "an h2 request through a QUIC tunnel must reach the backend, got {status} \
+         (body={body:?})\nngx log:\n{}\ntun log:\n{}",
+        ngx.log_string(),
+        tun.log_string()
+    );
+
+    // The negotiated protocol — the point of the change.
+    let version = meta
+        .split_once("HTTP_VERSION:")
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        version,
+        "2",
+        "a QUIC-tunneled vhost must negotiate h2; the client got {version:?} \
+         instead. stderr:\n{stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // The request reached the backend through the splice. The tunnel
+    // carries HTTP/1.1 bytes — the gateway terminated the client's h2.
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "the backend should have seen exactly one request, saw {}",
+        seen.len()
+    );
+    assert!(
+        seen[0].starts_with("GET /api/echo?x=1 HTTP/1.1"),
+        "the request line must survive the splice byte-exact, got {:?}",
+        seen[0]
+    );
 }
 
 /// A tunnel session that dies mid-request is an **error** on that

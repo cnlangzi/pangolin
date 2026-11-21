@@ -60,9 +60,11 @@ quinn = { version = "0.11", default-features = false, features = [
 futures-util = "0.3"
 
 # parking_lot::Mutex / RwLock are used in two places:
-#   - TLS hot-path (ALPN callback runs in a sync C context, so the
-#     per-SNI tunnel-domain mirror must use a sync lock). See
-#     `pangolin-core::App::tunnel_domains` and `ngx::tls::build_sni_settings`.
+#   - TLS hot-path (the ALPN callback runs in a sync C context, so the
+#     routing revision it classifies the SNI against and the per-tun
+#     transport map it reads must use sync locks). See
+#     `pangolin-core::App::tunnel_classification`,
+#     `pangolin-core::App::tun_kind` and `crates/ngx/src/tls.rs`.
 #   - App's in-memory access-log ring buffer (issue #73). Sync,
 #     non-poisoning, fast-path acquire — the response_filter hot path
 #     holds it for a single VecDeque bound check + push_back.

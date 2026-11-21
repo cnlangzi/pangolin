@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pangolin_tun::TunnelTransport;
+use pangolin_tun::{TransportKind, TunnelTransport};
 use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -16,6 +16,7 @@ use crate::bot::verify_bot;
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
 use crate::cidr::CidrSet;
+use crate::index::TunnelClassification;
 use crate::provider::{GlobalProviderConfig, GuardRejectionCounter, ProviderKey};
 use crate::ratelimit::RateLimiter;
 use crate::referer::RefererHit;
@@ -352,6 +353,23 @@ pub struct App {
     /// [`TunnelTransport`], so the proxy path does not care which one
     /// a tun is on.
     pub tun_sessions: Arc<RwLock<std::collections::HashMap<String, Arc<dyn TunnelTransport>>>>,
+    /// The transport every live tunnel session runs on: tun name →
+    /// [`TransportKind`].
+    ///
+    /// The TLS ALPN callback needs it to decide whether a
+    /// tunnel-backed vhost may negotiate h2: a QUIC session can, a
+    /// WebSocket/yamux session cannot (issue #210).
+    ///
+    /// It is written where a session enters and leaves
+    /// [`App::tun_sessions`] — [`App::register_tun`] and
+    /// [`App::unregister_tun_if`] — so the two views can never
+    /// disagree about which transport a tun is on.
+    ///
+    /// The lock is **sync** (`parking_lot`): the ALPN callback runs
+    /// inside the OpenSSL handshake, in a sync C context, and cannot
+    /// await. The map is small (one entry per connected tun) and is
+    /// read on the handshake path only.
+    pub tun_kinds: Arc<parking_lot::RwLock<std::collections::HashMap<String, TransportKind>>>,
     /// Per-tun last-seen timestamp (Unix seconds), used by the
     /// admin UI's tun list. Updated by the tunnel accept loop
     /// on each new request.
@@ -506,7 +524,7 @@ pub struct App {
     /// Domain → cert pre-computed link (fix/cert_www). Built once
     /// at startup from the `domains` × `certs` tables, then
     /// maintained by the domain/cert CRUD hooks. Read on every
-    /// TLS handshake by the SNI callback in `ngx::tls`. See
+    /// TLS handshake by the SNI callback in `crates/ngx/src/tls.rs`. See
     /// `docs/design/cert-link.md` for the full design.
     pub cert_links: CertLinkCache,
     /// Per-site rate limiting (issue #117). Owns the in-memory
@@ -732,6 +750,7 @@ impl App {
             system_config,
             config,
             tun_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            tun_kinds: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             tun_last_seen: Arc::new(RwLock::new(std::collections::HashMap::new())),
             cert_manager,
             events: Arc::new(EventBuffer::new()),
@@ -901,14 +920,16 @@ impl App {
 
     /// The tunnel classification of the currently published routing
     /// revision: the domains whose owning site has a `tun_name:`
-    /// backend prefix.
+    /// backend prefix, and the tunnel node that serves each of them.
     ///
-    /// The set is returned by handle — the caller gets the very
-    /// allocation the revision holds, so the TLS ALPN callback can
-    /// release the index lock before it looks at it. It comes from
+    /// Both views are returned by handle — the caller gets the very
+    /// allocations the revision holds, so the TLS ALPN callback can
+    /// release the index lock before it looks at them. They come from
     /// the same publication as the routing table, so a reload can
     /// never expose a routing table from one revision next to a
-    /// classification from another (issue #212).
+    /// classification from another (issue #212). They also come from
+    /// the same **read**, so the classification and the tun map can
+    /// never be a revision apart (issue #210).
     ///
     /// Note what this does **not** cover: a connection that already
     /// negotiated `h2` keeps that protocol after its host is
@@ -917,12 +938,34 @@ impl App {
     ///
     /// Sync on purpose: the ALPN callback runs inside the OpenSSL
     /// handshake and cannot await.
-    pub fn tunnel_classification(&self) -> Arc<std::collections::HashSet<String>> {
-        self.indexes.read().tunnel_domains.clone()
+    pub fn tunnel_classification(&self) -> TunnelClassification {
+        let indexes = self.indexes.read();
+        TunnelClassification {
+            domains: indexes.tunnel_domains.clone(),
+            hosts: indexes.tunnel_hosts.clone(),
+        }
+    }
+
+    /// The transport a tun's live session runs on.
+    ///
+    /// `None` when the tun has no session — it is offline, or it never
+    /// connected. The ALPN callback treats that as "unknown transport"
+    /// and keeps the vhost on HTTP/1.1, because a tun that comes back
+    /// on the WebSocket fallback must not be offered h2 (issue #210).
+    ///
+    /// Sync on purpose: the ALPN callback runs inside the OpenSSL
+    /// handshake and cannot await.
+    pub fn tun_kind(&self, name: &str) -> Option<TransportKind> {
+        self.tun_kinds.read().get(name).copied()
     }
 
     /// Register a live tunnel session. Called when a tun node connects
     /// — over QUIC or over the WebSocket/TCP fallback.
+    ///
+    /// The transport is recorded here, next to the session itself, so
+    /// the two can never disagree: the ALPN callback asks
+    /// [`App::tun_kind`] which transport a tun is on, and this is the
+    /// only place a session enters the registry (issue #210).
     ///
     /// Returns `false` when a session for that name is already
     /// registered: two tuns must not fight for the same routing slot,
@@ -932,7 +975,11 @@ impl App {
         if sessions.contains_key(&name) {
             return false;
         }
-        sessions.insert(name, tunnel);
+        let kind = tunnel.kind();
+        sessions.insert(name.clone(), tunnel);
+        // The sync lock is taken and released in this statement, so its
+        // guard is never held across an `.await`.
+        self.tun_kinds.write().insert(name, kind);
         true
     }
 
@@ -943,6 +990,10 @@ impl App {
     /// one — while the previous session's cleanup is still running.
     /// Removing the entry blindly would drop the *new* session and
     /// leave the proxy with no route to a tun that is online.
+    ///
+    /// The recorded transport is dropped with the session, so a tun
+    /// that is offline has no transport and the ALPN callback falls
+    /// back to HTTP/1.1 (issue #210).
     ///
     /// Returns whether the entry was removed.
     pub async fn unregister_tun_if(
@@ -956,6 +1007,7 @@ impl App {
             .is_some_and(|current| Arc::ptr_eq(current, transport));
         if matches {
             sessions.remove(name);
+            self.tun_kinds.write().remove(name);
         }
         matches
     }
@@ -1493,6 +1545,65 @@ mod tests {
     use crate::types::{DnsProvider, DnsProviderKind, Domain};
     use chrono::Utc;
     use std::fs;
+
+    /// A transport that carries no bytes — the test only needs its
+    /// `kind`.
+    struct FakeTransport(TransportKind);
+
+    #[async_trait::async_trait]
+    impl TunnelTransport for FakeTransport {
+        async fn open_stream(&self) -> pangolin_tun::Result<pangolin_tun::TunnelStream> {
+            Err(pangolin_tun::Error::Invalid(
+                "the fake transport opens no stream".into(),
+            ))
+        }
+        async fn accept_stream(&self) -> Option<pangolin_tun::Result<pangolin_tun::TunnelStream>> {
+            None
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+    }
+
+    /// The transport of a live tunnel session is recorded next to the
+    /// session — and dropped with it.
+    ///
+    /// The TLS ALPN callback reads the kind to decide whether the
+    /// tunnel's sites may negotiate h2 (issue #210), so the record has
+    /// to live exactly as long as the session. It is written where the
+    /// session is registered, not at the two call sites, so neither
+    /// transport can be forgotten.
+    #[tokio::test]
+    async fn register_tun_records_the_transport_and_unregister_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+
+        let quic: Arc<dyn TunnelTransport> = Arc::new(FakeTransport(TransportKind::Quic));
+        assert!(app.register_tun("office".to_string(), quic.clone()).await);
+        assert_eq!(
+            app.tun_kind("office"),
+            Some(TransportKind::Quic),
+            "the transport of a live session must be readable"
+        );
+
+        // A second session for the same name is rejected — and must not
+        // overwrite the recorded transport.
+        let tcp: Arc<dyn TunnelTransport> = Arc::new(FakeTransport(TransportKind::Tcp));
+        assert!(!app.register_tun("office".to_string(), tcp.clone()).await);
+        assert_eq!(app.tun_kind("office"), Some(TransportKind::Quic));
+
+        // Unregistering a session that is not the registered one leaves
+        // the record alone.
+        assert!(!app.unregister_tun_if("office", &tcp).await);
+        assert_eq!(app.tun_kind("office"), Some(TransportKind::Quic));
+
+        // The session that ends takes its transport with it: an offline
+        // tun has no transport, and the ALPN callback answers h1.
+        assert!(app.unregister_tun_if("office", &quic).await);
+        assert_eq!(app.tun_kind("office"), None);
+    }
 
     #[test]
     fn resolve_cert_prefers_ecdsa_over_rsa() {

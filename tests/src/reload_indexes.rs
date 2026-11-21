@@ -250,11 +250,23 @@ async fn published_revision_carries_its_own_tunnel_classification() {
     let classification = app.tunnel_classification();
 
     assert!(
-        Arc::ptr_eq(&published.tunnel_domains, &classification),
+        Arc::ptr_eq(&published.tunnel_domains, &classification.domains),
         "the ALPN callback must read the tunnel classification of the published revision"
     );
-    assert!(classification.contains("tun.example.com"));
-    assert!(!classification.contains("direct.example.com"));
+    assert!(classification.domains.contains("tun.example.com"));
+    assert!(!classification.domains.contains("direct.example.com"));
+    assert!(
+        Arc::ptr_eq(&published.tunnel_hosts, &classification.hosts),
+        "the ALPN callback must read the tun map of the published revision"
+    );
+    assert_eq!(
+        classification
+            .hosts
+            .get("tun.example.com")
+            .map(String::as_str),
+        Some("office"),
+        "the classification must name the tunnel that serves the domain"
+    );
 }
 
 /// The hosts the sampler compares. They are picked so the two host
@@ -377,7 +389,7 @@ async fn reload_publishes_the_routing_table_and_the_tunnel_classification_togeth
         let observed = observed.clone();
         let first_mismatch = first_mismatch.clone();
         std::thread::spawn(move || {
-            let mut previous: Option<Arc<std::collections::HashSet<String>>> = None;
+            let mut previous: Option<pangolin_core::TunnelClassification> = None;
             while !stop.load(Ordering::Relaxed) {
                 // The ALPN view, read the way the handshake reads it.
                 let before = app.tunnel_classification();
@@ -388,7 +400,7 @@ async fn reload_publishes_the_routing_table_and_the_tunnel_classification_togeth
                 let after = app.tunnel_classification();
 
                 let changed = match &previous {
-                    Some(prev) => !Arc::ptr_eq(prev, &before),
+                    Some(prev) => !Arc::ptr_eq(&prev.domains, &before.domains),
                     None => true,
                 };
                 if changed {
@@ -396,13 +408,15 @@ async fn reload_publishes_the_routing_table_and_the_tunnel_classification_togeth
                 }
                 previous = Some(before.clone());
 
-                if !Arc::ptr_eq(&before, &after) {
+                if !Arc::ptr_eq(&before.domains, &after.domains) {
                     // A publication landed between the two reads: the
                     // sample spans two revisions and says nothing.
                     discarded.fetch_add(1, Ordering::Relaxed);
                 } else {
                     for host in SAMPLED_HOSTS {
-                        if let Some(mismatch) = classification_mismatch(&revision, &before, host) {
+                        if let Some(mismatch) =
+                            classification_mismatch(&revision, &before.domains, host)
+                        {
                             mismatches.fetch_add(1, Ordering::Relaxed);
                             let mut guard = first_mismatch.lock().unwrap();
                             if guard.is_none() {

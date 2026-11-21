@@ -319,8 +319,10 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // time. See docs/design/cert-link.md.
         //
         // ALPN is decided per-SNI inside `build_sni_settings` — the
-        // listener runs a dynamic callback that picks h1 for tunnel
-        // sites and follows `config.tls.enable_h2` for everything else.
+        // listener runs a dynamic callback that follows
+        // `config.tls.enable_h2` for direct sites and for tunnel sites
+        // on the QUIC transport, and picks h1 for a tunnel site on the
+        // WebSocket/yamux fallback.
         // See `tls::install_dynamic_alpn` for the policy and
         // `pangolin_core::App::tunnel_classification` for the data it
         // consults.
@@ -328,7 +330,7 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), app.clone())?;
         proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
         log::info!(
-            "TLS enabled (SNI, dynamic ALPN) on {} (cert_dir: {}, non_tunnel_h2: {})",
+            "TLS enabled (SNI, dynamic ALPN) on {} (cert_dir: {}, enable_h2: {})",
             config.addr.https,
             cert_dir.display(),
             config.tls.enable_h2
