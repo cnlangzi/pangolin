@@ -4521,6 +4521,117 @@ async fn admin_ui_login_page_renders_chinese() {
     );
 }
 
+/// A signed-in client that speaks a chosen language.
+///
+/// The login is done by hand instead of through `AdminClient`, because
+/// the language is negotiated per request and `AdminClient` cannot set
+/// a header. The cookie store keeps the session, so the dashboard is
+/// reachable afterwards.
+async fn signed_in_client(ngx: &NgxProcess) -> reqwest::Client {
+    let client = new_client_no_redirect();
+    let resp = client.get(&ngx.admin_url("/login")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = client
+        .post(&ngx.admin_url("/login"))
+        .form(&[("username", "admin"), ("password", "admin")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the login must succeed — the dashboard is behind it"
+    );
+    client
+}
+
+/// Without a language cookie and without an `Accept-Language` header
+/// the interface is English — the default.
+///
+/// The dashboard is behind the login, so the client signs in first;
+/// the sign-in carries no language of its own, so the dashboard still
+/// answers in the default language.
+#[tokio::test]
+async fn admin_ui_default_language_is_english() {
+    let ngx = start_ngx().await;
+    let client = signed_in_client(&ngx).await;
+
+    let resp = client.get(&ngx.admin_url("/")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="en">"#),
+        "the default language must be English: {body}"
+    );
+    // The navigation is English — "Sites" is the `nav.sites` entry.
+    assert!(
+        body.contains(">Sites<"),
+        "the English navigation must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("站点"),
+        "the Chinese navigation must not be rendered: {body}"
+    );
+}
+
+/// The browser's language preference picks the Chinese interface.
+#[tokio::test]
+async fn admin_ui_accept_language_zh_renders_chinese() {
+    let ngx = start_ngx().await;
+    let client = signed_in_client(&ngx).await;
+
+    let resp = client
+        .get(&ngx.admin_url("/"))
+        .header("accept-language", "zh-CN")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<html lang="zh-CN">"#),
+        "the accept-language header must select the locale: {body}"
+    );
+    assert!(
+        body.contains("站点"),
+        "the Chinese navigation must be rendered: {body}"
+    );
+    assert!(
+        !body.contains(">Sites<"),
+        "the English navigation must not be rendered: {body}"
+    );
+}
+
+/// The switcher is on the page in both languages — otherwise an
+/// operator whose browser asks for a language the gateway does not
+/// speak has no way to change it.
+#[tokio::test]
+async fn admin_ui_lang_switcher_visible_in_both_languages() {
+    let ngx = start_ngx().await;
+    let client = signed_in_client(&ngx).await;
+
+    let resp = client.get(&ngx.admin_url("/")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/lang/"),
+        "the language switcher must be rendered in English: {body}"
+    );
+
+    let resp = client
+        .get(&ngx.admin_url("/"))
+        .header("accept-language", "zh-CN")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("/lang/"),
+        "the language switcher must be rendered in Chinese: {body}"
+    );
+}
+
 /// Fetch a page and return its body.
 async fn page_body(client: &AdminClient, path: &str) -> String {
     client.get(path).await.unwrap().text().await.unwrap()
@@ -4537,6 +4648,91 @@ async fn chinese_client(ngx: &NgxProcess) -> AdminClient {
     let resp = client.get("/lang/zh-CN").await.unwrap();
     assert_eq!(resp.status().as_u16(), 302);
     client
+}
+
+/// The pages that spelled English out instead of asking the catalog
+/// for it (issue #184).
+///
+/// The residual-English gate found "Save", the domain count and the
+/// traffic page's transport labels written into the templates. The fix
+/// was a key reference, so the Chinese interface says "保存", "个域名"
+/// and the translated transport names — and the English prose is gone.
+#[tokio::test]
+async fn admin_ui_chinese_pages_carry_no_english_prose() {
+    let ngx = start_ngx().await;
+    let client = chinese_client(&ngx).await;
+
+    // ── the settings page: the save button ──
+    let body = page_body(&client, "/settings").await;
+    assert!(
+        body.contains(">保存<"),
+        "the Chinese save button must be rendered: {body}"
+    );
+
+    // ── the traffic page: the transport breakdown ──
+    let body = page_body(&client, "/traffic").await;
+    for (needle, what) in [
+        ("流式", "the stream label"),
+        ("WebSocket", "the websocket label"),
+        ("未知主机", "the unknown-host label"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Chinese {what} must be rendered: {body}"
+        );
+    }
+    assert!(
+        !body.contains("unknown host"),
+        "the English unknown-host label must be gone: {body}"
+    );
+
+    // ── the site domains page: the domain count ──
+    let page = page_body(&client, "/sites/new").await;
+    let csrf = client.csrf_token(&page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/sites/new",
+            &[
+                ("backend", "http://127.0.0.1:8080"),
+                ("name", "no-english-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the site must be created — the count below needs it"
+    );
+    let domains_page = page_body(&client, "/domains").await;
+    let csrf = client.csrf_token(&domains_page).unwrap_or_default();
+    let resp = client
+        .post_form(
+            "/domains/new",
+            &[
+                ("domain", "no-english.test.example.com"),
+                ("site_name", "no-english-test"),
+                ("_csrf", &csrf),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the domain must be created — the count below needs it"
+    );
+
+    let body = page_body(&client, "/site/no-english-test/domains").await;
+    assert!(
+        body.contains("1 个域名"),
+        "the Chinese domain count must be rendered: {body}"
+    );
+    assert!(
+        !body.contains("1 domain"),
+        "the English domain count must be gone: {body}"
+    );
 }
 
 /// The sites, the domains and the tunnels are translated (issue

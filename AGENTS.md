@@ -123,6 +123,8 @@ breaks a contract an operator already depends on.
 17. **Operator-facing admin UI strings come from the i18n catalog**
    (`crates/admin/i18n/<code>.json`), never from a template or from Rust; a new
    template struct carries `pub lang: Lang`, its handler takes `lang: Lang`.
+   The residual-English gate fails a template that spells English out instead
+   of asking the catalog for it.
    ([i18n](docs/admin/i18n.md))
 
 ## Documentation Rules

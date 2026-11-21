@@ -166,6 +166,7 @@ than asking the route handler to pre-format strings.
    - `<resource>_hx_delete_no_csrf_forbidden` — missing CSRF → 403.
 7. Keep the legacy form-POST endpoint as a fallback and add a
    `// NOTE: legacy form-POST …` comment on its handler.
+
 ## Interface text comes from the i18n catalog
 
 Every operator-facing string — visible text, `title`, `placeholder`,
@@ -181,18 +182,26 @@ from the template:
 
 Adding a string takes three steps:
 
-1. add the key to `crates/admin/i18n/en.json` with the English text,
-2. reference it in the template with `lang.t()` / `lang.tf()`,
-3. add the translation to every catalog that is not empty.
+1. **add the key** to `crates/admin/i18n/en.json`,
+2. **write the English text** for that key — it is what every other
+   language is translated from,
+3. **write the translation** — the same key in every catalog that is
+   not empty.
+
+A new template struct needs a `pub lang: Lang` field, and the route
+handler that builds it needs a `lang: Lang` parameter that it passes
+on.
 
 Technical identifiers stay in the template — `DNS`, `ACME`, `HTTP-01`,
-status codes, provider keys, file paths, host names.
+status codes, provider keys, file paths, host names. They are the
+literals the residual-English gate whitelists, so a new one has to be
+registered there too.
 
-A template struct needs a `pub lang: Lang` field, and the route
-handler that builds it needs a `lang: Lang` parameter that it passes
-on. The catalog gate tests
-(`cargo test -p admin --lib i18n`) fail when a key is referenced but
-missing, or present but never referenced.
+The catalog gate tests (`cargo test -p admin --lib i18n`) fail when a
+key is referenced but missing, when a key is present but never
+referenced, when the two catalogs disagree about the key set, and
+when a template carries English prose that did not come from the
+catalog.
 
 See [the i18n guide](./i18n.md) for the key shape, the area list, the
-fallback rules, and the language switcher.
+fallback rules, the glossary, and the language switcher.
