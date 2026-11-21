@@ -837,6 +837,24 @@ impl TunProcess {
         token: &str,
         transport: &str,
     ) -> Self {
+        let server = format!("127.0.0.1:{}", ngx.tunnel_port);
+        Self::start_with_transport_at(&server, name, token, transport).await
+    }
+
+    /// Spawn `pangolin-tun` pinned to one transport, pointed at an
+    /// explicit server address.
+    ///
+    /// `server` is the `host:port` the tun dials — the gateway's
+    /// tunnel port, or a proxy in front of it.  The address is a
+    /// parameter so a test can put a proxy between the tun and the
+    /// gateway and cut the tunnel's connection there while the tun
+    /// process stays alive.
+    pub async fn start_with_transport_at(
+        server: &str,
+        name: &str,
+        token: &str,
+        transport: &str,
+    ) -> Self {
         let bin = tun_binary();
         if !bin.exists() {
             panic!(
@@ -849,7 +867,6 @@ impl TunProcess {
         // when the configs were split). The address here is the
         // **tunnel** port (where ngx's WS tunnel server listens),
         // not the admin port.
-        let server = format!("127.0.0.1:{}", ngx.tunnel_port);
         let tun_config = format!(
             r#"
 server: {server}
