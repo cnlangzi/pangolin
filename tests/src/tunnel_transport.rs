@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
 
@@ -173,6 +174,105 @@ impl WsBackend {
     }
 }
 
+/// What the backend saw on the connection the tun opened.
+#[derive(Debug, Clone)]
+struct BackendSeen {
+    /// The request bytes the backend received.
+    request: String,
+    /// The status the backend answered.
+    answered: u16,
+}
+
+/// A backend that answers `400 Bad Request` when the tunnel cuts the
+/// exchange short.
+///
+/// It reads until the peer stops sending and answers then.  The
+/// answer is the one a real server gives to a request it could not
+/// read to the end — and the answer the gateway must **not** relay
+/// to the client.
+struct TruncatingBackend {
+    addr: String,
+    /// What the backend saw, once its read ended.
+    seen: Arc<Mutex<Option<BackendSeen>>>,
+    /// Fires when the backend has the first bytes of a request.
+    arrived: Arc<Notify>,
+    /// Fires when the backend has answered.
+    answered: Arc<Notify>,
+}
+
+impl TruncatingBackend {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<Mutex<Option<BackendSeen>>> = Arc::new(Mutex::new(None));
+        let arrived = Arc::new(Notify::new());
+        let answered = Arc::new(Notify::new());
+        let seen_for_task = seen.clone();
+        let arrived_for_task = arrived.clone();
+        let answered_for_task = answered.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = seen_for_task.clone();
+                let arrived = arrived_for_task.clone();
+                let answered = answered_for_task.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                request.extend_from_slice(&buf[..n]);
+                                arrived.notify_one();
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let body = "missing required Host header";
+                    let answer = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len(),
+                        body = body,
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    answered.notify_one();
+                    *seen.lock().await = Some(BackendSeen {
+                        request: String::from_utf8_lossy(&request).into_owned(),
+                        answered: 400,
+                    });
+                });
+            }
+        });
+        Self {
+            addr,
+            seen,
+            arrived,
+            answered,
+        }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Wait until the backend has the first bytes of a request.
+    async fn wait_for_request(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Wait until the backend has answered.
+    async fn wait_for_answer(&self) {
+        self.answered.notified().await;
+    }
+
+    /// What the backend saw, once its read ended.
+    async fn seen(&self) -> Option<BackendSeen> {
+        self.seen.lock().await.clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -239,6 +339,63 @@ pub(crate) async fn assert_log_contains(
         "the {what} log must contain {expected:?}, got:\n{}",
         String::from_utf8_lossy(&log.lock().unwrap())
     );
+}
+
+/// A TCP forwarder between the tun and the gateway's tunnel port.
+///
+/// The tunnel session lives on the TCP connection the tun opens to the
+/// gateway.  Cutting that connection is how a test kills a session
+/// while the **tun process stays alive**: the tun reconnects on its
+/// own, and the request that was in flight keeps the failure of the
+/// session it belonged to.
+struct TunnelProxy {
+    /// The address the tun dials.
+    addr: String,
+    /// The copy tasks, one per connection.  A task owns both of the
+    /// connection's sockets, so aborting it drops them and cuts the
+    /// connection.
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl TunnelProxy {
+    /// Forward to `upstream` and start listening.
+    async fn start(upstream: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let tasks_for_task = tasks.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                let tasks = tasks_for_task.clone();
+                let handle = tokio::spawn(async move {
+                    let Ok(server) = TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let mut from_client = client;
+                    let mut from_server = server;
+                    let _ = tokio::io::copy_bidirectional(&mut from_client, &mut from_server).await;
+                });
+                tasks.lock().await.push(handle);
+            }
+        });
+        Self { addr, tasks }
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Cut every connection the proxy is carrying.
+    ///
+    /// Both ends go down with the task, so the tun and the gateway
+    /// each see their half of the tunnel connection die.
+    async fn cut(&self) {
+        let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock().await);
+        for task in tasks {
+            task.abort();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,4 +782,110 @@ async fn real_e2e_tunnel_quic_falls_back_to_tcp() {
     // to fall back is the crate's business — `pangolin-tun`'s own
     // suite asserts that (`tests/fallback.rs`).
     assert_log_contains(&ngx.log, "gateway", "serving the WebSocket/TCP tunnel only").await;
+}
+
+/// A tunnel session that dies mid-request is an **error** on that
+/// request, not a relayed backend answer and not a half-delivered
+/// response.
+///
+/// The tun's connection is cut while the request is in flight.  Three
+/// things have to hold:
+///
+/// * the client gets an error the **gateway** produced — not a
+///   response that stops half-way;
+/// * the backend's answer to the cut-short request never reaches the
+///   client;
+/// * the gateway sees the death of the session as an **error**.  The
+///   tunnel's byte stream ends when the session dies, and an
+///   end-of-stream says "the tun finished sending" — that is what
+///   lets the tun hand the backend a request that was cut short.
+///
+/// The **gateway's log** is what pins the third one: the bytes on
+/// the wire are the same either way — a dead session and a finished
+/// one both reach pingora as the end of the response — so the client
+/// cannot tell them apart.  The crate reports the death as an error,
+/// and the gateway says so.
+#[tokio::test]
+async fn real_e2e_tunnel_a_dead_session_is_reported_as_an_error() {
+    let backend = TruncatingBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+
+    let ngx = NgxProcess::start(move |db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_tun(&conn, "office", true);
+        seed_site(
+            &conn,
+            "office-site",
+            &format!("office:http://{backend_addr}"),
+        );
+        seed_domain(&conn, "office.test", "office-site");
+    })
+    .await;
+
+    // The tun reaches the gateway through a proxy: the test cuts the
+    // tunnel's connection there, with the tun itself still running —
+    // the tun is the process that has to notice the death.
+    //
+    // The transport is pinned to `tcp`: the WebSocket/TCP fallback is
+    // the one that carries a yamux session, and a yamux session is
+    // what reports the end of a stream.  The QUIC transport never
+    // touches yamux, so it cannot show this failure at all.
+    let proxy = TunnelProxy::start(format!("127.0.0.1:{}", ngx.tunnel_port)).await;
+    let tun =
+        TunProcess::start_with_transport_at(proxy.addr(), "office", "test-token", "tcp").await;
+
+    // The request goes out; the backend has it and waits.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let request =
+        tokio::spawn(
+            async move { raw_request(&addr, "office.test", "GET", "/api/echo", b"").await },
+        );
+    // The request has to reach the backend before the tunnel dies, or
+    // the test would prove nothing.  The wait is bounded: a request
+    // that never arrives must fail the test, not hang it.
+    tokio::time::timeout(Duration::from_secs(5), backend.wait_for_request())
+        .await
+        .expect("the request must reach the backend");
+
+    // The tunnel's connection dies while the request is in flight.
+    proxy.cut().await;
+
+    let (status, body) = request.await.expect("the request must not panic");
+
+    assert!(
+        status >= 500,
+        "a dying tunnel session must be an error the gateway produced, got {status} \
+         (body={body:?})\nngx log:\n{}\ntun log:\n{}",
+        ngx.log_string(),
+        tun.log_string()
+    );
+    assert!(
+        !body.contains("missing required Host header"),
+        "the backend's answer to the cut-short request must not be relayed to the \
+         client, got {body:?}\nngx log:\n{}\ntun log:\n{}",
+        ngx.log_string(),
+        tun.log_string()
+    );
+
+    // The backend did answer — its `400` is the answer a dying
+    // session used to hand to the client.
+    tokio::time::timeout(Duration::from_secs(5), backend.wait_for_answer())
+        .await
+        .expect("the backend must answer");
+    let seen = backend
+        .seen()
+        .await
+        .expect("the backend must have seen the request");
+    assert!(
+        seen.request.starts_with("GET /api/echo HTTP/1.1"),
+        "the request must have reached the backend before the tunnel died, got {:?}",
+        seen.request
+    );
+    assert_eq!(seen.answered, 400, "the backend answers 400");
+
+    // The gateway must see the death of the session as an error, not
+    // as the end of the stream — see `copy_half` in
+    // `crates/ngx/src/tunnel/connector.rs`.
+    assert_log_contains(&ngx.log, "gateway", "the tunnel stream failed").await;
 }

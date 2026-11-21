@@ -302,10 +302,25 @@ async fn bridge_tunnel_to_socket(tunnel: TunnelStream, socket: TcpStream) {
 
     // The response direction: the tun → pingora.
     let response = tokio::spawn(async move {
-        copy_half(tunnel_read, socket_write).await;
+        if let Err(e) = copy_half(tunnel_read, socket_write).await {
+            // The tunnel died under the request.  A clean end-of-file
+            // would say "the tun finished sending", and the response
+            // would be relayed as if it were whole; the crate reports
+            // the death of a session as an error instead, so the
+            // failure is visible here (issue #211).
+            //
+            // The bytes on the wire are the same either way — the
+            // half-close below still reaches pingora as a clean end
+            // of the response — so what the error buys is the
+            // *report*: a session that died under a request is an
+            // event the operator has to see, and one that reads as
+            // "the tun finished sending" is not one.
+            warn!("tunnel: the tunnel stream failed: {e}");
+        }
     });
-    // The request direction: pingora → the tun.
-    copy_half(socket_read, tunnel_write).await;
+    // The request direction: pingora → the tun.  Its failure is
+    // pingora's own (the client is gone), so it is dropped.
+    let _ = copy_half(socket_read, tunnel_write).await;
     // pingora closed its side — the tunnel stream is done with.
     response.abort();
 }
@@ -316,24 +331,30 @@ async fn bridge_tunnel_to_socket(tunnel: TunnelStream, socket: TcpStream) {
 /// socket's **write** side down when the request side ends and keeps
 /// reading, so a response that only arrives after the request is
 /// complete still reaches the client.
-async fn copy_half<R, W>(mut reader: R, mut writer: W)
+///
+/// A **failed read** is a different ending, and it is returned: the
+/// bytes that were still to come will never come.  A failed *write*
+/// is not — the peer is gone, and the half-close that follows says
+/// as much.
+async fn copy_half<R, W>(mut reader: R, mut writer: W) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 16 * 1024];
-    loop {
+    let outcome = loop {
         match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => break Ok(()),
             Ok(n) => {
                 if writer.write_all(&buf[..n]).await.is_err() {
-                    break;
+                    break Ok(());
                 }
             }
-            Err(_) => break,
+            Err(e) => break Err(e),
         }
-    }
+    };
     let _ = writer.shutdown().await;
+    outcome
 }
 
 #[cfg(test)]
