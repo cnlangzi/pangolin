@@ -301,10 +301,11 @@ the `tokio-yamux` race lives. The h1-only policy of the fallback is
 therefore guaranteed for every connection whose handshake saw a
 fallback (or no) session, not for the connections that were
 established while the tun was on QUIC. Revoking the negotiated
-protocol mid-connection is not something the listener can do, so the
-window is closed by the crate-side fix
-(`cnlangzi/pangolin-tun#14`), which turns the fallback's failure mode
-into an explicit error.
+protocol mid-connection is not something the listener can do. What
+the window costs is bounded by the crate-side fix (#223): a dying
+fallback session now reads as an **error** instead of a clean
+end-of-file, so such a request fails at the gateway rather than
+relaying the backend's answer to a truncated request.
 
 **The two views also use two host rules.** The request path resolves a
 host with `lookup_site` (exact match first, then the longest wildcard
