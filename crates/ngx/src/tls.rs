@@ -16,17 +16,26 @@
 //! [`build_sni_settings`] installs an ALPN selection callback that
 //! decides HTTP/2 vs HTTP/1.1 per connection based on the SNI:
 //!
-//! - If the SNI resolves to a site with a `tun_name:` backend prefix
-//!   (i.e. the request will be proxied through a yamux tunnel
-//!   session), the listener offers **HTTP/1.1 only** — this avoids
-//!   the `tokio-yamux 0.3.18` stream-state race that breaks the
-//!   h2 + tunnel path (issue #66 / commit `0c35ede`).
+//! - If the SNI resolves to a site with a `tun_name:` backend prefix,
+//!   the listener looks at the **transport** that site's tunnel runs
+//!   on:
+//!   - **QUIC** — the primary transport, one bidirectional stream per
+//!     request, no multiplexer in between — follows
+//!     `config.tls.enable_h2` exactly like a direct site. The tunnel
+//!     is a byte splice, so the gateway terminates the client's h2 and
+//!     writes HTTP/1.1 into the tunnel stream.
+//!   - **WebSocket/TCP** — the fallback transport, which layers
+//!     `tokio-yamux` over the WebSocket — offers **HTTP/1.1 only**.
+//!     The `tokio-yamux 0.3.18` stream-state race breaks the h2 +
+//!     tunnel path (issue #66 / commit `0c35ede`).
+//!   - **offline / unknown** — HTTP/1.1 only, conservatively: a tun
+//!     that comes back on the fallback must not be offered h2.
 //! - Otherwise the listener follows `config.tls.enable_h2`.
 //!
 //! The decision is per-connection, so the operator-facing `tls.enable_h2`
-//! flag still controls the non-tunnel default; the runtime override
-//! for tunnel sites is transparent to clients — no 4xx, no 421, no
-//! manual retry, just a fallback to h1 inside the handshake.
+//! flag still controls the default; the runtime override for a
+//! WebSocket-tunneled site is transparent to clients — no 4xx, no 421,
+//! no manual retry, just a fallback to h1 inside the handshake.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +45,7 @@ use openssl::pkey::PKey;
 use openssl::ssl::AlpnError;
 use openssl::x509::X509;
 use pangolin_core::{App, CertLinkCache};
+use pangolin_tun::TransportKind;
 use pingora::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingora_core::tls::ssl::NameType;
@@ -243,9 +253,13 @@ fn split_blob(blob: &str) -> anyhow::Result<(String, Vec<String>)> {
 ///    published routing revision (`App::tunnel_classification`; the
 ///    revision is swapped atomically on every admin-triggered
 ///    `App::reload_indexes`).
-/// 3. Picks the target protocol: `http/1.1` for tunnel sites, `h2` for
-///    non-tunnel sites if `config.tls.enable_h2`, otherwise `http/1.1`.
-/// 4. Walks the client-offered ALPN list and returns the first match;
+/// 3. Resolves the tunnel node that serves the SNI and asks which
+///    transport its live session runs on (`App::tun_kind`).
+/// 4. Picks the target protocol: `h2` for a QUIC-tunneled site if
+///    `config.tls.enable_h2`, `http/1.1` for a WebSocket-tunneled or
+///    offline site, `h2` for a non-tunnel site if `config.tls.enable_h2`,
+///    otherwise `http/1.1`.
+/// 5. Walks the client-offered ALPN list and returns the first match;
 ///    falls back to the other protocol if the target is not offered.
 ///
 /// We do NOT call `TlsSettings::enable_h2()` here — that would install
@@ -294,14 +308,26 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
         // sees the same string.
         let sni = sni.trim_end_matches('.');
 
-        // 2. Sync lookup: is this SNI a tunnel site? The set comes
-        //    from the currently published routing revision — the same
-        //    publication the request path's routing table comes from,
-        //    so the two views are never out of step (issue #212).
-        let tunnel_domains = app.tunnel_classification();
-        let is_tunnel = pangolin_core::index::host_matches_set(&tunnel_domains, sni);
+        // 2. Sync lookup: is this SNI a tunnel site, and which tun
+        //    serves it? Both views come from the currently published
+        //    routing revision — the same publication the request
+        //    path's routing table comes from, so the two views are
+        //    never out of step (issue #212) and never a revision
+        //    apart from each other (issue #210).
+        let classification = app.tunnel_classification();
+        let is_tunnel = pangolin_core::index::host_matches_set(&classification.domains, sni);
 
-        select_alpn(is_tunnel, global_enable_h2, alpn_in)
+        // 3. The transport that tun's live session runs on. `None`
+        //    when the tun is offline — or when the classification and
+        //    the map disagree, which cannot happen by construction.
+        let transport = if is_tunnel {
+            pangolin_core::index::host_lookup_tun(&classification.hosts, sni)
+                .and_then(|tun| app.tun_kind(tun))
+        } else {
+            None
+        };
+
+        select_alpn(is_tunnel, transport, global_enable_h2, alpn_in)
     });
 }
 
@@ -309,12 +335,18 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
 /// per-SNI policy is unit-testable without a real `SslRef` / handshake.
 ///
 /// Policy:
-/// - Tunnel sites: `http/1.1` ONLY. If the client doesn't offer it, return
-///   `NOACK`. Never fall back to `h2` — h2 + yamux tunnel trips
-///   tokio-yamux 0.3.18's stream-state race (issue #66 / commit
-///   `0c35ede`), and pingora then emits `400 Bad Request: missing
-///   required Host header`. Modern browsers automatically retry with h1
-///   when h2 isn't advertised, so NOACK is transparent in practice.
+/// - Tunnel sites on the **QUIC** transport: the target follows
+///   `tls.enable_h2`; if the target is not offered, fall back to the
+///   other protocol. QUIC carries one bidirectional stream per request
+///   and no multiplexer, so the h2 + yamux race cannot happen there.
+/// - Tunnel sites on the **WebSocket/TCP fallback** (or on no session at
+///   all — offline, or the transport is unknown): `http/1.1` ONLY. If
+///   the client doesn't offer it, return `NOACK`. Never fall back to
+///   `h2` — h2 + yamux tunnel trips tokio-yamux 0.3.18's stream-state
+///   race (issue #66 / commit `0c35ede`), and pingora then emits
+///   `400 Bad Request: missing required Host header`. Modern browsers
+///   automatically retry with h1 when h2 isn't advertised, so NOACK is
+///   transparent in practice.
 /// - Non-tunnel sites: target follows `tls.enable_h2`; if the target is
 ///   not offered, fall back to the other protocol so h1-only clients
 ///   (curl --http1.1) still work.
@@ -323,15 +355,20 @@ fn install_dynamic_alpn(settings: &mut pingora::listeners::tls::TlsSettings, app
 ///   pingora).
 fn select_alpn(
     is_tunnel: bool,
+    transport: Option<TransportKind>,
     global_enable_h2: bool,
     alpn_in: &[u8],
 ) -> Result<&[u8], AlpnError> {
-    // 3a. Tunnel sites: http/1.1 ONLY — see policy above.
-    if is_tunnel {
+    // 3a. A tunnel on the WebSocket/yamux fallback — and a tunnel with
+    //     no live session, whose transport is therefore unknown —
+    //     stay on http/1.1. See the policy above.
+    if is_tunnel && transport != Some(TransportKind::Quic) {
         return pick_protocol(alpn_in, b"http/1.1").ok_or(AlpnError::NOACK);
     }
 
-    // 3b. Non-tunnel sites.
+    // 3b. Non-tunnel sites, and tunnel sites on QUIC — the QUIC path
+    //     never touches yamux, so it follows the global knob exactly
+    //     like a direct site does.
     let target: &[u8] = if global_enable_h2 { b"h2" } else { b"http/1.1" };
     if let Some(p) = pick_protocol(alpn_in, target) {
         return Ok(p);
@@ -587,30 +624,18 @@ mod tests {
 
     // ---- select_alpn policy tests ----
     //
-    // These cover the per-SNI policy from `install_dynamic_alpn`. The key
-    // invariant is "tunnel sites always negotiate h1" — see the
+    // These cover the per-SNI policy from `install_dynamic_alpn`. The
+    // policy is transport-aware: a tunnel on QUIC may negotiate h2, a
+    // tunnel on the WebSocket/yamux fallback may not. See the
     // `TlsConfig` doc and `docs/configuration.md`.
 
     #[test]
-    fn select_alpn_tunnel_prefers_http11() {
+    fn select_alpn_non_tunnel_follows_the_global_knob() {
         let wire = alpn(&[b"h2", b"http/1.1"]);
-        // Tunnel + h2 + http/1.1 offered → must pick http/1.1, never h2.
-        assert_eq!(select_alpn(true, true, &wire), Ok(&b"http/1.1"[..]));
-        // Same wire, non-tunnel + enable_h2 → h2 picked.
-        assert_eq!(select_alpn(false, true, &wire), Ok(&b"h2"[..]));
-    }
-
-    #[test]
-    fn select_alpn_tunnel_rejects_h2_only_client() {
-        // Client offers ONLY h2 (no http/1.1) — a tunnel SNI must NOACK
-        // rather than negotiate h2. This is the regression test for the
-        // h2+tunnel bug (issue #66). Pre-fix, the callback would fall
-        // back to h2 here and trip tokio-yamux 0.3.18's stream-state
-        // race.
-        let wire = alpn(&[b"h2"]);
-        assert_eq!(select_alpn(true, true, &wire), Err(AlpnError::NOACK));
-        // Same wire on non-tunnel + enable_h2 → h2 is fine.
-        assert_eq!(select_alpn(false, true, &wire), Ok(&b"h2"[..]));
+        // Non-tunnel + enable_h2 → h2 picked.
+        assert_eq!(select_alpn(false, None, true, &wire), Ok(&b"h2"[..]));
+        // Non-tunnel + enable_h2=false → http/1.1 picked.
+        assert_eq!(select_alpn(false, None, false, &wire), Ok(&b"http/1.1"[..]));
     }
 
     #[test]
@@ -618,20 +643,99 @@ mod tests {
         // Non-tunnel + enable_h2: client offers only http/1.1 → must
         // fall back to http/1.1 (so curl --http1.1 still works).
         let wire = alpn(&[b"http/1.1"]);
-        assert_eq!(select_alpn(false, true, &wire), Ok(&b"http/1.1"[..]));
+        assert_eq!(select_alpn(false, None, true, &wire), Ok(&b"http/1.1"[..]));
 
         // Non-tunnel + enable_h2=false: client offers only h2 → must
         // fall back to h2 (mirrors the http1.1-only-client case).
         let wire = alpn(&[b"h2"]);
-        assert_eq!(select_alpn(false, false, &wire), Ok(&b"h2"[..]));
+        assert_eq!(select_alpn(false, None, false, &wire), Ok(&b"h2"[..]));
+    }
+
+    /// A tunnel on **QUIC** negotiates h2: the QUIC transport carries
+    /// one bidirectional stream per request and no multiplexer, so the
+    /// yamux race cannot happen there. The global knob still decides
+    /// whether h2 is the *target*.
+    #[test]
+    fn select_alpn_quic_tunnel_negotiates_h2() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Quic), true, &wire),
+            Ok(&b"h2"[..])
+        );
+        // The knob still governs: with enable_h2=false the target is
+        // http/1.1.
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Quic), false, &wire),
+            Ok(&b"http/1.1"[..])
+        );
+        // A client that offers no h2 falls back to http/1.1.
+        let wire = alpn(&[b"http/1.1"]);
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Quic), true, &wire),
+            Ok(&b"http/1.1"[..])
+        );
+    }
+
+    /// A tunnel on the **WebSocket/TCP fallback** stays on HTTP/1.1:
+    /// the fallback layers `tokio-yamux` over the WebSocket, and h2
+    /// trips its stream-state race (issue #66).
+    #[test]
+    fn select_alpn_websocket_tunnel_prefers_http11() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Tcp), true, &wire),
+            Ok(&b"http/1.1"[..])
+        );
+        // The knob does not change that: the fallback keeps h1 even
+        // with enable_h2 on.
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Tcp), false, &wire),
+            Ok(&b"http/1.1"[..])
+        );
+    }
+
+    /// A client that offers only h2 to a WebSocket-tunneled vhost is
+    /// NOACKed rather than served an h2 session that would trip the
+    /// yamux race. This is the regression test for the h2+tunnel bug
+    /// (issue #66): pre-fix, the callback fell back to h2 here.
+    #[test]
+    fn select_alpn_websocket_tunnel_rejects_h2_only_client() {
+        let wire = alpn(&[b"h2"]);
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Tcp), true, &wire),
+            Err(AlpnError::NOACK)
+        );
+    }
+
+    /// A tunnel with **no live session** — offline, or a transport the
+    /// gateway does not know — is answered conservatively with
+    /// HTTP/1.1: the tun may come back on the WebSocket fallback,
+    /// where the race lives.
+    #[test]
+    fn select_alpn_offline_tunnel_prefers_http11() {
+        let wire = alpn(&[b"h2", b"http/1.1"]);
+        assert_eq!(select_alpn(true, None, true, &wire), Ok(&b"http/1.1"[..]));
+        let wire = alpn(&[b"h2"]);
+        assert_eq!(select_alpn(true, None, true, &wire), Err(AlpnError::NOACK));
     }
 
     #[test]
     fn select_alpn_no_noack_when_neither_protocol_offered() {
-        // Client offers only an unrelated protocol — NOACK in both paths.
+        // Client offers only an unrelated protocol — NOACK in every path.
         let wire = alpn(&[b"spdy/3"]);
-        assert_eq!(select_alpn(true, true, &wire), Err(AlpnError::NOACK));
-        assert_eq!(select_alpn(false, true, &wire), Err(AlpnError::NOACK));
-        assert_eq!(select_alpn(false, false, &wire), Err(AlpnError::NOACK));
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Quic), true, &wire),
+            Err(AlpnError::NOACK)
+        );
+        assert_eq!(
+            select_alpn(true, Some(TransportKind::Tcp), true, &wire),
+            Err(AlpnError::NOACK)
+        );
+        assert_eq!(select_alpn(true, None, true, &wire), Err(AlpnError::NOACK));
+        assert_eq!(select_alpn(false, None, true, &wire), Err(AlpnError::NOACK));
+        assert_eq!(
+            select_alpn(false, None, false, &wire),
+            Err(AlpnError::NOACK)
+        );
     }
 }

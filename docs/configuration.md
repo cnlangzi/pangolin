@@ -347,7 +347,7 @@ knobs land in one place.
 
 | Field        | Type   | Default | Required | Notes |
 | ------------ | ------ | ------- | -------- | ----- |
-| `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN for **non-tunnel sites**. Tunnel sites (`site.backend = "<tun>:<url>"`) always negotiate h1 at runtime — this is the per-SNI dynamic ALPN policy in `ngx::tls::build_sni_settings` that works around the upstream `tokio-yamux 0.3.18` stream-state race (issue #66 / commit `0c35ede`). Modern browsers fall back to h1 automatically when h2 is not advertised; the per-SNI override is transparent to clients — no 4xx, no 421, no manual retry. |
+| `enable_h2`  | `bool` | `true`  | no       | Advertise HTTP/2 via ALPN for **direct sites** and for **tunnel sites whose tun is on the QUIC transport**. The per-SNI dynamic ALPN policy in `ngx::tls::build_sni_settings` decides by transport: a QUIC tunnel carries one bidirectional stream per request and no multiplexer, so h2 is safe there; a tunnel on the **WebSocket/TCP fallback** (`site.backend = "<tun>:<url>"`) negotiates h1 only, because the fallback layers `tokio-yamux` over the WebSocket and `tokio-yamux 0.3.18` has a stream-state race that breaks the h2 + tunnel path (issue #66 / commit `0c35ede`). A tunnel that is offline negotiates h1 as well. Modern browsers fall back to h1 automatically when h2 is not advertised; the per-SNI override is transparent to clients — no 4xx, no 421, no manual retry. |
 
 ### `[provider]` — front-CDN range refresh
 

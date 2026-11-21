@@ -71,6 +71,35 @@ pub struct Indexes {
     /// which the routing table already knew about a tunnel site while
     /// the handshake still classified it as direct (issue #212).
     pub tunnel_domains: Arc<HashSet<String>>,
+    /// The tunnel node that serves each tunnel-backed domain — the
+    /// same classification as [`Indexes::tunnel_domains`], resolved to
+    /// the tun.
+    ///
+    /// The ALPN callback needs the tun to learn **which transport** its
+    /// session runs on: a QUIC tunnel can negotiate h2, a
+    /// WebSocket/yamux tunnel cannot. The map is built in the same
+    /// pass as `tunnel_domains` out of the same `domain` map, so the
+    /// two views can never disagree about which domains are
+    /// tunnel-backed.
+    pub tunnel_hosts: Arc<HashMap<String, String>>,
+}
+
+/// The tunnel classification of a routing revision: the domains that
+/// route through a tunnel, and the tunnel node that serves each of
+/// them.
+///
+/// The two views are handed out together because they have to be read
+/// from the **same** revision: the ALPN callback classifies the SNI
+/// against the domain set and then resolves the tun that serves it,
+/// and a reload between the two reads would leave it with a domain set
+/// from one revision next to a tun map from another (issue #212).
+#[derive(Clone, Debug)]
+pub struct TunnelClassification {
+    /// Every tunnel-backed domain literal (exact FQDNs and
+    /// `*.wildcard` wildcards).
+    pub domains: Arc<HashSet<String>>,
+    /// The tunnel node that serves each tunnel-backed domain.
+    pub hosts: Arc<HashMap<String, String>>,
 }
 
 impl Indexes {
@@ -195,7 +224,7 @@ impl Indexes {
         //    site routes through a tunnel. Derived from the map that
         //    was just built, so the classification can never disagree
         //    with the routing table it belongs to.
-        let tunnel_domains = build_tunnel_domain_set(&domain_idx);
+        let (tunnel_domains, tunnel_hosts) = build_tunnel_classification(&domain_idx);
 
         Self {
             domain: domain_idx,
@@ -203,16 +232,18 @@ impl Indexes {
             limits,
             providers,
             tunnel_domains: Arc::new(tunnel_domains),
+            tunnel_hosts: Arc::new(tunnel_hosts),
         }
     }
 }
 
-/// Build the set of all domain strings (exact + wildcard literals)
-/// whose owning site has a `tun_name:` backend prefix.
+/// Build the tunnel classification: the set of all domain strings
+/// (exact + wildcard literals) whose owning site has a `tun_name:`
+/// backend prefix, and the tunnel node that serves each of them.
 ///
 /// The output contains the exact strings stored in `Indexes.domain`;
 /// wildcard suffix matching is done at lookup time by
-/// [`host_matches_set`].
+/// [`host_matches_set`] and [`host_lookup_tun`].
 ///
 /// The decision belongs to the **site**, not to the domain: a site's
 /// backend is parsed once and the answer reused for all of its
@@ -223,23 +254,28 @@ impl Indexes {
 /// the same policy used in [`rebuild_tun_index`]. Any startup-time
 /// parse errors have already failed-fast at boot, so a per-reload
 /// silent skip is safe.
-fn build_tunnel_domain_set(domain: &HashMap<String, Arc<Site>>) -> HashSet<String> {
-    let mut out = HashSet::new();
-    // Site name → is the site tunnel-backed? A domain's owner is
-    // decided once, no matter how many domains the site has.
-    let mut tunnel_sites: HashMap<&str, bool> = HashMap::new();
+fn build_tunnel_classification(
+    domain: &HashMap<String, Arc<Site>>,
+) -> (HashSet<String>, HashMap<String, String>) {
+    let mut domains = HashSet::new();
+    let mut hosts = HashMap::new();
+    // Site name → the tun that serves it (`None` for a direct site).
+    // A domain's owner is decided once, no matter how many domains
+    // the site has.
+    let mut tunnel_sites: HashMap<&str, Option<String>> = HashMap::new();
     for (domain, site) in domain {
-        let is_tunnel = *tunnel_sites.entry(site.name.as_str()).or_insert_with(|| {
-            matches!(
-                crate::parse::parse_backend(&site.backend),
-                Ok((ref tun, _)) if !tun.is_empty()
-            )
+        let tun = tunnel_sites.entry(site.name.as_str()).or_insert_with(|| {
+            match crate::parse::parse_backend(&site.backend) {
+                Ok((tun, _)) if !tun.is_empty() => Some(tun),
+                _ => None,
+            }
         });
-        if is_tunnel {
-            out.insert(domain.clone());
+        if let Some(tun) = tun {
+            domains.insert(domain.clone());
+            hosts.insert(domain.clone(), tun.clone());
         }
     }
-    out
+    (domains, hosts)
 }
 
 /// Build the effective provider configuration of every site.
@@ -422,24 +458,65 @@ pub fn host_matches_set(set: &std::collections::HashSet<String>, host: &str) -> 
         return true;
     }
 
-    let mut rest: &str = &domain;
-    while let Some(dot) = rest.find('.') {
+    guarded_wildcard_candidates(&domain).any(|candidate| set.contains(&candidate))
+}
+
+/// Resolve the tunnel node that serves `host`.
+///
+/// The twin of [`host_matches_set`] over a `domain → tun` map: the
+/// same normalization, the same exact-then-wildcard walk and the same
+/// bare-TLD guard, so the two answers can never disagree about which
+/// hosts are tunnel-backed (issue #210).
+///
+/// `map` is the `Indexes.tunnel_hosts` view — the tunnel-backed
+/// domain literals mapped to the tunnel node that serves them. A host
+/// that is not in the map is not tunnel-backed; `None` is the answer
+/// for a direct site *and* for a tunnel site whose entry the map does
+/// not carry (a domain that moved between revisions).
+///
+/// The lookup is sync because the TLS ALPN callback runs in a C
+/// context inside the handshake.
+pub fn host_lookup_tun<'a>(map: &'a HashMap<String, String>, host: &str) -> Option<&'a str> {
+    let domain = normalize_host(host);
+
+    if let Some(tun) = map.get(&domain) {
+        return Some(tun);
+    }
+
+    guarded_wildcard_candidates(&domain)
+        .find_map(|candidate| map.get(&candidate))
+        .map(|tun| tun.as_str())
+}
+
+/// The wildcard candidates for a normalized host, longest suffix first,
+/// **stopping before a bare TLD**.
+///
+/// `foo.bar.example.com` → `*.bar.example.com`, `*.example.com` — and
+/// then nothing: `*.com` is not a candidate, because a wildcard over a
+/// bare TLD is meaningless (RFC 6125) and an entry `*.com` would
+/// otherwise match every `foo.com` host.
+///
+/// This is the walk the TLS ALPN callback uses, and it is shared by
+/// [`host_matches_set`] and [`host_lookup_tun`] so the classification
+/// and the tun resolution cannot drift apart. The routing table's own
+/// walk ([`wildcard_candidates`]) deliberately differs: it has no
+/// TLD guard, and the difference is documented in
+/// `docs/design/routing-and-index.md`.
+fn guarded_wildcard_candidates(normalized: &str) -> impl Iterator<Item = String> + '_ {
+    let mut rest: &str = normalized;
+    std::iter::from_fn(move || {
+        let dot = rest.find('.')?;
         rest = &rest[dot + 1..];
         // rest must contain a dot to be a valid wildcard suffix
         // (*.com is meaningless — wildcard certs don't cover TLDs).
-        // Without this break, a set entry "*.com" would match
+        // Without this break, a "*.com" entry would match
         // "foo.com" and silently flip it to tunnel classification,
         // tripping the h2+yamux bug (issue #66).
         if !rest.contains('.') {
-            break;
+            return None;
         }
-        let candidate = format!("*.{}", rest);
-        if set.contains(&candidate) {
-            return true;
-        }
-    }
-
-    false
+        Some(format!("*.{rest}"))
+    })
 }
 
 #[cfg(test)]
@@ -735,6 +812,96 @@ mod tests {
         assert!(!host_matches_set(&s, "example.com"));
     }
 
+    // ── host_lookup_tun tests (the tunnel the ALPN callback resolves) ──
+
+    fn host_map(items: &[(&str, &str)]) -> HashMap<String, String> {
+        items
+            .iter()
+            .map(|(domain, tun)| (domain.to_string(), tun.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn host_lookup_tun_resolves_the_tun_name() {
+        let m = host_map(&[("foo.example.com", "office"), ("*.example.org", "home")]);
+        assert_eq!(host_lookup_tun(&m, "foo.example.com"), Some("office"));
+        assert_eq!(host_lookup_tun(&m, "a.example.org"), Some("home"));
+        assert_eq!(host_lookup_tun(&m, "other.test"), None);
+    }
+
+    /// The wildcard literal is found by the same walk the
+    /// classification uses, and the longest suffix wins.
+    #[test]
+    fn host_lookup_tun_wildcard_literal() {
+        let m = host_map(&[("*.example.com", "office"), ("*.foo.example.com", "home")]);
+        assert_eq!(host_lookup_tun(&m, "a.example.com"), Some("office"));
+        assert_eq!(host_lookup_tun(&m, "a.foo.example.com"), Some("home"));
+        // The apex is not covered by a wildcard.
+        assert_eq!(host_lookup_tun(&m, "example.com"), None);
+    }
+
+    /// The bare-TLD guard: a `*.com` entry must never make a host
+    /// tunnel-backed — the same rule `host_matches_set` applies.
+    #[test]
+    fn host_lookup_tun_rejects_bare_tld_wildcard() {
+        let m = host_map(&[("*.com", "office")]);
+        assert_eq!(host_lookup_tun(&m, "foo.com"), None);
+        assert_eq!(host_lookup_tun(&m, "example.com"), None);
+    }
+
+    #[test]
+    fn host_lookup_tun_normalizes_case_and_port() {
+        let m = host_map(&[("foo.example.com", "office")]);
+        assert_eq!(host_lookup_tun(&m, "FOO.example.com:8443"), Some("office"));
+        assert_eq!(host_lookup_tun(&m, "Foo.Example.COM"), Some("office"));
+    }
+
+    /// The classification and the tun resolution answer the same
+    /// question — "is this host tunnel-backed?" — and they must answer
+    /// it the same way.
+    ///
+    /// They are two lookups over two containers (a set and a map), so
+    /// a change to one that forgot the other would split the handshake
+    /// path: the ALPN callback would classify a host as direct and
+    /// resolve a tun for it, or the other way round.
+    #[test]
+    fn host_lookup_tun_agrees_with_host_matches_set() {
+        let entries = [
+            "foo.example.com",
+            "*.example.com",
+            "*.foo.example.com",
+            "deep.sub.example.org",
+            "*.com",
+        ];
+        let hosts = [
+            "foo.example.com",
+            "FOO.example.com:8443",
+            "bar.example.com",
+            "a.foo.example.com",
+            "x.y.example.com",
+            "example.com",
+            "foo.com",
+            "com",
+            "deep.sub.example.org",
+            "sub.example.org",
+            "other.test",
+            "",
+        ];
+
+        for entry in entries {
+            let s = set(&[entry]);
+            let m = host_map(&[(entry, "office")]);
+            for host in hosts {
+                assert_eq!(
+                    host_matches_set(&s, host),
+                    host_lookup_tun(&m, host).is_some(),
+                    "the classification and the tun lookup disagree for host \
+                     {host:?} against the entry {entry:?}"
+                );
+            }
+        }
+    }
+
     // ── tunnel_domains tests (the ALPN classification) ──
 
     /// The tunnel classification is derived from the same domain map
@@ -829,5 +996,51 @@ mod tests {
         let domains = vec![make_domain("bad.example.com", "bad")];
         let idx = Indexes::build(sites, domains);
         assert!(idx.tunnel_domains.is_empty());
+    }
+
+    /// The map carries the tunnel node that serves each tunnel-backed
+    /// domain — the ALPN callback resolves the SNI to a tun and then
+    /// asks which transport that tun's session runs on.
+    #[test]
+    fn tunnel_hosts_maps_each_tunnel_domain_to_its_tun() {
+        let sites = vec![
+            make_site("direct", "http://127.0.0.1:8080"),
+            make_site("tun", "office:http://10.0.0.1:8080"),
+            make_site("other-tun", "home:http://10.0.0.2:8080"),
+        ];
+        let domains = vec![
+            make_domain("direct.example.com", "direct"),
+            make_domain("tun.example.com", "tun"),
+            make_domain("*.wild.example.com", "tun"),
+            make_domain("other.example.com", "other-tun"),
+        ];
+        let idx = Indexes::build(sites, domains);
+
+        assert_eq!(
+            idx.tunnel_hosts.get("tun.example.com").map(String::as_str),
+            Some("office")
+        );
+        assert_eq!(
+            idx.tunnel_hosts
+                .get("*.wild.example.com")
+                .map(String::as_str),
+            Some("office")
+        );
+        assert_eq!(
+            idx.tunnel_hosts
+                .get("other.example.com")
+                .map(String::as_str),
+            Some("home")
+        );
+        assert!(
+            !idx.tunnel_hosts.contains_key("direct.example.com"),
+            "a direct site must not appear in the tun map"
+        );
+
+        // The map's keys are the tunnel-backed domains — the very set
+        // the classification holds. The two views are built in one
+        // pass, so they cannot drift apart.
+        let map_keys: HashSet<String> = idx.tunnel_hosts.keys().cloned().collect();
+        assert_eq!(map_keys, *idx.tunnel_domains);
     }
 }

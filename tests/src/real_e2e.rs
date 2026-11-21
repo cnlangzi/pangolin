@@ -727,12 +727,13 @@ async fn real_e2e_tunnel_preserves_multiple_set_cookie() {
 ///
 /// Why this test catches it: we drive a real HTTPS request through
 /// curl (`--http2`, no `--http2-prior-knowledge`) against the
-/// proxy's TLS port. The dynamic ALPN callback in
-/// `ngx::tls::build_sni_settings` forces h1 for tunnel sites
-/// (issue #66 / commit `0c35ede`), so curl falls back to h1
-/// transparently. The mock backend records the path it actually
-/// received; the assertion `path == "/api/profile"` (not
-/// `path == "/https://office.test/api/profile"`) catches a
+/// proxy's TLS port. The tun uses the default transport selector
+/// (QUIC first), and the dynamic ALPN callback in
+/// `ngx::tls::build_sni_settings` negotiates h2 for a QUIC-tunneled
+/// site (issue #210) — so the request arrives as h2 and the path has
+/// to survive the h2 → tunnel hand-off. The mock backend records the
+/// path it actually received; the assertion `path == "/api/profile"`
+/// (not `path == "/https://office.test/api/profile"`) catches a
 /// regression in `path_and_query()` regardless of which protocol
 /// the request actually used.
 #[tokio::test]
@@ -885,7 +886,8 @@ async fn real_e2e_tunnel_h2_path_preserved() {
 }
 
 /// **Regression test for the per-SNI dynamic ALPN policy:**
-/// h2 client + tunnel site must transparently fall back to h1.
+/// h2 client + a tunnel on the WebSocket/TCP fallback must
+/// transparently fall back to h1.
 ///
 /// Pre-fix (PR #66 / commit `0c35ede`): the listener advertised h2
 /// for every connection. Browsers and `curl --http2` (without
@@ -896,22 +898,28 @@ async fn real_e2e_tunnel_h2_path_preserved() {
 /// pingora fall back to `400 Bad Request: missing required Host
 /// header`.
 ///
-/// Post-fix: `ngx::tls::build_sni_settings` installs a per-SNI
-/// ALPN callback that does NOT offer h2 for tunnel sites — h1
-/// only. Curl's `--http2` mode (which respects the server's ALPN
-/// advertisement) silently falls back to h1 and the request goes
-/// through.
+/// Post-fix: `ngx::tls::build_sni_settings` installs a per-SNI ALPN
+/// callback that offers h2 only where it is safe — a direct site, or
+/// a tunnel whose session runs on the QUIC transport (issue #210).
+/// The WebSocket/TCP fallback still layers `tokio-yamux` over the
+/// WebSocket, so it keeps the h1-only policy; this test pins the tun
+/// to that transport. Curl's `--http2` mode (which respects the
+/// server's ALPN advertisement) silently falls back to h1 and the
+/// request goes through.
 ///
-/// This test asserts two things together:
+/// This test asserts three things together:
 ///
 /// 1. The end-to-end request succeeds (200) when the client tries
 ///    `--http2`. Pre-fix, this was a 400.
-/// 2. The server's ALPN did NOT offer h2 — confirmed by grepping
-///    `curl -v` stderr for the `ALPN: offers ` line. We assert the
-///    string `h2` does NOT appear in the ALPN offers for the
-///    tunnel site, so the h1 path is the only one that can run.
+/// 2. The protocol the client ended up with is HTTP/1.1 — curl's
+///    `%{http_version}` reports the negotiated protocol, so a silent
+///    h2 would be visible here.
+/// 3. The server's ALPN did NOT pick h2 — confirmed by grepping
+///    `curl -v` stderr for the `ALPN … server accepted` line. When
+///    the running curl cannot emit that line, the `%{http_version}`
+///    assertion above still pins the protocol.
 #[tokio::test]
-async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
+async fn real_e2e_h2_tunnel_tcp_fallback_stays_on_http11() {
     use std::process::Stdio;
 
     let backend = InspectingBackend::start().await;
@@ -934,7 +942,10 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
     })
     .await;
 
-    let _tun = TunProcess::start(&ngx, "office", "test-token").await;
+    // The tun is pinned to the **WebSocket/TCP fallback** — the
+    // transport that still layers yamux over the WebSocket, and the
+    // one the h1-only policy is about.
+    let _tun = TunProcess::start_with_transport(&ngx, "office", "test-token", "tcp").await;
 
     // Issue a self-signed cert for `office.test` and install it in
     // the per-test cert dir.
@@ -974,7 +985,9 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
     // (libcurl with debug builds). We use this to assert h2 was
     // NOT offered. The `http2` flag is present so curl tries h2
     // first; the absence of h2 in the ALPN line forces the
-    // downgrade to h1.
+    // downgrade to h1. `%{http_version}` reports the protocol the
+    // client ended up with, so the downgrade is asserted even when
+    // the running curl cannot print the ALPN line.
     let url = format!("https://office.test:{}/api/profile?id=42", ngx.tls_port);
     let output = tokio::process::Command::new("curl")
         .arg("--http2")
@@ -986,7 +999,7 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
         .arg("--output")
         .arg("-")
         .arg("--write-out")
-        .arg("HTTP_CODE:%{http_code}\n")
+        .arg("HTTP_CODE:%{http_code}\nHTTP_VERSION:%{http_version}\n")
         .arg("--resolve")
         .arg(format!("office.test:{}:127.0.0.1", ngx.tls_port))
         .arg(&url)
@@ -1028,6 +1041,22 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
         ngx.log_string()
     );
 
+    // The protocol the client actually got. `%{http_version}` is the
+    // negotiated protocol, so this pins the downgrade even when the
+    // running curl cannot print its ALPN line.
+    let version = meta
+        .split_once("HTTP_VERSION:")
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        version,
+        "1.1",
+        "a tunnel on the WebSocket/TCP fallback must stay on HTTP/1.1; \
+         the client negotiated {version:?}. \
+         stderr: {stderr}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
     // Look for curl's ALPN negotiation line. Curl's wording varies across
     // versions and build flags:
     //
@@ -1043,10 +1072,10 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
     // actually picked h2.
     //
     // When the running curl can't emit "server accepted" (non-debug build
-    // or a really old version), we fall back to behaviour-level assertions
-    // below: status==200 + exactly one backend observation. The h2+tunnel
-    // bug produces a 400 from pingora, so the request-level signal still
-    // catches the regression reliably even without the strict ALPN trace.
+    // or a really old version), the `%{http_version}` assertion above
+    // still pins the protocol, and the request-level signal below
+    // (status==200 + exactly one backend observation) catches the
+    // h2+tunnel bug, which produces a 400 from pingora.
     let server_alpn_line = stderr
         .lines()
         .find(|l| l.contains("ALPN") && l.contains("accepted"));
@@ -1068,12 +1097,12 @@ async fn real_e2e_h2_tunnel_auto_fallback_to_h1() {
     } else {
         // No "server accepted" line — curl is probably a build that only
         // emits client-offer lines. Log once so the operator knows the
-        // strict ALPN check was skipped, and rely on behaviour-level
-        // assertions below.
+        // strict ALPN check was skipped; the negotiated protocol is
+        // still pinned by `%{http_version}` above.
         eprintln!(
             "note: curl -v did not emit an `ALPN ... server accepted` line; \
-             falling back to behaviour-level assertion (status=200 + backend \
-             observation). Install libcurl with --enable-debug for stricter \
+             the negotiated protocol is pinned by `%{{http_version}}` instead. \
+             Install libcurl with --enable-debug for stricter \
              ALPN checking. stderr:\n{stderr}"
         );
     }

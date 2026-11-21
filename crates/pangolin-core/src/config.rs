@@ -389,22 +389,31 @@ impl Default for ProviderConfig {
 /// `ngx::tls::build_sni_settings`. The runtime rule is:
 ///
 /// - If the SNI resolves to a site with a `tun_name:` backend
-///   prefix, the listener offers **HTTP/1.1 only** — this
-///   sidesteps an upstream `tokio-yamux 0.3.18` stream-state race
-///   that tears down the yamux stream mid-request and makes
-///   pingora fall back to `400 Bad Request: missing required Host
-///   header`. Tracked upstream; the runtime override stays even
-///   after the upstream fix so that operators can keep tunnel
-///   sites on h1 if they choose to.
+///   prefix, the listener looks at the **transport** that site's
+///   tunnel runs on:
+///   - **QUIC** — the primary transport, one bidirectional stream per
+///     request and no multiplexer in between — follows the
+///     `enable_h2` field below, exactly like a direct site.
+///   - **WebSocket over TCP** — the fallback transport, which layers
+///     `tokio-yamux` over the WebSocket — offers **HTTP/1.1 only**.
+///     An upstream `tokio-yamux 0.3.18` stream-state race tears the
+///     yamux stream down mid-request and makes pingora fall back to
+///     `400 Bad Request: missing required Host header`. Tracked
+///     upstream; the override stays until the fallback itself is
+///     fixed.
+///   - **offline or unknown** — HTTP/1.1 only, conservatively: a tun
+///     that comes back on the fallback must not be offered h2.
 /// - Otherwise the listener follows the `enable_h2` field
 ///   below.
 ///
-/// `enable_h2` therefore controls the **non-tunnel default**.
+/// `enable_h2` therefore controls the **default** — the direct sites
+/// and the QUIC-tunneled ones.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TlsConfig {
-    /// Advertise HTTP/2 via ALPN for **non-tunnel** sites. Default
-    /// `true`. Tunnel sites always negotiate h1 regardless of this
-    /// field (see struct doc).
+    /// Advertise HTTP/2 via ALPN for **direct sites and QUIC-tunneled
+    /// sites**. Default `true`. A site on the WebSocket/TCP tunnel
+    /// fallback negotiates h1 regardless of this field (see struct
+    /// doc).
     #[serde(default)]
     pub enable_h2: bool,
 }

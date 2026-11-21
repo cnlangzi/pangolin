@@ -98,11 +98,11 @@ would then disagree with the request path.
 
 ### The `*.com` guard
 
-`host_matches_set` — the variant the TLS ALPN callback uses — stops the
-walk when the remaining suffix contains no dot. Without that break a
-literal `*.com` entry would match every `foo.com` host and silently
-classify it as tunnel-backed. `cert_link::lookup` enforces the same
-rule; the two must stay in sync.
+`host_matches_set` and `host_lookup_tun` — the two variants the TLS
+ALPN callback uses — stop the walk when the remaining suffix contains
+no dot. Without that break a literal `*.com` entry would match every
+`foo.com` host and silently classify it as tunnel-backed.
+`cert_link::lookup` enforces the same rule; the two must stay in sync.
 
 ### What a wildcard does and does not change
 
@@ -139,6 +139,7 @@ is ever held across an `.await` and every request future stays `Send`.
 | `limits` | `HashMap<String, Arc<SiteLimitConfig>>` | site name → the effective rate-limit policy and IP rules |
 | `providers` | `HashMap<String, Arc<SiteProviderConfig>>` | site name → the effective provider configuration and allow ranges |
 | `tunnel_domains` | `Arc<HashSet<String>>` | the domains of `domain` whose owning site is tunnel-backed |
+| `tunnel_hosts` | `Arc<HashMap<String, String>>` | each tunnel-backed domain → the tunnel node that serves it |
 
 A single `domain` map holds both exact and wildcard literals; there is no
 separate wildcard list. The earlier `domainIndex + wildcardList` design
@@ -154,14 +155,30 @@ Alongside `Indexes` the gateway keeps two more derived views:
 ### The tunnel classification
 
 `tunnel_domains` is the set of domain literals whose owning site has a
-`tun_name:` backend prefix. The TLS ALPN callback consults it on the
-handshake path: a tunnel site must negotiate HTTP/1.1 only, because
-`tokio-yamux 0.3.18` has a stream-state race that breaks the h2 +
-tunnel path (issue #66 / commit `0c35ede`).
+`tun_name:` backend prefix, and `tunnel_hosts` maps each of them to the
+tunnel node that serves it. The TLS ALPN callback consults both on the
+handshake path, because the protocol it may offer depends on the
+**transport** that tunnel runs on:
 
-The set is derived from the **same** `domain` map the routing table is
-built from, and it lives **inside** the routing revision. That is the
-point: the request path resolves a host through `domain`, and the
+- **QUIC** — the primary transport, one connection per tun and one
+  bidirectional stream per request — follows the global `tls.enable_h2`
+  knob exactly like a direct site. There is no multiplexer in between,
+  so the yamux race cannot happen there.
+- **WebSocket over TCP** — the fallback transport, which layers
+  `tokio-yamux` over the WebSocket — negotiates HTTP/1.1 only, because
+  `tokio-yamux 0.3.18` has a stream-state race that breaks the h2 +
+  tunnel path (issue #66 / commit `0c35ede`).
+- **offline or unknown** — HTTP/1.1 only, conservatively: a tun that
+  comes back on the fallback must not be offered `h2`.
+
+The transport itself is **runtime** state, not index state: the gateway
+records it per live session (`App::tun_kinds`), written where a session
+enters and leaves the registry. The index only says *which* tun serves
+a domain; the session says *how* that tun is connected.
+
+Both views are derived from the **same** `domain` map the routing table
+is built from, and they live **inside** the routing revision. That is
+the point: the request path resolves a host through `domain`, and the
 handshake path classifies the same host through `tunnel_domains`. Two
 separately published views would leave a window in which the routing
 table already knows a site is tunnel-backed while the handshake still
@@ -237,7 +254,7 @@ relevant table, builds a fresh `Indexes`, and swaps it in.
 | Gateway startup | The database is opened, migrations are applied, and the indexes are built once. |
 | An admin form writes a site, domain, rate limit, IP rule, bot list, provider override or DNS provider | The admin route writes the row and then calls `reload_indexes`. |
 | `POST /api/reload` | The same rebuild, for changes made outside the admin UI — an operator who edited the database with `sqlite3`. See [`../admin/reload-api.md`](../admin/reload-api.md). |
-| A tunnel node connects or disconnects | The tunnel session registry changes; the routing indexes do not. The `tun` index is already correct — it was built from the sites at the last reload. |
+| A tunnel node connects or disconnects | The tunnel session registry changes, and so does the recorded transport of that tun (`App::tun_kinds`); the routing indexes do not. The `tun` index is already correct — it was built from the sites at the last reload. |
 | A tunnel node is created, edited or deleted in the admin UI | Nothing is rebuilt. The `tun` table is **not** part of the routing index — the index derives the tunnel mapping from `sites.backend`, and the `tun` row is read straight from the database when a handshake arrives. |
 
 The rebuild is a **full** rebuild, not an incremental one. The site table
@@ -284,6 +301,14 @@ direct site owning `a.example.com` next to a tunnel site owning
 (`h1`), and the mismatch predates this document; it is a property of
 keeping a host-keyed set next to a site-keyed routing table.
 
+**The handshake path resolves the tunnel with a third lookup.**
+`host_lookup_tun` walks the `tunnel_hosts` map with the same rule as
+`host_matches_set` — same normalization, same wildcard order, same
+bare-TLD guard — so the classification and the tun resolution can
+never answer differently about which hosts are tunnel-backed. The two
+are read from the same revision in one go (`App::tunnel_classification`
+hands out both), so a reload cannot separate them either.
+
 ## The tunnel registration flow
 
 A tunnel node connects and authenticates before it is given any work.
@@ -312,7 +337,7 @@ tun (client)                     gateway
                     mark_tun_online(name)
 ```
 
-Three things are worth noting:
+Four things are worth noting:
 
 1. **The credential is compared as a SHA-256 digest, in a single SQL
    query.** The handshake hashes the token it was given and matches it
@@ -331,6 +356,12 @@ Three things are worth noting:
    network. The tunnel therefore needs no synchronisation round trip: a
    tunnel that reconnects is immediately usable, and one that goes away
    simply fails the requests routed to it.
+4. **The session and the transport it runs on are recorded
+   together.** `register_tun` stores the transport handle *and* its
+   `TransportKind`; `unregister_tun_if` drops both, and only when the
+   session that ends is still the registered one. The ALPN callback
+   reads the kind to decide whether that tunnel's sites may negotiate
+   h2, so the two records can never disagree about it.
 
 When the tunnel session ends, the gateway unregisters it and marks the
 row offline. In-flight requests on a dropped tunnel fail; the client
@@ -340,12 +371,14 @@ retries.
 
 - `crates/pangolin-core/src/index.rs` — `Indexes`, `lookup_site`,
   `site_of_host`, `wildcard_candidates`, `rebuild_tun_index`,
-  `build_tunnel_domain_set`
+  `build_tunnel_classification`, `host_matches_set`, `host_lookup_tun`
 - `crates/pangolin-core/src/normalize.rs` — `normalize_host`
 - `crates/pangolin-core/src/parse.rs` — `parse_backend`,
   `is_valid_domain`
 - `crates/pangolin-core/src/app.rs` — `App::new` (the first build),
-  `App::reload_indexes` (the rebuild), `App::register_tun`
+  `App::reload_indexes` (the rebuild), `App::register_tun`,
+  `App::tunnel_classification`, `App::tun_kind`
 - `crates/ngx/src/tunnel.rs` — the handshake
 - `crates/ngx/src/proxy.rs` — the request path
+- `crates/ngx/src/tls.rs` — the ALPN callback
 - [`docs/schema.md`](../schema.md) — the tables the indexes are built from
