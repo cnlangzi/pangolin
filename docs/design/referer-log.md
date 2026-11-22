@@ -228,6 +228,15 @@ The sort key is `hits` descending → `referer_host` ascending → `host`
 ascending; the last two keys make the order total, so two rows with the same
 hits never swap places between two renders.
 
+The counters live behind one lock that `record()` takes for writing and
+the top-N query takes for reading. The query holds that read lock for
+one pass and materialises at most `n` rows, so it stays short however
+saturated the table is — the admin polls it every 30 seconds, and a
+query that cloned and sorted the whole table under the guard would
+stall `record()` — the referral path — for the duration. The side
+channel must never hold up the forwarding path (invariant #5 of
+`AGENTS.md`).
+
 The writer task runs under a supervisor (`pangolin_core::supervisor`), the
 same one the bot log uses: a panic in the task restarts it instead of
 silently stopping the day's file. The supervisor's handle is the one
@@ -240,10 +249,65 @@ consumer would race for it.
 
 | Page | What it shows |
 | ---- | ------------- |
-| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the SSE tail + the JSONL writer's status. |
+| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the JSONL writer's status + the SSE tail. |
 | `/logs/referers/history` | The day's JSONL, filtered and paginated. |
 | `/logs/referers/stats` | The day's rollup: per referrer host — hits, distinct visitor IPs, landing paths, last seen. |
+| `/api/logs/referers/summary` | The polled summary region: the three counters, the saturation banner + the top-N table, scoped to `?site=`. Admin-only. |
 | `/api/logs/referers/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
+
+### The summary region refreshes itself
+
+The three summary cards and the top-N table on `/logs/referers` are **not**
+a load-time snapshot. The counters behind them move while the page is open —
+`RefererStats::record` runs on every recorded referral — so on a busy
+gateway the numbers the operator reads drift away from the truth within
+minutes. The page therefore polls `GET /api/logs/referers/summary` every 30
+seconds and swaps the region's `innerHTML`.
+
+The region is everything the counters live in: the three cards, the
+**saturation banner** and the top-N table. The banner belongs to it —
+it reports the records the capped pair table dropped, and that counter
+moves too — so the fragment carries it and the page and the fragment
+keep showing the same thing.
+
+Five rules make that safe:
+
+- **The region is one partial.** The page and the endpoint render the same
+  `views/referers/_summary.html`, so the polled fragment is byte-identical to
+  what the page painted. The swap cannot change the markup under the
+  operator's eyes, and the layout does not jump.
+- **The container survives the swap.** The polling attributes live on the
+  container (`hx-get` / `hx-trigger` / `hx-swap="innerHTML"`), not on the
+  content it holds: `innerHTML` replaces the children and keeps the
+  container, so the next poll still fires. `outerHTML` would replace the
+  container with content that carries no polling attributes, and the region
+  would freeze after the first refresh.
+- **The response is not cacheable.** The fragment is served
+  `Cache-Control: no-store` — a reused aggregate is a stale aggregate, and
+  at a 30-second cadence a cache hit would be visibly wrong.
+- **Only the fragment is swapped in.** The fragment marks its own response
+  with `X-Pangolin-Fragment`, and the page's `htmx:beforeSwap` guard skips
+  the swap when the marker is missing. Without the guard an expired session
+  would be worse than a stale counter: the admin redirects an
+  unauthenticated request to `/login`, the browser's XHR follows that
+  redirect, and htmx would swap the **login page** into the counters
+  region. htmx also executes the script tags it swaps in, so the login
+  page's own `htmx.min.js` would be re-evaluated inside the live page.
+- **A failed poll leaves the region alone.** A render that fails answers
+  `500`, not an empty `200`: htmx swaps a 2xx body unconditionally, so an
+  empty one would blank the region the operator is reading. htmx leaves the
+  DOM alone on a 5xx, so the last good markup survives until the next poll.
+
+The fragment is rendered in the operator's language, exactly like the page
+it replaces.
+
+**The poll carries the site scope.** htmx does not inherit the page's query
+string, and the site selector is a sibling form rather than an ancestor of
+the polled region, so the scope travels with the poll (`?site=`, percent-
+encoded — a site name carrying a `&` would otherwise split the query
+string). The page and the endpoint resolve the scope through the same
+helper, so the two can never describe different slices — and a `?site=`
+naming no site stays scoped (and therefore empty), never "all sites".
 
 The **JSONL writer** panel on `/logs/referers` is what tells "no referral
 traffic today" apart from "the writer died": the ring buffer, the SSE tail
@@ -258,6 +322,12 @@ apart. It is a load-time snapshot, and it reports the writer *task*, not the
 disk: a writer whose writes keep failing is alive as far as the panel is
 concerned. See [`bot-log.md`](./bot-log.md#what-the-panel-shows-and-what-it-does-not)
 for the three limits of the panel.
+
+The panel is the one part of the live page that does **not** refresh: the
+summary region above it is polled every 30 seconds, the writer badge stays
+at the value the page was loaded with. A writer that died after the load
+therefore stays invisible until the page is reloaded — the badge is a
+load-time snapshot, and the live numbers next to it are not.
 
 All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
@@ -314,5 +384,6 @@ rows it describes.
 | Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
 | Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
 | Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221) |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221); the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page |
 | End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |
+| End-to-end | `tests/src/admin_ui_e2e.rs` | The polled summary endpoint answers a signed-in operator with the scoped fragment, and an anonymous one with the login redirect (issue #226) |

@@ -431,6 +431,11 @@ pub async fn handle(
                     routes::ratelimit::api_rules(&app, &csrf_token, lang).await?
                 } else if rest == "ratelimit/blocked" && method == "GET" {
                     routes::ratelimit::api_blocked(&app, lang).await?
+                } else if rest == "logs/referers/summary" && method == "GET" {
+                    // The polled summary region of `/logs/referers`:
+                    // the same partial the page inlined, scoped to the
+                    // site the request names.
+                    routes::logs::api_referers_summary(&app, &merged_params, lang).await?
                 } else if rest == "ratelimit/rules" && method == "DELETE" {
                     routes::ratelimit::api_handle_delete_rule(
                         &app,

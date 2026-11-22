@@ -6,7 +6,9 @@
 {# writer (issue #219); this panel says what the repair achieved.      #}
 {#                                                                      #}
 {# It is a load-time snapshot: the page has to be reloaded to see a    #}
-{# writer that died after the page was rendered.                        #}
+{# writer that died after the page was rendered. The summary region      #}
+{# above it is polled every 30 seconds — this badge is the one part of  #}
+{# the live page that does not move.                                    #}
 {#                                                                      #}
 {# `writer` and `lang` come from the including page.                  #}
 {% if writer.available %}
