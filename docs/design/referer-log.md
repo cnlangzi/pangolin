@@ -231,7 +231,27 @@ consumer would race for it.
 | `/logs/referers` | Live view: top-N `(referrer, host)` summary + the SSE tail + the JSONL writer's status. |
 | `/logs/referers/history` | The day's JSONL, filtered and paginated. |
 | `/logs/referers/stats` | The day's rollup: per referrer host — hits, distinct visitor IPs, landing paths, last seen. |
+| `/api/logs/referers/summary` | The polled summary region: the three counters + the top-N table, scoped to `?site=`. Admin-only. |
 | `/api/logs/referers/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
+
+The **summary region** of `/logs/referers` — the three counters and the
+top-N table — is polled every 30 seconds from
+`GET /api/logs/referers/summary`. The counters move while the operator
+watches the page: every recorded referral ticks them, and the SSE tail
+below only appends rows, so without the poll the numbers freeze at the
+value they had when the page was loaded. The endpoint returns the very
+`views/referers/_summary.html` partial the page inlined, so the swap
+replaces the markup with byte-identical markup — no flicker, no layout
+jump.
+
+The poll carries the site scope (`?site=`) explicitly: htmx does not
+inherit the page's query string, and the site selector is a sibling form
+rather than an ancestor of the polled region. The page and the endpoint
+resolve the scope through the same helper, so the two can never
+describe different slices — and a `?site=` naming no site stays scoped
+(and therefore empty), never "all sites". The response is
+`Cache-Control: no-store`: a cached aggregate would keep showing a
+value the counters have already moved past.
 
 The **JSONL writer** panel on `/logs/referers` is what tells "no referral
 traffic today" apart from "the writer died": the ring buffer, the SSE tail
@@ -292,5 +312,6 @@ rows it describes.
 | Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
 | Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
 | Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219) |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219), the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page |
 | End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |
+| End-to-end | `tests/src/admin_ui_e2e.rs` | The polled summary endpoint answers a signed-in operator with the scoped fragment, and an anonymous one with the login redirect (issue #226) |

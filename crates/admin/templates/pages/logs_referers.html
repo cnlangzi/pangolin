@@ -55,68 +55,30 @@
     </div>
   </form>
 
-  {# ── Summary card (server-rendered) ─────────────────────────────────── #}
-  {# On first paint the dashboard should show useful state, not a #}
-  {# skeleton. The top-N table + summary counters come from #}
-  {# `RefererStats::snapshot()` and are rendered server-side; the SSE #}
-  {# feed below appends new rows in real time. #}
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.total_hits") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
-    </div>
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.distinct_pairs") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.unique_pairs }}</div>
-    </div>
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.top_referrer") }}</div>
-      <div class="mt-1 text-2xl font-semibold text-slate-900 dark:text-white">
-        {% if top_rows.is_empty() %}
-          <span class="text-slate-400 dark:text-slate-500 text-base font-normal">{{ lang.t("referers.none_yet") }}</span>
-        {% else %}
-          {{ top_rows[0].referer_host }}
-          <span class="text-sm text-slate-500 dark:text-slate-400 font-normal ml-1">{{ lang.tf("referers.hits_suffix", [("n", top_rows[0].hits)]) }}</span>
-        {% endif %}
-      </div>
-    </div>
+  {# ── Summary region (server-rendered, polled every 30s) ────────────── #}
+  {# The counters and the top-N table come from the live snapshot, so  #}
+  {# they drift while the operator watches the page — the SSE feed     #}
+  {# below appends new rows but never touches the counters. The region #}
+  {# is therefore polled: `GET /api/logs/referers/summary` returns the  #}
+  {# very partial the page inlined, so the swap does not flicker and   #}
+  {# the layout does not jump.                                         #}
+  {#                                                                   #}
+  {# The poll URL carries the site scope: htmx does not inherit the    #}
+  {# page's query string, and the site selector is a sibling form —   #}
+  {# without the explicit `?site=` the view would silently widen to   #}
+  {# "all sites". The value is percent-encoded, so a site name with a  #}
+  {# space or an `&` survives the round-trip.                          #}
+  <div id="referers-summary"
+       hx-get="/api/logs/referers/summary?site={{ self.site_scope_query() }}"
+       hx-trigger="every 30s"
+       hx-swap="innerHTML">
+    {% include "views/referers/_summary.html" %}
   </div>
 
   {# ── JSONL writer status (server-rendered) ────────────────────────── #}
   {# The shared panel: both log pages show the writer's state the same #}
   {# way, from the same catalog keys.                                    #}
   {% include "components/_writer_status.html" %}
-
-  {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
-  {% if !top_rows.is_empty() %}
-  <div class="card overflow-hidden mb-6">
-    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("referers.top_referrers_title") }}</h2>
-    </div>
-    <div class="overflow-x-auto scrollbar-thin">
-      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
-        <thead class="bg-slate-50 dark:bg-slate-800/50">
-          <tr>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-56">{{ lang.t("common.referrer") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-36">{{ lang.t("common.host") }}</th>
-            <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-44">{{ lang.t("common.last_seen") }}</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
-          {% for row in top_rows %}
-          <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
-            <td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100" title="{{ row.referer_host }}">{{ row.referer_host }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="{{ row.host }}">{{ row.host }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ row.hits }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400" data-last-seen="{{ row.last_seen }}"></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-  {% endif %}
 
   {# ── Live tail table (client-side SSE) ───────────────────────────────── #}
   {# `data-site-domains` carries the selected site's domain literals so #}
@@ -302,6 +264,12 @@
   }
 
   paintLastSeen();
+
+  // The polled summary fragment ships its own `data-last-seen`
+  // cells, and a swapped-in cell starts out blank — the timestamp is
+  // only an attribute until the client formats it. `htmx:afterSwap`
+  // bubbles, so one listener on the body covers every swap.
+  document.body.addEventListener("htmx:afterSwap", paintLastSeen);
 
   // ── SSE connection (mirror of /logs but pointing at the referer stream) ─
   let es = null;

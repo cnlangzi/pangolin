@@ -57,8 +57,8 @@ pub use logs::{
     BotHistoryFilter, BotHistorySummary, BotLogsHistoryTemplate, BotLogsStatsTemplate,
     BotLogsTemplate, LogsTemplate, RefererHistoryDateLink, RefererHistoryFilter,
     RefererHistoryStatsPage, RefererHistorySummary, RefererLogsHistoryTemplate,
-    RefererLogsStatsTemplate, RefererLogsTemplate, RefererSiteOption, RefererStatsHostRow,
-    RefererStatsPathRow, referer_subnav, subnav,
+    RefererLogsStatsTemplate, RefererLogsSummaryView, RefererLogsTemplate, RefererSiteOption,
+    RefererStatsHostRow, RefererStatsPathRow, referer_subnav, subnav,
 };
 pub use ratelimit::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,

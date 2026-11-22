@@ -53,6 +53,7 @@ use http_body_util::Full;
 use crate::App;
 use crate::i18n::Lang;
 use crate::ok_html_with_csrf;
+use crate::routes::helpers::ok_html_no_store;
 use crate::templates::logs::referer_subnav;
 use crate::templates::logs::subnav;
 use crate::templates::logs::{
@@ -62,7 +63,8 @@ use crate::templates::logs::{
 };
 use crate::templates::{
     BotLogsHistoryTemplate, BotLogsStatsTemplate, BotLogsTemplate, LogsTemplate,
-    RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsTemplate,
+    RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsSummaryView,
+    RefererLogsTemplate,
 };
 use pangolin_core::bot_log::list_dates;
 
@@ -985,41 +987,52 @@ const REFERRER_HISTORY_MAX_PAGE: usize = 10_000;
 /// Landing paths kept per referrer host on the stats panel.
 const REFERRER_STATS_PATH_LIMIT: usize = 50;
 
-/// Build the `/logs/referers` HTML page (live view).
+/// The slice of the referer counters one view describes.
 ///
-/// Server-renders the top-N `(referer_host, host)` summary so the
-/// page shows useful state on first paint (before the SSE
-/// client-side tail delivers recent rows). The live tail table is
-/// populated by the browser's `EventSource('/api/logs/referers/stream')`
-/// connection.
-pub async fn render_referers(
-    app: &Arc<App>,
-    csrf: &str,
-    merged_params: &[u8],
-    lang: Lang,
-) -> http::Result<Response<Full<Bytes>>> {
-    let enabled = app.config.log.referer.enabled;
-    let filter = parse_referer_params(merged_params).filter;
-    let sites = site_options(app, &filter.site);
-    // "A site is selected" is a separate fact from "the selected site
-    // has domains": a `?site=` naming a site that does not exist (or
-    // one whose domains are all disabled) resolves to an empty domain
-    // list. Treating that as "no scope" would show the operator
-    // *every* site's traffic while the history/stats pages — which
-    // scope through `RefererSiteFilter` — show none. So the scope is
-    // driven by the presence of the filter, not by the domain list.
-    let site_scoped = !filter.site.is_empty();
+/// The live page and the polled summary fragment must show the same
+/// numbers, so both read the counters through [`referer_live_scope`]
+/// and never through a second copy of the filtering rules.
+struct RefererLiveScope {
+    /// The site selector's options.
+    sites: Vec<RefererSiteOption>,
+    /// `true` when a site is selected (see [`referer_live_scope`]).
+    site_scoped: bool,
+    /// The selected site's domain literals.
+    site_domains: Vec<String>,
+    /// The scoped counters.
+    summary: pangolin_core::referer_stats::RefererStatsSummary,
+    /// The scoped top-N rows, hits descending.
+    top_rows: Vec<pangolin_core::referer_stats::RefererStatsRow>,
+}
+
+/// Resolve the site scope of the live referer view and the counters
+/// that belong to it.
+///
+/// `site` is the selected site name — empty means "all sites".
+///
+/// "A site is selected" is a separate fact from "the selected site
+/// has domains": a `?site=` naming a site that does not exist (or
+/// one whose domains are all disabled) resolves to an empty domain
+/// list. Treating that as "no scope" would show the operator
+/// *every* site's traffic while the history/stats pages — which
+/// scope through `RefererSiteFilter` — show none. So the scope is
+/// driven by the presence of the filter, not by the domain list: an
+/// unknown site stays scoped and therefore shows no rows.
+///
+/// The in-memory counters are keyed by `(referer_host, host)`;
+/// scoping them to the selected site means keeping the rows whose
+/// host belongs to one of the site's domains. The summary cards are
+/// scoped the same way, so the numbers on the page and the table
+/// below them always describe the same slice.
+async fn referer_live_scope(app: &Arc<App>, site: &str) -> RefererLiveScope {
+    let sites = site_options(app, site);
+    let site_scoped = !site.is_empty();
     let site_domains = sites
         .iter()
         .find(|s| s.selected)
         .map(|s| s.domains.clone())
         .unwrap_or_default();
 
-    // The in-memory counters are keyed by `(referer_host, host)`;
-    // scoping them to the selected site means keeping the rows whose
-    // host belongs to one of the site's domains. The summary cards
-    // are scoped the same way, so the numbers on the page and the
-    // table below them always describe the same slice.
     let (rows, global_summary) = app.referer_stats_snapshot();
     let scoped: Vec<pangolin_core::referer_stats::RefererStatsRow> = rows
         .into_iter()
@@ -1040,6 +1053,32 @@ pub async fn render_referers(
     };
     let top_rows = scoped.into_iter().take(REFERRER_TOP_N).collect();
 
+    RefererLiveScope {
+        sites,
+        site_scoped,
+        site_domains,
+        summary,
+        top_rows,
+    }
+}
+
+/// Build the `/logs/referers` HTML page (live view).
+///
+/// Server-renders the top-N `(referer_host, host)` summary so the
+/// page shows useful state on first paint (before the SSE
+/// client-side tail delivers recent rows). The live tail table is
+/// populated by the browser's `EventSource('/api/logs/referers/stream')`
+/// connection.
+pub async fn render_referers(
+    app: &Arc<App>,
+    csrf: &str,
+    merged_params: &[u8],
+    lang: Lang,
+) -> http::Result<Response<Full<Bytes>>> {
+    let enabled = app.config.log.referer.enabled;
+    let filter = parse_referer_params(merged_params).filter;
+    let scope = referer_live_scope(app, &filter.site).await;
+
     // The writer's health comes from the supervisor's state — the
     // panel has to be able to say "the JSONL writer is dead", which
     // nothing else on the page can (issue #219).
@@ -1050,12 +1089,12 @@ pub async fn render_referers(
         active_nav: "logs-referers",
         active_subnav: referer_subnav::LIVE,
         enabled,
-        summary,
-        top_rows,
-        sites,
+        summary: scope.summary,
+        top_rows: scope.top_rows,
+        sites: scope.sites,
         filter,
-        site_domains,
-        site_scoped,
+        site_domains: scope.site_domains,
+        site_scoped: scope.site_scoped,
         writer,
         lang,
     };
@@ -1068,6 +1107,43 @@ pub async fn render_referers(
     };
 
     ok_html_with_csrf(html, csrf)
+}
+
+/// `GET /api/logs/referers/summary` — the polled summary region.
+///
+/// The live page swaps this fragment in every 30 seconds so the
+/// counters and the top-N table follow the traffic without a page
+/// reload. The response is the very partial the page inlined, scoped
+/// to the site the request names (`?site=`): htmx does not inherit
+/// the page's query string, so the scope has to travel with the
+/// poll — dropping it would silently widen the operator's view to
+/// "all sites".
+///
+/// The fragment is `Cache-Control: no-store`: it carries live
+/// aggregates, and a cached copy would keep showing a value the
+/// counters have already moved past.
+pub async fn api_referers_summary(
+    app: &Arc<App>,
+    merged_params: &[u8],
+    lang: Lang,
+) -> http::Result<Response<Full<Bytes>>> {
+    let site = parse_referer_params(merged_params).filter.site;
+    let scope = referer_live_scope(app, &site).await;
+
+    let tmpl = RefererLogsSummaryView {
+        summary: scope.summary,
+        top_rows: scope.top_rows,
+        lang,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("referer summary template error: {e}");
+            String::new()
+        }
+    };
+
+    ok_html_no_store(html)
 }
 
 /// Build the `/logs/referers/history` HTML page.
@@ -3810,6 +3886,213 @@ mod tests {
         assert!(
             html.contains("name=\"status\" value=\"404\""),
             "the stats form must carry the status filter: {html}"
+        );
+    }
+
+    // ---- The polled summary region (`/api/logs/referers/summary`) ----
+
+    /// Record one external referral in the live counters.
+    fn push_referer_hit(app: &Arc<App>, referer_host: &str, host: &str) {
+        let entry = pangolin_core::events::AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: "GET".into(),
+            path: "/a".into(),
+            host: host.into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "1.1.1.1".into(),
+            user_agent: None,
+        };
+        let hit = pangolin_core::RefererHit {
+            referer: format!("https://{referer_host}/a"),
+            referer_host: referer_host.into(),
+        };
+        app.push_referer_log(&entry, &hit);
+    }
+
+    /// The polled fragment carries the counters as they are *now*: the
+    /// page ships a snapshot, the fragment a fresh one.
+    #[tokio::test]
+    async fn referers_summary_fragment_reflects_hits_recorded_after_the_page_render() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        // The page is rendered before any referral arrives.
+        let resp = render_referers(&app, "csrf-token", b"", Lang::En)
+            .await
+            .expect("live render");
+        let page_html = response_html(resp).await;
+        assert!(
+            !page_html.contains("news.example.org"),
+            "the page must not show a referral that has not happened yet: {page_html}"
+        );
+
+        // A referral lands.
+        push_referer_hit(&app, "news.example.org", "example.com");
+
+        // The fragment carries it …
+        let resp = api_referers_summary(&app, b"", Lang::En)
+            .await
+            .expect("summary fragment");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let fragment = response_html(resp).await;
+        assert!(
+            fragment.contains("news.example.org"),
+            "the fragment must carry the referral recorded after the page render: {fragment}"
+        );
+        // … while the page that was already rendered does not.
+        assert!(
+            !page_html.contains("news.example.org"),
+            "the rendered page must not change under the operator's feet: {page_html}"
+        );
+    }
+
+    /// The poll carries the site scope: the fragment must describe the
+    /// same slice as the page, never a wider one.
+    #[tokio::test]
+    async fn referers_summary_fragment_keeps_the_selected_site_scope() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+        seed_site_with_domains(&app, "shop", &["shop.example.net"]).await;
+
+        // One referral per site.
+        push_referer_hit(&app, "news.example.org", "example.com");
+        push_referer_hit(&app, "blog.example.org", "shop.example.net");
+
+        // The selected site keeps its own row and drops the other's.
+        let resp = api_referers_summary(&app, b"site=web", Lang::En)
+            .await
+            .expect("summary fragment");
+        let fragment = response_html(resp).await;
+        assert!(
+            fragment.contains("news.example.org"),
+            "the scoped fragment must carry the site's own row: {fragment}"
+        );
+        assert!(
+            !fragment.contains("blog.example.org"),
+            "another site's row leaked into the scoped fragment: {fragment}"
+        );
+
+        // An unknown site must not widen the view to "all sites" — it
+        // stays scoped, and a scoped view with no domains has no rows.
+        let resp = api_referers_summary(&app, b"site=nosuchsite", Lang::En)
+            .await
+            .expect("summary fragment");
+        let fragment = response_html(resp).await;
+        assert!(
+            !fragment.contains("news.example.org") && !fragment.contains("blog.example.org"),
+            "an unknown site must show no rows at all: {fragment}"
+        );
+    }
+
+    /// The page polls the summary region and ships exactly the markup
+    /// the fragment returns — the swap must neither flicker nor jump.
+    #[tokio::test]
+    async fn referers_page_embeds_the_summary_fragment_and_its_poll_attributes() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+
+        let resp = render_referers(&app, "csrf-token", b"site=web", Lang::En)
+            .await
+            .expect("live render");
+        let page_html = response_html(resp).await;
+
+        // The poll carries the site scope and replaces the region's
+        // content — not the region itself, or the poll would stop
+        // after the first swap.
+        assert!(
+            page_html.contains("hx-get=\"/api/logs/referers/summary?site=web\""),
+            "the poll must carry the site scope: {page_html}"
+        );
+        assert!(
+            page_html.contains("hx-trigger=\"every 30s\""),
+            "the summary region must be polled: {page_html}"
+        );
+        assert!(
+            page_html.contains("hx-swap=\"innerHTML\""),
+            "the poll must replace the region's content: {page_html}"
+        );
+
+        // The page's markup is the fragment's markup, byte for byte.
+        let resp = api_referers_summary(&app, b"site=web", Lang::En)
+            .await
+            .expect("summary fragment");
+        let fragment = response_html(resp).await;
+        assert!(
+            page_html.contains(&fragment),
+            "the page must embed the polled fragment verbatim: {page_html}"
+        );
+
+        // A swapped-in "Last seen" cell starts out blank — the
+        // timestamp is only an attribute until the client formats it.
+        assert!(
+            page_html.contains("addEventListener(\"htmx:afterSwap\", paintLastSeen)"),
+            "the page must repaint the last-seen column after every swap: {page_html}"
+        );
+    }
+
+    /// The polled fragment carries live aggregates — a cached copy
+    /// would keep showing a value the counters have moved past.
+    #[tokio::test]
+    async fn referers_summary_fragment_is_never_cached() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+
+        let resp = api_referers_summary(&app, b"", Lang::En)
+            .await
+            .expect("summary fragment");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    /// A site name that carries a `&` must not split the poll's query
+    /// string: the scope would be read as "the site before the `&`",
+    /// which names no site — and the view would silently widen.
+    #[tokio::test]
+    async fn referers_poll_url_encodes_the_site_scope() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "a&b", &["example.com"]).await;
+        push_referer_hit(&app, "news.example.org", "example.com");
+
+        let resp = render_referers(&app, "csrf-token", b"site=a%26b", Lang::En)
+            .await
+            .expect("live render");
+        let page_html = response_html(resp).await;
+        assert!(
+            page_html.contains("hx-get=\"/api/logs/referers/summary?site=a%26b\""),
+            "the site scope must be percent-encoded in the poll URL: {page_html}"
+        );
+
+        // … and the endpoint reads it back as the very same site, so
+        // the site's own row stays in scope.
+        let resp = api_referers_summary(&app, b"site=a%26b", Lang::En)
+            .await
+            .expect("summary fragment");
+        let fragment = response_html(resp).await;
+        assert!(
+            fragment.contains("news.example.org"),
+            "the encoded site scope must resolve to the same site: {fragment}"
         );
     }
 }

@@ -5428,3 +5428,208 @@ async fn admin_ui_referer_log_and_traffic_pages_render_chinese() {
         );
     }
 }
+
+// ── §issue-226 — The polled referer summary region ─────────────────────────
+
+/// A tiny HTTP backend that answers `200 OK` to every request.
+///
+/// The referer counters tick on the *response* path, so a referral
+/// only reaches them when the upstream actually answers.
+async fn start_summary_backend() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the mock backend");
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::with_capacity(2048);
+                let mut tmp = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        stream.read(&mut tmp),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let body = b"ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// The polled summary region must answer a signed-in operator with the
+/// fragment for **the site the request names** — never a wider slice —
+/// and an anonymous one with the login redirect.
+#[tokio::test]
+async fn admin_ui_referers_summary_endpoint_keeps_the_site_scope() {
+    let (backend_addr, _backend) = start_summary_backend().await;
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = rusqlite::Connection::open(db_path).expect("open db");
+            let now = chrono::Utc::now();
+            for (name, domain) in [("web", "example.test"), ("shop", "shop.example.test")] {
+                pangolin_core::db::upsert_site(
+                    &conn,
+                    &pangolin_core::types::Site {
+                        name: name.into(),
+                        backend: format!("http://{backend_addr}"),
+                        enabled: true,
+                        created_at: now,
+                        updated_at: now,
+                        host_mode: pangolin_core::types::HostMode::Passthrough,
+                        host_custom: None,
+                        domain_count: 0,
+                    },
+                )
+                .expect("insert site");
+                pangolin_core::db::upsert_domain(
+                    &conn,
+                    &pangolin_core::types::Domain {
+                        domain: domain.into(),
+                        site_name: name.into(),
+                        enabled: true,
+                        auto_issue: false,
+                        dns_provider: None,
+                        challenge_kind: None,
+                        created_at: now,
+                    },
+                )
+                .expect("insert domain");
+            }
+        }
+    })
+    .await;
+
+    // An external document navigation lands on the `web` site's domain
+    // — one referral, scoped to that site.
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+    let (status, _body) = crate::harness::raw_request_with_headers(
+        &addr,
+        "example.test",
+        "GET",
+        "/pricing",
+        b"",
+        &[
+            ("Referer", "https://news.example.org/article"),
+            ("Sec-Fetch-Dest", "document"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    // The counters tick on the response path; poll the fragment until
+    // the referral shows up.
+    let mut scoped = String::new();
+    for _ in 0..40 {
+        let resp = client
+            .get("/api/logs/referers/summary?site=web")
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        scoped = resp.text().await.unwrap();
+        if scoped.contains("news.example.org") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        scoped.contains("news.example.org"),
+        "the scoped fragment must carry the site's own referral: {scoped}"
+    );
+    // The three cards are there, in the operator's language.
+    for (needle, what) in [
+        ("Total referral hits", "the total-hits card"),
+        (
+            "Distinct (referrer × host) pairs",
+            "the distinct-pairs card",
+        ),
+        ("Top referrer", "the top-referrer card"),
+    ] {
+        assert!(
+            scoped.contains(needle),
+            "the fragment must carry the {what}: {scoped}"
+        );
+    }
+    // A live aggregate must not be served from a cache.
+    let resp = client
+        .get("/api/logs/referers/summary?site=web")
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "the polled fragment must not be cacheable"
+    );
+
+    // Another site's scope must not show the `web` site's referral.
+    let resp = client
+        .get("/api/logs/referers/summary?site=shop")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let other = resp.text().await.unwrap();
+    assert!(
+        !other.contains("news.example.org"),
+        "the fragment must not widen to another site's traffic: {other}"
+    );
+
+    // The page polls the very same URL, scope included.
+    let resp = client.get("/logs/referers?site=web").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let page = resp.text().await.unwrap();
+    assert!(
+        page.contains("hx-get=\"/api/logs/referers/summary?site=web\""),
+        "the page must poll the scoped summary: {page}"
+    );
+    assert!(
+        page.contains("hx-trigger=\"every 30s\""),
+        "the page must poll the summary region: {page}"
+    );
+
+    // Without a session the fragment is not handed out at all.
+    let anon = new_client_no_redirect();
+    let resp = anon
+        .get(&format!(
+            "{}/api/logs/referers/summary?site=web",
+            ngx.admin_url("")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "an anonymous request must be redirected to the login"
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        loc.contains("/login"),
+        "the redirect must point at the login, got: {loc}"
+    );
+}

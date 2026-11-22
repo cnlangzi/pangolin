@@ -623,6 +623,36 @@ impl RefererLogsTemplate<'_> {
     pub fn site_domains_attr(&self) -> String {
         self.site_domains.join(" ")
     }
+
+    /// The site scope for the summary poll's URL, percent-encoded.
+    ///
+    /// The poll has to carry the scope explicitly: htmx does not
+    /// inherit the page's query string, and the site selector is a
+    /// sibling form rather than an ancestor of the polled region. A
+    /// raw site name would break the query string on a `&` and widen
+    /// the operator's view to "all sites", so the value is encoded
+    /// here and decoded by the endpoint.
+    pub fn site_scope_query(&self) -> String {
+        urlencoding::encode(&self.filter.site).into_owned()
+    }
+}
+
+/// The polled summary region of `/logs/referers`
+/// (`GET /api/logs/referers/summary`).
+///
+/// Renders the same partial the live page inlines, so the swapped-in
+/// markup is byte-for-byte the markup the page shipped. The struct
+/// carries only what the partial reads — the counters, the top-N
+/// rows and the language — so the two renders cannot drift apart.
+#[derive(Template)]
+#[template(path = "views/referers/_summary.html")]
+pub struct RefererLogsSummaryView {
+    /// The scoped counters.
+    pub summary: RefererStatsSummary,
+    /// The scoped top-N rows, already truncated to `REFERRER_TOP_N`.
+    pub top_rows: Vec<RefererStatsRow>,
+    /// The interface language this fragment is rendered in.
+    pub lang: Lang,
 }
 
 /// Full-page template for `GET /logs/referers/history`.

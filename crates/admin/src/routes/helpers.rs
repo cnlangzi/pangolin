@@ -52,6 +52,21 @@ pub fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
     Ok(resp)
 }
 
+/// Build a 200 OK HTML response that must never be cached.
+///
+/// Same body contract as [`ok_html`], plus `Cache-Control: no-store`:
+/// the polled fragments carry live counters, and a cached copy would
+/// show the operator a stale aggregate long after the value moved on.
+pub fn ok_html_no_store(body: String) -> http::Result<Response<Full<Bytes>>> {
+    let resp = Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("response builder for 200 OK should not fail");
+    Ok(resp)
+}
+
 /// Return a 302 Found redirect to the given path. Used after a successful
 /// POST/PUT/DELETE to send the user back to the index/list page.
 ///
