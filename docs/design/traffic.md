@@ -10,9 +10,11 @@ persistence — restart clears everything. Complements the per-request
   per-host tables without leaving the admin UI.
 - Stats **must not delay the proxy**. A full side-channel drops the
   sample; the request still completes.
-- Cover every HTTP request pingora finishes — including
-  `request_filter` short-circuits (unknown host, ACME, tunnel,
-  `file://`) — via `ProxyHttp::logging`.
+- Cover every HTTP request pingora finishes — including the
+  `request_filter` short-circuits (unknown host, ACME, `file://`) —
+  via `ProxyHttp::logging`. A tunnelled request is **not** a
+  short-circuit: it travels through pingora's upstream path like a
+  direct one and is recorded with the `Tunnel` route.
 
 ## Non-goals
 
