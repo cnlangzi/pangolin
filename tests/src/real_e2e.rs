@@ -11,7 +11,6 @@
 //! Prerequisite: `make build` (or `cargo build --release -p ngx -p tun`)
 //! so the binaries exist at `target/release/{ngx,tun}`.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::harness::{
     InspectingBackend, NgxProcess, RecordedRequest, TunProcess, find_double_crlf, init_pangolin_db,
+    seed_googlebot_registry,
 };
 
 /// Issue a raw HTTP/1.1 GET to `addr` with the given `Host` header,
@@ -4745,25 +4745,6 @@ fn seed_rate_limit_bots(conn: &Connection, site_name: &str, bot_name: &str) {
         rusqlite::params![site_name, bot_name],
     )
     .expect("insert site_rate_limit_bots");
-}
-
-/// Override the `googlebot` registry entry so the e2e can present a
-/// verified bot from the loopback address.
-///
-/// The override **replaces** the embedded entry, so it carries no
-/// `urls`: the bot is never refreshed from the vendor, and its
-/// `custom` CIDR is always in force. The registry is read from
-/// `<cache root>/conf.d/` — the cache root defaults to
-/// `./logs/bots/cache` relative to the process's working directory,
-/// which is the tempdir the harness spawns the binary in.
-fn seed_googlebot_registry(cache_root: &Path) {
-    let conf_d = cache_root.join("conf.d");
-    std::fs::create_dir_all(&conf_d).expect("mkdir conf.d");
-    std::fs::write(
-        conf_d.join("googlebot.yaml"),
-        "kind: SearchEngine\nname: googlebot\nvendor: \"Google\"\nua: \"Googlebot\"\ncustom:\n  - \"127.0.0.1/32\"\n",
-    )
-    .expect("write googlebot.yaml");
 }
 
 /// Seed a global IP rule (the `ip_rules` table added by V9).

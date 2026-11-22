@@ -1,4 +1,6 @@
-//! SSE streaming handler for `/api/logs/stream` (issue #73).
+//! SSE streaming handlers for the three admin log streams:
+//! `/api/logs/stream` (access), `/api/logs/bots/stream` (bot) and
+//! `/api/logs/referers/stream` (referer).
 //!
 //! Lives in the `ngx` crate (not `admin`) because:
 //!   - The SSE writer owns the `ServerSession` and calls
@@ -10,6 +12,16 @@
 //!     chunk-writer.
 //!
 //! ## Design
+//!
+//! The three streams differ in exactly four places: the broadcast
+//! channel they subscribe to, the ring-buffer snapshot they replay,
+//! the encoder that turns an entry into a `data:` frame, and the
+//! topic word that names the stream in the 401 body and in the log
+//! lines. Everything else (auth, the SSE prelude, the
+//! replay-then-tail loop, the lag / closed / shutdown handling and
+//! the final `finish()`) is identical, so it is implemented **once**
+//! in `handle_stream`; the three public handlers are thin wrappers
+//! over it.
 //!
 //! 1. Authenticate: parse the session cookie and call
 //!    `SessionStore::validate`. 401 if invalid (admin endpoints are
@@ -23,10 +35,9 @@
 //!      - `X-Accel-Buffering: no` (disable nginx-level buffering)
 //! 3. Drain the ring buffer snapshot as `data: <json>\n\n` frames
 //!    (oldest first).
-//! 4. Subscribe to `App::access_log_tx` and forward each entry as
-//!    it arrives. On `LagError(N)`, write
-//!    `: lagged N events\n\n` (an SSE comment that the browser
-//!    ignores) and continue.
+//! 4. Forward each entry that arrives on the broadcast channel as
+//!    it arrives. On `LagError(N)`, write `: lagged N events\n\n` (an
+//!    SSE comment that the browser ignores) and continue.
 //! 5. Drop the receiver cleanly when the client disconnects (the
 //!    `write_response_body` call returns an error → break the loop).
 
@@ -41,44 +52,55 @@ use pingora::apps::ReusedHttpStream;
 use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
 use serde_json::json;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::App;
 
-/// Handle the `/api/logs/stream` SSE request.
+/// The one implementation behind the three admin log SSE streams.
 ///
-/// Returns `Some(ReusedHttpStream)` on a clean shutdown (the
-/// connection may be reused); `None` on error (the caller logs).
+/// The stream-specific bits arrive as parameters: `subscribe` picks
+/// the broadcast channel, `replay` picks the ring-buffer snapshot
+/// and `encode` turns one entry into a `data:` frame. `topic` names
+/// the stream — it is the word in the 401 body ("Admin login
+/// required to view *access logs*.") and the bracket in every log
+/// line this function writes.
 ///
-/// `shutdown` is an owned clone of pingora's
-/// `ShutdownWatch` — a `tokio::sync::watch::Receiver<bool>`
-/// the runtime flips on SIGINT/SIGTERM. We `select!` on it
-/// inside the live broadcast loop so a Ctrl-C doesn't have to
-/// wait for `graceful_shutdown_timeout_seconds` to expire
-/// before the SSE handler yields. Without this, an idle SSE
-/// client (no new access-log entries) would hold the runtime
-/// open for the full 5 s pingora-configured drain window —
-/// visible in the log as
-/// `Waiting for service runtime pangolin-http to exit` — and
-/// the operator-facing shutdown latency would be `grace_period
-/// + graceful_shutdown_timeout` instead of `grace_period`
-///   alone.
-pub async fn handle_access_log_stream(
+/// `T: Clone` is a hard constraint: `broadcast::Receiver::recv()`
+/// hands the entry out by value. `T: Send` is one too: the public
+/// handlers are awaited from `#[async_trait]`, so the whole future
+/// chain (wrapper → `handle_stream` → `recv()`) must be `Send`.
+///
+/// The parameter list is long because the three streams pass their
+/// own channel, snapshot and encoder; grouping them into a struct
+/// would only move the same values one level down.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream<T, Sub, Rep, Enc>(
     mut session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
     mut shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
+    topic: &'static str,
+    subscribe: Sub,
+    replay: Rep,
+    encode: Enc,
+) -> Option<ReusedHttpStream>
+where
+    T: Clone + Send + 'static,
+    Sub: FnOnce(&App) -> broadcast::Receiver<T> + Send,
+    Rep: FnOnce(&App) -> Vec<T> + Send,
+    Enc: Fn(&T) -> Bytes + Send + Sync,
+{
     // 1) Auth — admin-only. Non-admin attempts get a normal 401
-    //    HTML response, not an SSE frame.
+    //    JSON response, not an SSE frame.
     let token = cookie.and_then(::admin::state::parse_session_cookie);
     let authed = match token {
         Some(t) => sessions.validate(&t).await,
         None => false,
     };
     if !authed {
-        return write_sse_unauth(session, "access logs").await;
+        return write_sse_unauth(session, topic).await;
     }
 
     // 2) SSE prelude.
@@ -110,14 +132,14 @@ pub async fn handle_access_log_stream(
     let resp: http::Response<()> = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {
-            warn!("SSE: failed to build response: {e}");
+            warn!("SSE: [{topic}] failed to build response: {e}");
             return None;
         }
     };
     let (parts, _body) = resp.into_parts();
     let header: ResponseHeader = parts.into();
     if let Err(e) = session.write_response_header(Box::new(header)).await {
-        warn!("SSE: write_response_header failed: {e}");
+        warn!("SSE: [{topic}] write_response_header failed: {e}");
         return None;
     }
 
@@ -133,8 +155,8 @@ pub async fn handle_access_log_stream(
     //    The previous order (snapshot → subscribe) had a TOCTOU race:
     //    entries pushed between the two calls were in neither the
     //    snapshot nor the live stream and were silently lost.
-    let mut rx = app.access_log_tx.subscribe();
-    let snapshot = app.recent_access_log();
+    let mut rx = subscribe(&app);
+    let snapshot = replay(&app);
     if snapshot.is_empty() {
         // Tell the client there is no replay. SSE comments are
         // ignored by `EventSource` but visible in devtools, which
@@ -147,7 +169,7 @@ pub async fn handle_access_log_stream(
         // value before we can read `.len()` again.
         let snapshot_len = snapshot.len();
         for entry in snapshot {
-            write_chunk(&mut session, frame_data(&entry)).await?;
+            write_chunk(&mut session, encode(&entry)).await?;
         }
         write_chunk(
             &mut session,
@@ -174,7 +196,7 @@ pub async fn handle_access_log_stream(
     // from a poll that races on shutdown mid-loop.
     loop {
         if *shutdown.borrow() {
-            info!("SSE: shutdown already signalled, ending live tail");
+            info!("SSE: [{topic}] shutdown already signalled, ending live tail");
             let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
             break;
         }
@@ -184,18 +206,18 @@ pub async fn handle_access_log_stream(
             // entry to arrive.
             biased;
             _ = shutdown.changed() => {
-                info!("SSE: shutdown observed, ending live tail");
+                info!("SSE: [{topic}] shutdown observed, ending live tail");
                 let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
                 break;
             }
             recv = rx.recv() => match recv {
                 Ok(entry) => {
-                    if write_chunk(&mut session, frame_data(&entry))
+                    if write_chunk(&mut session, encode(&entry))
                         .await
                         .is_none()
                     {
                         // Client disconnected.
-                        debug!("SSE: client disconnected, stopping live tail");
+                        debug!("SSE: [{topic}] client disconnected, stopping live tail");
                         return None;
                     }
                 }
@@ -204,8 +226,8 @@ pub async fn handle_access_log_stream(
                     // (browsers ignore these, devtools shows them).
                     // The next successful recv() will deliver the
                     // newest message the channel still has.
-                    write_chunk(&mut session, frame_comment(&format!("lagged {} events", n))).await?;
-                    warn!("SSE: subscriber lagged by {n} events");
+                    write_chunk(&mut session, frame_comment(&format!("lagged {n} events"))).await?;
+                    warn!("SSE: [{topic}] subscriber lagged by {n} events");
                 }
                 Err(RecvError::Closed) => {
                     // Broadcast channel closed (app shutdown). Send a
@@ -222,10 +244,119 @@ pub async fn handle_access_log_stream(
     match session.finish().await {
         Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
         Err(e) => {
-            warn!("SSE: finish failed: {e}");
+            warn!("SSE: [{topic}] finish failed: {e}");
             None
         }
     }
+}
+
+/// Handle the `/api/logs/stream` SSE request.
+///
+/// Returns `Some(ReusedHttpStream)` on a clean shutdown (the
+/// connection may be reused); `None` on error (the caller logs).
+///
+/// `shutdown` is an owned clone of pingora's
+/// `ShutdownWatch` — a `tokio::sync::watch::Receiver<bool>`
+/// the runtime flips on SIGINT/SIGTERM. We `select!` on it
+/// inside the live broadcast loop so a Ctrl-C doesn't have to
+/// wait for `graceful_shutdown_timeout_seconds` to expire
+/// before the SSE handler yields. Without this, an idle SSE
+/// client (no new access-log entries) would hold the runtime
+/// open for the full 5 s pingora-configured drain window —
+/// visible in the log as
+/// `Waiting for service runtime pangolin-http to exit` — and
+/// the operator-facing shutdown latency would be `grace_period
+/// + graceful_shutdown_timeout` instead of `grace_period`
+///   alone.
+///
+/// The stream itself is implemented by `handle_stream`; this
+/// wrapper only names the access-log channel, snapshot and encoder.
+pub async fn handle_access_log_stream(
+    session: ServerSession,
+    app: Arc<App>,
+    sessions: Arc<::admin::state::SessionStore>,
+    cookie: Option<&str>,
+    shutdown: pingora::server::ShutdownWatch,
+) -> Option<ReusedHttpStream> {
+    handle_stream(
+        session,
+        app,
+        sessions,
+        cookie,
+        shutdown,
+        "access logs",
+        |app| app.access_log_tx.subscribe(),
+        |app| app.recent_access_log(),
+        // The access-log entry travels as an `Arc` — one allocation,
+        // shared by the ring buffer, the channel and every subscriber
+        // (issue #224). The frame is built from the entry it points
+        // at; the JSON is the same either way.
+        |entry: &Arc<AccessLogEntry>| frame_data(entry),
+    )
+    .await
+}
+
+/// Handle the `/api/logs/bots/stream` SSE request.
+///
+/// Searchenginebots stage-2: subscribes to [`App::bot_log_tx`]
+/// instead of the access-log channel. The bot side-channel is
+/// populated by [`App::push_access_log`] whenever a request's
+/// `User-Agent` matches a known bot (see
+/// `pangolin_core::bot::verify_bot`). Real-browser / curl /
+/// Postman traffic never reaches this stream.
+///
+/// The auth / prelude / replay / live-loop / shutdown handling is
+/// shared with the other two streams — see `handle_stream`.
+pub async fn handle_bot_log_stream(
+    session: ServerSession,
+    app: Arc<App>,
+    sessions: Arc<::admin::state::SessionStore>,
+    cookie: Option<&str>,
+    shutdown: pingora::server::ShutdownWatch,
+) -> Option<ReusedHttpStream> {
+    handle_stream(
+        session,
+        app,
+        sessions,
+        cookie,
+        shutdown,
+        "bot logs",
+        |app| app.bot_log_tx.subscribe(),
+        |app| app.recent_bot_log(),
+        frame_bot_data,
+    )
+    .await
+}
+
+/// Handle the `/api/logs/referers/stream` SSE request.
+///
+/// Subscribes to [`App::referer_log_tx`] instead of the access-log
+/// channel. The referer side-channel is populated by
+/// [`App::push_referer_log`] whenever the proxy classified a request
+/// as an external document navigation (see `classify_referer` in
+/// `proxy.rs`).
+///
+/// The auth / prelude / replay / live-loop / shutdown handling is
+/// shared with the other two streams — see `handle_stream`.
+pub async fn handle_referer_log_stream(
+    session: ServerSession,
+    app: Arc<App>,
+    sessions: Arc<::admin::state::SessionStore>,
+    cookie: Option<&str>,
+    shutdown: pingora::server::ShutdownWatch,
+) -> Option<ReusedHttpStream> {
+    handle_stream(
+        session,
+        app,
+        sessions,
+        cookie,
+        shutdown,
+        "referer logs",
+        |app| app.referer_log_tx.subscribe(),
+        |app| app.recent_referer_log(),
+        frame_referer_data,
+    )
+    .await
 }
 
 /// Build an SSE `data:` frame for one access log entry.
@@ -245,6 +376,36 @@ fn frame_data(entry: &AccessLogEntry) -> Bytes {
     // `Bytes::from(Vec)` transfers ownership of the heap allocation
     // — no copy. The previous `Vec<u8>` + `Bytes::copy_from_slice`
     // in `write_chunk` allocated twice per frame per subscriber.
+    Bytes::from(buf)
+}
+
+/// Build an SSE `data:` frame for one bot log entry.
+///
+/// Identical to [`frame_data`] but typed against [`BotLogEntry`].
+/// Kept as a separate helper so the wire format is locked down
+/// per-stream (a future field addition to `BotLogEntry` won't
+/// accidentally leak into the access-log stream's frames).
+fn frame_bot_data(entry: &BotLogEntry) -> Bytes {
+    let json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
+    let mut buf = Vec::with_capacity(json.len() + 8);
+    buf.extend_from_slice(b"data: ");
+    buf.extend_from_slice(json.as_bytes());
+    buf.extend_from_slice(b"\n\n");
+    Bytes::from(buf)
+}
+
+/// Build an SSE `data:` frame for one referer log entry.
+///
+/// Identical to [`frame_data`] but typed against [`RefererLogEntry`].
+/// Kept as a separate helper so the wire format is locked down
+/// per-stream (a future field addition to `RefererLogEntry` won't
+/// accidentally leak into the other streams' frames).
+fn frame_referer_data(entry: &RefererLogEntry) -> Bytes {
+    let json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
+    let mut buf = Vec::with_capacity(json.len() + 8);
+    buf.extend_from_slice(b"data: ");
+    buf.extend_from_slice(json.as_bytes());
+    buf.extend_from_slice(b"\n\n");
     Bytes::from(buf)
 }
 
@@ -277,21 +438,17 @@ async fn write_chunk(session: &mut ServerSession, bytes: Bytes) -> Option<()> {
     }
 }
 
-/// Write a 401 HTML response for unauthenticated SSE requests.
-///
-/// We deliberately do **not** write an SSE-shaped 401 — the
-/// browser's `EventSource` API silently retries on opaque errors,
-/// and a JSON-shaped error would still go through the SSE parser
-/// (which then tries to parse our 401 HTML as `data:` frames and
-/// errors out). A plain HTML 401 is the cleanest "you must log in"
-/// signal.
 /// Write a 401 response for an unauthenticated SSE request.
 ///
-/// Used by both [`handle_access_log_stream`] and
-/// [`handle_bot_log_stream`]. The `topic` argument lets each
-/// caller pass a stream-specific label so the error message
-/// doesn't lie to the operator (e.g. "view access logs" when
-/// they hit the bot stream).
+/// The response is **not** SSE-shaped: it carries
+/// `Content-Type: application/json` and a JSON body, so the
+/// browser's `EventSource` never parses it as `data:` frames and
+/// errors out — it just sees a failed connection and surfaces the
+/// "disconnected" state the admin UI already handles.
+///
+/// `topic` names the stream in the message body ("Admin login
+/// required to view *bot logs*."), so the error doesn't lie to the
+/// operator about which stream they tried to open.
 async fn write_sse_unauth(mut session: ServerSession, topic: &str) -> Option<ReusedHttpStream> {
     let body = json!({
         "error": "unauthenticated",
@@ -315,269 +472,8 @@ async fn write_sse_unauth(mut session: ServerSession, topic: &str) -> Option<Reu
     match session.finish().await {
         Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
         Err(e) => {
-            warn!("SSE: finish failed: {e}");
+            warn!("SSE: [{topic}] finish failed: {e}");
             None
         }
     }
-}
-
-/// Handle the `/api/logs/bots/stream` SSE request.
-///
-/// Searchenginebots stage-2: mirror of [`handle_access_log_stream`]
-/// that subscribes to [`App::bot_log_tx`] instead. The bot
-/// side-channel is populated by [`App::push_access_log`] whenever
-/// a request's `User-Agent` matches a known bot (see
-/// `pangolin_core::bot::verify_bot`). Real-browser / curl /
-/// Postman traffic never reaches this stream.
-///
-/// All the auth / prelude / replay / live-loop / shutdown handling
-/// is identical to the access-log stream — see
-/// [`handle_access_log_stream`] for the full commentary.
-pub async fn handle_bot_log_stream(
-    mut session: ServerSession,
-    app: Arc<App>,
-    sessions: Arc<::admin::state::SessionStore>,
-    cookie: Option<&str>,
-    mut shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
-    // 1) Auth — admin-only.
-    let token = cookie.and_then(::admin::state::parse_session_cookie);
-    let authed = match token {
-        Some(t) => sessions.validate(&t).await,
-        None => false,
-    };
-    if !authed {
-        return write_sse_unauth(session, "bot logs").await;
-    }
-
-    // 2) SSE prelude (identical headers to the access-log stream).
-    let status = http::StatusCode::OK;
-    let builder = http::Response::builder()
-        .status(status)
-        .header("Content-Type", "text/event-stream; charset=utf-8")
-        .header("Cache-Control", "no-cache")
-        .header("X-Accel-Buffering", "no")
-        .header("Connection", "keep-alive");
-
-    let resp: http::Response<()> = match builder.body(()) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("SSE: failed to build bot response: {e}");
-            return None;
-        }
-    };
-    let (parts, _body) = resp.into_parts();
-    let header: ResponseHeader = parts.into();
-    if let Err(e) = session.write_response_header(Box::new(header)).await {
-        warn!("SSE: write_response_header failed: {e}");
-        return None;
-    }
-
-    // 3) Subscribe FIRST, then snapshot. See handle_access_log_stream
-    //    for the TOCTOU rationale.
-    let mut rx = app.bot_log_tx.subscribe();
-    let snapshot = app.recent_bot_log();
-    if snapshot.is_empty() {
-        write_chunk(&mut session, frame_comment("replay: empty")).await?;
-    } else {
-        let snapshot_len = snapshot.len();
-        for entry in snapshot {
-            write_chunk(&mut session, frame_bot_data(&entry)).await?;
-        }
-        write_chunk(
-            &mut session,
-            frame_comment(&format!("replay: done ({})", snapshot_len)),
-        )
-        .await?;
-    }
-
-    // 4) Live broadcast loop (identical to access log).
-    loop {
-        if *shutdown.borrow() {
-            info!("SSE: shutdown already signalled, ending bot live tail");
-            let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                info!("SSE: shutdown observed, ending bot live tail");
-                let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-                break;
-            }
-            recv = rx.recv() => match recv {
-                Ok(entry) => {
-                    if write_chunk(&mut session, frame_bot_data(&entry))
-                        .await
-                        .is_none()
-                    {
-                        debug!("SSE: bot client disconnected, stopping live tail");
-                        return None;
-                    }
-                }
-                Err(RecvError::Lagged(n)) => {
-                    write_chunk(&mut session, frame_comment(&format!("lagged {n} events"))).await?;
-                    warn!("SSE: bot subscriber lagged by {n} events");
-                }
-                Err(RecvError::Closed) => {
-                    let _ = write_chunk(&mut session, frame_comment("closed")).await;
-                    break;
-                }
-            }
-        }
-    }
-
-    let settings = pingora::apps::HttpPersistentSettings::for_session(&session);
-    match session.finish().await {
-        Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
-        Err(e) => {
-            warn!("SSE: bot finish failed: {e}");
-            None
-        }
-    }
-}
-
-/// Build an SSE `data:` frame for one bot log entry.
-///
-/// Identical to [`frame_data`] but typed against [`BotLogEntry`].
-/// Kept as a separate helper so the wire format is locked down
-/// per-stream (a future field addition to `BotLogEntry` won't
-/// accidentally leak into the access-log stream's frames).
-fn frame_bot_data(entry: &BotLogEntry) -> Bytes {
-    let json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
-    let mut buf = Vec::with_capacity(json.len() + 8);
-    buf.extend_from_slice(b"data: ");
-    buf.extend_from_slice(json.as_bytes());
-    buf.extend_from_slice(b"\n\n");
-    Bytes::from(buf)
-}
-
-/// Handle the `/api/logs/referers/stream` SSE request.
-///
-/// Mirror of [`handle_bot_log_stream`] that subscribes to
-/// [`App::referer_log_tx`] instead. The referer side-channel is
-/// populated by [`App::push_referer_log`] whenever the proxy
-/// classified a request as an external document navigation (see
-/// `classify_referer` in `proxy.rs`).
-///
-/// All the auth / prelude / replay / live-loop / shutdown handling
-/// is identical to the access-log stream — see
-/// [`handle_access_log_stream`] for the full commentary.
-pub async fn handle_referer_log_stream(
-    mut session: ServerSession,
-    app: Arc<App>,
-    sessions: Arc<::admin::state::SessionStore>,
-    cookie: Option<&str>,
-    mut shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
-    // 1) Auth — admin-only.
-    let token = cookie.and_then(::admin::state::parse_session_cookie);
-    let authed = match token {
-        Some(t) => sessions.validate(&t).await,
-        None => false,
-    };
-    if !authed {
-        return write_sse_unauth(session, "referer logs").await;
-    }
-
-    // 2) SSE prelude (identical headers to the access-log stream).
-    let status = http::StatusCode::OK;
-    let builder = http::Response::builder()
-        .status(status)
-        .header("Content-Type", "text/event-stream; charset=utf-8")
-        .header("Cache-Control", "no-cache")
-        .header("X-Accel-Buffering", "no")
-        .header("Connection", "keep-alive");
-
-    let resp: http::Response<()> = match builder.body(()) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("SSE: failed to build referer response: {e}");
-            return None;
-        }
-    };
-    let (parts, _body) = resp.into_parts();
-    let header: ResponseHeader = parts.into();
-    if let Err(e) = session.write_response_header(Box::new(header)).await {
-        warn!("SSE: write_response_header failed: {e}");
-        return None;
-    }
-
-    // 3) Subscribe FIRST, then snapshot. See handle_access_log_stream
-    //    for the TOCTOU rationale.
-    let mut rx = app.referer_log_tx.subscribe();
-    let snapshot = app.recent_referer_log();
-    if snapshot.is_empty() {
-        write_chunk(&mut session, frame_comment("replay: empty")).await?;
-    } else {
-        let snapshot_len = snapshot.len();
-        for entry in snapshot {
-            write_chunk(&mut session, frame_referer_data(&entry)).await?;
-        }
-        write_chunk(
-            &mut session,
-            frame_comment(&format!("replay: done ({})", snapshot_len)),
-        )
-        .await?;
-    }
-
-    // 4) Live broadcast loop (identical to access log).
-    loop {
-        if *shutdown.borrow() {
-            info!("SSE: shutdown already signalled, ending referer live tail");
-            let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                info!("SSE: shutdown observed, ending referer live tail");
-                let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-                break;
-            }
-            recv = rx.recv() => match recv {
-                Ok(entry) => {
-                    if write_chunk(&mut session, frame_referer_data(&entry))
-                        .await
-                        .is_none()
-                    {
-                        debug!("SSE: referer client disconnected, stopping live tail");
-                        return None;
-                    }
-                }
-                Err(RecvError::Lagged(n)) => {
-                    write_chunk(&mut session, frame_comment(&format!("lagged {n} events"))).await?;
-                    warn!("SSE: referer subscriber lagged by {n} events");
-                }
-                Err(RecvError::Closed) => {
-                    let _ = write_chunk(&mut session, frame_comment("closed")).await;
-                    break;
-                }
-            }
-        }
-    }
-
-    let settings = pingora::apps::HttpPersistentSettings::for_session(&session);
-    match session.finish().await {
-        Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
-        Err(e) => {
-            warn!("SSE: referer finish failed: {e}");
-            None
-        }
-    }
-}
-
-/// Build an SSE `data:` frame for one referer log entry.
-///
-/// Identical to [`frame_data`] but typed against [`RefererLogEntry`].
-/// Kept as a separate helper so the wire format is locked down
-/// per-stream (a future field addition to `RefererLogEntry` won't
-/// accidentally leak into the other streams' frames).
-fn frame_referer_data(entry: &RefererLogEntry) -> Bytes {
-    let json = serde_json::to_string(entry).unwrap_or_else(|_| "{}".to_string());
-    let mut buf = Vec::with_capacity(json.len() + 8);
-    buf.extend_from_slice(b"data: ");
-    buf.extend_from_slice(json.as_bytes());
-    buf.extend_from_slice(b"\n\n");
-    Bytes::from(buf)
 }
