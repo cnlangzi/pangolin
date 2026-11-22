@@ -57,7 +57,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::admin_harness::AdminClient;
-use crate::harness::{NgxProcess, TunProcess, init_pangolin_db, raw_request};
+use crate::harness::{
+    NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db, raw_request,
+    read_sse_data_frames,
+};
 
 // ─────────────────────────────────────────────────────────────────
 // DB seed helpers — thin wrappers over `pangolin_core::db::upsert_*`
@@ -194,136 +197,6 @@ impl MockHttpBackend {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// SSE raw reader — connects to /api/logs/stream, returns
-// whatever `data:` JSON frames arrive within `within`.
-// ─────────────────────────────────────────────────────────────────
-
-/// Open a raw TCP connection to `addr`, send a GET with
-/// `Accept: text/event-stream`, and return every `data:` line we
-/// read within `within`. The body is split into per-frame JSON
-/// strings (the SSE wire format is `data: <json>\n\n`; we slice
-/// on that boundary).
-///
-/// `cookie` is the raw `Cookie:` header value (e.g.
-/// `"pangolin_session=abc; pangolin_csrf=def"`). The SSE endpoint
-/// requires an authenticated admin session — without it the
-/// handshake returns 401 (see `sse.rs::write_sse_unauth`). Pass
-/// `None` to exercise the unauthenticated path on purpose.
-async fn read_sse_data_frames(
-    addr: &str,
-    within: Duration,
-    cookie: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let mut stream: TcpStream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
-        .await
-        .map_err(|e| anyhow::anyhow!("connect timeout: {e}"))?
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-
-    // The `Cookie:` header is appended only when `cookie` is
-    // `Some`. Sending an empty `Cookie:` line is technically legal
-    // per RFC 6265 §5.4 but a few middleboxes treat it as a parse
-    // error, so we omit the line entirely instead.
-    let cookie_line = match cookie {
-        Some(c) => format!("Cookie: {c}\r\n"),
-        None => String::new(),
-    };
-    let req = format!(
-        "GET /api/logs/stream HTTP/1.1\r\n\
-         Host: 127.0.0.1\r\n\
-         Accept: text/event-stream\r\n\
-         Connection: close\r\n\
-         User-Agent: pangolin-access-log-e2e\r\n\
-         {cookie_line}\r\n"
-    );
-    stream.write_all(req.as_bytes()).await?;
-    stream.flush().await?;
-
-    // Read until we have the full header block.
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        match timeout(within, stream.read(&mut tmp)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Ok(Err(e)) => return Err(anyhow::anyhow!("read err: {e}")),
-            Err(_) => return Err(anyhow::anyhow!("read header timeout")),
-        }
-    }
-    // Verify status line.
-    let head_str = String::from_utf8_lossy(&buf).into_owned();
-    let status_line = head_str.lines().next().unwrap_or("");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if status != 200 {
-        return Err(anyhow::anyhow!(
-            "SSE handshake failed: status={status}, head={head_str:?}"
-        ));
-    }
-
-    // Strip the headers — anything after the first \r\n\r\n is body.
-    let body_start = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(buf.len());
-    let mut body = buf.split_off(body_start);
-
-    // Read the rest of the body until EOF or `within` elapses.
-    loop {
-        match timeout(within, stream.read(&mut tmp)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
-            Ok(Err(_)) => break,
-            Err(_) => break,
-        }
-    }
-    let body_str = String::from_utf8_lossy(&body).into_owned();
-
-    // Split the body on the SSE frame terminator `\n\n` and pull
-    // out the JSON after each `data: ` prefix. We deliberately
-    // ignore SSE comment lines (`: ...`) and event-id / event
-    // lines (the server doesn't emit those).
-    let mut frames = Vec::new();
-    for raw in body_str.split("\n\n") {
-        let mut json: Option<String> = None;
-        for line in raw.lines() {
-            if let Some(rest) = line.strip_prefix("data:") {
-                let s = rest.trim_start();
-                // Multi-line `data:` (per the SSE spec, multiple
-                // `data:` lines are concatenated with newlines).
-                // Our server emits a single line per frame so
-                // we don't need to handle the multi-line case,
-                // but be defensive.
-                if let Some(prev) = json.as_mut() {
-                    prev.push('\n');
-                    prev.push_str(s);
-                } else {
-                    json = Some(s.to_string());
-                }
-            }
-        }
-        if let Some(j) = json {
-            // Skip empty data lines and the comment-only frames
-            // that the server uses for diagnostics
-            // (": replay: done" etc.).
-            if j.is_empty() || j.starts_with(':') {
-                continue;
-            }
-            frames.push(j);
-        }
-    }
-    Ok(frames)
-}
-
-// ─────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────
 
@@ -403,38 +276,10 @@ async fn access_log_sse_replays_then_streams_live() {
     //    `access_log_sse_requires_auth`. We capture the raw session
     //    cookie here so the low-level SSE reader can send it on the
     //    `GET /api/logs/stream`. Logging in via `AdminClient` is
-    //    convenient but its cookie store is opaque to us; we just
-    //    POST /login and pluck the `pangolin_session` cookie out of
-    //    `Set-Cookie`.
-    let admin_base = format!("http://127.0.0.1:{}", ngx.admin_port);
-    let raw_client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build raw client");
-    let login_resp = raw_client
-        .post(&format!("{admin_base}/login"))
-        .form(&[("username", "admin"), ("password", "admin")])
-        .send()
-        .await
-        .expect("POST /login");
-    assert_eq!(login_resp.status().as_u16(), 302, "login must redirect");
-    let session_cookie: String = login_resp
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find_map(|v| {
-            // Set-Cookie: pangolin_session=<token>; HttpOnly; ...
-            v.split(';').next().and_then(|kv| {
-                let kv = kv.trim();
-                if kv.starts_with("pangolin_session=") {
-                    Some(kv.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-        .expect("login response must Set-Cookie pangolin_session=");
+    //    convenient but its cookie store is opaque to us; the shared
+    //    helper POSTs /login and plucks the `pangolin_session`
+    //    cookie out of `Set-Cookie`.
+    let session_cookie = admin_session_cookie(&ngx).await;
 
     // 1) Generate a request BEFORE the SSE connection opens. The
     //    proxy's response_filter pushes an AccessLogEntry to the
@@ -458,10 +303,9 @@ async fn access_log_sse_replays_then_streams_live() {
     // Read frames in a separate task so we can keep pushing
     // requests into the live stream.
     let sse_cookie = session_cookie.clone();
-    let sse_task =
-        tokio::spawn(
-            async move { read_sse_data_frames(&sse_addr, within, Some(&sse_cookie)).await },
-        );
+    let sse_task = tokio::spawn(async move {
+        read_sse_data_frames(&sse_addr, "/api/logs/stream", within, Some(&sse_cookie)).await
+    });
 
     // Give the SSE handshake a moment to complete and the
     // replay frames to land.
@@ -675,45 +519,23 @@ async fn access_log_all_backend_types_emit_entries() {
     let _tun = TunProcess::start(&ngx, "office", "test-token").await;
 
     // Authenticate so the SSE endpoint will accept our stream.
-    // We login via a low-level reqwest client (no auto-redirect)
-    // and pull the raw `pangolin_session=...` cookie out of the
-    // Set-Cookie header — same dance as
-    // `access_log_sse_replays_then_streams_live`.
-    let admin_base = format!("http://127.0.0.1:{}", ngx.admin_port);
-    let raw_login = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build raw login client");
-    let login_resp = raw_login
-        .post(&format!("{admin_base}/login"))
-        .form(&[("username", "admin"), ("password", "admin")])
-        .send()
-        .await
-        .expect("POST /login");
-    assert_eq!(login_resp.status().as_u16(), 302, "login must redirect");
-    let sse_cookie: String = login_resp
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find_map(|v| {
-            v.split(';').next().and_then(|kv| {
-                let kv = kv.trim();
-                if kv.starts_with("pangolin_session=") {
-                    Some(kv.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-        .expect("login must Set-Cookie pangolin_session=");
+    // The shared helper returns the raw `pangolin_session=...`
+    // cookie the low-level SSE reader puts on the wire — same dance
+    // as `access_log_sse_replays_then_streams_live`.
+    let sse_cookie = admin_session_cookie(&ngx).await;
 
     // Open SSE in the background; it will receive both the
     // pre-stream replay (empty — we haven't fired yet) and the
     // live entries pushed by the three requests below.
     let sse_addr = format!("127.0.0.1:{}", ngx.admin_port);
     let sse_task = tokio::spawn(async move {
-        read_sse_data_frames(&sse_addr, Duration::from_secs(5), Some(&sse_cookie)).await
+        read_sse_data_frames(
+            &sse_addr,
+            "/api/logs/stream",
+            Duration::from_secs(5),
+            Some(&sse_cookie),
+        )
+        .await
     });
 
     // Give the SSE handshake + replay-drain time to settle before

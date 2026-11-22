@@ -191,6 +191,9 @@ mod access_log_e2e;
 mod referer_log_e2e;
 
 #[cfg(feature = "integration")]
+mod bot_log_e2e;
+
+#[cfg(feature = "integration")]
 mod traffic_e2e;
 
 // Hop-by-hop header handling against the real gateway (issue #189).
