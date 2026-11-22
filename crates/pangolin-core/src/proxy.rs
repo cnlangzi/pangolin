@@ -380,6 +380,47 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 
 // ── is_streaming_request ──────────────────────────────────────
 
+/// The token that marks a request as a streaming one.
+///
+/// It lives here so that the rule has exactly one home: both
+/// [`is_streaming_request`] and the gateway's own per-header check
+/// compare against this one constant.
+const STREAMING_MARKER: &[u8] = b"text/event-stream";
+
+/// The header names the streaming marker is looked for in.
+///
+/// The names are lower-case — that is how an `http::HeaderMap`
+/// stores them — but the comparison in [`is_streaming_header`] is
+/// case-insensitive, so a request may spell them any way.
+///
+/// The gateway asks the request's header map for exactly these two
+/// names, so a header that cannot carry the marker is never even
+/// converted to a string.
+pub const STREAMING_HEADER_NAMES: [&str; 2] = ["accept", "content-type"];
+
+/// Whether one request header marks the request as a streaming one.
+///
+/// The header **name** is compared case-insensitively (a request may
+/// spell it `Accept` or `ACCEPT`), the **value** as a
+/// case-insensitive **substring** — the browser sends
+/// `*/*, text/event-stream`.
+///
+/// The comparison allocates nothing: the gateway runs it on every
+/// candidate header of every request, and a lower-cased copy of the
+/// value would cost one allocation per candidate header.
+pub fn is_streaming_header(name: &str, value: &str) -> bool {
+    if !STREAMING_HEADER_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        return false;
+    }
+    value
+        .as_bytes()
+        .windows(STREAMING_MARKER.len())
+        .any(|window| window.eq_ignore_ascii_case(STREAMING_MARKER))
+}
+
 /// Detect if `request` expects a streaming response that should
 /// bypass the standard HttpResponse buffering path.
 ///
@@ -394,11 +435,17 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 /// layer. The flag only decides how the response is *accounted*
 /// for — since issue #153 both the direct and the tunnelled path
 /// stream the response natively.
+///
+/// This is the framework-neutral **whole-request** entry point: it
+/// takes the owned [`HttpRequest`] the framework-neutral code works
+/// with. The gateway's request path does not go through it — it
+/// applies [`is_streaming_header`] to the headers it already holds
+/// (issue #217) — so the rule still has exactly one home.
 pub fn is_streaming_request(request: &HttpRequest) -> bool {
-    request.headers.iter().any(|(k, v)| {
-        (k.eq_ignore_ascii_case("Accept") || k.eq_ignore_ascii_case("Content-Type"))
-            && v.to_ascii_lowercase().contains("text/event-stream")
-    })
+    request
+        .headers
+        .iter()
+        .any(|(name, value)| is_streaming_header(name, value))
 }
 
 // ── serve_file_target ─────────────────────────────────────────
@@ -1006,6 +1053,41 @@ mod tests {
         // No Accept header at all
         let req = mk("GET", "/", &[("Host", "x.test")], &[]);
         assert!(!is_streaming_request(&req));
+    }
+
+    // The per-header predicate the whole heuristic is made of. The
+    // gateway runs it on the headers it already holds, so the truth
+    // table here is the contract both entry points share.
+    #[test]
+    fn is_streaming_header_matches_the_marker_on_accept_or_content_type_only() {
+        // The canonical marker, on either header name.
+        assert!(is_streaming_header("Accept", "text/event-stream"));
+        assert!(is_streaming_header("Content-Type", "text/event-stream"));
+
+        // The header name is matched case-insensitively.
+        assert!(is_streaming_header("accept", "text/event-stream"));
+        assert!(is_streaming_header("ACCEPT", "text/event-stream"));
+        assert!(is_streaming_header("content-type", "text/event-stream"));
+
+        // The value is matched case-insensitively and as a substring
+        // (the browser sends `*/*, text/event-stream`).
+        assert!(is_streaming_header("Accept", "TEXT/EVENT-STREAM"));
+        assert!(is_streaming_header("Accept", "*/*, text/event-stream"));
+
+        // The marker in another header is not a streaming request.
+        assert!(!is_streaming_header(
+            "X-Accel-Buffering",
+            "text/event-stream"
+        ));
+
+        // Another value on a streaming header name is not the marker.
+        assert!(!is_streaming_header("Accept", "application/json"));
+
+        // A value shorter than the marker cannot contain it.
+        assert!(!is_streaming_header("Accept", "text/event"));
+
+        // An empty value is not the marker.
+        assert!(!is_streaming_header("Accept", ""));
     }
 
     // I-8

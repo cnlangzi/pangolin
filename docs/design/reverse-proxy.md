@@ -219,7 +219,20 @@ pub fn decode_connect_reply(line: &[u8]) -> IoResult<Result<(), String>>;
 
 /// Heuristic: returns true if the request expects a streaming
 /// response (matches `text/event-stream` in Accept or Content-Type).
+/// This is the framework-neutral whole-request entry point; the
+/// gateway's request path applies the per-header rule below.
 pub fn is_streaming_request(request: &HttpRequest) -> bool;
+
+/// The per-header rule that heuristic is made of (pangolin-core):
+/// true if **one** header marks the request as a streaming one. The
+/// gateway applies it to the headers it already holds, so the request
+/// path copies nothing.
+pub fn is_streaming_header(name: &str, value: &str) -> bool;
+
+/// The header names the rule looks in (pangolin-core). The gateway
+/// asks the request's header map for exactly these, so a header that
+/// cannot carry the marker is never converted to a string.
+pub const STREAMING_HEADER_NAMES: [&str; 2];
 ```
 
 Wire layout:
@@ -347,6 +360,13 @@ This is what enables SSE (`Content-Type: text/event-stream`)
 and other long-lived chunked responses through the tunnel —
 the buffering path would deadlock waiting for an infinite
 chunked body to complete.
+
+The **detection** runs on every request, so it copies nothing:
+the gateway reads the headers it already holds and asks for
+exactly the header names the rule names
+(`pangolin_core::STREAMING_HEADER_NAMES`), so a header that
+cannot carry the marker is never even converted to a string
+(issue #217).
 
 ### Streaming requests on **direct** backends
 
@@ -509,6 +529,7 @@ These are the testable contracts. Each row gets a unit test in
 | I-26 | A client-supplied `P-*` header is replaced by pangolin's value | `real_e2e_gateway_headers_replace_client_supplied_values` |
 | I-27 | `X-Real-IP` is never emitted | `apply_proxy_policy_appends_peer_ip_to_xff_chain`, `real_e2e_proxy_injects_x_forwarded_headers_all_paths` |
 | I-28 | An upgrade outranks the streaming marker: a request carrying both `Upgrade: websocket` and `Accept: text/event-stream` is still an upgrade (101), and it is accounted as `Websocket`, not `Stream` | `traffic_kind_for_ranks_the_upgrade_over_the_streaming_marker`, `real_e2e_tunnel_ws_upgrade_survives_event_stream_accept`, `real_e2e_direct_ws_upgrade_survives_event_stream_accept` |
+| I-29 | The streaming marker is detected from the request's own headers, and the per-header rule is the only home of the heuristic: the gateway and the core agree on every request | `is_streaming_header_matches_the_marker_on_accept_or_content_type_only`, `is_streaming_headers_detects_the_marker_in_the_request_headers`, `is_streaming_headers_agree_with_the_core_rule` |
 
 ---
 

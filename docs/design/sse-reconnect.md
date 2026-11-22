@@ -220,7 +220,8 @@ Static checks
 
 Unit
 - `cargo test -p pangolin-core --lib`
-- `cargo test -p pangolin-core is_streaming_request_*`
+- `cargo test -p pangolin-core is_streaming_*`
+- `cargo test -p ngx --lib is_streaming_*` — the gateway's own detection
 
 e2e (existing — must still pass)
 - `cargo test -p pangolin-integration-tests --features integration --lib sse_e2e::`

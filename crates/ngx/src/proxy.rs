@@ -39,6 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::HeaderMap;
 use http::header::HeaderValue;
 use log::{debug, error, info, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -400,32 +401,18 @@ impl ProxyHttp for AppProxy {
         // way it does for a direct backend.
         //
         // The detection is delegated to the shared
-        // `pangolin_core::is_streaming_request` so the heuristic
+        // `pangolin_core::is_streaming_header` so the heuristic
         // has exactly one home — extending it (chunked
         // responses, custom headers, path patterns) touches
         // pangolin-core and reaches both transports at once.
-        // See `is_streaming_request_detects_text_event_stream`
+        // See `is_streaming_headers_detects_the_marker_in_the_request_headers`
+        // and `is_streaming_headers_agree_with_the_core_rule`
         // for the unit-test contract.
-        let is_streaming = {
-            // Build a minimal `HttpRequest` (no body — the helper
-            // only reads `headers`) from the session so we can
-            // delegate to the shared detector. The body is empty
-            // because the helper does not consult it.
-            let req_header = session.req_header();
-            let headers: Vec<(String, String)> = req_header
-                .headers
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                .collect();
-            let req = HttpRequest {
-                method: req_header.method.as_str().to_string(),
-                target: req_header.uri.to_string(),
-                version: format!("{:?}", req_header.version),
-                headers,
-                body: Vec::new(),
-            };
-            pangolin_core::is_streaming_request(&req)
-        };
+        //
+        // The headers are read where they already are: the request
+        // path must not copy them into an owned `Vec` just to run
+        // the shared rule.
+        let is_streaming = is_streaming_headers(&session.req_header().headers);
 
         // A WebSocket upgrade is marked as such for the traffic
         // histogram — the connection's lifetime is the upgrade's,
@@ -1092,6 +1079,29 @@ fn traffic_kind_for(is_upgrade: bool, is_streaming: bool) -> pangolin_core::Traf
     }
 }
 
+/// Whether the request's headers mark it as a streaming request.
+///
+/// The shared rule is `pangolin_core::is_streaming_header` — the
+/// same predicate `pangolin_core::is_streaming_request` applies to
+/// a whole request, so the gateway and the core can never disagree
+/// about what a streaming request is.
+///
+/// The header map is asked for exactly the header names the rule
+/// names (`pangolin_core::STREAMING_HEADER_NAMES`): a header that
+/// cannot carry the marker is never converted to a string, and the
+/// map is never copied into an owned `Vec` to be scanned.
+///
+/// A header value that is not valid UTF-8 is read as an empty value
+/// — the reading the owned-copy path had.
+fn is_streaming_headers(headers: &HeaderMap) -> bool {
+    pangolin_core::STREAMING_HEADER_NAMES.iter().any(|name| {
+        headers
+            .get_all(*name)
+            .iter()
+            .any(|value| pangolin_core::is_streaming_header(name, value.to_str().unwrap_or("")))
+    })
+}
+
 /// Build the upstream peer for a tunnelled backend.
 ///
 /// The peer carries a **numeric** address: `HttpPeer::new` resolves
@@ -1706,6 +1716,131 @@ mod tests {
         assert_eq!(traffic_kind_for(true, false), TrafficKind::Websocket);
         assert_eq!(traffic_kind_for(false, true), TrafficKind::Stream);
         assert_eq!(traffic_kind_for(false, false), TrafficKind::Http);
+    }
+
+    /// The streaming marker is read out of the request's own headers,
+    /// without copying them into an owned `Vec` first.
+    ///
+    /// The header name is matched case-insensitively, the value as a
+    /// case-insensitive substring — and a value that is not valid
+    /// UTF-8 is read as an empty value, so a marker hiding in a
+    /// non-UTF-8 value does not match. That last cell is the trap:
+    /// unwrapping the conversion instead would panic on the request
+    /// path.
+    #[test]
+    fn is_streaming_headers_detects_the_marker_in_the_request_headers() {
+        // The canonical marker on `Accept`. The name is spelled in
+        // mixed case on purpose: the header map stores it lower-cased
+        // anyway, and the rule matches the name case-insensitively.
+        let mut header = RequestHeader::build("GET", b"/events", None).unwrap();
+        header.insert_header("ACCEPT", "text/event-stream").unwrap();
+        assert!(header.headers.contains_key("accept"));
+        assert!(is_streaming_headers(&header.headers));
+
+        // `Content-Type` carries the marker too, in a value that
+        // mixes the marker with another type.
+        let mut header = RequestHeader::build("GET", b"/events", None).unwrap();
+        header
+            .insert_header("Content-Type", "*/*, TEXT/EVENT-STREAM")
+            .unwrap();
+        assert!(is_streaming_headers(&header.headers));
+
+        // An ordinary request is not a streaming one.
+        let mut header = RequestHeader::build("GET", b"/api", None).unwrap();
+        header.insert_header("Accept", "application/json").unwrap();
+        assert!(!is_streaming_headers(&header.headers));
+
+        // A request without any of the two header names is not a
+        // streaming one either.
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header
+            .insert_header("X-Accel-Buffering", "text/event-stream")
+            .unwrap();
+        assert!(!is_streaming_headers(&header.headers));
+
+        // A value that is not valid UTF-8 reads as an empty value: the
+        // marker inside it must not match.
+        let mut header = RequestHeader::build("GET", b"/events", None).unwrap();
+        header
+            .insert_header(
+                "Accept",
+                HeaderValue::from_bytes(b"text/event-stream\xff").unwrap(),
+            )
+            .unwrap();
+        assert!(!is_streaming_headers(&header.headers));
+    }
+
+    /// The gateway and the core must never disagree about what a
+    /// streaming request is.
+    ///
+    /// The gateway reads the headers it already holds; the core's
+    /// `is_streaming_request` reads an owned copy of the same
+    /// headers. Both apply the same per-header rule, and this pins
+    /// that they cannot drift apart — the rule has to have exactly
+    /// one home, or the two transports classify the same request
+    /// differently.
+    #[test]
+    fn is_streaming_headers_agree_with_the_core_rule() {
+        // The headers of one request, per case. A name may repeat —
+        // a request may carry several `Accept` headers.
+        const CASES: &[&[(&str, &str)]] = &[
+            &[("Accept", "text/event-stream")],
+            &[("Accept", "TEXT/EVENT-STREAM")],
+            &[("Accept", "application/json")],
+            &[("Content-Type", "text/event-stream")],
+            // The marker in a header that does not carry it.
+            &[("X-Accel-Buffering", "text/event-stream")],
+            // Two Accept headers: one of them carries the marker.
+            &[
+                ("Accept", "application/json"),
+                ("Accept", "text/event-stream"),
+            ],
+            // No header at all.
+            &[],
+        ];
+
+        for case in CASES {
+            let mut header = RequestHeader::build("GET", b"/events", None).unwrap();
+            for &(name, value) in *case {
+                // `append_header`, not `insert_header`: the latter
+                // replaces every value under the name, so the case
+                // with two `Accept` headers would collapse into one.
+                header.append_header(name, value).unwrap();
+            }
+
+            // The owned copy the core's entry point takes.
+            let request = HttpRequest {
+                method: "GET".into(),
+                target: "/events".into(),
+                version: "HTTP/1.1".into(),
+                headers: header
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect(),
+                body: Vec::new(),
+            };
+
+            assert_eq!(
+                is_streaming_headers(&header.headers),
+                pangolin_core::is_streaming_request(&request),
+                "the gateway and the core disagree on {case:?}",
+            );
+        }
+
+        // The repeated-header case has to be a repeated header: a
+        // rule that only looked at the first value would answer the
+        // same, and the agreement above would prove nothing.
+        let mut header = RequestHeader::build("GET", b"/events", None).unwrap();
+        header.append_header("Accept", "application/json").unwrap();
+        header.append_header("Accept", "text/event-stream").unwrap();
+        assert_eq!(header.headers.get_all("accept").iter().count(), 2);
+        assert!(is_streaming_headers(&header.headers));
     }
 
     /// The four gateway headers are always written — an illegal value

@@ -69,9 +69,9 @@ pub use provider::{
     RangeUrl, SiteProviderConfig, SiteProviderOverride, spec,
 };
 pub use proxy::{
-    BackendTarget, ProxyCtx, Scheme, apply_proxy_policy,
-    apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_request, parse_backend_to_target,
-    serve_file_target,
+    BackendTarget, ProxyCtx, STREAMING_HEADER_NAMES, Scheme, apply_proxy_policy,
+    apply_proxy_policy_without_hop_by_hop_stripping, is_streaming_header, is_streaming_request,
+    parse_backend_to_target, serve_file_target,
 };
 pub use ratelimit::{
     ClientGeo, IpRule, IpRules, LimitDecision, OverLimitClient, RateLimitPolicy, RateLimitSnapshot,
