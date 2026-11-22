@@ -216,6 +216,14 @@ attacker-shaped — anyone can send a `Referer` header naming a host of their
 choosing. Past the cap the counters keep ticking but the new pairs are not
 stored, and the saturation is visible to the operator.
 
+The counters live behind one lock that `record()` takes for writing and
+the snapshot takes for reading. The snapshot clones the pair table under
+the read guard and sorts it **after** the guard is released: the admin
+polls the snapshot every 30 seconds, and sorting up to 50 000 rows under
+the guard would stall `record()` — the referral path — for the whole
+sort. The side channel must never hold up the forwarding path
+(invariant #5 of `AGENTS.md`).
+
 The writer task runs under a supervisor (`pangolin_core::supervisor`), the
 same one the bot log uses: a panic in the task restarts it instead of
 silently stopping the day's file. The supervisor's handle is the one
@@ -228,7 +236,7 @@ consumer would race for it.
 
 | Page | What it shows |
 | ---- | ------------- |
-| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the SSE tail + the JSONL writer's status. |
+| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the JSONL writer's status + the SSE tail. |
 | `/logs/referers/history` | The day's JSONL, filtered and paginated. |
 | `/logs/referers/stats` | The day's rollup: per referrer host — hits, distinct visitor IPs, landing paths, last seen. |
 | `/api/logs/referers/summary` | The polled summary region: the three counters + the top-N table, scoped to `?site=`. Admin-only. |
@@ -241,8 +249,10 @@ watches the page: every recorded referral ticks them, and the SSE tail
 below only appends rows, so without the poll the numbers freeze at the
 value they had when the page was loaded. The endpoint returns the very
 `views/referers/_summary.html` partial the page inlined, so the swap
-replaces the markup with byte-identical markup — no flicker, no layout
-jump.
+replaces the markup with byte-identical markup — the swap itself does
+not flicker. (The region's *height* still follows the data: the top-N
+table appears and disappears with the traffic, and the content below
+the region moves with it.)
 
 The poll carries the site scope (`?site=`) explicitly: htmx does not
 inherit the page's query string, and the site selector is a sibling form
@@ -251,7 +261,10 @@ resolve the scope through the same helper, so the two can never
 describe different slices — and a `?site=` naming no site stays scoped
 (and therefore empty), never "all sites". The response is
 `Cache-Control: no-store`: a cached aggregate would keep showing a
-value the counters have already moved past.
+value the counters have already moved past. A fragment that fails to
+render answers **500** rather than an empty 200: the HTMX client does
+not swap a non-2xx response, so the operator keeps the content the
+last successful poll put there.
 
 The **JSONL writer** panel on `/logs/referers` is what tells "no referral
 traffic today" apart from "the writer died": the ring buffer, the SSE tail
@@ -266,6 +279,12 @@ apart. It is a load-time snapshot, and it reports the writer *task*, not the
 disk: a writer whose writes keep failing is alive as far as the panel is
 concerned. See [`bot-log.md`](./bot-log.md#what-the-panel-shows-and-what-it-does-not)
 for the three limits of the panel.
+
+The panel is the one part of the live page that does **not** refresh: the
+summary region above it is polled every 30 seconds, the writer badge stays
+at the value the page was loaded with. A writer that died after the load
+therefore stays invisible until the page is reloaded — the badge is a
+load-time snapshot, and the live numbers next to it are not.
 
 All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the

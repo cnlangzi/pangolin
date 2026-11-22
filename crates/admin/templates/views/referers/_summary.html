@@ -2,8 +2,9 @@
 {# The three counters and the top-N table. The live page inlines    #}
 {# this partial and `GET /api/logs/referers/summary` returns it on    #}
 {# its own, so the polled markup is byte-for-byte the markup the    #}
-{# page shipped — the swap does not flicker and the layout does not  #}
-{# jump.                                                            #}
+{# page shipped — the swap itself does not flicker. (The region's   #}
+{# height still follows the data: the table appears and disappears  #}
+{# with the traffic.)                                                #}
 {#                                                                   #}
 {# Only `summary`, `top_rows` and `lang` may be referenced here: the #}
 {# endpoint's view struct carries no other field, and the page and  #}

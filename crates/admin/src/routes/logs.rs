@@ -53,6 +53,7 @@ use http_body_util::Full;
 use crate::App;
 use crate::i18n::Lang;
 use crate::ok_html_with_csrf;
+use crate::routes::helpers::html_no_store;
 use crate::routes::helpers::ok_html_no_store;
 use crate::templates::logs::referer_subnav;
 use crate::templates::logs::subnav;
@@ -1024,7 +1025,7 @@ struct RefererLiveScope {
 /// host belongs to one of the site's domains. The summary cards are
 /// scoped the same way, so the numbers on the page and the table
 /// below them always describe the same slice.
-async fn referer_live_scope(app: &Arc<App>, site: &str) -> RefererLiveScope {
+fn referer_live_scope(app: &Arc<App>, site: &str) -> RefererLiveScope {
     let sites = site_options(app, site);
     let site_scoped = !site.is_empty();
     let site_domains = sites
@@ -1077,7 +1078,7 @@ pub async fn render_referers(
 ) -> http::Result<Response<Full<Bytes>>> {
     let enabled = app.config.log.referer.enabled;
     let filter = parse_referer_params(merged_params).filter;
-    let scope = referer_live_scope(app, &filter.site).await;
+    let scope = referer_live_scope(app, &filter.site);
 
     // The writer's health comes from the supervisor's state — the
     // panel has to be able to say "the JSONL writer is dead", which
@@ -1122,13 +1123,19 @@ pub async fn render_referers(
 /// The fragment is `Cache-Control: no-store`: it carries live
 /// aggregates, and a cached copy would keep showing a value the
 /// counters have already moved past.
+///
+/// A fragment that fails to render answers **500**, not an empty
+/// 200: the HTMX client does not swap a non-2xx response, so the
+/// operator keeps the content the last successful poll put there. An
+/// empty 200 would blank the summary cards — and blank them again on
+/// every poll — with nothing on the page saying why.
 pub async fn api_referers_summary(
     app: &Arc<App>,
     merged_params: &[u8],
     lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     let site = parse_referer_params(merged_params).filter.site;
-    let scope = referer_live_scope(app, &site).await;
+    let scope = referer_live_scope(app, &site);
 
     let tmpl = RefererLogsSummaryView {
         summary: scope.summary,
@@ -1139,7 +1146,7 @@ pub async fn api_referers_summary(
         Ok(s) => s,
         Err(e) => {
             log::error!("referer summary template error: {e}");
-            String::new()
+            return html_no_store(http::StatusCode::INTERNAL_SERVER_ERROR, String::new());
         }
     };
 
@@ -4035,6 +4042,43 @@ mod tests {
         assert!(
             page_html.contains("addEventListener(\"htmx:afterSwap\", paintLastSeen)"),
             "the page must repaint the last-seen column after every swap: {page_html}"
+        );
+    }
+
+    /// The polled fragment must carry the "Last seen" timestamp as an
+    /// attribute: the cell's text is written by the client, so an
+    /// attribute-less cell renders blank after every poll.
+    #[tokio::test]
+    async fn referers_summary_fragment_carries_the_last_seen_timestamp() {
+        let dir = TempDir::new().expect("tempdir");
+        let referer_dir = dir.path().join("referers");
+        let (_keep, app) = make_test_app_with_referer_dir(referer_dir);
+        seed_site_with_domains(&app, "web", &["example.com"]).await;
+        push_referer_hit(&app, "news.example.org", "example.com");
+
+        let resp = api_referers_summary(&app, b"", Lang::En)
+            .await
+            .expect("summary fragment");
+        let fragment = response_html(resp).await;
+        assert!(
+            fragment.contains("news.example.org"),
+            "the fragment must carry the referral: {fragment}"
+        );
+        // One attribute per row, and no empty value: the cell's text
+        // is written by the client from this attribute.
+        assert_eq!(
+            fragment.matches("data-last-seen=\"").count(),
+            1,
+            "every row must carry the last-seen attribute: {fragment}"
+        );
+        let stamp = fragment
+            .split("data-last-seen=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the last-seen attribute must carry a value");
+        assert!(
+            !stamp.is_empty(),
+            "the last-seen attribute must not be empty: {fragment}"
         );
     }
 

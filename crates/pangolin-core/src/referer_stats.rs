@@ -181,9 +181,33 @@ impl RefererStats {
 
     /// Snapshot the full per-(referer_host, host) table plus a
     /// summary. Used by the admin UI to render the live summary.
+    ///
+    /// The rows are cloned under the read guard and sorted **after**
+    /// it is released — see [`RefererStats::clone_rows`].
     pub fn snapshot(&self) -> (Vec<RefererStatsRow>, RefererStatsSummary) {
+        let (mut rows, summary) = self.clone_rows();
+        rows.sort_by(|a, b| {
+            b.hits
+                .cmp(&a.hits)
+                .then_with(|| a.referer_host.cmp(&b.referer_host))
+                .then_with(|| a.host.cmp(&b.host))
+        });
+        (rows, summary)
+    }
+
+    /// Clone the pair table and the counters under the read guard.
+    ///
+    /// The guard is released when this returns, so the caller can sort
+    /// the rows without holding it. That is not a micro-optimisation:
+    /// `record()` takes the **write** lock on the same mutex, and the
+    /// admin UI polls this snapshot every 30 seconds — sorting the
+    /// whole table (up to [`MAX_UNIQUE_PAIRS`] rows) under the read
+    /// guard would stall the referral path for the whole sort, which
+    /// is the forwarding path this side channel must not touch
+    /// (invariant #5 of `AGENTS.md`).
+    fn clone_rows(&self) -> (Vec<RefererStatsRow>, RefererStatsSummary) {
         let g = self.inner.read();
-        let mut rows: Vec<RefererStatsRow> = g
+        let rows: Vec<RefererStatsRow> = g
             .rows
             .iter()
             .map(|(k, v)| RefererStatsRow {
@@ -193,12 +217,6 @@ impl RefererStats {
                 last_seen: v.last_seen,
             })
             .collect();
-        rows.sort_by(|a, b| {
-            b.hits
-                .cmp(&a.hits)
-                .then_with(|| a.referer_host.cmp(&b.referer_host))
-                .then_with(|| a.host.cmp(&b.host))
-        });
         let summary = RefererStatsSummary {
             unique_pairs: rows.len(),
             total_records: g.total_records,
@@ -252,6 +270,38 @@ mod tests {
         assert_eq!(summary.total_hits, 3);
         assert_eq!(summary.unique_pairs, 2);
         assert_eq!(summary.dropped_unique_pairs, 0);
+    }
+
+    /// The rows a snapshot hands out must be free of the stats lock.
+    ///
+    /// `record()` takes the **write** lock on the same mutex, and the
+    /// admin UI polls the snapshot every 30 seconds — so the caller
+    /// has to be able to sort the rows while the write lock is held.
+    /// The guard is therefore released with the rows, and the sort
+    /// runs outside it (see [`RefererStats::snapshot`]).
+    ///
+    /// The test takes the write lock while holding the rows: with the
+    /// guard still held it would block, and with the lock held the
+    /// sort could not run at all.
+    #[test]
+    fn the_snapshot_hands_out_rows_that_are_free_of_the_lock() {
+        let stats = RefererStats::new();
+        let t0 = Utc::now();
+        stats.record(&entry("news.example.org", "example.com", t0));
+        stats.record(&entry("news.example.org", "example.com", t0));
+        stats.record(&entry("blog.example.org", "example.com", t0));
+
+        let (mut rows, _summary) = stats.clone_rows();
+        // The write lock is free while the caller sorts the rows.
+        let guard = stats
+            .inner
+            .try_write()
+            .expect("the read guard must be released with the rows");
+        rows.sort_by_key(|r| std::cmp::Reverse(r.hits));
+        drop(guard);
+
+        assert_eq!(rows[0].referer_host, "news.example.org");
+        assert_eq!(rows[0].hits, 2);
     }
 
     #[test]

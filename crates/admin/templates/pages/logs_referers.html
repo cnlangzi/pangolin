@@ -60,8 +60,9 @@
   {# they drift while the operator watches the page — the SSE feed     #}
   {# below appends new rows but never touches the counters. The region #}
   {# is therefore polled: `GET /api/logs/referers/summary` returns the  #}
-  {# very partial the page inlined, so the swap does not flicker and   #}
-  {# the layout does not jump.                                         #}
+  {# very partial the page inlined, so the swap itself does not       #}
+  {# flicker. (The region's height still follows the data: the table  #}
+  {# appears and disappears with the traffic.)                         #}
   {#                                                                   #}
   {# The poll URL carries the site scope: htmx does not inherit the    #}
   {# page's query string, and the site selector is a sibling form —   #}

@@ -58,12 +58,23 @@ pub fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
 /// the polled fragments carry live counters, and a cached copy would
 /// show the operator a stale aggregate long after the value moved on.
 pub fn ok_html_no_store(body: String) -> http::Result<Response<Full<Bytes>>> {
-    let resp = Response::builder()
-        .status(200)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .header("Cache-Control", "no-store")
-        .body(Full::new(Bytes::from(body)))
-        .expect("response builder for 200 OK should not fail");
+    html_no_store(StatusCode::OK, body)
+}
+
+/// Build an HTML response with the given status that must never be
+/// cached.
+///
+/// The status is the point of the extra helper: the HTMX client does
+/// not swap a non-2xx response, so a fragment that failed to render
+/// leaves the last good content on the page instead of replacing it
+/// with an empty body.
+pub fn html_no_store(status: StatusCode, body: String) -> http::Result<Response<Full<Bytes>>> {
+    let mut resp = ok_html(body)?;
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::header::HeaderValue::from_static("no-store"),
+    );
     Ok(resp)
 }
 
