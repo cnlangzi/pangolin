@@ -240,6 +240,13 @@ file simply stops growing. When the referer log is disabled there is no
 writer, and the panel says the status is unavailable rather than claiming
 health.
 
+The panel is the shared `components/_writer_status.html` fragment, rendered
+from the same catalog keys as the bot log's — the two pages cannot drift
+apart. It is a load-time snapshot, and it reports the writer *task*, not the
+disk: a writer whose writes keep failing is alive as far as the panel is
+concerned. See [`bot-log.md`](./bot-log.md#what-the-panel-shows-and-what-it-does-not)
+for the three limits of the panel.
+
 All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
 same site are aggregated together rather than split per host.
@@ -269,8 +276,8 @@ rows it describes.
 | `Sec-Fetch-Dest` absent and `Accept` does not contain `text/html` | No row. |
 | The `Referer` header is longer than 4 KiB | Treated as "no referer". The HTTP header parser already bounds the total header size; this is a second, tighter guard against a client making the gateway copy a multi-kilobyte string on every request. |
 | Writer queue full | The oldest queued row is dropped and a rate-limited warning is logged. The request path is never blocked on a slow disk. |
-| The writer task panics | The supervisor restarts it after a 100 ms backoff — the same `Arc`, so the queue and the day's file survive and the queued rows are not lost. The panic and the restart counter are logged; the `/logs/referers` panel shows "Restarted N times". |
-| The writer task panics 5 times in a row | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/referers` panel shows "Stopped: automatic repair failed after 5 restarts". The request path is untouched — a side-channel failure never reaches the forwarding decision. |
+| The writer task panics | The supervisor restarts it after a 100 ms backoff — the same `Arc`, so the queue the writer had not drained yet is still there, and the day's file is appended to as before. (A batch that was already being written when the panic hit is lost: it had left the queue and had not reached the disk.) The panic and the restart counter are logged; the `/logs/referers` panel shows "Restarted N time(s)". |
+| The writer task panics again after 5 restarts | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/referers` panel shows "Stopped: automatic repair failed after 5 restart(s)" — the count is the repair attempts that failed, not every restart since the process started. The request path is untouched — a side-channel failure never reaches the forwarding decision. |
 | The JSONL file cannot be created (bad `dir`) | The batch is dropped with a warning; the gateway keeps serving traffic. The directory is created lazily on first write. |
 | A site's domains are later re-pointed to a different site | Historical rows are re-grouped under the current mapping when queried. The rows carry the host, not the site. |
 | `log.referer.enabled: false` | No capture, no rows, no live stream data; the admin pages state that the feature is disabled. |

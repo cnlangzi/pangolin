@@ -178,9 +178,33 @@ notification. `App::shutdown_bot_writer` sets the flag *before* it signals the
 writer, so a panic that lands in between cannot resurrect the writer after
 the shutdown began.
 
-The `alive` flag follows the supervisor: if the supervisor itself goes away
-without the writer exiting — it was aborted, or it unwound on a bug of its
-own — the flag is cleared, so the panel never claims a dead writer is alive.
+The `alive` flag follows the writer task: the supervisor owns the task's
+handle, so a supervisor that goes away — aborted, or unwound on a bug of its
+own — takes the writer with it and clears the flag. The panel therefore never
+claims a dead writer is alive, and a writer never outlives the supervisor that
+could have restarted it.
+
+## What the panel shows, and what it does not
+
+The **JSONL writer** card on `/logs/bots` renders the supervisor's state:
+"Running" while the writer task is up, "Not running" when it was never
+started, "Stopped: automatic repair failed after N restart(s)" once the
+budget is spent, plus a line for the restart count and one for the entries
+the hot path had to drop.
+
+Three limits are worth stating, because the panel is the operator's only
+view of the write path:
+
+- **It is a load-time snapshot.** The card is server-rendered with the page;
+  a writer that dies while the page is open is only visible after a reload.
+  (The knownbots verification panel next to it has the same property.)
+- **It reports the task, not the disk.** A writer whose `open` / `write_all`
+  calls keep failing is alive, so the card stays green while the file stops
+  growing. Those failures are logged as warnings — see the failure-mode
+  table — and they are self-healing (the next batch retries).
+- **It does not cover a wedged disk.** A writer stuck in a write that never
+  returns is alive by every measure the panel has; the queue-full warning is
+  the signal there.
 
 ### `crates/pangolin-core/src/bot_stats.rs`
 
@@ -319,8 +343,8 @@ itself does not auto-clean up.
 | The knownbots verifier cannot be built | `App::new` fails with a configuration error — the verifier is mandatory (issue #117). Only a malformed or incomplete **embedded** config gets here; a malformed operator override is skipped and reported (see [Knownbots verification health](#knownbots-verification-health)). |
 | `verify_bot` returns `None` (unknown / forged / pending RDNS) | Skip the bot fan-out. The generic access log still fires. |
 | `BotLogWriter::enqueue` queue full (10 000 entries backlogged) | Drop oldest entry, `log::warn!` once. The ring buffer + stats still receive the current entry; only the JSONL write is best-effort. |
-| The writer task panics | The supervisor restarts it after a 100 ms backoff — the same `Arc`, so the queue and the day's file survive and the queued entries are not lost. The panic and the restart counter are logged; the `/logs/bots` panel shows "Restarted N times". |
-| The writer task panics 5 times in a row | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/bots` panel shows "Stopped: automatic repair failed after 5 restarts". The request path is untouched — a side-channel failure never reaches the forwarding decision. |
+| The writer task panics | The supervisor restarts it after a 100 ms backoff — the same `Arc`, so the queue the writer had not drained yet is still there, and the day's file is appended to as before. (A batch that was already being written when the panic hit is lost: it had left the queue and had not reached the disk.) The panic and the restart counter are logged; the `/logs/bots` panel shows "Restarted N time(s)". |
+| The writer task panics again after 5 restarts | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/bots` panel shows "Stopped: automatic repair failed after 5 restart(s)" — the count is the repair attempts that failed, not every restart since the process started. The request path is untouched — a side-channel failure never reaches the forwarding decision. |
 | `tokio::fs::OpenOptions::open` fails on first write | `log::warn!` and drop the batch. The generic access log keeps working. Retry on the next batch. |
 | Disk fills mid-day | `write_all` returns `Err`; `log::warn!`; current batch is dropped. Next `drain_and_write` retries. The `sync_all` after `write_all` surfaces the error before `current_size` is updated. |
 | Process crash mid-write | At most `fsync_interval_secs` (5 s default) of unflushed bytes lost. JSONL's "one line per request" format means a partial line at EOF is silently skipped by `jq` / DuckDB on recovery. |
@@ -421,6 +445,6 @@ duckdb -c "
 | Unit | `pangolin_integration_tests::knownbots_dependency` (issue #146) | The in-tree copy of the crate is gone and is not a workspace member; `pangolin-core` depends on the published crate from the registry (not a path), with the `full` feature enabled; the lockfile resolves `knownbots 0.3.0` from crates.io |
 | Unit | `admin::routes::logs::tests::*` (issue #136) | The `/logs/bots` page renders the verification panel with its three counts; a failed bot shows its kind + message; a config error shows its path + reason; a healthy bot is not listed; `All IP lists loaded` when nothing needs attention; the `RDNS lookups dropped` line only when the count is non-zero |
 | Unit | `admin::routes::logs::tests::*` (issue #158) | The panel header badges the bot address lists that are not ready — `data-not-ready="<count>"`, the count itself and the "may fail closed" tooltip; a failed bot that still holds its cached prefix set is counted too, and the row still reports the cached prefixes; the badge is absent when every list is loaded, when no verifier is attached, and when only an operator config file is broken |
-| Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`); a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted |
-| Unit | `app::tests::*` (issue #219) | The writer health reports a running writer, and an unavailable one when the referer log is disabled; the graceful shutdown stops the supervisor; a writer that panicked keeps writing the day's file after the restart, with the entry that was queued behind it |
-| Unit | `admin::routes::logs::tests::*` (issue #219) | The `/logs/bots` page shows the writer's state — "Running" while it is alive, "Stopped: automatic repair failed after N restarts" once the budget is spent, and the "Queue was full; dropped N entries" line when the hot path had to drop rows |
+| Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`), with the window's restart count published for the panel; a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted; an aborted supervisor takes the writer task with it |
+| Unit | `app::tests::*` (issue #219) | The writer health reports a running writer, and an unavailable one when the referer log is disabled; the graceful shutdown stops the supervisor; a writer that panicked keeps writing the day's file after the restart, and the panel sees the restart |
+| Unit | `admin::routes::logs::tests::*` (issue #219) | The `/logs/bots` and `/logs/referers` pages show the writer's state — "Running" while it is alive, "Stopped: automatic repair failed after N restart(s)" once the budget is spent, and the "Queue was full; dropped N entry(s)" line when the hot path had to drop rows |
