@@ -441,6 +441,9 @@ pub async fn handle(
                         lang,
                     )
                     .await?
+                } else if rest == "logs/bots/summary" && method == "GET" {
+                    // The polled summary region of /logs/bots (issue #225).
+                    routes::logs::api_bots_summary(&app, lang).await?
                 } else if let Some(domain) = rest.strip_prefix("domains/") {
                     if method == "DELETE" {
                         if domain.is_empty() {
