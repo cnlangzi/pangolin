@@ -213,8 +213,36 @@ view of the write path:
 
 - `record(&self, &BotLogEntry)` — increments `(bot_name, host) → hits` row.
   Single `RwLock::write` per call.
-- `snapshot(&self) -> (Vec<BotStatsRow>, BotStatsSummary)` — admin UI feed.
-- `top_n(&self, n) -> Vec<BotStatsRow>` — dashboard "top bots" card.
+- `top_n(&self, n) -> (Vec<BotStatsRow>, BotStatsSummary)` — the admin UI's
+  feed: the `n` best rows plus a summary of the whole table.
+
+The query is a **single pass** over the pair map. It materialises at
+most `n` rows — the walk borrows the map's rows and only the rows
+that make the result are cloned — and it holds the read lock for the
+walk, not for an allocation of the whole table followed by a sort. The
+write lock on the same map belongs to `record()`, which runs on the
+request hot path, so the shorter the read side holds it, the less the
+side channel can delay a request (invariant #5).
+
+The sort key is `hits` descending → `host` ascending → `bot_name`
+ascending. The last key makes the order total: two rows with the same
+hits and the same host would otherwise be ordered by the map's
+iteration order, and the page would shuffle between two renders.
+
+The summary describes the **whole** table, not the `n` rows that came
+back: `unique_pairs` is the number of rows the table holds,
+`total_records` counts every recorded request — including the ones the
+cap dropped — `total_hits` is the sum of the rows' hits, and
+`dropped_unique_pairs` is the process-wide count of the records the
+cap dropped.
+
+When `dropped_unique_pairs` is not zero, `/logs/bots` shows a
+saturation banner under the summary cards: how many records were
+dropped, the cap they were dropped at, and where the per-day JSONL
+stream is (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) — the stream has its
+own drop counter, reported by the writer panel. The banner quotes the
+cap from the code constant, so a bump of `MAX_UNIQUE_PAIRS` shows up
+on the page without a translation change.
 
 ### `crates/pangolin-core/src/app.rs`
 
@@ -443,7 +471,7 @@ duckdb -c "
 | ----- | ----- | ------------- |
 | Unit | `bot::tests::*` | All 5 categories detected, case-insensitive, more-specific patterns shadow generic ones, no duplicate needles, every category has at least one rule |
 | Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
-| Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
+| Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, top-N sort order (`hits` desc → `host` asc → `bot_name` asc) and its tie-break, the summary describing the whole table rather than the returned rows, the cap dropping rows and counting the drops, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
 | Unit | `knownbots::model::registry::tests::*` (in the crate's own repository, issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **or incomplete** **embedded** config stays fatal, and every shipped embedded config is complete; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
@@ -455,3 +483,5 @@ duckdb -c "
 | Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`), with the window's restart count published for the panel; a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted; an aborted supervisor takes the writer task with it |
 | Unit | `app::tests::*` (issue #219) | The writer health reports a running writer, and an unavailable one when the referer log is disabled; the graceful shutdown stops the supervisor; a writer that panicked keeps writing the day's file after the restart, and the panel sees the restart |
 | Unit | `admin::routes::logs::tests::*` (issue #219) | The `/logs/bots` and `/logs/referers` pages show the writer's state — "Running" while it is alive, "Stopped: automatic repair failed after N restart(s)" once the budget is spent, and the "Queue was full; dropped N entry(s)" line when the hot path had to drop rows |
+| Unit | `topn::tests::*` (issue #221) | The bounded collector keeps the best `limit` items of a stream, keeps nothing when the limit is zero, and hands them back best first |
+| Unit | `admin::routes::logs::tests::*` (issue #221) | The `/logs/bots` and `/logs/referers` pages show the saturation banner when the pair table dropped records — with the dropped count and the cap — and no banner when it did not; the bot page shows it for a table that really hit its cap |

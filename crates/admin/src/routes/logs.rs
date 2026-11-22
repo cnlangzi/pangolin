@@ -121,11 +121,11 @@ pub async fn render_bots(
     csrf: &str,
     lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
-    // Snapshot the stats under one `RwLock` acquisition so the
-    // summary card and top-N table agree on `total_records` even
-    // under live traffic.
-    let (top_rows, summary) = app.bot_stats_snapshot();
-    let top_rows = top_rows.into_iter().take(BOT_TOP_N).collect();
+    // One pass over the pair table: the top-N rows and the summary
+    // that describes the whole table come out of the same walk, so
+    // the read lock is taken once and no row beyond the N that is
+    // rendered is ever materialised.
+    let (top_rows, summary) = app.bot_stats_top_n(BOT_TOP_N);
 
     // The verification panel reads in-memory state only — no DNS or
     // HTTP request happens on the page path. A bot whose IP list was
@@ -146,6 +146,7 @@ pub async fn render_bots(
         top_rows,
         health,
         writer,
+        stats_cap: pangolin_core::bot_stats::MAX_UNIQUE_PAIRS,
         lang,
     };
     let html = match tmpl.render() {
@@ -1020,25 +1021,12 @@ pub async fn render_referers(
     // host belongs to one of the site's domains. The summary cards
     // are scoped the same way, so the numbers on the page and the
     // table below them always describe the same slice.
-    let (rows, global_summary) = app.referer_stats_snapshot();
-    let scoped: Vec<pangolin_core::referer_stats::RefererStatsRow> = rows
-        .into_iter()
-        // No site selected ⇒ no scope, every row is in. This mirrors
-        // the live tail's client-side filter, which treats the
-        // unscoped case the same way.
-        .filter(|r| !site_scoped || pangolin_core::host_matches_domains(&site_domains, &r.host))
-        .collect();
-    let scoped_hits: u64 = scoped.iter().map(|r| r.hits).sum();
-    let summary = pangolin_core::referer_stats::RefererStatsSummary {
-        unique_pairs: scoped.len(),
-        total_records: scoped_hits,
-        total_hits: scoped_hits,
-        // The saturation counter is process-wide, so it is reported
-        // as-is: it tells the operator that the pair table dropped
-        // rows, whatever the current scope.
-        dropped_unique_pairs: global_summary.dropped_unique_pairs,
-    };
-    let top_rows = scoped.into_iter().take(REFERRER_TOP_N).collect();
+    //
+    // The scope stays here, in the admin layer: "the selected site's
+    // domains" is the admin's notion, so the counter only takes a
+    // predicate.
+    let scope = stats_scope_predicate(site_scoped, &site_domains);
+    let (top_rows, summary) = app.referer_stats_top_n(REFERRER_TOP_N, scope);
 
     // The writer's health comes from the supervisor's state — the
     // panel has to be able to say "the JSONL writer is dead", which
@@ -1057,6 +1045,7 @@ pub async fn render_referers(
         site_domains,
         site_scoped,
         writer,
+        stats_cap: pangolin_core::referer_stats::MAX_UNIQUE_PAIRS,
         lang,
     };
     let html = match tmpl.render() {
@@ -1256,6 +1245,33 @@ fn site_scope(
         return None;
     }
     Some(pangolin_core::RefererSiteFilter::from_index(site, domain))
+}
+
+/// The scope predicate for the referer stats query.
+///
+/// The predicate runs while the stats table holds its read lock, and
+/// it is not free: it normalises the host and walks the site's
+/// domain list. A pair table holds many pairs per host, so the answer
+/// is cached per host — the predicate then runs once per *host*
+/// instead of once per pair.
+///
+/// No site selected ⇒ every row is in scope, and the predicate
+/// answers without touching the domain list at all.
+fn stats_scope_predicate(site_scoped: bool, site_domains: &[String]) -> impl Fn(&str) -> bool {
+    let cache: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    move |host: &str| {
+        if !site_scoped {
+            return true;
+        }
+        let cached = cache.borrow().get(host).copied();
+        if let Some(in_scope) = cached {
+            return in_scope;
+        }
+        let in_scope = pangolin_core::host_matches_domains(site_domains, host);
+        cache.borrow_mut().insert(host.to_string(), in_scope);
+        in_scope
+    }
 }
 
 /// Internal result of [`build_referer_history_page`].
@@ -1669,15 +1685,22 @@ mod tests {
     }
 
     /// Drive one entry through the bot side-channel so
-    /// `bot_stats_snapshot()` has something to render. Reuses
+    /// `bot_stats_top_n()` has something to render. Reuses
     /// the helper that `BotLogEntry::from_access_log` and the
     /// `detect_bot` rules already exercise.
     fn record_one_googlebot(app: &App) {
+        record_one_googlebot_on(app, "example.com");
+    }
+
+    /// [`record_one_googlebot`] on a named host — the pair table is
+    /// keyed by `(bot, host)`, so a test that wants many rows needs
+    /// many hosts.
+    fn record_one_googlebot_on(app: &App, host: &str) {
         let access = AccessLogEntry {
             timestamp: Utc::now(),
             method: "GET".into(),
             path: "/sitemap.xml".into(),
-            host: "example.com".into(),
+            host: host.into(),
             status: 200,
             duration_ms: 12,
             backend: "direct:127.0.0.1:8080".into(),
@@ -1767,15 +1790,34 @@ mod tests {
     /// exercised through the template, the same way the verification
     /// panel is.
     fn render_bots_page_with_writer(writer: WriterHealth) -> String {
+        render_bots_page_with(pangolin_core::bot_stats::BotStatsSummary::default(), writer)
+    }
+
+    /// Render the `/logs/bots` page with a hand-built summary and
+    /// writer health. See [`render_bots_page_with_writer`].
+    fn render_bots_page_with(
+        summary: pangolin_core::bot_stats::BotStatsSummary,
+        writer: WriterHealth,
+    ) -> String {
+        render_bots_page_in(summary, writer, Lang::En)
+    }
+
+    /// The same page, in a given language.
+    fn render_bots_page_in(
+        summary: pangolin_core::bot_stats::BotStatsSummary,
+        writer: WriterHealth,
+        lang: Lang,
+    ) -> String {
         let tmpl = BotLogsTemplate {
             csrf_token: "csrf".into(),
             active_nav: "logs-bots",
             active_subnav: subnav::LIVE,
-            summary: pangolin_core::bot_stats::BotStatsSummary::default(),
+            summary,
             top_rows: vec![],
             health: BotVerificationHealth::default(),
             writer,
-            lang: Lang::En,
+            stats_cap: pangolin_core::bot_stats::MAX_UNIQUE_PAIRS,
+            lang,
         };
         tmpl.render().expect("BotLogsTemplate render")
     }
@@ -1783,18 +1825,31 @@ mod tests {
     /// Render the `/logs/referers` page with a hand-built writer
     /// health. See [`render_bots_page_with_writer`].
     fn render_referers_page_with_writer(writer: WriterHealth) -> String {
+        render_referers_page_with(
+            pangolin_core::referer_stats::RefererStatsSummary::default(),
+            writer,
+        )
+    }
+
+    /// Render the `/logs/referers` page with a hand-built summary and
+    /// writer health. See [`render_bots_page_with_writer`].
+    fn render_referers_page_with(
+        summary: pangolin_core::referer_stats::RefererStatsSummary,
+        writer: WriterHealth,
+    ) -> String {
         let tmpl = RefererLogsTemplate {
             csrf_token: "csrf".into(),
             active_nav: "logs-referers",
             active_subnav: referer_subnav::LIVE,
             enabled: true,
-            summary: pangolin_core::referer_stats::RefererStatsSummary::default(),
+            summary,
             top_rows: vec![],
             sites: vec![],
             filter: RefererHistoryFilter::default(),
             site_domains: vec![],
             site_scoped: false,
             writer,
+            stats_cap: pangolin_core::referer_stats::MAX_UNIQUE_PAIRS,
             lang: Lang::En,
         };
         tmpl.render().expect("RefererLogsTemplate render")
@@ -1861,6 +1916,197 @@ mod tests {
             html.contains("Queue was full; dropped 12 entry(s)"),
             "the dropped entries must be visible: {html}"
         );
+    }
+
+    // ── Pair-table saturation (issue #221) ────────────────────────────
+
+    /// A saturated `(bot, host)` table has to be visible: the totals
+    /// above count the dropped records, the table below does not, and
+    /// the operator is told how many records went missing and where
+    /// the complete data is.
+    #[test]
+    fn bots_page_shows_the_saturation_banner() {
+        let html = render_bots_page_with(
+            pangolin_core::bot_stats::BotStatsSummary {
+                unique_pairs: 50_000,
+                total_records: 50_007,
+                total_hits: 50_000,
+                dropped_unique_pairs: 7,
+            },
+            WriterHealth {
+                available: true,
+                alive: true,
+                restarts: 0,
+                window_restarts: 0,
+                failed: false,
+                dropped: 0,
+            },
+        );
+        assert!(
+            html.contains("7 record(s) were dropped"),
+            "the dropped count must be visible: {html}"
+        );
+        assert!(
+            html.contains("50000-pair cap"),
+            "the cap must be visible: {html}"
+        );
+        assert!(
+            html.contains("log.bot.dir") && html.contains("bot-YYYY-MM-DD.jsonl"),
+            "the JSONL stream must be pointed at: {html}"
+        );
+    }
+
+    /// A table that never hit its cap has nothing to warn about: a
+    /// banner that is always there is a banner nobody reads.
+    #[test]
+    fn bots_page_hides_the_saturation_banner_without_drops() {
+        let html = render_bots_page_with_writer(WriterHealth {
+            available: true,
+            alive: true,
+            restarts: 0,
+            window_restarts: 0,
+            failed: false,
+            dropped: 0,
+        });
+        assert!(
+            !html.contains("record(s) were dropped"),
+            "no banner without dropped records: {html}"
+        );
+    }
+
+    /// The Chinese page carries the Chinese banner: a translation gap
+    /// would fall back to English, and the operator would read an
+    /// English warning on a Chinese page.
+    #[test]
+    fn bots_page_shows_the_saturation_banner_in_chinese() {
+        let html = render_bots_page_in(
+            pangolin_core::bot_stats::BotStatsSummary {
+                unique_pairs: 50_000,
+                total_records: 50_007,
+                total_hits: 50_000,
+                dropped_unique_pairs: 7,
+            },
+            WriterHealth {
+                available: true,
+                alive: true,
+                restarts: 0,
+                window_restarts: 0,
+                failed: false,
+                dropped: 0,
+            },
+            Lang::ZhCn,
+        );
+        assert!(
+            html.contains("条记录被丢弃"),
+            "the Chinese banner must be rendered: {html}"
+        );
+        assert!(
+            !html.contains("record(s) were dropped"),
+            "the English banner must not leak into the Chinese page: {html}"
+        );
+    }
+
+    /// The same banner on the referer page — with the referer's own
+    /// wording: there the counts are scoped to a site, while the
+    /// dropped count is process-wide.
+    #[test]
+    fn referers_page_shows_the_saturation_banner() {
+        let html = render_referers_page_with(
+            pangolin_core::referer_stats::RefererStatsSummary {
+                unique_pairs: 3,
+                total_hits: 12,
+                dropped_unique_pairs: 7,
+            },
+            WriterHealth {
+                available: true,
+                alive: true,
+                restarts: 0,
+                window_restarts: 0,
+                failed: false,
+                dropped: 0,
+            },
+        );
+        assert!(
+            html.contains("7 record(s) were dropped process-wide"),
+            "the dropped count must be visible: {html}"
+        );
+        assert!(
+            html.contains("50000-pair cap"),
+            "the cap must be visible: {html}"
+        );
+        assert!(
+            html.contains("log.referer.dir") && html.contains("referer-YYYY-MM-DD.jsonl"),
+            "the JSONL stream must be pointed at: {html}"
+        );
+    }
+
+    /// No drops, no banner — on this page too.
+    #[test]
+    fn referers_page_hides_the_saturation_banner_without_drops() {
+        let html = render_referers_page_with_writer(WriterHealth {
+            available: true,
+            alive: true,
+            restarts: 0,
+            window_restarts: 0,
+            failed: false,
+            dropped: 0,
+        });
+        assert!(
+            !html.contains("record(s) were dropped"),
+            "no banner without dropped records: {html}"
+        );
+    }
+
+    /// The route hands the counter to the page: a table that really
+    /// hit its cap shows the banner.
+    #[tokio::test]
+    async fn bots_page_shows_the_saturation_banner_for_a_saturated_table() {
+        let (_dir, app) = make_test_app();
+        // Fill the `(bot, host)` table to its cap …
+        for i in 0..pangolin_core::bot_stats::MAX_UNIQUE_PAIRS {
+            record_one_googlebot_on(&app, &format!("host-{i}.example.com"));
+        }
+        // … and push one pair past it.
+        record_one_googlebot_on(&app, "host-extra.example.com");
+
+        let resp = render_bots(&app, "csrf-token", Lang::En)
+            .await
+            .expect("render_bots should succeed with a saturated table");
+        let html = response_html(resp).await;
+        assert!(
+            html.contains("record(s) were dropped"),
+            "the saturation must be visible on the page: {html}"
+        );
+    }
+
+    /// The scope predicate answers the same way as the plain domain
+    /// match — the per-host cache must not change a verdict. It is
+    /// asked twice per host on purpose: the second answer comes from
+    /// the cache.
+    #[test]
+    fn the_scope_predicate_agrees_with_the_domain_match() {
+        let domains = vec!["example.com".to_string(), "*.example.net".to_string()];
+        let scope = stats_scope_predicate(true, &domains);
+        for host in [
+            "example.com",
+            "www.example.com",
+            "shop.example.net",
+            "example.net",
+            "other.example.org",
+        ] {
+            let expected = pangolin_core::host_matches_domains(&domains, host);
+            assert_eq!(scope(host), expected, "the verdict for {host}");
+            assert_eq!(scope(host), expected, "the cached verdict for {host}");
+        }
+    }
+
+    /// No site selected ⇒ every row is in scope. The predicate must
+    /// say so without looking at the domain list.
+    #[test]
+    fn the_scope_predicate_accepts_everything_without_a_site() {
+        let scope = stats_scope_predicate(false, &[]);
+        assert!(scope("example.com"));
+        assert!(scope("anything.at.all"));
     }
 
     /// The same panel on the referer page.
@@ -1941,6 +2187,7 @@ mod tests {
             top_rows: vec![],
             health: BotVerificationHealth::default(),
             writer: pangolin_core::supervisor::WriterHealth::default(),
+            stats_cap: pangolin_core::bot_stats::MAX_UNIQUE_PAIRS,
             lang: Lang::En,
         };
         let html = tmpl.render().expect("BotLogsTemplate render");
@@ -1964,6 +2211,7 @@ mod tests {
             top_rows: vec![],
             health,
             writer: pangolin_core::supervisor::WriterHealth::default(),
+            stats_cap: pangolin_core::bot_stats::MAX_UNIQUE_PAIRS,
             lang: Lang::En,
         };
         tmpl.render().expect("BotLogsTemplate render")
