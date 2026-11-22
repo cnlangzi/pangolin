@@ -31,7 +31,7 @@ New to Pangolin? Start here:
 - [The management API](design/api.md) — the dashboard-facing JSON API (`/api/v1/`): the signed-request protocol, the error codes, every resource's shape and the per-resource write semantics (issue #185)
 - [Routing and the in-memory index](design/routing-and-index.md) — the wildcard-domain resolution rule, the four in-memory indexes, the reload triggers and the tunnel registration flow
 - [Tunnel](design/tunnel.md) — the tunnel as a byte splice: the two transports (QUIC + WebSocket/TCP), the CONNECT instruction, the certificate and the trust model, the fallback policy
-- [Reverse Proxy](design/reverse-proxy.md) — `ngx` ↔ `tun` shared reverse-proxy design (v8): `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade
+- [Reverse Proxy](design/reverse-proxy.md) — the forwarding design (v8): one forwarding path, the tunnel as a byte splice, `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade
 - [Access log + SSE real-time push](design/access-log.md) — in-memory access log streamed to the `/logs` admin page (issue #73): ring buffer + `broadcast` channel, replay-then-live SSE, capacity knobs, failure modes
 - [Crawler log](design/bot-log.md) — the `bot-YYYY-MM-DD.jsonl` side-channel, its wire format, the `/logs/bots` pages and its failure modes
 - [Known bots](design/knownbots.md) — the crawler verification model, the address lists a bot has to match, and the registry contract
