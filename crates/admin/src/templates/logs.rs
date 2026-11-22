@@ -119,6 +119,10 @@ pub struct BotLogsTemplate<'a> {
     /// The panel is the only place that tells "no crawler traffic
     /// today" apart from "the writer died": every other view of the
     /// side channel keeps working when the writer task is dead.
+    ///
+    /// `available` is always `true` here — the bot log is always on
+    /// (issue #117) — and the field exists so the shared panel
+    /// fragment can guard itself.
     pub writer: WriterHealth,
     /// The interface language this page is rendered in.
     pub lang: Lang,
