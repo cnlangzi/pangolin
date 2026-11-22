@@ -61,8 +61,8 @@ use crate::templates::logs::{
     RefererStatsPathRow,
 };
 use crate::templates::{
-    BotLogsHistoryTemplate, BotLogsStatsTemplate, BotLogsTemplate, LogsTemplate,
-    RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsTemplate,
+    BotLogsHistoryTemplate, BotLogsStatsTemplate, BotLogsSummaryView, BotLogsTemplate,
+    LogsTemplate, RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsTemplate,
 };
 use pangolin_core::bot_log::list_dates;
 
@@ -159,6 +159,48 @@ pub async fn render_bots(
     };
 
     ok_html_with_csrf(html, csrf)
+}
+
+// ── `/api/logs/bots/summary` (issue #225) ────────────────────────────────
+//
+// The polled fragment of the `/logs/bots` summary region.
+//
+// The counters behind that region move while the page is open —
+// `BotStats::record` runs on every verified crawler request — so the
+// page polls this endpoint every 30 s and swaps the region's
+// content. The fragment is rendered from the *same* partial the page
+// includes, so the swap is byte-identical to what the page painted.
+//
+// The response is `no-store`: it is a snapshot of live counters, and
+// a cached aggregate is a stale one.
+
+/// Serve the `/logs/bots` summary region as a standalone HTML
+/// fragment.
+///
+/// The snapshot is taken under one `RwLock` acquisition (inside
+/// `App::bot_stats_snapshot`), so the cards and the table agree on
+/// `total_records` even under live traffic — same as the page.
+pub async fn api_bots_summary(app: &Arc<App>, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
+    let (top_rows, summary) = app.bot_stats_snapshot();
+    let top_rows = top_rows.into_iter().take(BOT_TOP_N).collect();
+
+    let tmpl = BotLogsSummaryView {
+        summary,
+        top_rows,
+        lang,
+    };
+    let html = match tmpl.render() {
+        Ok(s) => s,
+        Err(e) => {
+            // Same fallback as `render_bots`: log server-side and serve
+            // an empty 200. The browser keeps the markup it already
+            // has, so a failed poll never blanks the region.
+            log::error!("bot logs summary fragment error: {e}");
+            String::new()
+        }
+    };
+
+    crate::routes::helpers::ok_html_no_store(html)
 }
 
 // ── `/logs/bots/history` (stage-3) ───────────────────────────────────────
@@ -1756,6 +1798,124 @@ mod tests {
         assert!(html.contains(">1<"), "hits=1 not rendered: {html}");
         // host column rendered (don't pin full URL, just presence).
         assert!(html.contains("example.com"), "host column missing: {html}");
+    }
+
+    // ── The polled summary region (issue #225) ───────────────────────
+
+    /// The page's counters are a snapshot; the polled fragment is a
+    /// *newer* snapshot.
+    ///
+    /// A gateway under crawler traffic records hits every second, so
+    /// the numbers the operator reads have to catch up on their own —
+    /// that is the whole point of the fragment. The test pins the two
+    /// moments apart: the page is rendered while the log is empty, a
+    /// hit lands, and the fragment then has to report it while the
+    /// page still shows the older truth.
+    #[tokio::test]
+    async fn bots_summary_fragment_reflects_hits_recorded_after_the_page_render() {
+        let (_dir, app) = make_test_app();
+
+        // 1. The page is rendered while no crawler has been seen.
+        let page = render_bots(&app, "csrf-token", Lang::En)
+            .await
+            .expect("render_bots should succeed");
+        let page_html = response_html(page).await;
+        assert!(
+            !page_html.contains("Googlebot"),
+            "the page must not show a bot that had not been recorded yet: {page_html}"
+        );
+
+        // 2. A crawler hits the gateway.
+        record_one_googlebot(&app);
+
+        // 3. The fragment reports the new truth.
+        let resp = api_bots_summary(&app, Lang::En)
+            .await
+            .expect("api_bots_summary should succeed");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let fragment = response_html(resp).await;
+        assert!(
+            fragment.contains("Googlebot"),
+            "the fragment must show the bot recorded after the page render: {fragment}"
+        );
+        assert!(
+            fragment.contains(">1<"),
+            "the fragment must count the hit recorded after the page render: {fragment}"
+        );
+    }
+
+    /// The fragment is a snapshot of live counters, so the browser
+    /// must not reuse a cached copy of it.
+    #[tokio::test]
+    async fn bots_summary_fragment_is_not_cacheable() {
+        let (_dir, app) = make_test_app();
+        let resp = api_bots_summary(&app, Lang::En)
+            .await
+            .expect("api_bots_summary should succeed");
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            cache_control, "no-store",
+            "a polled aggregate must not be reused from the cache"
+        );
+    }
+
+    /// The page and the endpoint render the *same* markup — that is
+    /// what makes the swap invisible.
+    ///
+    /// The three polling attributes have to be on the container (not
+    /// on the content it holds): `innerHTML` replaces the children and
+    /// keeps the container, so the next poll still fires. `outerHTML`
+    /// would replace the container with content that carries no
+    /// polling attributes and the region would freeze after the first
+    /// refresh.
+    #[tokio::test]
+    async fn bots_page_embeds_the_summary_fragment_and_its_poll_attributes() {
+        let (_dir, app) = make_test_app();
+        record_one_googlebot(&app);
+
+        let page = render_bots(&app, "csrf-token", Lang::En)
+            .await
+            .expect("render_bots should succeed");
+        let page_html = response_html(page).await;
+
+        // The polling attributes, on the container.
+        for attribute in [
+            "hx-get=\"/api/logs/bots/summary\"",
+            "hx-trigger=\"every 30s\"",
+            "hx-swap=\"innerHTML\"",
+        ] {
+            assert!(
+                page_html.contains(attribute),
+                "the polling attribute {attribute} is missing: {page_html}"
+            );
+        }
+
+        // The fragment is embedded verbatim — byte-identical to what
+        // the endpoint serves, so the swap cannot rearrange the region.
+        let resp = api_bots_summary(&app, Lang::En)
+            .await
+            .expect("api_bots_summary should succeed");
+        let fragment = response_html(resp).await;
+        assert!(
+            !fragment.is_empty(),
+            "the fragment must not be empty — an empty one would satisfy the check below trivially"
+        );
+        assert!(
+            page_html.contains(&fragment),
+            "the page must embed the polled fragment verbatim"
+        );
+
+        // The "Last seen" column is painted by the browser, so the
+        // page has to repaint it after every swap — otherwise the
+        // column goes blank on the first refresh.
+        assert!(
+            page_html.contains("document.body.addEventListener(\"htmx:afterSwap\", paintLastSeen)"),
+            "the page must repaint the last-seen column after every swap: {page_html}"
+        );
     }
 
     // ── JSONL writer status (issue #219) ───────────────────────────────

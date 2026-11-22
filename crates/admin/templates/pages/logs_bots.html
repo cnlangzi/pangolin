@@ -108,67 +108,16 @@
   {# way, from the same catalog keys.                                    #}
   {% include "components/_writer_status.html" %}
 
-  {# ── Summary card (server-rendered) ─────────────────────────────────── #}
-  {# On first paint the dashboard should show useful state, not a #}
-  {# "no bots detected yet" skeleton. The top-N table + summary #}
-  {# counters come from `BotStats::snapshot()` and are rendered #}
-  {# server-side; the SSE feed below appends new rows in real time. #}
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.total_requests") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
-    </div>
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.distinct_pairs") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.unique_pairs }}</div>
-    </div>
-    <div class="card p-4">
-      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.top_bot") }}</div>
-      <div class="mt-1 text-2xl font-semibold text-slate-900 dark:text-white">
-        {% if top_rows.is_empty() %}
-          <span class="text-slate-400 dark:text-slate-500 text-base font-normal">{{ lang.t("bots.none_yet") }}</span>
-        {% else %}
-          {{ top_rows[0].bot_name }}
-          <span class="text-sm text-slate-500 dark:text-slate-400 font-normal ml-1">{{ lang.tf("bots.hits_suffix", [("n", top_rows[0].hits)]) }}</span>
-        {% endif %}
-      </div>
-    </div>
+  {# ── Summary region (server-rendered, polled every 30 s) ───────────── #}
+  {# The counters behind it keep moving while the page is open, so    #}
+  {# the region polls `/api/logs/bots/summary` and swaps its content. #}
+  {# See docs/design/bot-log.md.                                      #}
+  <div id="bots-summary"
+       hx-get="/api/logs/bots/summary"
+       hx-trigger="every 30s"
+       hx-swap="innerHTML">
+    {% include "views/bots/_summary.html" %}
   </div>
-
-  {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
-  {% if !top_rows.is_empty() %}
-  <div class="card overflow-hidden mb-6">
-    <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("bots.top_bots_title") }}</h2>
-    </div>
-    <div class="overflow-x-auto scrollbar-thin">
-      <table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
-        <thead class="bg-slate-50 dark:bg-slate-800/50">
-          <tr>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("common.bot") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("bots.col.vendor") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-28">{{ lang.t("bots.col.category") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider">{{ lang.t("common.host") }}</th>
-            <th scope="col" class="px-4 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-24">{{ lang.t("common.hits") }}</th>
-            <th scope="col" class="px-4 py-2 text-left text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wider w-32">{{ lang.t("common.last_seen") }}</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-slate-100 dark:divide-slate-700 text-xs">
-          {% for row in top_rows %}
-          <tr class="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
-            <td class="px-4 py-2 whitespace-nowrap font-medium text-slate-900 dark:text-slate-100">{{ row.bot_name }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ row.bot_vendor }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300">{{ row.bot_category }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-600 dark:text-slate-300" title="{{ row.host }}">{{ row.host }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-right tabular-nums font-mono text-slate-700 dark:text-slate-200">{{ row.hits }}</td>
-            <td class="px-4 py-2 whitespace-nowrap text-slate-500 dark:text-slate-400" data-last-seen="{{ row.last_seen }}"></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-  {% endif %}
 
   {# ── Live tail table (client-side SSE) ───────────────────────────────── #}
   <div id="bots-table" class="card overflow-hidden">
@@ -326,6 +275,10 @@
   }
 
   paintLastSeen();
+  // The summary region is replaced every 30 s, and its "Last seen"
+  // cells carry only the raw timestamp — the browser renders them, so
+  // repaint after every swap. `htmx:afterSwap` bubbles to `document.body`.
+  document.body.addEventListener("htmx:afterSwap", paintLastSeen);
 
   // ── SSE connection (mirror of /logs but pointing at the bot stream) ─
   let es = null;

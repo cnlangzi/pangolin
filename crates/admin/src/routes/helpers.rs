@@ -52,6 +52,25 @@ pub fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
     Ok(resp)
 }
 
+/// Build a 200 OK HTML response that the browser must not reuse.
+///
+/// Same body contract as [`ok_html`] — `Content-Type: text/html;
+/// charset=utf-8` — plus `Cache-Control: no-store`.
+///
+/// For the fragments an HTMX poll pulls: they carry a *snapshot* of
+/// live counters, so a cached response is a stale aggregate. At a
+/// 30-second polling cadence a cache hit would be visibly wrong, and
+/// `no-store` says so to the browser and to any proxy in between.
+pub fn ok_html_no_store(body: String) -> http::Result<Response<Full<Bytes>>> {
+    let resp = Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("response builder for 200 OK should not fail");
+    Ok(resp)
+}
+
 /// Return a 302 Found redirect to the given path. Used after a successful
 /// POST/PUT/DELETE to send the user back to the index/list page.
 ///

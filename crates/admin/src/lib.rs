@@ -431,6 +431,9 @@ pub async fn handle(
                     routes::ratelimit::api_rules(&app, &csrf_token, lang).await?
                 } else if rest == "ratelimit/blocked" && method == "GET" {
                     routes::ratelimit::api_blocked(&app, lang).await?
+                } else if rest == "logs/bots/summary" && method == "GET" {
+                    // The polled summary region of /logs/bots (issue #225).
+                    routes::logs::api_bots_summary(&app, lang).await?
                 } else if rest == "ratelimit/rules" && method == "DELETE" {
                     routes::ratelimit::api_handle_delete_rule(
                         &app,

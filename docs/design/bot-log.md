@@ -342,6 +342,54 @@ Filename: `bot-YYYY-MM-DD.jsonl`. UTC day boundary. Operators handle
 retention via `logrotate(8)` / `find -mtime +30 -delete` — the gateway
 itself does not auto-clean up.
 
+## Admin surface
+
+| Page | What it shows |
+| ---- | ------------- |
+| `/logs/bots` | Live view: the summary cards + the top-N `(bot, host)` table + the SSE tail + the verification and JSONL-writer panels. |
+| `/logs/bots/history` | The day's JSONL, filtered and paginated. |
+| `/logs/bots/stats` | The day's rollup: per bot and per URL — hits, unique URLs, last status. |
+| `/api/logs/bots/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
+| `/api/logs/bots/summary` | HTML fragment: the summary cards + the top-N table, re-rendered from the current snapshot. Admin-only (no session ⇒ redirected to `/login`). |
+
+### The summary region refreshes itself
+
+The three summary cards and the top-N table on `/logs/bots` are **not** a
+load-time snapshot. The counters behind them move while the page is open —
+`BotStats::record` runs on every verified crawler request — so on a busy
+gateway the numbers the operator reads drift away from the truth within
+minutes. The page therefore polls `GET /api/logs/bots/summary` every 30
+seconds and swaps the region's `innerHTML`.
+
+Three rules make that safe:
+
+- **The region is one partial.** The page and the endpoint render the same
+  `views/bots/_summary.html`, so the polled fragment is byte-identical to
+  what the page painted. The swap cannot change the markup under the
+  operator's eyes, and the layout does not jump.
+- **The container survives the swap.** The polling attributes live on the
+  container (`hx-get` / `hx-trigger` / `hx-swap="innerHTML"`), not on the
+  content it holds: `innerHTML` replaces the children and keeps the
+  container, so the next poll still fires. `outerHTML` would replace the
+  container with content that carries no polling attributes, and the region
+  would freeze after the first refresh.
+- **The response is not cacheable.** The fragment is served
+  `Cache-Control: no-store` — a reused aggregate is a stale aggregate, and
+  at a 30-second cadence a cache hit would be visibly wrong.
+
+The fragment is rendered in the operator's language, exactly like the page
+it replaces, and the counters keep their meaning: `total_records` is still
+the process-lifetime total.
+
+The "Last seen" column is filled in by the browser — the timestamp is
+rendered in the operator's local time — so the page re-paints it after
+every swap; the server-rendered cell keeps the raw timestamp in
+`data-last-seen`.
+
+The **verification panel** and the **JSONL-writer panel** next to it are
+**not** polled: they follow the knownbots address-list refresh cycle and
+the writer task, not the traffic. They stay server-rendered.
+
 ## Failure modes
 
 | Failure | Behaviour |
@@ -455,3 +503,5 @@ duckdb -c "
 | Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`), with the window's restart count published for the panel; a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted; an aborted supervisor takes the writer task with it |
 | Unit | `app::tests::*` (issue #219) | The writer health reports a running writer, and an unavailable one when the referer log is disabled; the graceful shutdown stops the supervisor; a writer that panicked keeps writing the day's file after the restart, and the panel sees the restart |
 | Unit | `admin::routes::logs::tests::*` (issue #219) | The `/logs/bots` and `/logs/referers` pages show the writer's state — "Running" while it is alive, "Stopped: automatic repair failed after N restart(s)" once the budget is spent, and the "Queue was full; dropped N entry(s)" line when the hot path had to drop rows |
+| Unit | `admin::routes::logs::tests::*` (issue #225) | The polled summary fragment reflects the hits recorded **after** the page was rendered — the page and the fragment cannot show two different truths; the page embeds the fragment verbatim (byte-identical markup) and carries the polling attributes (`hx-get` / `hx-trigger="every 30s"` / `hx-swap="innerHTML"`) plus the `htmx:afterSwap` re-paint of the "Last seen" column; the fragment is served `Cache-Control: no-store` |
+| e2e | `admin_ui_bots_summary_endpoint_serves_the_polled_fragment` (issue #225) | A signed-in operator gets the three summary cards from `GET /api/logs/bots/summary`; an unauthenticated request is redirected to `/login` and never sees the fragment |

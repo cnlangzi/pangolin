@@ -128,6 +128,32 @@ pub struct BotLogsTemplate<'a> {
     pub lang: Lang,
 }
 
+/// The polled summary region of `/logs/bots` — the three summary
+/// cards and the top-N `(bot, host)` table.
+///
+/// The page includes the same partial
+/// ([`views/bots/_summary.html`](askama::Template::render)), and
+/// `GET /api/logs/bots/summary` renders it on its own: the page
+/// polls that endpoint every 30 s so the counters behind the
+/// region do not drift away from the truth while the operator
+/// watches it.
+///
+/// The two renders must produce **byte-identical** markup, or the
+/// swap would rearrange the region under the operator's eyes. That
+/// is why this struct carries exactly the fields the partial reads
+/// — `summary`, `top_rows` and `lang` — and why the page and the
+/// endpoint share the one template file.
+#[derive(Template)]
+#[template(path = "views/bots/_summary.html")]
+pub struct BotLogsSummaryView {
+    /// The process-lifetime counters behind the cards.
+    pub summary: BotStatsSummary,
+    /// The top-N rows, hits descending.
+    pub top_rows: Vec<BotStatsRow>,
+    /// The interface language this fragment is rendered in.
+    pub lang: Lang,
+}
+
 /// Echo of the current filter form values, so the page can
 /// re-populate the inputs on first paint (and the pagination
 /// controls can preserve them across page navigation).
