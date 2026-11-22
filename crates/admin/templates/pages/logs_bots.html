@@ -137,10 +137,13 @@
 
   {# ── Saturation banner (server-rendered) ────────────────────────────── #}
   {# The in-memory `(bot × host)` table is capped. Past the cap the  #}
-  {# counters keep ticking but the rows are dropped, so the totals   #}
-  {# above count them and the table below does not. The banner says #}
-  {# so, with the number of dropped records and the cap, and points #}
-  {# at the JSONL stream, which holds every row.                      #}
+  {# counters keep ticking but the rows are dropped, so the request  #}
+  {# total above counts them, the pair count stops at the cap, and #}
+  {# the table below does not have them. The banner says so, with    #}
+  {# the number of dropped records and the cap, and points at the    #}
+  {# JSONL stream — the per-day log the rows are written to. (That  #}
+  {# stream has its own drop counter, reported by the writer panel  #}
+  {# above.)                                                            #}
   {% if summary.dropped_unique_pairs > 0 %}
   <div class="card overflow-hidden mb-6">
     <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">

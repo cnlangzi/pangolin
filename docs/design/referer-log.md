@@ -207,14 +207,14 @@ userinfo must not be stored at all — it is a credential.
 | ---- | ------------- | ----- |
 | `referer_log_recent` | Ring buffer of recent rows for late-join replay | `log.referer.recent` (default 200; `0` disables) |
 | `referer_log_tx` | Broadcast channel for live subscribers | `log.referer.capacity` (default 1000) |
-| `referer_stats` | Per-`(referer_host, host)` hit counters + last-seen | 50 000 distinct pairs; further pairs are counted but not stored |
+| `referer_stats` | Per-`(referer_host, host)` hit counters + last-seen | 50 000 distinct pairs; further pairs are dropped and counted in the saturation counter |
 | `referer_writer` | Background JSONL writer | 10 000 queued rows; the oldest is dropped on overflow |
 | `referer_writer_state` | The supervisor's state for that writer | 5 restarts per rolling window |
 
 The pair cap matters here in a way it does not for bots: a referral stream is
 attacker-shaped — anyone can send a `Referer` header naming a host of their
-choosing. Past the cap the counters keep ticking but the new pairs are not
-stored, and the saturation is visible to the operator.
+choosing. Past the cap the new pairs are not stored: they are counted in the
+saturation counter, and the saturation is visible to the operator.
 
 `referer_stats` is read through one query,
 `RefererStats::top_n(n, in_scope)`: a single pass over the pair map that
@@ -265,13 +265,13 @@ same site are aggregated together rather than split per host.
 
 When the in-memory pair table is saturated, `/logs/referers` shows a
 **saturation banner** under the summary cards: how many records were dropped,
-the cap they were dropped at, and where the complete data lives
-(`log.referer.dir/referer-YYYY-MM-DD.jsonl`). The dropped count is
-process-wide, so the banner shows it whatever the site scope is; the counts it
-sits between are scoped, and they do not include the dropped records. The
-banner quotes the cap from the code constant, so a bump of
-`referer_stats::MAX_UNIQUE_PAIRS` shows up on the page without a translation
-change.
+the cap they were dropped at, and where the per-day JSONL stream is
+(`log.referer.dir/referer-YYYY-MM-DD.jsonl`) — the stream has its own drop
+counter, reported by the writer panel. The dropped count is process-wide, so
+the banner shows it whatever the site scope is; the counts it sits between are
+scoped, and they do not include the dropped records. The banner quotes the cap
+from the code constant, so a bump of `referer_stats::MAX_UNIQUE_PAIRS` shows up
+on the page without a translation change.
 
 The history page and the stats page apply the same filters (`referer_host`,
 `host`, `path`, `status`, `method`, `client_ip`) to the same day's file, and

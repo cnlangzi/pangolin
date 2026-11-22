@@ -92,7 +92,9 @@
   {# the rows are dropped, so the counts above and the table below   #}
   {# do not hold them. The dropped counter is process-wide — it says #}
   {# "the table is saturated", not "this scope is missing rows" — so #}
-  {# the banner shows it whatever the site scope is.                  #}
+  {# the banner shows it whatever the site scope is. The JSONL stream #}
+  {# it points at is the per-day log the rows are written to; that    #}
+  {# stream has its own drop counter, reported by the writer panel.  #}
   {% if summary.dropped_unique_pairs > 0 %}
   <div class="card overflow-hidden mb-6">
     <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">

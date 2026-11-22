@@ -53,6 +53,20 @@ pub mod subnav {
     pub const STATS: &str = "stats";
 }
 
+/// The placeholders of the saturation banner: the number of records
+/// the in-memory pair table dropped and the cap it dropped them at.
+///
+/// Both pages render the same banner, so the placeholders live here
+/// and not twice — the two texts must not drift apart.
+///
+/// Both values are numbers, so they are rendered as one type: the
+/// template cannot spell the conversion. An array rather than a
+/// `Vec`, because the banner is rendered on every page load and the
+/// array needs no allocation.
+fn saturation_placeholders(dropped: u64, cap: usize) -> [(&'static str, u64); 2] {
+    [("n", dropped), ("cap", cap as u64)]
+}
+
 /// Full-page template for `GET /logs`.
 ///
 /// Fields mirror the other page templates: `csrf_token` is empty
@@ -136,16 +150,10 @@ pub struct BotLogsTemplate<'a> {
 }
 
 impl BotLogsTemplate<'_> {
-    /// The placeholders of the saturation banner: the number of
-    /// records the pair table dropped and the cap it dropped them at.
-    ///
-    /// Both are numbers, so they are rendered as one type — the
-    /// template cannot spell the conversion.
-    pub fn saturation_args(&self) -> Vec<(&'static str, u64)> {
-        vec![
-            ("n", self.summary.dropped_unique_pairs),
-            ("cap", self.stats_cap as u64),
-        ]
+    /// The placeholders of the saturation banner. See
+    /// [`saturation_placeholders`].
+    pub fn saturation_args(&self) -> [(&'static str, u64); 2] {
+        saturation_placeholders(self.summary.dropped_unique_pairs, self.stats_cap)
     }
 }
 
@@ -643,16 +651,10 @@ pub struct RefererLogsTemplate<'a> {
 }
 
 impl RefererLogsTemplate<'_> {
-    /// The placeholders of the saturation banner: the number of
-    /// records the pair table dropped and the cap it dropped them at.
-    ///
-    /// Both are numbers, so they are rendered as one type — the
-    /// template cannot spell the conversion.
-    pub fn saturation_args(&self) -> Vec<(&'static str, u64)> {
-        vec![
-            ("n", self.summary.dropped_unique_pairs),
-            ("cap", self.stats_cap as u64),
-        ]
+    /// The placeholders of the saturation banner. See
+    /// [`saturation_placeholders`].
+    pub fn saturation_args(&self) -> [(&'static str, u64); 2] {
+        saturation_placeholders(self.summary.dropped_unique_pairs, self.stats_cap)
     }
 
     /// The selected site's domain literals as a space-separated

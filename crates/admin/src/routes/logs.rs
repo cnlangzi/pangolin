@@ -1025,8 +1025,7 @@ pub async fn render_referers(
     // The scope stays here, in the admin layer: "the selected site's
     // domains" is the admin's notion, so the counter only takes a
     // predicate.
-    let scope =
-        |host: &str| !site_scoped || pangolin_core::host_matches_domains(&site_domains, host);
+    let scope = stats_scope_predicate(site_scoped, &site_domains);
     let (top_rows, summary) = app.referer_stats_top_n(REFERRER_TOP_N, scope);
 
     // The writer's health comes from the supervisor's state — the
@@ -1246,6 +1245,33 @@ fn site_scope(
         return None;
     }
     Some(pangolin_core::RefererSiteFilter::from_index(site, domain))
+}
+
+/// The scope predicate for the referer stats query.
+///
+/// The predicate runs while the stats table holds its read lock, and
+/// it is not free: it normalises the host and walks the site's
+/// domain list. A pair table holds many pairs per host, so the answer
+/// is cached per host — the predicate then runs once per *host*
+/// instead of once per pair.
+///
+/// No site selected ⇒ every row is in scope, and the predicate
+/// answers without touching the domain list at all.
+fn stats_scope_predicate(site_scoped: bool, site_domains: &[String]) -> impl Fn(&str) -> bool {
+    let cache: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    move |host: &str| {
+        if !site_scoped {
+            return true;
+        }
+        let cached = cache.borrow().get(host).copied();
+        if let Some(in_scope) = cached {
+            return in_scope;
+        }
+        let in_scope = pangolin_core::host_matches_domains(site_domains, host);
+        cache.borrow_mut().insert(host.to_string(), in_scope);
+        in_scope
+    }
 }
 
 /// Internal result of [`build_referer_history_page`].
@@ -1917,7 +1943,7 @@ mod tests {
             },
         );
         assert!(
-            html.contains("7 records were dropped"),
+            html.contains("7 record(s) were dropped"),
             "the dropped count must be visible: {html}"
         );
         assert!(
@@ -1943,7 +1969,7 @@ mod tests {
             dropped: 0,
         });
         assert!(
-            !html.contains("records were dropped"),
+            !html.contains("record(s) were dropped"),
             "no banner without dropped records: {html}"
         );
     }
@@ -1975,7 +2001,7 @@ mod tests {
             "the Chinese banner must be rendered: {html}"
         );
         assert!(
-            !html.contains("records were dropped"),
+            !html.contains("record(s) were dropped"),
             "the English banner must not leak into the Chinese page: {html}"
         );
     }
@@ -2001,7 +2027,7 @@ mod tests {
             },
         );
         assert!(
-            html.contains("7 records were dropped process-wide"),
+            html.contains("7 record(s) were dropped process-wide"),
             "the dropped count must be visible: {html}"
         );
         assert!(
@@ -2026,7 +2052,7 @@ mod tests {
             dropped: 0,
         });
         assert!(
-            !html.contains("records were dropped"),
+            !html.contains("record(s) were dropped"),
             "no banner without dropped records: {html}"
         );
     }
@@ -2048,9 +2074,39 @@ mod tests {
             .expect("render_bots should succeed with a saturated table");
         let html = response_html(resp).await;
         assert!(
-            html.contains("records were dropped"),
+            html.contains("record(s) were dropped"),
             "the saturation must be visible on the page: {html}"
         );
+    }
+
+    /// The scope predicate answers the same way as the plain domain
+    /// match — the per-host cache must not change a verdict. It is
+    /// asked twice per host on purpose: the second answer comes from
+    /// the cache.
+    #[test]
+    fn the_scope_predicate_agrees_with_the_domain_match() {
+        let domains = vec!["example.com".to_string(), "*.example.net".to_string()];
+        let scope = stats_scope_predicate(true, &domains);
+        for host in [
+            "example.com",
+            "www.example.com",
+            "shop.example.net",
+            "example.net",
+            "other.example.org",
+        ] {
+            let expected = pangolin_core::host_matches_domains(&domains, host);
+            assert_eq!(scope(host), expected, "the verdict for {host}");
+            assert_eq!(scope(host), expected, "the cached verdict for {host}");
+        }
+    }
+
+    /// No site selected ⇒ every row is in scope. The predicate must
+    /// say so without looking at the domain list.
+    #[test]
+    fn the_scope_predicate_accepts_everything_without_a_site() {
+        let scope = stats_scope_predicate(false, &[]);
+        assert!(scope("example.com"));
+        assert!(scope("anything.at.all"));
     }
 
     /// The same panel on the referer page.

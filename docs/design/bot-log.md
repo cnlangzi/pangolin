@@ -237,10 +237,11 @@ cap dropped.
 
 When `dropped_unique_pairs` is not zero, `/logs/bots` shows a
 saturation banner under the summary cards: how many records were
-dropped, the cap they were dropped at, and where the complete data
-lives (`log.bot.dir/bot-YYYY-MM-DD.jsonl`). The banner quotes the cap
-from the code constant, so a bump of `MAX_UNIQUE_PAIRS` shows up on
-the page without a translation change.
+dropped, the cap they were dropped at, and where the per-day JSONL
+stream is (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) — the stream has its
+own drop counter, reported by the writer panel. The banner quotes the
+cap from the code constant, so a bump of `MAX_UNIQUE_PAIRS` shows up
+on the page without a translation change.
 
 ### `crates/pangolin-core/src/app.rs`
 
