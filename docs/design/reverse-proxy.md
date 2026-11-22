@@ -77,7 +77,7 @@ matrix; only the transport and the schema-specific bits vary.
 
 | Layer | Shared? | Lives in | Used by |
 |---|---|---|---|
-| Path-prefix join (`url` + request path + query) | n/a (caller's job) | — | `ngx` direct, `ngx` tunnel |
+| Path-prefix join (`url` + request path + query) | n/a (caller's job) | — | `ngx` tunnel |
 | `Host` header rewrite (`host_mode` policy) | **yes** | `pangolin_core::proxy::apply_proxy_policy` | `ngx` direct, `ngx` tunnel |
 | Hop-by-hop header stripping | **yes** | `pangolin_core::proxy::strip_hop_by_hop_headers` | the gateway's `file://` branch; the upstream paths let pingora strip them |
 | `X-Forwarded-Host` / `X-Forwarded-Proto` | **yes** | same | `ngx` direct, `ngx` tunnel |
@@ -90,6 +90,17 @@ matrix; only the transport and the schema-specific bits vary.
 file-serve function — and all three of them sit on the **gateway**
 side. The tun shares none of them: it applies no policy and speaks no
 HTTP.
+
+Two cells of the matrix in §2 do not behave like the rest today, and
+both are visible in the code rather than in the design:
+
+- a `file://` backend **behind a tunnel** is refused with a 501 — the
+  splice cannot carry a local file (§8);
+- a **path prefix on a direct backend** (`http://10.0.0.1:8080/apis`)
+  is not joined onto the request path. `upstream_request_filter`
+  applies the prefix only to a tunnelled backend, because the
+  pre-#153 tunnel path was the one that joined it. A direct backend
+  written with a prefix therefore loses it — see §13.
 
 Since issue #153 the tunnel is a **splice**: the tun is a byte relay
 and no longer runs an HTTP client of its own, so the `tun` column
@@ -279,41 +290,49 @@ change without any tun-side state to invalidate.
 
 ```
                      ngx::request_filter
-                            │
-                  ┌─────────┴─────────┐
-              ACME challenge?      (no)
-                  │                   │
-                  ▼                   ▼
-             served here          site lookup
-                                     │
-                                     ▼
-                            parse_backend_to_target
-                                     │
-                  ┌──────────────────┴────────────────┐
-                  │                                   │
-                  file:// (direct)                                   everything else
-                  │                                   │
-                  ▼                                   ▼
-                  serve_file_target                                   fall through to pingora
-                  (the gateway serves the                                   │
-                   file itself)                                   │
-                                                      ▼
-                                                      upstream_peer
-                                                      │
-                  ┌───────────────────────────────────┐
-                  │                                   │
-                  direct peer                                   tunnel peer
-                  (pingora's TCP/TLS)                                   (custom_l4 → TunnelConnector
-                                                       → a tunnel byte stream)
-                  │                                   │
-                  └───────────────────────────────────┘
-                                    │
-                                    upstream_request_filter
-                                    (the policy, every backend)
-                                    │
-                                    ▼
-                                    pingora's HTTP client
-                                    (streams H1/H2 natively, on both paths)
+                              │
+                              ▼
+                    ┌─────────┴──────────┐
+                    │ACME challenge? (no)│
+                    └────────────────────┘
+                    │                    │
+                    ▼                    ▼
+               served here          site lookup
+                                         │
+                                         ▼
+                              parse_backend_to_target
+                                         │
+              ┌──────────────────────────┴──────────────────────────┐
+              │                                                     │
+              ▼                                                     ▼
+    ┌─────────▼─────────────┐                             ┌─────────▼──────────────┐
+    │file:// (direct)       │                             │everything else         │
+    │                       │                             │                        │
+    │serve_file_target      │                             │fall through to pingora │
+    │(the gateway serves    │                             └────────────────────────┘
+    │ the file itself)      │
+    └───────────────────────┘
+
+                         upstream_peer
+                               │
+                               ▼
+            ┌──────────────────┴──────────────────┐
+            │                                     │
+            ▼                                     ▼
+       direct peer                           tunnel peer
+   (pingora's TCP/TLS)                      (custom_l4 →
+                                          TunnelConnector →
+                                        a tunnel byte stream)
+            │                                     │
+            └──────────────────┴──────────────────┘
+                               │
+                               ▼
+                    upstream_request_filter
+                  (the policy, every backend)
+                               │
+                               ▼
+                     pingora's HTTP client
+            (streams H1/H2 natively, on both paths)
 ```
 
 The `request_filter` does the routing. It applies the proxy policy
@@ -516,7 +535,7 @@ published crate's own unit tests.
 | I-12 | `serve_file_target` returns 304 on ETag match | `serve_file_etag_304` |
 | I-13 | `serve_file_target` honors Range | `serve_file_range` |
 | I-14 | `serve_file_target` sets `Content-Type` from extension | `serve_file_mime` |
-| I-15 | Tunnel path: method round-trips byte-exact (all 7 verbs) | `real_e2e_tunnel_http_request_through_tun` (tunnel path); `real_e2e_proxy_forwards_all_methods_on_api_path` (all seven verbs, direct path) |
+| I-15 | Tunnel path: method round-trips byte-exact | `real_e2e_tunnel_http_request_through_tun` (a POST through the tunnel); `real_e2e_proxy_forwards_all_methods_on_api_path` (all seven verbs, direct path) |
 | I-16 | Tunnel path: path + query round-trips byte-exact | `real_e2e_tunnel_path_invariant_across_host_modes` |
 | I-17 | Tunnel path: body round-trips byte-exact | `real_e2e_tunnel_http_request_through_tun` |
 | I-18 | Tunnel path: `host_mode` reaches backend with correct Host | `real_e2e_tunnel_host_mode_passthrough_preserves_host`, `real_e2e_tunnel_host_mode_backend_overrides_host` |
@@ -536,45 +555,47 @@ published crate's own unit tests.
 ## 11. Layered architecture summary
 
 ```
-                           ┌──────────────────────────────────────────────┐
-                           │ pangolin-core (shared)                       │
-                           │                                              │
-                           │ proxy.rs                                     │
-                           │  - HttpRequest, HttpResponse                 │
-                           │  - ProxyCtx, BackendTarget                   │
-                           │  - apply_proxy_policy                        │
-                           │  - parse_backend_to_target                   │
-                           │  - is_streaming_request (accounting only)    │
-                           │  - serve_file_target (one file impl)         │
-                           │  - strip_hop_by_hop_headers                  │
-                           │                                              │
-                           │ parse.rs (existing)                          │
-                           │  - parse_backend                             │
-                           └───────────────────────┬──────────────────────┘
-                                                   │
-                           ┌───────────────────────┴───────────────────────┐
-                           │                                               │
-    ┌──────────────────────▼─────────────────────┐    ┌────────────────────▼───────────────────┐
-    │ pangolin-ngx (the gateway)                 │    │ pangolin-tun (the published crate)     │
-    │                                            │    │                                        │
-    │ proxy.rs                                   │    │ tunnel.rs                              │
-    │  - request_filter (routing, ACME,          │    │  - TunnelTransport                     │
-    │    file://, traffic class)                 │    │  - CONNECT instruction                 │
-    │  - upstream_peer (direct peer or           │    │  - relay_bidirectional (half-close)    │
-    │    tunnel peer)                            │    │  - quic.rs / ws.rs (the transports)    │
-    │  - upstream_request_filter (the            │    │  - pin.rs (TOFU trust)                 │
-    │    policy, for every backend)              │    │                                        │
-    │                                            │    │ client.rs                              │
-    │ tunnel/connector.rs                        │    │  - TunnelClient                        │
-    │  - TunnelConnector (pingora L4Connect)     │    │                                        │
-    │  - tunnel_group_key                        │    │ (no site cache, no DB,                 │
-    │                                            │    │  no HTTP client, stateless)            │
-    │ tunnel/quic.rs (the QUIC transport)        │    └────────────────────────────────────────┘
-                           │                                               │
-                           └───────────────────────────────────────────────┘
-                                                   │
-
-                          raw bytes over the tunnel (QUIC, or yamux over WS)
+                      ┌─────────────────────────────────────────┐
+                      │pangolin-core (shared)                   │
+                      │                                         │
+                      │proxy.rs                                 │
+                      │ - HttpRequest, HttpResponse             │
+                      │ - ProxyCtx, BackendTarget               │
+                      │ - apply_proxy_policy                    │
+                      │ - parse_backend_to_target               │
+                      │ - is_streaming_request (accounting only)│
+                      │ - serve_file_target (one file impl)     │
+                      │ - strip_hop_by_hop_headers              │
+                      │                                         │
+                      │parse.rs (existing)                      │
+                      │ - parse_backend                         │
+                      └────────────────────┬────────────────────┘
+                                           │
+                      ┌────────────────────┴────────────────────┐
+                      │                                         │
+  ┌───────────────────▼──────────────────┐    ┌─────────────────▼─────────────────┐
+  │pangolin-ngx (the gateway)            │    │pangolin-tun (the published crate) │
+  │                                      │    │                                   │
+  │proxy.rs                              │    │tunnel.rs                          │
+  │ - request_filter (routing, ACME,     │    │ - TunnelTransport                 │
+  │   file://, traffic class)            │    │ - CONNECT instruction             │
+  │ - upstream_peer (direct peer or      │    │ - relay_bidirectional (half-close)│
+  │   tunnel peer)                       │    │ - quic.rs / ws.rs (the transports)│
+  │ - upstream_request_filter (the       │    │ - pin.rs (TOFU trust)             │
+  │   policy, for every backend)         │    │                                   │
+  │                                      │    │client.rs                          │
+  │tunnel/connector.rs                   │    │ - TunnelClient                    │
+  │ - TunnelConnector (pingora L4Connect)│    │                                   │
+  │ - tunnel_group_key                   │    │(no site cache, no DB,             │
+  │                                      │    │ no HTTP client, stateless)        │
+  │tunnel/quic.rs (the QUIC transport)   │    │                                   │
+  │tunnel.rs (the WS/TCP fallback)       │    │                                   │
+  └──────────────────────────────────────┘    └───────────────────────────────────┘
+                      │                                         │
+                      └─────────────────────────────────────────┘
+                                           │
+                               raw bytes over the tunnel
+                               (QUIC, or yamux over WS)
 ```
 
 The `crates/tun/` crate in this repository is the **binary and its
@@ -626,6 +647,13 @@ To keep the scope tight:
   coverage assumes `passthrough`; we should add explicit
   direct-path e2e for `Backend` and `Custom` to lock the
   `upstream_request_filter` behaviour.
+- **Path prefix on a direct backend.** `upstream_request_filter`
+  joins a backend URL's path prefix onto the request path only for a
+  tunnelled backend. A direct backend written
+  `http://10.0.0.1:8080/apis` loses the `/apis` and is served under
+  the bare request path. Either the join belongs on both paths, or the
+  direct path should refuse such a backend outright rather than serve
+  it under the wrong path.
 - **Tunnel + https backend e2e.** The peer for an `https://`
   backend behind a tunnel is built with TLS enabled, so the
   handshake runs end-to-end over the splice — but no e2e test

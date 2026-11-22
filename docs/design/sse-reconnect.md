@@ -31,8 +31,9 @@ layer in between and no body-forwarding loop of our own.
 When a client browser disconnects mid-stream, pingora drops the
 upstream connection. On the tunnelled path that upstream connection
 *is* a tunnel byte stream, so dropping it closes the stream; the tun
-reads the end of the request and its relay shuts the backend
-connection down.
+reads the end of the request and its relay tears the backend
+connection down — see "The tunnel stream's close reaches the tun's
+relay" below for the two shapes that teardown takes.
 
 **Before the splice rewrite (issue #153)** the tun held the response:
 it buffered the whole body before forwarding it and ran its own
@@ -111,9 +112,9 @@ product or implement `Last-Event-ID` in their own backend.
 
 | File | Change | Reason |
 |---|---|---|
-| `pangolin-tun` crate (the tun-side client, issue #159) | The relay (`relay_bidirectional`) copies bytes in both directions and ends the relay on the **first error** either side reports: both directions are torn down and the error is returned. A failed read is not an end-of-file — it says the bytes that were still to come will never come. | Close the backend TCP promptly when the tunnel stream fails, so a client disconnect reaches the backend instead of lingering until the OS-level FIN/RST timeout. |
+| `pangolin-tun` crate (the tun-side client, issue #159) | **Before issue #153** the tun matched on the result of its own `tokio::io::copy` and called `backend.shutdown().await` on `Err`. The published crate's relay does the same job differently: it copies bytes in both directions and ends the relay on the **first error** either side reports — both directions are torn down and the error is returned. A failed read is not an end-of-file: it says the bytes that were still to come will never come. | Close the backend TCP promptly when the tunnel stream fails, so a client disconnect reaches the backend instead of lingering until the OS-level FIN/RST timeout. |
 | `crates/ngx/src/proxy.rs` | A comment block above the streaming handling in `request_filter`. **No code change.** | Lock the contract that the gateway does not relay the body itself — pingora does — and that a streaming request is not routed down a separate path. |
-| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend TCP closes within 2 s of client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — the direct path skips the tun hop, so it should propagate faster). |
+| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend sees the end of its request within 2 s of the client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — the direct path skips the tun hop, so it should propagate faster). |
 | `docs/design/sse-reconnect.md` | This document | Record the contract. |
 
 ### The tunnel stream's close reaches the tun's relay
@@ -125,29 +126,44 @@ The teardown on the tunnelled path runs from the gateway outwards:
    is bridged onto (`crates/ngx/src/tunnel/connector.rs`), so the
    bridge sees the end of file.
 2. The bridge shuts the tunnel stream's write half down and then
-   drops it. The tun reads an end-of-file on that stream.
-3. The tun's `relay_bidirectional` reacts to the end of the request
-   direction with its half-close: it shuts the **backend's write
-   side** down and keeps the response direction running. The backend
-   sees the end of its request, and the connection is over for it.
-   On the QUIC transport the dropped receive side also stops the
-   tun's writes, so the relay tears both directions down and the
-   backend socket goes with it.
+   drops it. The tun reads an **end-of-file** on that stream: the
+   request direction is over.
+3. What the tun does next depends on what the *other* direction does,
+   and the two transports differ:
 
-The half-close in step 3 is not a weakness — it is what the tunnel's
-relay is for: a response that only arrives after the request is
-complete still has to reach the client. What matters for this
-contract is that it is prompt: the backend learns about the
-disconnect within the SLO the e2e pins — 2 s on the tunnel path, 1 s
-on the direct path.
+| | the tun's next write to the tunnel | the relay's outcome | the backend socket |
+|---|---|---|---|
+| QUIC (primary) | **fails** — the dropped receive side stops the tun's writes | the error path: both directions are torn down, the error is returned | dropped — a full close |
+| WebSocket/TCP fallback | still succeeds — the multiplexer has closed the stream, so the frames are discarded | the half-close path: the backend's **write side** is shut down, the response direction keeps running | half-closed — the backend sees the end of its request |
 
-**Implication for the SSE teardown**: the relay's teardown is already
-the **most aggressive teardown available** on this path. The stream
-is closed by the time the relay sees it, so there is nothing left for
-the gateway to shut down, and a second teardown would slow the
-disconnect path down rather than speed it up. The comment block above
-the streaming handling makes this explicit so a future refactor does
-not try to "improve" it.
+**The error path is the one that closes the backend outright.** The
+published crate's `relay_bidirectional` treats a failed read or write
+as an error, not as an end-of-file — it says the bytes that were
+still to come will never come — so it tears both directions down and
+returns the error, and the backend socket is dropped with it.
+
+The half-close path is not a weakness in itself: it is what the
+tunnel's relay is for, because a response that only arrives after the
+request is complete still has to reach the client. But it leaves the
+backend socket open on the fallback transport, so the backend learns
+about the disconnect through the end of its request rather than
+through a closed socket.
+
+**What the e2e actually observes.**
+`real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` pins
+that the backend's **read** returns within 2 s of the client drop —
+the backend sees the end of its request. It does **not** pin that the
+backend's socket is closed, and it does not pin a transport: the tun
+it starts uses the default `auto` selector, so in practice it is the
+QUIC path that is measured.
+
+**Implication for the SSE teardown**: on the QUIC path the relay's
+error teardown is already the **most aggressive teardown available** —
+the stream is closed by the time the relay sees it, so there is
+nothing left for the gateway to shut down, and a second teardown
+would slow the disconnect path down rather than speed it up. The
+comment block above the streaming handling makes this explicit so a
+future refactor does not try to "improve" it.
 
 ## Data-loss contract (CDN-equivalent)
 
@@ -157,7 +173,7 @@ from any other byte-pump proxy.
 
 | Scenario | nginx behaviour | pangolin behaviour |
 |---|---|---|
-| Client disconnects mid-stream | Drop upstream connection within milliseconds; backend receives FIN/RST | Drop the upstream connection; on the tunnel path that closes the tunnel stream, and the relay's teardown closes the backend TCP (FIN) — the e2e pins 2 s on the tunnel path and 1 s on the direct path |
+| Client disconnects mid-stream | Drop upstream connection within milliseconds; backend receives FIN/RST | Drop the upstream connection; on the tunnel path that closes the tunnel stream, and the relay's teardown reaches the backend — the backend sees the end of its request well inside a second (the e2e pins 2 s on the tunnel path and 1 s on the direct path) |
 | Backend pushes while no listener is connected | Events lost at the nginx boundary | Events lost at the tun boundary — same model, different host |
 | Proxy process restarts | In-flight events lost | In-flight events lost |
 | Backend crashes | Upstream errors; client sees RST / ECONNRESET | Same |
@@ -222,6 +238,11 @@ Unit
 - `cargo test -p pangolin-core --lib`
 - `cargo test -p pangolin-core is_streaming_request_*`
 
+e2e — the suite drives the **real** `pangolin-ngx` and `pangolin-tun`
+binaries as subprocesses, so it needs the release binaries in
+`target/release/`: run `make build` (or
+`cargo build --release -p ngx -p tun`) first.
+
 e2e (existing — must still pass)
 - `cargo test -p pangolin-integration-tests --features integration --lib sse_e2e::`
   — the whole SSE suite
@@ -244,10 +265,10 @@ Observability
 - A streaming request for a `file://` backend is refused with a 415 and
   logged at warn level:
   `SSE: refused on file:// backend for <host> (file:// has no streaming concept)`.
-- The teardown itself is not a log event: the relay's job is to end
-  the relay, and it does. A tunnel **session** that dies is a
-  different thing and is logged — see
-  [`tunnel.md`](tunnel.md).
+- The teardown itself is not a log event: the relay ends the relay
+  and returns the error to its caller, which does not log it. A
+  tunnel **session** that dies is a different thing and is logged —
+  see [`tunnel.md`](tunnel.md).
 
 ## References
 
@@ -255,8 +276,8 @@ Observability
   tun's client moved to the published `pangolin-tun` crate in issue
   #159); it ends the relay on the first error either side reports
 - `crates/ngx/src/tunnel/connector.rs` — the bridge between the tunnel
-  stream and the socket pingora writes into; dropping the socket is
-  what drops the tunnel stream
+  stream and the socket pingora writes into; the end of the socket is
+  what closes the tunnel stream
 - `crates/ngx/src/proxy.rs` — the streaming detection in `request_filter`
   and the `SSE:` log lines
 - `tests/src/sse_e2e.rs::real_e2e_tunnel_sse_client_disconnect_propagates_to_backend`
