@@ -1,17 +1,16 @@
 # SSE / Streaming Reconnect — Stateless half-close contract
 
-> **Status**: shipped on the `fix/sse_reconnect_buffer` branch
-> (commit `d27c59b`). Defines the contract pangolin provides
+> **Status**: shipped. Defines the contract pangolin provides
 > for SSE / long-lived chunked responses when a client disconnects and
 > (later) reconnects.
 >
 > **Note (issue #153)**: the tunnel is a byte splice now, so the
 > gateway streams the response with pingora's own HTTP client on
-> **both** the direct and the tunnelled path — the separate
-> tun-side streaming path this doc describes is gone. The *contract*
+> **both** the direct and the tunnelled path — the separate tun-side
+> streaming path this doc used to describe is gone. The *contract*
 > (a client disconnect must reach the backend promptly) is
 > unchanged and still holds; the mechanism is now the tunnel
-> stream's reset reaching the tun's relay.
+> stream's close reaching the tun's relay.
 
 This doc captures the behaviour **pangolin does and does not provide** for
 SSE-style streams. For the transport-level details (the byte splice,
@@ -22,19 +21,31 @@ direct-path streaming flow (pingora-native, no buffering), see
 
 ## Context
 
-`pangolin-ngx` exposes a tunnel path for SSE / long-lived streaming
-responses (the `is_streaming_request` heuristic). When a client
-browser disconnects mid-stream, the gateway detects the close on
-`session.write_response_body` error and exits its body-forwarding loop
-([`crates/ngx/src/proxy.rs:1208-1226`](../../crates/ngx/src/proxy.rs)).
-The tun-side `tokio::io::copy(backend → yamux_stream)` keeps running
-until the yamux send window fills, and the backend TCP connection
-**lingered** until OS-level FIN/RST timeout (60–120 s on Linux) — backend
-keeps producing events that go into a dead yamux stream.
+`pangolin-ngx` forwards SSE / long-lived streaming responses (the
+`is_streaming_request` heuristic) on **both** delivery paths — direct
+and tunnelled. On either path the response body is forwarded by
+pingora's own HTTP client: it writes the bytes it reads from the
+backend straight to the client, as they arrive. There is no buffering
+layer in between and no body-forwarding loop of our own.
 
-This doc records the chosen fix: a small tun-side change that closes the
-backend TCP promptly when the yamux peer disappears, plus the explicit
-**stateless** contract that pangolin provides.
+When a client browser disconnects mid-stream, pingora drops the
+upstream connection. On the tunnelled path that upstream connection
+*is* a tunnel byte stream, so dropping it closes the stream; the tun
+reads the end of the request and its relay tears the backend
+connection down — see "The tunnel stream's close reaches the tun's
+relay" below for the two shapes that teardown takes.
+
+**Before the splice rewrite (issue #153)** the tun held the response:
+it buffered the whole body before forwarding it and ran its own
+`tokio::io::copy` pump towards the tunnel. A client disconnect left
+that pump running until the tunnel's send window filled, and the
+backend TCP connection **lingered** until the OS-level FIN/RST timeout
+(60–120 s on Linux) — the backend kept producing events that went into
+a dead stream.
+
+This doc records the contract: a client disconnect must reach the
+backend promptly, on both paths, and the proxy must stay stateless
+about the events it carried.
 
 ## Goals
 
@@ -101,58 +112,58 @@ product or implement `Last-Event-ID` in their own backend.
 
 | File | Change | Reason |
 |---|---|---|
-| `pangolin-tun` crate (the tun-side client, issue #159) | Match on `copy` result. On `Err`, call `backend.shutdown().await` before returning. | Close backend TCP promptly when yamux peer disappears. Mirrors `relay_bidirectional`'s "read failure → peer shutdown" pattern. |
-| `crates/ngx/src/proxy.rs:1205` | Comment block above the body loop. **No code change.** | Lock the contract that `StreamHandle::drop` sends RST (not FIN), and that calling `shutdown().await` explicitly here would be *worse*, not better. |
-| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend TCP closes within 2 s of client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — direct path skips the tun/yamux hops, so it should propagate faster). |
+| `pangolin-tun` crate (the tun-side client, issue #159) | **Before issue #153** the tun matched on the result of its own `tokio::io::copy` and called `backend.shutdown().await` on `Err`. The published crate's relay does the same job differently: it copies bytes in both directions and ends the relay on the **first error** either side reports — both directions are torn down and the error is returned. A failed read is not an end-of-file: it says the bytes that were still to come will never come. | Close the backend TCP promptly when the tunnel stream fails, so a client disconnect reaches the backend instead of lingering until the OS-level FIN/RST timeout. |
+| `crates/ngx/src/proxy.rs` | A comment block above the streaming handling in `request_filter`. **No code change.** | Lock the contract that the gateway does not relay the body itself — pingora does — and that a streaming request is not routed down a separate path. |
+| `tests/src/sse_e2e.rs` | New `ObservableSseBackend` mock + `real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` and `real_e2e_direct_sse_client_disconnect_propagates_to_backend` tests | Verify that the backend sees the end of its request within 2 s of the client disconnect on the tunnel path and within 1 s on the direct path (a tighter SLO — the direct path skips the tun hop, so it should propagate faster). |
 | `docs/design/sse-reconnect.md` | This document | Record the contract. |
 
-### yamux Drop sends RST, not FIN — verified
+### The tunnel stream's close reaches the tun's relay
 
-From `tokio-yamux-0.3.18/src/stream.rs:597-622`:
+The teardown on the tunnelled path runs from the gateway outwards:
 
-```rust
-impl Drop for StreamHandle {
-    fn drop(&mut self) {
-        if !self.unbound_event_sender.is_closed() && self.state != StreamState::Closed {
-            match self.state {
-                // LocalClosing means that local have sent Fin to the remote and waiting for a response.
-                StreamState::LocalClosing | StreamState::Reset => (),
-                // if not, we should send Rst first
-                StreamState::Established
-                | StreamState::Init
-                | StreamState::RemoteClosing
-                | StreamState::SynReceived
-                | StreamState::SynSent => {
-                    let mut flags = self.get_flags();
-                    flags.add(Flag::Rst);                 // <-- RST, not FIN
-                    let frame = Frame::new_window_update(flags, self.id, 0);
-                    let rst_event = StreamEvent::Frame(frame);
-                    let _ignore = self.unbound_event_sender.unbounded_send(rst_event);
-                }
-                ...
-            }
-            ...
-        }
-    }
-}
-```
+1. pingora drops the upstream connection when the client goes away.
+   That upstream connection is the loopback socket the tunnel stream
+   is bridged onto (`crates/ngx/src/tunnel/connector.rs`), so the
+   bridge sees the end of file.
+2. The bridge shuts the tunnel stream's write half down and then
+   drops it. The tun reads an **end-of-file** on that stream: the
+   request direction is over.
+3. What the tun does next depends on what the *other* direction does,
+   and the two transports differ:
 
-By contrast, `StreamHandle::poll_shutdown` (`shutdown().await`) sets
-state to `LocalClosing` and sends the FIN flag — a half-close handshake.
+| | the tun's next write to the tunnel | the relay's outcome | the backend socket |
+|---|---|---|---|
+| QUIC (primary) | **fails** — the dropped receive side stops the tun's writes | the error path: both directions are torn down, the error is returned | dropped — a full close |
+| WebSocket/TCP fallback | still succeeds — the multiplexer has closed the stream, so the frames are discarded | the half-close path: the backend's **write side** is shut down, the response direction keeps running | half-closed — the backend sees the end of its request |
 
-**Implication for the SSE body loop on the ngx side**:
+**The error path is the one that closes the backend outright.** The
+published crate's `relay_bidirectional` treats a failed read or write
+as an error, not as an end-of-file — it says the bytes that were
+still to come will never come — so it tears both directions down and
+returns the error, and the backend socket is dropped with it.
 
-- `break` followed by `yamux_stream` falling out of scope sends RST.
-- RST propagates immediately: the peer's next `write` returns
-  `ECONNRESET`.
-- FIN (explicit `shutdown().await`) requires a half-close handshake
-  round-trip before the peer's next `write` notices.
+The half-close path is not a weakness in itself: it is what the
+tunnel's relay is for, because a response that only arrives after the
+request is complete still has to reach the client. But it leaves the
+backend socket open on the fallback transport, so the backend learns
+about the disconnect through the end of its request rather than
+through a closed socket.
 
-Therefore the existing code in `handle_streaming_request` is already
-the **most aggressive teardown available**. Adding a
-`yamux_stream.shutdown().await` call would slow down the disconnect
-path. The comment block above the loop makes this explicit so a future
-refactor does not try to "improve" it.
+**What the e2e actually observes.**
+`real_e2e_tunnel_sse_client_disconnect_propagates_to_backend` pins
+that the backend's **read** returns within 2 s of the client drop —
+the backend sees the end of its request. It does **not** pin that the
+backend's socket is closed, and it does not pin a transport: the tun
+it starts uses the default `auto` selector, so in practice it is the
+QUIC path that is measured.
+
+**Implication for the SSE teardown**: on the QUIC path the relay's
+error teardown is already the **most aggressive teardown available** —
+the stream is closed by the time the relay sees it, so there is
+nothing left for the gateway to shut down, and a second teardown
+would slow the disconnect path down rather than speed it up. The
+comment block above the streaming handling makes this explicit so a
+future refactor does not try to "improve" it.
 
 ## Data-loss contract (CDN-equivalent)
 
@@ -162,11 +173,11 @@ from any other byte-pump proxy.
 
 | Scenario | nginx behaviour | pangolin behaviour |
 |---|---|---|
-| Client disconnects mid-stream | Drop upstream connection within milliseconds; backend receives FIN/RST | Drop yamux stream (RST) + close backend TCP (FIN) within milliseconds (tun fix) |
+| Client disconnects mid-stream | Drop upstream connection within milliseconds; backend receives FIN/RST | Drop the upstream connection; on the tunnel path that closes the tunnel stream, and the relay's teardown reaches the backend — the backend sees the end of its request well inside a second (the e2e pins 2 s on the tunnel path and 1 s on the direct path) |
 | Backend pushes while no listener is connected | Events lost at the nginx boundary | Events lost at the tun boundary — same model, different host |
 | Proxy process restarts | In-flight events lost | In-flight events lost |
 | Backend crashes | Upstream errors; client sees RST / ECONNRESET | Same |
-| Long-lived idle, backend sends no heartbeat | nginx may time out per `proxy_read_timeout` | yamux has no read timeout — backend **must** send a heartbeat to detect dead peers and to defeat edge idle timeouts |
+| Long-lived idle, backend sends no heartbeat | nginx may time out per `proxy_read_timeout` | the tunnel has no read timeout of its own — the backend **must** send a heartbeat to detect dead peers and to defeat edge idle timeouts |
 
 This matches the contract documented by Cloudflare's streaming-miss
 docs, Fastly's streaming-miss docs, and AWS CloudFront's
@@ -197,24 +208,29 @@ SSE backends that proxy through pangolin should:
 
 3. **Use `Content-Type: text/event-stream`** so pangolin's
    `is_streaming_request` detection (in
-   `pangolin-core/src/proxy`) routes to the streaming path. Otherwise
-   the request falls through to the buffered HTTP path and deadlocks
-   on infinite chunked bodies.
+   `crates/pangolin-core/src/proxy.rs`) recognises the request as a
+   stream. The detection does **not** route anything — both the direct
+   and the tunnelled path are forwarded by pingora's own HTTP client,
+   which streams the response natively, and there is no buffered path
+   that could deadlock on an infinite chunked body — but it does
+   decide how the request is accounted for (a long-lived stream is
+   kept out of the latency histogram and the RPS rings), and a
+   `file://` backend is refused for a streaming request.
 
 ## Direct path note
 
 The **direct path** (no tunnel — backend reachable from the `ngx`
-host) is unaffected. `pingora-proxy/src/proxy_h1.rs:106-115` runs the
-upstream reader and the downstream writer as a `tokio::try_join!` pair;
-when the downstream errors (client disconnect), the join returns, the
-`tx_downstream` sender is dropped, the upstream reader sees its `rx`
-close, and the upstream connection is dropped. No code change is
-needed; this doc records the fact.
+host) is unaffected. pingora's HTTP/1 proxy runs the downstream writer
+and the upstream reader as a `tokio::try_join!` pair
+(`pingora-proxy/src/proxy_h1.rs`); when the downstream errors (client
+disconnect), the join returns, the `tx_downstream` sender is dropped,
+the upstream reader sees its `rx` close, and the upstream connection
+is dropped. No code change is needed; this doc records the fact.
 
 ## Verification
 
 Static checks
-- `cargo build -p pangolin-ngx -p pangolin-tun -p pangolin-core`
+- `cargo build -p ngx -p tun -p pangolin-core`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo fmt --check`
 
@@ -222,14 +238,20 @@ Unit
 - `cargo test -p pangolin-core --lib`
 - `cargo test -p pangolin-core is_streaming_request_*`
 
+e2e — the suite drives the **real** `pangolin-ngx` and `pangolin-tun`
+binaries as subprocesses, so it needs the release binaries in
+`target/release/`: run `make build` (or
+`cargo build --release -p ngx -p tun`) first.
+
 e2e (existing — must still pass)
 - `cargo test -p pangolin-integration-tests --features integration --lib sse_e2e::`
-  — all pre-existing SSE tests (10 at commit time, plus the new one)
+  — the whole SSE suite
 - `cargo test -p pangolin-integration-tests --features integration --lib`
   — full workspace, no regressions
 
-e2e (new — must pass)
-- `cargo test -p e2e_tests --test sse_e2e real_e2e_tunnel_sse_client_disconnect_propagates_to_backend`
+e2e (the disconnect contract — must pass)
+- `cargo test -p pangolin-integration-tests --features integration --lib sse_e2e::real_e2e_tunnel_sse_client_disconnect_propagates_to_backend`
+- `cargo test -p pangolin-integration-tests --features integration --lib sse_e2e::real_e2e_direct_sse_client_disconnect_propagates_to_backend`
 
 Manual smoke
 - Three terminals: `pangolin-tun`, a Python SSE backend writing
@@ -238,24 +260,33 @@ Manual smoke
   `BrokenPipeError` within ~1 RTT.
 
 Observability
-- Pre-fix: no log line indicates the backend linger.
-- Post-fix: log line
-  `tun <name> streaming backend→stream copy: <error> → closing backend TCP`
-  appears on the disconnect path. Existing
-  `SSE: client closed early: <error>` log on the ngx side is unchanged.
+- The gateway logs the streaming marker at debug level:
+  `SSE: pingora-native streaming <host> → <authority>`.
+- A streaming request for a `file://` backend is refused with a 415 and
+  logged at warn level:
+  `SSE: refused on file:// backend for <host> (file:// has no streaming concept)`.
+- The teardown itself is not a log event: the relay ends the relay
+  and returns the error to its caller, which does not log it. A
+  tunnel **session** that dies is a different thing and is logged —
+  see [`tunnel.md`](tunnel.md).
 
 ## References
 
-- `pangolin_tun::relay_bidirectional` — tun-side copy loop (the tun's
-  client moved to the published `pangolin-tun` crate in issue #159)
-- `crates/ngx/src/proxy.rs::handle_streaming_request` — ngx-side body
-  forwarding loop
-- `pangolin_tun::relay_bidirectional` — reference pattern for
-  "read failure → peer shutdown"
+- `pangolin_tun::relay_bidirectional` — the tun-side copy loop (the
+  tun's client moved to the published `pangolin-tun` crate in issue
+  #159); it ends the relay on the first error either side reports
+- `crates/ngx/src/tunnel/connector.rs` — the bridge between the tunnel
+  stream and the socket pingora writes into; the end of the socket is
+  what closes the tunnel stream
+- `crates/ngx/src/proxy.rs` — the streaming detection in `request_filter`
+  and the `SSE:` log lines
 - `tests/src/sse_e2e.rs::real_e2e_tunnel_sse_client_disconnect_propagates_to_backend`
-  — the new e2e test
-- `tokio-yamux-0.3.18/src/stream.rs:597` — `Drop for StreamHandle`,
-  RST-not-FIN contract
+  — the tunnel-path e2e test
+- `tests/src/sse_e2e.rs::real_e2e_direct_sse_client_disconnect_propagates_to_backend`
+  — the direct-path e2e test
+- `tokio-yamux` — the multiplexer behind the WebSocket/TCP fallback
+  transport; `Drop for StreamHandle` sends a RST (not a FIN) for a
+  stream that is dropped while it is still open
 - WHATWG HTML §[Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
   — browser-side reconnect contract (reconnect time, `Last-Event-ID`,
   `retry:` field)

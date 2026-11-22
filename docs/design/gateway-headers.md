@@ -199,10 +199,13 @@ client sends:  X-Forwarded-For: 1.2.3.4, 5.6.7.8
 backend sees:  X-Forwarded-For: 1.2.3.4, 5.6.7.8, 127.0.0.1
 ```
 
-The tunnel frame's IP field carries the TCP peer (the field was
-renamed `client_ip` → `peer_ip`; the **wire format is unchanged** —
-same presence byte, same length-prefixed payload — so frames stay
-decodable by existing peers).
+The TCP peer is computed **on the gateway**, from the connection the
+gateway accepted, and it goes straight into `X-Forwarded-For` — the
+same value on both delivery paths, direct and tunnelled. There is no
+tunnel frame: the tunnel is a byte splice, so nothing carries the
+peer address across it. (Before issue #153 the tunnel frame had an
+IP field, renamed `client_ip` → `peer_ip`, and the frame carried the
+peer to the tun.)
 
 ## Failure matrix
 
