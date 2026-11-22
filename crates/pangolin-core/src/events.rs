@@ -11,9 +11,9 @@ use std::sync::Arc;
 /// Access log entry for real-time monitoring via SSE.
 ///
 /// Constructed by `ngx`'s `response_filter` on every proxied request
-/// (issue #73). The struct is deliberately small + `Clone` — the
-/// entry is built **once** per request and then shared: the ring
-/// buffer, the live broadcast and every subscriber hold an
+/// (issue #73). The struct is deliberately small, and the entry is
+/// built **once** per request and then **shared**: the ring buffer,
+/// the live broadcast and every subscriber hold an
 /// `Arc<AccessLogEntry>` of the same allocation instead of a copy of
 /// the bytes (issue #224). The `backend` field is a pre-formatted
 /// string ("tun:office", "direct:1.2.3.4:8080", "file://…") derived

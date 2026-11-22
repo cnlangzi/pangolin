@@ -133,8 +133,12 @@ plain-JSON 401 body.
 The entry is built **once** per request and wrapped in an `Arc`
 (issue #224). The ring buffer, the broadcast channel and every subscriber
 hold a reference to that one allocation, so the fan-out copies a reference
-count instead of the entry: the per-request allocation count drops from 24
-(one subscriber) to 7 — the `Arc` plus the entry's own six fields.
+count instead of the entry. The **access log's own** per-request
+allocations drop from 24 (one subscriber) to 7 — the `Arc` plus the
+entry's six fields. The request context is a separate budget: it still
+allocates its own strings, but it no longer copies the `User-Agent` at
+all (issue #224 reads it in place, and the access log copies it once,
+when it builds the entry).
 
 `AccessLogEntry` is ~150 bytes serialised; defaults cost ≈ 15 KB (ring) +
 ≈ 150 KB (channel). A noisy proxy with 10k req/s sees each subscriber

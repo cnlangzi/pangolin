@@ -1100,9 +1100,12 @@ fn is_streaming_headers(headers: &HeaderMap) -> bool {
 /// O(n) `.iter().find(...)` linear scan) and returns the first
 /// matching value, which is what the owned copy used to see.
 ///
-/// A value that is not valid UTF-8 reads as "no user agent": the bot
-/// rules are ASCII, so a non-UTF-8 value cannot match one anyway, and
-/// unwrapping the conversion would panic on the request path.
+/// A value that is not **visible ASCII** reads as "no user agent":
+/// `HeaderValue::to_str` rejects anything outside `0x20..=0x7e` plus
+/// tab, so a non-ASCII value — invalid UTF-8 or valid UTF-8 with
+/// non-ASCII bytes in it — is dropped. The bot rules are ASCII, so
+/// such a value cannot match one anyway, and unwrapping the
+/// conversion would panic on the request path.
 fn request_user_agent(req_header: &RequestHeader) -> Option<&str> {
     req_header
         .headers
@@ -1792,11 +1795,14 @@ mod tests {
     /// headers — the request path must not copy it into the
     /// per-request context (issue #224).
     ///
-    /// The truth table has three cells: a header that is there, a
-    /// header that is absent, and a header whose value is not valid
-    /// UTF-8. The last one is the trap: the owned copy read it as
-    /// `None` too, and unwrapping the conversion instead would panic
-    /// on the request path.
+    /// The truth table has four cells: a header that is there, a
+    /// header that is absent, a value that is not valid UTF-8, and a
+    /// value that is valid UTF-8 but not visible ASCII. The last two
+    /// are the traps: `HeaderValue::to_str` rejects anything outside
+    /// `0x20..=0x7e` plus tab, so both read as "no user agent" — as
+    /// they did when the value was copied into the request context.
+    /// Unwrapping the conversion instead would panic on the request
+    /// path.
     #[test]
     fn request_user_agent_reads_the_header_in_place() {
         // A request that carries a `User-Agent`.
@@ -1820,6 +1826,18 @@ mod tests {
             .insert_header(
                 "User-Agent",
                 HeaderValue::from_bytes(b"curl/8.0\xff").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(request_user_agent(&header), None);
+
+        // Valid UTF-8, but not visible ASCII: dropped as well. A
+        // non-ASCII byte is legal in a header value, so this cell is
+        // reachable — it is not a malformed request.
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header
+            .insert_header(
+                "User-Agent",
+                HeaderValue::from_bytes("ÜnicödeBot/1.0".as_bytes()).unwrap(),
             )
             .unwrap();
         assert_eq!(request_user_agent(&header), None);

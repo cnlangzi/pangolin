@@ -249,8 +249,8 @@ stays inside the supervisor.
   recorded user agent of a rejected client and the reputation check — read
   it from the session where they need it.
 - `record_access_log` copies it **once**, into `AccessLogEntry.user_agent`.
-  A value that is not valid UTF-8 reads as "no user agent", exactly as the
-  owned copy did.
+  A value that is not visible ASCII reads as "no user agent" — exactly as
+  the owned copy did, and for the same reason: the bot rules are ASCII.
 
 ### `crates/ngx/src/main.rs`
 
