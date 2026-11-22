@@ -254,7 +254,20 @@ lives with the rest of the proxy policy:
 // pangolin-core (crates/pangolin-core/src/proxy.rs)
 /// Heuristic: returns true if the request expects a streaming
 /// response (matches `text/event-stream` in Accept or Content-Type).
+/// This is the framework-neutral whole-request entry point; the
+/// gateway's request path applies the per-header rule below.
 pub fn is_streaming_request(request: &HttpRequest) -> bool;
+
+/// The per-header rule that heuristic is made of (pangolin-core):
+/// true if **one** header marks the request as a streaming one. The
+/// gateway applies it to the headers it already holds, so the request
+/// path copies nothing.
+pub fn is_streaming_header(name: &str, value: &str) -> bool;
+
+/// The header names the rule looks in (pangolin-core). The gateway
+/// asks the request's header map for exactly these, so a header that
+/// cannot carry the marker is never converted to a string.
+pub const STREAMING_HEADER_NAMES: [&str; 2];
 ```
 
 It does not route anything: since issue #153 both the direct and the
@@ -343,12 +356,18 @@ tunnelled (issue #153). pingora owns the request-header buffer at that
 point, so that is where the `Host` rewrite and the `X-Forwarded-*`
 family belong.
 
-The streaming detection (`is_streaming_request`) is **not** part of
+The streaming detection (`is_streaming_header`) is **not** part of
 the routing. It runs in `request_filter`, but all it decides is the
 traffic class the request is accounted under and whether a `file://`
 backend is refused — a request is never sent down a separate
 streaming path, because there is no separate streaming path any more
 (§6).
+
+The detection runs on **every** request, so it copies nothing: the
+gateway reads the headers it already holds and asks for exactly the
+header names the rule names (`pangolin_core::STREAMING_HEADER_NAMES`),
+so a header that cannot carry the marker is never even converted to a
+string (issue #217).
 
 ---
 
@@ -406,7 +425,7 @@ tunnel therefore carried its own hand-written byte-pump for streaming
 requests, and a streaming request on a direct backend was refused
 with a 501. That forced every site that wanted SSE (chat streams, a
 live tail of `/logs`, etc.) to be fronted by a tun. Neither carve-out
-exists any more: `is_streaming_request` is a traffic-accounting
+exists any more: `is_streaming_header` is a traffic-accounting
 marker, not a router.
 
 The one thing the streaming marker still refuses is a `file://`
@@ -549,6 +568,7 @@ published crate's own unit tests.
 | I-26 | A client-supplied `P-*` header is replaced by pangolin's value | `real_e2e_gateway_headers_replace_client_supplied_values` |
 | I-27 | `X-Real-IP` is never emitted | `apply_proxy_policy_appends_peer_ip_to_xff_chain`, `real_e2e_proxy_injects_x_forwarded_headers_all_paths` |
 | I-28 | An upgrade outranks the streaming marker: a request carrying both `Upgrade: websocket` and `Accept: text/event-stream` is still an upgrade (101), and it is accounted as `Websocket`, not `Stream` | `traffic_kind_for_ranks_the_upgrade_over_the_streaming_marker`, `real_e2e_tunnel_ws_upgrade_survives_event_stream_accept`, `real_e2e_direct_ws_upgrade_survives_event_stream_accept` |
+| I-29 | The streaming marker is detected from the request's own headers, and the per-header rule is the only home of the heuristic: the gateway and the core agree on every request | `is_streaming_header_matches_the_marker_on_accept_or_content_type_only`, `is_streaming_headers_detects_the_marker_in_the_request_headers`, `is_streaming_headers_agree_with_the_core_rule` |
 
 ---
 
@@ -563,6 +583,7 @@ published crate's own unit tests.
                       │ - ProxyCtx, BackendTarget               │
                       │ - apply_proxy_policy                    │
                       │ - parse_backend_to_target               │
+                      │ - is_streaming_header (the rule)        │
                       │ - is_streaming_request (accounting only)│
                       │ - serve_file_target (one file impl)     │
                       │ - strip_hop_by_hop_headers              │

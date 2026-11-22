@@ -22,7 +22,7 @@ direct-path streaming flow (pingora-native, no buffering), see
 ## Context
 
 `pangolin-ngx` forwards SSE / long-lived streaming responses (the
-`is_streaming_request` heuristic) on **both** delivery paths — direct
+`is_streaming_header` heuristic) on **both** delivery paths — direct
 and tunnelled. On either path the response body is forwarded by
 pingora's own HTTP client: it writes the bytes it reads from the
 backend straight to the client, as they arrive. There is no buffering
@@ -207,7 +207,7 @@ SSE backends that proxy through pangolin should:
    that disconnect without sending FIN cleanly.
 
 3. **Use `Content-Type: text/event-stream`** so pangolin's
-   `is_streaming_request` detection (in
+   `is_streaming_header` detection (in
    `crates/pangolin-core/src/proxy.rs`) recognises the request as a
    stream. The detection does **not** route anything — both the direct
    and the tunnelled path are forwarded by pingora's own HTTP client,
@@ -236,7 +236,8 @@ Static checks
 
 Unit
 - `cargo test -p pangolin-core --lib`
-- `cargo test -p pangolin-core is_streaming_request_*`
+- `cargo test -p pangolin-core is_streaming_*`
+- `cargo test -p ngx --lib is_streaming_*` — the gateway's own detection
 
 e2e — the suite drives the **real** `pangolin-ngx` and `pangolin-tun`
 binaries as subprocesses, so it needs the release binaries in
