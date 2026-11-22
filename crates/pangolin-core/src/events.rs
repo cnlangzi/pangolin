@@ -6,17 +6,20 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Access log entry for real-time monitoring via SSE.
 ///
 /// Constructed by `ngx`'s `response_filter` on every proxied request
-/// (issue #73). The struct is deliberately small + `Clone` — every
-/// push goes through a `tokio::sync::broadcast` channel, so we want
-/// to copy the bytes, not borrow them. The `backend` field is a
-/// pre-formatted string ("tun:office", "direct:1.2.3.4:8080",
-/// "file://…") derived from the existing `site.backend` so the
-/// dashboard renders a human-readable value without re-running the
-/// backend parser on every read.
+/// (issue #73). The struct is deliberately small, and the entry is
+/// built **once** per request and then **shared**: the ring buffer,
+/// the live broadcast and every subscriber hold an
+/// `Arc<AccessLogEntry>` of the same allocation instead of a copy of
+/// the bytes (issue #224). The `backend` field is a pre-formatted
+/// string ("tun:office", "direct:1.2.3.4:8080", "file://…") derived
+/// from the existing `site.backend` so the dashboard renders a
+/// human-readable value without re-running the backend parser on
+/// every read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccessLogEntry {
     pub timestamp: DateTime<Utc>,
@@ -27,8 +30,9 @@ pub struct AccessLogEntry {
     pub duration_ms: u64,
     pub backend: String,
     pub client_ip: String,
-    /// `User-Agent` header value, captured by the proxy on the
-    /// request hot path. `None` if the client didn't send one.
+    /// `User-Agent` header value, copied out of the request headers
+    /// once — when the entry is built. `None` if the client didn't
+    /// send one.
     ///
     /// Added in stage-1 of the searchenginebots feature so the
     /// bot side-channel in [`App::push_access_log`](crate::app::App::push_access_log)
@@ -42,6 +46,10 @@ pub struct AccessLogEntry {
 }
 
 /// Bounded ring buffer of recent access log entries.
+///
+/// Holds `Arc<AccessLogEntry>` — the buffer shares the entry with the
+/// live broadcast and with every subscriber instead of copying it
+/// (issue #224).
 ///
 /// Uses `parking_lot::Mutex` (not `std::sync::Mutex`) because:
 ///   - The lock is held for microseconds (one `push_back` + one
@@ -59,7 +67,7 @@ pub struct AccessLogEntry {
 /// user disable buffering entirely if they want to keep only the
 /// live broadcast.
 pub struct AccessLogBuffer {
-    entries: parking_lot::Mutex<VecDeque<AccessLogEntry>>,
+    entries: parking_lot::Mutex<VecDeque<Arc<AccessLogEntry>>>,
     capacity: usize,
 }
 
@@ -79,7 +87,7 @@ impl AccessLogBuffer {
     /// entry if capacity is exceeded. Never blocks (the buffer is
     /// sync) and never panics on capacity=0 (the loop is a single
     /// integer compare).
-    pub fn push(&self, entry: AccessLogEntry) {
+    pub fn push(&self, entry: Arc<AccessLogEntry>) {
         if self.capacity == 0 {
             return;
         }
@@ -97,7 +105,10 @@ impl AccessLogBuffer {
     /// the lock once, clones the entries into a local `Vec`, and
     /// drops the lock before the first `await` — so the lock is
     /// never held across a network read.
-    pub fn snapshot(&self) -> Vec<AccessLogEntry> {
+    ///
+    /// The clone is an `Arc` clone: a reference-count bump, not a
+    /// copy of the entry.
+    pub fn snapshot(&self) -> Vec<Arc<AccessLogEntry>> {
         let entries = self.entries.lock();
         entries.iter().cloned().collect()
     }
@@ -302,8 +313,8 @@ mod tests {
         // capacity=0 means "disable ring buffer entirely" — every
         // push is silently dropped, snapshot is empty.
         let buf = AccessLogBuffer::new(0);
-        buf.push(make_entry("GET", "/a"));
-        buf.push(make_entry("GET", "/b"));
+        buf.push(Arc::new(make_entry("GET", "/a")));
+        buf.push(Arc::new(make_entry("GET", "/b")));
         assert!(buf.snapshot().is_empty());
         assert_eq!(buf.capacity(), 0);
     }
@@ -312,7 +323,7 @@ mod tests {
     fn access_log_buffer_evicts_oldest_on_overflow() {
         let buf = AccessLogBuffer::new(3);
         for i in 0..5 {
-            buf.push(make_entry("GET", &format!("/p{i}")));
+            buf.push(Arc::new(make_entry("GET", &format!("/p{i}"))));
         }
         let snap = buf.snapshot();
         assert_eq!(snap.len(), 3);
@@ -329,13 +340,47 @@ mod tests {
         // snapshot() returns oldest-first so an SSE endpoint can
         // replay them as it received them.
         let buf = AccessLogBuffer::new(10);
-        buf.push(make_entry("GET", "/a"));
-        buf.push(make_entry("GET", "/b"));
-        buf.push(make_entry("GET", "/c"));
+        buf.push(Arc::new(make_entry("GET", "/a")));
+        buf.push(Arc::new(make_entry("GET", "/b")));
+        buf.push(Arc::new(make_entry("GET", "/c")));
         let snap = buf.snapshot();
         assert_eq!(
             snap.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
             vec!["/a", "/b", "/c"]
         );
+    }
+
+    /// The ring buffer **shares** the entry it was handed: the
+    /// snapshot carries the very same allocation, not a copy of it.
+    ///
+    /// This is the property that makes the access-log fan-out cheap
+    /// (issue #224) — a copy would show up here as two different
+    /// allocations.
+    #[test]
+    fn access_log_buffer_snapshot_shares_the_pushed_entry() {
+        let buf = AccessLogBuffer::new(10);
+        let entry = Arc::new(make_entry("GET", "/shared"));
+        buf.push(entry.clone());
+
+        let snap = buf.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            Arc::ptr_eq(&snap[0], &entry),
+            "the ring buffer must hold the same allocation it was given"
+        );
+    }
+
+    /// The wire format does not change when the entry travels as an
+    /// `Arc` (issue #224): the API and the SSE frames serialise the
+    /// entry itself, not the pointer.
+    #[test]
+    fn access_log_entry_arc_serialises_like_the_entry() {
+        let mut entry = make_entry("GET", "/a");
+        entry.user_agent = Some("curl/8.0".into());
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let json_via_arc = serde_json::to_string(&Arc::new(entry)).unwrap();
+        assert_eq!(json, json_via_arc);
+        assert!(json.contains(r#""user_agent":"curl/8.0""#));
     }
 }

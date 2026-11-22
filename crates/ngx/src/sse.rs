@@ -287,7 +287,11 @@ pub async fn handle_access_log_stream(
         "access logs",
         |app| app.access_log_tx.subscribe(),
         |app| app.recent_access_log(),
-        frame_data,
+        // The access-log entry travels as an `Arc` — one allocation,
+        // shared by the ring buffer, the channel and every subscriber
+        // (issue #224). The frame is built from the entry it points
+        // at; the JSON is the same either way.
+        |entry: &Arc<AccessLogEntry>| frame_data(entry),
     )
     .await
 }

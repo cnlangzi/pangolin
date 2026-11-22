@@ -79,7 +79,11 @@ rcgen = "0.14"
 instant-acme = { version = "0.8", features = ["hyper-rustls"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+#
+# The `rc` feature teaches serde to (de)serialize `Arc<T>` as `T`.
+# The access log hands out `Arc<AccessLogEntry>` (issue #224) and the
+# API still has to render the same JSON as before.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml = "0.9"
 

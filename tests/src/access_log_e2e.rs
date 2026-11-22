@@ -24,9 +24,9 @@
 //! 4. **JSON shape** — every `data:` frame is one `AccessLogEntry`
 //!    serialised with serde_json. We parse the first frame and
 //!    verify the field set (method, path, status, duration_ms,
-//!    backend, host, client_ip, timestamp). A future change that
-//!    renames or removes a field will fail this test loudly
-//!    instead of breaking the admin UI silently.
+//!    backend, host, client_ip, timestamp, user_agent). A future
+//!    change that renames or removes a field will fail this test
+//!    loudly instead of breaking the admin UI silently.
 //!
 //! 5. **Admin UI `/logs` page renders** — the page is reachable
 //!    by an authenticated admin and contains the wiring
@@ -58,8 +58,8 @@ use tokio::time::timeout;
 
 use crate::admin_harness::AdminClient;
 use crate::harness::{
-    NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db, raw_request,
-    read_sse_data_frames,
+    DEFAULT_USER_AGENT, NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db,
+    raw_request, read_sse_data_frames,
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -257,6 +257,9 @@ async fn access_log_sse_requires_auth() {
 ///      (method, path, status, duration_ms, host, backend, etc.).
 ///   3. A GET sent *after* the SSE connection is opened shows up
 ///      in the live stream within a small budget.
+///   4. The frame carries the `User-Agent` the client sent — the
+///      proxy reads it in place out of the request headers and
+///      copies it once, into the entry (issue #224).
 #[tokio::test]
 async fn access_log_sse_replays_then_streams_live() {
     let backend = MockHttpBackend::start().await;
@@ -386,6 +389,14 @@ async fn access_log_sse_replays_then_streams_live() {
             "duration_ms must be a number: {entry}"
         );
         assert_eq!(entry["backend"], format!("direct:{}", backend_addr));
+        // The entry carries the `User-Agent` the client sent. The
+        // proxy reads it in place out of the request headers and
+        // copies it once, into the entry (issue #224) — so the log
+        // still shows what the crawler announced itself as.
+        assert_eq!(
+            entry["user_agent"], DEFAULT_USER_AGENT,
+            "the access log must carry the request's User-Agent: {entry}"
+        );
     }
 }
 
