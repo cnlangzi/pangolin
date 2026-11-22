@@ -45,7 +45,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
-use crate::harness::{NgxProcess, init_pangolin_db, raw_request_with_headers};
+use crate::harness::{
+    NgxProcess, admin_session_cookie, init_pangolin_db, raw_request_with_headers,
+    read_sse_data_frames,
+};
 
 // ─────────────────────────────────────────────────────────────────
 // DB seed helpers
@@ -592,4 +595,91 @@ async fn referer_sse_stream_requires_auth() {
         !text.contains("data:"),
         "the 401 must not carry an SSE frame: {text:?}"
     );
+}
+
+/// The referer SSE endpoint streams the recorded entries to the
+/// browser: an external document navigation made while the stream
+/// is open shows up as a `data:` frame.
+///
+/// The JSONL file is the contract for the *history* pages; this is
+/// the live tail the `/logs/referers` page consumes.
+#[tokio::test]
+async fn referer_sse_streams_live_entry() {
+    let backend = MockHttpBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+    let ngx = NgxProcess::start({
+        let backend_addr = backend_addr.clone();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "web", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "example.test", "web");
+        }
+    })
+    .await;
+
+    // The SSE endpoint is admin-only — the raw session cookie goes
+    // straight onto the wire (see `harness::admin_session_cookie`).
+    let session_cookie = admin_session_cookie(&ngx).await;
+
+    // Open the stream first, so the request below lands on the live
+    // tail rather than in the replay snapshot.
+    let sse_addr = format!("127.0.0.1:{}", ngx.admin_port);
+    let within = Duration::from_secs(3);
+    let sse_cookie = session_cookie.clone();
+    let sse_task = tokio::spawn(async move {
+        read_sse_data_frames(
+            &sse_addr,
+            "/api/logs/referers/stream",
+            within,
+            Some(&sse_cookie),
+        )
+        .await
+    });
+
+    // Give the handshake a moment to complete before the request.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (status, _) = raw_request_with_headers(
+        &format!("127.0.0.1:{}", ngx.http_port),
+        "example.test",
+        "GET",
+        "/pricing",
+        b"",
+        &[
+            ("Referer", "https://news.example.org/article?id=7"),
+            ("Sec-Fetch-Dest", "document"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let frames = sse_task.await.expect("sse task join").expect("sse frames");
+    assert!(
+        !frames.is_empty(),
+        "expected at least one SSE data frame, got 0. \
+         ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    let entry = frames
+        .iter()
+        .map(|s| serde_json::from_str::<serde_json::Value>(s))
+        .find_map(|r| {
+            r.ok().and_then(|j| {
+                let matches =
+                    j.get("referer_host").and_then(|h| h.as_str()) == Some("news.example.org");
+                if matches { Some(j) } else { None }
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no SSE frame for the external referral. frames={frames:?}\nngx log:\n{}",
+                ngx.log_string()
+            )
+        });
+
+    assert_eq!(entry["referer_host"], "news.example.org");
+    assert_eq!(entry["host"], "example.test");
+    assert_eq!(entry["status"], 200);
 }

@@ -96,6 +96,8 @@ instead of breaking the admin UI silently.
 
 The SSE stream also emits comment frames for diagnostics:
 
+- `: replay: empty` — the ring buffer held no entry, so there is nothing
+  to replay; the stream is live from the first frame.
 - `: replay: done` — after the last replay frame from the ring buffer; the
   stream is now live.
 - `: lagged N events` — the subscriber fell behind the broadcast channel
@@ -151,8 +153,11 @@ back to a no-op when the channel is full.
 - `crates/ngx/src/proxy.rs` — proxy hook (one line).
 - `crates/ngx/src/serve.rs` — `AdminApp` (HttpServerApp) that owns the
   `/api/logs/stream` route.
-- `crates/ngx/src/sse.rs` — `handle_access_log_stream` and
-  `write_sse_unauth`.
+- `crates/ngx/src/sse.rs` — `handle_stream`, the shared implementation
+  behind the three admin log streams (`/api/logs/stream`,
+  `/api/logs/bots/stream`, `/api/logs/referers/stream`); each public
+  handler (`handle_access_log_stream` and its two siblings) is a thin
+  wrapper over it. `write_sse_unauth` writes the 401.
 - `crates/admin/src/routes/logs.rs` — `/logs` page handler.
 - `crates/admin/templates/pages/logs.html` — browser-side EventSource
   consumer.

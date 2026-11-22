@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 // Global port allocator to prevent race conditions in parallel tests
 lazy_static::lazy_static! {
@@ -347,6 +348,178 @@ async fn raw_request_inner(
     (status, body)
 }
 
+/// Open a raw TCP connection to `addr`, send a GET for `path` with
+/// `Accept: text/event-stream`, and return every `data:` line we
+/// read within `within`. The body is split into per-frame JSON
+/// strings (the SSE wire format is `data: <json>\n\n`; we slice
+/// on that boundary).
+///
+/// `cookie` is the raw `Cookie:` header value (e.g.
+/// `"pangolin_session=abc; pangolin_csrf=def"`). Every admin SSE
+/// endpoint requires an authenticated admin session — without it the
+/// handshake returns 401 (see `sse.rs::write_sse_unauth`). Pass
+/// `None` to exercise the unauthenticated path on purpose.
+///
+/// Shared by the three log-stream e2e modules (access / bot /
+/// referer): one reader, one place to fix the frame parsing.
+pub async fn read_sse_data_frames(
+    addr: &str,
+    path: &str,
+    within: Duration,
+    cookie: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let mut stream: TcpStream = timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        .await
+        .map_err(|e| anyhow::anyhow!("connect timeout: {e}"))?
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // The `Cookie:` header is appended only when `cookie` is
+    // `Some`. Sending an empty `Cookie:` line is technically legal
+    // per RFC 6265 §5.4 but a few middleboxes treat it as a parse
+    // error, so we omit the line entirely instead.
+    let cookie_line = match cookie {
+        Some(c) => format!("Cookie: {c}\r\n"),
+        None => String::new(),
+    };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Accept: text/event-stream\r\n\
+         Connection: close\r\n\
+         User-Agent: pangolin-access-log-e2e\r\n\
+         {cookie_line}\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
+
+    // Read until we have the full header block.
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match timeout(within, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(anyhow::anyhow!("read err: {e}")),
+            Err(_) => return Err(anyhow::anyhow!("read header timeout")),
+        }
+    }
+    // Verify status line.
+    let head_str = String::from_utf8_lossy(&buf).into_owned();
+    let status_line = head_str.lines().next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(anyhow::anyhow!(
+            "SSE handshake failed: status={status}, head={head_str:?}"
+        ));
+    }
+
+    // Strip the headers — anything after the first \r\n\r\n is body.
+    let body_start = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(buf.len());
+    let mut body = buf.split_off(body_start);
+
+    // Read the rest of the body until EOF or `within` elapses.
+    loop {
+        match timeout(within, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+    // Split the body on the SSE frame terminator `\n\n` and pull
+    // out the JSON after each `data: ` prefix. We deliberately
+    // ignore SSE comment lines (`: ...`) and event-id / event
+    // lines (the server doesn't emit those).
+    let mut frames = Vec::new();
+    for raw in body_str.split("\n\n") {
+        let mut json: Option<String> = None;
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                let s = rest.trim_start();
+                // Multi-line `data:` (per the SSE spec, multiple
+                // `data:` lines are concatenated with newlines).
+                // Our server emits a single line per frame so
+                // we don't need to handle the multi-line case,
+                // but be defensive.
+                if let Some(prev) = json.as_mut() {
+                    prev.push('\n');
+                    prev.push_str(s);
+                } else {
+                    json = Some(s.to_string());
+                }
+            }
+        }
+        if let Some(j) = json {
+            // Skip empty data lines and the comment-only frames
+            // that the server uses for diagnostics
+            // (": replay: done" etc.).
+            if j.is_empty() || j.starts_with(':') {
+                continue;
+            }
+            frames.push(j);
+        }
+    }
+    Ok(frames)
+}
+
+/// Log in to the admin UI as `admin` / `admin` and return the raw
+/// `pangolin_session=<token>` cookie value.
+///
+/// The admin SSE endpoints need the **raw** cookie: the low-level
+/// reader ([`read_sse_data_frames`]) opens a bare TCP socket, and
+/// `reqwest`'s cookie store is opaque to it. `AdminClient` logs in
+/// and keeps the cookie to itself, so this helper fetches the value
+/// once and hands it to the raw reader.
+pub async fn admin_session_cookie(ngx: &NgxProcess) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build raw client");
+    let resp = client
+        .post(ngx.admin_url("/login"))
+        .form(&[("username", "admin"), ("password", "admin")])
+        .send()
+        .await
+        .expect("POST /login");
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the admin login must answer 302 (redirect), got {}",
+        resp.status()
+    );
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| {
+            // Set-Cookie: pangolin_session=<token>; HttpOnly; ...
+            v.split(';').next().and_then(|kv| {
+                let kv = kv.trim();
+                if kv.starts_with("pangolin_session=") {
+                    Some(kv.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("login response must Set-Cookie pangolin_session=")
+}
+
 /// Async readiness check — keep trying `TcpStream::connect` until
 /// either it succeeds or the timeout elapses.
 ///
@@ -427,6 +600,29 @@ pub fn enable_badbots(path: &Path) {
     let conn = pangolin_core::db::open(path).expect("open pangolin.db");
     conn.execute("UPDATE badbots_config SET enabled = 1 WHERE id = 1", [])
         .expect("enable the reputation check");
+}
+
+/// Override the `googlebot` registry entry so an e2e can present a
+/// verified bot from the loopback address.
+///
+/// The override **replaces** the embedded entry, so it carries no
+/// `urls`: the bot is never refreshed from the vendor, and its
+/// `custom` CIDR is always in force. The registry is read from
+/// `<cache root>/conf.d/` — the cache root defaults to
+/// `./logs/bots/cache` relative to the process's working directory,
+/// which is the tempdir the harness spawns the binary in.
+///
+/// Shared by the rate-limit e2e (which needs the bot to be
+/// *counted*) and the bot-log e2e (which needs a bot *entry* to
+/// show up on `/api/logs/bots/stream`).
+pub fn seed_googlebot_registry(cache_root: &Path) {
+    let conf_d = cache_root.join("conf.d");
+    std::fs::create_dir_all(&conf_d).expect("mkdir conf.d");
+    std::fs::write(
+        conf_d.join("googlebot.yaml"),
+        "kind: SearchEngine\nname: googlebot\nvendor: \"Google\"\nua: \"Googlebot\"\ncustom:\n  - \"127.0.0.1/32\"\n",
+    )
+    .expect("write googlebot.yaml");
 }
 
 /// Shared, lock-protected log buffer (stdout+stderr) captured from
