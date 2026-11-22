@@ -23,6 +23,7 @@
 //! written?"); if the two diverge the writer is dropping.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use serde::Serialize;
 
 use crate::bot::BotCategory;
 use crate::bot_log::BotLogEntry;
+use crate::topn::TopN;
 
 /// Snapshot row for the admin UI: one per `(bot_name, host)`.
 ///
@@ -52,17 +54,19 @@ pub struct BotStatsRow {
 }
 
 /// Process-lifetime counters returned alongside the per-row
-/// snapshot. Cheap to compute (atomic loads under the same lock
-/// that already covers the row map).
+/// top-N. Cheap to compute (one pass over the row map, under the
+/// same lock that already covers it).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BotStatsSummary {
     /// Distinct `(bot_name, host)` pairs seen since process start.
     pub unique_pairs: usize,
     /// Total bot requests recorded (== enqueued into the writer).
+    ///
+    /// Process-wide: it counts the records the cap dropped too, so
+    /// it is *not* the sum of the table's `hits`.
     pub total_records: u64,
-    /// Cumulative `hits` across all rows — currently equals
-    /// `total_records`, kept separate for forward-compat
-    /// (if we ever record only a sample, this stays accurate).
+    /// Cumulative `hits` across all rows — `total_records` minus the
+    /// records the cap dropped.
     pub total_hits: u64,
     /// Records dropped because the unique-pair map hit
     /// [`MAX_UNIQUE_PAIRS`]. Non-zero ⇒ operators should pivot
@@ -141,7 +145,7 @@ impl BotStats {
     /// Lock discipline: the warn-log on cap-saturation runs
     /// **after** releasing the write guard so a slow stderr
     /// (file-backed logger, journald socket, etc.) can't stall
-    /// every other `record()` writer or `snapshot()` reader.
+    /// every other `record()` writer or `top_n()` reader.
     pub fn record(&self, entry: &BotLogEntry) {
         // Cold-path outcome (saturated cap) needs a separate
         // signal because we can't log under the lock.
@@ -193,44 +197,89 @@ impl BotStats {
         }
     }
 
-    /// Number of records dropped because the unique-pair cap was
-    /// reached. Process-lifetime counter; expose in the admin UI
-    /// so a saturated map is visible.
-    pub fn dropped_unique_pairs(&self) -> u64 {
-        self.inner.read().dropped_unique_cap
-    }
-
-    /// Snapshot the full per-(bot, host) table plus a summary.
-    /// Used by the admin UI to render the dashboard.
-    pub fn snapshot(&self) -> (Vec<BotStatsRow>, BotStatsSummary) {
+    /// The best `n` rows by hit count, plus a summary of the whole
+    /// table.
+    ///
+    /// One pass over the map: the collector keeps the `n` best rows
+    /// while the walk counts the pairs and the hits, so the read lock
+    /// is taken once and no more than `n` rows are ever
+    /// materialised. The summary describes the **whole** table — not
+    /// the `n` rows that came back.
+    ///
+    /// The order is `hits` descending, then `host` ascending, then
+    /// `bot_name` ascending. The last key is what makes the order
+    /// total: without it two rows with the same hits and the same
+    /// host would be ordered by the map's iteration order, and the
+    /// page would shuffle between two renders.
+    pub fn top_n(&self, n: usize) -> (Vec<BotStatsRow>, BotStatsSummary) {
         let g = self.inner.read();
-        let mut rows: Vec<BotStatsRow> = g
-            .rows
-            .iter()
-            .map(|(k, v)| BotStatsRow {
-                bot_name: k.bot_name.clone(),
-                bot_vendor: v.bot_vendor.clone(),
-                bot_category: v.bot_category,
-                host: k.host.clone(),
-                hits: v.hits,
-                last_seen: v.last_seen,
+        let mut top = TopN::new(n);
+        let mut unique_pairs = 0usize;
+        let mut total_hits = 0u64;
+        for (key, data) in g.rows.iter() {
+            unique_pairs += 1;
+            total_hits += data.hits;
+            top.offer(RankedBotRow { key, data });
+        }
+        let rows = top
+            .into_best_first()
+            .into_iter()
+            .map(|ranked| BotStatsRow {
+                bot_name: ranked.key.bot_name.clone(),
+                bot_vendor: ranked.data.bot_vendor.clone(),
+                bot_category: ranked.data.bot_category,
+                host: ranked.key.host.clone(),
+                hits: ranked.data.hits,
+                last_seen: ranked.data.last_seen,
             })
             .collect();
-        rows.sort_by(|a, b| b.hits.cmp(&a.hits).then(a.host.cmp(&b.host)));
         let summary = BotStatsSummary {
-            unique_pairs: rows.len(),
+            unique_pairs,
             total_records: g.total_records,
-            total_hits: rows.iter().map(|r| r.hits).sum(),
+            total_hits,
             dropped_unique_pairs: g.dropped_unique_cap,
         };
         (rows, summary)
     }
+}
 
-    /// Top-N rows by hit count. Convenience wrapper around
-    /// [`snapshot`] for the admin UI's "top bots" card.
-    pub fn top_n(&self, n: usize) -> Vec<BotStatsRow> {
-        let (rows, _summary) = self.snapshot();
-        rows.into_iter().take(n).collect()
+/// A borrowed view of one row, ranked for the top-N query.
+///
+/// The wrapper exists so the query can hand the collector a *borrow*
+/// of the map's row instead of a clone of it: the table holds up to
+/// [`MAX_UNIQUE_PAIRS`] rows, and cloning every one of them to sort
+/// them is exactly the work the top-N query exists to avoid. Only
+/// the rows that make it into the result are cloned.
+///
+/// The `Ord` implementation ranks the better row as the greater one
+/// — more hits, then a smaller host, then a smaller bot name. That
+/// is the convention [`TopN`] expects.
+struct RankedBotRow<'a> {
+    key: &'a RowKey,
+    data: &'a RowData,
+}
+
+impl PartialEq for RankedBotRow<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl PartialOrd for RankedBotRow<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for RankedBotRow<'_> {}
+
+impl Ord for RankedBotRow<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.data
+            .hits
+            .cmp(&other.data.hits)
+            .then_with(|| other.key.host.cmp(&self.key.host))
+            .then_with(|| other.key.bot_name.cmp(&self.key.bot_name))
     }
 }
 
@@ -277,7 +326,7 @@ mod tests {
         stats.record(&entry("Googlebot", "example.com", "/a"));
         stats.record(&entry("Googlebot", "example.com", "/b"));
         stats.record(&entry("Googlebot", "example.com", "/c"));
-        let (rows, summary) = stats.snapshot();
+        let (rows, summary) = stats.top_n(10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hits, 3);
         assert_eq!(rows[0].host, "example.com");
@@ -292,7 +341,7 @@ mod tests {
         let stats = BotStats::new();
         stats.record(&entry("Googlebot", "a.example.com", "/"));
         stats.record(&entry("Googlebot", "b.example.com", "/"));
-        let (rows, _) = stats.snapshot();
+        let (rows, _) = stats.top_n(10);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].hits, 1);
         assert_eq!(rows[1].hits, 1);
@@ -308,12 +357,12 @@ mod tests {
             "example.com",
             "/",
         ));
-        let (rows, _) = stats.snapshot();
+        let (rows, _) = stats.top_n(10);
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
-    fn snapshot_sorted_by_hits_desc() {
+    fn top_n_orders_by_hits_desc() {
         let stats = BotStats::new();
         for _ in 0..3 {
             stats.record(&entry("Googlebot", "a.example.com", "/"));
@@ -324,7 +373,7 @@ mod tests {
         for _ in 0..5 {
             stats.record(&entry("Googlebot", "c.example.com", "/"));
         }
-        let (rows, _) = stats.snapshot();
+        let (rows, _) = stats.top_n(10);
         assert_eq!(rows[0].host, "b.example.com");
         assert_eq!(rows[0].hits, 7);
         assert_eq!(rows[1].host, "c.example.com");
@@ -339,15 +388,80 @@ mod tests {
         for i in 0..5 {
             stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
         }
-        let top = stats.top_n(2);
+        let (top, _) = stats.top_n(2);
         assert_eq!(top.len(), 2);
     }
 
     #[test]
     fn top_n_handles_zero() {
         let stats = BotStats::new();
-        assert!(stats.top_n(0).is_empty());
-        assert!(stats.top_n(100).is_empty());
+        let (rows, _) = stats.top_n(0);
+        assert!(rows.is_empty());
+        let (rows, summary) = stats.top_n(100);
+        assert!(rows.is_empty());
+        assert_eq!(summary.unique_pairs, 0);
+        assert_eq!(summary.total_hits, 0);
+    }
+
+    /// A limit of zero returns no rows — but the summary still
+    /// describes the whole table. The summary is not a summary of
+    /// the rows that came back.
+    #[test]
+    fn bot_top_n_with_zero_returns_empty() {
+        let stats = BotStats::new();
+        stats.record(&entry("Googlebot", "example.com", "/"));
+        let (rows, summary) = stats.top_n(0);
+        assert!(rows.is_empty());
+        assert_eq!(summary.unique_pairs, 1);
+        assert_eq!(summary.total_hits, 1);
+    }
+
+    /// The query returns `n` rows and describes the whole table: the
+    /// pair count and the hit sum are not truncated with the rows.
+    #[test]
+    fn bot_top_n_counts_every_pair_while_returning_n_rows() {
+        let stats = BotStats::new();
+        for i in 0..1000 {
+            stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
+        }
+        let (rows, summary) = stats.top_n(10);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(summary.unique_pairs, 1000);
+        assert_eq!(summary.total_hits, 1000);
+        assert_eq!(summary.total_records, 1000);
+    }
+
+    /// The tie-break is total: hits descending, then host ascending,
+    /// then bot name ascending. Two rows with the same hits and the
+    /// same host are ordered by their bot name, not by the map's
+    /// iteration order — otherwise the page would shuffle between
+    /// two renders.
+    #[test]
+    fn bot_top_n_orders_ties_by_host_then_bot_name() {
+        let stats = BotStats::new();
+        // Two hosts with one hit each …
+        stats.record(&entry("Googlebot", "b.example.com", "/"));
+        stats.record(&entry("Googlebot", "a.example.com", "/"));
+        // … and a second bot on the first host, with one hit too.
+        stats.record(&entry(
+            "Mozilla/5.0 (compatible; bingbot/2.0)",
+            "a.example.com",
+            "/y",
+        ));
+
+        let (rows, _) = stats.top_n(10);
+        let order: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.host.clone(), row.bot_name.to_string()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("a.example.com".to_string(), "Bingbot".to_string()),
+                ("a.example.com".to_string(), "Googlebot".to_string()),
+                ("b.example.com".to_string(), "Googlebot".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -356,7 +470,7 @@ mod tests {
         for i in 0..17 {
             stats.record(&entry("Googlebot", "example.com", &format!("/p{i}")));
         }
-        let (_, summary) = stats.snapshot();
+        let (_, summary) = stats.top_n(10);
         assert_eq!(summary.total_records, 17);
     }
 
@@ -368,7 +482,7 @@ mod tests {
         let e2 = entry("Googlebot", "example.com", "/b");
         stats.record(&e1);
         stats.record(&e2);
-        let (rows, _) = stats.snapshot();
+        let (rows, _) = stats.top_n(10);
         assert_eq!(rows[0].hits, 2);
         // last_seen must be the later entry's timestamp.
         assert!(rows[0].last_seen >= e1.timestamp);
@@ -388,36 +502,55 @@ mod tests {
         for i in 0..MAX_UNIQUE_PAIRS {
             stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
         }
-        let (rows, summary) = stats.snapshot();
-        assert_eq!(rows.len(), MAX_UNIQUE_PAIRS);
+        let (_, summary) = stats.top_n(10);
+        assert_eq!(summary.unique_pairs, MAX_UNIQUE_PAIRS);
         assert_eq!(summary.total_records, MAX_UNIQUE_PAIRS as u64);
         assert_eq!(summary.dropped_unique_pairs, 0);
 
         // One more distinct host → dropped, but total_records ticks.
         stats.record(&entry("Googlebot", "host-extra.example.com", "/"));
-        let (rows, summary) = stats.snapshot();
-        assert_eq!(rows.len(), MAX_UNIQUE_PAIRS); // unchanged
+        let (_, summary) = stats.top_n(10);
+        assert_eq!(summary.unique_pairs, MAX_UNIQUE_PAIRS); // unchanged
         assert_eq!(summary.total_records, (MAX_UNIQUE_PAIRS + 1) as u64);
         assert_eq!(summary.dropped_unique_pairs, 1);
 
         // A repeat hit on a known pair still increments normally
         // (the cap is on *unique* pairs, not total records).
         stats.record(&entry("Googlebot", "host-0.example.com", "/"));
-        let (_, summary) = stats.snapshot();
+        let (_, summary) = stats.top_n(10);
         assert_eq!(summary.total_records, (MAX_UNIQUE_PAIRS + 2) as u64);
         assert_eq!(summary.dropped_unique_pairs, 1);
     }
 
-    /// The dropped counter is exposed via the public getter so
-    /// `/logs/bots` (and any future `/api/logs/bots/stats`) can
-    /// surface saturation without going through the full snapshot.
+    /// A saturated map still answers the query: the rows come back
+    /// (the top `n` of them) and the summary counts every pair the
+    /// table holds, not the ones that were dropped.
     #[test]
-    fn dropped_unique_pairs_getter() {
+    fn bot_top_n_on_a_saturated_map_still_counts_every_pair() {
         let stats = BotStats::new();
-        assert_eq!(stats.dropped_unique_pairs(), 0);
+        for i in 0..MAX_UNIQUE_PAIRS {
+            stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
+        }
+        // One more distinct host → dropped at the cap.
+        stats.record(&entry("Googlebot", "host-extra.example.com", "/"));
+
+        let (rows, summary) = stats.top_n(10);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(summary.unique_pairs, MAX_UNIQUE_PAIRS);
+        assert_eq!(summary.dropped_unique_pairs, 1);
+    }
+
+    /// The dropped counter rides on the summary, so `/logs/bots` can
+    /// surface the saturation without a second query.
+    #[test]
+    fn bot_summary_carries_the_dropped_pair_count() {
+        let stats = BotStats::new();
+        let (_, summary) = stats.top_n(10);
+        assert_eq!(summary.dropped_unique_pairs, 0);
         for i in 0..(MAX_UNIQUE_PAIRS + 5) {
             stats.record(&entry("Googlebot", &format!("h-{i}.ex"), "/"));
         }
-        assert_eq!(stats.dropped_unique_pairs(), 5);
+        let (_, summary) = stats.top_n(10);
+        assert_eq!(summary.dropped_unique_pairs, 5);
     }
 }

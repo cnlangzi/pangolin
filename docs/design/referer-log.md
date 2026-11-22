@@ -207,22 +207,35 @@ userinfo must not be stored at all — it is a credential.
 | ---- | ------------- | ----- |
 | `referer_log_recent` | Ring buffer of recent rows for late-join replay | `log.referer.recent` (default 200; `0` disables) |
 | `referer_log_tx` | Broadcast channel for live subscribers | `log.referer.capacity` (default 1000) |
-| `referer_stats` | Per-`(referer_host, host)` hit counters + last-seen | 50 000 distinct pairs; further pairs are counted but not stored |
+| `referer_stats` | Per-`(referer_host, host)` hit counters + last-seen | 50 000 distinct pairs; further pairs are dropped and counted in the saturation counter |
 | `referer_writer` | Background JSONL writer | 10 000 queued rows; the oldest is dropped on overflow |
 | `referer_writer_state` | The supervisor's state for that writer | 5 restarts per rolling window |
 
 The pair cap matters here in a way it does not for bots: a referral stream is
 attacker-shaped — anyone can send a `Referer` header naming a host of their
-choosing. Past the cap the counters keep ticking but the new pairs are not
-stored, and the saturation is visible to the operator.
+choosing. Past the cap the new pairs are not stored: they are counted in the
+saturation counter, and the saturation is visible to the operator.
+
+`referer_stats` is read through one query,
+`RefererStats::top_n(n, in_scope)`: a single pass over the pair map that
+materialises at most `n` rows and hands back a summary of the rows **in
+scope**. The scope is the caller's — the admin layer decides which hosts
+belong to the selected site and passes the predicate down — so `unique_pairs`
+and `total_hits` count the scoped rows, while `dropped_unique_pairs` stays
+process-wide: the records the cap dropped are not attributed to any host, so
+the counter says "the table is saturated", not "this scope is missing rows".
+The sort key is `hits` descending → `referer_host` ascending → `host`
+ascending; the last two keys make the order total, so two rows with the same
+hits never swap places between two renders.
 
 The counters live behind one lock that `record()` takes for writing and
-the snapshot takes for reading. The snapshot clones the pair table under
-the read guard and sorts it **after** the guard is released: the admin
-polls the snapshot every 30 seconds, and sorting up to 50 000 rows under
-the guard would stall `record()` — the referral path — for the whole
-sort. The side channel must never hold up the forwarding path
-(invariant #5 of `AGENTS.md`).
+the top-N query takes for reading. The query holds that read lock for
+one pass and materialises at most `n` rows, so it stays short however
+saturated the table is — the admin polls it every 30 seconds, and a
+query that cloned and sorted the whole table under the guard would
+stall `record()` — the referral path — for the duration. The side
+channel must never hold up the forwarding path (invariant #5 of
+`AGENTS.md`).
 
 The writer task runs under a supervisor (`pangolin_core::supervisor`), the
 same one the bot log uses: a panic in the task restarts it instead of
@@ -239,11 +252,11 @@ consumer would race for it.
 | `/logs/referers` | Live view: top-N `(referrer, host)` summary + the JSONL writer's status + the SSE tail. |
 | `/logs/referers/history` | The day's JSONL, filtered and paginated. |
 | `/logs/referers/stats` | The day's rollup: per referrer host — hits, distinct visitor IPs, landing paths, last seen. |
-| `/api/logs/referers/summary` | The polled summary region: the three counters + the top-N table, scoped to `?site=`. Admin-only. |
+| `/api/logs/referers/summary` | The polled summary region: the three counters, the saturation banner + the top-N table, scoped to `?site=`. Admin-only. |
 | `/api/logs/referers/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
 
-The **summary region** of `/logs/referers` — the three counters and the
-top-N table — is polled every 30 seconds from
+The **summary region** of `/logs/referers` — the three counters, the
+saturation banner and the top-N table — is polled every 30 seconds from
 `GET /api/logs/referers/summary`. The counters move while the operator
 watches the page: every recorded referral ticks them, and the SSE tail
 below only appends rows, so without the poll the numbers freeze at the
@@ -290,6 +303,16 @@ All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
 same site are aggregated together rather than split per host.
 
+When the in-memory pair table is saturated, `/logs/referers` shows a
+**saturation banner** under the summary cards: how many records were dropped,
+the cap they were dropped at, and where the per-day JSONL stream is
+(`log.referer.dir/referer-YYYY-MM-DD.jsonl`) — the stream has its own drop
+counter, reported by the writer panel. The dropped count is process-wide, so
+the banner shows it whatever the site scope is; the counts it sits between are
+scoped, and they do not include the dropped records. The banner quotes the cap
+from the code constant, so a bump of `referer_stats::MAX_UNIQUE_PAIRS` shows up
+on the page without a translation change.
+
 The history page and the stats page apply the same filters (`referer_host`,
 `host`, `path`, `status`, `method`, `client_ip`) to the same day's file, and
 the links between them — plus the date sidebar's links — carry every current
@@ -327,10 +350,10 @@ rows it describes.
 | ---- | ----- | ------------ |
 | Unit (core) | `crates/pangolin-core/src/referer.rs` | Referer parsing (userinfo / port / case / non-absolute / `about:blank`), the document-navigation rule, the site-boundary rule |
 | Unit (core) | `crates/pangolin-core/src/referer_log.rs` | The JSONL wire format and its exact key set, the ring buffer's eviction, the writer's append + daily rotation, the history reader's filters and pagination, the statistics rollup |
-| Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap |
+| Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap; the top-N query's sort order (`hits` desc → `referer_host` asc → `host` asc) and its tie-break, the scope predicate keeping a row out of the result *and* out of the summary, and the summary describing the scoped rows rather than the returned ones (issue #221) |
 | Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
 | Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
 | Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219), the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221); the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page |
 | End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |
 | End-to-end | `tests/src/admin_ui_e2e.rs` | The polled summary endpoint answers a signed-in operator with the scoped fragment, and an anonymous one with the login redirect (issue #226) |

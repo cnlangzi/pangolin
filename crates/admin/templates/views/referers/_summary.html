@@ -1,18 +1,18 @@
 {# ── Summary region (server-rendered) ─────────────────────────────── #}
-{# The three counters and the top-N table. The live page inlines    #}
-{# this partial and `GET /api/logs/referers/summary` returns it on    #}
-{# its own, so the polled markup is byte-for-byte the markup the    #}
-{# page shipped — the swap itself does not flicker. (The region's   #}
-{# height still follows the data: the table appears and disappears  #}
-{# with the traffic.)                                                #}
-{#                                                                   #}
-{# Only `summary`, `top_rows` and `lang` may be referenced here: the #}
-{# endpoint's view struct carries no other field, and the page and  #}
-{# the fragment must describe the same slice of the counters.        #}
+{# The three counters, the saturation banner and the top-N table.    #}
+{# The live page inlines this partial and                              #}
+{# `GET /api/logs/referers/summary` returns it on its own, so the     #}
+{# polled markup is byte-for-byte the markup the page shipped — the  #}
+{# swap itself does not flicker. (The region's height still follows   #}
+{# the data: the table appears and disappears with the traffic.)       #}
+{#                                                                    #}
+{# The partial reads `summary`, `top_rows`, `stats_cap` and `lang`;  #}
+{# the endpoint's view struct carries exactly those, so the two       #}
+{# renders cannot drift apart.                                         #}
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
     <div class="card p-4">
       <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.total_hits") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
+      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_hits }}</div>
     </div>
     <div class="card p-4">
       <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.distinct_pairs") }}</div>
@@ -31,6 +31,24 @@
     </div>
   </div>
 
+  {# ── Saturation banner (server-rendered) ────────────────────────────── #}
+  {# The in-memory `(referrer × host)` table is capped. Past the cap #}
+  {# the rows are dropped, so the counts above and the table below   #}
+  {# do not hold them. The dropped counter is process-wide — it says #}
+  {# "the table is saturated", not "this scope is missing rows" — so #}
+  {# the banner shows it whatever the site scope is. The JSONL stream #}
+  {# it points at is the per-day log the rows are written to; that    #}
+  {# stream has its own drop counter, reported by the writer panel.  #}
+  {% if summary.dropped_unique_pairs > 0 %}
+  <div class="card overflow-hidden mb-6">
+    <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">
+      <p>{{ lang.tf("referers.saturation_hint_1", self.saturation_args()) }}</p>
+      <p class="mt-1">{{ lang.t("referers.saturation_hint_2") }} <code>log.referer.dir</code> <code>referer-YYYY-MM-DD.jsonl</code> {{ lang.t("referers.saturation_hint_3") }}</p>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
   {% if !top_rows.is_empty() %}
   <div class="card overflow-hidden mb-6">
     <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700">

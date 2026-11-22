@@ -56,8 +56,8 @@
   </form>
 
   {# ── Summary region (server-rendered, polled every 30s) ────────────── #}
-  {# The counters and the top-N table come from the live snapshot, so  #}
-  {# they drift while the operator watches the page — the SSE feed     #}
+  {# The counters and the top-N table come from the live top-N query, #}
+  {# so they drift while the operator watches the page — the SSE feed  #}
   {# below appends new rows but never touches the counters. The region #}
   {# is therefore polled: `GET /api/logs/referers/summary` returns the  #}
   {# very partial the page inlined, so the swap itself does not       #}
