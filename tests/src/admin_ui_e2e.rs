@@ -5292,6 +5292,84 @@ async fn admin_ui_access_and_bot_log_pages_render_chinese() {
     );
 }
 
+/// The `/logs/bots` summary region refreshes itself (issue #225).
+///
+/// The counters behind the three cards and the top-N table move while
+/// the page is open, so the page polls `GET /api/logs/bots/summary`
+/// every 30 s and swaps the region's content.  The fragment is the
+/// server's authoritative snapshot — the browser never accumulates the
+/// numbers itself — so the endpoint has to be reachable by a signed-in
+/// operator and closed to everyone else.
+#[tokio::test]
+async fn admin_ui_bots_summary_endpoint_serves_the_polled_fragment() {
+    let ngx = start_ngx().await;
+
+    // ── signed in: the fragment is served ──
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+    let resp = client.get("/api/logs/bots/summary").await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "text/html; charset=utf-8",
+        "the fragment must be served as HTML"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "no-store",
+        "a polled aggregate must not be reused from the cache"
+    );
+    // The marker lets the page tell its own fragment apart from
+    // anything else the browser hands it — an expired session
+    // redirects to /login, and htmx must not swap that in.
+    assert_eq!(
+        resp.headers()
+            .get("x-pangolin-fragment")
+            .and_then(|v| v.to_str().ok()),
+        Some("bots-summary"),
+        "the fragment must mark its own response"
+    );
+    let body = resp.text().await.unwrap();
+    for (needle, what) in [
+        ("Total bot requests", "the total-requests card"),
+        ("Distinct (bot × host) pairs", "the distinct-pairs card"),
+        ("Top bot", "the top-bot card"),
+    ] {
+        assert!(
+            body.contains(needle),
+            "the fragment must carry {what}: {body}"
+        );
+    }
+
+    // ── signed out: no fragment ──
+    let anon = new_client_no_redirect();
+    let resp = anon
+        .get(&ngx.admin_url("/api/logs/bots/summary"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        302,
+        "the fragment must not be served to an anonymous client"
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        loc.contains("/login"),
+        "the anonymous request must be sent to the login page, got: {loc}"
+    );
+}
+
 /// The referer log and the traffic page are translated (issue #183).
 ///
 /// These are the two "look at the numbers" pages: the referer log
@@ -5581,6 +5659,16 @@ async fn admin_ui_referers_summary_endpoint_keeps_the_site_scope() {
             .and_then(|v| v.to_str().ok()),
         Some("no-store"),
         "the polled fragment must not be cacheable"
+    );
+    // The marker lets the page tell its own fragment apart from
+    // anything else the browser hands it — an expired session
+    // redirects to /login, and htmx must not swap that in.
+    assert_eq!(
+        resp.headers()
+            .get("x-pangolin-fragment")
+            .and_then(|v| v.to_str().ok()),
+        Some("referers-summary"),
+        "the fragment must mark its own response"
     );
 
     // Another site's scope must not show the `web` site's referral.

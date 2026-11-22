@@ -255,29 +255,59 @@ consumer would race for it.
 | `/api/logs/referers/summary` | The polled summary region: the three counters, the saturation banner + the top-N table, scoped to `?site=`. Admin-only. |
 | `/api/logs/referers/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
 
-The **summary region** of `/logs/referers` — the three counters, the
-saturation banner and the top-N table — is polled every 30 seconds from
-`GET /api/logs/referers/summary`. The counters move while the operator
-watches the page: every recorded referral ticks them, and the SSE tail
-below only appends rows, so without the poll the numbers freeze at the
-value they had when the page was loaded. The endpoint returns the very
-`views/referers/_summary.html` partial the page inlined, so the swap
-replaces the markup with byte-identical markup — the swap itself does
-not flicker. (The region's *height* still follows the data: the top-N
-table appears and disappears with the traffic, and the content below
-the region moves with it.)
+### The summary region refreshes itself
 
-The poll carries the site scope (`?site=`) explicitly: htmx does not
-inherit the page's query string, and the site selector is a sibling form
-rather than an ancestor of the polled region. The page and the endpoint
-resolve the scope through the same helper, so the two can never
-describe different slices — and a `?site=` naming no site stays scoped
-(and therefore empty), never "all sites". The response is
-`Cache-Control: no-store`: a cached aggregate would keep showing a
-value the counters have already moved past. A fragment that fails to
-render answers **500** rather than an empty 200: the HTMX client does
-not swap a non-2xx response, so the operator keeps the content the
-last successful poll put there.
+The three summary cards and the top-N table on `/logs/referers` are **not**
+a load-time snapshot. The counters behind them move while the page is open —
+`RefererStats::record` runs on every recorded referral — so on a busy
+gateway the numbers the operator reads drift away from the truth within
+minutes. The page therefore polls `GET /api/logs/referers/summary` every 30
+seconds and swaps the region's `innerHTML`.
+
+The region is everything the counters live in: the three cards, the
+**saturation banner** and the top-N table. The banner belongs to it —
+it reports the records the capped pair table dropped, and that counter
+moves too — so the fragment carries it and the page and the fragment
+keep showing the same thing.
+
+Five rules make that safe:
+
+- **The region is one partial.** The page and the endpoint render the same
+  `views/referers/_summary.html`, so the polled fragment is byte-identical to
+  what the page painted. The swap cannot change the markup under the
+  operator's eyes, and the layout does not jump.
+- **The container survives the swap.** The polling attributes live on the
+  container (`hx-get` / `hx-trigger` / `hx-swap="innerHTML"`), not on the
+  content it holds: `innerHTML` replaces the children and keeps the
+  container, so the next poll still fires. `outerHTML` would replace the
+  container with content that carries no polling attributes, and the region
+  would freeze after the first refresh.
+- **The response is not cacheable.** The fragment is served
+  `Cache-Control: no-store` — a reused aggregate is a stale aggregate, and
+  at a 30-second cadence a cache hit would be visibly wrong.
+- **Only the fragment is swapped in.** The fragment marks its own response
+  with `X-Pangolin-Fragment`, and the page's `htmx:beforeSwap` guard skips
+  the swap when the marker is missing. Without the guard an expired session
+  would be worse than a stale counter: the admin redirects an
+  unauthenticated request to `/login`, the browser's XHR follows that
+  redirect, and htmx would swap the **login page** into the counters
+  region. htmx also executes the script tags it swaps in, so the login
+  page's own `htmx.min.js` would be re-evaluated inside the live page.
+- **A failed poll leaves the region alone.** A render that fails answers
+  `500`, not an empty `200`: htmx swaps a 2xx body unconditionally, so an
+  empty one would blank the region the operator is reading. htmx leaves the
+  DOM alone on a 5xx, so the last good markup survives until the next poll.
+
+The fragment is rendered in the operator's language, exactly like the page
+it replaces.
+
+**The poll carries the site scope.** htmx does not inherit the page's query
+string, and the site selector is a sibling form rather than an ancestor of
+the polled region, so the scope travels with the poll (`?site=`, percent-
+encoded — a site name carrying a `&` would otherwise split the query
+string). The page and the endpoint resolve the scope through the same
+helper, so the two can never describe different slices — and a `?site=`
+naming no site stays scoped (and therefore empty), never "all sites".
 
 The **JSONL writer** panel on `/logs/referers` is what tells "no referral
 traffic today" apart from "the writer died": the ring buffer, the SSE tail

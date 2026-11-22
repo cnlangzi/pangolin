@@ -55,10 +55,11 @@ pub use domains::{
 };
 pub use logs::{
     BotHistoryFilter, BotHistorySummary, BotLogsHistoryTemplate, BotLogsStatsTemplate,
-    BotLogsTemplate, LogsTemplate, RefererHistoryDateLink, RefererHistoryFilter,
-    RefererHistoryStatsPage, RefererHistorySummary, RefererLogsHistoryTemplate,
-    RefererLogsStatsTemplate, RefererLogsSummaryView, RefererLogsTemplate, RefererSiteOption,
-    RefererStatsHostRow, RefererStatsPathRow, referer_subnav, subnav,
+    BotLogsSummaryView, BotLogsTemplate, LogsTemplate, RefererHistoryDateLink,
+    RefererHistoryFilter, RefererHistoryStatsPage, RefererHistorySummary,
+    RefererLogsHistoryTemplate, RefererLogsStatsTemplate, RefererLogsSummaryView,
+    RefererLogsTemplate, RefererSiteOption, RefererStatsHostRow, RefererStatsPathRow,
+    referer_subnav, subnav,
 };
 pub use ratelimit::{
     RateLimitKpisView, RateLimitPageTemplate, RateLimitRulesView, RateLimitSitesView, RuleRow,
