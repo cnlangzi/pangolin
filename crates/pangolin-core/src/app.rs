@@ -535,10 +535,12 @@ pub struct App {
     referer_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// The supervisor state of the referer-log writer.
     ///
-    /// `None` when the referer log is disabled — then there is no
-    /// writer to supervise and the panel says the status is
-    /// unavailable.
-    referer_writer_state: Option<Arc<SupervisedTask>>,
+    /// Always present, even when the referer log is disabled — then
+    /// there is no writer to supervise, and
+    /// [`App::referer_writer_health`] says so through `available`.
+    /// Keeping the state unconditional means "is the referer log
+    /// enabled" is answered by one field only.
+    referer_writer_state: Arc<SupervisedTask>,
     /// In-memory traffic stats (no persistence). Hot path is
     /// `on_start` / `on_finish` (`try_send` only); aggregation
     /// lives on a dedicated OS thread. See `docs/design/traffic.md`.
@@ -767,7 +769,7 @@ impl App {
         let referer_writer = referer_cfg
             .enabled
             .then(|| RefererLogWriter::new(referer_cfg.dir.clone()));
-        let referer_writer_state = referer_writer.as_ref().map(|_| SupervisedTask::new());
+        let referer_writer_state = SupervisedTask::new();
 
         let traffic_enabled = config.log.traffic.enabled;
         Ok(Self {
@@ -1211,9 +1213,7 @@ impl App {
         let Some(writer) = self.referer_writer.as_ref() else {
             return false;
         };
-        let Some(state) = self.referer_writer_state.clone() else {
-            return false;
-        };
+        let state = self.referer_writer_state.clone();
         let mut guard = self.referer_writer_task.lock();
         if guard.is_some() {
             // Already started — second call is a silent no-op so a
@@ -1259,9 +1259,7 @@ impl App {
         // The supervisor must stop restarting *before* the writer is
         // told to stop: a panic that lands in between would otherwise
         // resurrect the writer after the shutdown began.
-        if let Some(state) = self.referer_writer_state.as_ref() {
-            state.begin_shutdown();
-        }
+        self.referer_writer_state.begin_shutdown();
         let handle = self.referer_writer_task.lock().take();
         writer.shutdown();
         let Some(handle) = handle else {
@@ -1490,17 +1488,12 @@ impl App {
     /// "the writer is dead" — the two look the same on every other
     /// view of the side channel.
     pub fn bot_writer_health(&self) -> WriterHealth {
+        // The bot log is always on, so the writer object always
+        // exists — the panel may still say "not running" when the
+        // task was never spawned (no runtime in scope).
+        let available = self.bot_writer.is_some();
         let dropped = self.bot_writer.as_ref().map_or(0, |w| w.dropped_total());
-        WriterHealth {
-            // The bot log is always on, so the writer object always
-            // exists — the panel may still say "not running" when
-            // the task was never spawned (no runtime in scope).
-            available: self.bot_writer.is_some(),
-            alive: self.bot_writer_state.is_alive(),
-            restarts: self.bot_writer_state.restart_count(),
-            failed: self.bot_writer_state.gave_up(),
-            dropped,
-        }
+        Self::writer_health(available, dropped, &self.bot_writer_state)
     }
 
     /// The health of the referer-log JSONL writer task.
@@ -1509,23 +1502,25 @@ impl App {
     /// there is no writer to report on and the panel says so instead
     /// of claiming the side channel is healthy.
     pub fn referer_writer_health(&self) -> WriterHealth {
+        let available = self.referer_writer.is_some();
         let dropped = self
             .referer_writer
             .as_ref()
             .map_or(0, |w| w.dropped_total());
-        let Some(state) = self.referer_writer_state.as_ref() else {
-            return WriterHealth {
-                available: false,
-                alive: false,
-                restarts: 0,
-                failed: false,
-                dropped,
-            };
-        };
+        Self::writer_health(available, dropped, &self.referer_writer_state)
+    }
+
+    /// The one place a writer's health is assembled.
+    ///
+    /// Both side channels answer the same questions with the same
+    /// fields, so the projection lives here once: a field added to
+    /// [`WriterHealth`] then reaches both panels.
+    fn writer_health(available: bool, dropped: u64, state: &SupervisedTask) -> WriterHealth {
         WriterHealth {
-            available: self.referer_writer.is_some(),
+            available,
             alive: state.is_alive(),
             restarts: state.restart_count(),
+            window_restarts: state.window_restart_count(),
             failed: state.gave_up(),
             dropped,
         }
@@ -2805,9 +2800,12 @@ mod tests {
     }
 
     /// A writer that panics must come back and keep writing the
-    /// same day's file — the entries that were queued when it died
-    /// are still in the queue, because the queue lives in the `Arc`
-    /// the supervisor reuses.
+    /// same day's file.
+    ///
+    /// The supervisor restarts the *same* `Arc`, so the queue the
+    /// writer had not drained yet is still there after the restart.
+    /// (A batch that was already being written when the panic hit is
+    /// lost — it had left the queue and had not reached the disk.)
     #[tokio::test]
     async fn bot_writer_keeps_writing_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -2818,8 +2816,10 @@ mod tests {
         let writer = app.bot_writer.clone().expect("the bot writer exists");
 
         // The supervisor's factory: the first attempt panics, the
-        // second one is the real writer.
-        let state = SupervisedTask::new();
+        // second one is the real writer. The state is the app's own,
+        // so the panel's "Restarted N times" line is pinned end to
+        // end.
+        let state = app.bot_writer_state.clone();
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer_for_task = writer.clone();
         let runs_for_task = runs.clone();
@@ -2854,6 +2854,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(restarted, "the supervisor must restart the writer");
+        assert_eq!(
+            app.bot_writer_health().restarts,
+            1,
+            "the panel must see the restart"
+        );
 
         // The entry goes into the queue of the *same* writer the
         // restarted task drains.

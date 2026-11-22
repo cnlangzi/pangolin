@@ -39,11 +39,18 @@ use std::time::{Duration, Instant};
 ///
 /// Shared between the supervisor (which writes it) and the admin
 /// panel (which reads it), so every field is an atomic.
+///
+/// The panel reads `gave_up` and `restarts` together, so the stores
+/// and the loads that pair them are `Release` / `Acquire`: a reader
+/// that sees "the supervisor gave up" also sees the restart count
+/// that goes with it.
 pub struct SupervisedTask {
     /// The task is running right now.
     alive: AtomicBool,
     /// Restarts since the process started.
     restarts: AtomicU32,
+    /// Restarts performed in the current rolling window.
+    window_restarts: AtomicU32,
     /// The supervisor gave up — the task is dead until the process restarts.
     gave_up: AtomicBool,
     /// The shutdown was requested; the supervisor must not restart.
@@ -62,6 +69,7 @@ impl SupervisedTask {
         Arc::new(Self {
             alive: AtomicBool::new(false),
             restarts: AtomicU32::new(0),
+            window_restarts: AtomicU32::new(0),
             gave_up: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -70,7 +78,7 @@ impl SupervisedTask {
 
     /// The task is running right now.
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Restarts since the process started.
@@ -79,12 +87,20 @@ impl SupervisedTask {
     /// panics it saw: a task that panicked once and could not be
     /// restarted (the budget was spent) was never restarted.
     pub fn restart_count(&self) -> u32 {
-        self.restarts.load(Ordering::Relaxed)
+        self.restarts.load(Ordering::Acquire)
+    }
+
+    /// Restarts performed in the current rolling window.
+    ///
+    /// At give-up this is the number of repair attempts that failed
+    /// — the number the panel's failure message quotes.
+    pub fn window_restart_count(&self) -> u32 {
+        self.window_restarts.load(Ordering::Acquire)
     }
 
     /// The supervisor gave up — the task is dead until the process restarts.
     pub fn gave_up(&self) -> bool {
-        self.gave_up.load(Ordering::Relaxed)
+        self.gave_up.load(Ordering::Acquire)
     }
 
     /// Ask the supervisor to stop restarting. Set before the task is told to stop.
@@ -102,17 +118,22 @@ impl SupervisedTask {
 
     /// Record that the task is (not) running.
     fn set_alive(&self, alive: bool) {
-        self.alive.store(alive, Ordering::Relaxed);
+        self.alive.store(alive, Ordering::Release);
     }
 
     /// Record that the supervisor performed a restart.
     fn record_restart(&self) {
-        self.restarts.fetch_add(1, Ordering::Relaxed);
+        self.restarts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record how many restarts the current window has spent.
+    fn set_window_restarts(&self, restarts: u32) {
+        self.window_restarts.store(restarts, Ordering::Release);
     }
 
     /// Record that the supervisor gave up.
     fn set_gave_up(&self) {
-        self.gave_up.store(true, Ordering::Relaxed);
+        self.gave_up.store(true, Ordering::Release);
     }
 
     /// Wait until the shutdown is requested.
@@ -164,24 +185,55 @@ pub struct WriterHealth {
     pub alive: bool,
     /// Restarts since the process started.
     pub restarts: u32,
+    /// Restarts the supervisor performed in the current rolling
+    /// window.
+    ///
+    /// At give-up this is the number of repair attempts that failed
+    /// — the number the panel's failure message quotes. It is not
+    /// [`Self::restarts`]: that one counts every restart since the
+    /// process started, including the ones that happened before the
+    /// last stable run.
+    pub window_restarts: u32,
     /// The supervisor gave up — the side channel is dead.
     pub failed: bool,
     /// Entries dropped because the queue was full.
     pub dropped: u64,
 }
 
-/// Clears the `alive` flag when the supervisor goes away.
+/// Owns the writer task while the supervisor runs.
 ///
-/// The supervisor is supposed to end only after the writer exited or
-/// after it gave up — but a task that is aborted, or a supervisor that
-/// unwinds on a bug of its own, would leave the flag saying "the
-/// writer is running" while nothing is running. The guard makes the
-/// flag honest in every path.
-struct AliveGuard(Arc<SupervisedTask>);
+/// Dropping it aborts the task: a writer that outlived its
+/// supervisor would keep writing with nobody left to restart it, and
+/// the panel would have no way to say so. The guard also clears the
+/// `alive` flag, so the flag never outlives the task it describes.
+struct WriterTask {
+    state: Arc<SupervisedTask>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
 
-impl Drop for AliveGuard {
+impl WriterTask {
+    /// Spawn the writer in a task of its own: that is what turns a
+    /// panic into a `JoinError` instead of an unwind through the
+    /// supervisor.
+    fn spawn<Fut>(state: Arc<SupervisedTask>, fut: Fut) -> Self
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            state,
+            handle: Some(tokio::spawn(fut)),
+        }
+    }
+}
+
+impl Drop for WriterTask {
     fn drop(&mut self) {
-        self.0.set_alive(false);
+        if let Some(handle) = self.handle.take() {
+            // A no-op once the task has finished; a real abort while
+            // it is still running.
+            handle.abort();
+        }
+        self.state.set_alive(false);
     }
 }
 
@@ -212,10 +264,9 @@ pub async fn supervise<F, Fut>(
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let _alive = AliveGuard(state.clone());
-    // Restarts inside the current rolling window. Reset when the
-    // task survives long enough to be considered stable.
-    let mut window_restarts: u32 = 0;
+    // Restarts performed inside the current rolling window. Reset
+    // when the task survives long enough to be considered stable.
+    let mut attempts: u32 = 0;
     let mut backoff = config.backoff;
     loop {
         if state.is_shutting_down() {
@@ -223,17 +274,17 @@ pub async fn supervise<F, Fut>(
         }
         state.set_alive(true);
         let started = Instant::now();
-        // The writer runs in a task of its own: that is what turns a
-        // panic into a `JoinError` instead of an unwind through the
-        // supervisor.
-        let handle = tokio::spawn(make());
-        let join_err = match handle.await {
-            Ok(()) => {
-                // The task exited on its own — the shutdown signal.
-                state.set_alive(false);
-                return;
+        let mut task = WriterTask::spawn(state.clone(), make());
+        let join_err = {
+            let handle = task.handle.as_mut().expect("the task was just spawned");
+            match handle.await {
+                Ok(()) => {
+                    // The task exited on its own — the shutdown signal.
+                    state.set_alive(false);
+                    return;
+                }
+                Err(join_err) => join_err,
             }
-            Err(join_err) => join_err,
         };
         state.set_alive(false);
         if join_err.is_cancelled() {
@@ -246,26 +297,37 @@ pub async fn supervise<F, Fut>(
         }
         if state.is_shutting_down() {
             // The shutdown was requested while the task was dying:
-            // do not resurrect it.
+            // do not resurrect it. The panic is still worth a log
+            // line — it landed during the final flush, which is
+            // exactly where the last queued rows are lost, and the
+            // shutdown path only sees the supervisor's clean exit.
+            log::error!("{name}: writer task panicked during shutdown: {join_err}");
             return;
         }
         if started.elapsed() >= config.stable_run {
             // The task ran long enough to be considered healthy, so
             // the panic that just happened starts a new window.
-            window_restarts = 0;
+            attempts = 0;
         }
-        window_restarts += 1;
-        if window_restarts > config.max_restarts {
+        if attempts >= config.max_restarts {
+            // The budget is spent: this panic is the one after the
+            // last restart, and no further attempt is made.
             state.set_gave_up();
+            // The count is the number of restarts, not the number of
+            // panics — it is the number the admin panel quotes, so
+            // the journal and the panel say the same thing.
             log::error!(
-                "{name}: writer task panicked {window_restarts} times in a row; \
-                 giving up — this side channel is dead until the gateway restarts"
+                "{name}: writer task panicked ({join_err}); giving up after \
+                 {attempts} restarts — this side channel is dead until the \
+                 gateway restarts"
             );
             return;
         }
+        attempts += 1;
+        state.set_window_restarts(attempts);
         log::error!(
             "{name}: writer task panicked ({join_err}); restarting \
-             ({window_restarts}/{})",
+             ({attempts}/{})",
             config.max_restarts
         );
         state.record_restart();
@@ -383,6 +445,11 @@ mod tests {
             "five restarts were performed before the supervisor gave up"
         );
         assert_eq!(
+            state.window_restart_count(),
+            5,
+            "the window holds the failed repair attempts the panel quotes"
+        );
+        assert_eq!(
             runs.load(Ordering::SeqCst),
             6,
             "the task ran once and was restarted five times"
@@ -451,16 +518,22 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
 
         let runs_for_task = runs.clone();
+        let state_for_task = state.clone();
         let supervisor = tokio::spawn(supervise(
             state.clone(),
             "test",
             fast_config(5),
             move || {
                 let runs = runs_for_task.clone();
+                let state = state_for_task.clone();
                 async move {
                     runs.fetch_add(1, Ordering::SeqCst);
-                    // Give the test time to ask for the shutdown.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // The panic lands only after the shutdown was
+                    // requested — a fixed sleep would race the test
+                    // on a loaded machine.
+                    while !state.is_shutting_down() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     panic!("the writer task panicked");
                 }
             },
@@ -510,19 +583,29 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
-    /// The panel must never claim a dead writer is alive: when the
-    /// supervisor goes away, the flag has to follow it.
+    /// A writer must not outlive its supervisor: a task that kept
+    /// writing with nobody left to restart it would be a hole the
+    /// panel cannot describe. So an aborted supervisor takes the
+    /// writer with it, and the `alive` flag follows.
     #[tokio::test]
-    async fn the_supervisor_clears_the_alive_flag_when_it_is_aborted() {
+    async fn an_aborted_supervisor_stops_the_writer_task() {
         let state = SupervisedTask::new();
+        let writes = Arc::new(AtomicUsize::new(0));
 
+        let writes_for_task = writes.clone();
         let supervisor = tokio::spawn(supervise(
             state.clone(),
             "test",
             fast_config(5),
-            move || async {
-                // A writer that never ends: only the abort stops it.
-                std::future::pending::<()>().await;
+            move || {
+                let writes = writes_for_task.clone();
+                async move {
+                    // A writer that would keep going forever.
+                    loop {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
             },
         ));
 
@@ -533,8 +616,16 @@ mod tests {
         supervisor.abort();
         let _ = supervisor.await;
         assert!(
-            !state.is_alive(),
+            wait_for(|| !state.is_alive()).await,
             "an aborted supervisor must not leave the writer looking alive"
+        );
+        // The writer was stopped with it: the counter stops moving.
+        let after_abort = writes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            after_abort,
+            "the writer task must not outlive its supervisor"
         );
     }
 }
