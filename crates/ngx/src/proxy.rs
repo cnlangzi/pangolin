@@ -72,12 +72,14 @@ const MAX_REFERRER_HEADER_LEN: usize = 4_096;
 // ─────────────────────────────────────────────────────────────────
 
 /// Per-request state for access logging (Issue #73).
-/// Captures start time, method, path, host, backend, and the
-/// `User-Agent` header so [`record_access_log`] can build a fully
-/// populated [`AccessLogEntry`](pangolin_core::AccessLogEntry) —
-/// the `user_agent` field is consumed by the bot side-channel
-/// in [`App::push_access_log`](pangolin_core::App::push_access_log)
-/// (searchenginebots stage-1).
+/// Captures start time, method, path, host and backend so
+/// [`record_access_log`] can build a fully populated
+/// [`AccessLogEntry`](pangolin_core::AccessLogEntry).
+///
+/// The `User-Agent` is deliberately **not** one of them (issue #224):
+/// the per-request context has to be `Send + Sync + 'static`, so it
+/// cannot hold a borrow of *this* request's headers. The value is read
+/// in place from the session by each of its consumers instead.
 #[derive(Debug, Clone)]
 pub struct RequestState {
     pub start: std::time::Instant,
@@ -85,10 +87,6 @@ pub struct RequestState {
     pub path: String,
     pub host: String,
     pub backend: String, // "tun:office" | "direct:1.2.3.4:8080" | "file://..."
-    /// `User-Agent` header value, captured once per request in
-    /// `request_filter`. `None` if the client didn't send one or
-    /// the header wasn't valid UTF-8.
-    pub user_agent: Option<String>,
     /// The authoritative client IP, resolved **once** per request
     /// in `request_filter` (issue #115). `None` when there is no
     /// trusted source for it — behind a CDN / LB without the
@@ -147,7 +145,6 @@ impl Default for RequestState {
             path: String::new(),
             host: String::new(),
             backend: String::new(),
-            user_agent: None,
             client_ip: None,
             log_client_ip: pangolin_core::client_ip::UNKNOWN.to_string(),
             peer_ip: None,
@@ -191,31 +188,10 @@ impl ProxyHttp for AppProxy {
         ctx.method = session.req_header().method.as_str().to_string();
         ctx.path = path.clone();
         ctx.host = host_from_session(session);
-        // Stage-1 (searchenginebots): capture the User-Agent so
-        // `record_access_log` can populate the entry's
-        // `user_agent` field, which feeds `App::push_access_log`'s
-        // bot side-channel. We do it once here (the hot path) so
-        // the four call sites of `record_access_log` don't need
-        // to re-iterate the request headers.
-        //
-        // `HeaderMap::get` does the case-insensitive lookup in
-        // O(1) (vs. an O(n) `.iter().find(...)` linear scan)
-        // and returns the first matching value, which matches
-        // the previous behaviour exactly.
-        //
-        // Non-ASCII / non-UTF-8 UA values are coerced to `None` —
-        // bot detection is substring-based and the rules are
-        // ASCII, so a non-UTF-8 UA can't match anyway.
-        ctx.user_agent = session
-            .req_header()
-            .headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok().map(String::from));
 
         // Referer log (inbound external referrals): capture the three
-        // headers the classification needs, next to the User-Agent
-        // capture above so all the request-header reads happen in one
-        // place on the hot path.
+        // headers the classification needs, in one place on the hot
+        // path.
         //
         // The header is only read when the feature is enabled
         // (`log.referer.enabled`), so a deploy that turns the
@@ -374,7 +350,7 @@ impl ProxyHttp for AppProxy {
             &provider_cfg,
             peer,
             |name: &str| first_level.get(name).cloned(),
-            ctx.user_agent.as_deref(),
+            request_user_agent(session.req_header()),
             // No verifier when the gateway headers are disabled: the
             // result would be thrown away, so skip the verification
             // work entirely.
@@ -528,7 +504,7 @@ impl ProxyHttp for AppProxy {
         } else {
             match (
                 self.app.bot_verifier.as_deref(),
-                ctx.user_agent.as_deref(),
+                request_user_agent(session.req_header()),
                 limit_ip,
             ) {
                 (Some(v), Some(ua), Some(ip)) => {
@@ -570,9 +546,11 @@ impl ProxyHttp for AppProxy {
             if !matches!(decision, pangolin_core::LimitDecision::Allow)
                 && let Some(ip) = limit_ip
             {
-                self.app
-                    .rate_limiter
-                    .record_user_agent(&site.name, ip, ctx.user_agent.as_deref());
+                self.app.rate_limiter.record_user_agent(
+                    &site.name,
+                    ip,
+                    request_user_agent(session.req_header()),
+                );
             }
             match decision {
                 pangolin_core::LimitDecision::Allow => {}
@@ -609,7 +587,7 @@ impl ProxyHttp for AppProxy {
                         pangolin_core::reputation::assess(
                             library.as_deref(),
                             ctx.client_ip,
-                            ctx.user_agent.as_deref(),
+                            request_user_agent(session.req_header()),
                             bot_name.as_deref(),
                         )
                     };
@@ -780,7 +758,12 @@ impl ProxyHttp for AppProxy {
             // tunnel + direct paths. `ctx` (the trait's
             // `RequestState`) is unaffected because the proxy
             // policy `ProxyCtx` was renamed to `proxy_ctx` above.
-            record_access_log(&self.app, ctx, parse_status_from_line(&resp.status_line)).await;
+            record_access_log(
+                &self.app,
+                ctx,
+                parse_status_from_line(&resp.status_line),
+                request_user_agent(session.req_header()),
+            );
             write_response_to_session(session, &resp).await;
             return Ok(true);
         }
@@ -1037,13 +1020,18 @@ impl ProxyHttp for AppProxy {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Issue #73: construct AccessLogEntry and push to App
         let status = upstream_response.status.as_u16();
-        record_access_log(&self.app, ctx, status).await;
+        record_access_log(
+            &self.app,
+            ctx,
+            status,
+            request_user_agent(session.req_header()),
+        );
         Ok(())
     }
 
@@ -1100,6 +1088,26 @@ fn is_streaming_headers(headers: &HeaderMap) -> bool {
             .iter()
             .any(|value| pangolin_core::is_streaming_header(name, value.to_str().unwrap_or("")))
     })
+}
+
+/// The request's `User-Agent`, borrowed from the request headers.
+///
+/// The hot path must not copy the value out of the header map: every
+/// consumer takes a borrow, and the access log copies it once — when
+/// it builds the entry (issue #224).
+///
+/// `HeaderMap::get` does the case-insensitive lookup in O(1) (vs. an
+/// O(n) `.iter().find(...)` linear scan) and returns the first
+/// matching value, which is what the owned copy used to see.
+///
+/// A value that is not valid UTF-8 reads as "no user agent": the bot
+/// rules are ASCII, so a non-UTF-8 value cannot match one anyway, and
+/// unwrapping the conversion would panic on the request path.
+fn request_user_agent(req_header: &RequestHeader) -> Option<&str> {
+    req_header
+        .headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
 }
 
 /// Build the upstream peer for a tunnelled backend.
@@ -1605,7 +1613,16 @@ fn classify_referer(
 /// **separate** [`App::push_referer_log`] call: the bot branch of
 /// `push_access_log` returns early in five places, so a referer
 /// branch placed after it would never fire.
-async fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16) {
+///
+/// The `User-Agent` is **borrowed** from the request headers, not
+/// copied out of them: it is the only copy the request path makes of
+/// the value, and it happens here — once — when the entry is built
+/// (issue #224).
+///
+/// The function is synchronous for the same reason: a borrow of the
+/// request headers must not cross an `await`, which would demand
+/// `Session: Sync`.
+fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16, user_agent: Option<&str>) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
     let entry = pangolin_core::AccessLogEntry {
         timestamp: chrono::Utc::now(),
@@ -1616,10 +1633,11 @@ async fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16) {
         duration_ms,
         backend: ctx.backend.clone(),
         client_ip: ctx.log_client_ip.clone(),
-        // Captured once in `request_filter` (searchenginebots
-        // stage-1). Consumed by `App::push_access_log`'s bot
-        // side-channel; a missing UA simply skips the bot path.
-        user_agent: ctx.user_agent.clone(),
+        // The only copy of the User-Agent on the request path: it is
+        // read in place from the request headers and copied once,
+        // here, into the entry. Consumed by `App::push_access_log`'s
+        // bot side-channel; a missing UA simply skips the bot path.
+        user_agent: user_agent.map(String::from),
     };
     // The referer fan-out goes first: it needs a borrow of the
     // entry, and `push_access_log` consumes it.
@@ -1768,6 +1786,43 @@ mod tests {
             )
             .unwrap();
         assert!(!is_streaming_headers(&header.headers));
+    }
+
+    /// The `User-Agent` is read **in place** out of the request's own
+    /// headers — the request path must not copy it into the
+    /// per-request context (issue #224).
+    ///
+    /// The truth table has three cells: a header that is there, a
+    /// header that is absent, and a header whose value is not valid
+    /// UTF-8. The last one is the trap: the owned copy read it as
+    /// `None` too, and unwrapping the conversion instead would panic
+    /// on the request path.
+    #[test]
+    fn request_user_agent_reads_the_header_in_place() {
+        // A request that carries a `User-Agent`.
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("User-Agent", "curl/8.0").unwrap();
+        assert_eq!(request_user_agent(&header), Some("curl/8.0"));
+
+        // The name is matched case-insensitively — the header map
+        // stores the names lower-cased.
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("USER-AGENT", "wget").unwrap();
+        assert_eq!(request_user_agent(&header), Some("wget"));
+
+        // A request that carries none.
+        let header = RequestHeader::build("GET", b"/", None).unwrap();
+        assert_eq!(request_user_agent(&header), None);
+
+        // A value that is not valid UTF-8 reads as "no user agent".
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header
+            .insert_header(
+                "User-Agent",
+                HeaderValue::from_bytes(b"curl/8.0\xff").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(request_user_agent(&header), None);
     }
 
     /// The gateway and the core must never disagree about what a

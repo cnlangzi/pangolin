@@ -35,8 +35,9 @@ For the corresponding config keys, see
                 │           proxy.rs (existing, unchanged)       │
                 │                                                │
 proxy.rs ──────►│ App::push_access_log(entry)                    │
-                │   ├── access_log_recent.push(entry)            │
-                │   ├── access_log_tx.send(entry)    ──► /api/logs/stream
+                │   ├── Arc::new(entry) — one allocation, shared │
+                │   ├── access_log_recent.push(arc)              │
+                │   ├── access_log_tx.send(arc)      ──► /api/logs/stream
                 │   └── bot side-channel (fail closed):          │
                 │         verify_bot(ua, client_ip)              │
                 │         only if Verified:                      │
@@ -240,11 +241,16 @@ stays inside the supervisor.
 
 ### `crates/ngx/src/proxy.rs`
 
-- `RequestState.user_agent: Option<String>` — captured once per request in
-  `request_filter` (zero per-call-site duplication; `record_access_log`'s
-  four call sites stay at zero changes).
-- `record_access_log` populates `AccessLogEntry.user_agent` from
-  `ctx.user_agent`.
+- `request_user_agent(&RequestHeader) -> Option<&str>` — reads the
+  `User-Agent` **in place** out of the request headers (issue #224). The
+  per-request context cannot hold the borrow (pingora requires it to be
+  `Send + Sync + 'static`), so the four request-time consumers — the
+  gateway-header bot name, the rate limiter's bot-name fallback, the
+  recorded user agent of a rejected client and the reputation check — read
+  it from the session where they need it.
+- `record_access_log` copies it **once**, into `AccessLogEntry.user_agent`.
+  A value that is not valid UTF-8 reads as "no user agent", exactly as the
+  owned copy did.
 
 ### `crates/ngx/src/main.rs`
 
@@ -383,8 +389,9 @@ duckdb -c "
 - **stage-1 (this commit)** — core engine, unit-tested. Files: `bot.rs`,
   `bot_log.rs`, `bot_stats.rs`, `events.rs` (add `user_agent`), `config.rs`
   (add `BotLogConfig`), `app.rs` (5 new fields + side-channel),
-  `proxy.rs` (`RequestState.user_agent`), `main.rs` (shutdown hook),
-  `ngx.yml` (`log.bot` block), `docs/configuration.md` + this file.
+  `proxy.rs` (the `User-Agent` capture — since issue #224 read in place
+  instead of copied into the per-request context), `main.rs` (shutdown
+  hook), `ngx.yml` (`log.bot` block), `docs/configuration.md` + this file.
 - **stage-2** — UI: SSE handler for `/api/logs/bots/stream` +
   `/logs/bots` admin page + nav link.
 - **stage-3** — Historical view. Read-only side of the JSONL

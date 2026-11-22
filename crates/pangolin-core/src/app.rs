@@ -398,7 +398,12 @@ pub struct App {
     /// (default 1000). A lagged subscriber sees an SSE comment
     /// `: lagged N events` and the stream keeps flowing — we do
     /// **not** crash the channel on LagError.
-    pub access_log_tx: broadcast::Sender<AccessLogEntry>,
+    ///
+    /// The channel carries an `Arc<AccessLogEntry>`: the entry is
+    /// built once per request and shared with the ring buffer and
+    /// with every subscriber, instead of being copied once per
+    /// delivery (issue #224).
+    pub access_log_tx: broadcast::Sender<Arc<AccessLogEntry>>,
     /// Bounded ring buffer of recent access log entries (issue #73).
     /// Late-joining SSE subscribers get a snapshot of this buffer
     /// replayed as the first N `data:` frames before any live
@@ -1092,7 +1097,16 @@ impl App {
     ///
     /// Unverified claims (forged UA, cold RDNS, unknown UA) are
     /// fail-closed: they never touch the bot sinks.
+    ///
+    /// ## One entry, many holders
+    ///
+    /// The entry is wrapped in an `Arc` **once**, here, and the same
+    /// allocation is handed to the ring buffer, to the broadcast and
+    /// (through it) to every subscriber (issue #224). The fan-out
+    /// copies a reference count, not the entry.
     pub fn push_access_log(&self, entry: AccessLogEntry) {
+        let entry = Arc::new(entry);
+
         // 1) ring buffer (sync, fast path). Even if the broadcast
         //    later drops the entry, the ring buffer always keeps
         //    the most-recent N entries for late-join replay.
@@ -1144,7 +1158,10 @@ impl App {
     /// (oldest first). Used by the SSE endpoint to replay entries
     /// on connect. Returns an empty Vec if the buffer is disabled
     /// (`access_log_recent: 0`).
-    pub fn recent_access_log(&self) -> Vec<AccessLogEntry> {
+    ///
+    /// The entries are `Arc`s: the caller shares the very same
+    /// allocation the ring buffer holds (issue #224).
+    pub fn recent_access_log(&self) -> Vec<Arc<AccessLogEntry>> {
         self.access_log_recent.snapshot()
     }
 
@@ -2242,11 +2259,11 @@ mod tests {
         // variant in App::new uses max(1) to avoid the
         // `Sender::new(0)` trap, but the ring buffer is what
         // matters here for the "no panic" assertion.
-        let (tx, _rx) = broadcast::channel::<AccessLogEntry>(1);
+        let (tx, _rx) = broadcast::channel::<Arc<AccessLogEntry>>(1);
         let buf = AccessLogBuffer::new(cfg.log.access_log_recent);
         // Mirror App::push_access_log.
-        buf.push(make_entry("GET", "/a", 200));
-        let _ = tx.send(make_entry("GET", "/a", 200));
+        buf.push(Arc::new(make_entry("GET", "/a", 200)));
+        let _ = tx.send(Arc::new(make_entry("GET", "/a", 200)));
         // Ring buffer should hold the entry.
         assert_eq!(buf.snapshot().len(), 1);
     }
@@ -2260,7 +2277,7 @@ mod tests {
         let cfg = make_log_config(3, 100);
         let buf = AccessLogBuffer::new(cfg.log.access_log_recent);
         for i in 0..5 {
-            buf.push(make_entry("GET", &format!("/p{i}"), 200));
+            buf.push(Arc::new(make_entry("GET", &format!("/p{i}"), 200)));
         }
         let snap = buf.snapshot();
         assert_eq!(snap.len(), 3);
@@ -2327,6 +2344,40 @@ mod tests {
         assert_eq!(entry.method, "POST");
         assert_eq!(entry.path, "/submit");
         assert_eq!(entry.status, 201);
+    }
+
+    /// The fan-out **shares** one entry: the ring buffer and the
+    /// broadcast carry the very same allocation (issue #224).
+    ///
+    /// Two copies would be equal in every field, so only the
+    /// allocation's identity tells the two designs apart — hence
+    /// `Arc::ptr_eq` rather than a field comparison.
+    #[test]
+    fn push_access_log_shares_one_entry_with_the_ring_buffer_and_the_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let cert_mgr = CertManager::default();
+        let app = App::new(&db_path, cfg, cert_mgr).unwrap();
+
+        let mut rx = app.access_log_tx.subscribe();
+        app.push_access_log(make_entry("GET", "/shared", 200));
+
+        let snap = app.recent_access_log();
+        assert_eq!(snap.len(), 1);
+
+        let received = tokio_test_block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("recv timed out")
+                .expect("broadcast channel closed unexpectedly")
+        });
+
+        assert!(
+            Arc::ptr_eq(&snap[0], &received),
+            "the ring buffer and the broadcast must carry the same entry, \
+             not two copies of it"
+        );
     }
 
     /// Tiny helper to block on a future from a non-async test fn.

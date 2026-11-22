@@ -24,7 +24,7 @@ For the corresponding config keys, see
 | Give SEO teams a queryable record of "which external sites link here, and how much traffic did they deliver" | JSONL is the wire format; `jq` and DuckDB pick it up natively |
 | Answer the question per **site**, not per hostname | A site may own several domains; a link between two of them is internal |
 | Persist across process restarts | In-memory ring buffers do not — the JSONL file does |
-| Stay cheap on the hot path | The header is read once, next to the `User-Agent` capture; the classification is three pure function calls |
+| Stay cheap on the hot path | The header is read once, next to the other request-header reads; the classification is three pure function calls |
 | Not regress the existing access log or bot log | `AccessLogEntry`'s wire format is unchanged; the bot channel is untouched |
 
 ## Non-goals
@@ -57,7 +57,7 @@ For the corresponding config keys, see
 ```
                      proxy.rs (ngx)
   request_filter
-    ├─ capture Referer / Sec-Fetch-Dest / Accept      (next to ctx.user_agent)
+    ├─ capture Referer / Sec-Fetch-Dest / Accept      (one place, hot path)
     ├─ site lookup (published routing revision)  ──► site: Arc<Site>
     ├─ classify_referer(ctx, &site.name, &indexes.domain)
     │        └─ core::referer::parse_referer
@@ -65,7 +65,7 @@ For the corresponding config keys, see
     │        └─ core::referer::is_external_referer ──► core::index::site_of_host
     └─ ctx.referer_hit: Option<RefererHit>   (None ⇒ not an external referral)
                        │
-  record_access_log(app, ctx, status)
+  record_access_log(app, ctx, status, user_agent)
     ├─ app.push_referer_log(&entry, hit)     ──► referer channel
     │        ├─ referer_log_recent.push       (ring buffer)
     │        ├─ referer_stats.record          (per-pair counters)

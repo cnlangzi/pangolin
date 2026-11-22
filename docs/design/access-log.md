@@ -38,12 +38,12 @@ For the corresponding config keys, see
             │
             ▼
    ┌─────────────────┐
-   │ App             │   ← 2. (1) write to bounded ring buffer
-   │ push_access_log │        (VecDeque, capped by access_log_recent)
-   │   ↓             │        (2) broadcast to live subscribers
-   └────────┬────────┘        (tokio::sync::broadcast, capped by
-            │                  access_log_capacity)
-            ▼
+   │ App             │   ← 2. the entry is built once, wrapped in an Arc:
+   │ push_access_log │        (1) the ring buffer and (2) the broadcast
+   │   ↓             │        share it
+   └────────┬────────┘        (ring: VecDeque, capped by access_log_recent;
+            │                 broadcast: tokio::sync::broadcast, capped by
+            ▼                   access_log_capacity)
    ┌─────────────────┐
    │ broadcaster     │   ← 3. one slot per SSE subscriber
    │ .subscribe()    │
@@ -86,9 +86,15 @@ Each `data:` frame is one `AccessLogEntry` serialised as JSON:
   "status":      200,
   "duration_ms": 12,
   "backend":     "http://10.0.0.7:8080",
-  "client_ip":   "203.0.113.42"
+  "client_ip":   "203.0.113.42",
+  "user_agent":  "curl/8.0"
 }
 ```
+
+`user_agent` is optional: it is present only when the client sent a
+`User-Agent` header, and it carries the value the request arrived with
+(issue #224 reads it in place out of the request headers and copies it
+once, into the entry).
 
 Field set is locked by `tests/src/access_log_e2e.rs::access_log_sse_replays_then_streams_live`:
 a future change that renames or removes a field fails the test loudly
@@ -123,6 +129,12 @@ plain-JSON 401 body.
 | Ring buffer | 100 | `log.access_log_recent` | Late-join replay depth |
 | Broadcast channel | 1000 | `log.access_log_capacity` | Live fan-out to slow subscribers |
 | Browser DOM rows | 500 | (client-side, hard-coded in `pages/logs.html`) | `tbody.children.length` after insert |
+
+The entry is built **once** per request and wrapped in an `Arc`
+(issue #224). The ring buffer, the broadcast channel and every subscriber
+hold a reference to that one allocation, so the fan-out copies a reference
+count instead of the entry: the per-request allocation count drops from 24
+(one subscriber) to 7 — the `Arc` plus the entry's own six fields.
 
 `AccessLogEntry` is ~150 bytes serialised; defaults cost ≈ 15 KB (ring) +
 ≈ 150 KB (channel). A noisy proxy with 10k req/s sees each subscriber
