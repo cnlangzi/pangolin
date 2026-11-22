@@ -103,6 +103,11 @@
     </div>
   </div>
 
+  {# ── JSONL writer status (server-rendered) ────────────────────────── #}
+  {# The shared panel: both log pages show the writer's state the same #}
+  {# way, from the same catalog keys.                                    #}
+  {% include "components/_writer_status.html" %}
+
   {# ── Summary card (server-rendered) ─────────────────────────────────── #}
   {# On first paint the dashboard should show useful state, not a #}
   {# "no bots detected yet" skeleton. The top-N table + summary #}

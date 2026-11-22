@@ -23,6 +23,7 @@ use crate::referer::RefererHit;
 use crate::referer_log::{RefererLogBuffer, RefererLogEntry, RefererLogWriter};
 use crate::referer_stats::RefererStats;
 use crate::reputation::build_library;
+use crate::supervisor::{SupervisedTask, SupervisorConfig, WriterHealth};
 use crate::traffic::TrafficHub;
 use crate::{
     AccessLogBuffer, AccessLogEntry, CertLinkCache, EventBuffer, EventType, Indexes,
@@ -473,7 +474,19 @@ pub struct App {
     /// `parking_lot::Mutex` is fine here — the critical section is
     /// always a single `Option::take` and we never hold the guard
     /// across an await.
+    ///
+    /// The handle is the **supervisor**'s, not the writer's: the
+    /// supervisor owns the writer task and restarts it when it
+    /// panics. See [`Self::bot_writer_state`].
     bot_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// The supervisor state of the bot-log writer.
+    ///
+    /// The writer task is what turns a panic into a dead side
+    /// channel, and the panic itself says nothing about which
+    /// channel died — so the supervisor restarts the writer and the
+    /// admin panel reads the state here to tell "no traffic today"
+    /// apart from "the writer is dead".
+    bot_writer_state: Arc<SupervisedTask>,
 
     /// Referer log side-channel (inbound external referrals).
     ///
@@ -516,7 +529,18 @@ pub struct App {
     /// `JoinHandle` for the background referer-writer task.
     /// Populated by [`App::start_referer_writer`], consumed by
     /// [`App::shutdown_referer_writer`].
+    ///
+    /// The handle is the **supervisor**'s, not the writer's — the
+    /// same arrangement as the bot writer.
     referer_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// The supervisor state of the referer-log writer.
+    ///
+    /// Always present, even when the referer log is disabled — then
+    /// there is no writer to supervise, and
+    /// [`App::referer_writer_health`] says so through `available`.
+    /// Keeping the state unconditional means "is the referer log
+    /// enabled" is answered by one field only.
+    referer_writer_state: Arc<SupervisedTask>,
     /// In-memory traffic stats (no persistence). Hot path is
     /// `on_start` / `on_finish` (`try_send` only); aggregation
     /// lives on a dedicated OS thread. See `docs/design/traffic.md`.
@@ -718,6 +742,11 @@ impl App {
         .map_err(|e| crate::PangolinError::Config(format!("knownbots init failed: {e}")))?;
         let bot_writer = Some(BotLogWriter::new(bot_cfg.dir.clone()));
         let bot_verifier = Some(verifier);
+        // The supervisor state is built next to the writer it
+        // supervises: the writer task is spawned later, from inside
+        // a tokio runtime, but the state the admin panel reads is
+        // available from the start.
+        let bot_writer_state = SupervisedTask::new();
 
         // IP reputation (issue #141). The configuration lives in the
         // database, not in `ngx.yml` — see `badbots_config` (V12).
@@ -740,6 +769,7 @@ impl App {
         let referer_writer = referer_cfg
             .enabled
             .then(|| RefererLogWriter::new(referer_cfg.dir.clone()));
+        let referer_writer_state = SupervisedTask::new();
 
         let traffic_enabled = config.log.traffic.enabled;
         Ok(Self {
@@ -765,11 +795,13 @@ impl App {
             bot_verifier,
             badbots: Arc::new(parking_lot::RwLock::new(badbots)),
             bot_writer_task: parking_lot::Mutex::new(None),
+            bot_writer_state,
             referer_log_tx,
             referer_log_recent,
             referer_stats,
             referer_writer,
             referer_writer_task: parking_lot::Mutex::new(None),
+            referer_writer_state,
             cert_links,
             traffic: TrafficHub::new(traffic_enabled),
             rate_limiter,
@@ -1181,6 +1213,7 @@ impl App {
         let Some(writer) = self.referer_writer.as_ref() else {
             return false;
         };
+        let state = self.referer_writer_state.clone();
         let mut guard = self.referer_writer_task.lock();
         if guard.is_some() {
             // Already started — second call is a silent no-op so a
@@ -1196,7 +1229,19 @@ impl App {
             return false;
         };
         let writer_for_task = writer.clone();
-        let join = handle.spawn(async move { writer_for_task.run().await });
+        // The writer runs under a supervisor: a panic in the writer
+        // task would otherwise stop the JSONL file from growing for
+        // the rest of the process lifetime, with nothing on the
+        // panel to say so. See `supervisor::supervise`.
+        let join = handle.spawn(async move {
+            crate::supervisor::supervise(
+                state,
+                "referer_log",
+                SupervisorConfig::default(),
+                move || writer_for_task.clone().run(),
+            )
+            .await
+        });
         *guard = Some(join);
         true
     }
@@ -1211,6 +1256,10 @@ impl App {
         let Some(writer) = self.referer_writer.as_ref() else {
             return;
         };
+        // The supervisor must stop restarting *before* the writer is
+        // told to stop: a panic that lands in between would otherwise
+        // resurrect the writer after the shutdown began.
+        self.referer_writer_state.begin_shutdown();
         let handle = self.referer_writer_task.lock().take();
         writer.shutdown();
         let Some(handle) = handle else {
@@ -1221,12 +1270,13 @@ impl App {
         };
         match tokio::time::timeout(Self::writer_shutdown_timeout(), handle).await {
             Ok(Ok(())) => {
-                // Task exited cleanly within the timeout.
+                // The supervisor saw the writer exit cleanly.
             }
             Ok(Err(join_err)) => {
-                // The task itself panicked. Surfaces as a loud log so
-                // the operator investigates.
-                log::error!("referer_log: writer task panicked: {join_err}");
+                // The *supervisor* task panicked. The writer's own
+                // panics are handled inside the supervisor and never
+                // reach this branch.
+                log::error!("referer_log: supervisor task panicked: {join_err}");
             }
             Err(_elapsed) => {
                 // Wedged disk / stuck fsync. Log loudly but don't
@@ -1353,7 +1403,17 @@ impl App {
             return false;
         }
         let writer_for_task = writer.clone();
-        let join = handle.spawn(async move { writer_for_task.run().await });
+        let state = self.bot_writer_state.clone();
+        // The writer runs under a supervisor: a panic in the writer
+        // task would otherwise stop the JSONL file from growing for
+        // the rest of the process lifetime, with nothing on the
+        // panel to say so. See `supervisor::supervise`.
+        let join = handle.spawn(async move {
+            crate::supervisor::supervise(state, "bot_log", SupervisorConfig::default(), move || {
+                writer_for_task.clone().run()
+            })
+            .await
+        });
         *guard = Some(join);
         true
     }
@@ -1362,12 +1422,14 @@ impl App {
     /// wait for it to exit.
     ///
     /// Sequence:
-    ///   1. Take the `JoinHandle` out of `bot_writer_task` (a
+    ///   1. Tell the supervisor to stop restarting (a panic that
+    ///      lands after this point must not resurrect the writer).
+    ///   2. Take the `JoinHandle` out of `bot_writer_task` (a
     ///      second call is a no-op so re-entrancy is safe).
-    ///   2. `writer.shutdown()` to fire the task's `select!`
+    ///   3. `writer.shutdown()` to fire the task's `select!`
     ///      shutdown arm.
-    ///   3. `tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await`.
-    ///   4. On timeout: log a warning identifying the wedged
+    ///   4. `tokio::time::timeout(SHUTDOWN_TIMEOUT, handle).await`.
+    ///   5. On timeout: log a warning identifying the wedged
     ///      state; do NOT block process exit. On normal exit:
     ///      silent.
     ///
@@ -1384,6 +1446,10 @@ impl App {
         let Some(writer) = self.bot_writer.as_ref() else {
             return;
         };
+        // The supervisor must stop restarting *before* the writer is
+        // told to stop: a panic that lands in between would otherwise
+        // resurrect the writer after the shutdown began.
+        self.bot_writer_state.begin_shutdown();
         let handle = self.bot_writer_task.lock().take();
         writer.shutdown();
         let Some(handle) = handle else {
@@ -1394,14 +1460,13 @@ impl App {
         };
         match tokio::time::timeout(Self::writer_shutdown_timeout(), handle).await {
             Ok(Ok(())) => {
-                // Task exited cleanly within the timeout.
+                // The supervisor saw the writer exit cleanly.
             }
             Ok(Err(join_err)) => {
-                // The task itself panicked. Surfaces as a loud
-                // log so the operator investigates — a panicked
-                // writer means the JSONL side-channel is dead
-                // and `BotLogWriter::run` needs to be hardened.
-                log::error!("bot_log: writer task panicked: {join_err}");
+                // The *supervisor* task panicked. The writer's own
+                // panics are handled inside the supervisor and never
+                // reach this branch.
+                log::error!("bot_log: supervisor task panicked: {join_err}");
             }
             Err(_elapsed) => {
                 // Wedged disk / stuck fsync. Log loudly but
@@ -1414,6 +1479,50 @@ impl App {
                     Self::writer_shutdown_timeout()
                 );
             }
+        }
+    }
+
+    /// The health of the bot-log JSONL writer task.
+    ///
+    /// The panel uses it to tell "no crawler traffic today" apart from
+    /// "the writer is dead" — the two look the same on every other
+    /// view of the side channel.
+    pub fn bot_writer_health(&self) -> WriterHealth {
+        // The bot log is always on, so the writer object always
+        // exists — the panel may still say "not running" when the
+        // task was never spawned (no runtime in scope).
+        let available = self.bot_writer.is_some();
+        let dropped = self.bot_writer.as_ref().map_or(0, |w| w.dropped_total());
+        Self::writer_health(available, dropped, &self.bot_writer_state)
+    }
+
+    /// The health of the referer-log JSONL writer task.
+    ///
+    /// `available` is `false` when the referer log is disabled — then
+    /// there is no writer to report on and the panel says so instead
+    /// of claiming the side channel is healthy.
+    pub fn referer_writer_health(&self) -> WriterHealth {
+        let available = self.referer_writer.is_some();
+        let dropped = self
+            .referer_writer
+            .as_ref()
+            .map_or(0, |w| w.dropped_total());
+        Self::writer_health(available, dropped, &self.referer_writer_state)
+    }
+
+    /// The one place a writer's health is assembled.
+    ///
+    /// Both side channels answer the same questions with the same
+    /// fields, so the projection lives here once: a field added to
+    /// [`WriterHealth`] then reaches both panels.
+    fn writer_health(available: bool, dropped: u64, state: &SupervisedTask) -> WriterHealth {
+        WriterHealth {
+            available,
+            alive: state.is_alive(),
+            restarts: state.restart_count(),
+            window_restarts: state.window_restart_count(),
+            failed: state.gave_up(),
+            dropped,
         }
     }
 
@@ -2606,6 +2715,184 @@ mod tests {
         assert!(
             !cache.join("ips.txt").exists(),
             "a unit test must not download the vendor IP lists"
+        );
+    }
+
+    // ---- Writer supervision (issue #219) ----
+
+    /// Wait until the bot writer task is running, or give up.
+    ///
+    /// The supervisor is a task of its own, so the state it publishes
+    /// lands a scheduling tick after the call that started it.
+    async fn wait_for_bot_writer_alive(app: &App) -> bool {
+        for _ in 0..200 {
+            if app.bot_writer_health().alive {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// The panel has to be able to tell "no crawler traffic today"
+    /// apart from "the writer is dead" — so it needs to know whether
+    /// the writer task is running.
+    #[tokio::test]
+    async fn bot_writer_health_reports_a_running_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        // The writer alone: the knownbots workers reach the network.
+        assert!(app.start_bot_log_writer());
+        assert!(
+            wait_for_bot_writer_alive(&app).await,
+            "the writer task must be running: {:?}",
+            app.bot_writer_health()
+        );
+        let health = app.bot_writer_health();
+        assert!(health.available, "the bot log is always on");
+        assert!(health.alive);
+        assert!(!health.failed, "a healthy writer has not failed");
+        assert_eq!(health.restarts, 0);
+        assert_eq!(health.dropped, 0);
+    }
+
+    /// The graceful shutdown has to stop the *supervisor* too, and it
+    /// has to do so inside the existing 5 s budget — the writer
+    /// flushes and exits, the supervisor sees the clean exit and
+    /// returns.
+    #[tokio::test]
+    async fn shutdown_bot_writer_stops_the_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        assert!(app.start_bot_log_writer());
+        assert!(wait_for_bot_writer_alive(&app).await);
+
+        app.shutdown_bot_writer().await;
+
+        let health = app.bot_writer_health();
+        assert!(
+            !health.alive,
+            "the writer must be gone after the shutdown: {health:?}"
+        );
+        assert!(!health.failed, "a shutdown is not a failure: {health:?}");
+    }
+
+    /// A disabled side channel has no writer, so the panel must not
+    /// claim it is healthy — it says the status is unavailable.
+    #[tokio::test]
+    async fn referer_writer_health_is_unavailable_when_the_side_channel_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        cfg.log.referer.enabled = false;
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        let health = app.referer_writer_health();
+        assert!(
+            !health.available,
+            "a disabled referer log has no writer: {health:?}"
+        );
+        assert!(!health.alive);
+        assert!(!health.failed);
+    }
+
+    /// A writer that panics must come back and keep writing the
+    /// same day's file.
+    ///
+    /// The supervisor restarts the *same* `Arc`, so the queue the
+    /// writer had not drained yet is still there after the restart.
+    /// (A batch that was already being written when the panic hit is
+    /// lost — it had left the queue and had not reached the disk.)
+    #[tokio::test]
+    async fn bot_writer_keeps_writing_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let mut cfg = make_log_config(50, 16);
+        cfg.log.bot.dir = dir.path().to_path_buf();
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        let writer = app.bot_writer.clone().expect("the bot writer exists");
+
+        // The supervisor's factory: the first attempt panics, the
+        // second one is the real writer. The state is the app's own,
+        // so the panel's "Restarted N times" line is pinned end to
+        // end.
+        let state = app.bot_writer_state.clone();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_for_task = writer.clone();
+        let runs_for_task = runs.clone();
+        let supervisor = tokio::spawn(crate::supervisor::supervise(
+            state.clone(),
+            "bot_log",
+            SupervisorConfig {
+                max_restarts: 5,
+                stable_run: std::time::Duration::from_secs(60),
+                backoff: std::time::Duration::from_millis(1),
+                max_backoff: std::time::Duration::from_millis(5),
+            },
+            move || {
+                let runs = runs_for_task.clone();
+                let writer = writer_for_task.clone();
+                async move {
+                    if runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        panic!("the writer task panicked");
+                    }
+                    writer.run().await;
+                }
+            },
+        ));
+
+        // Wait for the restart to have happened.
+        let mut restarted = false;
+        for _ in 0..200 {
+            if state.restart_count() == 1 {
+                restarted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(restarted, "the supervisor must restart the writer");
+        assert_eq!(
+            app.bot_writer_health().restarts,
+            1,
+            "the panel must see the restart"
+        );
+
+        // The entry goes into the queue of the *same* writer the
+        // restarted task drains.
+        let entry = crate::bot_log::BotLogEntry::from_access_log(
+            &make_bot_entry(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "/sitemap.xml",
+            ),
+            crate::bot::BotIdentity {
+                name: "Googlebot".into(),
+                vendor: "Google".into(),
+                category: crate::bot::BotCategory::SearchEngine,
+            },
+        )
+        .expect("a bot entry");
+        writer.enqueue(entry);
+
+        let today = chrono::Utc::now().date_naive();
+        let path = crate::bot_log::file_path_for(dir.path(), today);
+        let mut body = String::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                body = text;
+                if body.contains("/sitemap.xml") {
+                    break;
+                }
+            }
+        }
+        writer.shutdown();
+        let _ = supervisor.await;
+        assert!(
+            body.contains("/sitemap.xml"),
+            "the restarted writer must keep writing the day's file: {body}"
         );
     }
 

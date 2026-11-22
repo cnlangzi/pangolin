@@ -39,6 +39,7 @@ pub mod referer;
 pub mod referer_log;
 pub mod referer_stats;
 pub mod reputation;
+pub mod supervisor;
 pub mod traffic;
 pub mod types;
 
@@ -85,6 +86,7 @@ pub use referer_log::{
 };
 pub use referer_stats::{RefererStats, RefererStatsRow, RefererStatsSummary};
 pub use reputation::{BadbotVerdict, build_library, library_config};
+pub use supervisor::{SupervisedTask, SupervisorConfig, WriterHealth, supervise};
 pub use traffic::{
     TrafficHub, TrafficKind, TrafficMethod, TrafficRoute, TrafficSample, TrafficSnapshot,
     classify_route, normalize_path,

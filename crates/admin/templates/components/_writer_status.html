@@ -1,0 +1,39 @@
+{# ── JSONL writer status ─────────────────────────────────────────────── #}
+{# The panel is the only place that can tell "no traffic today" apart #}
+{# from "the writer died": the ring buffer, the SSE tail and the        #}
+{# counters all keep working when the writer task is dead, and the     #}
+{# JSONL file simply stops growing. The supervisor restarts a panicked #}
+{# writer (issue #219); this panel says what the repair achieved.      #}
+{#                                                                      #}
+{# It is a load-time snapshot: the page has to be reloaded to see a    #}
+{# writer that died after the page was rendered.                        #}
+{#                                                                      #}
+{# `writer` and `lang` come from the including page.                  #}
+{% if writer.available %}
+<div class="card overflow-hidden mb-6">
+  <div class="px-4 py-2.5 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3">
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("common.writer_title") }}</h2>
+    {% if writer.alive %}
+      <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 whitespace-nowrap">{{ lang.t("common.writer_running") }}</span>
+    {% else if writer.failed %}
+      {# The budget is spent: the side channel stays dead until the   #}
+      {# gateway restarts, and only the operator can fix it. The count #}
+      {# is the repair attempts that failed, not every restart since   #}
+      {# the process started.                                          #}
+      <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 whitespace-nowrap">{{ lang.tf("common.writer_failed", [("n", writer.window_restarts)]) }}</span>
+    {% else %}
+      <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 whitespace-nowrap">{{ lang.t("common.writer_not_running") }}</span>
+    {% endif %}
+  </div>
+  {% if writer.restarts > 0 || writer.dropped > 0 %}
+  <div class="p-4 text-sm text-slate-600 dark:text-gray-300">
+    {% if writer.restarts > 0 %}
+      <p>{{ lang.tf("common.writer_restarted", [("n", writer.restarts)]) }}</p>
+    {% endif %}
+    {% if writer.dropped > 0 %}
+      <p class="mt-1">{{ lang.tf("common.writer_dropped", [("n", writer.dropped)]) }}</p>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}

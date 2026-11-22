@@ -133,6 +133,11 @@ pub async fn render_bots(
     // this page; the panel is what makes that visible.
     let health = pangolin_core::bot::verification_health(app.bot_verifier.as_deref());
 
+    // The writer's health is read from the supervisor's state — the
+    // panel has to be able to say "the JSONL writer is dead", which
+    // nothing else on the page can (issue #219).
+    let writer = app.bot_writer_health();
+
     let tmpl = BotLogsTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-bots",
@@ -140,6 +145,7 @@ pub async fn render_bots(
         summary,
         top_rows,
         health,
+        writer,
         lang,
     };
     let html = match tmpl.render() {
@@ -1034,6 +1040,11 @@ pub async fn render_referers(
     };
     let top_rows = scoped.into_iter().take(REFERRER_TOP_N).collect();
 
+    // The writer's health comes from the supervisor's state — the
+    // panel has to be able to say "the JSONL writer is dead", which
+    // nothing else on the page can (issue #219).
+    let writer = app.referer_writer_health();
+
     let tmpl = RefererLogsTemplate {
         csrf_token: csrf.to_string(),
         active_nav: "logs-referers",
@@ -1045,6 +1056,7 @@ pub async fn render_referers(
         filter,
         site_domains,
         site_scoped,
+        writer,
         lang,
     };
     let html = match tmpl.render() {
@@ -1622,6 +1634,7 @@ mod tests {
     use pangolin_core::bot_log::BotLogEntry;
     use pangolin_core::config::{Config, LogConfig};
     use pangolin_core::events::AccessLogEntry;
+    use pangolin_core::supervisor::WriterHealth;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1745,6 +1758,163 @@ mod tests {
         assert!(html.contains("example.com"), "host column missing: {html}");
     }
 
+    // ── JSONL writer status (issue #219) ───────────────────────────────
+
+    /// Render the `/logs/bots` page with a hand-built writer health.
+    ///
+    /// The supervisor's state lives inside `App`, and nothing in the
+    /// admin crate can force a writer to die — so the panel is
+    /// exercised through the template, the same way the verification
+    /// panel is.
+    fn render_bots_page_with_writer(writer: WriterHealth) -> String {
+        let tmpl = BotLogsTemplate {
+            csrf_token: "csrf".into(),
+            active_nav: "logs-bots",
+            active_subnav: subnav::LIVE,
+            summary: pangolin_core::bot_stats::BotStatsSummary::default(),
+            top_rows: vec![],
+            health: BotVerificationHealth::default(),
+            writer,
+            lang: Lang::En,
+        };
+        tmpl.render().expect("BotLogsTemplate render")
+    }
+
+    /// Render the `/logs/referers` page with a hand-built writer
+    /// health. See [`render_bots_page_with_writer`].
+    fn render_referers_page_with_writer(writer: WriterHealth) -> String {
+        let tmpl = RefererLogsTemplate {
+            csrf_token: "csrf".into(),
+            active_nav: "logs-referers",
+            active_subnav: referer_subnav::LIVE,
+            enabled: true,
+            summary: pangolin_core::referer_stats::RefererStatsSummary::default(),
+            top_rows: vec![],
+            sites: vec![],
+            filter: RefererHistoryFilter::default(),
+            site_domains: vec![],
+            site_scoped: false,
+            writer,
+            lang: Lang::En,
+        };
+        tmpl.render().expect("RefererLogsTemplate render")
+    }
+
+    /// A dead writer has to be visible: "the file stopped growing" and
+    /// "there was no traffic today" look the same on every other view
+    /// of the side channel.
+    #[test]
+    fn bots_page_shows_a_stopped_jsonl_writer() {
+        let html = render_bots_page_with_writer(WriterHealth {
+            available: true,
+            alive: false,
+            restarts: 5,
+            window_restarts: 5,
+            failed: true,
+            dropped: 0,
+        });
+        assert!(
+            html.contains("Stopped: automatic repair failed after 5 restart(s)"),
+            "the failed writer must be visible: {html}"
+        );
+        assert!(
+            html.contains("Restarted 5 time(s)"),
+            "the restart count must be visible: {html}"
+        );
+    }
+
+    /// The healthy state says so — a panel that always renders the
+    /// failure text is a panel nobody reads.
+    #[test]
+    fn bots_page_shows_a_running_jsonl_writer() {
+        let html = render_bots_page_with_writer(WriterHealth {
+            available: true,
+            alive: true,
+            restarts: 0,
+            window_restarts: 0,
+            failed: false,
+            dropped: 0,
+        });
+        assert!(
+            html.contains(">Running<"),
+            "the running writer must be visible: {html}"
+        );
+        assert!(
+            !html.contains("Stopped: automatic repair failed"),
+            "a healthy writer must not render the failure text: {html}"
+        );
+    }
+
+    /// A queue that overflowed is worth a line of its own: the
+    /// entries it dropped are gone for good.
+    #[test]
+    fn bots_page_shows_the_dropped_entries() {
+        let html = render_bots_page_with_writer(WriterHealth {
+            available: true,
+            alive: true,
+            restarts: 0,
+            window_restarts: 0,
+            failed: false,
+            dropped: 12,
+        });
+        assert!(
+            html.contains("Queue was full; dropped 12 entry(s)"),
+            "the dropped entries must be visible: {html}"
+        );
+    }
+
+    /// The same panel on the referer page.
+    #[test]
+    fn referers_page_shows_a_stopped_jsonl_writer() {
+        let html = render_referers_page_with_writer(WriterHealth {
+            available: true,
+            alive: false,
+            restarts: 5,
+            window_restarts: 5,
+            failed: true,
+            dropped: 0,
+        });
+        assert!(
+            html.contains("Stopped: automatic repair failed after 5 restart(s)"),
+            "the failed writer must be visible: {html}"
+        );
+    }
+
+    /// The referer page shows the healthy state too — the panel is
+    /// shared, so the two pages cannot drift apart.
+    #[test]
+    fn referers_page_shows_a_running_jsonl_writer() {
+        let html = render_referers_page_with_writer(WriterHealth {
+            available: true,
+            alive: true,
+            restarts: 0,
+            window_restarts: 0,
+            failed: false,
+            dropped: 0,
+        });
+        assert!(
+            html.contains(">Running<"),
+            "the running writer must be visible: {html}"
+        );
+    }
+
+    /// The route reads the writer's health out of the app, so the
+    /// panel shows up on the real page too.
+    #[tokio::test]
+    async fn bots_page_says_not_running_when_the_writer_task_was_never_started() {
+        let (_dir, app) = make_test_app();
+        let resp = render_bots(&app, "csrf-token", Lang::En)
+            .await
+            .expect("render_bots should succeed");
+        let html = response_html(resp).await;
+        // The writer task was never started in this test, so the panel
+        // says "not running" rather than claiming health.
+        assert!(
+            html.contains(">Not running<"),
+            "the writer status must come from the app: {html}"
+        );
+    }
+
     #[test]
     fn logs_template_renders_minimal_shell() {
         // The /logs page itself has no server-side state —
@@ -1770,6 +1940,7 @@ mod tests {
             summary: pangolin_core::bot_stats::BotStatsSummary::default(),
             top_rows: vec![],
             health: BotVerificationHealth::default(),
+            writer: pangolin_core::supervisor::WriterHealth::default(),
             lang: Lang::En,
         };
         let html = tmpl.render().expect("BotLogsTemplate render");
@@ -1792,6 +1963,7 @@ mod tests {
             summary: pangolin_core::bot_stats::BotStatsSummary::default(),
             top_rows: vec![],
             health,
+            writer: pangolin_core::supervisor::WriterHealth::default(),
             lang: Lang::En,
         };
         tmpl.render().expect("BotLogsTemplate render")

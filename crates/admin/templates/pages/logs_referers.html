@@ -82,6 +82,11 @@
     </div>
   </div>
 
+  {# ── JSONL writer status (server-rendered) ────────────────────────── #}
+  {# The shared panel: both log pages show the writer's state the same #}
+  {# way, from the same catalog keys.                                    #}
+  {% include "components/_writer_status.html" %}
+
   {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
   {% if !top_rows.is_empty() %}
   <div class="card overflow-hidden mb-6">

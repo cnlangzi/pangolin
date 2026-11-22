@@ -40,6 +40,7 @@ use pangolin_core::bot_log::BotLogEntry;
 use pangolin_core::bot_stats::{BotStatsRow, BotStatsSummary};
 use pangolin_core::referer_log::RefererLogEntry;
 use pangolin_core::referer_stats::{RefererStatsRow, RefererStatsSummary};
+use pangolin_core::supervisor::WriterHealth;
 
 /// Sub-nav slot for the bot-log pages. The shared sub-nav
 /// partial lights up the matching tab.
@@ -113,6 +114,16 @@ pub struct BotLogsTemplate<'a> {
     /// traffic never reaches this page — the panel is what tells the
     /// operator "the crawler is real, our list is not".
     pub health: BotVerificationHealth,
+    /// Health of the JSONL writer task (issue #219).
+    ///
+    /// The panel is the only place that tells "no crawler traffic
+    /// today" apart from "the writer died": every other view of the
+    /// side channel keeps working when the writer task is dead.
+    ///
+    /// `available` is always `true` here — the bot log is always on
+    /// (issue #117) — and the field exists so the shared panel
+    /// fragment can guard itself.
+    pub writer: WriterHealth,
     /// The interface language this page is rendered in.
     pub lang: Lang,
 }
@@ -593,6 +604,12 @@ pub struct RefererLogsTemplate<'a> {
     /// but the scope is still *on* — the page then shows no rows
     /// rather than every site's rows.
     pub site_scoped: bool,
+    /// Health of the JSONL writer task (issue #219).
+    ///
+    /// `available` is `false` when the referer log is disabled — the
+    /// page then shows the "feature disabled" notice instead of a
+    /// writer status.
+    pub writer: WriterHealth,
     /// The interface language this page is rendered in.
     pub lang: Lang,
 }

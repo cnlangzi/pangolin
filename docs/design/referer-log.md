@@ -209,20 +209,43 @@ userinfo must not be stored at all — it is a credential.
 | `referer_log_tx` | Broadcast channel for live subscribers | `log.referer.capacity` (default 1000) |
 | `referer_stats` | Per-`(referer_host, host)` hit counters + last-seen | 50 000 distinct pairs; further pairs are counted but not stored |
 | `referer_writer` | Background JSONL writer | 10 000 queued rows; the oldest is dropped on overflow |
+| `referer_writer_state` | The supervisor's state for that writer | 5 restarts per rolling window |
 
 The pair cap matters here in a way it does not for bots: a referral stream is
 attacker-shaped — anyone can send a `Referer` header naming a host of their
 choosing. Past the cap the counters keep ticking but the new pairs are not
 stored, and the saturation is visible to the operator.
 
+The writer task runs under a supervisor (`pangolin_core::supervisor`), the
+same one the bot log uses: a panic in the task restarts it instead of
+silently stopping the day's file. The supervisor's handle is the one
+`App::shutdown_referer_writer` awaits; the writer's own handle stays inside
+the supervisor. The shutdown signal has exactly one consumer — the writer
+itself — because `Notify::notify_one` stores a single permit and a second
+consumer would race for it.
+
 ## Admin surface
 
 | Page | What it shows |
 | ---- | ------------- |
-| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the SSE tail. |
+| `/logs/referers` | Live view: top-N `(referrer, host)` summary + the SSE tail + the JSONL writer's status. |
 | `/logs/referers/history` | The day's JSONL, filtered and paginated. |
 | `/logs/referers/stats` | The day's rollup: per referrer host — hits, distinct visitor IPs, landing paths, last seen. |
 | `/api/logs/referers/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
+
+The **JSONL writer** panel on `/logs/referers` is what tells "no referral
+traffic today" apart from "the writer died": the ring buffer, the SSE tail
+and the counters all keep working when the writer task is dead, and the day's
+file simply stops growing. When the referer log is disabled there is no
+writer, and the panel says the status is unavailable rather than claiming
+health.
+
+The panel is the shared `components/_writer_status.html` fragment, rendered
+from the same catalog keys as the bot log's — the two pages cannot drift
+apart. It is a load-time snapshot, and it reports the writer *task*, not the
+disk: a writer whose writes keep failing is alive as far as the panel is
+concerned. See [`bot-log.md`](./bot-log.md#what-the-panel-shows-and-what-it-does-not)
+for the three limits of the panel.
 
 All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
@@ -253,6 +276,8 @@ rows it describes.
 | `Sec-Fetch-Dest` absent and `Accept` does not contain `text/html` | No row. |
 | The `Referer` header is longer than 4 KiB | Treated as "no referer". The HTTP header parser already bounds the total header size; this is a second, tighter guard against a client making the gateway copy a multi-kilobyte string on every request. |
 | Writer queue full | The oldest queued row is dropped and a rate-limited warning is logged. The request path is never blocked on a slow disk. |
+| The writer task panics | The supervisor restarts it after a 100 ms backoff — the same `Arc`, so the queue the writer had not drained yet is still there, and the day's file is appended to as before. (A batch that was already being written when the panic hit is lost: it had left the queue and had not reached the disk.) The panic and the restart counter are logged; the `/logs/referers` panel shows "Restarted N time(s)". |
+| The writer task panics again after 5 restarts | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/referers` panel shows "Stopped: automatic repair failed after 5 restart(s)" — the count is the repair attempts that failed, not every restart since the process started. The request path is untouched — a side-channel failure never reaches the forwarding decision. |
 | The JSONL file cannot be created (bad `dir`) | The batch is dropped with a warning; the gateway keeps serving traffic. The directory is created lazily on first write. |
 | A site's domains are later re-pointed to a different site | Historical rows are re-grouped under the current mapping when queried. The rows carry the host, not the site. |
 | `log.referer.enabled: false` | No capture, no rows, no live stream data; the admin pages state that the feature is disabled. |
@@ -266,5 +291,6 @@ rows it describes.
 | Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap |
 | Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
 | Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links |
+| Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219) |
 | End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |
