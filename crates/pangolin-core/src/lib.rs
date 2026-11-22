@@ -40,6 +40,10 @@ pub mod referer_log;
 pub mod referer_stats;
 pub mod reputation;
 pub mod supervisor;
+// The bounded top-N collector the two stats modules share. Private:
+// it is an implementation detail of `bot_stats` and `referer_stats`,
+// not a piece of the crate's surface.
+mod topn;
 pub mod traffic;
 pub mod types;
 

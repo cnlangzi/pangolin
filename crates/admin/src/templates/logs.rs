@@ -57,6 +57,20 @@ pub mod subnav {
     pub const STATS: &str = "stats";
 }
 
+/// The placeholders of the saturation banner: the number of records
+/// the in-memory pair table dropped and the cap it dropped them at.
+///
+/// Both pages render the same banner, so the placeholders live here
+/// and not twice — the two texts must not drift apart.
+///
+/// Both values are numbers, so they are rendered as one type: the
+/// template cannot spell the conversion. An array rather than a
+/// `Vec`, because the banner is rendered on every page load and the
+/// array needs no allocation.
+fn saturation_placeholders(dropped: u64, cap: usize) -> [(&'static str, u64); 2] {
+    [("n", dropped), ("cap", cap as u64)]
+}
+
 /// Full-page template for `GET /logs`.
 ///
 /// Fields mirror the other page templates: `csrf_token` is empty
@@ -107,7 +121,7 @@ pub struct BotLogsTemplate<'a> {
     /// branch.
     pub active_subnav: &'a str,
     /// Pre-rendered summary numbers (`unique_pairs`,
-    /// `total_records`, `total_hits`).
+    /// `total_records`, `total_hits`, `dropped_unique_pairs`).
     pub summary: BotStatsSummary,
     /// Top-N rows by hit count, already sorted by
     /// `BotStats::top_n`.
@@ -128,12 +142,19 @@ pub struct BotLogsTemplate<'a> {
     /// (issue #117) — and the field exists so the shared panel
     /// fragment can guard itself.
     pub writer: WriterHealth,
+    /// The hard cap on the in-memory `(bot, host)` pair table
+    /// (`pangolin_core::bot_stats::MAX_UNIQUE_PAIRS`).
+    ///
+    /// The saturation banner quotes it, so the number in the text is
+    /// the number the code enforces — a bump of the constant shows up
+    /// on the page without a translation change.
+    pub stats_cap: usize,
     /// The interface language this page is rendered in.
     pub lang: Lang,
 }
 
 /// The polled summary region of `/logs/bots` — the three summary
-/// cards and the top-N `(bot, host)` table.
+/// cards, the saturation banner and the top-N `(bot, host)` table.
 ///
 /// The page includes the same partial (`views/bots/_summary.html`),
 /// and `GET /api/logs/bots/summary` renders it on its own: the page
@@ -144,8 +165,8 @@ pub struct BotLogsTemplate<'a> {
 /// The two renders must produce **byte-identical** markup, or the
 /// swap would rearrange the region under the operator's eyes. That
 /// is why this struct carries exactly the fields the partial reads
-/// — `summary`, `top_rows` and `lang` — and why the page and the
-/// endpoint share the one template file.
+/// — `summary`, `top_rows`, `stats_cap` and `lang` — and why the
+/// page and the endpoint share the one template file.
 ///
 /// See docs/design/bot-log.md — "The summary region refreshes itself".
 #[derive(Template)]
@@ -155,8 +176,28 @@ pub struct BotLogsSummaryView {
     pub summary: BotStatsSummary,
     /// The top-N rows, hits descending.
     pub top_rows: Vec<BotStatsRow>,
+    /// The hard cap on the in-memory `(bot, host)` pair table. The
+    /// saturation banner quotes it, so the number in the text is the
+    /// number the code enforces.
+    pub stats_cap: usize,
     /// The interface language this fragment is rendered in.
     pub lang: Lang,
+}
+
+impl BotLogsSummaryView {
+    /// The placeholders of the saturation banner. See
+    /// [`saturation_placeholders`].
+    pub fn saturation_args(&self) -> [(&'static str, u64); 2] {
+        saturation_placeholders(self.summary.dropped_unique_pairs, self.stats_cap)
+    }
+}
+
+impl BotLogsTemplate<'_> {
+    /// The placeholders of the saturation banner. See
+    /// [`saturation_placeholders`].
+    pub fn saturation_args(&self) -> [(&'static str, u64); 2] {
+        saturation_placeholders(self.summary.dropped_unique_pairs, self.stats_cap)
+    }
 }
 
 /// Echo of the current filter form values, so the page can
@@ -641,11 +682,24 @@ pub struct RefererLogsTemplate<'a> {
     /// page then shows the "feature disabled" notice instead of a
     /// writer status.
     pub writer: WriterHealth,
+    /// The hard cap on the in-memory `(referer_host, host)` pair
+    /// table (`pangolin_core::referer_stats::MAX_UNIQUE_PAIRS`).
+    ///
+    /// The saturation banner quotes it, so the number in the text is
+    /// the number the code enforces — a bump of the constant shows up
+    /// on the page without a translation change.
+    pub stats_cap: usize,
     /// The interface language this page is rendered in.
     pub lang: Lang,
 }
 
 impl RefererLogsTemplate<'_> {
+    /// The placeholders of the saturation banner. See
+    /// [`saturation_placeholders`].
+    pub fn saturation_args(&self) -> [(&'static str, u64); 2] {
+        saturation_placeholders(self.summary.dropped_unique_pairs, self.stats_cap)
+    }
+
     /// The selected site's domain literals as a space-separated
     /// list, for the live table's `data-site-domains` attribute.
     ///

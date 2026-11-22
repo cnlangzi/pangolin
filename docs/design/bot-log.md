@@ -234,6 +234,36 @@ last key, two crawlers with the same hit count on the same host were
 ordered by the hash map's iteration order — which flips whenever the map
 changes — and a UI that re-reads the table (the polled summary card does,
 every 30 s) reshuffled those rows for no reason the operator can see.
+- `top_n(&self, n) -> (Vec<BotStatsRow>, BotStatsSummary)` — the admin UI's
+  feed: the `n` best rows plus a summary of the whole table.
+
+The query is a **single pass** over the pair map. It materialises at
+most `n` rows — the walk borrows the map's rows and only the rows
+that make the result are cloned — and it holds the read lock for the
+walk, not for an allocation of the whole table followed by a sort. The
+write lock on the same map belongs to `record()`, which runs on the
+request hot path, so the shorter the read side holds it, the less the
+side channel can delay a request (invariant #5).
+
+The sort key is `hits` descending → `host` ascending → `bot_name`
+ascending. The last key makes the order total: two rows with the same
+hits and the same host would otherwise be ordered by the map's
+iteration order, and the page would shuffle between two renders.
+
+The summary describes the **whole** table, not the `n` rows that came
+back: `unique_pairs` is the number of rows the table holds,
+`total_records` counts every recorded request — including the ones the
+cap dropped — `total_hits` is the sum of the rows' hits, and
+`dropped_unique_pairs` is the process-wide count of the records the
+cap dropped.
+
+When `dropped_unique_pairs` is not zero, `/logs/bots` shows a
+saturation banner under the summary cards: how many records were
+dropped, the cap they were dropped at, and where the per-day JSONL
+stream is (`log.bot.dir/bot-YYYY-MM-DD.jsonl`) — the stream has its
+own drop counter, reported by the writer panel. The banner quotes the
+cap from the code constant, so a bump of `MAX_UNIQUE_PAIRS` shows up
+on the page without a translation change.
 
 ### `crates/pangolin-core/src/app.rs`
 
@@ -369,7 +399,7 @@ itself does not auto-clean up.
 | `/logs/bots/history` | The day's JSONL, filtered and paginated. |
 | `/logs/bots/stats` | The day's rollup: per bot and per URL — hits, unique URLs, last status. |
 | `/api/logs/bots/stream` | SSE: the ring-buffer replay first, then live rows. Admin-only (401 otherwise). |
-| `/api/logs/bots/summary` | HTML fragment: the summary cards + the top-N table, re-rendered from the current snapshot. Admin-only (no session ⇒ redirected to `/login`). |
+| `/api/logs/bots/summary` | HTML fragment: the summary region — the cards, the saturation banner and the top-N table — re-rendered from the current snapshot. Admin-only (no session ⇒ redirected to `/login`). |
 
 ### The summary region refreshes itself
 
@@ -379,6 +409,12 @@ load-time snapshot. The counters behind them move while the page is open —
 gateway the numbers the operator reads drift away from the truth within
 minutes. The page therefore polls `GET /api/logs/bots/summary` every 30
 seconds and swaps the region's `innerHTML`.
+
+The region is everything the counters live in: the three cards, the
+**saturation banner** and the top-N table. The banner belongs to it —
+it reports the records the capped pair table dropped, and that counter
+moves too — so the fragment carries it and the page and the fragment
+keep showing the same thing.
 
 Five rules make that safe:
 
@@ -525,7 +561,7 @@ duckdb -c "
 | ----- | ----- | ------------- |
 | Unit | `bot::tests::*` | All 5 categories detected, case-insensitive, more-specific patterns shadow generic ones, no duplicate needles, every category has at least one rule |
 | Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
-| Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, snapshot sort order, `last_seen` updates |
+| Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, top-N sort order (`hits` desc → `host` asc → `bot_name` asc) and its tie-break, the summary describing the whole table rather than the returned rows, the cap dropping rows and counting the drops, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
 | Unit | `knownbots::model::registry::tests::*` (in the crate's own repository, issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **or incomplete** **embedded** config stays fatal, and every shipped embedded config is complete; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
@@ -540,3 +576,5 @@ duckdb -c "
 | Unit | `admin::routes::logs::tests::*` (issue #225) | The polled summary fragment reflects the hits recorded **after** the page was rendered — the page and the fragment cannot show two different truths; the page embeds the fragment verbatim (byte-identical markup) and carries the polling attributes (`hx-get` / `hx-trigger="every 30s"` / `hx-swap="innerHTML"`); the fragment is served `Cache-Control: no-store` and marks its own response, so the page can refuse to swap anything else in; the page repaints the "Last seen" column and restores the table's horizontal scroll after every swap |
 | Unit | `bot_stats::tests::*` (issue #225) | `snapshot_top_n` returns the head of the full snapshot — the same rows in the same order — with the summary of the whole table; the row order is total, so a re-read after the table changed does not reshuffle the rows the hit count and the host cannot separate |
 | e2e | `admin_ui_bots_summary_endpoint_serves_the_polled_fragment` (issue #225) | A signed-in operator gets the three summary cards from `GET /api/logs/bots/summary`; an unauthenticated request is redirected to `/login` and never sees the fragment |
+| Unit | `topn::tests::*` (issue #221) | The bounded collector keeps the best `limit` items of a stream, keeps nothing when the limit is zero, and hands them back best first |
+| Unit | `admin::routes::logs::tests::*` (issue #221) | The `/logs/bots` and `/logs/referers` pages show the saturation banner when the pair table dropped records — with the dropped count and the cap — and no banner when it did not; the bot page shows it for a table that really hit its cap |

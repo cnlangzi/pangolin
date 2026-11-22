@@ -5,7 +5,7 @@
 {# See docs/design/bot-log.md.                                       #}
 
 {# ── Summary card ─────────────────────────────────────────────────── #}
-{# The counters come from `BotStats::snapshot()` — the server's      #}
+{# The counters come from `BotStats::top_n()` — the server's         #}
 {# authoritative values. The page shows them on first paint and the  #}
 {# polled fragment refreshes them; the SSE tail below the region    #}
 {# appends the live rows.                                            #}
@@ -30,6 +30,24 @@
     </div>
   </div>
 </div>
+
+{# ── Saturation banner (server-rendered) ────────────────────────────── #}
+{# The in-memory `(bot × host)` table is capped. Past the cap the  #}
+{# counters keep ticking but the rows are dropped, so the request  #}
+{# total above counts them, the pair count stops at the cap, and #}
+{# the table below does not have them. The banner says so, with    #}
+{# the number of dropped records and the cap, and points at the    #}
+{# JSONL stream — the per-day log the rows are written to. (That  #}
+{# stream has its own drop counter, reported by the writer panel  #}
+{# above.)                                                            #}
+{% if summary.dropped_unique_pairs > 0 %}
+<div class="card overflow-hidden mb-6">
+  <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">
+    <p>{{ lang.tf("bots.saturation_hint_1", self.saturation_args()) }}</p>
+    <p class="mt-1">{{ lang.t("bots.saturation_hint_2") }} <code>log.bot.dir</code> <code>bot-YYYY-MM-DD.jsonl</code> {{ lang.t("bots.saturation_hint_3") }}</p>
+  </div>
+</div>
+{% endif %}
 
 {# ── Top-N table ──────────────────────────────────────────────────── #}
 {% if !top_rows.is_empty() %}
