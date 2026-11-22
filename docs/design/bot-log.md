@@ -215,6 +215,25 @@ view of the write path:
   Single `RwLock::write` per call.
 - `snapshot(&self) -> (Vec<BotStatsRow>, BotStatsSummary)` — admin UI feed.
 - `top_n(&self, n) -> Vec<BotStatsRow>` — dashboard "top bots" card.
+- `snapshot_top_n(&self, n) -> (Vec<BotStatsRow>, BotStatsSummary)` — the
+  polled summary's feed: the same rows as `snapshot().take(n)`, but selected
+  **inside** the lock instead of after it.
+
+The two reads differ in cost, and the difference matters because `record`
+runs on the request path. `snapshot` clones and sorts every row, and the row
+map holds up to `MAX_UNIQUE_PAIRS = 50 000` of them: measured, that is
+~0.6 ms at 500 rows, ~19 ms at 10 000 and ~120 ms at the cap — all of it
+under the stats lock, which is the lock every verified crawler request
+waits for. `snapshot_top_n` walks the map by reference and clones only the
+`n` rows that survive: ~3 ms at 10 000 and ~25 ms at the cap. A UI that
+shows ten rows must not make the crawlers wait for the other 49 990.
+
+The row order is **total**: hits descending, then host, then bot name. The
+map key is `(bot_name, host)`, so no two rows compare equal. Without the
+last key, two crawlers with the same hit count on the same host were
+ordered by the hash map's iteration order — which flips whenever the map
+changes — and a UI that re-reads the table (the polled summary card does,
+every 30 s) reshuffled those rows for no reason the operator can see.
 
 ### `crates/pangolin-core/src/app.rs`
 
@@ -361,7 +380,7 @@ gateway the numbers the operator reads drift away from the truth within
 minutes. The page therefore polls `GET /api/logs/bots/summary` every 30
 seconds and swaps the region's `innerHTML`.
 
-Three rules make that safe:
+Five rules make that safe:
 
 - **The region is one partial.** The page and the endpoint render the same
   `views/bots/_summary.html`, so the polled fragment is byte-identical to
@@ -376,6 +395,18 @@ Three rules make that safe:
 - **The response is not cacheable.** The fragment is served
   `Cache-Control: no-store` — a reused aggregate is a stale aggregate, and
   at a 30-second cadence a cache hit would be visibly wrong.
+- **Only the fragment is swapped in.** The fragment marks its own response
+  with `X-Pangolin-Fragment`, and the page's `htmx:beforeSwap` guard skips
+  the swap when the marker is missing. Without the guard an expired session
+  would be worse than a stale counter: the admin redirects an
+  unauthenticated request to `/login`, the browser's XHR follows that
+  redirect, and htmx would swap the **login page** into the counters
+  region. htmx also executes the script tags it swaps in, so the login
+  page's own `htmx.min.js` would be re-evaluated inside the live page.
+- **A failed poll leaves the region alone.** A render that fails answers
+  `500`, not an empty `200`: htmx swaps a 2xx body unconditionally, so an
+  empty one would blank the region the operator is reading. htmx leaves the
+  DOM alone on a 5xx, so the last good markup survives until the next poll.
 
 The fragment is rendered in the operator's language, exactly like the page
 it replaces, and the counters keep their meaning: `total_records` is still
@@ -384,7 +415,10 @@ the process-lifetime total.
 The "Last seen" column is filled in by the browser — the timestamp is
 rendered in the operator's local time — so the page re-paints it after
 every swap; the server-rendered cell keeps the raw timestamp in
-`data-last-seen`.
+`data-last-seen`. The table's horizontal scroll lives *inside* the swapped
+region, so the page restores the scroll offset after the swap too: without
+it, an operator reading the "Host" column on a narrow screen would be
+thrown back to the left edge every 30 seconds.
 
 The **verification panel** and the **JSONL-writer panel** next to it are
 **not** polled: they follow the knownbots address-list refresh cycle and
@@ -503,5 +537,6 @@ duckdb -c "
 | Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`), with the window's restart count published for the panel; a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted; an aborted supervisor takes the writer task with it |
 | Unit | `app::tests::*` (issue #219) | The writer health reports a running writer, and an unavailable one when the referer log is disabled; the graceful shutdown stops the supervisor; a writer that panicked keeps writing the day's file after the restart, and the panel sees the restart |
 | Unit | `admin::routes::logs::tests::*` (issue #219) | The `/logs/bots` and `/logs/referers` pages show the writer's state — "Running" while it is alive, "Stopped: automatic repair failed after N restart(s)" once the budget is spent, and the "Queue was full; dropped N entry(s)" line when the hot path had to drop rows |
-| Unit | `admin::routes::logs::tests::*` (issue #225) | The polled summary fragment reflects the hits recorded **after** the page was rendered — the page and the fragment cannot show two different truths; the page embeds the fragment verbatim (byte-identical markup) and carries the polling attributes (`hx-get` / `hx-trigger="every 30s"` / `hx-swap="innerHTML"`) plus the `htmx:afterSwap` re-paint of the "Last seen" column; the fragment is served `Cache-Control: no-store` |
+| Unit | `admin::routes::logs::tests::*` (issue #225) | The polled summary fragment reflects the hits recorded **after** the page was rendered — the page and the fragment cannot show two different truths; the page embeds the fragment verbatim (byte-identical markup) and carries the polling attributes (`hx-get` / `hx-trigger="every 30s"` / `hx-swap="innerHTML"`); the fragment is served `Cache-Control: no-store` and marks its own response, so the page can refuse to swap anything else in; the page repaints the "Last seen" column and restores the table's horizontal scroll after every swap |
+| Unit | `bot_stats::tests::*` (issue #225) | `snapshot_top_n` returns the head of the full snapshot — the same rows in the same order — with the summary of the whole table; the row order is total, so a re-read after the table changed does not reshuffle the rows the hit count and the host cannot separate |
 | e2e | `admin_ui_bots_summary_endpoint_serves_the_polled_fragment` (issue #225) | A signed-in operator gets the three summary cards from `GET /api/logs/bots/summary`; an unauthenticated request is redirected to `/login` and never sees the fragment |

@@ -1327,6 +1327,24 @@ impl App {
         self.bot_stats.snapshot()
     }
 
+    /// The top-N per-(bot, host) hit counters + totals.
+    ///
+    /// Used by the `/logs/bots` summary card, which the page polls
+    /// every 30 seconds. The top-N is selected **inside** the stats
+    /// lock: the table can hold
+    /// [`crate::bot_stats::MAX_UNIQUE_PAIRS`] rows, and cloning and
+    /// sorting all of them under the lock would stall the crawler
+    /// requests that record into it.
+    pub fn bot_stats_top_n(
+        &self,
+        n: usize,
+    ) -> (
+        Vec<crate::bot_stats::BotStatsRow>,
+        crate::bot_stats::BotStatsSummary,
+    ) {
+        self.bot_stats.snapshot_top_n(n)
+    }
+
     /// Latest traffic snapshot (cloned `Arc`). Cheap — no wait on
     /// the aggregator thread.
     pub fn traffic_snapshot(&self) -> Arc<crate::traffic::TrafficSnapshot> {

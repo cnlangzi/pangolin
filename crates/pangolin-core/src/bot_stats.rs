@@ -23,6 +23,7 @@
 //! written?"); if the two diverge the writer is dropping.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -203,10 +204,37 @@ impl BotStats {
     /// Snapshot the full per-(bot, host) table plus a summary.
     /// Used by the admin UI to render the dashboard.
     pub fn snapshot(&self) -> (Vec<BotStatsRow>, BotStatsSummary) {
+        self.snapshot_top_n(usize::MAX)
+    }
+
+    /// The top-N rows by hit count plus the summary counters, without
+    /// cloning the whole table.
+    ///
+    /// [`snapshot`] clones and sorts every `(bot, host)` row: at the
+    /// [`MAX_UNIQUE_PAIRS`] cap that is ~120 ms measured, all of it
+    /// under the stats lock — the lock [`record`] takes, and
+    /// `record` runs on the request path. A UI that shows ten rows
+    /// must not make every crawler request wait for the other
+    /// 49 990.
+    ///
+    /// The result is the same as `snapshot().take(n)`: the same rows
+    /// in the same order. The sort key is a total order (the map key
+    /// `(bot_name, host)` is unique), so the head of the full sort is
+    /// well defined.
+    pub fn snapshot_top_n(&self, n: usize) -> (Vec<BotStatsRow>, BotStatsSummary) {
         let g = self.inner.read();
-        let mut rows: Vec<BotStatsRow> = g
-            .rows
-            .iter()
+        // References first: the map is walked, not copied. Only the
+        // `n` rows that survive the selection are cloned.
+        let mut refs: Vec<(&RowKey, &RowData)> = g.rows.iter().collect();
+        if n < refs.len() {
+            // `select_nth_unstable_by` puts the n-th best row at
+            // index `n` and leaves the `n` best ones before it.
+            refs.select_nth_unstable_by(n, cmp_row_refs);
+            refs.truncate(n);
+        }
+        refs.sort_unstable_by(cmp_row_refs);
+        let rows: Vec<BotStatsRow> = refs
+            .into_iter()
             .map(|(k, v)| BotStatsRow {
                 bot_name: k.bot_name.clone(),
                 bot_vendor: v.bot_vendor.clone(),
@@ -216,11 +244,10 @@ impl BotStats {
                 last_seen: v.last_seen,
             })
             .collect();
-        rows.sort_by(|a, b| b.hits.cmp(&a.hits).then(a.host.cmp(&b.host)));
         let summary = BotStatsSummary {
-            unique_pairs: rows.len(),
+            unique_pairs: g.rows.len(),
             total_records: g.total_records,
-            total_hits: rows.iter().map(|r| r.hits).sum(),
+            total_hits: g.rows.values().map(|v| v.hits).sum(),
             dropped_unique_pairs: g.dropped_unique_cap,
         };
         (rows, summary)
@@ -232,6 +259,22 @@ impl BotStats {
         let (rows, _summary) = self.snapshot();
         rows.into_iter().take(n).collect()
     }
+}
+
+/// The row order: hits descending, then host, then bot name.
+///
+/// The last key makes the order **total**: the map key is
+/// `(bot_name, host)`, so no two rows compare equal. Without it, two
+/// crawlers with the same hit count on the same host were ordered by
+/// the hash map's iteration order — which flips whenever the map
+/// changes. A UI that re-reads the table (the polled summary card
+/// does, every 30 s) would then reshuffle those rows on every
+/// refresh, for no reason the operator can see.
+fn cmp_row_refs(a: &(&RowKey, &RowData), b: &(&RowKey, &RowData)) -> Ordering {
+    b.1.hits
+        .cmp(&a.1.hits)
+        .then(a.0.host.cmp(&b.0.host))
+        .then(a.0.bot_name.cmp(&b.0.bot_name))
 }
 
 #[cfg(test)]
@@ -268,6 +311,25 @@ mod tests {
         } else {
             bot("Googlebot", "Google")
         };
+        BotLogEntry::from_access_log(&access, identity).unwrap()
+    }
+
+    /// A row for an explicitly named bot — the tie-break tests need
+    /// several crawlers on the same host, which the UA-sniffing
+    /// [`entry`] helper cannot produce.
+    fn entry_as(name: &'static str, vendor: &'static str, host: &str, path: &str) -> BotLogEntry {
+        let access = AccessLogEntry {
+            timestamp: chrono::Utc::now(),
+            method: "GET".into(),
+            path: path.into(),
+            host: host.into(),
+            status: 200,
+            duration_ms: 5,
+            backend: "direct:127.0.0.1:8080".into(),
+            client_ip: "10.0.0.1".into(),
+            user_agent: Some(format!("Mozilla/5.0 (compatible; {name}/1.0)")),
+        };
+        let identity = bot(name, vendor);
         BotLogEntry::from_access_log(&access, identity).unwrap()
     }
 
@@ -331,6 +393,89 @@ mod tests {
         assert_eq!(rows[1].hits, 5);
         assert_eq!(rows[2].host, "a.example.com");
         assert_eq!(rows[2].hits, 3);
+    }
+
+    /// The polled summary card asks for ten rows; it must get
+    /// exactly the rows the full snapshot shows on top — same rows,
+    /// same order — without making the request path wait for a full
+    /// clone and sort of the whole table.
+    #[test]
+    fn snapshot_top_n_matches_the_head_of_the_full_snapshot() {
+        let stats = BotStats::new();
+        // Two crawlers on one host with the same hit count: the tie
+        // the sort has to break.
+        for _ in 0..3 {
+            stats.record(&entry("Googlebot", "tied.example.com", "/"));
+            stats.record(&entry("bingbot", "tied.example.com", "/"));
+        }
+        for i in 0..25 {
+            for _ in 0..(i + 1) {
+                stats.record(&entry("Googlebot", &format!("host-{i}.example.com"), "/"));
+            }
+        }
+        let (all, all_summary) = stats.snapshot();
+        let (top, top_summary) = stats.snapshot_top_n(10);
+
+        assert_eq!(top.len(), 10);
+        let expected: Vec<_> = all
+            .iter()
+            .take(10)
+            .map(|r| (r.bot_name.to_string(), r.host.clone(), r.hits))
+            .collect();
+        let got: Vec<_> = top
+            .iter()
+            .map(|r| (r.bot_name.to_string(), r.host.clone(), r.hits))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the top-N must be the head of the full snapshot, in the same order"
+        );
+        // The summary describes the whole table, not the top-N.
+        assert_eq!(top_summary.unique_pairs, all_summary.unique_pairs);
+        assert_eq!(top_summary.total_records, all_summary.total_records);
+        assert_eq!(top_summary.total_hits, all_summary.total_hits);
+        assert_eq!(
+            top_summary.dropped_unique_pairs,
+            all_summary.dropped_unique_pairs
+        );
+    }
+
+    /// The order between rows the sort key cannot separate must not
+    /// depend on the hash map's iteration order.
+    ///
+    /// Two crawlers with the same hit count on the same host are
+    /// separated only by their name. Before the sort key was made
+    /// total, their order came from the hash map — which flips when
+    /// the map changes — so a UI that re-reads the table (the polled
+    /// summary card does, every 30 s) reshuffled those rows for no
+    /// reason the operator can see.
+    #[test]
+    fn snapshot_order_is_total_so_a_reread_does_not_reshuffle_tied_rows() {
+        let stats = BotStats::new();
+        // Eight crawlers on one host, one hit each: eight rows the
+        // hit count and the host cannot separate.
+        for name in ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh"] {
+            stats.record(&entry_as(name, "Vendor", "tied.example.com", "/"));
+        }
+
+        let names = |stats: &BotStats| -> Vec<String> {
+            let (rows, _) = stats.snapshot();
+            rows.iter()
+                .filter(|r| r.host == "tied.example.com")
+                .map(|r| r.bot_name.to_string())
+                .collect()
+        };
+        let expected = vec!["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh"];
+        assert_eq!(names(&stats), expected, "the tie is broken by name");
+
+        // Re-read after the table changed: the tied rows must not
+        // move.
+        stats.record(&entry("Googlebot", "other.example.com", "/"));
+        assert_eq!(
+            names(&stats),
+            expected,
+            "the tied rows must not reshuffle when the table changes"
+        );
     }
 
     #[test]

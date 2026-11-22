@@ -19,6 +19,10 @@
 //! (`/api/logs/bots/stream`) appends live entries below the
 //! server-rendered rows.
 //!
+//! [`BotLogsSummaryView`] renders the same summary region on its
+//! own, for `GET /api/logs/bots/summary` — the page polls that
+//! endpoint so the counters do not drift while it is open.
+//!
 //! ## `/logs/bots/history` (searchenginebots stage-3)
 //!
 //! [`BotLogsHistoryTemplate`] renders the historical JSONL
@@ -131,9 +135,8 @@ pub struct BotLogsTemplate<'a> {
 /// The polled summary region of `/logs/bots` — the three summary
 /// cards and the top-N `(bot, host)` table.
 ///
-/// The page includes the same partial
-/// ([`views/bots/_summary.html`](askama::Template::render)), and
-/// `GET /api/logs/bots/summary` renders it on its own: the page
+/// The page includes the same partial (`views/bots/_summary.html`),
+/// and `GET /api/logs/bots/summary` renders it on its own: the page
 /// polls that endpoint every 30 s so the counters behind the
 /// region do not drift away from the truth while the operator
 /// watches it.
@@ -143,6 +146,8 @@ pub struct BotLogsTemplate<'a> {
 /// is why this struct carries exactly the fields the partial reads
 /// — `summary`, `top_rows` and `lang` — and why the page and the
 /// endpoint share the one template file.
+///
+/// See docs/design/bot-log.md — "The summary region refreshes itself".
 #[derive(Template)]
 #[template(path = "views/bots/_summary.html")]
 pub struct BotLogsSummaryView {

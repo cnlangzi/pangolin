@@ -44,12 +44,7 @@ pub fn parse_form(body: &[u8]) -> HashMap<String, String> {
 /// Replaces the `ok_html(...)` helper that used to be defined in every
 /// resource module.
 pub fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
-    let resp = Response::builder()
-        .status(200)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
-        .expect("response builder for 200 OK should not fail");
-    Ok(resp)
+    html_response(StatusCode::OK, body, &[])
 }
 
 /// Build a 200 OK HTML response that the browser must not reuse.
@@ -62,12 +57,41 @@ pub fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
 /// 30-second polling cadence a cache hit would be visibly wrong, and
 /// `no-store` says so to the browser and to any proxy in between.
 pub fn ok_html_no_store(body: String) -> http::Result<Response<Full<Bytes>>> {
-    let resp = Response::builder()
-        .status(200)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .header("Cache-Control", "no-store")
+    html_response(StatusCode::OK, body, &[("Cache-Control", "no-store")])
+}
+
+/// Build a 500 response for a render that failed server-side.
+///
+/// An HTMX fragment must **not** answer a failed render with an empty
+/// 200: htmx swaps a 200 body unconditionally, so an empty one would
+/// blank the region the operator is reading. htmx leaves the DOM
+/// alone on a 5xx, so the last good markup survives and the next
+/// poll can fix it.
+pub fn internal_error_html(message: &str) -> http::Result<Response<Full<Bytes>>> {
+    let body = format!(
+        r#"<div class="p-6 max-w-md mx-auto"><div class="bg-red-50 border border-red-200 rounded-lg p-4"><h2 class="text-red-800 font-semibold mb-1">500 Internal Server Error</h2><p class="text-red-700 text-sm">{}</p></div></div>"#,
+        html_escape(message)
+    );
+    html_response(StatusCode::INTERNAL_SERVER_ERROR, body, &[])
+}
+
+/// The one place that builds an HTML response: the status, the
+/// content type and the extra headers live here, so the callers
+/// cannot drift apart.
+fn html_response(
+    status: StatusCode,
+    body: String,
+    headers: &[(&str, &str)],
+) -> http::Result<Response<Full<Bytes>>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Content-Type", "text/html; charset=utf-8");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let resp = builder
         .body(Full::new(Bytes::from(body)))
-        .expect("response builder for 200 OK should not fail");
+        .expect("HTML response builder should not fail");
     Ok(resp)
 }
 

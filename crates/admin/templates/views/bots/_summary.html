@@ -5,10 +5,10 @@
 {# See docs/design/bot-log.md.                                       #}
 
 {# ── Summary card ─────────────────────────────────────────────────── #}
-{# On first paint the dashboard should show useful state, not a #}
-{# "no bots detected yet" skeleton. The top-N table + summary #}
-{# counters come from `BotStats::snapshot()` and are rendered #}
-{# server-side; the SSE feed below appends new rows in real time. #}
+{# The counters come from `BotStats::snapshot()` — the server's      #}
+{# authoritative values. The page shows them on first paint and the  #}
+{# polled fragment refreshes them; the SSE tail below the region    #}
+{# appends the live rows.                                            #}
 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
   <div class="card p-4">
     <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("bots.total_requests") }}</div>

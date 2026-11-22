@@ -5325,6 +5325,16 @@ async fn admin_ui_bots_summary_endpoint_serves_the_polled_fragment() {
         "no-store",
         "a polled aggregate must not be reused from the cache"
     );
+    // The marker lets the page tell its own fragment apart from
+    // anything else the browser hands it — an expired session
+    // redirects to /login, and htmx must not swap that in.
+    assert_eq!(
+        resp.headers()
+            .get("x-pangolin-fragment")
+            .and_then(|v| v.to_str().ok()),
+        Some("bots-summary"),
+        "the fragment must mark its own response"
+    );
     let body = resp.text().await.unwrap();
     for (needle, what) in [
         ("Total bot requests", "the total-requests card"),

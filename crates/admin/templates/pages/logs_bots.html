@@ -275,10 +275,40 @@
   }
 
   paintLastSeen();
-  // The summary region is replaced every 30 s, and its "Last seen"
-  // cells carry only the raw timestamp — the browser renders them, so
-  // repaint after every swap. `htmx:afterSwap` bubbles to `document.body`.
-  document.body.addEventListener("htmx:afterSwap", paintLastSeen);
+
+  // ── The polled summary region ─────────────────────────────────────────
+  // The region is replaced wholesale every 30 s. Three things have to
+  // survive that: the "Last seen" cells (the browser renders them), the
+  // table's horizontal scroll (it lives inside the swapped region), and
+  // the region itself when the response turns out not to be the
+  // fragment at all.
+  let summaryScrollLeft = 0;
+  document.body.addEventListener("htmx:beforeSwap", function (e) {
+    const detail = e.detail || {};
+    // Another region on the page: not ours to guard.
+    if (detail.target && detail.target.id !== "bots-summary") return;
+    const xhr = detail.xhr;
+    // An expired session makes the admin redirect to /login; the XHR
+    // follows it and hands htmx a 200 carrying the login page, which
+    // would replace the counters with a login form. The fragment
+    // marks its own response — without the marker, keep the markup
+    // the operator is reading.
+    if (!xhr || xhr.getResponseHeader("X-Pangolin-Fragment") !== "bots-summary") {
+      detail.shouldSwap = false;
+      return;
+    }
+    const scroller = document.querySelector("#bots-summary .overflow-x-auto");
+    summaryScrollLeft = scroller ? scroller.scrollLeft : 0;
+  });
+  document.body.addEventListener("htmx:afterSwap", function () {
+    // The "Last seen" cells carry only the raw timestamp — the browser
+    // renders them in its own local time.
+    paintLastSeen();
+    // The table's horizontal scroll is inside the swapped region, so
+    // it would jump back to the left edge on every refresh.
+    const scroller = document.querySelector("#bots-summary .overflow-x-auto");
+    if (scroller) scroller.scrollLeft = summaryScrollLeft;
+  });
 
   // ── SSE connection (mirror of /logs but pointing at the bot stream) ─
   let es = null;
