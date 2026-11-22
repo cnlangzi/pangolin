@@ -103,7 +103,7 @@ pub struct BotLogsTemplate<'a> {
     /// branch.
     pub active_subnav: &'a str,
     /// Pre-rendered summary numbers (`unique_pairs`,
-    /// `total_records`, `total_hits`).
+    /// `total_records`, `total_hits`, `dropped_unique_pairs`).
     pub summary: BotStatsSummary,
     /// Top-N rows by hit count, already sorted by
     /// `BotStats::top_n`.
@@ -124,8 +124,29 @@ pub struct BotLogsTemplate<'a> {
     /// (issue #117) — and the field exists so the shared panel
     /// fragment can guard itself.
     pub writer: WriterHealth,
+    /// The hard cap on the in-memory `(bot, host)` pair table
+    /// (`pangolin_core::bot_stats::MAX_UNIQUE_PAIRS`).
+    ///
+    /// The saturation banner quotes it, so the number in the text is
+    /// the number the code enforces — a bump of the constant shows up
+    /// on the page without a translation change.
+    pub stats_cap: usize,
     /// The interface language this page is rendered in.
     pub lang: Lang,
+}
+
+impl BotLogsTemplate<'_> {
+    /// The placeholders of the saturation banner: the number of
+    /// records the pair table dropped and the cap it dropped them at.
+    ///
+    /// Both are numbers, so they are rendered as one type — the
+    /// template cannot spell the conversion.
+    pub fn saturation_args(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("n", self.summary.dropped_unique_pairs),
+            ("cap", self.stats_cap as u64),
+        ]
+    }
 }
 
 /// Echo of the current filter form values, so the page can
@@ -610,11 +631,30 @@ pub struct RefererLogsTemplate<'a> {
     /// page then shows the "feature disabled" notice instead of a
     /// writer status.
     pub writer: WriterHealth,
+    /// The hard cap on the in-memory `(referer_host, host)` pair
+    /// table (`pangolin_core::referer_stats::MAX_UNIQUE_PAIRS`).
+    ///
+    /// The saturation banner quotes it, so the number in the text is
+    /// the number the code enforces — a bump of the constant shows up
+    /// on the page without a translation change.
+    pub stats_cap: usize,
     /// The interface language this page is rendered in.
     pub lang: Lang,
 }
 
 impl RefererLogsTemplate<'_> {
+    /// The placeholders of the saturation banner: the number of
+    /// records the pair table dropped and the cap it dropped them at.
+    ///
+    /// Both are numbers, so they are rendered as one type — the
+    /// template cannot spell the conversion.
+    pub fn saturation_args(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("n", self.summary.dropped_unique_pairs),
+            ("cap", self.stats_cap as u64),
+        ]
+    }
+
     /// The selected site's domain literals as a space-separated
     /// list, for the live table's `data-site-domains` attribute.
     ///

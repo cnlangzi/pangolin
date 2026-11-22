@@ -1188,15 +1188,22 @@ impl App {
         self.referer_log_recent.snapshot()
     }
 
-    /// Snapshot per-(referer_host, host) hit counters + totals.
-    /// Used by the `/logs/referers` dashboard card.
-    pub fn referer_stats_snapshot(
+    /// The best `n` per-(referer_host, host) rows by hit count, plus
+    /// a summary of the rows in scope.
+    ///
+    /// `in_scope` decides which rows count — the caller owns the
+    /// notion of scope (the selected site's domains), the counter only
+    /// counts what it is handed. Used by the `/logs/referers`
+    /// dashboard card.
+    pub fn referer_stats_top_n(
         &self,
+        n: usize,
+        in_scope: impl Fn(&str) -> bool,
     ) -> (
         Vec<crate::referer_stats::RefererStatsRow>,
         crate::referer_stats::RefererStatsSummary,
     ) {
-        self.referer_stats.snapshot()
+        self.referer_stats.top_n(n, in_scope)
     }
 
     /// Spawn the background referer-log writer task. Must be called
@@ -1298,16 +1305,19 @@ impl App {
         self.bot_log_recent.snapshot()
     }
 
-    /// Snapshot per-(bot, host) hit counters + totals. Used by the
-    /// `/logs/bots` dashboard card (stage-2). Cheap — single
-    /// `RwLock` acquisition.
-    pub fn bot_stats_snapshot(
+    /// The best `n` per-(bot, host) rows by hit count, plus a summary
+    /// of the whole table. Used by the `/logs/bots` dashboard card
+    /// (stage-2). Cheap — a single `RwLock` acquisition and a walk
+    /// over the row map; only the `n` rows that are rendered are
+    /// materialised.
+    pub fn bot_stats_top_n(
         &self,
+        n: usize,
     ) -> (
         Vec<crate::bot_stats::BotStatsRow>,
         crate::bot_stats::BotStatsSummary,
     ) {
-        self.bot_stats.snapshot()
+        self.bot_stats.top_n(n)
     }
 
     /// Latest traffic snapshot (cloned `Arc`). Cheap — no wait on
@@ -2393,7 +2403,7 @@ mod tests {
         assert!(snap[0].ua.contains("Googlebot"));
 
         // 2) Stats counter incremented.
-        let (rows, summary) = app.bot_stats_snapshot();
+        let (rows, summary) = app.bot_stats_top_n(10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bot_name, "googlebot");
         assert_eq!(rows[0].hits, 1);
@@ -2431,7 +2441,7 @@ mod tests {
         app.push_access_log(entry);
 
         assert!(app.recent_bot_log().is_empty());
-        let (rows, summary) = app.bot_stats_snapshot();
+        let (rows, summary) = app.bot_stats_top_n(10);
         assert!(rows.is_empty());
         assert_eq!(summary.total_records, 0);
         // Access log still records the request.
@@ -2452,7 +2462,7 @@ mod tests {
 
         // Bot sinks are empty.
         assert!(app.recent_bot_log().is_empty());
-        let (rows, summary) = app.bot_stats_snapshot();
+        let (rows, summary) = app.bot_stats_top_n(10);
         assert!(rows.is_empty());
         assert_eq!(summary.total_records, 0);
 
@@ -2472,7 +2482,7 @@ mod tests {
         app.push_access_log(make_entry("GET", "/page", 200));
 
         assert!(app.recent_bot_log().is_empty());
-        let (rows, _) = app.bot_stats_snapshot();
+        let (rows, _) = app.bot_stats_top_n(10);
         assert!(rows.is_empty());
     }
 
@@ -2495,7 +2505,7 @@ mod tests {
         app.push_access_log(entry);
 
         assert!(app.recent_bot_log().is_empty());
-        let (rows, _) = app.bot_stats_snapshot();
+        let (rows, _) = app.bot_stats_top_n(10);
         assert!(rows.is_empty());
         assert_eq!(app.recent_access_log().len(), 1);
     }
@@ -2520,7 +2530,7 @@ mod tests {
         app.push_access_log(entry);
 
         assert!(app.recent_bot_log().is_empty());
-        let (rows, _) = app.bot_stats_snapshot();
+        let (rows, _) = app.bot_stats_top_n(10);
         assert!(rows.is_empty());
     }
 
@@ -2551,7 +2561,7 @@ mod tests {
             app.push_access_log(e);
         }
 
-        let (rows, summary) = app.bot_stats_snapshot();
+        let (rows, summary) = app.bot_stats_top_n(10);
         assert_eq!(rows.len(), 2);
         assert_eq!(summary.total_records, 5);
         assert_eq!(summary.total_hits, 5);
@@ -2930,12 +2940,12 @@ mod tests {
         assert_eq!(snap[0].path, "/landing");
 
         // 2) Counters.
-        let (rows, summary) = app.referer_stats_snapshot();
+        let (rows, summary) = app.referer_stats_top_n(10, |_| true);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hits, 1);
         assert_eq!(rows[0].referer_host, "news.example.org");
         assert_eq!(rows[0].host, "example.com");
-        assert_eq!(summary.total_records, 1);
+        assert_eq!(summary.total_hits, 1);
 
         // 3) Broadcast channel.
         let delivered = tokio_test_block_on(async {
@@ -2970,9 +2980,9 @@ mod tests {
         app.push_referer_log(&entry, &referer_hit("news.example.org"));
 
         assert!(app.recent_referer_log().is_empty());
-        let (rows, summary) = app.referer_stats_snapshot();
+        let (rows, summary) = app.referer_stats_top_n(10, |_| true);
         assert!(rows.is_empty());
-        assert_eq!(summary.total_records, 0);
+        assert_eq!(summary.total_hits, 0);
     }
 
     /// The JSONL writer writes one JSON object per line into

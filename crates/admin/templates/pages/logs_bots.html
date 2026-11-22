@@ -111,7 +111,7 @@
   {# ── Summary card (server-rendered) ─────────────────────────────────── #}
   {# On first paint the dashboard should show useful state, not a #}
   {# "no bots detected yet" skeleton. The top-N table + summary #}
-  {# counters come from `BotStats::snapshot()` and are rendered #}
+  {# counters come from `BotStats::top_n()` and are rendered #}
   {# server-side; the SSE feed below appends new rows in real time. #}
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
     <div class="card p-4">
@@ -134,6 +134,21 @@
       </div>
     </div>
   </div>
+
+  {# ── Saturation banner (server-rendered) ────────────────────────────── #}
+  {# The in-memory `(bot × host)` table is capped. Past the cap the  #}
+  {# counters keep ticking but the rows are dropped, so the totals   #}
+  {# above count them and the table below does not. The banner says #}
+  {# so, with the number of dropped records and the cap, and points #}
+  {# at the JSONL stream, which holds every row.                      #}
+  {% if summary.dropped_unique_pairs > 0 %}
+  <div class="card overflow-hidden mb-6">
+    <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">
+      <p>{{ lang.tf("bots.saturation_hint_1", self.saturation_args()) }}</p>
+      <p class="mt-1">{{ lang.t("bots.saturation_hint_2") }} <code>log.bot.dir</code> <code>bot-YYYY-MM-DD.jsonl</code> {{ lang.t("bots.saturation_hint_3") }}</p>
+    </div>
+  </div>
+  {% endif %}
 
   {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
   {% if !top_rows.is_empty() %}

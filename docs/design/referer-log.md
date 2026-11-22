@@ -216,6 +216,18 @@ attacker-shaped — anyone can send a `Referer` header naming a host of their
 choosing. Past the cap the counters keep ticking but the new pairs are not
 stored, and the saturation is visible to the operator.
 
+`referer_stats` is read through one query,
+`RefererStats::top_n(n, in_scope)`: a single pass over the pair map that
+materialises at most `n` rows and hands back a summary of the rows **in
+scope**. The scope is the caller's — the admin layer decides which hosts
+belong to the selected site and passes the predicate down — so `unique_pairs`
+and `total_hits` count the scoped rows, while `dropped_unique_pairs` stays
+process-wide: the records the cap dropped are not attributed to any host, so
+the counter says "the table is saturated", not "this scope is missing rows".
+The sort key is `hits` descending → `referer_host` ascending → `host`
+ascending; the last two keys make the order total, so two rows with the same
+hits never swap places between two renders.
+
 The writer task runs under a supervisor (`pangolin_core::supervisor`), the
 same one the bot log uses: a panic in the task restarts it instead of
 silently stopping the day's file. The supervisor's handle is the one
@@ -250,6 +262,16 @@ for the three limits of the panel.
 All three pages carry a **site selector**. Selecting a site scopes the view to
 that site's configured domains; rows belonging to different domains of the
 same site are aggregated together rather than split per host.
+
+When the in-memory pair table is saturated, `/logs/referers` shows a
+**saturation banner** under the summary cards: how many records were dropped,
+the cap they were dropped at, and where the complete data lives
+(`log.referer.dir/referer-YYYY-MM-DD.jsonl`). The dropped count is
+process-wide, so the banner shows it whatever the site scope is; the counts it
+sits between are scoped, and they do not include the dropped records. The
+banner quotes the cap from the code constant, so a bump of
+`referer_stats::MAX_UNIQUE_PAIRS` shows up on the page without a translation
+change.
 
 The history page and the stats page apply the same filters (`referer_host`,
 `host`, `path`, `status`, `method`, `client_ip`) to the same day's file, and
@@ -288,9 +310,9 @@ rows it describes.
 | ---- | ----- | ------------ |
 | Unit (core) | `crates/pangolin-core/src/referer.rs` | Referer parsing (userinfo / port / case / non-absolute / `about:blank`), the document-navigation rule, the site-boundary rule |
 | Unit (core) | `crates/pangolin-core/src/referer_log.rs` | The JSONL wire format and its exact key set, the ring buffer's eviction, the writer's append + daily rotation, the history reader's filters and pagination, the statistics rollup |
-| Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap |
+| Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap; the top-N query's sort order (`hits` desc → `referer_host` asc → `host` asc) and its tie-break, the scope predicate keeping a row out of the result *and* out of the summary, and the summary describing the scoped rows rather than the returned ones (issue #221) |
 | Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
 | Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
 | Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219) |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221) |
 | End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |

@@ -58,12 +58,12 @@
   {# ── Summary card (server-rendered) ─────────────────────────────────── #}
   {# On first paint the dashboard should show useful state, not a #}
   {# skeleton. The top-N table + summary counters come from #}
-  {# `RefererStats::snapshot()` and are rendered server-side; the SSE #}
+  {# `RefererStats::top_n()` and are rendered server-side; the SSE #}
   {# feed below appends new rows in real time. #}
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
     <div class="card p-4">
       <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.total_hits") }}</div>
-      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_records }}</div>
+      <div class="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ summary.total_hits }}</div>
     </div>
     <div class="card p-4">
       <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("referers.distinct_pairs") }}</div>
@@ -86,6 +86,21 @@
   {# The shared panel: both log pages show the writer's state the same #}
   {# way, from the same catalog keys.                                    #}
   {% include "components/_writer_status.html" %}
+
+  {# ── Saturation banner (server-rendered) ────────────────────────────── #}
+  {# The in-memory `(referrer × host)` table is capped. Past the cap #}
+  {# the rows are dropped, so the counts above and the table below   #}
+  {# do not hold them. The dropped counter is process-wide — it says #}
+  {# "the table is saturated", not "this scope is missing rows" — so #}
+  {# the banner shows it whatever the site scope is.                  #}
+  {% if summary.dropped_unique_pairs > 0 %}
+  <div class="card overflow-hidden mb-6">
+    <div class="px-4 py-3 bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm">
+      <p>{{ lang.tf("referers.saturation_hint_1", self.saturation_args()) }}</p>
+      <p class="mt-1">{{ lang.t("referers.saturation_hint_2") }} <code>log.referer.dir</code> <code>referer-YYYY-MM-DD.jsonl</code> {{ lang.t("referers.saturation_hint_3") }}</p>
+    </div>
+  </div>
+  {% endif %}
 
   {# ── Top-N table (server-rendered) ─────────────────────────────────── #}
   {% if !top_rows.is_empty() %}
