@@ -43,9 +43,11 @@ pub struct Config {
     /// developer can run `make start-ngx` straight from a fresh clone
     /// without sudo or a `.env`. Production hosts that bind the
     /// privileged ports set `addr.http` / `addr.https` to `:80` /
-    /// `:443` in their YAML config or `.env`. Set a port to `:0`
-    /// to disable that listener entirely (e.g. `https: ":0"` to run
-    /// HTTP-only).
+    /// `:443` in their YAML config or `.env`. `https: ":0"` disables
+    /// the TLS listener entirely (HTTP-only). `http` has **no** such
+    /// switch: the value goes to pingora as it is, and pingora
+    /// cannot resolve `":0"` — its listener thread panics and the
+    /// gateway stays up serving nothing.
     #[serde(default)]
     pub addr: AddrConfig,
     /// Virtual host used to resolve per-domain certs. `null` (default)

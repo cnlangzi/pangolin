@@ -22,10 +22,10 @@ system-wide default location**.
 ## Checking the configuration before a restart
 
 `pangolin-ngx` takes a second flag, `--check`: it runs the
-validation steps of the real startup — parse the configuration, open
-the database, verify the cert dir, reconcile the certificates on
-disk, build the SNI callback — and then stops. It binds no port,
-starts no service and writes no PID file.
+validation steps of the real startup — parse the configuration, parse
+the listen addresses, open the database, verify the cert dir,
+reconcile the certificates on disk, build the SNI callback — and then
+stops. It binds no port, starts no service and writes no PID file.
 
 ```console
 $ pangolin-ngx --config /etc/pangolin/ngx.yml --check
@@ -36,8 +36,15 @@ $ echo $?
 A successful check prints nothing at all; a failing one exits
 non-zero and names the problem on stderr. The check is **not**
 read-only: it opens the database (which applies the pending
-migrations) and reconciles the certificates on disk into the `certs`
-table, exactly as a real start would. See
+migrations and resets the certificate rows a dead process left in
+`Issuing`) and reconciles the certificates on disk into the `certs`
+table, exactly as a real start would.
+
+Two things to know: the database is the `pangolin.db` in the
+**current working directory**, so run the check from the directory
+the service runs in (`/var/lib/pangolin` for the package); and the
+check writes to the database, so do not run it against a live
+gateway's. See
 [design/graceful-reload.md](design/graceful-reload.md#pangolin-ngx---check).
 
 ## Environment variable override
@@ -103,7 +110,7 @@ because they apply to the whole file, not just one section.
 
 | Field         | Type            | Default      | Required | Notes |
 | ------------- | --------------- | ------------ | -------- | ----- |
-| `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Set to `":0"` to disable plain-HTTP serving entirely. |
+| `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Unlike `addr.https` and `api.listen`, it has **no** `"off"` switch: `":0"` is not a value pingora can resolve, and its listener thread panics — the process stays up and serves nothing. Leave the listener on and put the TLS listener in front of it. |
 | `addr.https`  | `string`        | `0.0.0.0:443`| no       | Full `host:port` for the HTTPS listener. Set to `":0"` to disable TLS entirely. |
 | `host`        | `string \| null` | `null`      | no       | Parsed, but **not read by the gateway**. It used to name the virtual host that resolved the per-domain certificate; since v2 the TLS listener is SNI-based and resolves a certificate through the pre-computed domain → cert link, so there is no virtual host any more. Setting it changes nothing. |
 | `workers`     | `usize \| null` | `null`       | no       | Parsed, but **not read by the gateway** — the worker count is chosen by the runtime, not by the configuration. Setting it changes nothing. |

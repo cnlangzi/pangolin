@@ -120,8 +120,10 @@ stderr. The exit code is the answer.
 | --- | --- | --- |
 | the configuration is usable | `0` | empty |
 | the configuration does not parse | non-zero | the parse error |
+| a listen address does not parse | non-zero | the key, named |
 | the cert dir is missing | non-zero | the cert dir, named |
 | the database cannot be opened | non-zero | the database error |
+| the certificates cannot be reconciled | non-zero | the reconciliation error |
 
 ### What it does
 
@@ -130,11 +132,14 @@ The steps, in the order the real startup takes them:
 1. the rustls crypto provider is installed (the process does this
    before the arguments are parsed — rustls needs it),
 2. the configuration is parsed,
-3. the database is opened (`App::new`, which applies the pending
+3. the **listen addresses** are parsed — the three the gateway
+   parses itself (`tunnel.addr`, `api.listen`) and the three
+   pingora parses (`addr.http`, `addr.https`, `admin.addr`),
+4. the database is opened (`App::new`, which applies the pending
    migrations),
-4. the cert dir has to exist and has to be a directory,
-5. the certificates on disk are reconciled into the `certs` table,
-6. the SNI callback is built.
+5. the cert dir has to exist and has to be a directory,
+6. the certificates on disk are reconciled into the `certs` table,
+7. the SNI callback is built.
 
 ### What it does not do
 
@@ -145,14 +150,35 @@ milliseconds.
 ### The side effects — it is not a read-only operation
 
 The check opens the database, and opening the database **applies the
-pending migrations**. It also reconciles the certificates on disk into
-the `certs` table, which is a write.
+pending migrations**. It also resets the certificate rows a dead
+process left in `Issuing` (the ACME startup watchdog) and reconciles
+the certificates on disk into the `certs` table — both writes.
 
 That is deliberate. A check that took a different path than the real
 startup would answer a question nobody asked: "would *this* code
 path work?" is not the same as "would the gateway work?". The check
 follows the startup, and the side effects are what the startup would
 have done anyway. They are documented in `--help` and here.
+
+Two consequences the operator has to know:
+
+- **Run the check from the service's working directory.** The
+  database is `pangolin.db` in the **current working directory** —
+  the packaged service runs in `/var/lib/pangolin`, the Ansible
+  deployment in `/usr/local/pangolin`. A check run from somewhere
+  else opens a different (empty) database and says nothing about the
+  one the service uses.
+- **Do not run the check against a live gateway's database.** The
+  check writes to it, and the ACME startup watchdog can abort an
+  in-flight DNS-01 issuance. The gateway is meant to be checked
+  while it is stopped.
+
+### Where the check is stricter than the startup
+
+The startup only logs a warning when the certificate reconciliation
+fails and serves anyway; the check fails. A failed reconciliation
+means the disk and the database disagree about the certificates — the
+operator wants to hear that **before** a handover, not after it.
 
 ### The cert dir
 

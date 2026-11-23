@@ -35,6 +35,7 @@
 //! directory (or points `acme.cert_dir` at an existing one) and runs
 //! the check again.
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,7 +53,16 @@ pub fn run_check(config: Config) -> anyhow::Result<()> {
 /// The database path is a parameter so the unit tests can point it at
 /// a throwaway file instead of the working directory.
 fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
-    // 3. The database. `App::new` opens it and applies the pending
+    // 3. The listen addresses. Every one of them is parsed by the
+    // real startup, and every one of them is fatal when it does not
+    // parse: `tunnel.addr` and `api.listen` by the gateway itself
+    // (a clear error), the three pingora ones by pingora's listener
+    // thread — which leaves the process alive and serving nothing.
+    // A check that skipped them would answer "yes" for a
+    // configuration the gateway refuses to start with.
+    check_listen_addresses(&config)?;
+
+    // 4. The database. `App::new` opens it and applies the pending
     // migrations — the same thing the real startup does.
     let app = Arc::new(App::new(
         db_path,
@@ -73,7 +83,7 @@ fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("the cert dir {} is not a directory", cert_dir.display());
     }
 
-    // 5. The reconciliation. It is the step that imports a
+    // 6. The reconciliation. It is the step that imports a
     // certificate issued while the gateway was down into the
     // `certs` table; a check that skipped it would not notice a
     // certificate that the disk and the database disagree about.
@@ -82,10 +92,73 @@ fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
         .build()?;
     runtime.block_on(crate::acme::scan_and_reconcile_blobs(&app))?;
 
-    // 6. The SNI callback. Building it is what proves that the
+    // 7. The SNI callback. Building it is what proves that the
     // certificate blobs the gateway will serve can be loaded.
     let _settings = crate::tls::build_sni_settings(cert_dir, app.clone())?;
 
+    Ok(())
+}
+
+/// Check every listen address the gateway parses at startup.
+///
+/// Two shapes, because the startup parses them two ways:
+///
+/// * `tunnel.addr` and `api.listen` are parsed by the gateway itself
+///   as a `SocketAddr` — a hostname is not a valid value there.
+/// * `addr.http`, `addr.https` and `admin.addr` are parsed by
+///   pingora, which resolves them with `to_socket_addrs()` and so
+///   accepts a hostname. The check resolves them the same way, which
+///   is what makes the two agree on what "usable" means.
+///
+/// The "off" switches are the ones the gateway honours: `api.listen:
+/// ":0"` and an empty `api.listen` switch the management API off, and
+/// `addr.https: ":0"` (or empty) keeps the gateway from adding the
+/// TLS listener at all — pingora never sees those. `addr.http` has
+/// no such switch: the gateway hands it to pingora as it is, and
+/// pingora cannot resolve `":0"` — its listener thread panics and the
+/// process stays up serving nothing.
+fn check_listen_addresses(config: &Config) -> anyhow::Result<()> {
+    config.tunnel.addr.parse::<SocketAddr>().map_err(|e| {
+        anyhow::anyhow!(
+            "tunnel.addr is not a valid host:port address ({:?}): {e}",
+            config.tunnel.addr
+        )
+    })?;
+
+    if config.api.listen != ":0" && !config.api.listen.is_empty() {
+        config.api.listen.parse::<SocketAddr>().map_err(|e| {
+            anyhow::anyhow!(
+                "api.listen is not a valid host:port address ({:?}): {e}",
+                config.api.listen
+            )
+        })?;
+    }
+
+    for (key, value) in [
+        ("addr.http", &config.addr.http),
+        ("admin.addr", &config.admin.addr),
+    ] {
+        resolve_listen_address(key, value)?;
+    }
+
+    if config.addr.https != ":0" && !config.addr.https.is_empty() {
+        resolve_listen_address("addr.https", &config.addr.https)?;
+    }
+
+    Ok(())
+}
+
+/// Resolve one of pingora's listen addresses.
+///
+/// pingora resolves them with `to_socket_addrs()` and takes the first
+/// answer, so the check does the same: a hostname is a valid value,
+/// and one that does not resolve is not.
+fn resolve_listen_address(key: &str, value: &str) -> anyhow::Result<()> {
+    value
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("{key} is not a valid listen address ({value:?}): {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{key} does not resolve to an address ({value:?})"))?;
     Ok(())
 }
 
@@ -108,6 +181,72 @@ mod tests {
 
         let db_path = dir.path().join("pangolin.db");
         run_check_in(config, &db_path).expect("a valid configuration passes the check");
+    }
+
+    /// A listen address the gateway cannot parse fails the check.
+    ///
+    /// The real startup dies with `invalid tunnel server address`
+    /// (or, for the pingora ones, leaves a process that serves
+    /// nothing) — a check that answered "yes" here would send the
+    /// operator into a handover that cannot work.
+    #[test]
+    fn an_unparsable_listen_address_fails_the_check() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_dir = dir.path().join("certs");
+        std::fs::create_dir_all(&cert_dir).expect("create the cert dir");
+        let db_path = dir.path().join("pangolin.db");
+
+        for (key, value) in [
+            ("tunnel.addr", "not-an-address"),
+            ("api.listen", "also-not-an-address"),
+            ("addr.http", "http://127.0.0.1:8000"),
+            ("admin.addr", "127.0.0.1:not-a-port"),
+        ] {
+            let mut config = Config::default();
+            config.acme.cert_dir = cert_dir.display().to_string();
+            match key {
+                "tunnel.addr" => config.tunnel.addr = value.to_string(),
+                "api.listen" => config.api.listen = value.to_string(),
+                "addr.http" => config.addr.http = value.to_string(),
+                "admin.addr" => config.admin.addr = value.to_string(),
+                _ => unreachable!(),
+            }
+
+            let error = run_check_in(config, &db_path)
+                .expect_err("an unparsable listen address must fail the check");
+            assert!(
+                error.to_string().contains(key),
+                "the error has to name {key}: {error}"
+            );
+        }
+    }
+
+    /// The "do not listen" switches are valid addresses.
+    ///
+    /// `api.listen: ":0"` switches the management API off and
+    /// `addr.https: ":0"` keeps the gateway from adding the TLS
+    /// listener — neither is an error, and a check that refused them
+    /// would send the operator chasing a problem that does not
+    /// exist.
+    ///
+    /// `addr.http: ":0"` is **not** one of them: the gateway hands it
+    /// to pingora, which cannot resolve it — its listener thread
+    /// panics and the process stays up serving nothing. The check
+    /// refuses it, and the documentation says so too.
+    #[test]
+    fn the_disabled_listeners_are_not_an_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_dir = dir.path().join("certs");
+        std::fs::create_dir_all(&cert_dir).expect("create the cert dir");
+
+        let mut config = Config::default();
+        config.acme.cert_dir = cert_dir.display().to_string();
+        config.api.listen = ":0".to_string();
+        config.addr.https = ":0".to_string();
+        config.addr.http = "127.0.0.1:0".to_string();
+
+        let db_path = dir.path().join("pangolin.db");
+        run_check_in(config, &db_path).expect("the disabled listeners are not an error");
     }
 
     /// A cert dir that is not there fails the check.
