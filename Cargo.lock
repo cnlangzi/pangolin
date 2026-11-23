@@ -2649,9 +2649,9 @@ dependencies = [
 
 [[package]]
 name = "pangolin-tun"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc1e713ae145330353e2bade1af80e331823f7e48874e1b045b8aa3c97ea03bb"
+checksum = "b829fddcdb8f3cbb40e440bb0fd31810b4f2226b55adb5fece8356f47b01d2f1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
