@@ -23,19 +23,6 @@
 
   {% include "views/referers/_subnav.html" %}
 
-  {% if !enabled %}
-    {# ── Feature disabled ─────────────────────────────────────────── #}
-    {# `log.referer.enabled: false` turns the capture off entirely:  #}
-    {# no header is read, no row is recorded, no JSONL is written.    #}
-    <div class="card p-6">
-      <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("referers.disabled_title") }}</h2>
-      <p class="mt-2 text-sm text-slate-600 dark:text-gray-300">
-        {{ lang.t("referers.disabled_hint_1") }} <code>log.referer.enabled: true</code> {{ lang.t("referers.disabled_hint_2") }} <code>ngx.yml</code> {{ lang.t("referers.disabled_hint_3") }}
-        <code>NGX_LOG__REFERER__ENABLED=true</code>{{ lang.t("referers.disabled_hint_4") }}
-      </p>
-    </div>
-  {% else %}
-
   {# ── Site selector ────────────────────────────────────────────── #}
   {# The scoping unit is the site, not the hostname. Selecting a site #}
   {# scopes the summary card *and* the live tail below to that site's #}
@@ -123,7 +110,6 @@
     <code>referer-YYYY-MM-DD.jsonl</code> {{ lang.t("referers.footnote_6") }} <code>jq</code> {{ lang.t("referers.footnote_7") }}
     <code>DuckDB</code>{{ lang.t("referers.footnote_8") }} <code>pangolin-ngx</code> {{ lang.t("referers.footnote_9") }}
   </p>
-  {% endif %}
 </main>
 
 <script>

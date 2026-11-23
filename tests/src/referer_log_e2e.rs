@@ -47,7 +47,7 @@ use tokio::time::timeout;
 
 use crate::harness::{
     NgxProcess, admin_session_cookie, init_pangolin_db, raw_request_with_headers,
-    read_sse_data_frames,
+    read_sse_data_frames, wait_for_log,
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -350,6 +350,71 @@ async fn referer_log_records_only_external_document_navigations() {
         rows.len(),
         1,
         "only the external document navigation may be recorded, got {rows:#?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(rows[0]["referer_host"], "news.example.org");
+    assert_eq!(rows[0]["path"], "/pricing");
+}
+
+/// The retired `log.referer.enabled: false` must not silence the
+/// side-channel (issue #227).
+///
+/// The gateway boots with the retired key in its configuration — the
+/// loader ignores it, and the operator is told which key is gone.
+/// The capture still runs: the external document navigation is
+/// recorded exactly as it is without the key.
+#[tokio::test]
+async fn the_referer_log_records_even_when_the_config_carries_the_retired_key() {
+    let backend = MockHttpBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+    let ngx = NgxProcess::start_with_log_config(
+        {
+            let backend_addr = backend_addr.clone();
+            move |db_path| {
+                init_pangolin_db(db_path);
+                let conn = Connection::open(db_path).expect("open db");
+                seed_site(&conn, "web", &format!("http://{backend_addr}"));
+                seed_domain(&conn, "example.test", "web");
+            }
+        },
+        "referer:\n  enabled: false\n",
+    )
+    .await;
+
+    // The operator is told which key is gone — and the warning has to
+    // reach the log, not just the code. The log is drained
+    // asynchronously, so poll for the line instead of racing it.
+    let warned = wait_for_log(
+        &ngx.log,
+        "`log.referer.enabled` has been retired and is ignored",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        warned,
+        "the retired-key warning is missing from the gateway's log:\n{}",
+        ngx.log_string()
+    );
+
+    let (status, _) = raw_request_with_headers(
+        &format!("127.0.0.1:{}", ngx.http_port),
+        "example.test",
+        "GET",
+        "/pricing",
+        b"",
+        &[
+            ("Referer", "https://news.example.org/article?id=7"),
+            ("Sec-Fetch-Dest", "document"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let rows = wait_for_rows(&ngx, 1).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the retired key must not silence the referer log, got {rows:#?}\nngx log:\n{}",
         ngx.log_string()
     );
     assert_eq!(rows[0]["referer_host"], "news.example.org");

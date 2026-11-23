@@ -520,9 +520,12 @@ pub struct App {
     pub referer_log_recent: Arc<RefererLogBuffer>,
     /// Per-(referer_host, host) hit counters.
     pub referer_stats: Arc<RefererStats>,
-    /// Background JSONL writer. `None` when `log.referer.enabled`
-    /// is `false` — the feature is then fully off (no capture, no
-    /// rows, no live stream data).
+    /// Background JSONL writer.
+    ///
+    /// The referer log is always on (issue #227), so the writer
+    /// always exists. The field stays an `Option` to mirror the bot
+    /// writer's shape; the `None` branch is a safety net, not a
+    /// configuration state.
     ///
     /// Like the bot writer, the writer *object* is built in
     /// [`App::new`] but the task that drains its queue is **not**
@@ -540,11 +543,8 @@ pub struct App {
     referer_writer_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     /// The supervisor state of the referer-log writer.
     ///
-    /// Always present, even when the referer log is disabled — then
-    /// there is no writer to supervise, and
-    /// [`App::referer_writer_health`] says so through `available`.
-    /// Keeping the state unconditional means "is the referer log
-    /// enabled" is answered by one field only.
+    /// Always present, like the bot writer's: the referer log is
+    /// always on, so there is always a writer to supervise.
     referer_writer_state: Arc<SupervisedTask>,
     /// In-memory traffic stats (no persistence). Hot path is
     /// `on_start` / `on_finish` (`try_send` only); aggregation
@@ -715,7 +715,7 @@ impl App {
         // be unconditional, and a disabled bot log silently turned
         // the gateway's `P-Known-Bot` header into an empty value.
         // The retired `log.bot.enabled` key is ignored —
-        // `Config::from_str` warns about it.
+        // `warn_retired_keys` names it in the log.
         //
         // The writer *object* is built here, but the task that
         // drains its queue is NOT spawned here. `App::new` runs
@@ -773,18 +773,14 @@ impl App {
 
         // Referer log side-channel (inbound external referrals).
         //
-        // The channel, the ring buffer and the counters exist even
-        // when the feature is disabled — `push_referer_log` is the
-        // single gate, and the admin pages read `config.log.referer.enabled`
-        // to render the "disabled" notice. The *writer* is `None`
-        // when disabled so no JSONL file is ever created.
+        // The side-channel is always on (issue #227) — the channel,
+        // the ring buffer, the counters and the writer all exist
+        // whatever the configuration says.
         let referer_cfg = &config.log.referer;
         let (referer_log_tx, _initial_referer_rx) = broadcast::channel(referer_cfg.capacity.max(1));
         let referer_log_recent = Arc::new(RefererLogBuffer::new(referer_cfg.recent));
         let referer_stats = RefererStats::new();
-        let referer_writer = referer_cfg
-            .enabled
-            .then(|| RefererLogWriter::new(referer_cfg.dir.clone()));
+        let referer_writer = Some(RefererLogWriter::new(referer_cfg.dir.clone()));
         let referer_writer_state = SupervisedTask::new();
 
         let traffic_enabled = config.log.traffic.enabled;
@@ -1194,8 +1190,9 @@ impl App {
     /// disk write happens in the background `RefererLogWriter::run`
     /// task.
     ///
-    /// No-op when `log.referer.enabled` is `false` — the writer is
-    /// `None` in that case, which is the single gate.
+    /// No-op when the writer is absent. The side-channel is always on
+    /// (issue #227), so the writer always exists — the `None` branch
+    /// is a safety net.
     pub fn push_referer_log(&self, entry: &AccessLogEntry, hit: &RefererHit) {
         let Some(writer) = self.referer_writer.as_ref() else {
             return;
@@ -1210,8 +1207,7 @@ impl App {
 
     /// Snapshot the referer log ring buffer in chronological order
     /// (oldest first). Used by `/api/logs/referers/stream` to replay
-    /// entries on connect. Empty Vec when the referer log is
-    /// disabled or `referer.recent: 0`.
+    /// entries on connect. Empty Vec when `referer.recent: 0`.
     pub fn recent_referer_log(&self) -> Vec<RefererLogEntry> {
         self.referer_log_recent.snapshot()
     }
@@ -1243,7 +1239,7 @@ impl App {
     ///     `#[tokio::test]`)
     ///   - `start_referer_writer` was already called once (idempotent
     ///     guard — second call is a no-op)
-    ///   - the referer log is disabled (`log.referer.enabled: false`)
+    ///   - the `App` was built without a referer writer
     pub fn start_referer_writer(&self) -> bool {
         let Some(writer) = self.referer_writer.as_ref() else {
             return false;
@@ -1536,9 +1532,8 @@ impl App {
 
     /// The health of the referer-log JSONL writer task.
     ///
-    /// `available` is `false` when the referer log is disabled — then
-    /// there is no writer to report on and the panel says so instead
-    /// of claiming the side channel is healthy.
+    /// The referer log is always on (issue #227), so `available` is
+    /// `true` for every `App` built by [`App::new`].
     pub fn referer_writer_health(&self) -> WriterHealth {
         let available = self.referer_writer.is_some();
         let dropped = self
@@ -2853,19 +2848,22 @@ mod tests {
         assert!(!health.failed, "a shutdown is not a failure: {health:?}");
     }
 
-    /// A disabled side channel has no writer, so the panel must not
-    /// claim it is healthy — it says the status is unavailable.
+    /// The referer log is always on (issue #227), so the writer
+    /// always exists — the panel can always report on it.
+    ///
+    /// The configuration still carries the retired key: a retired key
+    /// must not take the writer away.
     #[tokio::test]
-    async fn referer_writer_health_is_unavailable_when_the_side_channel_is_disabled() {
+    async fn the_referer_writer_is_always_available() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let mut cfg = make_log_config(50, 16);
-        cfg.log.referer.enabled = false;
+        let cfg = crate::config::Config::from_str("log:\n  referer:\n    enabled: false\n")
+            .expect("an old config must still parse");
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         let health = app.referer_writer_health();
         assert!(
-            !health.available,
-            "a disabled referer log has no writer: {health:?}"
+            health.available,
+            "the referer log is always on, so it always has a writer: {health:?}"
         );
         assert!(!health.alive);
         assert!(!health.failed);
@@ -3023,28 +3021,38 @@ mod tests {
         assert!(app.recent_bot_log().is_empty());
     }
 
-    /// `log.referer.enabled: false` must suppress the capture
-    /// entirely: no rows, no counters, no writer.
+    /// The retired `log.referer.enabled: false` must not silence the
+    /// side-channel (issue #227).
+    ///
+    /// The config is built through the real loader, so the test walks
+    /// the path an operator's old `ngx.yml` takes: the key is parsed,
+    /// ignored, and the referer log keeps recording.
     #[test]
-    fn push_referer_log_is_a_noop_when_the_feature_is_disabled() {
+    fn the_referer_log_records_even_when_the_config_carries_the_retired_key() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pangolin.db");
-        let mut cfg = make_log_config(50, 16);
-        cfg.log.referer.enabled = false;
+
+        let mut cfg = crate::config::Config::from_str("log:\n  referer:\n    enabled: false\n")
+            .expect("an old config must still parse");
+        // The loader merges the `NGX_*` environment layer, so the
+        // knobs are pinned here rather than read from the YAML.
+        cfg.log.referer.recent = 200;
+        cfg.log.referer.capacity = 1000;
         cfg.log.referer.dir = dir.path().to_path_buf();
+
         let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
         assert!(
-            app.referer_writer.is_none(),
-            "no writer may exist when the feature is disabled"
+            app.referer_writer.is_some(),
+            "the retired key must not take the writer away"
         );
 
         let entry = make_entry("GET", "/landing", 200);
         app.push_referer_log(&entry, &referer_hit("news.example.org"));
 
-        assert!(app.recent_referer_log().is_empty());
+        assert_eq!(app.recent_referer_log().len(), 1);
         let (rows, summary) = app.referer_stats_top_n(10, |_| true);
-        assert!(rows.is_empty());
-        assert_eq!(summary.total_hits, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(summary.total_hits, 1);
     }
 
     /// The JSONL writer writes one JSON object per line into

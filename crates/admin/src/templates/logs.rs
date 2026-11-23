@@ -651,10 +651,6 @@ pub struct RefererLogsTemplate<'a> {
     pub active_nav: &'a str,
     /// Sub-nav token. Always [`referer_subnav::LIVE`].
     pub active_subnav: &'a str,
-    /// `false` when `log.referer.enabled` is false — the page then
-    /// says the feature is disabled instead of showing an empty
-    /// table.
-    pub enabled: bool,
     /// Pre-rendered summary numbers.
     pub summary: RefererStatsSummary,
     /// Top-N rows by hit count, already scoped to the selected site.
@@ -678,9 +674,8 @@ pub struct RefererLogsTemplate<'a> {
     pub site_scoped: bool,
     /// Health of the JSONL writer task (issue #219).
     ///
-    /// `available` is `false` when the referer log is disabled — the
-    /// page then shows the "feature disabled" notice instead of a
-    /// writer status.
+    /// The referer log is always on (issue #227), so `available` is
+    /// `true` — the page always shows the writer's status.
     pub writer: WriterHealth,
     /// The hard cap on the in-memory `(referer_host, host)` pair
     /// table (`pangolin_core::referer_stats::MAX_UNIQUE_PAIRS`).
@@ -766,8 +761,6 @@ pub struct RefererLogsHistoryTemplate<'a> {
     pub active_nav: &'a str,
     /// Sub-nav token. [`referer_subnav::HISTORY`].
     pub active_subnav: &'a str,
-    /// `false` when `log.referer.enabled` is false.
-    pub enabled: bool,
     /// One link per JSONL file, newest first.
     pub date_links: Vec<RefererHistoryDateLink>,
     /// The site selector.
@@ -797,8 +790,6 @@ pub struct RefererLogsStatsTemplate<'a> {
     pub active_nav: &'a str,
     /// Sub-nav token. [`referer_subnav::STATS`].
     pub active_subnav: &'a str,
-    /// `false` when `log.referer.enabled` is false.
-    pub enabled: bool,
     /// One link per JSONL file.
     pub date_links: Vec<RefererHistoryDateLink>,
     /// The site selector.

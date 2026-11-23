@@ -710,7 +710,32 @@ impl NgxProcess {
     /// which seed data is visible without an explicit
     /// `reload_indexes` admin call.
     pub async fn start<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, false).await
+        Self::start_inner(seed_db, false, "").await
+    }
+
+    /// Spawn `pangolin-ngx` with extra keys merged into its `[log]`
+    /// section.
+    ///
+    /// `extra_log` is YAML that lands inside the `log:` block, so a
+    /// test can configure a side-channel the way an operator would —
+    /// a retired key, a directory. The block is indented here rather
+    /// than by the caller: a caller that forgot the two spaces would
+    /// put the keys at the top level, where the loader ignores them,
+    /// and the test would silently stop exercising what it was
+    /// written for.
+    pub async fn start_with_log_config<F: FnOnce(&Path)>(seed_db: F, extra_log: &str) -> Self {
+        let indented: String = extra_log
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    line.to_string()
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::start_inner(seed_db, false, &indented).await
     }
 
     /// Start ngx with the tunnel's **UDP** port already occupied by a
@@ -722,10 +747,10 @@ impl NgxProcess {
     /// That is the "the network blocks UDP" case, exercised without
     /// touching the host's firewall.
     pub async fn start_with_quic_blocked<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, true).await
+        Self::start_inner(seed_db, true, "").await
     }
 
-    async fn start_inner<F: FnOnce(&Path)>(seed_db: F, occupy_udp: bool) -> Self {
+    async fn start_inner<F: FnOnce(&Path)>(seed_db: F, occupy_udp: bool, extra_log: &str) -> Self {
         let tmpdir = tempfile::Builder::new()
             .prefix("pangolin-e2e-ngx-")
             .tempdir()
@@ -772,6 +797,7 @@ tunnel:
 
 log:
   level: info
+{extra_log}
 
 admin:
   addr: 127.0.0.1:{admin}
@@ -790,6 +816,7 @@ acme:
             admin = admin_port,
             api = api_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
+            extra_log = extra_log,
         );
         let config_path = tmpdir.path().join("ngx.yml");
         std::fs::write(&config_path, config).expect("write ngx.yml");

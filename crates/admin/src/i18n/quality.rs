@@ -198,9 +198,7 @@ const ALLOWED_ENGLISH_TEXT: &[&str] = &[
     "file",
     "http",
     "https",
-    // The configuration keys and the environment variable the log
-    // pages quote.
-    "NGX_LOG__REFERER__ENABLED=true",
+    // The configuration keys the log pages quote.
     "api.listen",
     "api_disabled",
     "client_ip",
@@ -259,7 +257,6 @@ const ALLOWED_ENGLISH_TEXT: &[&str] = &[
     "&lt;h1&gt;Too many requests&lt;/h1&gt;",
     "203.0.113.7 or 10.0.0.0/8",
     // The configuration snippets the log pages quote as they are.
-    "log.referer.enabled: true",
     "log.traffic.enabled = false",
 ];
 

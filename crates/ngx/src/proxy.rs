@@ -112,8 +112,8 @@ pub struct RequestState {
     pub traffic_kind: pangolin_core::TrafficKind,
     pub host_known: bool,
     /// The raw `Referer` header, captured once per request in
-    /// `request_filter`. `None` when the client sent none, the
-    /// header wasn't valid UTF-8, or the referer log is disabled.
+    /// `request_filter`. `None` when the client sent none or the
+    /// header wasn't valid UTF-8.
     ///
     /// Kept raw because the classification needs the full URL: the
     /// parsed form ([`Self::referer_hit`]) is derived from it at the
@@ -193,9 +193,9 @@ impl ProxyHttp for AppProxy {
         // headers the classification needs, in one place on the hot
         // path.
         //
-        // The header is only read when the feature is enabled
-        // (`log.referer.enabled`), so a deploy that turns the
-        // feature off pays nothing for the capture.
+        // The capture is unconditional — the referer log is always on
+        // (issue #227), so there is no configuration that turns it
+        // off.
         //
         // `Referer` is a client-supplied value: it is truncated by
         // the header parser, but we still keep it short. A referer
@@ -203,27 +203,25 @@ impl ProxyHttp for AppProxy {
         // link, and the referrer *host* — the only thing the
         // classification and the rollup use — is already captured
         // in the first few bytes.
-        if self.app.config.log.referer.enabled {
-            ctx.referer = session
-                .req_header()
-                .headers
-                .get("referer")
-                .and_then(|v| v.to_str().ok())
-                .filter(|v| !v.is_empty() && v.len() <= MAX_REFERRER_HEADER_LEN)
-                .map(String::from);
-            ctx.sec_fetch_dest = session
-                .req_header()
-                .headers
-                .get("sec-fetch-dest")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-            ctx.accept = session
-                .req_header()
-                .headers
-                .get("accept")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-        }
+        ctx.referer = session
+            .req_header()
+            .headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty() && v.len() <= MAX_REFERRER_HEADER_LEN)
+            .map(String::from);
+        ctx.sec_fetch_dest = session
+            .req_header()
+            .headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        ctx.accept = session
+            .req_header()
+            .headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
 
         // The TCP peer, resolved once per request.
         let peer = peer_addr_std(session);

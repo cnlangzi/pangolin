@@ -312,9 +312,9 @@ naming no site stays scoped (and therefore empty), never "all sites".
 The **JSONL writer** panel on `/logs/referers` is what tells "no referral
 traffic today" apart from "the writer died": the ring buffer, the SSE tail
 and the counters all keep working when the writer task is dead, and the day's
-file simply stops growing. When the referer log is disabled there is no
-writer, and the panel says the status is unavailable rather than claiming
-health.
+file simply stops growing. The referer log is always on, so the writer always
+exists — the panel reports its state rather than saying the status is
+unavailable.
 
 The panel is the shared `components/_writer_status.html` fragment, rendered
 from the same catalog keys as the bot log's — the two pages cannot drift
@@ -350,6 +350,27 @@ filter over, site scope included. A page number past the last page is
 clamped to the last page, so the "Page X of Y" header always sits above the
 rows it describes.
 
+## The referer log is always on
+
+The `log.referer.enabled` configuration key has been retired (issue #227). The
+referer side-channel is always enabled, because `false` was never "a slower
+version of the same thing": turning the capture off does not degrade the
+record, it removes the "where did this visitor come from" dimension
+altogether — no header is read, no row is recorded, no JSONL is written, and
+the three admin pages say the feature is disabled. A knob that can only be
+changed by editing `ngx.yml` and restarting the gateway, and whose `false`
+value deletes an analysis dimension rather than trimming it, does not earn its
+place. The bot log — the sibling side-channel — has been always-on since
+issue #117, and the two are shaped the same way.
+
+A configuration file that still contains `log.referer.enabled` parses
+successfully and logs a warning naming the retired key. The environment form,
+`NGX_LOG__REFERER__ENABLED`, is ignored **without** a warning: the loader
+layers the `NGX_*` environment on top of the file, and the retired key is no
+longer a field, so there is nothing for the loader to complain about. The
+other three keys in the block — `recent`, `capacity` and `dir` — are growth
+and placement knobs, not switches, and they are unchanged.
+
 ## Failure modes
 
 | Scenario | Behaviour |
@@ -372,7 +393,7 @@ rows it describes.
 | The writer task panics again after 5 restarts | The supervisor gives up: the JSONL side channel is dead until the gateway restarts. One `error!` line says so, and the `/logs/referers` panel shows "Stopped: automatic repair failed after 5 restart(s)" — the count is the repair attempts that failed, not every restart since the process started. The request path is untouched — a side-channel failure never reaches the forwarding decision. |
 | The JSONL file cannot be created (bad `dir`) | The batch is dropped with a warning; the gateway keeps serving traffic. The directory is created lazily on first write. |
 | A site's domains are later re-pointed to a different site | Historical rows are re-grouped under the current mapping when queried. The rows carry the host, not the site. |
-| `log.referer.enabled: false` | No capture, no rows, no live stream data; the admin pages state that the feature is disabled. |
+| The configuration still carries the retired `log.referer.enabled: false` | The key is ignored: the capture runs, the rows are recorded, the JSONL is written. The loader logs a warning naming the key. |
 
 ## Test coverage
 
@@ -381,9 +402,9 @@ rows it describes.
 | Unit (core) | `crates/pangolin-core/src/referer.rs` | Referer parsing (userinfo / port / case / non-absolute / `about:blank`), the document-navigation rule, the site-boundary rule |
 | Unit (core) | `crates/pangolin-core/src/referer_log.rs` | The JSONL wire format and its exact key set, the ring buffer's eviction, the writer's append + daily rotation, the history reader's filters and pagination, the statistics rollup |
 | Unit (core) | `crates/pangolin-core/src/referer_stats.rs` | Per-pair keying, hit aggregation, last-seen updates, the distinct-pair cap; the top-N query's sort order (`hits` desc → `referer_host` asc → `host` asc) and its tie-break, the scope predicate keeping a row out of the result *and* out of the summary, and the summary describing the scoped rows rather than the returned ones (issue #221) |
-| Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, and that the shipped `ngx.yml` parses |
-| Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the disabled case, the writer lifecycle |
+| Unit (core) | `crates/pangolin-core/src/config.rs` | The `log.referer` keys, their defaults, the `NGX_LOG__REFERER__DIR` override, that the shipped `ngx.yml` parses, and that the retired `log.referer.enabled` key still parses (issue #227) |
+| Unit (core) | `crates/pangolin-core/src/app.rs` | The fan-out to all four referer sinks, the writer lifecycle, and that the retired `log.referer.enabled` key does not silence the side-channel (issue #227) |
 | Unit (core) | `crates/pangolin-core/src/supervisor.rs` | The restart loop a panicked writer goes through: the panic surfaces as a `JoinError`, the supervisor restarts the task, the rolling budget is spent after five restarts, a stable run resets it, and a shutdown stops the restarts (issue #219) |
-| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the disabled-feature notice, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221); the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page |
-| End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none |
+| Unit (admin) | `crates/admin/src/routes/logs.rs` | The three pages, the site selector, the site scoping, the date-sidebar links, the JSONL writer's status panel (issue #219); the saturation banner under the summary cards — with the dropped count and the cap — and no banner when nothing was dropped (issue #221); the polled summary fragment (issue #226): the counters it carries, the site scope it keeps, the markup it shares with the page; that the pages carry no "disabled" notice (issue #227) |
+| End-to-end | `tests/src/referer_log_e2e.rs` | A real `pangolin-ngx`: an external document navigation writes a row; an internal referral, a subresource request and a request without a referer write none; a configuration that still carries the retired `log.referer.enabled: false` records the row anyway, and the gateway's log names the retired key (issue #227) |
 | End-to-end | `tests/src/admin_ui_e2e.rs` | The polled summary endpoint answers a signed-in operator with the scoped fragment, and an anonymous one with the login redirect (issue #226) |

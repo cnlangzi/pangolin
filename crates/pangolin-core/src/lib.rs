@@ -57,6 +57,7 @@ pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
 pub use config::{
     ApiConfig, BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger,
+    load_config_and_init_logger,
 };
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
