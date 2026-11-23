@@ -745,6 +745,17 @@ impl App {
             ..ValidatorOptions::default()
         })
         .map_err(|e| crate::PangolinError::Config(format!("knownbots init failed: {e}")))?;
+        // A bot config the verifier skipped is a crawler the gateway
+        // will never verify: its traffic is not recognised as a bot's,
+        // it keeps no rate-limit exemption, and it is missing from
+        // the admin UI's bot list. The panel reports the same list
+        // under "Verification status", but a config the operator
+        // wrote is worth a line in the log — the file is skipped
+        // silently otherwise, and the operator has to go looking for
+        // it.
+        for error in verifier.config_errors() {
+            log::warn!("bot config skipped: {} — {}", error.path, error.message);
+        }
         let bot_writer = Some(BotLogWriter::new(bot_cfg.dir.clone()));
         let bot_verifier = Some(verifier);
         // The supervisor state is built next to the writer it

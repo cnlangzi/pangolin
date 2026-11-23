@@ -118,6 +118,54 @@ three removed ids leave the table inert. The V14 migration rewrites
 `applebot`, and a site that deliberately kept it out of its exemptions must
 keep doing so — and deletes the two ids with no successor.
 
+### The 0.4 category change
+
+Since 0.4.0 the crate owns the **category** of a crawler, and every bot
+definition states its own. Two things follow for the operator.
+
+**A bot config that names no `category` is skipped.** The loader reads
+`category` as a required field: a document without one is incomplete, so
+it never reaches the registry. The crawler in it is then **not verified** —
+its traffic is not recognised as a bot's, it gets no bot-log row, no
+`P-Known-Bot` header and no rate-limit exemption, and it is missing from
+the site's bot list. The file is **not** fatal: the rest of the registry
+loads, the gateway starts, and the file is reported as skipped — on
+`/logs/bots` under "Verification status", and in the gateway log at
+startup:
+
+```
+WARN bot config skipped: /var/lib/pangolin/logs/bots/cache/conf.d/mybot.yaml — missing required 'category' field
+```
+
+**So an existing override file needs one line.** A file written for 0.3.0
+carries `name` / `ua` / `vendor` / `kind` and no `category`:
+
+```yaml
+# before (knownbots 0.3.0) — skipped by 0.4.0
+kind: SEO
+name: mybot
+vendor: "Example"
+ua: "MyBot"
+```
+
+```yaml
+# after (knownbots 0.4.0 and later)
+kind: SEO
+category: search_engine
+name: mybot
+vendor: "Example"
+ua: "MyBot"
+```
+
+The category is **not** derived from the `kind` — the kind says what the
+crawler does on the web, the category says which dashboard it belongs to.
+The bucket that fits a `Monitor` is a choice: `monitoring` or `ads_bot`
+(see [The category vocabulary](#the-category-vocabulary)).
+
+Nothing else changes for the operator: the embedded bots of the crate
+already carry their category, and the wire labels of the rows are the
+same as before.
+
 ### The address space — three sources
 
 A bot's address space is assembled from up to three sources. They are
@@ -472,7 +520,9 @@ urls:
 An operator file that cannot be turned into a bot — a YAML syntax error, or
 a document without `name` / `ua` / `category` — is **skipped and reported**,
 not fatal: a typo in an override file must not take the gateway down. The
-file path and the reason show up on `/logs/bots`. The contract test does
+file path and the reason show up on `/logs/bots`, and the gateway logs each
+skipped file at startup (a crawler that is not in the registry is not
+verified, and that is worth a line in the log). The contract test does
 **not** cover operator files — it runs over the embedded set only, because
 that is the set this repository controls.
 

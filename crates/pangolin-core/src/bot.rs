@@ -38,6 +38,13 @@ pub struct BotIdentity {
     pub category: BotCategory,
 }
 
+/// The badge of a category the host does not know — the neutral style.
+///
+/// The live-tail page's `categoryClass()` uses the same string for a
+/// label it does not know, so the two render paths stay in step.
+pub const NEUTRAL_CATEGORY_CLASS: &str =
+    "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300";
+
 /// The Tailwind class token of a category's badge.
 ///
 /// The **badge** is pangolin's vocabulary, the **bucket** is the
@@ -75,22 +82,28 @@ impl BotCategoryStyle for BotCategory {
             // A bucket the crate gains later: the neutral badge, the
             // same one the live-tail page's `categoryClass()` uses for
             // a label it does not know.
-            _ => "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300",
+            _ => NEUTRAL_CATEGORY_CLASS,
         }
     }
 }
 
 impl BotIdentity {
     /// Build from a knownbots verified result.
+    ///
+    /// A verified result always carries the category of the bot the
+    /// crate matched — the crate fills it in `VerifyResult::verified`
+    /// and clears it for every other outcome — so the fallback below
+    /// only covers a caller that passes a result it did not check.
     pub fn from_verified(r: &VerifyResult) -> Self {
+        debug_assert!(
+            r.status == VerifyStatus::Verified,
+            "from_verified takes a verified result"
+        );
         Self {
             name: r.name.clone(),
             vendor: r.vendor.clone(),
-            // The crate states the bucket of a crawler in its own
-            // definition and fills it for every verified result. The
-            // fallback keeps the constructor total for a result the
-            // caller did not check — `monitoring` is the bucket the
-            // crate gives a crawler whose kind it cannot place.
+            // `monitoring` is the bucket the crate gives a crawler
+            // whose kind it cannot place.
             category: r.category.unwrap_or(BotCategory::Monitoring),
         }
     }
@@ -488,19 +501,27 @@ mod tests {
         assert_eq!(ident.category, BotCategory::Social);
     }
 
+    /// The wire labels of the crate's vocabulary, and the badge class
+    /// of every bucket.
+    ///
+    /// One table, so the two tests below cannot drift apart: the
+    /// label is what the JSONL row carries, the class is what the
+    /// admin UI paints the badge with.
+    const CATEGORY_LABELS: [(BotCategory, &str); 5] = [
+        (BotCategory::SearchEngine, "search_engine"),
+        (BotCategory::AiBot, "ai_bot"),
+        (BotCategory::Social, "social"),
+        (BotCategory::Monitoring, "monitoring"),
+        (BotCategory::AdsBot, "ads_bot"),
+    ];
+
     /// The serde form of a category is the JSONL `bot_category` — the
     /// key the downstream `jq` / DuckDB queries filter on. Every label
     /// of the crate's vocabulary is pinned byte for byte, so a change
     /// of the vocabulary cannot silently move the rows of a query.
     #[test]
     fn bot_category_serializes_as_snake_case() {
-        for (category, label) in [
-            (BotCategory::SearchEngine, "search_engine"),
-            (BotCategory::AiBot, "ai_bot"),
-            (BotCategory::Social, "social"),
-            (BotCategory::Monitoring, "monitoring"),
-            (BotCategory::AdsBot, "ads_bot"),
-        ] {
+        for (category, label) in CATEGORY_LABELS {
             let json = serde_json::to_string(&category).unwrap();
             assert_eq!(json, format!("\"{label}\""));
             // And it must NOT contain the Rust debug repr.
@@ -571,9 +592,43 @@ mod tests {
         let v = Validator::with_root(dir.path()).unwrap();
         let bots = registry(Some(&v));
         assert!(bots.iter().any(|b| b.name == "custombot"));
+        // The category the definition states is the category the host
+        // hands the admin UI — the row of a custom bot carries the
+        // bucket the operator wrote down.
+        let custom = bots.iter().find(|b| b.name == "custombot").unwrap();
+        assert_eq!(custom.category, BotCategory::AiBot);
         assert!(
             !bots.iter().any(|b| b.name == "not-in-the-registry"),
             "only the bots the verifier knows are offered"
+        );
+    }
+
+    /// An operator definition that names no `category` is skipped and
+    /// reported — the crate refuses to guess the bucket. The bot is
+    /// then not in the registry at all, so its traffic is never
+    /// recognised and it loses the rate-limit exemption.
+    #[test]
+    fn an_operator_bot_without_a_category_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("conf.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(
+            conf.join("uncategorised.yaml"),
+            "name: uncategorisedbot\nua: \"UncategorisedBot\"\nvendor: \"Example\"\nkind: AITraining\n",
+        )
+        .unwrap();
+        let v = Validator::with_root(dir.path()).unwrap();
+
+        let bots = registry(Some(&v));
+        assert!(
+            !bots.iter().any(|b| b.name == "uncategorisedbot"),
+            "a definition without a category never reaches the registry"
+        );
+        // The operator learns why, from the panel's config errors.
+        let errors = v.config_errors();
+        assert!(
+            errors.iter().any(|e| e.message.contains("category")),
+            "the missing category is reported: {errors:?}"
         );
     }
 
@@ -594,12 +649,57 @@ mod tests {
 
     /// Every category has a badge class — the admin UI colours the
     /// category the same way on the bot log and on the site's
-    /// bot-limited list. The crate's vocabulary is walked as a whole,
-    /// so a bucket it gains later is covered too.
+    /// bot-limited list.
+    ///
+    /// The five classes are pinned **exactly**: they are the UI's
+    /// look, and the `#[non_exhaustive]` fallback means a loose
+    /// assertion ("the class is not empty") could never fail. A
+    /// bucket the crate gains later is covered by the second half —
+    /// it has to fall into the neutral style, not into an arbitrary
+    /// one.
     #[test]
     fn every_category_has_a_badge_class() {
-        for cat in BotCategory::ALL {
-            assert!(!cat.class().is_empty(), "category {cat:?} → empty class");
+        for (category, class) in [
+            (
+                BotCategory::SearchEngine,
+                "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200",
+            ),
+            (
+                BotCategory::AiBot,
+                "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200",
+            ),
+            (
+                BotCategory::Social,
+                "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200",
+            ),
+            (
+                BotCategory::Monitoring,
+                "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200",
+            ),
+            (
+                BotCategory::AdsBot,
+                "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200",
+            ),
+        ] {
+            assert_eq!(category.class(), class, "category {category:?}");
+        }
+
+        // A bucket the crate gains later: the neutral style, and
+        // nothing else.
+        let known = [
+            "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200",
+            "bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-200",
+            "bg-pink-100 dark:bg-pink-900/30 text-pink-800 dark:text-pink-200",
+            "bg-amber-100 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200",
+            "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200",
+            NEUTRAL_CATEGORY_CLASS,
+        ];
+        for category in BotCategory::ALL {
+            assert!(
+                known.contains(&category.class()),
+                "category {category:?} has an unknown badge class: {:?}",
+                category.class()
+            );
         }
     }
 
@@ -610,13 +710,7 @@ mod tests {
     /// rows of the queries that filter on them.
     #[test]
     fn category_wire_labels_are_unchanged() {
-        for (category, label) in [
-            (BotCategory::SearchEngine, "search_engine"),
-            (BotCategory::AiBot, "ai_bot"),
-            (BotCategory::Social, "social"),
-            (BotCategory::Monitoring, "monitoring"),
-            (BotCategory::AdsBot, "ads_bot"),
-        ] {
+        for (category, label) in CATEGORY_LABELS {
             assert_eq!(category.as_str(), label);
             // The admin UI's `/logs/bots` page renders the category
             // through `{{ row.bot_category }}` — the label it shows is
@@ -626,10 +720,11 @@ mod tests {
         // Every label the crate publishes is one this host knows: a
         // bucket the crate gains is a label the JSONL rows start
         // carrying, so the host has to document it.
-        let known = ["search_engine", "ai_bot", "social", "monitoring", "ads_bot"];
         for category in BotCategory::ALL {
             assert!(
-                known.contains(&category.as_str()),
+                CATEGORY_LABELS
+                    .iter()
+                    .any(|(_, label)| *label == category.as_str()),
                 "the crate publishes a label this host does not document: {:?}",
                 category.as_str()
             );
