@@ -21,7 +21,9 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use crate::harness::{CapturedLog, NgxProcess, ngx_binary, spawn_with_log_capture};
+use crate::harness::{
+    CapturedLog, NgxProcess, ngx_binary, spawn_with_log_capture, terminate_child,
+};
 
 /// How long a test waits for the second gateway to bind the shared
 /// ports.
@@ -38,6 +40,12 @@ struct PeerGateway {
     child: Option<Child>,
     log: CapturedLog,
     log_tasks: Vec<JoinHandle<()>>,
+    // The peer's own working directory: it holds its **own**
+    // `pangolin.db`, so the two generations never write to the same
+    // SQLite file (the database is opened for writing, and
+    // `db::open` sets no busy timeout — a concurrent write from the
+    // other generation would fail with `SQLITE_BUSY`).
+    _work_dir: tempfile::TempDir,
 }
 
 impl PeerGateway {
@@ -53,9 +61,15 @@ impl PeerGateway {
             bin.display()
         );
 
+        // The peer's own working directory — and therefore its own
+        // database. The configuration file is shared (the same
+        // ports, the same certificates, the same log level), which is
+        // what the handover looks like; the state directory is not.
+        let work_dir = tempfile::TempDir::new().expect("tempdir for the peer gateway");
+
         let mut cmd = Command::new(&bin);
         cmd.arg("--config").arg(&first.config_path);
-        cmd.current_dir(first.work_dir());
+        cmd.current_dir(work_dir.path());
         // Info everywhere, debug for the proxy module only: the
         // per-request line is what tells the two generations apart,
         // and the debug noise of the background refreshes would keep
@@ -79,6 +93,7 @@ impl PeerGateway {
             child: Some(child),
             log,
             log_tasks,
+            _work_dir: work_dir,
         }
     }
 
@@ -112,25 +127,7 @@ impl PeerGateway {
 
 impl Drop for PeerGateway {
     fn drop(&mut self) {
-        for h in self.log_tasks.drain(..) {
-            h.abort();
-        }
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status();
-        }
-        for _ in 0..40 {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = child.start_kill();
+        terminate_child(&mut self.child, &mut self.log_tasks);
     }
 }
 

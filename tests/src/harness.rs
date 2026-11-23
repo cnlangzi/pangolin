@@ -987,41 +987,51 @@ impl Drop for NgxProcess {
         release_port(self.tunnel_port);
         release_port(self.admin_port);
 
-        // Abort the log-reader tasks first. They hold references to
-        // the child's stdout/stderr pipes, so if we let the runtime
-        // shut down with them still alive the test process hangs
-        // forever. The child is already being killed below, so
-        // aborting them is safe — any data not yet drained is lost,
-        // and a 1h CI hang is much worse than a missing log line.
-        for h in self.log_tasks.drain(..) {
-            h.abort();
-        }
-
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        // Best-effort graceful shutdown: SIGTERM, wait up to 2s, then
-        // SIGKILL. We shell out to `kill` for SIGTERM because
-        // `Child::kill` (and `start_kill`) only do SIGKILL.
-        if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status();
-        }
-        for _ in 0..40 {
-            if child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        // Drop runs on a sync stack — `child.kill().await` is not
-        // available here. `start_kill()` issues SIGKILL synchronously;
-        // the kernel reaps the child via the `try_wait` poll above on
-        // any future iteration, but on Drop we are at end-of-life so
-        // a brief unreaped zombie is acceptable.
-        let _ = child.start_kill();
+        terminate_child(&mut self.child, &mut self.log_tasks);
     }
+}
+
+/// Stop a child process and its log readers.
+///
+/// The sequence every child in this suite gets: SIGTERM, poll for up
+/// to 2s, then SIGKILL. It lives here so the two shutdown paths
+/// (the harness' own process and the peer gateway of the
+/// graceful-reload tests) cannot drift apart.
+pub fn terminate_child(child: &mut Option<Child>, log_tasks: &mut Vec<JoinHandle<()>>) {
+    // Abort the log-reader tasks first. They hold references to
+    // the child's stdout/stderr pipes, so if we let the runtime
+    // shut down with them still alive the test process hangs
+    // forever. The child is already being killed below, so
+    // aborting them is safe — any data not yet drained is lost,
+    // and a 1h CI hang is much worse than a missing log line.
+    for h in log_tasks.drain(..) {
+        h.abort();
+    }
+
+    let Some(mut child) = child.take() else {
+        return;
+    };
+    // Best-effort graceful shutdown: SIGTERM, wait up to 2s, then
+    // SIGKILL. We shell out to `kill` for SIGTERM because
+    // `Child::kill` (and `start_kill`) only do SIGKILL.
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    for _ in 0..40 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Drop runs on a sync stack — `child.kill().await` is not
+    // available here. `start_kill()` issues SIGKILL synchronously;
+    // the kernel reaps the child via the `try_wait` poll above on
+    // any future iteration, but on Drop we are at end-of-life so
+    // a brief unreaped zombie is acceptable.
+    let _ = child.start_kill();
 }
 
 /// RAII handle for a running `pangolin-tun` subprocess. On drop the
