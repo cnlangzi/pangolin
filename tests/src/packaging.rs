@@ -249,6 +249,14 @@ fn the_gateway_config_template_parses_with_the_real_parser() {
         config.log.referer.dir,
         PathBuf::from("/var/log/pangolin/referers")
     );
+    // The PID file (issue #233) has to live in the service's own
+    // directory: the derived path would sit next to the
+    // configuration in `/etc/pangolin/`, which the `pangolin` service
+    // user cannot write to.
+    assert_eq!(
+        config.pid.pid_file.as_deref(),
+        Some(Path::new("/var/lib/pangolin/pangolin-ngx.pid"))
+    );
 }
 
 /// The packaged tunnel configuration has to parse with the real parser

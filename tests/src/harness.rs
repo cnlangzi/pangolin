@@ -47,7 +47,7 @@ fn target_release() -> PathBuf {
         .join("release")
 }
 
-fn ngx_binary() -> PathBuf {
+pub fn ngx_binary() -> PathBuf {
     resolve_binary("pangolin-ngx", "ngx")
 }
 
@@ -629,14 +629,14 @@ pub fn seed_googlebot_registry(cache_root: &Path) {
 /// a running child process. The `Arc<Mutex<Vec<u8>>>` is shared
 /// between the reader tasks and the test thread that wants to
 /// dump it on failure.
-type CapturedLog = Arc<Mutex<Vec<u8>>>;
+pub type CapturedLog = Arc<Mutex<Vec<u8>>>;
 
 /// Capture child stdout+stderr into a shared `Vec<u8>` so failing tests
 /// can dump the binary's log output. Returns the `JoinHandle`s of the
 /// reader tasks so `NgxProcess::drop` can `abort()` them — otherwise
 /// they keep the tokio runtime alive after the test process tries to
 /// exit, and `cargo test` hangs indefinitely.
-fn spawn_with_log_capture(mut cmd: Command) -> (Child, CapturedLog, Vec<JoinHandle<()>>) {
+pub fn spawn_with_log_capture(mut cmd: Command) -> (Child, CapturedLog, Vec<JoinHandle<()>>) {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn child process");
     let log = Arc::new(Mutex::new(Vec::<u8>::new()));

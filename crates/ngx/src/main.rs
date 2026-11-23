@@ -20,9 +20,11 @@
 mod acme;
 mod api_service;
 mod badbots_feed;
+mod check;
 mod dns;
 mod provider_ip;
 mod proxy;
+mod reuseport;
 mod runtime;
 mod serve;
 mod sse;
@@ -45,6 +47,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use pingora::listeners::TcpSocketOptions;
 use pingora::proxy::http_proxy_service;
 use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
@@ -53,6 +56,13 @@ use pangolin_core::config::Config;
 use tokio_util::sync::CancellationToken;
 
 // ---- CLI entry point ----
+
+/// Where the gateway's database lives.
+///
+/// Relative to the working directory, exactly as it has always been:
+/// the packaged service runs with `/var/lib/pangolin` as its working
+/// directory, the Ansible deployment with `/usr/local/pangolin`.
+pub(crate) const DB_PATH: &str = "pangolin.db";
 
 #[derive(Parser, Debug)]
 #[command(name = "ngx")]
@@ -66,6 +76,21 @@ struct Args {
     /// Path to config file (default: ./ngx.yml)
     #[arg(short, long, default_value = "ngx.yml")]
     config: PathBuf,
+
+    /// Check the configuration and exit, without serving anything.
+    ///
+    /// The check parses the configuration, opens the database,
+    /// verifies the cert dir and builds the SNI callback — the steps
+    /// a real start goes through — and then stops. It binds no port,
+    /// starts no service, installs no signal handler and writes no
+    /// PID file.
+    ///
+    /// It is **not** a read-only operation: it applies the pending
+    /// database migrations and reconciles the certificates on disk
+    /// into the `certs` table, exactly as a real start would. The
+    /// point is that the check and the start follow the same path.
+    #[arg(long)]
+    check: bool,
 }
 
 // DNS providers in v2 are stored in the `dns_providers` SQLite table and
@@ -96,18 +121,42 @@ fn main() -> anyhow::Result<()> {
     // `log` crate's no-op logger — the operator would never learn
     // which key is gone.
     // (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
-    let config = pangolin_core::load_config_and_init_logger(&args.config)
-        .map_err(|e| anyhow::anyhow!("config error: {}", e))?;
+    //
+    // `--check` is the exception: it deliberately does **not** install
+    // the logger, so that a successful check says nothing at all.
+    let config = if args.check {
+        pangolin_core::config::Config::from_file(&args.config)
+            .map_err(|e| anyhow::anyhow!("config error: {}", e))?
+    } else {
+        pangolin_core::load_config_and_init_logger(&args.config)
+            .map_err(|e| anyhow::anyhow!("config error: {}", e))?
+    };
 
-    let db_path = PathBuf::from("pangolin.db");
-    let cert_manager = CertManager::new(
-        PathBuf::from(&config.acme.cert_dir),
-        config.acme.email.clone(),
-        config.acme.acme_directory.clone(),
-        config.acme.renew_threshold_days,
-        config.acme.renew_check_interval_hours,
-        config.acme.key_type.clone(),
-    );
+    // The offline check (issue #233): it runs the validation steps of
+    // the real startup and stops before anything is bound.
+    if args.check {
+        return crate::check::run_check(config);
+    }
+
+    // The PID file (issue #233). It is written **before** any listener
+    // is bound: the file says "this process intends to serve", not
+    // "the ports are up". The guard removes it when the process
+    // exits — a `SIGKILL` leaves it behind, and the next start
+    // truncates it.
+    let pid_file = config.resolved_pid_file(&args.config);
+    let _pid_guard = match pangolin_core::pidfile::write(&pid_file) {
+        Ok(()) => Some(pangolin_core::pidfile::PidFileGuard::new(pid_file.clone())),
+        Err(e) => {
+            // The PID file is not a precondition for serving: the
+            // gateway has to come up even when the operator cannot
+            // write the file.
+            log::error!("could not write the pid file {}: {e}", pid_file.display());
+            None
+        }
+    };
+
+    let db_path = PathBuf::from(DB_PATH);
+    let cert_manager = cert_manager(&config);
     let app = Arc::new(pangolin_core::App::new(
         &db_path,
         config.clone(),
@@ -282,6 +331,22 @@ fn main() -> anyhow::Result<()> {
     host_result
 }
 
+/// The certificate manager the gateway runs with.
+///
+/// One place owns the construction: the real startup and the offline
+/// check (`--check`) have to agree on it, or the check would validate
+/// a different setup than the one that ends up serving.
+pub(crate) fn cert_manager(config: &Config) -> CertManager {
+    CertManager::new(
+        PathBuf::from(&config.acme.cert_dir),
+        config.acme.email.clone(),
+        config.acme.acme_directory.clone(),
+        config.acme.renew_threshold_days,
+        config.acme.renew_check_interval_hours,
+        config.acme.key_type.clone(),
+    )
+}
+
 /// Build the pingora `Server`, add the proxy + admin services, and
 /// run it with a `TokenShutdownSignalWatch` so a single shared
 /// shutdown token drives the whole process.
@@ -307,9 +372,20 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         sessions: Arc::new(::admin::state::SessionStore::default()),
     };
 
+    // The socket options every listener of the gateway shares.
+    //
+    // Every listener asks for `SO_REUSEPORT` (issue #233): two
+    // generations of the gateway have to be able to hold the same port
+    // at the same time, so that the outgoing one can drain while the
+    // incoming one already serves. The kernel spreads the connections
+    // over the sockets of the group by the hash of each connection's
+    // 4-tuple.
+    let mut sock_opt = TcpSocketOptions::default();
+    sock_opt.so_reuseport = Some(true);
+
     // HTTP proxy service (domain-routed).
     let mut proxy_service = http_proxy_service(&conf, app_proxy);
-    proxy_service.add_tcp(&config.addr.http);
+    proxy_service.add_tcp_with_settings(&config.addr.http, sock_opt.clone());
     if config.addr.https != ":0" && !config.addr.https.is_empty() {
         // v2: SNI callback that loads per-host cert blobs on demand from
         // config.acme.cert_dir. The previous static-blob path with
@@ -330,7 +406,11 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
         // consults.
         let cert_dir = std::path::PathBuf::from(&app.config.acme.cert_dir);
         let tls_settings = crate::tls::build_sni_settings(cert_dir.clone(), app.clone())?;
-        proxy_service.add_tls_with_settings(&config.addr.https, None, tls_settings);
+        proxy_service.add_tls_with_settings(
+            &config.addr.https,
+            Some(sock_opt.clone()),
+            tls_settings,
+        );
         log::info!(
             "TLS enabled (SNI, dynamic ALPN) on {} (cert_dir: {}, enable_h2: {})",
             config.addr.https,
@@ -346,7 +426,7 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     // over a long-lived connection (ServeHttp materialises the
     // whole body before returning, which would defeat SSE).
     let mut http_server = Service::new("pangolin-http".to_string(), app_http);
-    http_server.add_tcp(&config.admin.addr);
+    http_server.add_tcp_with_settings(&config.admin.addr, sock_opt);
     server.add_service(http_server);
 
     // Drive pingora with our shared shutdown token.

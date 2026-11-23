@@ -42,7 +42,7 @@ pub async fn serve(
     state: Arc<ApiState>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind(addr)?;
     let local = listener.local_addr()?;
     log::info!("api: listening on {local}");
 
@@ -80,6 +80,47 @@ pub async fn serve(
         }
     }
     Ok(())
+}
+
+/// The backlog the API's listener uses.
+///
+/// The number tokio's `TcpListener::bind` uses — the behaviour this
+/// listener had before its socket moved into [`bind`].
+const LISTEN_BACKLOG: i32 = 1024;
+
+/// Bind the API's listener with `SO_REUSEPORT` set.
+///
+/// The option has to be set **before** the bind, so the socket is
+/// built here instead of by tokio's `bind`.
+///
+/// Why: two generations of the gateway have to be able to hold the
+/// same port at the same time (issue #233) — the kernel spreads the
+/// connections over the sockets of the group by the hash of each
+/// connection's 4-tuple, so the outgoing generation can drain while
+/// the incoming one already serves.
+///
+/// The gateway's own listeners do the same in `crates/ngx`; the API
+/// is a separate crate with its own listener (its own port, its own
+/// authentication), so it sets the option itself.
+fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // `SO_REUSEPORT` is a Unix option, and the `socket2` crate
+    // exposes it on the Unix platforms that have it. Windows has no
+    // equivalent that spreads the connections over the sockets of the
+    // group — its `SO_REUSEADDR` lets a second socket bind the
+    // address, but the kernel hands every connection to one of them.
+    // The handover this option is for is a Linux feature, so on the
+    // other platforms the listener stays a plain one.
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// Turn one HTTP request into one API request.

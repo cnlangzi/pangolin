@@ -207,6 +207,20 @@ tls:
                         # does a tunnel that is offline.
                         # See TlsConfig docs in crates/pangolin-core/src/config.rs.
 
+# ── PID file ─────────────────────────────────────────────────────────────
+# Where the gateway writes its process number (issue #233). The file
+# holds one decimal number and a newline, and it is the anchor for
+# the operator commands that address the gateway by its number.
+#
+# The section is commented out on purpose: without it the path is
+# derived from THIS file's own path (`ngx.yml` → `ngx.pid`), which is
+# what a development checkout wants. A packaged deployment has to
+# name an absolute path — its configuration lives in `/etc/pangolin/`,
+# which the service user cannot write to. See
+# packaging/config/ngx.yml.
+# pid:
+#   pid_file: /var/lib/pangolin/pangolin-ngx.pid
+
 log:
   level: debug          # env_logger filter: trace|debug|info|warn|error
   file: ""              # log file path; "" = stderr only

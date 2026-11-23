@@ -59,6 +59,11 @@ Cargo.lock.bak
 /pangolin.db-shm
 /pangolin.db-wal
 
+# The gateway's PID file (issue #233).  The path is derived from the
+# configuration file's own path, so a run from the repository root
+# leaves `ngx.pid` next to `ngx.yml`.
+/ngx.pid
+
 # Local log files. `make init-data` writes fixture JSONL under ./logs/bots;
 # the running process also keeps its bot cache here.
 /logs/

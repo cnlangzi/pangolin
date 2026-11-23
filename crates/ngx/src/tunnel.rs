@@ -46,7 +46,6 @@ use std::sync::Arc;
 
 use fastwebsockets::{Role as WsRole, WebSocket};
 use log::{debug, error, info, warn};
-use tokio::net::TcpListener;
 
 use pangolin_tun::{
     TUNNEL_PROTOCOL_VERSION, TUNNEL_VERSION_HEADER, TunnelRole, TunnelTransport, bearer_token,
@@ -100,8 +99,11 @@ pub async fn start_tunnel_server(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid tunnel server address {addr:?}: {e}"))?;
 
-    let listener = TcpListener::bind(addr)
-        .await
+    // The listener asks for `SO_REUSEPORT` (issue #233): the socket
+    // is built and bound here rather than by tokio's `bind`, because
+    // the option has to be set **before** the bind. See
+    // `crate::reuseport`.
+    let listener = crate::reuseport::bind_tcp(addr)
         .map_err(|e| anyhow::anyhow!("failed to bind tunnel server on {addr}: {e}"))?;
 
     info!("tunnel server listening on {}", addr);

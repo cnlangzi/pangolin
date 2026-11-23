@@ -7,6 +7,7 @@ pub mod badbots_feed;
 pub mod dns;
 pub mod provider_ip;
 pub mod proxy;
+pub mod reuseport;
 pub mod runtime;
 pub mod serve;
 pub mod sse;

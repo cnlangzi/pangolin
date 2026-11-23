@@ -38,6 +38,13 @@ admin:
   username: admin
   password: admin
 
+# The PID file the gateway writes its process number into.  It is
+# named explicitly because the derived path would sit next to this
+# file — `/etc/pangolin/`, which the `pangolin` service user cannot
+# write to.  `/var/lib/pangolin` is the service's own directory.
+pid:
+  pid_file: /var/lib/pangolin/pangolin-ngx.pid
+
 acme:
   email: ""
   cert_dir: /var/lib/pangolin/certs

@@ -221,3 +221,9 @@ mod admin_settings_e2e;
 
 #[cfg(feature = "integration")]
 mod provider;
+
+// The graceful-reload groundwork (issue #233): `SO_REUSEPORT` on
+// every listener, `pangolin-ngx --check` and the PID file.  These
+// drive the real binary, so they need the `integration` feature.
+#[cfg(feature = "integration")]
+mod graceful_reload;

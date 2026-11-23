@@ -88,6 +88,14 @@ pub struct Config {
     /// Front-CDN / provider settings (the background range fetch).
     #[serde(default)]
     pub provider: ProviderConfig,
+    /// Where the gateway writes its process number (issue #233).
+    ///
+    /// The PID file is the anchor for the operator commands that
+    /// address the process by its number — "is it alive?", "send it
+    /// a signal" — for the deployments that do not go through
+    /// systemd.
+    #[serde(default)]
+    pub pid: PidConfig,
 }
 
 /// HTTP / HTTPS listen addresses.
@@ -185,6 +193,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             log: LogConfig::default(),
             provider: ProviderConfig::default(),
+            pid: PidConfig::default(),
         }
     }
 }
@@ -381,6 +390,29 @@ impl Default for ProviderConfig {
             ip_refresh_interval_secs: default_ip_refresh_interval_secs(),
         }
     }
+}
+
+/// Where the gateway writes its process number (issue #233).
+///
+/// The PID file holds one decimal process number and a newline. It
+/// exists for the operator commands that address the gateway by its
+/// process number — "is it alive?", "which process is that?" — in
+/// the deployments that do not go through systemd.
+///
+/// The path is optional: without it the path is derived from the
+/// configuration file's own path (see
+/// [`Config::resolved_pid_file`]). The packaged deployments name the
+/// path explicitly, because their configuration lives in a directory
+/// the service user cannot write to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PidConfig {
+    /// Where the PID file lives.
+    ///
+    /// `None` (default) → derived from the configuration file's own
+    /// path, exactly as the tun derives its pin file (`tun.yml` →
+    /// `tun.pins`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_file: Option<PathBuf>,
 }
 
 /// TLS listener tuning.
@@ -731,6 +763,46 @@ impl Config {
             .extract()
             .map_err(|e| PangolinError::Config(format!("config: {}", e)))
     }
+
+    /// Load the configuration from a YAML file.
+    ///
+    /// The environment layer (`NGX_*`) is applied on top of the file,
+    /// exactly as [`Config::from_str`] does — the only thing this
+    /// leaves out is the **process logger**, which
+    /// [`load_config_and_init_logger`] installs.
+    ///
+    /// The split exists for `pangolin-ngx --check` (issue #233): the
+    /// check has to parse the configuration, and it has to say
+    /// *nothing* when the configuration is fine. Installing the
+    /// logger would put the log lines of the check itself on the
+    /// operator's terminal.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
+        Self::from_str(&raw)
+    }
+
+    /// The PID file path derived from the configuration file's path.
+    ///
+    /// `ngx.yml` → `ngx.pid`, next to the configuration — the same
+    /// convention the tun uses for its pin file, so the operator
+    /// finds the two side files of a configuration next to it.
+    pub fn pid_file(config_path: &Path) -> PathBuf {
+        config_path.with_extension("pid")
+    }
+
+    /// The PID file this configuration actually uses.
+    ///
+    /// The configured `pid.pid_file` wins; without it the path is
+    /// derived from the configuration file's own path. The two shapes
+    /// have to stay distinguishable: a packaged deployment keeps its
+    /// configuration in `/etc/pangolin/`, which the service user
+    /// cannot write to, so it has to name a writable path explicitly.
+    pub fn resolved_pid_file(&self, config_path: &Path) -> PathBuf {
+        self.pid
+            .pid_file
+            .clone()
+            .unwrap_or_else(|| Self::pid_file(config_path))
+    }
 }
 
 /// Load the configuration from a file and install the process logger.
@@ -885,6 +957,14 @@ mod tests {
             assert_eq!(
                 c.log.referer.dir,
                 PathBuf::from("/var/log/pangolin/referers")
+            );
+            // The PID file (issue #233) is named explicitly: the
+            // derived path would sit next to this file in
+            // `/etc/pangolin/`, which the service user cannot write
+            // to.
+            assert_eq!(
+                c.pid.pid_file.as_deref(),
+                Some(Path::new("/var/lib/pangolin/pangolin-ngx.pid"))
             );
             Ok(())
         });
@@ -1047,11 +1127,29 @@ mod tests {
             );
         }
 
+        // The PID file ships as a commented-out example too (issue
+        // #233): without the key the path is derived from the
+        // configuration file's own path, which is what a development
+        // checkout wants — a live key would point a packaged
+        // deployment at a directory the service user cannot write to.
+        assert!(
+            shipped.lines().any(|line| {
+                let line = line.trim_start().trim_start_matches('#').trim_start();
+                line.starts_with("pid_file:")
+            }),
+            "ngx.yml must mention `pid_file:` as a commented-out example — the gateway \
+             implements it, so an operator who reads only the shipped file has to learn \
+             that it exists"
+        );
+
         let c = shipped_ngx();
         // The ACME hooks are unset in the shipped file.
         assert!(c.acme.pre_renew.is_none());
         assert!(c.acme.post_renew.is_none());
         assert!(c.acme.deploy.is_none());
+
+        // The PID file is derived in the shipped file.
+        assert_eq!(c.pid.pid_file, None);
 
         // The knownbots cache root and its refresh cadence.
         assert_eq!(c.log.bot.cache_dir, PathBuf::from("./logs/bots/cache"));
@@ -1419,5 +1517,70 @@ acme:
             c.acme.acme_directory, "https://acme-v02.api.letsencrypt.org/directory",
             "acme.acme_directory from yml should be honored"
         );
+    }
+
+    /// A configuration that carries no `[pid]` section parses exactly
+    /// as it did before the section existed (issue #233).
+    ///
+    /// The section is optional, so an `ngx.yml` written for an older
+    /// gateway must keep working — the only thing that changes is
+    /// where the PID file lands.
+    #[test]
+    fn a_config_without_a_pid_section_parses_unchanged() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("addr:\n  http: \"0.0.0.0:8000\"\n")
+                .expect("a config without a [pid] section must parse");
+            assert_eq!(c.pid.pid_file, None);
+            // The rest of the configuration is untouched.
+            assert_eq!(c.addr.http, "0.0.0.0:8000");
+            assert_eq!(c.addr.https, "0.0.0.0:8443");
+            Ok(())
+        });
+    }
+
+    /// Without an explicit path the PID file is derived from the
+    /// configuration file's own path (issue #233).
+    ///
+    /// `./ngx.yml` → `./ngx.pid`: the same convention the tun uses
+    /// for its pin file, so the operator finds the side files of a
+    /// configuration next to it.
+    #[test]
+    fn the_pid_file_is_derived_from_the_config_path() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").expect("an empty config must parse");
+            assert_eq!(
+                c.resolved_pid_file(Path::new("./ngx.yml")),
+                PathBuf::from("./ngx.pid")
+            );
+            assert_eq!(
+                c.resolved_pid_file(Path::new("/etc/pangolin/ngx.yml")),
+                PathBuf::from("/etc/pangolin/ngx.pid")
+            );
+            Ok(())
+        });
+    }
+
+    /// An explicit `pid.pid_file` wins over the derived path.
+    ///
+    /// The packaged deployments need it: their configuration lives in
+    /// `/etc/pangolin/`, which the service user cannot write to.
+    #[test]
+    fn an_explicit_pid_file_wins_over_the_derived_path() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("pid:\n  pid_file: /var/lib/pangolin/pangolin-ngx.pid\n")
+                .expect("a config with a [pid] section must parse");
+            assert_eq!(
+                c.pid.pid_file.as_deref(),
+                Some(Path::new("/var/lib/pangolin/pangolin-ngx.pid"))
+            );
+            assert_eq!(
+                c.resolved_pid_file(Path::new("/etc/pangolin/ngx.yml")),
+                PathBuf::from("/var/lib/pangolin/pangolin-ngx.pid")
+            );
+            Ok(())
+        });
     }
 }

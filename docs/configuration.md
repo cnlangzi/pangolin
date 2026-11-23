@@ -19,6 +19,27 @@ working directory. The file must exist or startup fails with
 `config error: …` — there is **no fallback chain** and **no
 system-wide default location**.
 
+## Checking the configuration before a restart
+
+`pangolin-ngx` takes a second flag, `--check`: it runs the
+validation steps of the real startup — parse the configuration, open
+the database, verify the cert dir, reconcile the certificates on
+disk, build the SNI callback — and then stops. It binds no port,
+starts no service and writes no PID file.
+
+```console
+$ pangolin-ngx --config /etc/pangolin/ngx.yml --check
+$ echo $?
+0
+```
+
+A successful check prints nothing at all; a failing one exits
+non-zero and names the problem on stderr. The check is **not**
+read-only: it opens the database (which applies the pending
+migrations) and reconciles the certificates on disk into the `certs`
+table, exactly as a real start would. See
+[design/graceful-reload.md](design/graceful-reload.md#pangolin-ngx---check).
+
 ## Environment variable override
 
 Both config files are loaded with `figment`, which means the YAML
@@ -360,6 +381,28 @@ published source-IP ranges.
 | Field                      | Type   | Default | Required | Notes |
 | -------------------------- | ------ | ------- | -------- | ----- |
 | `ip_refresh_interval_secs` | `u64`  | `3600`  | no       | How often the published source-IP ranges are refreshed. The fetch is conditional (`ETag` / `Last-Modified`), so a short interval costs one cheap request per provider URL. A failed fetch backs off (60 s → 1800 s) and never removes the stored ranges. |
+
+### `[pid]` — the PID file
+
+Where the gateway writes its process number. The file holds one
+decimal process number and a newline, and it is the anchor for the
+operator commands that address the gateway by its process number
+("is it alive?", "which process is that?") in the deployments that do
+not go through systemd.
+
+| Field      | Type            | Default | Required | Notes |
+| ---------- | --------------- | ------- | -------- | ----- |
+| `pid_file` | path (string)   | derived from the configuration file's path | no | Where the PID file lives. Without it the path is derived from the **configuration file's own path** — `./ngx.yml` → `./ngx.pid` — the same convention the tun uses for its pin file (`tun.yml` → `tun.pins`). The packaged deployments name the path explicitly, because their configuration lives in `/etc/pangolin/`, which the service user cannot write to, while `/var/lib/pangolin/` is theirs. |
+
+The gateway writes the file **after** it has read its configuration
+and **before** it binds any listener — the file says "this process
+intends to serve", not "the ports are up". A graceful exit removes
+it; a `SIGKILL` leaves it behind and the next start truncates it. A
+PID file that cannot be written is not a reason to refuse to start:
+the gateway logs the error and serves anyway.
+
+See [design/graceful-reload.md](design/graceful-reload.md) for the
+PID file's role in the handover the gateway is being prepared for.
 
 ### `system_config` table (DB) — provider + gateway headers
 
