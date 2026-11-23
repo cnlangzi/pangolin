@@ -620,7 +620,7 @@ pub fn seed_googlebot_registry(cache_root: &Path) {
     std::fs::create_dir_all(&conf_d).expect("mkdir conf.d");
     std::fs::write(
         conf_d.join("googlebot.yaml"),
-        "kind: SearchEngine\nname: googlebot\nvendor: \"Google\"\nua: \"Googlebot\"\ncustom:\n  - \"127.0.0.1/32\"\n",
+        "kind: SearchEngine\ncategory: search_engine\nname: googlebot\nvendor: \"Google\"\nua: \"Googlebot\"\ncustom:\n  - \"127.0.0.1/32\"\n",
     )
     .expect("write googlebot.yaml");
 }

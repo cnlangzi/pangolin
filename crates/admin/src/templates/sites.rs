@@ -12,7 +12,11 @@ use std::collections::BTreeSet;
 use askama::Template;
 
 use crate::i18n::Lang;
-use pangolin_core::bot::BotInfo;
+// `BotCategoryStyle` carries the badge class of a category. The type
+// belongs to the `knownbots` crate, so the class cannot be an inherent
+// method — and the template's `{{ bot.category.class() }}` needs the
+// trait in scope here, in the module the generated code lives in.
+use pangolin_core::bot::{BotCategoryStyle, BotInfo};
 use pangolin_core::ratelimit::RateLimitPolicy;
 use pangolin_core::types::{Site, Tun};
 

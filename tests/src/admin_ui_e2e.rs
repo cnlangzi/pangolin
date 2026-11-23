@@ -4151,7 +4151,7 @@ async fn a_throttled_known_bot_shows_up_in_the_tables_with_its_name() {
         std::fs::create_dir_all(&conf_d).expect("mkdir the bot conf.d");
         std::fs::write(
             conf_d.join("testbot.yaml"),
-            "kind: SearchEngine\nname: testbot\nvendor: \"Test\"\nua: \"Testbot\"\n\
+            "kind: SearchEngine\ncategory: search_engine\nname: testbot\nvendor: \"Test\"\nua: \"Testbot\"\n\
              custom:\n  - \"127.0.0.1/32\"\n",
         )
         .expect("write the bot config");

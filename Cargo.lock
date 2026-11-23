@@ -2133,9 +2133,9 @@ dependencies = [
 
 [[package]]
 name = "knownbots"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e12496a640648418238b967277e857dc6010046ddb76793f6aed452ad109be2"
+checksum = "8116fcb36a8a50d9cf04beabe9b809bccdfc736b7c33cfa5cd3c85e56c8d9072"
 dependencies = [
  "dns-lookup",
  "ipnet",

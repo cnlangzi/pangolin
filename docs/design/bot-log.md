@@ -58,7 +58,7 @@ JSONL happens in `BotLogWriter::run`.
 
 ### `knownbots` (external crate)
 
-The published `knownbots` crate (crates.io 0.3.0, developed in
+The published `knownbots` crate (crates.io 0.4.0, developed in
 [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)) —
 a Rust port of the knownbots verification model. The model itself — what
 "verified" means, what is *not* logged, the bot configuration contract, and
@@ -88,9 +88,14 @@ the difference to the upstream Go library — is documented in
 ### `crates/pangolin-core/src/bot.rs`
 
 Thin adapter: `verify_bot` → `Option<BotIdentity>` only when verified.
-`BotCategory` wire labels unchanged (`search_engine`, `ai_bot`, …); the
-mapping from the crate's `BotKind` to those five buckets lives here, in the
-consumer — the library carries no admin vocabulary.
+`BotCategory` is **the crate's** type: the crate owns the vocabulary of the
+coarse buckets and the mapping of a crawler into one, so the wire labels
+(`search_engine`, `ai_bot`, …) are the crate's and unchanged — this
+repository keeps no second copy of them (issue #230).
+What stays here is the **badge**: `BotCategoryStyle` is an extension trait
+(the category type belongs to the crate, so it cannot carry an inherent
+method) that maps a category to its Tailwind classes, with a neutral
+fallback for a bucket the crate gains later.
 `verification_health()` maps the validator's state onto plain data
 (`BotVerificationHealth`) for the admin crate, which does not depend on
 `knownbots`. `BotVerificationHealth::not_ready_count()` is the count the
@@ -565,9 +570,9 @@ duckdb -c "
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |
 | Unit | `knownbots::model::registry::tests::*` (in the crate's own repository, issue #136) | A malformed operator override is skipped + reported (path + reason) and the rest of the registry still loads; a malformed **or incomplete** **embedded** config stays fatal, and every shipped embedded config is complete; `refresh_status()` derives `Ready` / `Cold` / `Failed`; `rdns_overflow()` counts the dropped reverse-DNS lookups |
-| Unit | `knownbots::model::registry::tests::embedded_bot_configs_satisfy_the_contract` (in the crate's own repository, issue #137) | The embedded bot configs satisfy the six-rule contract — unique + non-empty `name`, non-empty `ua`, a known parser for every URL-backed bot, a usable domain list for every RDNS bot, valid `custom:` CIDRs, and every `conf.d/` file compiled into `EMBEDDED_CONFIGS`. Offline; reports every violation in one message. `domain_usability_mirrors_the_ptr_comparison` pins the domain check against the PTR comparison it stands in for. See [`knownbots.md`](./knownbots.md) |
-| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None`; a failed bot with a loaded prefix set still verifies and the panel row says how many prefixes are still in use; the `BotKind` → bucket mapping covers every kind, the `adsbot` / `mediapartners` monitors land in `ads_bot`, and the five wire labels are unchanged (issue #146); `not_ready_count()` counts the cold and the failed bots, ignores the ready ones and the config errors, equals `problem_bots().len()`, and still counts a failed bot that holds its cached prefix set (issue #158) |
-| Unit | `pangolin_integration_tests::knownbots_dependency` (issue #146) | The in-tree copy of the crate is gone and is not a workspace member; `pangolin-core` depends on the published crate from the registry (not a path), with the `full` feature enabled; the lockfile resolves `knownbots 0.3.0` from crates.io |
+| Unit | `knownbots::model::registry::tests::embedded_bot_configs_satisfy_the_contract` (in the crate's own repository, issue #137) | The embedded bot configs satisfy the seven-rule contract — unique + non-empty `name`, non-empty `ua`, a known parser for every URL-backed bot, a usable domain list for every RDNS bot, valid `custom:` CIDRs, every `conf.d/` file compiled into `EMBEDDED_CONFIGS`, and a `category` every definition states and its `kind` allows. Offline; reports every violation in one message. `domain_usability_mirrors_the_ptr_comparison` pins the domain check against the PTR comparison it stands in for. See [`knownbots.md`](./knownbots.md) |
+| Unit | `pangolin_core::bot::tests::*` (issue #136) | `verification_health()` maps a seeded `RefreshFailure::Unreachable` to `Failed` + `Unreachable`, counts cold / ready bots, carries the config errors, and returns an empty (unavailable) health for `None`; a failed bot with a loaded prefix set still verifies and the panel row says how many prefixes are still in use; the five wire labels of the crate's vocabulary are unchanged and every one of them serializes to its snake_case label (issue #230); `not_ready_count()` counts the cold and the failed bots, ignores the ready ones and the config errors, equals `problem_bots().len()`, and still counts a failed bot that holds its cached prefix set (issue #158) |
+| Unit | `pangolin_integration_tests::knownbots_dependency` (issue #146) | The in-tree copy of the crate is gone and is not a workspace member; `pangolin-core` depends on the published crate from the registry (not a path), with the `full` feature enabled; the lockfile resolves `knownbots 0.4.0` from crates.io |
 | Unit | `admin::routes::logs::tests::*` (issue #136) | The `/logs/bots` page renders the verification panel with its three counts; a failed bot shows its kind + message; a config error shows its path + reason; a healthy bot is not listed; `All IP lists loaded` when nothing needs attention; the `RDNS lookups dropped` line only when the count is non-zero |
 | Unit | `admin::routes::logs::tests::*` (issue #158) | The panel header badges the bot address lists that are not ready — `data-not-ready="<count>"`, the count itself and the "may fail closed" tooltip; a failed bot that still holds its cached prefix set is counted too, and the row still reports the cached prefixes; the badge is absent when every list is loaded, when no verifier is attached, and when only an operator config file is broken |
 | Unit | `supervisor::tests::*` (issue #219) | A panicked task is restarted — the panic surfaces as a `JoinError` and the supervisor survives it; a task that always panics spends the budget after five restarts and leaves the side channel dead (`gave_up`), with the window's restart count published for the panel; a stable run resets the rolling window; a shutdown stops the supervisor from restarting; a clean exit is not restarted; an aborted supervisor takes the writer task with it |

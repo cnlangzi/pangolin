@@ -124,7 +124,13 @@ ipnet = "2"
 # no longer starve a crawler of its address list — 0.2.0 left the
 # address order to the system resolver, which hands back the AAAA
 # record first (upstream issue #57).
-knownbots = { version = "0.3.0", features = ["full"] }
+#
+# 0.4.0 (issue #230) owns the category vocabulary: the crate states the
+# coarse bucket of a crawler in its own definition and publishes the
+# `BotCategory` type with the wire labels. The labels are a published
+# contract, so the host consumes them instead of keeping a second copy
+# that could drift away from the one the JSONL rows carry.
+knownbots = { version = "0.4.0", features = ["full"] }
 
 # IP reputation (issue #141). The `full` feature compiles in every
 # provider the crate ships: the five list publishers (Spamhaus,

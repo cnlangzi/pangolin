@@ -10,9 +10,17 @@
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
+use knownbots::{Validator, VerifyResult, VerifyStatus};
 
-use knownbots::{BotKind, Validator, VerifyResult, VerifyStatus};
+/// The coarse bucket of a bot — **the crate's** vocabulary.
+///
+/// The `knownbots` crate states the bucket of a crawler in its own
+/// definition and publishes the type together with the wire labels a
+/// host persists. A second copy of the enum here would be a second
+/// source of truth for a value the JSONL rows carry: the two would
+/// drift, and a drifted label makes the downstream queries filter on a
+/// value that is no longer written (issue #230).
+pub use knownbots::BotCategory;
 
 /// Identity of a verified bot, ready for the JSONL / SSE / stats sinks.
 ///
@@ -30,49 +38,24 @@ pub struct BotIdentity {
     pub category: BotCategory,
 }
 
-/// Coarse classification of a bot. SEO dashboards group SearchEngine
-/// vs AI vs Social etc. so operators can answer "how much of our
-/// crawl budget is being consumed by AI scrapers?" at a glance.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BotCategory {
-    /// Traditional web search crawlers (Googlebot, Baiduspider, …).
-    SearchEngine,
-    /// AI model trainers / inference scrapers (GPTBot, ClaudeBot, …).
-    AiBot,
-    /// Link-preview unfurlers for messaging / social platforms
-    /// (facebookexternalhit, TelegramBot, …).
-    Social,
-    /// Site-monitoring / uptime probes (UptimeRobot, Pingdom, …).
-    Monitoring,
-    /// Ad-quality crawlers (AdsBot-Google, Mediapartners-Google, …).
-    AdsBot,
-}
-
-impl std::fmt::Display for BotCategory {
-    /// Human-readable label matching the serde snake_case wire
-    /// format (`search_engine`, `ai_bot`, `social`, `monitoring`,
-    /// `ads_bot`). The admin UI's `/logs/bots` page uses this
-    /// via Askama's `{{ row.bot_category }}` interpolation.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            BotCategory::SearchEngine => "search_engine",
-            BotCategory::AiBot => "ai_bot",
-            BotCategory::Social => "social",
-            BotCategory::Monitoring => "monitoring",
-            BotCategory::AdsBot => "ads_bot",
-        };
-        f.write_str(s)
-    }
-}
-
-impl BotCategory {
+/// The Tailwind class token of a category's badge.
+///
+/// The **badge** is pangolin's vocabulary, the **bucket** is the
+/// crate's — and a type the crate owns cannot carry an inherent
+/// method, so the mapping is an extension trait. `BotCategory` is
+/// `#[non_exhaustive]`: a bucket the crate adds later falls into the
+/// neutral style instead of breaking the build.
+pub trait BotCategoryStyle {
     /// The Tailwind class token of the category badge.
     ///
     /// The admin UI colours a bot's category the same way everywhere:
     /// the badge on the bot-log rows, the badge on the site's
     /// bot-limited list. One mapping, so the two never drift.
-    pub fn class(&self) -> &'static str {
+    fn class(&self) -> &'static str;
+}
+
+impl BotCategoryStyle for BotCategory {
+    fn class(&self) -> &'static str {
         match self {
             BotCategory::SearchEngine => {
                 "bg-blue-100 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
@@ -89,40 +72,11 @@ impl BotCategory {
             BotCategory::AdsBot => {
                 "bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200"
             }
+            // A bucket the crate gains later: the neutral badge, the
+            // same one the live-tail page's `categoryClass()` uses for
+            // a label it does not know.
+            _ => "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300",
         }
-    }
-}
-
-/// The admin-facing bucket of a registry entry.
-///
-/// The library classifies a bot by [`BotKind`]; the admin UI needs
-/// five coarser buckets, and the `adsbot` / `mediapartners` names are
-/// pangolin's own filter vocabulary — so the mapping lives here, in
-/// the consumer, and not in the library.
-///
-/// The rule is inherited **verbatim** from the `BotKind::to_category_label`
-/// of the library method this replaces, down to the substring match.
-/// Narrowing it (an exact set, or a `starts_with`) would silently move
-/// bots between buckets and change the JSONL `bot_category` of the rows
-/// that follow — so it is a migration, not a cleanup. Today's registry
-/// holds seven `Monitor` bots, of which exactly `adsbot`,
-/// `adsbot-mobile` and `mediapartners-google` carry the substring.
-fn category_for(kind: BotKind, bot_name: &str) -> BotCategory {
-    match kind {
-        BotKind::SearchEngine | BotKind::SEO => BotCategory::SearchEngine,
-        BotKind::AITraining | BotKind::AIAssist | BotKind::AIMixed => BotCategory::AiBot,
-        BotKind::SocialMedia => BotCategory::Social,
-        BotKind::Monitor => {
-            // Ad-quality monitors (`adsbot*`, `mediapartners*`) land in
-            // `ads_bot` so the existing admin filter keeps working;
-            // every other monitor is `monitoring`.
-            if bot_name.contains("ads") || bot_name.contains("mediapartners") {
-                BotCategory::AdsBot
-            } else {
-                BotCategory::Monitoring
-            }
-        }
-        BotKind::Security | BotKind::Scraper | BotKind::Unknown => BotCategory::Monitoring,
     }
 }
 
@@ -132,7 +86,12 @@ impl BotIdentity {
         Self {
             name: r.name.clone(),
             vendor: r.vendor.clone(),
-            category: category_for(r.kind, &r.name),
+            // The crate states the bucket of a crawler in its own
+            // definition and fills it for every verified result. The
+            // fallback keeps the constructor total for a result the
+            // caller did not check — `monitoring` is the bucket the
+            // crate gives a crawler whose kind it cannot place.
+            category: r.category.unwrap_or(BotCategory::Monitoring),
         }
     }
 }
@@ -195,7 +154,7 @@ fn bot_info(bot: &knownbots::Bot) -> BotInfo {
     BotInfo {
         name: bot.name.clone(),
         vendor: bot.vendor.clone(),
-        category: category_for(bot.kind, &bot.name),
+        category: bot.category,
     }
 }
 
@@ -417,7 +376,7 @@ pub fn verification_health(verifier: Option<&Validator>) -> BotVerificationHealt
         .refresh_status()
         .into_iter()
         .map(|s| {
-            let category = category_for(s.kind, &s.name);
+            let category = s.category;
             let (error_kind, error_message) = match &s.error {
                 Some(knownbots::RefreshFailure::Unreachable(m)) => {
                     (Some(BotRefreshErrorKind::Unreachable), Some(m.clone()))
@@ -529,20 +488,24 @@ mod tests {
         assert_eq!(ident.category, BotCategory::Social);
     }
 
+    /// The serde form of a category is the JSONL `bot_category` — the
+    /// key the downstream `jq` / DuckDB queries filter on. Every label
+    /// of the crate's vocabulary is pinned byte for byte, so a change
+    /// of the vocabulary cannot silently move the rows of a query.
     #[test]
     fn bot_category_serializes_as_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&BotCategory::SearchEngine).unwrap(),
-            "\"search_engine\""
-        );
-        assert_eq!(
-            serde_json::to_string(&BotCategory::AiBot).unwrap(),
-            "\"ai_bot\""
-        );
-        assert_eq!(
-            serde_json::to_string(&BotCategory::AdsBot).unwrap(),
-            "\"ads_bot\""
-        );
+        for (category, label) in [
+            (BotCategory::SearchEngine, "search_engine"),
+            (BotCategory::AiBot, "ai_bot"),
+            (BotCategory::Social, "social"),
+            (BotCategory::Monitoring, "monitoring"),
+            (BotCategory::AdsBot, "ads_bot"),
+        ] {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{label}\""));
+            // And it must NOT contain the Rust debug repr.
+            assert!(!json.contains("SearchEngine"), "{json}");
+        }
     }
 
     /// A request whose `User-Agent` carries the token the vendor
@@ -598,9 +561,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("conf.d");
         std::fs::create_dir_all(&conf).unwrap();
+        // The crate requires a `category` in every definition — a
+        // document without one is skipped and reported.
         std::fs::write(
             conf.join("custombot.yaml"),
-            "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\nkind: AITraining\n",
+            "name: custombot\nua: \"CustomBot\"\nvendor: \"Example\"\nkind: AITraining\ncategory: ai_bot\n",
         )
         .unwrap();
         let v = Validator::with_root(dir.path()).unwrap();
@@ -629,92 +594,20 @@ mod tests {
 
     /// Every category has a badge class — the admin UI colours the
     /// category the same way on the bot log and on the site's
-    /// bot-limited list.
+    /// bot-limited list. The crate's vocabulary is walked as a whole,
+    /// so a bucket it gains later is covered too.
     #[test]
     fn every_category_has_a_badge_class() {
-        for cat in [
-            BotCategory::SearchEngine,
-            BotCategory::AiBot,
-            BotCategory::Social,
-            BotCategory::Monitoring,
-            BotCategory::AdsBot,
-        ] {
+        for cat in BotCategory::ALL {
             assert!(!cat.class().is_empty(), "category {cat:?} → empty class");
         }
     }
 
-    /// The bucket of a registry entry is pangolin's own mapping from
-    /// the library's `BotKind` — the admin filters and the JSONL
-    /// `bot_category` depend on it, so every kind is pinned here.
-    #[test]
-    fn category_mapping_covers_every_bot_kind() {
-        assert_eq!(
-            category_for(BotKind::SearchEngine, "googlebot"),
-            BotCategory::SearchEngine
-        );
-        assert_eq!(
-            category_for(BotKind::SEO, "semrushbot"),
-            BotCategory::SearchEngine
-        );
-        assert_eq!(
-            category_for(BotKind::AITraining, "gptbot"),
-            BotCategory::AiBot
-        );
-        assert_eq!(
-            category_for(BotKind::AIAssist, "chatgpt-user"),
-            BotCategory::AiBot
-        );
-        assert_eq!(
-            category_for(BotKind::AIMixed, "perplexitybot"),
-            BotCategory::AiBot
-        );
-        assert_eq!(
-            category_for(BotKind::SocialMedia, "twitterbot"),
-            BotCategory::Social
-        );
-        assert_eq!(
-            category_for(BotKind::Monitor, "uptimerobot"),
-            BotCategory::Monitoring
-        );
-        assert_eq!(
-            category_for(BotKind::Security, "someguard"),
-            BotCategory::Monitoring
-        );
-        assert_eq!(
-            category_for(BotKind::Scraper, "somescraper"),
-            BotCategory::Monitoring
-        );
-        assert_eq!(
-            category_for(BotKind::Unknown, "somebot"),
-            BotCategory::Monitoring
-        );
-    }
-
-    /// Ad-quality monitors land in `ads_bot`; every other monitor is
-    /// `monitoring`. The names are pangolin's filter vocabulary, so
-    /// they are matched on the name and not on the kind.
-    #[test]
-    fn ads_and_mediapartners_monitors_are_the_ads_bucket() {
-        assert_eq!(
-            category_for(BotKind::Monitor, "adsbot"),
-            BotCategory::AdsBot
-        );
-        assert_eq!(
-            category_for(BotKind::Monitor, "adsbot-mobile"),
-            BotCategory::AdsBot
-        );
-        assert_eq!(
-            category_for(BotKind::Monitor, "mediapartners-google"),
-            BotCategory::AdsBot
-        );
-        assert_eq!(
-            category_for(BotKind::Monitor, "pingdom"),
-            BotCategory::Monitoring
-        );
-    }
-
     /// The wire labels of the buckets are the JSONL `bot_category` of
-    /// every row — they must not drift.
+    /// every row — they must not drift. The vocabulary belongs to the
+    /// crate; this pins the labels **as this host persists them**, so
+    /// a change of the crate's vocabulary cannot silently move the
+    /// rows of the queries that filter on them.
     #[test]
     fn category_wire_labels_are_unchanged() {
         for (category, label) in [
@@ -724,7 +617,22 @@ mod tests {
             (BotCategory::Monitoring, "monitoring"),
             (BotCategory::AdsBot, "ads_bot"),
         ] {
+            assert_eq!(category.as_str(), label);
+            // The admin UI's `/logs/bots` page renders the category
+            // through `{{ row.bot_category }}` — the label it shows is
+            // this one.
             assert_eq!(category.to_string(), label);
+        }
+        // Every label the crate publishes is one this host knows: a
+        // bucket the crate gains is a label the JSONL rows start
+        // carrying, so the host has to document it.
+        let known = ["search_engine", "ai_bot", "social", "monitoring", "ads_bot"];
+        for category in BotCategory::ALL {
+            assert!(
+                known.contains(&category.as_str()),
+                "the crate publishes a label this host does not document: {:?}",
+                category.as_str()
+            );
         }
     }
 

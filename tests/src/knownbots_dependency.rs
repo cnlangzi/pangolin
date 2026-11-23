@@ -5,15 +5,19 @@
 //! `knownbots` on crates.io, consumed from the registry, and the
 //! in-tree copy is gone.
 //!
-//! The locked version is 0.3.0 (issue #157): the first release whose
-//! transport repeats a refused download over the other address family
-//! and remembers the family that delivered the list.  0.2.0 leaves
-//! the address order to the system resolver, which hands back the AAAA
-//! record first — a tampered IPv6 path to a publisher then starves the
-//! crawler of its address list, and the crawler is throttled like an
-//! ordinary client.
+//! The locked version is 0.4.0 (issue #230): the release that owns the
+//! category vocabulary — the coarse buckets and their wire labels — so
+//! the host consumes the crate's `BotCategory` instead of keeping a
+//! second copy of the enum that could drift away from the labels the
+//! JSONL rows carry.  0.3.0 was the previous floor (issue #157): the
+//! first release whose transport repeats a refused download over the
+//! other address family and remembers the family that delivered the
+//! list.  0.2.0 leaves the address order to the system resolver, which
+//! hands back the AAAA record first — a tampered IPv6 path to a
+//! publisher then starves the crawler of its address list, and the
+//! crawler is throttled like an ordinary client.
 //!
-//! Two failure modes are worth a test, and neither of them shows up
+//! Three failure modes are worth a test, and none of them shows up
 //! as a compile error:
 //!
 //! 1. **The `full` feature is dropped.**  The crate's default feature
@@ -25,6 +29,9 @@
 //!    member, a stray directory).  Two copies of the same registry
 //!    drift, and the whole point of publishing the crate is that there
 //!    is one source of truth.
+//! 3. **The host grows a second category vocabulary.**  A local
+//!    `enum BotCategory` beside the crate's is two sources of truth
+//!    for the wire labels the JSONL rows carry, and the two drift.
 //!
 //! The tests are deliberately cheap and hermetic — they parse the
 //! manifests and the lockfile.  No network, no binaries — so they run
@@ -88,8 +95,8 @@ fn pangolin_core_depends_on_the_published_crate() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
     assert!(
-        version.starts_with("0.3"),
-        "the {CRATE} dependency must ask for the 0.3 line, got {version:?}"
+        version.starts_with("0.4"),
+        "the {CRATE} dependency must ask for the 0.4 line, got {version:?}"
     );
 
     // The consumer inherits it — it does not declare its own.
@@ -151,8 +158,8 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
     );
     assert_eq!(
         entry.get("version").and_then(|v| v.as_str()),
-        Some("0.3.0"),
-        "the locked {CRATE} must be the published 0.3.0"
+        Some("0.4.0"),
+        "the locked {CRATE} must be the published 0.4.0"
     );
 
     let dependencies = entry
@@ -177,7 +184,7 @@ fn the_lockfile_resolves_knownbots_from_the_registry() {
 /// name cargo resolves it to.
 #[test]
 fn the_published_crate_is_the_one_on_the_registry() {
-    // The checksum pins the exact artefact: a re-publish of 0.3.0
+    // The checksum pins the exact artefact: a re-publish of 0.4.0
     // under a different content would not resolve to the same
     // checksum, and cargo would refuse the lockfile.
     let packages = lock_packages();
@@ -187,29 +194,43 @@ fn the_published_crate_is_the_one_on_the_registry() {
         .and_then(|c| c.as_str())
         .unwrap_or_else(|| panic!("the registry entry of {CRATE} must carry a checksum"));
     assert_eq!(
-        checksum, "5e12496a640648418238b967277e857dc6010046ddb76793f6aed452ad109be2",
-        "the locked {CRATE} must be the published 0.3.0 artefact"
+        checksum, "8116fcb36a8a50d9cf04beabe9b809bccdfc736b7c33cfa5cd3c85e56c8d9072",
+        "the locked {CRATE} must be the published 0.4.0 artefact"
     );
 }
 
-/// The library must stay free of pangolin's admin vocabulary: the
-/// category mapping belongs to the adapter, not to the crate.
+/// The category vocabulary belongs to the crate: the adapter consumes
+/// the crate's `BotCategory` and keeps no second copy of the enum, of
+/// its `Display`, or of the mapping into the buckets.
+///
+/// A local copy is the failure this guards: it is a second source of
+/// truth for the wire labels the JSONL rows carry, and the two drift —
+/// a drifted label makes the downstream queries filter on a value that
+/// is no longer written.
 #[test]
-fn the_adapter_owns_the_category_mapping() {
+fn the_adapter_consumes_the_crate_category_vocabulary() {
     let adapter = repo_root().join("crates/pangolin-core/src/bot.rs");
     let source = std::fs::read_to_string(&adapter)
         .unwrap_or_else(|e| panic!("read {}: {e}", adapter.display()));
 
     assert!(
-        source.contains("fn category_for("),
-        "the category mapping must live in the adapter"
+        source.contains("pub use knownbots::BotCategory;"),
+        "the adapter must re-export the crate's category type"
     );
     assert!(
-        !source.contains("from_label"),
-        "the wire-label round-trip is gone — the mapping is derived from the BotKind"
+        !source.contains("enum BotCategory"),
+        "the adapter must not define a second category vocabulary"
+    );
+    assert!(
+        !source.contains("fn category_for("),
+        "the mapping into the buckets belongs to the crate"
+    );
+    assert!(
+        !source.contains("impl std::fmt::Display for BotCategory"),
+        "the wire label is the crate's — the adapter must not print its own"
     );
     assert!(
         !Path::new(&repo_root().join("crates/knownbots")).exists(),
-        "there is no in-tree copy left to carry the admin vocabulary"
+        "there is no in-tree copy left to carry the vocabulary"
     );
 }

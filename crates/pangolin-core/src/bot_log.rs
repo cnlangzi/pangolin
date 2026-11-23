@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::bot::{BotCategory, BotIdentity};
+use crate::bot::{BotCategory, BotCategoryStyle, BotIdentity};
 
 /// JSONL row for a single bot request.
 ///
@@ -1428,7 +1428,7 @@ const FIXTURE_CORE: &[FixtureHit] = &[
         client_ip: "160.79.104.1",
     },
     FixtureHit {
-        bot_name: "mediapartners-google",
+        bot_name: "adsbot",
         bot_vendor: "Google",
         category: BotCategory::AdsBot,
         host: "www.example.com",
@@ -2982,13 +2982,7 @@ mod tests {
             },
         )
         .unwrap();
-        for name in [
-            "googlebot",
-            "bingbot",
-            "gptbot",
-            "claudebot",
-            "mediapartners-google",
-        ] {
+        for name in ["googlebot", "bingbot", "gptbot", "claudebot", "adsbot"] {
             assert!(
                 www.bots.iter().any(|b| b.bot_name == name),
                 "missing bot {name}"

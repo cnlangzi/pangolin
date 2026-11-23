@@ -279,7 +279,7 @@ Shape of the `config` JSON per kind:
 | `bot.recent`           | `usize`  | `200`   | no       | Capacity of the in-memory ring buffer for `/logs/bots` late-join replay. Set to `0` to disable replay (the live SSE + JSONL still work). |
 | `bot.capacity`         | `usize`  | `1000`  | no       | Capacity of the dedicated `tokio::sync::broadcast` channel for bot entries. A lagged subscriber sees `: lagged N events` on `/api/logs/bots/stream`. |
 | `bot.dir`              | `path`   | `./logs/bots` | no | Output directory for `bot-YYYY-MM-DD.jsonl`. Created lazily on first write. Rotation is **daily at UTC 00:00**; no size-based rotation in v1 (the operator can `logrotate` / `find -mtime` for retention). |
-| `bot.cache_dir`        | `path`   | `./logs/bots/cache` | no | knownbots cache root: per-bot `ips.txt` (downloaded CIDRs) and `rdns.txt` (successful PTR results). A `conf.d/` sub-directory may hold extra bot YAMLs; one that cannot be parsed is **skipped and reported** on `/logs/bots` (the gateway still starts). |
+| `bot.cache_dir`        | `path`   | `./logs/bots/cache` | no | knownbots cache root: per-bot `ips.txt` (downloaded CIDRs) and `rdns.txt` (successful PTR results). A `conf.d/` sub-directory may hold extra bot YAMLs; each one states the crawler's `category` (`search_engine` / `ai_bot` / `social` / `monitoring` / `ads_bot`) — one that cannot be parsed, or that names no category, is **skipped and reported** on `/logs/bots` (the gateway still starts). |
 | `bot.refresh_interval_secs` | `u64` | `86400` | no | Seconds between successful official IP-list refreshes. On refresh failure the scheduler retries with exponential backoff (5s → 5min) instead of waiting a full interval. `0` still runs one startup refresh, then sleeps for a very long time. |
 | `referer.enabled`        | `bool`   | `true`  | no       | Master switch for the referer log side-channel. When `false` the gateway does not read the `Referer` header at all, no rows are recorded, no JSONL is written, and `/logs/referers*` says the feature is disabled. |
 | `referer.recent`         | `usize`  | `200`   | no       | Capacity of the in-memory ring buffer for `/logs/referers` late-join replay. Set to `0` to disable replay (the live SSE + JSONL still work). |
@@ -298,7 +298,7 @@ Shape of the `config` JSON per kind:
 
 > **Bot log side-channel.** Each request's `User-Agent` + client IP
 > is verified by the `knownbots` crate — an **external dependency**,
-> published to crates.io as `knownbots` 0.3.0 and developed in
+> published to crates.io as `knownbots` 0.4.0 and developed in
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust)
 > (it ships the embedded YAML configs for Googlebot / Bingbot / GPTBot /
 > ClaudeBot / facebookexternalhit / UptimeRobot / …). **Only verified**
