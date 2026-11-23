@@ -2627,6 +2627,7 @@ dependencies = [
  "ngx",
  "pangolin-core",
  "pangolin-tun",
+ "quinn",
  "rcgen",
  "reqwest",
  "rusqlite",

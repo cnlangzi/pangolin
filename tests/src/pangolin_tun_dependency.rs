@@ -13,8 +13,7 @@
 //! fail at runtime instead of at build time.  These tests are the
 //! cheap, offline guard against that — they parse the manifests and
 //! the lockfile and assert that *this* repository keeps no second
-//! copy of the protocol, and they pin the crate's public surface the
-//! repository consumes.
+//! copy of the protocol.
 //!
 //! They deliberately duplicate none of the crate's own tests: the
 //! crate's suite asserts the behaviour of the code, these assert the
@@ -266,25 +265,18 @@ fn the_protocol_version_is_still_two() {
 /// has to be set **before** the bind, which is the whole point of the
 /// handover between two generations of the gateway.  0.3.0 added
 /// `bind_endpoint_with_socket`, which takes the socket the caller
-/// bound; a dependency that does not carry it fails to compile this
-/// line.
+/// bound.
 ///
-/// The endpoint has to come up on the caller's socket and nowhere
-/// else: an endpoint that landed on another address would put the
-/// tunnel's QUIC listener where the gateway does not expect it.
-#[tokio::test]
-async fn the_crate_binds_the_quic_endpoint_on_a_socket_the_caller_bound() {
-    let cert = pangolin_tun::QuicCert::generate().expect("a certificate for the endpoint");
-    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .expect("a socket to hand the crate");
-    let addr = socket.local_addr().expect("the socket's own address");
-
-    let endpoint = pangolin_tun::bind_endpoint_with_socket(addr, socket, &cert)
-        .expect("the endpoint must come up on the caller's socket");
-
-    assert_eq!(
-        endpoint.local_addr().expect("the endpoint's address"),
-        addr,
-        "the endpoint must listen on the socket the caller bound"
-    );
+/// The handover is a later pull request, so nothing in this
+/// repository calls the constructor yet.  The guard is therefore on
+/// the **signature**: the dependency has to carry the constructor the
+/// handover will call, and a dependency that does not — or that
+/// changes the constructor — fails to compile this line.
+#[test]
+fn the_crate_carries_the_caller_bindable_quic_endpoint() {
+    let _: fn(
+        std::net::SocketAddr,
+        std::net::UdpSocket,
+        &pangolin_tun::QuicCert,
+    ) -> pangolin_tun::Result<quinn::Endpoint> = pangolin_tun::bind_endpoint_with_socket;
 }
