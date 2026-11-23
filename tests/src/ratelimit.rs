@@ -348,6 +348,64 @@ async fn limiter_counts_distinct_pages() {
 }
 
 #[tokio::test]
+async fn a_static_asset_is_not_counted_by_the_limiter() {
+    let dir = TempDir::new().unwrap();
+    let app = make_test_app(&dir);
+    {
+        let db = app.db.lock().await;
+        db::upsert_site(&db, &site("a")).unwrap();
+        db::upsert_site_rate_limit(&db, "a", &policy(1, 1)).unwrap();
+    }
+    app.reload_indexes().await;
+
+    let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
+    let client = ip(198, 51, 100, 12);
+
+    // A hundred images cost the client nothing: neither dimension
+    // counts them, so neither of the two limits is touched.
+    for i in 0..100 {
+        let target = format!("/img/{i}.png");
+        assert_eq!(
+            app.rate_limiter.check(
+                "a",
+                &cfg,
+                Some(client),
+                None,
+                Some(&target),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow,
+            "image {i} must be served"
+        );
+    }
+    // The first content request is the client's first request and its
+    // first page, so it is served.
+    assert_eq!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            None,
+            Some("/a.html"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Allow
+    );
+    // The second one is over both limits.
+    assert!(matches!(
+        app.rate_limiter.check(
+            "a",
+            &cfg,
+            Some(client),
+            None,
+            Some("/b.html"),
+            ClientGeo::default()
+        ),
+        LimitDecision::Throttled { .. }
+    ));
+}
+
+#[tokio::test]
 async fn limiter_exempts_a_verified_known_bot() {
     let dir = TempDir::new().unwrap();
     let app = make_test_app(&dir);

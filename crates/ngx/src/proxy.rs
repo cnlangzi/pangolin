@@ -519,7 +519,7 @@ impl ProxyHttp for AppProxy {
         };
         if let Some(limit_cfg) = limit_cfg {
             let decision = {
-                let pq = session.req_header().uri.path_and_query();
+                let target = session.req_header().uri.path_and_query();
                 // The geo is the one the gateway already resolved for
                 // the `P-Client-Country` / `P-Client-Region` headers
                 // — the limiter records it for a rejected client, so
@@ -533,7 +533,7 @@ impl ProxyHttp for AppProxy {
                     &limit_cfg,
                     limit_ip,
                     bot_name.as_deref(),
-                    pq.map(|p| p.as_str()),
+                    target.map(|p| p.as_str()),
                     geo,
                 )
             };

@@ -4862,6 +4862,73 @@ async fn real_e2e_rate_limit_rejects_the_third_request_with_429() {
     );
 }
 
+/// A static asset is counted by neither dimension: a burst of images
+/// must leave the request limit intact, and the content requests that
+/// follow must still be throttled once they exceed it.
+///
+/// This is the test that pins the **wiring**: the limiter has to be
+/// handed the client's own request target, with the path's extension
+/// intact — not the backend's rewritten path, and not the query
+/// string alone.
+#[tokio::test]
+async fn real_e2e_static_assets_are_not_counted_by_the_rate_limit() {
+    let backend = InspectingBackend::start().await;
+
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = Connection::open(db_path).expect("open db");
+        seed_site(&conn, "rl-site", &format!("http://{}", backend.addr()));
+        seed_domain(&conn, "rl.test", "rl-site");
+        seed_rate_limit(&conn, "rl-site", 2, 60);
+    })
+    .await;
+
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Three images: the third one would be over the limit of two if
+    // the images were counted.
+    for i in 0..3 {
+        let (status, body) = raw_get(&addr, "rl.test", &format!("/img/{i}.png")).await;
+        assert_eq!(
+            status,
+            200,
+            "image {i} must be served, got {status} ({body})\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+
+    // The images took none of the two requests the limit allows, so
+    // the first two content requests are within it …
+    for i in 0..2 {
+        let (status, body) = raw_get(&addr, "rl.test", &format!("/page-{i}")).await;
+        assert_eq!(
+            status,
+            200,
+            "content request {i} must be served, got {status} ({body})\nngx log:\n{}",
+            ngx.log_string()
+        );
+    }
+
+    // … and the third one is over it.
+    let (status, text) = raw_get_full(&addr, "rl.test", "/page-2").await;
+    assert_eq!(
+        status,
+        429,
+        "the third content request must be throttled, got {status}\n{text}\nngx log:\n{}",
+        ngx.log_string()
+    );
+
+    // The images reached the backend: they were served, just not
+    // counted.
+    let seen = backend.seen().await;
+    assert_eq!(
+        seen.len(),
+        5,
+        "the throttled request must never reach the backend, saw {} request(s)",
+        seen.len()
+    );
+}
+
 /// A blacklisted client IP is rejected with 403 — even when the site
 /// has no limits at all.
 #[tokio::test]
