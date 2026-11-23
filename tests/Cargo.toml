@@ -29,6 +29,11 @@ bytes = "1"
 httpdate = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = "0.20"
+# The tunnel's QUIC endpoint type, named by the dependency test that
+# pins the constructor's signature.  `quinn.workspace = true` adds a
+# dependency edge and not a second copy of the crate: the workspace
+# already builds quinn for `ngx`, with the same features.
+quinn.workspace = true
 
 # Async / ws
 futures-util = "0.3"

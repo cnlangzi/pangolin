@@ -17,7 +17,8 @@
 //!
 //! They deliberately duplicate none of the crate's own tests: the
 //! crate's suite asserts the behaviour of the code, these assert the
-//! shape of the repository that consumes it.
+//! shape of the repository that consumes it — the version it consumes
+//! and the surface that version has to carry.
 //!
 //! Like the `knownbots` dependency tests (issue #146), they need
 //! neither the `integration` feature nor a real binary, so they run
@@ -33,12 +34,12 @@ const CRATE: &str = "pangolin-tun";
 /// The published artefact's checksum — the `sha256` of the `.crate`
 /// file on crates.io.
 ///
-/// A re-publish of 0.2.0 under different content would not resolve to
+/// A re-publish of 0.3.0 under different content would not resolve to
 /// the same checksum, and cargo would refuse the lockfile.
-const CHECKSUM: &str = "cc1e713ae145330353e2bade1af80e331823f7e48874e1b045b8aa3c97ea03bb";
+const CHECKSUM: &str = "b829fddcdb8f3cbb40e440bb0fd31810b4f2226b55adb5fece8356f47b01d2f1";
 
 /// The version the lockfile must resolve.
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3.0";
 
 /// Every Rust file under `dir`, recursively.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
@@ -141,11 +142,10 @@ fn no_crate_imports_the_in_tree_tunnel_module() {
 /// The workspace depends on the **published** crate: a version
 /// requirement, not a path.
 ///
-/// The requirement is a caret on the 0.2 line (issue #211).  0.2.0
-/// is the release that binds the session-end signal to the streams,
-/// so a dying tunnel session reads as an error instead of as a clean
-/// end-of-file.  A `path` key would mean the in-tree copy crept
-/// back.
+/// The requirement is a caret on the 0.3 line (issue #232).  0.3.0
+/// is the release that carries `bind_endpoint_with_socket`, the
+/// constructor the gateway's handover rests on.  A `path` key would
+/// mean the in-tree copy crept back.
 #[test]
 fn the_workspace_depends_on_the_published_crate() {
     let manifest = parse_toml("Cargo.toml");
@@ -165,8 +165,8 @@ fn the_workspace_depends_on_the_published_crate() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the {CRATE} dependency must carry a version requirement"));
     assert!(
-        version.starts_with("0.2"),
-        "the {CRATE} dependency must ask for the 0.2 line, got {version:?}"
+        version.starts_with("0.3"),
+        "the {CRATE} dependency must ask for the 0.3 line, got {version:?}"
     );
 }
 
@@ -256,4 +256,27 @@ fn the_protocol_version_is_still_two() {
         2,
         "the tunnel's protocol version must stay 2 — the wire format did not change"
     );
+}
+
+/// The crate carries the constructor the gateway's handover rests on.
+///
+/// `bind_endpoint` binds the socket itself, so a caller cannot hand
+/// it a socket that already carries `SO_REUSEPORT` — and the option
+/// has to be set **before** the bind, which is the whole point of the
+/// handover between two generations of the gateway.  0.3.0 added
+/// `bind_endpoint_with_socket`, which takes the socket the caller
+/// bound.
+///
+/// The handover is a later pull request, so nothing in this
+/// repository calls the constructor yet.  The guard is therefore on
+/// the **signature**: the dependency has to carry the constructor the
+/// handover will call, and a dependency that does not — or that
+/// changes the constructor — fails to compile this line.
+#[test]
+fn the_crate_carries_the_caller_bindable_quic_endpoint() {
+    let _: fn(
+        std::net::SocketAddr,
+        std::net::UdpSocket,
+        &pangolin_tun::QuicCert,
+    ) -> pangolin_tun::Result<quinn::Endpoint> = pangolin_tun::bind_endpoint_with_socket;
 }

@@ -101,7 +101,7 @@ figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 #
 # The lock file still carries a `digest 0.10` alongside `digest 0.11`,
 # but every edge into it is a third-party crate we do not control:
-# `pangolin-tun 0.2` (published), `fastwebsockets 0.10` and
+# `pangolin-tun 0.3` (published), `fastwebsockets 0.10` and
 # `tungstenite 0.24` (sha1 0.10), `rust-embed-utils 8.11` (sha2
 # 0.10) and `pingora-cache`'s `blake2 0.10` (digest 0.10).  The two
 # `digest` versions never meet at a type boundary here — no public
@@ -151,26 +151,39 @@ badbots = { version = "0.1.4", features = ["full"] }
 # the client all live there, and this repository consumes them from
 # the registry the way it consumes `knownbots` and `badbots`.
 #
-# The requirement is a caret on the 0.2 line (issue #211). 0.2.0 is
-# the release that binds the session-end signal to the streams of the
-# WebSocket/TCP transport: a dying tunnel session now reads as an
-# error instead of as a clean end-of-file, so the tun closes the
-# backend socket with an error instead of handing it a truncated
-# request. The change is a **Rust API** change — `open_stream()` and
-# `accept_stream()` return the crate's own stream wrapper instead of
-# `yamux::StreamHandle` — and it stays behind the `TunnelTransport`
-# trait, so no source file here had to change. The *wire* protocol is
-# untouched: `TUNNEL_PROTOCOL_VERSION` stays 2, and a gateway and a
-# tun that were not upgraded together still interoperate.
+# The requirement is a caret on the 0.3 line (issue #232). 0.2.0 was
+# already published under issue #211, and crates.io does not let a
+# version be published twice, so the constructor could not ship on the
+# 0.2 line: the release that carries it is 0.3.0.
 #
-# The crate pins `base64 0.23` and `thiserror 2` while this workspace
-# asks for `base64 0.22` and `thiserror 1`, so the tree carries two
-# copies of each. The duplication is harmless: none of the crate's
-# public API is a `base64` or a `thiserror` type, so the two copies
-# never meet at a type boundary. Aligning the workspace on the
-# crate's versions would remove the duplication but is a workspace-wide
-# change that belongs in its own pull request.
-pangolin-tun = { version = "0.2" }
+# 0.3.0 is the release that adds `bind_endpoint_with_socket`: the QUIC
+# endpoint can be built on a socket the caller bound itself, so the
+# caller can set `SO_REUSEPORT` *before* the bind — which is what a
+# handover between two generations of the gateway needs, because the
+# outgoing generation still holds the port. The gateway keeps using the
+# crate's own `bind_endpoint` for now; the caller-bindable constructor
+# is the capability the handover will rest on.
+#
+# 0.2.0 (issue #211) is the release that binds the session-end signal
+# to the streams of the WebSocket/TCP transport: a dying tunnel
+# session now reads as an error instead of as a clean end-of-file, so
+# the tun closes the backend socket with an error instead of handing
+# it a truncated request. The change is a **Rust API** change —
+# `open_stream()` and `accept_stream()` return the crate's own stream
+# wrapper instead of `yamux::StreamHandle` — and it stays behind the
+# `TunnelTransport` trait, so no source file here had to change. The
+# *wire* protocol is untouched across both releases:
+# `TUNNEL_PROTOCOL_VERSION` stays 2, and a gateway and a tun that were
+# not upgraded together still interoperate.
+#
+# The crate pins `thiserror 2` while this workspace asks for
+# `thiserror 1`, so the tree carries two copies of it. The
+# duplication is harmless: none of the crate's public API is a
+# `thiserror` type, so the two copies never meet at a type boundary.
+# Aligning the workspace on the crate's version would remove the
+# duplication but is a workspace-wide change that belongs in its own
+# pull request.
+pangolin-tun = { version = "0.3" }
 
 log = "0.4"
 env_logger = "0.11"
