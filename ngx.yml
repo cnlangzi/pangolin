@@ -285,11 +285,12 @@ log:
   # between two of its own domains) is internal and is not
   # recorded.
   #
-  #   * `enabled`    master switch. `false` turns the capture off
-  #                  entirely: no header is read, no row is
-  #                  recorded, no JSONL is written, and the admin
-  #                  pages say the feature is disabled.
-  #                  Default true.
+  # The side-channel is always on — it is the same shape as the bot
+  # log above, and `false` was never "a slower version of the same
+  # thing": turning it off drops the whole "where did this visitor
+  # come from" dimension. The old `enabled` key is retired: a config
+  # that still carries it parses fine and logs a warning.
+  #
   #   * `recent`     in-memory ring buffer for `/logs/referers`
   #                  late-join replay. 0 disables replay; the
   #                  live SSE + JSONL still work. Default 200.
@@ -298,7 +299,6 @@ log:
   #   * `dir`        output directory for `referer-YYYY-MM-DD.jsonl`.
   #                  Created lazily on first write.
   referer:
-    enabled: true
     recent: 200
     capacity: 1000
     dir: ./logs/referers

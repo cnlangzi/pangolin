@@ -259,7 +259,6 @@ const ALLOWED_ENGLISH_TEXT: &[&str] = &[
     "&lt;h1&gt;Too many requests&lt;/h1&gt;",
     "203.0.113.7 or 10.0.0.0/8",
     // The configuration snippets the log pages quote as they are.
-    "log.referer.enabled: true",
     "log.traffic.enabled = false",
 ];
 

@@ -356,6 +356,64 @@ async fn referer_log_records_only_external_document_navigations() {
     assert_eq!(rows[0]["path"], "/pricing");
 }
 
+/// The retired `log.referer.enabled: false` must not silence the
+/// side-channel (issue #227).
+///
+/// The gateway boots with the retired key in its configuration — the
+/// loader ignores it, and the operator is told which key is gone.
+/// The capture still runs: the external document navigation is
+/// recorded exactly as it is without the key.
+#[tokio::test]
+async fn the_referer_log_records_even_when_the_config_carries_the_retired_key() {
+    let backend = MockHttpBackend::start().await;
+    let backend_addr = backend.addr().to_string();
+    let ngx = NgxProcess::start_with_log_config(
+        {
+            let backend_addr = backend_addr.clone();
+            move |db_path| {
+                init_pangolin_db(db_path);
+                let conn = Connection::open(db_path).expect("open db");
+                seed_site(&conn, "web", &format!("http://{backend_addr}"));
+                seed_domain(&conn, "example.test", "web");
+            }
+        },
+        "  referer:\n    enabled: false\n",
+    )
+    .await;
+
+    // The operator is told which key is gone — and the warning has to
+    // reach the log, not just the code.
+    let log = ngx.log_string();
+    assert!(
+        log.contains("`log.referer.enabled` has been retired and is ignored"),
+        "the retired-key warning is missing from the gateway's log:\n{log}"
+    );
+
+    let (status, _) = raw_request_with_headers(
+        &format!("127.0.0.1:{}", ngx.http_port),
+        "example.test",
+        "GET",
+        "/pricing",
+        b"",
+        &[
+            ("Referer", "https://news.example.org/article?id=7"),
+            ("Sec-Fetch-Dest", "document"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let rows = wait_for_rows(&ngx, 1).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the retired key must not silence the referer log, got {rows:#?}\nngx log:\n{}",
+        ngx.log_string()
+    );
+    assert_eq!(rows[0]["referer_host"], "news.example.org");
+    assert_eq!(rows[0]["path"], "/pricing");
+}
+
 /// The `Accept` fallback: a client that omits `Sec-Fetch-Dest` is
 /// eligible only when its `Accept` header contains `text/html`.
 #[tokio::test]

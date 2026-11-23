@@ -372,7 +372,8 @@ fn every_path_in_the_config_templates_is_absolute() {
 /// The configuration loader does *not* refuse unknown keys: a stale
 /// key is silently ignored with a warning.  The template is the only
 /// place an operator learns a knob exists, so it has to be clean on
-/// its own — `log.bot.enabled` was retired in issue #117.
+/// its own — `log.bot.enabled` was retired in issue #117 and
+/// `log.referer.enabled` in issue #227.
 #[test]
 fn the_config_templates_carry_no_retired_keys() {
     for template in ["packaging/config/ngx.yml", "packaging/config/tun.yml"] {
@@ -380,6 +381,11 @@ fn the_config_templates_carry_no_retired_keys() {
         assert!(
             !text.contains("log.bot.enabled"),
             "{template} carries the retired `log.bot.enabled` key — the loader ignores it \
+             silently, so the template must not mention it"
+        );
+        assert!(
+            !text.contains("log.referer.enabled"),
+            "{template} carries the retired `log.referer.enabled` key — the loader ignores it \
              silently, so the template must not mention it"
         );
     }

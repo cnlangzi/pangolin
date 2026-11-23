@@ -476,15 +476,13 @@ pub struct LogConfig {
 /// `ngx.yml` (or no `ngx.yml` at all) produces a working referer
 /// log. The block mirrors `log.bot` so the two side-channels are
 /// configured the same way.
+///
+/// The referer log is **always on** (issue #227). The former
+/// `log.referer.enabled` key has been retired; a configuration file
+/// that still carries it parses fine and logs a warning naming the
+/// key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefererLogConfig {
-    /// Master switch. When `false` the gateway does not capture the
-    /// `Referer` header at all, no rows are recorded, and the admin
-    /// pages say the feature is disabled. Default `true` — the
-    /// feature is the point of the change and a missing block must
-    /// still produce a working referer log.
-    #[serde(default = "default_referer_enabled")]
-    pub enabled: bool,
     /// Capacity of the in-memory ring buffer used by `/logs/referers`
     /// late-join replay. Default 200. Set to 0 to disable replay
     /// (the live SSE stream still works).
@@ -499,10 +497,6 @@ pub struct RefererLogConfig {
     /// lazily on first write. Default `./logs/referers`.
     #[serde(default = "default_referer_dir")]
     pub dir: PathBuf,
-}
-
-fn default_referer_enabled() -> bool {
-    true
 }
 
 fn default_referer_recent() -> usize {
@@ -641,7 +635,6 @@ impl Default for LogConfig {
 impl Default for RefererLogConfig {
     fn default() -> Self {
         Self {
-            enabled: default_referer_enabled(),
             recent: default_referer_recent(),
             capacity: default_referer_capacity(),
             dir: default_referer_dir(),
@@ -725,17 +718,27 @@ impl Config {
     /// Load from a YAML file, with `NGX_*` env vars layered on top.
     /// Missing optional sections / fields fall back to the defaults
     /// declared via `#[serde(default = "…")]` on the struct.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+    ///
+    /// The file's raw text comes back with the parsed
+    /// configuration: the retired-key warnings are derived from it
+    /// (see [`warn_retired_keys`]), and they can only be emitted once
+    /// the process logger is installed — which is after the parse.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<(Self, String)> {
         let s = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
-        Self::from_str(&s)
+        let c = Self::from_str(&s)?;
+        Ok((c, s))
     }
 
     /// Parse from a YAML string (used in tests) with the same env
     /// override as [`from_file`]. The two-arg form makes the layered
     /// load explicit at the call site.
+    ///
+    /// The retired-key warnings are **not** emitted here — see
+    /// [`warn_retired_keys`]: the process logger does not exist yet
+    /// while the configuration is parsed, so a `log::warn!` emitted
+    /// at that point would be swallowed.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        warn_retired_keys(s);
         Figment::new()
             .merge(Yaml::string(s))
             .merge(Env::prefixed("NGX_").split("__"))
@@ -748,18 +751,30 @@ impl Config {
 ///
 /// The key is *not* an error: an old `ngx.yml` must keep working —
 /// the operator just learns that the knob is gone. Today that is
-/// `log.bot.enabled`: the bot log and the knownbots verifier are
-/// always on (issue #117), and a disabled bot log used to silently
-/// turn the gateway's `P-Known-Bot` header into an empty value.
-fn warn_retired_keys(s: &str) {
+/// `log.bot.enabled` (issue #117) and `log.referer.enabled` (issue
+/// #227): both side-channels are always on.
+///
+/// The caller must invoke this **after** the process logger has been
+/// installed: a `log::warn!` emitted before that is swallowed by the
+/// `log` crate's no-op logger, so a warning emitted while the
+/// configuration was being parsed would never reach the operator.
+/// (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
+pub fn warn_retired_keys(s: &str) {
     // `find_value` walks the parsed YAML — `Err(MissingField)` means
     // the key is not there, `Ok(_)` means it is. A YAML syntax error
-    // is reported by the parse below; don't double-report it here.
+    // is reported by the loader; don't double-report it here.
     let figment = Figment::new().merge(Yaml::string(s));
     if figment.find_value("log.bot.enabled").is_ok() {
         log::warn!(
             "config: `log.bot.enabled` has been retired and is ignored — \
              the bot log and the knownbots verifier are always on. \
+             Remove the key from your configuration."
+        );
+    }
+    if figment.find_value("log.referer.enabled").is_ok() {
+        log::warn!(
+            "config: `log.referer.enabled` has been retired and is ignored — \
+             the referer log is always on. \
              Remove the key from your configuration."
         );
     }
@@ -893,6 +908,29 @@ mod tests {
         });
     }
 
+    /// The referer log is always on (issue #227), so
+    /// `log.referer.enabled` was retired. An old configuration file
+    /// must keep working — the key is ignored (and `warn_retired_keys`
+    /// logs a warning naming it), and the side-channel keeps running.
+    #[test]
+    fn retired_referer_enabled_key_still_parses() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let s = r#"
+                log:
+                  referer:
+                    enabled: false
+            "#;
+            let c = Config::from_str(s).expect("an old config must still parse");
+            // The key had no effect — the other knobs keep their
+            // defaults.
+            assert_eq!(c.log.referer.recent, 200);
+            assert_eq!(c.log.referer.capacity, 1000);
+            assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
+            Ok(())
+        });
+    }
+
     /// The shipped `ngx.yml`, parsed.
     ///
     /// The environment layer is deliberately *not* merged here: these
@@ -933,7 +971,6 @@ mod tests {
             let c = Config::from_str(include_str!("../../../ngx.yml")).expect("ngx.yml must parse");
             // The referer block in the example carries the documented
             // defaults.
-            assert!(c.log.referer.enabled);
             assert_eq!(c.log.referer.recent, 200);
             assert_eq!(c.log.referer.capacity, 1000);
             assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
@@ -1082,7 +1119,6 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.clear_env();
             let c = Config::from_str("").unwrap();
-            assert!(c.log.referer.enabled);
             assert_eq!(c.log.referer.recent, 200);
             assert_eq!(c.log.referer.capacity, 1000);
             assert_eq!(c.log.referer.dir, PathBuf::from("./logs/referers"));
@@ -1096,13 +1132,11 @@ mod tests {
             let s = r#"
                 log:
                   referer:
-                    enabled: false
                     recent: 5
                     capacity: 7
                     dir: /var/log/referers
             "#;
             let c = Config::from_str(s).unwrap();
-            assert!(!c.log.referer.enabled);
             assert_eq!(c.log.referer.recent, 5);
             assert_eq!(c.log.referer.capacity, 7);
             assert_eq!(c.log.referer.dir, PathBuf::from("/var/log/referers"));

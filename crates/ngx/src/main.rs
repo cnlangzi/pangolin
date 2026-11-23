@@ -49,7 +49,7 @@ use pingora::proxy::http_proxy_service;
 use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
 
-use pangolin_core::config::Config;
+use pangolin_core::config::{Config, warn_retired_keys};
 use pangolin_core::init_logger;
 use tokio_util::sync::CancellationToken;
 
@@ -91,11 +91,17 @@ fn main() -> anyhow::Result<()> {
 
     // ---- 1. Blocking init --------------------------------------------------
     let args = Args::parse();
-    let config =
+    let (config, raw_config) =
         Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
     // Now that config is loaded, honor its `[log]` section for the
     // process logger (shared with `tun`).
     init_logger(&config.log);
+    // The retired-key warnings come *after* the logger: a `log::warn!`
+    // emitted while the configuration was parsed would be swallowed by
+    // the `log` crate's no-op logger, and the operator would never
+    // learn which key is gone.
+    // (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
+    warn_retired_keys(&raw_config);
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager::new(
@@ -239,8 +245,8 @@ fn main() -> anyhow::Result<()> {
         // Spawn the referer-log JSONL writer task. Same reasoning as
         // the bot writer above: `App::new` runs before the runtime
         // exists, so the task has to be spawned from inside it.
-        // Returns `false` when `log.referer.enabled` is false — the
-        // call is safe either way.
+        // The referer log is always on (issue #227), so the call is
+        // safe either way.
         app_for_shutdown.start_referer_writer();
 
         let mut handles = Vec::with_capacity(services.len());
