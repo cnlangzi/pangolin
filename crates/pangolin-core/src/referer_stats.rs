@@ -289,6 +289,7 @@ mod tests {
                 backend: "direct:127.0.0.1:8080".into(),
                 client_ip: "203.0.113.7".into(),
                 user_agent: None,
+                referer: None,
             },
             &RefererHit {
                 referer: format!("https://{referer_host}/page"),

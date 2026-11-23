@@ -47,10 +47,9 @@ use crate::bot::{BotCategory, BotCategoryStyle, BotIdentity};
 /// (`"search_engine"`, `"ai_bot"`, `"social"`, `"monitoring"`,
 /// `"ads_bot"`) for the same reason.
 ///
-/// `referer` is captured as `Option<String>` for v1 but always
-/// `None` today — the per-request `RequestState` doesn't track
-/// the `Referer` header yet. Wiring the capture is a one-line
-/// follow-up once an operator asks for it.
+/// `referer` is the `Referer` header the crawler sent, copied
+/// verbatim out of the access-log entry. The key is absent from a
+/// row whose request carried no `Referer` header.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BotLogEntry {
     /// ISO-8601 / RFC-3339 timestamp in UTC.
@@ -86,8 +85,14 @@ pub struct BotLogEntry {
     /// changes that operators want to investigate).
     pub ua: String,
 
-    /// `Referer` header value. Always `None` in v1; reserved for
-    /// a follow-up that captures it in `RequestState`.
+    /// `Referer` header value, verbatim. `None` when the request
+    /// carried no `Referer` header (or one that was not valid UTF-8,
+    /// or one longer than 4 KiB).
+    ///
+    /// The same string the access log carries — the two logs must
+    /// agree on one request, so an analyst can join the two tables.
+    /// Nothing is stripped here: the referer log side-channel keeps
+    /// its own, sanitised copy (see `docs/design/referer-log.md`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub referer: Option<String>,
 }
@@ -119,7 +124,9 @@ impl BotLogEntry {
             bot_vendor: Cow::Owned(bot.vendor),
             bot_category: bot.category,
             ua: ua.to_string(),
-            referer: None,
+            // The same string the access log carries — verbatim, so
+            // the two logs agree on one request.
+            referer: entry.referer.clone(),
         })
     }
 
@@ -1664,6 +1671,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "66.249.66.1".into(),
             user_agent: ua.map(String::from),
+            referer: None,
         }
     }
 
@@ -1714,6 +1722,25 @@ mod tests {
     fn from_access_log_returns_none_without_ua() {
         let access = entry(None);
         assert!(BotLogEntry::from_access_log(&access, bot()).is_none());
+    }
+
+    /// The bot row carries the access entry's `Referer` — the same
+    /// string, verbatim. The proxy does not parse the value, so the
+    /// query string and the fragment survive into the JSONL row.
+    #[test]
+    fn from_access_log_carries_the_referer_into_the_row() {
+        let mut access = entry(Some("Mozilla/5.0 (compatible; Googlebot/2.1)"));
+        access.referer = Some("https://news.example.org/a/b?q=1#frag".into());
+
+        let e = BotLogEntry::from_access_log(&access, bot()).unwrap();
+        assert_eq!(
+            e.referer.as_deref(),
+            Some("https://news.example.org/a/b?q=1#frag")
+        );
+
+        // And the key is in the wire format.
+        let v: serde_json::Value = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["referer"], "https://news.example.org/a/b?q=1#frag");
     }
 
     #[test]
@@ -1956,6 +1983,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "10.0.0.1".into(),
             user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
+            referer: None,
         };
         let identity = BotIdentity {
             name: name.into(),
@@ -2856,6 +2884,7 @@ mod tests {
                 backend: "direct:127.0.0.1:8080".into(),
                 client_ip: "203.0.113.7".into(),
                 user_agent: Some("Mozilla/5.0 (compatible; Googlebot/2.1)".into()),
+                referer: None,
             },
             crate::bot::BotIdentity {
                 name: "googlebot".into(),

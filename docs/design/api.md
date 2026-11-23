@@ -630,6 +630,10 @@ dashboard.
 | `GET` | `/api/v1/logs/referer/raw?date=YYYY-MM-DD` | the raw `referer-YYYY-MM-DD.jsonl` |
 | `GET` | `/api/v1/logs/access` | the in-memory access log, one JSON object per entry |
 
+Each object of `/api/v1/logs/access` carries an optional `referer` key — the
+`Referer` header the client sent, verbatim. The key is absent for a request
+that carried no `Referer` header (issue #228).
+
 A `date` that is not `YYYY-MM-DD` is a `422 date_invalid`; a file
 that does not exist is a `404 bot_log_not_found` (or
 `referer_log_not_found`).

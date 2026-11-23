@@ -119,6 +119,10 @@ pub struct RequestState {
     /// parsed form ([`Self::referer_hit`]) is derived from it at the
     /// site lookup, and a request that turns out to be ineligible
     /// never pays for the parse.
+    ///
+    /// The same value is what the access log and the bot log record —
+    /// verbatim, one byte unchanged. The analyst parses it off the
+    /// proxy path; the proxy does not.
     pub referer: Option<String>,
     /// `Sec-Fetch-Dest` header value — the primary signal for
     /// "is this a top-level document navigation".
@@ -1639,6 +1643,11 @@ fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16, user_agent
         // here, into the entry. Consumed by `App::push_access_log`'s
         // bot side-channel; a missing UA simply skips the bot path.
         user_agent: user_agent.map(String::from),
+        // The `Referer` header, verbatim. `request_filter` captured it
+        // once (no parsing, no stripping — see `RequestState::referer`);
+        // this is the copy that lands in the entry, and the bot log
+        // inherits the very same string through the entry.
+        referer: ctx.referer.clone(),
     };
     // The referer fan-out goes first: it needs a borrow of the
     // entry, and `push_access_log` consumes it.

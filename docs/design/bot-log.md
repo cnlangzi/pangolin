@@ -16,7 +16,7 @@ For the corresponding config keys, see
 | Give SEO / DevRel teams a queryable record of "who hit what, when, with which UA" | JSONL is the wire format; `jq` and DuckDB pick it up natively |
 | Persist across process restarts | In-memory ring buffers do not — the JSONL file does |
 | Stay zero-cost for non-bot traffic | The detector short-circuits on every `None` UA / `None` bot identity result |
-| Not regress the existing access log | `AccessLogEntry` is unchanged except for the optional `user_agent` field (back-compat via `#[serde(default, skip_serializing_if = "Option::is_none")]`) |
+| Not regress the existing access log | `AccessLogEntry` is unchanged except for the optional `user_agent` and `referer` fields (back-compat via `#[serde(default, skip_serializing_if = "Option::is_none")]`) |
 
 ## Non-goals
 
@@ -109,12 +109,13 @@ JSONL writer + ring buffer + (stage-3) history reader.
 - `BotLogEntry` — flat JSONL row, `Clone + Serialize + Deserialize`.
   Field set: timestamp / host / method / path / status / duration_ms /
   backend / client_ip / bot_name / bot_vendor / bot_category / ua /
-  referer (always `None` in v1; reserved for a future
-  `RequestState::referer` capture). `bot_name` / `bot_vendor` are
-  `Cow<'static, str>` so the history reader and the verifier share
-  one field. Both paths own the string: knownbots display names
-  come from YAML, and JSONL lines are parsed text. There is no
-  `Cow::Borrowed` hot path after the `'static` rule table was
+  referer (the `Referer` header the crawler sent, **verbatim** — the
+  access log's entry carries the same string, so the two logs agree on
+  one request; the key is absent when the request carried no `Referer`).
+  `bot_name` / `bot_vendor` are `Cow<'static, str>` so the history reader
+  and the verifier share one field. Both paths own the string: knownbots
+  display names come from YAML, and JSONL lines are parsed text. There is
+  no `Cow::Borrowed` hot path after the `'static` rule table was
   removed.
 - `BotLogBuffer` — bounded ring buffer mirroring `AccessLogBuffer`.
   Capacity 0 → no-op (the JSONL stream + stats counters still work).
@@ -305,6 +306,11 @@ stays inside the supervisor.
 - `record_access_log` copies it **once**, into `AccessLogEntry.user_agent`.
   A value that is not visible ASCII reads as "no user agent" — exactly as
   the owned copy did, and for the same reason: the bot rules are ASCII.
+- `record_access_log` also copies the captured `Referer` header into
+  `AccessLogEntry.referer`, verbatim (issue #228). The bot row inherits
+  that string through the entry, so the access log and the bot log carry
+  the same referer for the same request — the analyst joins the two
+  tables on it.
 
 ### `crates/ngx/src/main.rs`
 
@@ -396,6 +402,10 @@ snake_case category enum:
 Filename: `bot-YYYY-MM-DD.jsonl`. UTC day boundary. Operators handle
 retention via `logrotate(8)` / `find -mtime +30 -delete` — the gateway
 itself does not auto-clean up.
+
+A row carries one more **optional** key: `referer`, the `Referer` header
+the crawler sent, verbatim. The key is absent from a row whose request
+carried no `Referer` header (issue #228).
 
 ## Admin surface
 
@@ -558,8 +568,7 @@ duckdb -c "
   - `admin/src/lib.rs` — register `GET /logs/bots/history` and
     `GET /logs/bots/stats`.
 - **later, separate PRs** — reverse-DNS validation, optional
-  `extra_user_agent_patterns` config knob, `Referer` capture in
-  `RequestState`.
+  `extra_user_agent_patterns` config knob.
 
 ## Test coverage
 

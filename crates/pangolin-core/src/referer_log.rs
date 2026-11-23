@@ -1133,6 +1133,7 @@ mod tests {
                 backend: "direct:127.0.0.1:8080".into(),
                 client_ip: ip.into(),
                 user_agent: Some("Mozilla/5.0".into()),
+                referer: None,
             },
             &RefererHit {
                 referer: format!("https://{referer_host}{path}"),
@@ -1182,6 +1183,7 @@ mod tests {
             backend: "direct:1.2.3.4:80".into(),
             client_ip: "203.0.113.7".into(),
             user_agent: Some("UA/1".into()),
+            referer: None,
         };
         let hit = RefererHit {
             referer: "https://news.example.org/page".into(),
@@ -1243,6 +1245,7 @@ mod tests {
             backend: "direct:1.2.3.4:80".into(),
             client_ip: "1.2.3.4".into(),
             user_agent: None,
+            referer: None,
         };
         access.user_agent = None;
         let e = RefererLogEntry::from_access_log(

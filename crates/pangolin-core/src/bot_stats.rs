@@ -311,6 +311,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "10.0.0.1".into(),
             user_agent: Some(ua.into()),
+            referer: None,
         };
         let identity = if ua.to_ascii_lowercase().contains("bingbot") {
             bot("Bingbot", "Microsoft")

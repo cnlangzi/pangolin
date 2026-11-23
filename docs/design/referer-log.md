@@ -25,7 +25,7 @@ For the corresponding config keys, see
 | Answer the question per **site**, not per hostname | A site may own several domains; a link between two of them is internal |
 | Persist across process restarts | In-memory ring buffers do not — the JSONL file does |
 | Stay cheap on the hot path | The header is read once, next to the other request-header reads; the classification is three pure function calls |
-| Not regress the existing access log or bot log | `AccessLogEntry`'s wire format is unchanged; the bot channel is untouched |
+| Not regress the existing access log or bot log | The access log and the bot log carry the raw `Referer` header (issue #228); the bot channel is otherwise untouched |
 
 ## Non-goals
 
@@ -95,9 +95,11 @@ revision, and hands the finished result to the core side-channel. Two
 consequences:
 
 - The detection path never takes the index lock a second time.
-- The referer data does **not** travel through `AccessLogEntry`, so that
-  struct's wire format is unchanged — the general `/logs` SSE stream and the
-  bot JSONL keep their current shape.
+- The **classification** does not travel through `AccessLogEntry` — only
+  the raw header value does (issue #228). The access log and the bot log
+  store the raw `Referer` header; the referer log stores the sanitised
+  URL and its `referer_host`. Two forms of one header value, each for its
+  own use: the raw one for forensics, the sanitised one for grouping.
 
 The referer fan-out is also a **separate** `App::push_referer_log` call rather
 than a branch inside `App::push_access_log`: the bot branch of
@@ -200,6 +202,10 @@ ClickHouse local ingest it without a custom schema declaration.
 Query strings carry tracking parameters and sometimes tokens from the
 referring site; the linking page's *path* is what the SEO analysis needs. The
 userinfo must not be stored at all — it is a credential.
+
+This sanitising applies to **this** log only. The access log and the bot log
+keep the raw `Referer` header verbatim (issue #228) — they are the forensic
+record, and the analyst there decides what to keep.
 
 ## In-memory state
 

@@ -87,7 +87,8 @@ Each `data:` frame is one `AccessLogEntry` serialised as JSON:
   "duration_ms": 12,
   "backend":     "http://10.0.0.7:8080",
   "client_ip":   "203.0.113.42",
-  "user_agent":  "curl/8.0"
+  "user_agent":  "curl/8.0",
+  "referer":     "https://news.example.org/a/b?q=1"
 }
 ```
 
@@ -95,6 +96,13 @@ Each `data:` frame is one `AccessLogEntry` serialised as JSON:
 `User-Agent` header, and it carries the value the request arrived with
 (issue #224 reads it in place out of the request headers and copies it
 once, into the entry).
+
+`referer` is optional in the same way (issue #228): it is present only
+when the client sent a `Referer` header, and it carries that header
+**verbatim** — the query string, the fragment and the userinfo are
+whatever the client sent. The proxy does not parse the value: the
+analysis happens off the proxy path, and it is the analyst's job to
+decide what to keep.
 
 Field set is locked by `tests/src/access_log_e2e.rs::access_log_sse_replays_then_streams_live`:
 a future change that renames or removes a field fails the test loudly
@@ -136,15 +144,20 @@ The entry is built **once** per request and wrapped in an `Arc`
 (issue #224). The ring buffer, the broadcast channel and every subscriber
 hold a reference to that one allocation, so the fan-out copies a reference
 count instead of the entry. The **access log's own** per-request
-allocations drop from 24 (one subscriber) to 7 — the `Arc` plus the
-entry's six fields. The request context is a separate budget: it still
-allocates its own strings, but it no longer copies the `User-Agent` at
-all (issue #224 reads it in place, and the access log copies it once,
-when it builds the entry).
+allocations drop from 24 (one subscriber) to 8 — the `Arc` plus the
+entry's seven allocating fields (`referer` is the seventh: the proxy
+copies the captured header into the entry once, like the `User-Agent`).
+The request context is a separate budget: it still allocates its own
+strings, but it no longer copies the `User-Agent` at all (issue #224
+reads it in place, and the access log copies it once, when it builds the
+entry).
 
-`AccessLogEntry` is ~150 bytes serialised; defaults cost ≈ 15 KB (ring) +
-≈ 150 KB (channel). A noisy proxy with 10k req/s sees each subscriber
-behind by < 100 ms in steady state, well inside the channel cap.
+`AccessLogEntry` is ~200 bytes serialised in the typical case and
+~4.2 KB in the worst one — a client that sends a `Referer` of nearly
+4 KiB, which the capture accepts up to the header limit. The defaults
+therefore cost ≈ 20 KB (ring) + ≈ 200 KB (channel). A noisy proxy with
+10k req/s sees each subscriber behind by < 100 ms in steady state, well
+inside the channel cap.
 
 Set `access_log_recent: 0` to disable replay (the live stream still
 works). Setting `access_log_capacity: 0` is not currently supported —

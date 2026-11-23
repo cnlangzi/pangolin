@@ -2195,6 +2195,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "10.0.0.1".into(),
             user_agent: None,
+            referer: None,
         }
     }
 
@@ -2212,6 +2213,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "66.249.66.1".into(),
             user_agent: Some(ua.into()),
+            referer: None,
         }
     }
 
@@ -2478,6 +2480,35 @@ mod tests {
 
         // 4) Generic access log ALSO received it (both paths run).
         assert_eq!(app.recent_access_log().len(), 1);
+    }
+
+    /// The bot row carries the request's `Referer` header — the same
+    /// string the access log carries, verbatim.
+    ///
+    /// The two logs have to agree on one request: an analyst that
+    /// joins a crawler hit against the access log must not find two
+    /// different referers for the same request.
+    #[test]
+    fn push_access_log_carries_the_referer_into_the_bot_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let cfg = make_log_config(50, 16);
+        let app = App::new(&db_path, cfg, CertManager::default()).unwrap();
+        seed_googlebot_cidr(&app);
+
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let mut entry = make_bot_entry(ua, "/sitemap.xml");
+        // Verbatim: the query string and the fragment survive, because
+        // the proxy does not parse the value.
+        entry.referer = Some("https://news.example.org/a/b?q=1#frag".into());
+        app.push_access_log(entry);
+
+        let snap = app.recent_bot_log();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].referer.as_deref(),
+            Some("https://news.example.org/a/b?q=1#frag")
+        );
     }
 
     #[test]
