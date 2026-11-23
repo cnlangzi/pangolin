@@ -301,7 +301,9 @@ unknown claims are treated as ordinary clients (fail closed).
 A site may list the known bots that are **not** exempt on it. A
 verified bot whose registry id is in the list is counted against the
 site's limits like any other client and is answered `429` when it is
-over them; every other verified bot stays exempt.
+over them; every other verified bot stays exempt. The static-asset
+exclusion applies to a listed bot as well — it is counted like any
+other client, not like a bot.
 
 The list only removes the exemption step — it does not change the
 bot's identity anywhere else: the request still carries
@@ -401,6 +403,13 @@ extension that only appears in the query string
 client count **more**, never less, so they cannot be used to slip past
 a limit.
 
+The rule cannot know what the site actually serves: the limiter
+decides before the backend is contacted. A path the site does not
+serve is uncounted as well — a scanner that asks for `/admin.png` or
+`/dump.zip` is therefore never counted, whatever the backend answers
+it. That traffic is invisible to the limits; the IP rules are what an
+operator uses to stop it.
+
 ### Effect on existing deployments
 
 The rule is a relaxation: an upgraded deployment stops counting static
@@ -410,6 +419,14 @@ migration and no admin element, and the existing policy rows keep
 their meaning. The visible effect is that the per-site "counted"
 figure in the admin UI drops, because those requests are no longer
 counted.
+
+A site whose traffic is **only** static assets — a photo gallery, a
+video host, a software mirror — loses its request-count dimension
+entirely: `req_limit` no longer bounds anything for it, because every
+request it makes names a static asset. The same holds for the page
+dimension: such a site has no pages to count. There is no per-site
+opt-out; the tool an operator has is the IP blacklist (`ip_rules`),
+which rejects a client's traffic outright.
 
 ## Reload
 
@@ -464,8 +481,8 @@ restarts; the configuration lives in SQLite and survives restarts.
   way to tick or untick it, so an unrelated save must not silently
   drop it. The ids the form *can* show follow the form: unticking a
   box removes the bot.
-- `/ratelimit` renders a KPI row (sites with limits enabled, requests
-  counted, over-limit events, 429s sent, rule blocks, exempt
+- `/ratelimit` renders a KPI row (sites with limits enabled, content
+  requests counted, over-limit events, 429s sent, rule blocks, exempt
   requests), a per-site table (policy summary, tracked clients against
   capacity, counted, over-limit per dimension, 429s, untracked
   requests), the "top over-limit clients" table and the IP rules with
@@ -533,7 +550,7 @@ successfully and logs a warning naming the retired key.
 | Both dimensions trip | `Retry-After` is the greater of the two remaining window times. |
 | A whitelist rule and a blacklist rule match with the same prefix length | The whitelist wins; the client is served. |
 | A blacklisted IP is also a verified known bot | The request is rejected with 403 — rules take precedence over the exemption. |
-| The site lists the bot in its bot-limited list | The bot is counted against the site's limits and rejected with 429 when it is over them. |
+| The site lists the bot in its bot-limited list | The bot is counted against the site's limits and rejected with 429 when it is over them — a static asset excepted, as for any other client. |
 | The site does not list the bot | The bot stays exempt, exactly as before. |
 | The site's list names a bot the registry does not know | The id stays in the table and never matches — no request is affected. It also survives a save: the form cannot show it, so it cannot manage it either. |
 | The site has no row in `site_rate_limit_bots` | Every verified bot is exempt — the behaviour before issue #131. |

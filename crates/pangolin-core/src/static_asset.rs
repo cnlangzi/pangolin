@@ -37,11 +37,15 @@ const MAX_EXTENSION_LEN: usize = 8;
 /// stack buffer and compared against the list of byte-string
 /// literals.
 pub fn is_static_asset_target(target: &str) -> bool {
-    let path = target.split('?').next().unwrap_or(target);
-    let Some(segment) = path.rsplit('/').next() else {
-        return false;
+    let path = match target.split_once('?') {
+        Some((path, _query)) => path,
+        None => target,
     };
-    let Some((_, extension)) = segment.rsplit_once('.') else {
+    let segment = match path.rsplit_once('/') {
+        Some((_dir, segment)) => segment,
+        None => path,
+    };
+    let Some((_stem, extension)) = segment.rsplit_once('.') else {
         return false;
     };
     if extension.is_empty() || extension.len() > MAX_EXTENSION_LEN {

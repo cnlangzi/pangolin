@@ -383,6 +383,10 @@ pub struct SiteLimitConfig {
     /// site's limits and answered `429` when it is over them. Every
     /// other verified bot stays exempt. An empty set — the default —
     /// exempts every verified bot.
+    ///
+    /// Being counted means being counted like any other client, not
+    /// like a bot: a static asset is counted for a listed bot
+    /// neither, exactly as it is for anybody else.
     pub bot_limited: BTreeSet<String>,
 }
 
@@ -1166,7 +1170,9 @@ pub struct SiteLimitStat {
     pub throttle_secs: u64,
     /// Client IPs currently holding a slot in the request ring.
     pub tracked_clients: usize,
-    /// Requests counted since the process started.
+    /// Content requests counted since the process started. A static
+    /// asset is counted by neither dimension, so it is not part of
+    /// this figure.
     pub counted: u64,
     /// Requests that could not be tracked (the ring was full).
     pub untracked: u64,
@@ -1388,7 +1394,9 @@ impl RateLimiter {
     /// only for a **verified** known bot, because the caller reuses
     /// the verdict the gateway already computed for the `P-Known-Bot`
     /// header. A bot whose id is in the site's `bot_limited` list is
-    /// not exempt: it is counted and limited like any other client.
+    /// not exempt: it is counted and limited like any other client —
+    /// the static-asset exclusion applies to it as well, so a listed
+    /// bot that only fetches images is not counted either.
     ///
     /// `target` is the request target (path + query). It gates both
     /// counting dimensions: a target that names a static asset is
@@ -1989,7 +1997,8 @@ mod tests {
     /// A limiter with one site per name. Every site lists `bots` in
     /// its bot-limited set, so a request that carries one of those
     /// bot identities is counted and limited like any other client
-    /// (issue #131) — and the limiter records the name.
+    /// (issue #131) — the static-asset exclusion applies to it as
+    /// well — and the limiter records the name.
     fn limiter_with_bot_limited_sites(
         p: RateLimitPolicy,
         names: &[&str],
@@ -2228,6 +2237,24 @@ mod tests {
         ));
     }
 
+    /// One request from `client` for `target` — no bot identity and no
+    /// geo, which is what the counter tests need.
+    fn check(
+        limiter: &RateLimiter,
+        cfg: &SiteLimitConfig,
+        client: IpAddr,
+        target: &str,
+    ) -> LimitDecision {
+        limiter.check(
+            "site",
+            cfg,
+            Some(client),
+            None,
+            Some(target),
+            ClientGeo::default(),
+        )
+    }
+
     #[test]
     fn a_static_asset_is_counted_by_neither_dimension() {
         let (limiter, cfg) = limiter_with(policy(10, 10));
@@ -2237,14 +2264,7 @@ mod tests {
         for i in 0..100 {
             let target = format!("/img/{i}.png");
             assert_eq!(
-                limiter.check(
-                    "site",
-                    &cfg,
-                    Some(client),
-                    None,
-                    Some(&target),
-                    ClientGeo::default()
-                ),
+                check(&limiter, &cfg, client, &target),
                 LimitDecision::Allow,
                 "image {i} must be served"
             );
@@ -2263,14 +2283,7 @@ mod tests {
         for i in 0..100 {
             let target = format!("/img/{i}.png");
             assert_eq!(
-                limiter.check(
-                    "site",
-                    &cfg,
-                    Some(client),
-                    None,
-                    Some(&target),
-                    ClientGeo::default()
-                ),
+                check(&limiter, &cfg, client, &target),
                 LimitDecision::Allow,
                 "image {i} must be served"
             );
@@ -2280,28 +2293,14 @@ mod tests {
         for i in 0..10 {
             let target = format!("/page-{i}");
             assert_eq!(
-                limiter.check(
-                    "site",
-                    &cfg,
-                    Some(client),
-                    None,
-                    Some(&target),
-                    ClientGeo::default()
-                ),
+                check(&limiter, &cfg, client, &target),
                 LimitDecision::Allow,
                 "content request {i} must be within the limit"
             );
         }
         // … and the eleventh one is over it.
         assert!(matches!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/page-10"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/page-10"),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -2313,40 +2312,19 @@ mod tests {
         for i in 0..100 {
             let target = format!("/img/{i}.png");
             assert_eq!(
-                limiter.check(
-                    "site",
-                    &cfg,
-                    Some(client),
-                    None,
-                    Some(&target),
-                    ClientGeo::default()
-                ),
+                check(&limiter, &cfg, client, &target),
                 LimitDecision::Allow,
                 "image {i} must be served"
             );
         }
         // The first content page is the client's first distinct page.
         assert_eq!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/a.html"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/a.html"),
             LimitDecision::Allow
         );
         // The second one is over the limit of one page.
         assert!(matches!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/b.html"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/b.html"),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -2358,27 +2336,13 @@ mod tests {
         for i in 0..5 {
             let target = format!("/page-{i}.html");
             assert_eq!(
-                limiter.check(
-                    "site",
-                    &cfg,
-                    Some(client),
-                    None,
-                    Some(&target),
-                    ClientGeo::default()
-                ),
+                check(&limiter, &cfg, client, &target),
                 LimitDecision::Allow,
                 "page {i} must be within the limit"
             );
         }
         assert!(matches!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/page-5.html"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/page-5.html"),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -2387,36 +2351,15 @@ mod tests {
     fn a_throttled_client_is_still_rejected_on_a_static_asset() {
         let (limiter, cfg) = limiter_with(policy(1, 0));
         let client = ip(203, 0, 113, 44);
-        limiter.check(
-            "site",
-            &cfg,
-            Some(client),
-            None,
-            Some("/"),
-            ClientGeo::default(),
-        );
+        check(&limiter, &cfg, client, "/");
         assert!(matches!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/"),
             LimitDecision::Throttled { .. }
         ));
         // The penalty box is the limiter's backstop: switching to an
         // image does not release a client it has already caught.
         assert!(matches!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(client),
-                None,
-                Some("/a.png"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, client, "/a.png"),
             LimitDecision::Throttled { .. }
         ));
     }
@@ -2426,14 +2369,7 @@ mod tests {
         let (limiter, mut cfg) = limiter_with(policy(10, 10));
         cfg.blacklist.insert("192.0.2.8").unwrap();
         assert_eq!(
-            limiter.check(
-                "site",
-                &cfg,
-                Some(ip(192, 0, 2, 8)),
-                None,
-                Some("/a.png"),
-                ClientGeo::default()
-            ),
+            check(&limiter, &cfg, ip(192, 0, 2, 8), "/a.png"),
             LimitDecision::Blocked
         );
     }
