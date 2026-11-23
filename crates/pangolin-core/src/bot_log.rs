@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::bot::{BotCategory, BotIdentity};
+use crate::bot::{BotCategory, BotCategoryStyle, BotIdentity};
 
 /// JSONL row for a single bot request.
 ///
@@ -1428,7 +1428,7 @@ const FIXTURE_CORE: &[FixtureHit] = &[
         client_ip: "160.79.104.1",
     },
     FixtureHit {
-        bot_name: "mediapartners-google",
+        bot_name: "adsbot",
         bot_vendor: "Google",
         category: BotCategory::AdsBot,
         host: "www.example.com",
@@ -1496,7 +1496,7 @@ const FIXTURE_SHOP: &[FixtureHit] = &[
     FixtureHit {
         bot_name: "amazonbot",
         bot_vendor: "Amazon",
-        category: BotCategory::SearchEngine,
+        category: BotCategory::AiBot,
         host: "shop.example.com",
         path: "/products/widget",
         status: 301,
@@ -1780,7 +1780,8 @@ mod tests {
     fn entry_serializes_bot_category_as_snake_case() {
         let e = bot_entry("Googlebot", "/");
         let json = serde_json::to_string(&e).unwrap();
-        // "SearchEngine" -> "search_engine" via BotCategory serde rename.
+        // The label is the crate's wire label (`BotCategory::as_str`),
+        // not a serde rename of the variant name.
         assert!(
             json.contains("\"bot_category\":\"search_engine\""),
             "{json}"
@@ -2982,13 +2983,7 @@ mod tests {
             },
         )
         .unwrap();
-        for name in [
-            "googlebot",
-            "bingbot",
-            "gptbot",
-            "claudebot",
-            "mediapartners-google",
-        ] {
+        for name in ["googlebot", "bingbot", "gptbot", "claudebot", "adsbot"] {
             assert!(
                 www.bots.iter().any(|b| b.bot_name == name),
                 "missing bot {name}"

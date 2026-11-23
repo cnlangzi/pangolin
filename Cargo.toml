@@ -118,13 +118,25 @@ ipnet = "2"
 # download and the RDNS workers; without it every URL-backed bot
 # would stay `Cold`.
 #
-# 0.3.0 is the floor (issue #157): its transport repeats a refused
+# 0.3.0 raised the floor (issue #157): its transport repeats a refused
 # download over the other address family and remembers the family
 # that delivered the list, so a tampered IPv6 path to a publisher can
 # no longer starve a crawler of its address list — 0.2.0 left the
 # address order to the system resolver, which hands back the AAAA
-# record first (upstream issue #57).
-knownbots = { version = "0.3.0", features = ["full"] }
+# record first (upstream issue #57). 0.4.0 keeps that behaviour.
+#
+# 0.4.0 (issue #230) owns the category vocabulary: the crate states the
+# coarse bucket of a crawler in its own definition and publishes the
+# `BotCategory` type with the wire labels. The labels are a published
+# contract, so the host consumes them instead of keeping a second copy
+# that could drift away from the one the JSONL rows carry.
+#
+# 0.4.0 also makes `category:` a REQUIRED field of every bot
+# definition, an operator's `<log.bot.cache_dir>/conf.d/` one
+# included: a file without one is skipped and reported, and the
+# crawler in it is never verified. The gateway logs the skipped files
+# at startup. See docs/design/knownbots.md ("The 0.4 category change").
+knownbots = { version = "0.4.0", features = ["full"] }
 
 # IP reputation (issue #141). The `full` feature compiles in every
 # provider the crate ships: the five list publishers (Spamhaus,

@@ -50,6 +50,13 @@ mod release_version;
 #[cfg(test)]
 mod knownbots_dependency;
 
+// The category vocabulary the host publishes (issue #230): which
+// bucket a crawler of the registry lands in, and the badge class the
+// admin page paints it with.  The labels are the crate's; these two
+// are the host's contract on top of them.
+#[cfg(test)]
+mod bot_category;
+
 // Dependency-swap regression tests (the `pangolin-tun` crate moved out
 // of this repository, issue #159).  Like the knownbots tests above,
 // these need neither the `integration` feature nor a real binary:

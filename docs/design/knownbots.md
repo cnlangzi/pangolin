@@ -3,7 +3,7 @@
 > **Status:** implemented
 > **Code:** the published `knownbots` crate —
 > [`github.com/cnlangzi/knownbots-rust`](https://github.com/cnlangzi/knownbots-rust),
-> consumed from crates.io as `knownbots` 0.3.0 (issues #146, #157)
+> consumed from crates.io as `knownbots` 0.4.0 (issues #146, #157, #230)
 > **Configs:** the crate's own `conf.d/` (embedded),
 > `<log.bot.cache_dir>/conf.d/` (operator)
 > **Contract test:** the crate's
@@ -17,10 +17,11 @@ config file must contain, what a verified request actually guarantees, and
 which parts of upstream are deliberately left out.
 
 The crate lives in **its own repository** and is **published to crates.io**
-(`knownbots` 0.3.0); pangolin consumes it from the registry and no longer
-carries a copy. What stays here is the consumer-side contract: the category
-mapping in `crates/pangolin-core/src/bot.rs`, the admin panel's view of the
-verification layer, and the operator-facing knobs.
+(`knownbots` 0.4.0); pangolin consumes it from the registry and no longer
+carries a copy. What stays here is the consumer-side contract: the admin
+panel's view of the verification layer and the operator-facing knobs. The
+category vocabulary and the mapping into it are the crate's — see
+[The category vocabulary](#the-category-vabulary).
 
 The log pipeline that consumes the verdict (JSONL, SSE, per-bot counters) is
 documented in [`bot-log.md`](./bot-log.md). The operator-facing knobs are in
@@ -116,6 +117,54 @@ three removed ids leave the table inert. The V14 migration rewrites
 `applebot-extended` to `applebot` — the request now identifies as
 `applebot`, and a site that deliberately kept it out of its exemptions must
 keep doing so — and deletes the two ids with no successor.
+
+### The 0.4 category change
+
+Since 0.4.0 the crate owns the **category** of a crawler, and every bot
+definition states its own. Two things follow for the operator.
+
+**A bot config that names no `category` is skipped.** The loader reads
+`category` as a required field: a document without one is incomplete, so
+it never reaches the registry. The crawler in it is then **not verified** —
+its traffic is not recognised as a bot's, it gets no bot-log row, no
+`P-Known-Bot` header and no rate-limit exemption, and it is missing from
+the site's bot list. The file is **not** fatal: the rest of the registry
+loads, the gateway starts, and the file is reported as skipped — on
+`/logs/bots` under "Verification status", and in the gateway log at
+startup:
+
+```
+WARN bot config skipped: /var/lib/pangolin/logs/bots/cache/conf.d/mybot.yaml — missing required 'category' field
+```
+
+**So an existing override file needs one line.** A file written for 0.3.0
+carries `name` / `ua` / `vendor` / `kind` and no `category`:
+
+```yaml
+# before (knownbots 0.3.0) — skipped by 0.4.0
+kind: SEO
+name: mybot
+vendor: "Example"
+ua: "MyBot"
+```
+
+```yaml
+# after (knownbots 0.4.0 and later)
+kind: SEO
+category: search_engine
+name: mybot
+vendor: "Example"
+ua: "MyBot"
+```
+
+The category is **not** derived from the `kind` — the kind says what the
+crawler does on the web, the category says which dashboard it belongs to.
+The bucket that fits a `Monitor` is a choice: `monitoring` or `ads_bot`
+(see [The category vocabulary](#the-category-vocabulary)).
+
+Nothing else changes for the operator: the embedded bots of the crate
+already carry their category, and the wire labels of the rows are the
+same as before.
 
 ### The address space — three sources
 
@@ -221,33 +270,50 @@ request that triggered it fails closed. See
 | ------------- | ---------------- |
 | `name` (the registry id, e.g. `googlebot`) | JSONL `bot_name`, and the `P-Known-Bot` response header (empty when the request is not a verified bot) |
 | `vendor` (e.g. `Google`) | JSONL `bot_vendor` |
-| `kind` (e.g. `SearchEngine`) | JSONL `bot_category`, after the coarse bucket mapping (`search_engine`, `ai_bot`, `social`, `ads_bot`, `monitoring`) |
+| `kind` (e.g. `SearchEngine`) | the fine-grained kind of the crawler — **not persisted**; the row carries the coarse `category` |
+| `category` (e.g. `SearchEngine`) | JSONL `bot_category`, the coarse bucket of the crate's vocabulary (`search_engine`, `ai_bot`, `social`, `ads_bot`, `monitoring`) |
 
 The registry id is the identity of the bot everywhere in the system. It is
 *not* the UA marker: `semrushbot-si` has the marker `SemrushBot-SI`, and
 `adsbot-mobile` has the marker `AdsBot-Google-Mobile`.
 
-### The category mapping — pangolin's own
+### The category vocabulary — the crate's
 
 The crate classifies a bot by `BotKind` (`SearchEngine`, `SocialMedia`,
 `AITraining`, `AIAssist`, `AIMixed`, `SEO`, `Monitor`, `Security`, `Scraper`,
-`Unknown`). The admin UI needs five coarser buckets, and the mapping between
-them lives **here**, in the consumer
-(`crates/pangolin-core/src/bot.rs` → `category_for`) — the library carries no
-admin vocabulary:
+`Unknown`) — that is the fine-grained kind, what the crawler does on the web.
+The **category** is the coarse bucket the admin UI groups by, and since 0.4.0
+the crate owns it: every bot definition states its own `category:`, the crate
+publishes the `BotCategory` type with its wire labels, and the host consumes
+both. Pangolin keeps no second copy of the enum, so there is no second source
+of truth that could drift away from the labels the JSONL rows carry.
 
-| `BotKind` | Bucket | Wire label |
-| --------- | ------ | ---------- |
-| `SearchEngine`, `SEO` | search engine | `search_engine` |
-| `AITraining`, `AIAssist`, `AIMixed` | AI bot | `ai_bot` |
-| `SocialMedia` | social | `social` |
-| `Monitor` **and** the name contains `ads` or `mediapartners` | ads bot | `ads_bot` |
-| `Monitor` (every other name), `Security`, `Scraper`, `Unknown` | monitoring | `monitoring` |
+| `BotKind` | Category | Wire label |
+| --------- | -------- | ---------- |
+| `SearchEngine`, `SEO` | `SearchEngine` | `search_engine` |
+| `AITraining`, `AIAssist`, `AIMixed` | `AiBot` | `ai_bot` |
+| `SocialMedia` | `Social` | `social` |
+| `Monitor` — the ad-quality crawlers | `AdsBot` | `ads_bot` |
+| `Monitor` — every other one, `Security`, `Scraper`, `Unknown` | `Monitoring` | `monitoring` |
 
-The `adsbot` / `mediapartners` names are pangolin's own filter vocabulary —
-the crate knows nothing about them — so the mapping needs the bot's **name**
-as well as its kind. The wire labels are the JSONL `bot_category` of every
-row and the values of the `/logs/bots` filters; they must not drift.
+A `Monitor` bot states which of the two buckets it is in: the ad-quality
+crawlers (`adsbot`, `adsbot-mobile`, `mediapartners-google`, `oai-adsbot`)
+say `ads_bot`, every other monitor says `monitoring`. The relation between a
+kind and a category lives in the crate's registry, and the crate's own
+contract test checks that the category a definition states is one its kind
+allows.
+
+The wire labels are the JSONL `bot_category` of every row and the values of
+the `/logs/bots` filters; they must not drift. They are the crate's
+vocabulary now — the label the crate publishes is the label the rows carry.
+
+The **badge** that paints a category is pangolin's own vocabulary and stays
+here: `BotCategoryStyle` in `crates/pangolin-core/src/bot.rs` is an
+extension trait — the category type belongs to the crate, so it cannot carry
+an inherent method — that maps a category to its Tailwind classes. Its
+fallback branch paints a bucket the crate gains later the neutral way, the
+same class the live-tail page's `categoryClass()` uses for a label it does
+not know.
 
 ## What is not logged
 
@@ -296,7 +362,8 @@ reads:
 | ----- | ---- | -------- | --------------------- |
 | `name` | string | **yes** | the file is skipped (embedded: fatal) — see rule 1 below |
 | `ua` | string | **yes** | the file is skipped (embedded: fatal) — see rule 2 below |
-| `kind` | enum | no | `Unknown` → the `monitoring` bucket. One of `SearchEngine`, `SocialMedia`, `AITraining`, `AIAssist`, `AIMixed`, `SEO`, `Monitor`, `Security`, `Scraper`; an unrecognised value becomes `Unknown` |
+| `category` | enum | **yes** | the file is skipped (embedded: fatal) — see rule 7 below. One of `search_engine`, `ai_bot`, `social`, `monitoring`, `ads_bot`; a value the crate does not know is skipped the same way |
+| `kind` | enum | no | `Unknown`. One of `SearchEngine`, `SocialMedia`, `AITraining`, `AIAssist`, `AIMixed`, `SEO`, `Monitor`, `Security`, `Scraper`; an unrecognised value becomes `Unknown` |
 | `vendor` | string | no | falls back to a **name-based heuristic** (`vendor_for`) — `google*` → `Google`, `bingbot` → `Microsoft`, `gptbot` → `OpenAI`, … A name the heuristic does not know becomes `Unknown` |
 | `parser` | string | no | **defaults to `txt`** — the list is read as plain CIDR / IP lines |
 | `urls` | list of strings | no | the bot is not URL-backed; its address space comes from `custom:` and / or `domains:` |
@@ -309,6 +376,14 @@ Notes:
 - **`name` is the id.** It is the value written to the JSONL `bot_name` field
   and to the `P-Known-Bot` header. It is also the key an operator override
   replaces on.
+- **`category` is the coarse bucket the crawler is grouped into**, and it is
+  the crate's vocabulary: the definition states it, the crate publishes the
+  labels, and the JSONL `bot_category` of a row is the label of the
+  definition. It is **not** derived from `kind` — the kind says what the
+  crawler does on the web, the category says which dashboard it belongs to,
+  and the two are facts of their own. A `Monitor` states `monitoring` or
+  `ads_bot`; the crate's contract test checks that the category a definition
+  states is one its kind allows.
 - **`parser` only matters for a URL-backed bot.** The list parsers this
   crate implements are `google`, `openai`, `uptimerobot`, `ahrefs`, `amazon`
   and `txt`. An unknown parser is *not* an error at load time — the list is
@@ -347,6 +422,11 @@ over the embedded set:
 6. **Every `*.yaml` / `*.yml` file in the crate's `conf.d/` is listed
    in `EMBEDDED_CONFIGS`.** A file that is not compiled into the crate is
    never parsed, so it does nothing at all.
+7. **Every definition states a `category`, and it is one the bot's `kind`
+   allows.** A definition that names no category is incomplete: the loader
+   skips it, so the crawler never reaches the registry and its traffic is
+   never recognised as a bot's. A category the kind does not allow puts the
+   crawler in a bucket that does not describe it.
 
 Which of these failures are **silent** — the loader accepts the config and
 the bot simply never verifies anything:
@@ -360,10 +440,12 @@ the bot simply never verifies anything:
 | 4 | no usable domain | silent — the bot is permanently unverified |
 | 5 | invalid `custom:` CIDR | silent — the loader skips it with a warning |
 | 6 | file not embedded | silent — the file is never read at all |
+| 7 | no `category` | **loud** — same fatal path as rules 1 and 2 |
+| 7 | a category the kind does not allow | silent — the loader does not check the relation; the bot lands in the bucket it named |
 
 The silent rows are the ones this contract test exists for: rules 3, 4, 5
 and 6 are exactly the failures that are invisible today, and so is the
-duplicate half of rule 1.
+duplicate half of rule 1 and the second half of rule 7.
 
 ```bash
 # The contract test — offline, no network access. It runs in the
@@ -395,7 +477,11 @@ its registry.
    the `name` field — `semrushbot-backlinks.yaml` declares
    `name: semrushbot-ba`. The file name is only the lookup key for
    `include_str!`; the `name` field is the registry id.
-3. Check the contract:
+3. State the bot's `category:` — one of the five labels of the crate's
+   vocabulary. The category is not derived from the `kind`: an embedded
+   definition without one is incomplete, and the loader refuses to start the
+   host over it.
+4. Check the contract:
 
    ```bash
    cargo test -p knownbots --lib
@@ -403,7 +489,7 @@ its registry.
 
    The contract test fails with **every** violation in one message, not just
    the first.
-4. Give the bot a `vendor:`. Without one the JSONL `bot_vendor` falls back
+5. Give the bot a `vendor:`. Without one the JSONL `bot_vendor` falls back
    to a name-based heuristic, and to `Unknown` for a name the heuristic does
    not know.
 
@@ -422,6 +508,7 @@ embedded bot **replaces** that bot — same fields, same schema.
 ```yaml
 # ./logs/bots/cache/conf.d/mybot.yaml
 kind: SEO
+category: search_engine
 name: mybot
 vendor: "Example"
 ua: "MyBot"
@@ -431,11 +518,13 @@ urls:
 ```
 
 An operator file that cannot be turned into a bot — a YAML syntax error, or
-a document without `name` / `ua` — is **skipped and reported**, not fatal: a
-typo in an override file must not take the gateway down. The file path and
-the reason show up on `/logs/bots`. The contract test does **not** cover
-operator files — it runs over the embedded set only, because that is the set
-this repository controls.
+a document without `name` / `ua` / `category` — is **skipped and reported**,
+not fatal: a typo in an override file must not take the gateway down. The
+file path and the reason show up on `/logs/bots`, and the gateway logs each
+skipped file at startup (a crawler that is not in the registry is not
+verified, and that is worth a line in the log). The contract test does
+**not** cover operator files — it runs over the embedded set only, because
+that is the set this repository controls.
 
 ## Relationship with upstream cnlangzi/knownbots
 
