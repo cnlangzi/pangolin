@@ -207,6 +207,15 @@ This sanitising applies to **this** log only. The access log and the bot log
 keep the raw `Referer` header verbatim (issue #228) — they are the forensic
 record, and the analyst there decides what to keep.
 
+**The two `referer` values are different strings.** This log's `referer` has
+its query string, fragment and userinfo removed; the access log's and the
+bot log's `referer` is the header as it arrived. A join on the `referer`
+key therefore matches nothing, and the access entry carries no
+`referer_host` to join on either. Correlate on `timestamp` + `method` +
+`path` + `host` — and remember that this log records only *external
+document navigations*, so the correlation is over a small subset of the
+access log's rows.
+
 ## In-memory state
 
 | Piece | What it holds | Bound |

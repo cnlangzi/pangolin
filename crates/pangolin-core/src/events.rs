@@ -43,9 +43,13 @@ pub struct AccessLogEntry {
     /// rows deserialise cleanly into `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
-    /// `Referer` header value, captured verbatim by the proxy on the
-    /// request hot path. `None` if the client didn't send one, the
-    /// header wasn't valid UTF-8, or it was longer than 4 KiB.
+    /// `Referer` header value, captured by the proxy on the request
+    /// hot path.
+    ///
+    /// `None` when the client sent no `Referer`, when the value was
+    /// empty, when it was not **visible ASCII** (the header parser
+    /// only yields `0x20..=0x7e` plus tab), or when it was longer
+    /// than 4 KiB.
     ///
     /// Verbatim: the operator analyses the raw value, and the
     /// analysis happens off the proxy path, so nothing is stripped or

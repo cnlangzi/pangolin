@@ -407,6 +407,14 @@ A row carries one more **optional** key: `referer`, the `Referer` header
 the crawler sent, verbatim. The key is absent from a row whose request
 carried no `Referer` header (issue #228).
 
+**The row is forensic, not sanitised.** A crawler can put anything into
+`Referer` — userinfo (`https://user:secret@…`), tokens in the query
+string, whatever it likes. The raw value is kept on purpose (the analyst
+decides what to keep), so **`log.bot.dir` holds secret-bearing material**
+and wants restricted permissions and the same retention care as a
+credential store. The referer log's own rows are the sanitised
+counterpart — see [`referer-log.md`](./referer-log.md).
+
 ## Admin surface
 
 | Page | What it shows |
@@ -575,7 +583,7 @@ duckdb -c "
 | Layer | Where | What's pinned |
 | ----- | ----- | ------------- |
 | Unit | `bot::tests::*` | All 5 categories detected, case-insensitive, more-specific patterns shadow generic ones, no duplicate needles, every category has at least one rule |
-| Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` omitted), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
+| Unit | `bot_log::tests::*` | Ring-buffer eviction, `from_access_log` field copy, JSONL wire format (flat, snake_case, `referer` present only when the request carried one and omitted otherwise), `from_access_log` inheriting the access entry's `referer` verbatim (issue #228), `drain_and_write` appends the full batch, daily rotation closes yesterday and opens today. **Stage-3** additions: `list_dates` filters non-matching files + sorts newest-first, `file_size_for` missing → 0, `query_history` paginates newest-first + applies every filter dimension + skips corrupt lines + reports file bytes, display helpers (`timestamp_local` / `status_class` / `category_class` / `duration_ms_human`) match the live-tail page's JS formatters |
 | Unit | `bot_stats::tests::*` | Per-(bot, host) keying, hit count aggregation, top-N sort order (`hits` desc → `host` asc → `bot_name` asc) and its tie-break, the summary describing the whole table rather than the returned rows, the cap dropping rows and counting the drops, `last_seen` updates |
 | Unit | `app::tests::*` (new stage-1 block) | Googlebot entry reaches all four sinks; non-bot UA touches none of them; missing UA short-circuits; the side-channel is always on (issue #117); multi-bot stats aggregation |
 | Unit | `admin::routes::logs::tests::*` (stage-3) | `parse_history_params` round-trips every filter, drops invalid status, decodes URL escapes, ignores unknown keys; `build_history_url` preserves all filters + omits empty ones; `render_bots_history` renders filter values back into the form + only matched rows in the table; date sidebar and pagination are full-page `/logs/bots/history` links (no HTMX fragment); `BotHistorySummary` row range + `file_size_human` bucketing |

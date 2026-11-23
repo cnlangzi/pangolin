@@ -112,17 +112,19 @@ pub struct RequestState {
     pub traffic_kind: pangolin_core::TrafficKind,
     pub host_known: bool,
     /// The raw `Referer` header, captured once per request in
-    /// `request_filter`. `None` when the client sent none or the
-    /// header wasn't valid UTF-8.
+    /// `request_filter`. `None` when the client sent none, when the
+    /// value was empty, when it was not **visible ASCII** (the
+    /// header parser only yields `0x20..=0x7e` plus tab), or when it
+    /// was longer than [`MAX_REFERRER_HEADER_LEN`].
     ///
     /// Kept raw because the classification needs the full URL: the
     /// parsed form ([`Self::referer_hit`]) is derived from it at the
     /// site lookup, and a request that turns out to be ineligible
     /// never pays for the parse.
     ///
-    /// The same value is what the access log and the bot log record —
-    /// verbatim, one byte unchanged. The analyst parses it off the
-    /// proxy path; the proxy does not.
+    /// The access log and the bot log record the same value — the
+    /// bytes the capture accepted, unchanged. The analyst parses it
+    /// off the proxy path; the proxy does not.
     pub referer: Option<String>,
     /// `Sec-Fetch-Dest` header value — the primary signal for
     /// "is this a top-level document navigation".

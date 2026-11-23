@@ -104,6 +104,19 @@ whatever the client sent. The proxy does not parse the value: the
 analysis happens off the proxy path, and it is the analyst's job to
 decide what to keep.
 
+**The entry is forensic, not sanitised.** A client can put anything into
+`Referer` — userinfo (`https://user:secret@…`), tokens in the query
+string. The raw value is kept on purpose, so the ring buffer, the SSE
+stream and `GET /api/v1/logs/access` carry secret-bearing material and
+want the same access care as a credential store. The referer log's own
+rows are the sanitised counterpart — see
+[`referer-log.md`](./referer-log.md).
+
+**Do not join this log against the referer log on `referer`.** The two
+logs store different strings under that name, and this entry carries no
+`referer_host` to join on either — see
+[`referer-log.md`](./referer-log.md) for the correlation key.
+
 Field set is locked by `tests/src/access_log_e2e.rs::access_log_sse_replays_then_streams_live`:
 a future change that renames or removes a field fails the test loudly
 instead of breaking the admin UI silently.
@@ -145,8 +158,8 @@ The entry is built **once** per request and wrapped in an `Arc`
 hold a reference to that one allocation, so the fan-out copies a reference
 count instead of the entry. The **access log's own** per-request
 allocations drop from 24 (one subscriber) to 8 — the `Arc` plus the
-entry's seven allocating fields (`referer` is the seventh: the proxy
-copies the captured header into the entry once, like the `User-Agent`).
+entry's seven allocating fields (`referer` is the seventh: the header is
+copied once into the entry, and the shared entry copies it no further).
 The request context is a separate budget: it still allocates its own
 strings, but it no longer copies the `User-Agent` at all (issue #224
 reads it in place, and the access log copies it once, when it builds the

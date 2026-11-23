@@ -86,8 +86,9 @@ pub struct BotLogEntry {
     pub ua: String,
 
     /// `Referer` header value, verbatim. `None` when the request
-    /// carried no `Referer` header (or one that was not valid UTF-8,
-    /// or one longer than 4 KiB).
+    /// carried no `Referer` header — or one that was empty, not
+    /// visible ASCII, or longer than 4 KiB (the proxy's capture
+    /// rule).
     ///
     /// The same string the access log carries — the two logs must
     /// agree on one request, so an analyst can join the two tables.

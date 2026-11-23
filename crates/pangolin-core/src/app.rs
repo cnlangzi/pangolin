@@ -1182,9 +1182,11 @@ impl App {
     /// It is a **separate** method rather than a branch inside
     /// [`App::push_access_log`]: the bot branch of that method
     /// returns early in five places, so a referer branch placed
-    /// after it would never fire. It also keeps the
-    /// [`AccessLogEntry`] wire format unchanged, so the general
-    /// `/logs` SSE stream and the bot JSONL are unaffected.
+    /// after it would never fire. It also keeps the *classification*
+    /// out of [`AccessLogEntry`]: the entry carries the raw
+    /// `Referer` header (issue #228), this method carries the parsed
+    /// [`RefererHit`]. The general `/logs` SSE stream and the bot
+    /// JSONL are otherwise unaffected.
     ///
     /// The whole fan-out is synchronous (no `.await`); the actual
     /// disk write happens in the background `RefererLogWriter::run`
