@@ -364,9 +364,12 @@ place. The bot log — the sibling side-channel — has been always-on since
 issue #117, and the two are shaped the same way.
 
 A configuration file that still contains `log.referer.enabled` parses
-successfully and logs a warning naming the retired key. The other three keys
-in the block — `recent`, `capacity` and `dir` — are growth and placement
-knobs, not switches, and they are unchanged.
+successfully and logs a warning naming the retired key. The environment form,
+`NGX_LOG__REFERER__ENABLED`, is ignored **without** a warning: the loader
+layers the `NGX_*` environment on top of the file, and the retired key is no
+longer a field, so there is nothing for the loader to complain about. The
+other three keys in the block — `recent`, `capacity` and `dir` — are growth
+and placement knobs, not switches, and they are unchanged.
 
 ## Failure modes
 

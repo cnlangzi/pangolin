@@ -523,8 +523,9 @@ pub struct App {
     /// Background JSONL writer.
     ///
     /// The referer log is always on (issue #227), so the writer
-    /// always exists — the field stays an `Option` so a caller can
-    /// build an `App` without a side-channel at all.
+    /// always exists. The field stays an `Option` to mirror the bot
+    /// writer's shape; the `None` branch is a safety net, not a
+    /// configuration state.
     ///
     /// Like the bot writer, the writer *object* is built in
     /// [`App::new`] but the task that drains its queue is **not**
@@ -714,7 +715,7 @@ impl App {
         // be unconditional, and a disabled bot log silently turned
         // the gateway's `P-Known-Bot` header into an empty value.
         // The retired `log.bot.enabled` key is ignored —
-        // `Config::from_str` warns about it.
+        // `warn_retired_keys` names it in the log.
         //
         // The writer *object* is built here, but the task that
         // drains its queue is NOT spawned here. `App::new` runs
@@ -1178,9 +1179,9 @@ impl App {
     /// disk write happens in the background `RefererLogWriter::run`
     /// task.
     ///
-    /// No-op when the writer is absent — the side-channel is always
-    /// on (issue #227), so that only happens for an `App` built
-    /// without one.
+    /// No-op when the writer is absent. The side-channel is always on
+    /// (issue #227), so the writer always exists — the `None` branch
+    /// is a safety net.
     pub fn push_referer_log(&self, entry: &AccessLogEntry, hit: &RefererHit) {
         let Some(writer) = self.referer_writer.as_ref() else {
             return;

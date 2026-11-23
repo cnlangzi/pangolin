@@ -177,9 +177,11 @@ impl Default for SupervisorConfig {
 /// the hot path had to drop.
 #[derive(Clone, Debug, Default)]
 pub struct WriterHealth {
-    /// `false` when there is no writer at all (the side channel is
-    /// disabled) — the panel then says the status is unavailable
-    /// instead of claiming health.
+    /// Whether the side channel has a writer at all.
+    ///
+    /// Always `true` today: the bot log (issue #117) and the referer
+    /// log (issue #227) are both always on, so both writers exist.
+    /// The field stays so the panel does not have to know that.
     pub available: bool,
     /// The writer task is running right now.
     pub alive: bool,

@@ -718,9 +718,24 @@ impl NgxProcess {
     ///
     /// `extra_log` is YAML that lands inside the `log:` block, so a
     /// test can configure a side-channel the way an operator would —
-    /// a retired key, a directory.
+    /// a retired key, a directory. The block is indented here rather
+    /// than by the caller: a caller that forgot the two spaces would
+    /// put the keys at the top level, where the loader ignores them,
+    /// and the test would silently stop exercising what it was
+    /// written for.
     pub async fn start_with_log_config<F: FnOnce(&Path)>(seed_db: F, extra_log: &str) -> Self {
-        Self::start_inner(seed_db, false, extra_log).await
+        let indented: String = extra_log
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    line.to_string()
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::start_inner(seed_db, false, &indented).await
     }
 
     /// Start ngx with the tunnel's **UDP** port already occupied by a

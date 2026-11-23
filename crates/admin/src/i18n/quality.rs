@@ -198,9 +198,7 @@ const ALLOWED_ENGLISH_TEXT: &[&str] = &[
     "file",
     "http",
     "https",
-    // The configuration keys and the environment variable the log
-    // pages quote.
-    "NGX_LOG__REFERER__ENABLED=true",
+    // The configuration keys the log pages quote.
     "api.listen",
     "api_disabled",
     "client_ip",

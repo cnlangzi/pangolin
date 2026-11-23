@@ -715,28 +715,14 @@ pub fn init_logger(log_cfg: &LogConfig) {
 }
 
 impl Config {
-    /// Load from a YAML file, with `NGX_*` env vars layered on top.
-    /// Missing optional sections / fields fall back to the defaults
-    /// declared via `#[serde(default = "…")]` on the struct.
-    ///
-    /// The file's raw text comes back with the parsed
-    /// configuration: the retired-key warnings are derived from it
-    /// (see [`warn_retired_keys`]), and they can only be emitted once
-    /// the process logger is installed — which is after the parse.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<(Self, String)> {
-        let s = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
-        let c = Self::from_str(&s)?;
-        Ok((c, s))
-    }
-
-    /// Parse from a YAML string (used in tests) with the same env
-    /// override as [`from_file`]. The two-arg form makes the layered
-    /// load explicit at the call site.
+    /// Parse from a YAML string, with the `NGX_*` env vars layered
+    /// on top. Missing optional sections / fields fall back to the
+    /// defaults declared via `#[serde(default = "…")]` on the struct.
     ///
     /// The retired-key warnings are **not** emitted here — see
-    /// [`warn_retired_keys`]: the process logger does not exist yet
-    /// while the configuration is parsed, so a `log::warn!` emitted
-    /// at that point would be swallowed.
+    /// [`load_config_and_init_logger`]: the process logger does not
+    /// exist yet while the configuration is parsed, so a `log::warn!`
+    /// emitted at that point would be swallowed.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         Figment::new()
@@ -747,6 +733,24 @@ impl Config {
     }
 }
 
+/// Load the configuration from a file and install the process logger.
+///
+/// The two happen together because the retired-key warnings need the
+/// logger: a `log::warn!` emitted before the logger exists is
+/// swallowed by the `log` crate's no-op logger, so a configuration
+/// file that still carries a retired key would be accepted in
+/// silence.
+///
+/// One place owns the load, so a new binary cannot forget the
+/// warning. (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
+pub fn load_config_and_init_logger(path: impl AsRef<Path>) -> Result<Config> {
+    let raw = std::fs::read_to_string(path).map_err(PangolinError::Io)?;
+    let config = Config::from_str(&raw)?;
+    init_logger(&config.log);
+    warn_retired_keys(&raw);
+    Ok(config)
+}
+
 /// Warn about configuration keys that have been retired.
 ///
 /// The key is *not* an error: an old `ngx.yml` must keep working —
@@ -754,12 +758,12 @@ impl Config {
 /// `log.bot.enabled` (issue #117) and `log.referer.enabled` (issue
 /// #227): both side-channels are always on.
 ///
-/// The caller must invoke this **after** the process logger has been
-/// installed: a `log::warn!` emitted before that is swallowed by the
-/// `log` crate's no-op logger, so a warning emitted while the
-/// configuration was being parsed would never reach the operator.
-/// (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
-pub fn warn_retired_keys(s: &str) {
+/// Only the file's own text is inspected: the `NGX_*` environment
+/// layer is layered on top of it by the loader, so a key set through
+/// the environment is ignored without a warning. The operator learns
+/// about the retired key from the file, which is where the knob is
+/// documented.
+fn warn_retired_keys(s: &str) {
     // `find_value` walks the parsed YAML — `Err(MissingField)` means
     // the key is not there, `Ok(_)` means it is. A YAML syntax error
     // is reported by the loader; don't double-report it here.

@@ -49,8 +49,7 @@ use pingora::proxy::http_proxy_service;
 use pingora::server::{RunArgs, Server};
 use pingora::services::listening::Service;
 
-use pangolin_core::config::{Config, warn_retired_keys};
-use pangolin_core::init_logger;
+use pangolin_core::config::Config;
 use tokio_util::sync::CancellationToken;
 
 // ---- CLI entry point ----
@@ -91,17 +90,14 @@ fn main() -> anyhow::Result<()> {
 
     // ---- 1. Blocking init --------------------------------------------------
     let args = Args::parse();
-    let (config, raw_config) =
-        Config::from_file(&args.config).map_err(|e| anyhow::anyhow!("config error: {}", e))?;
-    // Now that config is loaded, honor its `[log]` section for the
-    // process logger (shared with `tun`).
-    init_logger(&config.log);
-    // The retired-key warnings come *after* the logger: a `log::warn!`
-    // emitted while the configuration was parsed would be swallowed by
-    // the `log` crate's no-op logger, and the operator would never
-    // learn which key is gone.
+    // The configuration and the process logger are set up together:
+    // the retired-key warnings need the logger, and a `log::warn!`
+    // emitted before the logger exists would be swallowed by the
+    // `log` crate's no-op logger — the operator would never learn
+    // which key is gone.
     // (see `referer_log_e2e::the_referer_log_records_even_when_the_config_carries_the_retired_key`)
-    warn_retired_keys(&raw_config);
+    let config = pangolin_core::load_config_and_init_logger(&args.config)
+        .map_err(|e| anyhow::anyhow!("config error: {}", e))?;
 
     let db_path = PathBuf::from("pangolin.db");
     let cert_manager = CertManager::new(

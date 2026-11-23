@@ -47,7 +47,7 @@ use tokio::time::timeout;
 
 use crate::harness::{
     NgxProcess, admin_session_cookie, init_pangolin_db, raw_request_with_headers,
-    read_sse_data_frames,
+    read_sse_data_frames, wait_for_log,
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -377,16 +377,23 @@ async fn the_referer_log_records_even_when_the_config_carries_the_retired_key() 
                 seed_domain(&conn, "example.test", "web");
             }
         },
-        "  referer:\n    enabled: false\n",
+        "referer:\n  enabled: false\n",
     )
     .await;
 
     // The operator is told which key is gone — and the warning has to
-    // reach the log, not just the code.
-    let log = ngx.log_string();
+    // reach the log, not just the code. The log is drained
+    // asynchronously, so poll for the line instead of racing it.
+    let warned = wait_for_log(
+        &ngx.log,
+        "`log.referer.enabled` has been retired and is ignored",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
-        log.contains("`log.referer.enabled` has been retired and is ignored"),
-        "the retired-key warning is missing from the gateway's log:\n{log}"
+        warned,
+        "the retired-key warning is missing from the gateway's log:\n{}",
+        ngx.log_string()
     );
 
     let (status, _) = raw_request_with_headers(

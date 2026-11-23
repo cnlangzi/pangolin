@@ -374,20 +374,23 @@ fn every_path_in_the_config_templates_is_absolute() {
 /// place an operator learns a knob exists, so it has to be clean on
 /// its own — `log.bot.enabled` was retired in issue #117 and
 /// `log.referer.enabled` in issue #227.
+///
+/// The check is on the *parsed document*, not on the text: a template
+/// that carries the key the way YAML spells it (`referer:` /
+/// `enabled: true`) never contains the dotted path, so a substring
+/// scan would wave it through.
 #[test]
 fn the_config_templates_carry_no_retired_keys() {
     for template in ["packaging/config/ngx.yml", "packaging/config/tun.yml"] {
         let text = read_repo_file(template);
-        assert!(
-            !text.contains("log.bot.enabled"),
-            "{template} carries the retired `log.bot.enabled` key — the loader ignores it \
-             silently, so the template must not mention it"
-        );
-        assert!(
-            !text.contains("log.referer.enabled"),
-            "{template} carries the retired `log.referer.enabled` key — the loader ignores it \
-             silently, so the template must not mention it"
-        );
+        let document = figment::Figment::new().merge(figment::providers::Yaml::string(&text));
+        for key in ["log.bot.enabled", "log.referer.enabled"] {
+            assert!(
+                document.find_value(key).is_err(),
+                "{template} carries the retired `{key}` key — the loader ignores it \
+                 silently, so the template must not offer it"
+            );
+        }
     }
 }
 

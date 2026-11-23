@@ -3805,23 +3805,13 @@ mod tests {
 
     // ---- Referer log page tests ----
 
-    /// Build an `App` whose `log.referer.dir` points at `referer_dir`.
-    /// Same skeleton as `make_test_app_with_bot_dir` — the writer
-    /// creates the directory lazily, so swapping the config field is
-    /// enough for the history reader to see the seeded files.
-    fn make_test_app_with_referer_dir(referer_dir: std::path::PathBuf) -> (TempDir, Arc<App>) {
+    /// Build an `App` from `cfg`, in a throwaway directory.
+    ///
+    /// The skeleton every referer-page test needs: a tempdir that
+    /// holds the database, and an `App` built from the configuration.
+    fn make_test_app_with_config(cfg: Config) -> (TempDir, Arc<App>) {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
-        let cfg = Config {
-            log: LogConfig {
-                referer: pangolin_core::RefererLogConfig {
-                    dir: referer_dir,
-                    ..pangolin_core::RefererLogConfig::default()
-                },
-                ..LogConfig::default()
-            },
-            ..Config::default()
-        };
         let app = Arc::new(
             App::new(
                 db_path.to_str().expect("db path utf8"),
@@ -3833,6 +3823,24 @@ mod tests {
         (dir, app)
     }
 
+    /// Build an `App` whose `log.referer.dir` points at `referer_dir`.
+    /// Same skeleton as `make_test_app_with_bot_dir` — the writer
+    /// creates the directory lazily, so swapping the config field is
+    /// enough for the history reader to see the seeded files.
+    fn make_test_app_with_referer_dir(referer_dir: std::path::PathBuf) -> (TempDir, Arc<App>) {
+        let cfg = Config {
+            log: LogConfig {
+                referer: pangolin_core::RefererLogConfig {
+                    dir: referer_dir,
+                    ..pangolin_core::RefererLogConfig::default()
+                },
+                ..LogConfig::default()
+            },
+            ..Config::default()
+        };
+        make_test_app_with_config(cfg)
+    }
+
     /// Build an `App` from a configuration that still carries the
     /// retired `log.referer.enabled` key.
     ///
@@ -3841,8 +3849,6 @@ mod tests {
     fn make_test_app_with_retired_referer_key(
         referer_dir: std::path::PathBuf,
     ) -> (TempDir, Arc<App>) {
-        let dir = TempDir::new().expect("tempdir");
-        let db_path = dir.path().join("test.db");
         let mut cfg = Config::from_str("log:\n  referer:\n    enabled: false\n")
             .expect("an old config must still parse");
         // The loader merges the `NGX_*` environment layer, so the
@@ -3850,15 +3856,7 @@ mod tests {
         cfg.log.referer.recent = 200;
         cfg.log.referer.capacity = 1000;
         cfg.log.referer.dir = referer_dir;
-        let app = Arc::new(
-            App::new(
-                db_path.to_str().expect("db path utf8"),
-                cfg,
-                CertManager::default(),
-            )
-            .expect("App::new"),
-        );
-        (dir, app)
+        make_test_app_with_config(cfg)
     }
 
     /// Seed a site with the given domains and reload the index so
@@ -4138,29 +4136,42 @@ mod tests {
         let referer_dir = dir.path().join("referers");
         let (_keep, app) = make_test_app_with_retired_referer_key(referer_dir);
 
-        for html in [
-            response_html(
-                render_referers(&app, "csrf-token", b"", Lang::En)
-                    .await
-                    .expect("live render"),
-            )
-            .await,
-            response_html(
-                render_referers_history(&app, "csrf-token", b"", Lang::En)
-                    .await
-                    .expect("history render"),
-            )
-            .await,
-            response_html(
-                render_referers_stats(&app, "csrf-token", b"", Lang::En)
-                    .await
-                    .expect("stats render"),
-            )
-            .await,
+        // Each page renders its own content, not a "feature disabled"
+        // panel. The markers are the regions the panel used to
+        // replace: before the retirement the disabled branch took the
+        // whole page, so none of them was there.
+        for (html, marker) in [
+            (
+                response_html(
+                    render_referers(&app, "csrf-token", b"", Lang::En)
+                        .await
+                        .expect("live render"),
+                )
+                .await,
+                "referers-summary",
+            ),
+            (
+                response_html(
+                    render_referers_history(&app, "csrf-token", b"", Lang::En)
+                        .await
+                        .expect("history render"),
+                )
+                .await,
+                "referers-history-form",
+            ),
+            (
+                response_html(
+                    render_referers_stats(&app, "csrf-token", b"", Lang::En)
+                        .await
+                        .expect("stats render"),
+                )
+                .await,
+                "action=\"/logs/referers/stats\"",
+            ),
         ] {
             assert!(
-                !html.contains("Referer logging is disabled"),
-                "the retired key must not bring the disabled notice back: {html}"
+                html.contains(marker),
+                "the ordinary page must render, not a disabled notice: {html}"
             );
             assert!(
                 html.contains("Referer Logs"),
