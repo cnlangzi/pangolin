@@ -145,6 +145,10 @@ Limits are configured **per site** and counted **per client IP**:
     `page_window_secs`). A "page" here is **path plus query string**:
     `/a?id=1` and `/a?id=2` are two different pages. Going over on either
     dimension is going over.
+- **Both dimensions count content requests only**: a static asset (an
+  image, a script, a stylesheet, a font, a media file or an archive) is
+  counted by neither of them and occupies no slot — a client that only
+  fetches images is not limited for fetching images.
 - **IP allow / block rules** match a **single address** (`1.2.3.4`) or a
   **CIDR range** (`10.0.0.0/8`), and can apply **globally** or to **one site
   only**. The longest prefix wins, and at equal prefix length an allow rule

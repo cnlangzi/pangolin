@@ -5,6 +5,9 @@
 //! per counting window, and a set of IP rules (allow / block) that
 //! apply globally or to that site alone.
 //!
+//! Both dimensions count **content** requests: a static asset is
+//! counted by neither of them (see [`crate::static_asset`]).
+//!
 //! The module has **no pingora dependency** so it can be unit-tested
 //! on its own; the proxy hot path lives in `ngx`.
 //!
@@ -1387,8 +1390,10 @@ impl RateLimiter {
     /// header. A bot whose id is in the site's `bot_limited` list is
     /// not exempt: it is counted and limited like any other client.
     ///
-    /// `page_key` is the request target (path + query) used by the
-    /// distinct-page dimension.
+    /// `target` is the request target (path + query). It gates both
+    /// counting dimensions: a target that names a static asset is
+    /// counted by neither of them — see
+    /// [`crate::static_asset::is_static_asset_target`].
     ///
     /// `geo` is the client's geo, as reported by the provider. It is
     /// recorded when the client is rejected — it never influences the
@@ -1399,7 +1404,7 @@ impl RateLimiter {
         cfg: &SiteLimitConfig,
         ip: Option<IpAddr>,
         bot_name: Option<&str>,
-        page_key: Option<&str>,
+        target: Option<&str>,
         geo: ClientGeo<'_>,
     ) -> LimitDecision {
         let Some(ip) = ip else {
@@ -1415,7 +1420,7 @@ impl RateLimiter {
                 _ => LimitDecision::Allow,
             };
         };
-        state.lock().check(site, cfg, ip, bot_name, page_key, geo)
+        state.lock().check(site, cfg, ip, bot_name, target, geo)
     }
 
     /// Record what the IP reputation library said about a client
@@ -1692,7 +1697,7 @@ impl SiteState {
         cfg: &SiteLimitConfig,
         ip: IpAddr,
         bot_name: Option<&str>,
-        page_key: Option<&str>,
+        target: Option<&str>,
         geo: ClientGeo<'_>,
     ) -> LimitDecision {
         // 1. The operator's rules come first: an explicit block is
@@ -1751,11 +1756,21 @@ impl SiteState {
             return LimitDecision::Throttled { retry_after };
         }
 
+        // 5. A static asset is not content: it is counted by neither
+        //    dimension. The skip comes after the penalty box, so a
+        //    client the limiter has already caught stays rejected even
+        //    when it switches to images.
+        if let Some(target) = target
+            && crate::static_asset::is_static_asset_target(target)
+        {
+            return LimitDecision::Allow;
+        }
+
         let mut req_over = false;
         let mut page_over = false;
         let mut tracked = false;
 
-        // 5. The request-count dimension.
+        // 6. The request-count dimension.
         if policy.req_limit > 0 {
             self.advance_req_epoch(now, policy.req_window_secs);
             let (over, was_tracked) = self.count_request(ip, policy.req_limit);
@@ -1766,10 +1781,10 @@ impl SiteState {
             }
         }
 
-        // 6. The distinct-page dimension.
+        // 7. The distinct-page dimension.
         if policy.page_limit > 0 {
             self.advance_page_epoch(now, policy.page_window_secs);
-            let (over, was_tracked) = self.count_page(ip, page_key, policy.page_limit);
+            let (over, was_tracked) = self.count_page(ip, target, policy.page_limit);
             tracked |= was_tracked;
             if over {
                 page_over = true;
@@ -1780,7 +1795,7 @@ impl SiteState {
             self.counted += 1;
         }
 
-        // 7. The verdict is the union of the two dimensions.
+        // 8. The verdict is the union of the two dimensions.
         if req_over || page_over {
             self.throttled += 1;
             self.insert_penalty(ip, now, policy.throttle_secs);
@@ -1855,7 +1870,7 @@ impl SiteState {
     /// Count one distinct page in the page ring.
     ///
     /// Returns `(over_the_limit, was_tracked)`.
-    fn count_page(&mut self, ip: IpAddr, page_key: Option<&str>, limit: u32) -> (bool, bool) {
+    fn count_page(&mut self, ip: IpAddr, key: Option<&str>, limit: u32) -> (bool, bool) {
         let Some(idx) = Self::slot_index(self.page_ring.len(), &ip) else {
             self.untracked += 1;
             return (false, false);
@@ -1879,8 +1894,8 @@ impl SiteState {
         let over;
         {
             let slot = &mut self.page_ring[idx];
-            if let Some(key) = page_key {
-                slot.sketch.insert(hash_bytes(key.as_bytes()));
+            if let Some(page) = key {
+                slot.sketch.insert(hash_bytes(page.as_bytes()));
             }
             let estimate = slot.sketch.estimate();
             if estimate > limit as f64 {
@@ -2211,6 +2226,216 @@ mod tests {
             ),
             LimitDecision::Throttled { .. }
         ));
+    }
+
+    #[test]
+    fn a_static_asset_is_counted_by_neither_dimension() {
+        let (limiter, cfg) = limiter_with(policy(10, 10));
+        let client = ip(203, 0, 113, 40);
+        // A crawler that walks a hundred images has fetched no content:
+        // it is served every time and none of it is counted.
+        for i in 0..100 {
+            let target = format!("/img/{i}.png");
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    None,
+                    Some(&target),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow,
+                "image {i} must be served"
+            );
+        }
+        let snap = limiter.snapshot_now();
+        assert_eq!(snap.sites[0].counted, 0);
+        assert_eq!(snap.sites[0].req_over_events, 0);
+        assert_eq!(snap.sites[0].page_over_events, 0);
+        assert_eq!(snap.sites[0].throttled, 0);
+    }
+
+    #[test]
+    fn a_static_asset_request_is_not_counted_toward_the_request_limit() {
+        let (limiter, cfg) = limiter_with(policy(10, 0));
+        let client = ip(203, 0, 113, 41);
+        for i in 0..100 {
+            let target = format!("/img/{i}.png");
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    None,
+                    Some(&target),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow,
+                "image {i} must be served"
+            );
+        }
+        // The images took none of the ten requests the limit allows, so
+        // the tenth content request is still within it …
+        for i in 0..10 {
+            let target = format!("/page-{i}");
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    None,
+                    Some(&target),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow,
+                "content request {i} must be within the limit"
+            );
+        }
+        // … and the eleventh one is over it.
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/page-10"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+    }
+
+    #[test]
+    fn a_static_asset_does_not_consume_a_page_slot() {
+        let (limiter, cfg) = limiter_with(policy(0, 1));
+        let client = ip(203, 0, 113, 42);
+        for i in 0..100 {
+            let target = format!("/img/{i}.png");
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    None,
+                    Some(&target),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow,
+                "image {i} must be served"
+            );
+        }
+        // The first content page is the client's first distinct page.
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/a.html"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Allow
+        );
+        // The second one is over the limit of one page.
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/b.html"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+    }
+
+    #[test]
+    fn a_content_page_still_trips_the_page_limit() {
+        let (limiter, cfg) = limiter_with(policy(0, 5));
+        let client = ip(203, 0, 113, 43);
+        for i in 0..5 {
+            let target = format!("/page-{i}.html");
+            assert_eq!(
+                limiter.check(
+                    "site",
+                    &cfg,
+                    Some(client),
+                    None,
+                    Some(&target),
+                    ClientGeo::default()
+                ),
+                LimitDecision::Allow,
+                "page {i} must be within the limit"
+            );
+        }
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/page-5.html"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+    }
+
+    #[test]
+    fn a_throttled_client_is_still_rejected_on_a_static_asset() {
+        let (limiter, cfg) = limiter_with(policy(1, 0));
+        let client = ip(203, 0, 113, 44);
+        limiter.check(
+            "site",
+            &cfg,
+            Some(client),
+            None,
+            Some("/"),
+            ClientGeo::default(),
+        );
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+        // The penalty box is the limiter's backstop: switching to an
+        // image does not release a client it has already caught.
+        assert!(matches!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(client),
+                None,
+                Some("/a.png"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Throttled { .. }
+        ));
+    }
+
+    #[test]
+    fn a_blacklisted_client_is_still_rejected_on_a_static_asset() {
+        let (limiter, mut cfg) = limiter_with(policy(10, 10));
+        cfg.blacklist.insert("192.0.2.8").unwrap();
+        assert_eq!(
+            limiter.check(
+                "site",
+                &cfg,
+                Some(ip(192, 0, 2, 8)),
+                None,
+                Some("/a.png"),
+                ClientGeo::default()
+            ),
+            LimitDecision::Blocked
+        );
     }
 
     #[test]

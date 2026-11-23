@@ -17,6 +17,9 @@ limiter *acts* on it.
 - A per-site distinct-page limit per client IP per counting window.
   The page identity is the full request target — path **plus** query
   string — so `/a?id=1` and `/a?id=2` are two different pages.
+- Both dimensions measure **content fetching**: a request for a static
+  asset is counted by neither of them (see
+  [Static assets](#static-assets)).
 - IP allow / block rules, scoped globally or to one site, matching
   single addresses and CIDR ranges.
 - Hard enforcement (429 / 403), no artificial delay.
@@ -47,7 +50,9 @@ limiter *acts* on it.
 | Slot | One entry in a ring, owned by at most one client IP at a time. |
 | Known bot | A client whose User-Agent *and* client IP pass the `knownbots` verification (`knownbots::VerifyStatus::Verified`). Pending / failed / unknown claims are not known bots. |
 | Bot-limited list | The per-site set of registry ids whose bots are **not** exempt on that site. An empty list means every verified bot is exempt. |
-| Distinct page | The request target path plus its query string (`path?query`), treated as one unit. |
+| Target | The client's request target as it arrived: the path plus the query string (`uri.path_and_query()`), **not** percent-decoded. |
+| Distinct page | A target that is not a static asset, treated as one unit. |
+| Static asset | A target whose path ends in one of the extensions listed in [Static assets](#static-assets) — an image, a script, a stylesheet, a font, a media file or an archive. |
 | Rule | An IP blacklist or whitelist entry — a single IP or a CIDR range — scoped globally or to one site. |
 | Whitelist / blacklist | A whitelist match exempts a client from all counting and limiting; a blacklist match rejects the request outright. |
 | Geo | The visitor's country and region, as reported by the provider's first-level headers. |
@@ -240,11 +245,13 @@ if let Some(bot) = bot_name && !cfg.bot_limited.contains(bot) { pass }
 if !cfg.policy.enabled { pass }
 // 5. penalty box -> 429, without counting and without touching a slot
 if penalty_box.contains(ip) { respond 429 with Retry-After }
-// 6. request dimension
+// 6. static asset -> not counted by either dimension
+if is_static_asset_target(target) { pass }
+// 7. request dimension
 if policy.req_limit > 0 { … count … }
-// 7. page dimension
+// 8. page dimension
 if policy.page_limit > 0 { … count … }
-// 8. verdict
+// 9. verdict
 if request_over || page_over {
     penalty_box.insert(ip, now + throttle_secs)   // best effort
     respond 429 with Retry-After
@@ -345,6 +352,64 @@ A rate-limited request and a rule-blocked request are logged with the
 site, the client IP and the reason. Repeated identical events are
 logged at a reduced rate — the first, then every 1000th — so an
 attack does not flood the log.
+
+## Static assets
+
+A request for a static asset — an image, a script, a stylesheet, a
+font, a media file or an archive — is not a content request. It is
+counted by **neither** dimension: it does not occupy a slot in the
+request ring, it does not grow the page sketch, and it is not part of
+the "counted" statistic. A client that walks a site's images has
+fetched no content, so the limits do not apply to it.
+
+The rule is decided by the **extension of the path**, not by the
+response's `Content-Type`: the decision is taken in `request_filter`,
+before the backend is contacted, so no response header exists yet. The
+path is read as it arrived — it is not percent-decoded.
+
+The extension is the text after the last `.` of the **last path
+segment**; the query string takes no part in the decision, so
+`/app.css?v=3` is a static asset while `/download?file=x.js` is not.
+The comparison is case-insensitive.
+
+| Category | Extensions |
+| --- | --- |
+| Images | `png` `jpg` `jpeg` `jfif` `gif` `bmp` `ico` `svg` `apng` `webp` `avif` `tif` `tiff` `heic` `heif` |
+| Scripts and source maps | `js` `mjs` `cjs` `map` `wasm` |
+| Stylesheets | `css` |
+| Fonts | `woff` `woff2` `ttf` `otf` `eot` |
+| Media and playlists | `mp4` `webm` `m4v` `mov` `avi` `mkv` `mp3` `m4a` `wav` `ogg` `oga` `opus` `flac` `aac` `weba` `m3u8` `mpd` |
+| Archives | `zip` `gz` `tgz` `bz2` `xz` `7z` `rar` `tar` |
+
+Everything else is a page — including `html` `htm` `php` `json` `xml`
+`txt` `pdf` `md`, which carry content, and every extension the list
+does not name.
+
+The decision is made by
+`pangolin_core::static_asset::is_static_asset_target`, in the step
+after the penalty box and before the two counting dimensions. A client
+already in the penalty box stays rejected even when it asks for an
+image: the penalty box is the limiter's backstop for a client it has
+already caught. The IP rules and the known-bot exemption keep their
+precedence, so a blacklisted client is still answered 403 for an
+image.
+
+The rule is deliberately narrow. A path without an extension
+(`/media/12345`), a dot in a directory name (`/v1.2/page`) and an
+extension that only appears in the query string
+(`/download?file=x.js`) are all pages. Both misses only ever make a
+client count **more**, never less, so they cannot be used to slip past
+a limit.
+
+### Effect on existing deployments
+
+The rule is a relaxation: an upgraded deployment stops counting static
+assets, and a client that fetched only images stops being rejected.
+Nothing else changes — there is no configuration key, no database
+migration and no admin element, and the existing policy rows keep
+their meaning. The visible effect is that the per-site "counted"
+figure in the admin UI drops, because those requests are no longer
+counted.
 
 ## Reload
 
@@ -455,6 +520,15 @@ successfully and logs a warning naming the retired key.
 | The block window of a throttled client expires | The client is served a fresh counting window and must exceed the limit again to be rejected again. |
 | A client repeats the same URL | The distinct-page count does not grow. |
 | A client varies only the query string | Each distinct query string counts as a separate page. |
+| The target is a static asset | It is counted by neither dimension, it occupies no slot and it is never rejected for being over a limit. |
+| The target is a static asset and the client is in the penalty box | Still 429 — the penalty box is checked before the rule. |
+| The target is a static asset and the client matches a blacklist rule | Still 403 — the IP rules keep their precedence. |
+| The target is a static asset and the site's limits are disabled | The rule never comes into play; the request is forwarded. |
+| The path has no extension (`/media/12345`) | A page; counted normally. |
+| A dot appears in a directory name (`/v1.2/page`) | A page; counted normally. |
+| The extension is only in the query string (`/download?file=x.js`) | A page; counted normally. |
+| The path is percent-encoded (`/a%2Ejs`) | A page — the path is read as it arrived; the client only ever counts more. |
+| The extension is longer than eight bytes | A page — the longest extension in the list is five bytes. |
 | A client is over the request limit but under the page limit | It is rejected; the verdict is the union of the two dimensions. |
 | Both dimensions trip | `Retry-After` is the greater of the two remaining window times. |
 | A whitelist rule and a blacklist rule match with the same prefix length | The whitelist wins; the client is served. |
@@ -475,6 +549,7 @@ successfully and logs a warning naming the retired key.
 ## References
 
 - `crates/pangolin-core/src/ratelimit.rs` — the module.
+- `crates/pangolin-core/src/static_asset.rs` — the static-asset rule.
 - `crates/ngx/src/proxy.rs` — the hot path.
 - `crates/admin/src/routes/ratelimit.rs` — the admin page.
 - `docs/design/traffic.md` — the measurement side-channel.
