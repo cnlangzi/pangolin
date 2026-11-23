@@ -59,7 +59,7 @@ use tokio::time::timeout;
 use crate::admin_harness::AdminClient;
 use crate::harness::{
     DEFAULT_USER_AGENT, NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db,
-    raw_request, read_sse_data_frames,
+    raw_request, raw_request_with_headers, read_sse_data_frames,
 };
 
 // ─────────────────────────────────────────────────────────────────
@@ -398,6 +398,117 @@ async fn access_log_sse_replays_then_streams_live() {
             "the access log must carry the request's User-Agent: {entry}"
         );
     }
+}
+
+/// access_log_sse_carries_the_referer_verbatim — the access log
+/// records the `Referer` header the client sent, byte for byte, and
+/// omits the key entirely when the client sent none.
+///
+/// The value is **not** parsed on the proxy path: the query string
+/// and the fragment survive into the log. The analyst parses it off
+/// the proxy path (issue #228).
+#[tokio::test]
+async fn access_log_sse_carries_the_referer_verbatim() {
+    let backend = MockHttpBackend::start().await;
+    let ngx = NgxProcess::start({
+        let backend_addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "referer-site", &format!("http://{backend_addr}"));
+            seed_domain(&conn, "referer.test", "referer-site");
+        }
+    })
+    .await;
+
+    // The SSE endpoint is admin-only — the raw session cookie goes
+    // straight onto the wire (see `harness::admin_session_cookie`).
+    let session_cookie = admin_session_cookie(&ngx).await;
+
+    // Open the stream first so both requests below land on the live
+    // tail rather than in the replay snapshot.
+    let sse_addr = format!("127.0.0.1:{}", ngx.admin_port);
+    let sse_cookie = session_cookie.clone();
+    let sse_task = tokio::spawn(async move {
+        read_sse_data_frames(
+            &sse_addr,
+            "/api/logs/stream",
+            Duration::from_secs(5),
+            Some(&sse_cookie),
+        )
+        .await
+    });
+
+    // Give the SSE handshake a moment to complete before the
+    // requests go out.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let http_addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // 1) A request WITH a referer. The query string and the fragment
+    //    are part of the header's value and must survive: the proxy
+    //    records the header, it does not interpret it.
+    let referer = "https://news.example.org/a/b?q=1#frag";
+    let (status, _) = raw_request_with_headers(
+        &http_addr,
+        "referer.test",
+        "GET",
+        "/with-referer",
+        b"",
+        &[("Referer", referer)],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    // 2) A request WITHOUT one — the key must be absent, not empty.
+    let (status, _) = raw_request_with_headers(
+        &http_addr,
+        "referer.test",
+        "GET",
+        "/without-referer",
+        b"",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let frames = sse_task.await.expect("sse task join").expect("sse frames");
+    assert!(
+        !frames.is_empty(),
+        "expected at least one SSE data frame, got 0. \
+         ngx log:\n{}",
+        ngx.log_string()
+    );
+
+    let entry_for = |path: &str| -> serde_json::Value {
+        frames
+            .iter()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s))
+            .find_map(|r| {
+                r.ok().and_then(|j| {
+                    let matches = j.get("path").and_then(|p| p.as_str()) == Some(path);
+                    if matches { Some(j) } else { None }
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no SSE frame for path={path}. frames={frames:?}\nngx log:\n{}",
+                    ngx.log_string()
+                )
+            })
+    };
+
+    let with = entry_for("/with-referer");
+    assert_eq!(
+        with["referer"], referer,
+        "the access log must carry the request's Referer verbatim: {with}"
+    );
+
+    let without = entry_for("/without-referer");
+    assert!(
+        without.get("referer").is_none(),
+        "a request without a Referer must not carry the key: {without}"
+    );
 }
 
 /// access_log_admin_page_renders — the `/logs` UI is reachable

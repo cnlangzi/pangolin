@@ -43,6 +43,21 @@ pub struct AccessLogEntry {
     /// rows deserialise cleanly into `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// `Referer` header value, captured by the proxy on the request
+    /// hot path.
+    ///
+    /// `None` when the client sent no `Referer`, when the value was
+    /// empty, when it was not **visible ASCII** (the header parser
+    /// only yields `0x20..=0x7e` plus tab), or when it was longer
+    /// than 4 KiB.
+    ///
+    /// Verbatim: the operator analyses the raw value, and the
+    /// analysis happens off the proxy path, so nothing is stripped or
+    /// parsed here — no userinfo removal, no query-string split, no
+    /// host normalisation. The referer log side-channel keeps its
+    /// own, sanitised copy — see `docs/design/referer-log.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
 }
 
 /// Bounded ring buffer of recent access log entries.
@@ -285,6 +300,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "192.168.1.1".into(),
             user_agent: Some("curl/8.0".into()),
+            referer: Some("https://news.example.org/a/b?q=1".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: AccessLogEntry = serde_json::from_str(&json).unwrap();
@@ -292,6 +308,49 @@ mod tests {
         assert_eq!(parsed.path, "/test");
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.duration_ms, 42);
+    }
+
+    /// The `referer` key is **optional**: present when the client sent
+    /// a `Referer` header, absent otherwise. The wire format has to
+    /// stay that way because `GET /api/v1/logs/access` is a published
+    /// resource shape (AGENTS.md rule 9).
+    #[test]
+    fn access_log_entry_serialises_the_referer_verbatim() {
+        let mut entry = make_entry("GET", "/a");
+        entry.referer = Some("https://news.example.org/a/b?q=1#frag".into());
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["referer"], "https://news.example.org/a/b?q=1#frag");
+    }
+
+    #[test]
+    fn access_log_entry_omits_the_referer_when_there_is_none() {
+        let entry = make_entry("GET", "/a");
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("referer").is_none(),
+            "a request without a Referer must not carry the key: {json}"
+        );
+    }
+
+    /// An entry serialised before the `referer` key existed still
+    /// deserialises — into `None`. The key is additive, so old JSON
+    /// (and the rows an older gateway wrote) keep parsing.
+    #[test]
+    fn access_log_entry_deserialises_a_payload_without_the_referer_key() {
+        let json = r#"{
+            "timestamp": "2026-06-16T12:34:56.789Z",
+            "method": "GET",
+            "path": "/a",
+            "host": "example.com",
+            "status": 200,
+            "duration_ms": 1,
+            "backend": "direct:127.0.0.1:8080",
+            "client_ip": "192.168.1.1"
+        }"#;
+        let parsed: AccessLogEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.referer, None);
     }
 
     fn make_entry(method: &str, path: &str) -> AccessLogEntry {
@@ -305,6 +364,7 @@ mod tests {
             backend: "direct:127.0.0.1:8080".into(),
             client_ip: "192.168.1.1".into(),
             user_agent: None,
+            referer: None,
         }
     }
 

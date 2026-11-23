@@ -93,6 +93,64 @@ fn seed_domain(conn: &Connection, domain: &str, site_name: &str) {
 // Tests
 // ─────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────
+// JSONL reader — the artifact the operator inspects with `jq`
+// ─────────────────────────────────────────────────────────────────
+
+/// The JSONL file the running gateway writes for today.
+///
+/// The bot log's directory defaults to `./logs/bots` — a *relative*
+/// path — and the harness spawns the binary with its CWD set to the
+/// per-test tempdir, so the file lands under `<work_dir>/logs/bots/`.
+fn bot_jsonl_path(ngx: &NgxProcess) -> std::path::PathBuf {
+    let today = Utc::now().date_naive();
+    ngx.work_dir()
+        .join("logs")
+        .join("bots")
+        .join(format!("bot-{today}.jsonl"))
+}
+
+/// Read the rows the gateway has written so far. Returns an empty
+/// vec when the file doesn't exist yet.
+fn read_bot_rows(ngx: &NgxProcess) -> Vec<serde_json::Value> {
+    let path = bot_jsonl_path(ngx);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
+/// Poll the JSONL file until a row with `path` shows up, or the
+/// budget runs out.
+///
+/// The writer is a background task: `enqueue` pokes a `Notify` and
+/// the actual `fs::write` happens on the writer's own task, so a row
+/// is not on disk the instant the response comes back. Polling
+/// (rather than a fixed sleep) keeps the test fast without being
+/// flaky.
+async fn wait_for_bot_row(ngx: &NgxProcess, path: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(row) = read_bot_rows(ngx)
+            .into_iter()
+            .find(|r| r.get("path").and_then(|p| p.as_str()) == Some(path))
+        {
+            return row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "no bot row for path={path}. rows={:?}\nngx log:\n{}",
+                read_bot_rows(ngx),
+                ngx.log_string()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The bot SSE endpoint is admin-only: an anonymous GET must get a
 /// 401 with a plain error body, **not** an SSE frame.
 ///
@@ -278,4 +336,54 @@ async fn bot_log_sse_replays_then_streams_live() {
         );
         assert_eq!(entry["backend"], format!("direct:{}", backend.addr()));
     }
+}
+
+/// The bot JSONL row carries the `Referer` header the crawler sent,
+/// byte for byte.
+///
+/// The **file** is the contract here — it is the artifact the analyst
+/// reads with `jq` — so the assertion is on the row on disk, not on
+/// the SSE stream. The value is verbatim: the query string and the
+/// fragment survive, because the proxy records the header and does
+/// not interpret it (issue #228).
+#[tokio::test]
+async fn bot_log_jsonl_records_the_referer_verbatim() {
+    let backend = InspectingBackend::start().await;
+    let ngx = NgxProcess::start({
+        let addr = backend.addr().to_string();
+        move |db_path| {
+            init_pangolin_db(db_path);
+            let conn = Connection::open(db_path).expect("open db");
+            seed_site(&conn, "bot-site", &format!("http://{addr}"));
+            seed_domain(&conn, "bot.test", "bot-site");
+            // The registry the verifier reads lives in the cache
+            // root, which defaults to `./logs/bots/cache` relative
+            // to the process's working directory — the tempdir.
+            let cache_root = db_path
+                .parent()
+                .expect("the db lives in the tempdir")
+                .join("logs/bots/cache");
+            seed_googlebot_registry(&cache_root);
+        }
+    })
+    .await;
+
+    let referer = "https://news.example.org/a/b?q=1#frag";
+    let (status, _) = raw_request_with_headers(
+        &format!("127.0.0.1:{}", ngx.http_port),
+        "bot.test",
+        "GET",
+        "/sitemap.xml",
+        b"",
+        &[("User-Agent", GOOGLEBOT_UA), ("Referer", referer)],
+    )
+    .await;
+    assert_eq!(status, 200, "the proxied request must succeed");
+
+    let row = wait_for_bot_row(&ngx, "/sitemap.xml").await;
+    assert_eq!(row["bot_name"], "googlebot");
+    assert_eq!(
+        row["referer"], referer,
+        "the bot JSONL row must carry the request's Referer verbatim: {row}"
+    );
 }
