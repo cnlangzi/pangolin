@@ -495,11 +495,21 @@ jobs:
         run: echo "127.0.0.1 localhost.test" | sudo tee -a /etc/hosts
 
       - name: Run E2E tests
-        # 15-minute hard cap. Local runs finish in ~7 min; a 60-min
+        # 30-minute hard cap. Local runs finish in ~7 min; a 60-min
         # hang (the previous run) means a tokio spawn is keeping
         # the test runtime alive, and the only way to recover is
-        # to kill the step. `make test-e2e` builds release binaries
-        # first, so we pad the budget to cover a cold cache (~10 min
-        # build + ~5 min test).
-        timeout-minutes: 15
+        # to kill the step. `make test-e2e` builds the release
+        # binaries first, so the budget has to cover a cold cargo
+        # cache as well.
+        #
+        # The cold case is the normal case for a new branch: this
+        # workflow only runs on `pull_request`, so no run ever writes
+        # a cache on `main`, and a GitHub cache is visible only to the
+        # branch that wrote it (plus `main`). The first run of a
+        # branch therefore restores nothing and builds everything from
+        # scratch — measured on 2026-11-23: a 7m22s release build + a
+        # 4m30s debug build + a 2m44s test run ≈ 14m40s, which the old
+        # 15-minute cap cut off two seconds after the last test had
+        # passed. The warm case is ~6m30s.
+        timeout-minutes: 30
         run: make test-e2e
