@@ -38,9 +38,11 @@ use std::path::{Path, PathBuf};
 pub fn write(path: &Path) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
-    // The number has to be on the disk before the process claims the
-    // ports: an operator that reads the file has to see the number of
-    // the process that is already serving.
+    // The number has to have left this process's buffer before the
+    // process claims the ports: an operator that reads the file has
+    // to see the number of the process that is already serving.
+    // (`flush` pushes it into the page cache — the file survives a
+    // crash of the process, which is the case that matters here.)
     file.flush()?;
     Ok(())
 }

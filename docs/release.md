@@ -487,6 +487,19 @@ repository. The rules the build obeys:
   operator's edits have to survive an upgrade untouched and without an
   interactive prompt, and a deleted file has to come back. Changing the
   type changes that contract.
+
+  A conffile also means that a **new key in the template only reaches
+  a fresh install**. The `[pid]` section (issue #233) is the first
+  one: on a host that was installed before it, `/etc/pangolin/ngx.yml`
+  keeps the operator's copy, the PID file path is derived from it
+  (`/etc/pangolin/ngx.pid` — a directory the service user cannot
+  write to), and the gateway logs `could not write the pid file` on
+  every start. The operator adds the section by hand:
+
+  ```yaml
+  pid:
+    pid_file: /var/lib/pangolin/pangolin-ngx.pid
+  ```
 - **The packaging scripts are POSIX `sh`.** dpkg runs maintainer
   scripts with `/bin/sh`, and so does rpm's scriptlet interpreter — a
   bashism breaks the installation on the distribution that matters.

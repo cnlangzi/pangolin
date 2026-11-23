@@ -66,6 +66,7 @@ certs-staging/
 *.db-shm
 *.db-wal
 *.pem
+*.pid
 *.prof
 
 # ── Auxiliary tooling ──────────────────────────────────────────────────────

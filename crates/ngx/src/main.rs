@@ -86,9 +86,15 @@ struct Args {
     /// PID file.
     ///
     /// It is **not** a read-only operation: it applies the pending
-    /// database migrations and reconciles the certificates on disk
-    /// into the `certs` table, exactly as a real start would. The
-    /// point is that the check and the start follow the same path.
+    /// database migrations, resets the certificate rows a dead
+    /// process left in `Issuing` and reconciles the certificates on
+    /// disk into the `certs` table — exactly as a real start would.
+    /// The point is that the check and the start follow the same
+    /// path.
+    ///
+    /// The database is the one in the **current working directory**
+    /// (`pangolin.db`), so run the check from the directory the
+    /// service runs in (the packaged service: `/var/lib/pangolin`).
     #[arg(long)]
     check: bool,
 }
@@ -138,11 +144,26 @@ fn main() -> anyhow::Result<()> {
         return crate::check::run_check(config);
     }
 
+    let db_path = PathBuf::from(DB_PATH);
+    let cert_manager = cert_manager(&config);
+    let app = Arc::new(pangolin_core::App::new(
+        &db_path,
+        config.clone(),
+        cert_manager,
+    )?);
+
     // The PID file (issue #233). It is written **before** any listener
     // is bound: the file says "this process intends to serve", not
     // "the ports are up". The guard removes it when the process
     // exits — a `SIGKILL` leaves it behind, and the next start
     // truncates it.
+    //
+    // It is written *after* the database is open, because that is
+    // the slow part of the startup: a signal that arrives before the
+    // signal handlers are installed (they live on the host runtime,
+    // further down) kills the process without running the guard, and
+    // a stale number in the file would point the operator at a
+    // recycled process.
     let pid_file = config.resolved_pid_file(&args.config);
     let _pid_guard = match pangolin_core::pidfile::write(&pid_file) {
         Ok(()) => Some(pangolin_core::pidfile::PidFileGuard::new(pid_file.clone())),
@@ -154,14 +175,6 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
-
-    let db_path = PathBuf::from(DB_PATH);
-    let cert_manager = cert_manager(&config);
-    let app = Arc::new(pangolin_core::App::new(
-        &db_path,
-        config.clone(),
-        cert_manager,
-    )?);
 
     log::info!(
         "Pangolin ngx {} starting on http={} https={}",
