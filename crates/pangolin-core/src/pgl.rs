@@ -66,7 +66,14 @@ pub struct PglHeaders {
     /// The registry id of the knownbots-**verified** crawler
     /// (`googlebot`, `gptbot`, …); `None` when the request did not
     /// come from one.
-    pub bot_name: Option<String>,
+    ///
+    /// The **whole** identity travels with the request, not just the
+    /// registry id: the `P-Known-Bot` header needs the id, the rate
+    /// limiter needs the id, and the bot log needs the vendor and the
+    /// category too. Carrying the verdict is what lets the request
+    /// path verify the crawler **once** (issue #253) instead of once
+    /// per consumer.
+    pub bot: Option<crate::bot::BotIdentity>,
     /// The authoritative client IP; `None` when there is none.
     pub client_ip: Option<IpAddr>,
     /// Country code; `None` when unknown.
@@ -82,7 +89,7 @@ impl PglHeaders {
     /// The value is the same string the JSONL bot log writes as
     /// `bot_name` — never the raw User-Agent.
     pub fn known_bot_value(&self) -> &str {
-        self.bot_name.as_deref().unwrap_or("")
+        self.bot.as_ref().map(|b| b.name.as_str()).unwrap_or("")
     }
 
     /// The `P-Client-Ip` value: the normalized IP, empty when unknown.
@@ -142,70 +149,110 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let client_ip = resolve_authoritative(provider_cfg, peer, &get_header);
-    let bot_name = match (verifier, user_agent, client_ip) {
-        (Some(v), Some(ua), Some(ip)) => {
-            let result = v.verify(ua, ip);
-            if result.is_verified() {
-                Some(result.name)
-            } else {
-                None
-            }
-        }
+    let bot = match (verifier, user_agent, client_ip) {
+        (Some(v), Some(ua), Some(ip)) => crate::bot::verify_bot(v, ua, ip),
         _ => None,
     };
     PglHeaders {
-        bot_name,
+        bot,
         client_ip,
         country: resolve_country(provider_cfg, &get_header),
         region: resolve_region(provider_cfg, &get_header),
     }
 }
 
-/// The first-level header names pangolin consults for the site's
-/// effective provider.
+/// The maximum number of first-level header names a provider names.
 ///
-/// `ngx` uses this to decide which headers to snapshot off the
-/// request before the values are computed (the header lookup needs
-/// an owned snapshot — the session cannot be borrowed immutably
-/// while its request header is being mutated).
+/// The registry names five of them (`cloudflare`) and `custom_lb` at
+/// most three, so five is the ceiling.
+pub const MAX_FIRST_LEVEL_HEADERS: usize = 5;
+
+/// A snapshot of the first-level header values the resolver consults.
 ///
-/// The fixed names come from the registry (see
-/// [`crate::provider::spec`]); only `custom_lb` uses the
-/// operator-configured names.
-pub fn first_level_headers(provider_cfg: &SiteProviderConfig) -> Vec<String> {
-    match provider_cfg.provider {
-        ProviderKey::Direct => Vec::new(),
-        ProviderKey::Cloudflare => {
-            let headers = spec(ProviderKey::Cloudflare).headers;
-            [
-                headers.client_ip,
-                headers.client_ipv6,
-                headers.country,
-                headers.region,
-                headers.region_fallback,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|n| n.to_string())
-            .collect()
-        }
-        ProviderKey::CustomLb => {
-            let mut names = Vec::new();
-            for key in [
-                provider_cfg.client_ip_header.as_deref(),
-                provider_cfg.country_header.as_deref(),
-                provider_cfg.region_header.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if !names.iter().any(|n| n == key) {
-                    names.push(key.to_string());
-                }
-            }
-            names
+/// The values are **borrowed** from the request header map: the
+/// snapshot is taken before the gateway headers are written, and it
+/// lives only for the duration of the resolution.
+///
+/// Fixed-capacity on purpose — the number of names a provider uses is
+/// bounded by [`MAX_FIRST_LEVEL_HEADERS`], so the snapshot is a small
+/// array on the stack. The request path used to build a
+/// `HashMap<String, String>` per request (issue #253).
+#[derive(Debug, Clone, Copy)]
+pub struct FirstLevelHeaders<'a> {
+    entries: [(&'a str, &'a str); MAX_FIRST_LEVEL_HEADERS],
+    len: usize,
+}
+
+impl<'a> FirstLevelHeaders<'a> {
+    /// An empty snapshot.
+    pub fn new() -> Self {
+        Self {
+            entries: [("", ""); MAX_FIRST_LEVEL_HEADERS],
+            len: 0,
         }
     }
+
+    /// Add one `(name, value)` pair.
+    ///
+    /// A snapshot that is already full drops the pair — but that must
+    /// not happen silently: the ceiling is the number of names a
+    /// provider may consult, and a provider that named more would
+    /// lose its tail (a client IP or a country that reads as
+    /// unknown). The index build asserts the count, and this
+    /// assertion catches it in the tests.
+    pub fn push(&mut self, name: &'a str, value: &'a str) {
+        debug_assert!(
+            self.len < MAX_FIRST_LEVEL_HEADERS,
+            "the first-level header snapshot is full — a provider names more \
+             headers than the snapshot holds"
+        );
+        if self.len < MAX_FIRST_LEVEL_HEADERS {
+            self.entries[self.len] = (name, value);
+            self.len += 1;
+        }
+    }
+
+    /// The value of the named header, if the snapshot carries it.
+    pub fn get(&self, name: &str) -> Option<&'a str> {
+        self.entries[..self.len]
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| *value)
+    }
+
+    /// How many pairs the snapshot carries.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the snapshot carries nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for FirstLevelHeaders<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute the four gateway header values from a **snapshot** of the
+/// first-level headers.
+///
+/// The snapshot is the fixed-length structure the request path builds
+/// (issue #253): the lookup is a scan over at most
+/// [`MAX_FIRST_LEVEL_HEADERS`] entries, so the request path allocates
+/// neither a map nor a name list.
+pub fn resolve_headers_from_snapshot(
+    provider_cfg: &SiteProviderConfig,
+    peer: Option<SocketAddr>,
+    first_level: &FirstLevelHeaders<'_>,
+    user_agent: Option<&str>,
+    verifier: Option<&Validator>,
+) -> PglHeaders {
+    let get = |name: &str| first_level.get(name).map(String::from);
+    resolve_headers(provider_cfg, peer, get, user_agent, verifier)
 }
 
 /// The country code, or `None` when there is none.
@@ -270,6 +317,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot::{BotCategory, BotIdentity};
 
     fn cfg(provider: ProviderKey) -> SiteProviderConfig {
         SiteProviderConfig {
@@ -519,7 +567,11 @@ mod tests {
     #[test]
     fn pairs_carry_the_canonical_names() {
         let h = PglHeaders {
-            bot_name: Some("googlebot".into()),
+            bot: Some(BotIdentity {
+                name: "googlebot".into(),
+                vendor: "Google".into(),
+                category: BotCategory::SearchEngine,
+            }),
             client_ip: Some("203.0.113.7".parse().unwrap()),
             country: Some("DE".into()),
             region: Some("BE".into()),
@@ -577,20 +629,20 @@ mod tests {
             Some(&validator),
         );
         assert_eq!(h.known_bot_value(), "");
-        assert_eq!(h.bot_name, None);
+        assert_eq!(h.bot, None);
     }
 
     #[test]
     fn first_level_headers_lists_the_consulted_names() {
-        assert!(first_level_headers(&cfg(ProviderKey::Direct)).is_empty());
-        let cf = first_level_headers(&cfg(ProviderKey::Cloudflare));
+        assert!(cfg(ProviderKey::Direct).first_level_headers().is_empty());
+        let cf = cfg(ProviderKey::Cloudflare).first_level_headers();
         assert!(cf.iter().any(|n| n == "CF-Connecting-IP"));
         assert!(cf.iter().any(|n| n == "CF-IPCountry"));
 
         let mut lb = cfg(ProviderKey::CustomLb);
         lb.client_ip_header = Some("X-Client-IP".into());
         lb.region_header = Some("X-Region".into());
-        let names = first_level_headers(&lb);
+        let names = lb.first_level_headers();
         assert!(names.iter().any(|n| n == "X-Client-IP"));
         assert!(names.iter().any(|n| n == "X-Region"));
         assert!(!names.iter().any(|n| n == "X-Country"));

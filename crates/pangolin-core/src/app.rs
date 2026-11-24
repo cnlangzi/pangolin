@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
-use crate::bot::verify_bot;
+use crate::bot::{BotIdentity, verify_bot};
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
 use crate::cidr::CidrSet;
@@ -342,7 +342,16 @@ pub struct App {
     /// and resolves the client IP through
     /// [`pangolin_core::pgl::resolve_headers`] — see that module's
     /// doc comment for the per-mode semantics.
-    pub system_config: Arc<RwLock<SystemConfig>>,
+    ///
+    /// Published as an `Arc` **snapshot**, like [`App::indexes`]:
+    /// the request path clones the handle and releases the lock
+    /// immediately, so a request future never holds a lock guard
+    /// across an `.await` and never deep-copies the configuration
+    /// (issue #253).
+    ///
+    /// The lock is a **sync** `parking_lot::RwLock`: the hot path
+    /// must not await to read a value that is replaced wholesale.
+    pub system_config: Arc<parking_lot::RwLock<Arc<SystemConfig>>>,
     /// Global configuration
     pub config: Config,
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
@@ -672,7 +681,7 @@ impl App {
             Err(e) => return Err(e.into()),
         };
         let global_provider = GlobalProviderConfig::from_system_config(&system_config);
-        let system_config = Arc::new(RwLock::new(system_config));
+        let system_config = Arc::new(parking_lot::RwLock::new(Arc::new(system_config)));
         let indexes = Indexes::build_with_providers(
             sites,
             domains.clone(),
@@ -822,6 +831,44 @@ impl App {
         })
     }
 
+    /// Run a synchronous SQLite query **off** the async worker
+    /// threads (issue #253).
+    ///
+    /// The connection is a synchronous `rusqlite` connection behind a
+    /// `tokio::sync::Mutex`, so a query that takes a while blocks
+    /// whichever worker thread ran it — and the worker threads are
+    /// the ones that proxy requests. `with_db` moves the work onto
+    /// the runtime's blocking pool: the closure gets the connection
+    /// and returns whatever it computed, and the caller awaits the
+    /// result.
+    ///
+    /// The closure must be `Send + 'static` because it moves to
+    /// another thread, and it runs with the connection's lock held —
+    /// take the lock once, for the whole query, not once per
+    /// statement.
+    ///
+    /// The `Err` is the join error: the closure panicked. A panic in
+    /// the closure does not take the process down (the blocking pool
+    /// catches it), but the query's result is lost, so the caller
+    /// has to decide what to answer.
+    ///
+    /// `block_in_place` would be the obvious alternative, but it
+    /// **panics** on a current-thread runtime — and this repository's
+    /// tests use `#[tokio::test]`, which is exactly that. The
+    /// blocking pool has no such restriction.
+    pub async fn with_db<F, R>(&self, f: F) -> Result<R, tokio::task::JoinError>
+    where
+        F: FnOnce(&Connection) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = db.blocking_lock();
+            f(&conn)
+        })
+        .await
+    }
+
     /// Install the [`CertRetrier`] bridge once the ACME pipeline is built.
     /// Called from `ngx::main` after `AcmeState::empty()` produces the
     /// concrete retrier. Idempotent — re-installing replaces the prior
@@ -872,7 +919,7 @@ impl App {
         // The current in-memory value, kept as the fallback when the
         // database read fails. Cloned before the DB lock is taken so
         // the two locks are never held at the same time.
-        let previous_system_config = self.system_config.read().await.clone();
+        let previous_system_config = self.system_config.read().clone();
         let conn = self.db.lock().await;
         let sites = db::list_sites(&conn).unwrap_or_default();
         let domains = db::list_domains(&conn).unwrap_or_default();
@@ -904,7 +951,7 @@ impl App {
                 // /api/system/config (which calls
                 // update_system_config + this reload again).
                 log::warn!("system_config: reload from DB failed: {e}");
-                previous_system_config
+                (*previous_system_config).clone()
             }
         };
         let global_provider = GlobalProviderConfig::from_system_config(&system_config);
@@ -942,7 +989,7 @@ impl App {
         // fix-client-ip: publish the singleton. It was read above
         // (before the index build) so the effective provider of every
         // site could be resolved against it.
-        *self.system_config.write().await = system_config;
+        *self.system_config.write() = Arc::new(system_config);
         // Rebuild cert_links (fix/cert_www). The rebuild builds a new
         // table and publishes it under one write lock, so a handshake
         // sees either the whole old table or the whole new one —
@@ -1112,8 +1159,36 @@ impl App {
     /// (through it) to every subscriber (issue #224). The fan-out
     /// copies a reference count, not the entry.
     pub fn push_access_log(&self, entry: AccessLogEntry) {
-        let entry = Arc::new(entry);
+        // The caller had no verdict, so this method verifies the
+        // crawler itself. The proxy does **not** come through here:
+        // it verifies once per request and hands the verdict in (see
+        // [`App::push_access_log_verified`]).
+        //
+        // The bot side-channel's presence is checked **first**: with
+        // no writer there is nothing to verify for, and the
+        // verification is the expensive part.
+        let bot = if self.bot_writer.is_some() {
+            self.verify_entry_bot(&entry)
+        } else {
+            None
+        };
+        self.push_access_log_verified(Arc::new(entry), bot);
+    }
 
+    /// Push an access-log entry whose bot identity is **already
+    /// known** (issue #253).
+    ///
+    /// The verification is the expensive part of the bot side-channel
+    /// — a user-agent match plus an address-range scan — and the
+    /// proxy needs the verdict anyway (for the `P-Known-Bot` header
+    /// and for the rate limiter). Running it again here bought
+    /// nothing, so the caller hands the verdict in and this method
+    /// only fans the entry out.
+    ///
+    /// `bot` is `None` when the request did not come from a verified
+    /// crawler — the bot sinks stay untouched then, exactly as they
+    /// did when the verification failed here.
+    pub fn push_access_log_verified(&self, entry: Arc<AccessLogEntry>, bot: Option<BotIdentity>) {
         // 1) ring buffer (sync, fast path). Even if the broadcast
         //    later drops the entry, the ring buffer always keeps
         //    the most-recent N entries for late-join replay.
@@ -1131,24 +1206,7 @@ impl App {
         let Some(writer) = self.bot_writer.as_ref() else {
             return;
         };
-        let Some(verifier) = self.bot_verifier.as_ref() else {
-            return;
-        };
-        let Some(ua) = entry.user_agent.as_deref() else {
-            return;
-        };
-        let Ok(ip) = entry.client_ip.parse::<std::net::IpAddr>() else {
-            // "unknown" (no peer, no forwarding header) and other
-            // non-IP sentinels fail closed. debug so a misconfigured
-            // frontend is visible under RUST_LOG=pangolin_core=debug
-            // without a warn on every request.
-            log::debug!(
-                "bot verify skipped: client_ip {:?} is not an IP",
-                entry.client_ip
-            );
-            return;
-        };
-        let Some(bot) = verify_bot(verifier, ua, ip) else {
+        let Some(bot) = bot else {
             return;
         };
         let Some(bot_entry) = BotLogEntry::from_access_log(&entry, bot) else {
@@ -1159,6 +1217,27 @@ impl App {
         self.bot_stats.record(&bot_entry);
         writer.enqueue(bot_entry.clone());
         let _ = self.bot_log_tx.send(bot_entry);
+    }
+
+    /// The verified bot identity of an access-log entry.
+    ///
+    /// `None` when there is nothing to verify: no verifier, no user
+    /// agent, or a client IP that is not an address. The
+    /// non-IP sentinels ("unknown" and friends) fail closed — a
+    /// `debug` line, so a misconfigured frontend is visible under
+    /// `RUST_LOG=pangolin_core=debug` without a warn on every
+    /// request.
+    fn verify_entry_bot(&self, entry: &AccessLogEntry) -> Option<BotIdentity> {
+        let verifier = self.bot_verifier.as_ref()?;
+        let ua = entry.user_agent.as_deref()?;
+        let Ok(ip) = entry.client_ip.parse::<std::net::IpAddr>() else {
+            log::debug!(
+                "bot verify skipped: client_ip {:?} is not an IP",
+                entry.client_ip
+            );
+            return None;
+        };
+        verify_bot(verifier, ua, ip)
     }
 
     /// Snapshot the access log ring buffer in chronological order
@@ -2225,6 +2304,99 @@ mod tests {
         let v = app.bot_verifier.as_ref().expect("bot verifier enabled");
         v.seed_prefix("googlebot", "66.249.64.0/19")
             .expect("seed googlebot cidr");
+    }
+
+    /// The system configuration is published as an `Arc` **snapshot**
+    /// (issue #253).
+    ///
+    /// The request path clones the handle, not the configuration: two
+    /// readers share one allocation, so a request never deep-copies
+    /// the whole configuration.
+    #[tokio::test]
+    async fn the_system_config_is_published_as_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let app = App::new(&db_path, make_log_config(50, 16), CertManager::default()).unwrap();
+
+        let first = app.system_config.read().clone();
+        let second = app.system_config.read().clone();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two readers must share the published snapshot, not two copies"
+        );
+        assert_eq!(
+            first.pgl_headers_enabled, second.pgl_headers_enabled,
+            "the snapshot carries the configuration"
+        );
+    }
+
+    /// The database query runs **off** the async worker thread
+    /// (issue #253).
+    ///
+    /// The connection is a synchronous SQLite connection, so a query
+    /// on a worker thread is a worker thread that is not proxying
+    /// requests.
+    #[tokio::test]
+    async fn with_db_runs_the_query_off_the_worker_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let app = App::new(&db_path, make_log_config(50, 16), CertManager::default()).unwrap();
+
+        let worker = std::thread::current().id();
+        let query_thread = app
+            .with_db(|_| std::thread::current().id())
+            .await
+            .expect("the query ran");
+        assert_ne!(
+            query_thread, worker,
+            "the query must not run on the async worker thread"
+        );
+
+        // The query really saw the database.
+        let sites = app
+            .with_db(|db| crate::db::list_sites(db).unwrap_or_default())
+            .await
+            .expect("the query ran");
+        assert!(sites.is_empty(), "a fresh database has no sites");
+    }
+
+    /// The bot side-channel trusts the verdict it is handed — it does
+    /// not verify the crawler a second time (issue #253).
+    ///
+    /// `push_access_log` verifies on its own; `push_access_log_verified`
+    /// does not. An entry whose user agent and address would **not**
+    /// verify is still recorded when the caller hands the verdict in —
+    /// which is exactly what "verified once per request" means.
+    #[tokio::test]
+    async fn the_bot_log_trusts_the_verdict_it_is_handed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let app = App::new(&db_path, make_log_config(50, 16), CertManager::default()).unwrap();
+        seed_googlebot_cidr(&app);
+
+        // An entry whose address is **outside** the seeded range: the
+        // verification would fail closed.
+        let mut entry = make_bot_entry("Mozilla/5.0 (compatible; Googlebot/2.1)", "/bot");
+        entry.client_ip = "198.51.100.9".into();
+
+        // Without a verdict the entry is not a bot's.
+        app.push_access_log_verified(Arc::new(entry.clone()), None);
+        assert!(
+            app.recent_bot_log().is_empty(),
+            "no verdict means no bot entry"
+        );
+
+        // With the verdict the entry is recorded — the side-channel
+        // does not verify it again.
+        let bot = BotIdentity {
+            name: "googlebot".into(),
+            vendor: "Google".into(),
+            category: crate::bot::BotCategory::SearchEngine,
+        };
+        app.push_access_log_verified(Arc::new(entry), Some(bot));
+        let bots = app.recent_bot_log();
+        assert_eq!(bots.len(), 1, "the handed verdict is recorded");
+        assert_eq!(bots[0].bot_name, "googlebot");
     }
 
     #[test]

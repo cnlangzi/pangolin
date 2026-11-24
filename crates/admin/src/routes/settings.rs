@@ -38,7 +38,7 @@ async fn render_page(
     dashboard_error: Option<&str>,
     lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
-    let cfg = app.system_config.read().await.clone();
+    let cfg = app.system_config.read().clone();
     // The provider radio group is generated from the registry, so a
     // provider added to it appears without touching the template.
     let providers = provider_options(lang);

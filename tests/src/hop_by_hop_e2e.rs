@@ -14,8 +14,8 @@
 //! `strip_hop_by_hop_headers` (`crates/pangolin-core/src/proxy.rs`)
 //! never covered the nominated headers, and the direct proxy path
 //! deliberately does **not** strip anything itself — it relies on
-//! pingora for hop-by-hop handling (see
-//! `apply_proxy_policy_without_hop_by_hop_stripping`).
+//! pingora for hop-by-hop handling (see `rewrite_upstream_headers`
+//! in `crates/ngx/src/proxy.rs`).
 //!
 //! Before pingora 0.9 the nomination was not honoured at all: the
 //! backend received both `Connection: X-Probe` and `X-Probe: 1`.

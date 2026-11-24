@@ -257,6 +257,22 @@ pair and hands pingora the socket end. That buys the whole socket
 machinery: the fd check, the keep-alive handling and the connection
 pool behave exactly as they do for a TCP backend.
 
+### The bridge is a userspace copy
+
+The bridge copies the tunnel's bytes: it reads them out of the tunnel
+stream and writes them into the loopback socket pingora talks to.
+That is a **copy in userspace**, and it is the price of the fd-based
+connection machinery above — the bytes travel through the gateway's
+memory instead of straight from the tunnel to the socket.
+
+The copy buffer is 64 KiB per direction (issue #253). The buffer is
+how much of the copy is in flight, so a bigger buffer means fewer
+read/write pairs per kilobyte; it is a constant rather than a
+configuration key because the configuration keys are a published
+contract and a buffer size is not an operator's decision. The cost is
+memory: a tunnel connection holds two of them, so a thousand
+concurrent tunnel connections hold about 128 MiB of buffer.
+
 ### What the splice cannot carry
 
 A `file://` backend over a tunnel. The file lives on the tun's

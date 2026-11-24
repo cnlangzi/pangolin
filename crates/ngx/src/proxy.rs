@@ -48,14 +48,14 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora_core::prelude::*;
 
 use pangolin_core::proxy::{HttpRequest, HttpResponse};
-use pangolin_core::types::HostMode;
 
 use pangolin_core::{
-    BackendTarget, ProxyCtx, Scheme, apply_proxy_policy,
-    apply_proxy_policy_without_hop_by_hop_stripping, parse_backend_to_target, serve_file_target,
+    BackendTarget, HeaderPolicy, ProxyCtx, Scheme, apply_proxy_policy, parse_backend_to_target,
+    serve_file_target,
 };
 
 use crate::App;
+use crate::backend_resolver::BackendResolver;
 use crate::tunnel::connector::{TunnelConnector, tunnel_group_key};
 
 /// Longest `Referer` header value the gateway will look at.
@@ -141,6 +141,52 @@ pub struct RequestState {
     /// both live in the index. Resolving it here is what keeps the
     /// logging path from taking the index lock a second time.
     pub referer_hit: Option<pangolin_core::RefererHit>,
+    /// The site the request was routed to, resolved **once** in
+    /// `request_filter`.
+    ///
+    /// `upstream_peer` and `upstream_request_filter` read it from
+    /// here instead of looking the site up again: the routing
+    /// revision they would read could be a **newer** one than the one
+    /// that served the request, so a request could be routed to one
+    /// backend and sent to another (issue #253).
+    pub site: Option<Arc<pangolin_core::Site>>,
+    /// The backend target, parsed **once** in `request_filter`.
+    ///
+    /// The upstream hooks used to parse the site's backend again,
+    /// which was a second parse per request — and a second chance to
+    /// disagree with the routing revision.
+    pub target: Option<Arc<BackendTarget>>,
+    /// The tunnel the backend is reached through; empty for a direct
+    /// backend.
+    pub tun_name: String,
+    /// The **verified** bot identity, computed once per request
+    /// (issue #253).
+    ///
+    /// The `P-Known-Bot` header, the rate limiter's bot exemption
+    /// and the bot log all need it; verifying it once and carrying
+    /// the verdict is what keeps the three from disagreeing — and
+    /// what keeps the request path from verifying the same crawler
+    /// twice.
+    pub bot: Option<pangolin_core::BotIdentity>,
+    /// How many times the request's host was extracted.
+    ///
+    /// One, always: the upstream hooks read the host from here
+    /// instead of asking the session again (issue #253).
+    pub host_extractions: u32,
+    /// How many times the upstream peer was selected for this
+    /// request.
+    ///
+    /// pingora re-enters `upstream_peer` when it retries, and the
+    /// attempt number walks the addresses of a backend name that
+    /// resolved to several — so a retry reaches the next address
+    /// instead of the same dead one.
+    pub upstream_attempt: usize,
+    /// The access-log entry, once it was built.
+    ///
+    /// The entry takes **ownership** of the request's strings, so the
+    /// traffic sample reads them from here when the entry exists
+    /// (issue #253).
+    pub entry: Option<Arc<pangolin_core::AccessLogEntry>>,
 }
 
 impl Default for RequestState {
@@ -161,6 +207,13 @@ impl Default for RequestState {
             sec_fetch_dest: None,
             accept: None,
             referer_hit: None,
+            site: None,
+            target: None,
+            tun_name: String::new(),
+            bot: None,
+            host_extractions: 0,
+            upstream_attempt: 0,
+            entry: None,
         }
     }
 }
@@ -168,6 +221,11 @@ impl Default for RequestState {
 /// `ProxyHttp` implementation for pangolin.
 pub struct AppProxy {
     pub app: Arc<App>,
+    /// The resolver that turns a backend's name into the addresses
+    /// the gateway dials (issue #253).
+    ///
+    /// The request path reads its cache; it never resolves a name.
+    pub resolver: Arc<BackendResolver>,
 }
 
 #[async_trait]
@@ -193,7 +251,7 @@ impl ProxyHttp for AppProxy {
         ctx.start = std::time::Instant::now();
         ctx.method = session.req_header().method.as_str().to_string();
         ctx.path = path.clone();
-        ctx.host = host_from_session(session);
+        ctx.host = host_from_session(session, ctx);
 
         // Referer log (inbound external referrals): capture the three
         // headers the classification needs, in one place on the hot
@@ -287,7 +345,11 @@ impl ProxyHttp for AppProxy {
         // provider, and the revision needs the same provider's range
         // set. Reading them together keeps the number of lookups
         // per request unchanged.
-        let host = host_from_session(session);
+        //
+        // The host was extracted once, at the top of this function —
+        // the upstream hooks read it from the request state instead
+        // of asking the session again (issue #253).
+        let host = ctx.host.clone();
 
         let indexes = self.app.indexes.read().clone();
         let site = match pangolin_core::index::lookup_site(&indexes, &host) {
@@ -345,15 +407,23 @@ impl ProxyHttp for AppProxy {
         // site's header source and its range source can never
         // disagree.
         //
-        // The first-level headers have to be snapshotted into owned
-        // strings first: the resolver borrows them immutably while
-        // we are about to mutate the request header.
-        let cfg = self.app.system_config.read().await.clone();
-        let first_level = snapshot_first_level_headers(&provider_cfg, session);
-        let pgl = pangolin_core::pgl::resolve_headers(
+        // The first-level headers have to be snapshotted before the
+        // resolver reads them: the resolver borrows them immutably
+        // while we are about to mutate the request header. The
+        // snapshot is a fixed-length structure and the names come
+        // from the routing revision, so the request path allocates
+        // neither a name list nor a map (issue #253).
+        let cfg = self.app.system_config.read().clone();
+        let first_level_names = indexes
+            .provider_headers
+            .get(&site.name)
+            .map(|names| names.as_ref())
+            .unwrap_or_default();
+        let first_level = snapshot_first_level_headers(first_level_names, session);
+        let pgl = pangolin_core::pgl::resolve_headers_from_snapshot(
             &provider_cfg,
             peer,
-            |name: &str| first_level.get(name).cloned(),
+            &first_level,
             request_user_agent(session.req_header()),
             // No verifier when the gateway headers are disabled: the
             // result would be thrown away, so skip the verification
@@ -371,6 +441,10 @@ impl ProxyHttp for AppProxy {
         // unconditional — a client must never be able to impersonate
         // a gateway header, even when the headers are disabled.
         apply_pgl_headers(session, cfg.pgl_headers_enabled, &pgl);
+        // The verified bot identity travels with the request: the
+        // rate limiter and the bot log need it, and the gateway
+        // headers above already used it (issue #253).
+        ctx.bot = pgl.bot;
 
         // ── SSE / streaming response detection ────────────────
         // A streaming response (SSE) used to need a hand-written
@@ -490,33 +564,32 @@ impl ProxyHttp for AppProxy {
         let limit_ip = ctx
             .client_ip
             .or_else(|| peer.map(|a| pangolin_core::client_ip::normalize_addr(a.ip())));
-        // The bot identity is reused from the `P-Known-Bot`
-        // computation — but only when the gateway headers are on:
-        // `resolve_headers` skips the verification when they are
-        // off, so its verdict would be unusable. In that case the
-        // limiter verifies the bot itself (the verifier is always
-        // present — the bot log is always on).
+        // The bot identity is the one the `P-Known-Bot` computation
+        // produced — but only when the gateway headers are on:
+        // `resolve_headers` skips the verification when they are off,
+        // so its verdict would be unusable. In that case the limiter
+        // verifies the bot itself (the verifier is always present —
+        // the bot log is always on).
+        //
+        // Either way the crawler is verified **once** per request:
+        // the verdict travels with the request, so the bot log does
+        // not have to verify it a second time (issue #253).
         //
         // The identity is the bot's **registry id** (`googlebot`), the
         // same string the `P-Known-Bot` header carries — the limiter
         // needs the name to match the site's bot-limited list.
-        //
-        // The gateway headers already carry the name, so that path
-        // borrows it; only the fallback path has to own one.
-        let bot_name: Option<Cow<'_, str>> = if cfg.pgl_headers_enabled {
-            pgl.bot_name.as_deref().map(Cow::Borrowed)
-        } else {
-            match (
+        if !cfg.pgl_headers_enabled {
+            ctx.bot = match (
                 self.app.bot_verifier.as_deref(),
                 request_user_agent(session.req_header()),
                 limit_ip,
             ) {
-                (Some(v), Some(ua), Some(ip)) => {
-                    pangolin_core::verify_bot(v, ua, ip).map(|b| Cow::Owned(b.name))
-                }
+                (Some(v), Some(ua), Some(ip)) => pangolin_core::verify_bot(v, ua, ip),
                 _ => None,
-            }
-        };
+            };
+        }
+        let bot_name: Option<Cow<'_, str>> =
+            ctx.bot.as_ref().map(|b| Cow::Borrowed(b.name.as_str()));
         if let Some(limit_cfg) = limit_cfg {
             let decision = {
                 let target = session.req_header().uri.path_and_query();
@@ -652,6 +725,11 @@ impl ProxyHttp for AppProxy {
         }
 
         // Parse backend into a typed target.
+        //
+        // The target travels with the request: the upstream hooks used
+        // to parse the site's backend again — a second parse per
+        // request, and a second chance to disagree with the routing
+        // revision (issue #253).
         let (tun_name, target) = match parse_backend_to_target(&site.backend) {
             Ok(v) => v,
             Err(e) => {
@@ -660,6 +738,12 @@ impl ProxyHttp for AppProxy {
                 return Ok(true);
             }
         };
+        ctx.tun_name = tun_name.clone();
+        // The site travels with the request for the same reason: the
+        // upstream hooks read the routing entry from here, so they
+        // cannot see a newer revision than the one that served the
+        // request.
+        ctx.site = Some(site.clone());
 
         // Issue #73: record backend string for access log
         ctx.backend = if tun_name.is_empty() {
@@ -667,13 +751,19 @@ impl ProxyHttp for AppProxy {
         } else {
             format!("tun:{}", tun_name)
         };
+        let is_file_backend = matches!(target, BackendTarget::File { .. });
         ctx.traffic_route = if !tun_name.is_empty() {
             pangolin_core::TrafficRoute::Tunnel
-        } else if matches!(target, BackendTarget::File { .. }) {
+        } else if is_file_backend {
             pangolin_core::TrafficRoute::File
         } else {
             pangolin_core::TrafficRoute::Direct
         };
+        // The target travels with the request under a handle, so the
+        // upstream hooks read the very same value instead of parsing
+        // the site's backend again.
+        let target = Arc::new(target);
+        ctx.target = Some(target.clone());
 
         // ── SSE / streaming response ──────────────────────────
         // A streaming response used to need a hand-written byte-relay
@@ -692,7 +782,7 @@ impl ProxyHttp for AppProxy {
         //     tunneled   `Ok(false)` branch at the bottom of
         //                `request_filter`).
         if is_streaming {
-            if matches!(target, BackendTarget::File { .. }) {
+            if is_file_backend {
                 warn!(
                     "SSE: refused on file:// backend for {} (file:// has no streaming concept)",
                     host
@@ -721,7 +811,7 @@ impl ProxyHttp for AppProxy {
         // lives on the tun's machine and must be served
         // from there.
         if tun_name.is_empty()
-            && let BackendTarget::File { doc_root } = &target
+            && let BackendTarget::File { doc_root } = &*target
         {
             let path_and_query = session
                 .req_header()
@@ -742,7 +832,7 @@ impl ProxyHttp for AppProxy {
             // the file-serve path stays consistent with the
             // v8 invariant of "all 18 combinations behave
             // identically."
-            let original_host = host_from_session(session);
+            let original_host = ctx.host.clone();
             let scheme = match session.req_header().uri.scheme_str() {
                 Some("https") => Scheme::Https,
                 _ => Scheme::Http,
@@ -782,7 +872,7 @@ impl ProxyHttp for AppProxy {
         //
         // The only case that cannot work is a `file://` backend: it
         // has no host:port to dial.
-        if is_upgrade && !tun_name.is_empty() && matches!(target, BackendTarget::File { .. }) {
+        if is_upgrade && !tun_name.is_empty() && is_file_backend {
             warn!(
                 "WS upgrade: refused on file:// backend for {} (no host:port to dial)",
                 host
@@ -802,7 +892,7 @@ impl ProxyHttp for AppProxy {
         // carry: the file lives on the tun's machine and the tunnel
         // only dials a host:port, so there is nothing to relay.
         if !tun_name.is_empty() {
-            if matches!(target, BackendTarget::File { .. }) {
+            if is_file_backend {
                 warn!(
                     "tunnel: refused a file:// backend for {} — the tunnel relays \
                      bytes to a host:port and cannot serve a local file",
@@ -826,74 +916,69 @@ impl ProxyHttp for AppProxy {
 
     /// Select the upstream peer based on the site backend URL.
     ///
+    /// The site and the backend target come from the request state —
+    /// `request_filter` resolved them from **one** routing revision.
+    /// Reading the index again here could see a *newer* revision, so
+    /// a request could be routed by one revision and sent to another
+    /// (issue #253).
+    ///
     /// A tun backend gets a peer whose `custom_l4` connector opens a
     /// **tunnel byte stream** — from pingora's point of view that is
     /// an ordinary upstream connection, so the tunnel path uses
     /// pingora's own HTTP machinery (chunked bodies, upgrades,
     /// connection reuse) instead of a hand-written counterpart.
+    ///
+    /// A direct backend is dialled at an address the **resolver**
+    /// produced: a name is resolved once and cached, an IP literal is
+    /// parsed. `HttpPeer::new` takes the address as it is — it never
+    /// resolves anything itself, so the request path does no name
+    /// resolution at all (issue #253).
     async fn upstream_peer(
         &self,
-        session: &mut Session,
-        _ctx: &mut Self::CTX,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let host = host_from_session(session);
-        let indexes = self.app.indexes.read().clone();
-        let site = match pangolin_core::index::lookup_site(&indexes, &host) {
-            Some(s) => s.clone(),
-            None => return Err(Error::new_str("site not found")),
-        };
-        let (tun, target) = parse_backend_to_target(&site.backend)
-            .map_err(|e| Error::explain(ErrorType::ReadError, format!("bad backend: {e}")))?;
-        if !tun.is_empty() {
-            return Ok(Box::new(tunnel_peer(&self.app, &tun, &target)?));
-        }
-        match &target {
-            BackendTarget::Http { host: h, port, .. } => Ok(Box::new(HttpPeer::new(
-                format!("{}:{}", h, port),
-                false,
-                String::new(),
-            ))),
-            BackendTarget::Https { host: h, port, .. } => Ok(Box::new(HttpPeer::new(
-                format!("{}:{}", h, port),
-                true,
-                h.clone(),
-            ))),
-            BackendTarget::File { .. } => {
-                Err(Error::explain(ErrorType::ReadError, "file:// not a peer"))
-            }
-        }
+        upstream_peer_for(&self.app, &self.resolver, ctx).await
     }
 
-    /// Set Host header per site.host_mode, add X-Forwarded-Host
-    /// when in passthrough. Now uses the shared
-    /// `apply_proxy_policy` so direct and tunnel paths are
-    /// consistent.
+    /// Rewrite the upstream request's headers per the site's
+    /// `host_mode`, and add the `X-Forwarded-*` family.
+    ///
+    /// The rules live in [`pangolin_core::HeaderPolicy`] — the same
+    /// rules the `file://` path applies — and they are applied **in
+    /// place** to pingora's own header map. The headers used to be
+    /// materialised into an owned `Vec<(String, String)>`, rewritten
+    /// there and written back: O(n²) time and O(n) allocations per
+    /// request, and a rewrite that blanked every header value that
+    /// was not visible ASCII (issue #253).
+    ///
+    /// The site and the backend target come from the request state —
+    /// `request_filter` resolved them from **one** routing revision
+    /// (issue #253).
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let original_host = host_from_session(session);
+        let original_host = ctx.host.clone();
         let scheme = match session.req_header().uri.scheme_str() {
             Some("https") => Scheme::Https,
             _ => Scheme::Http,
         };
-        let indexes = self.app.indexes.read().clone();
-        let site = match pangolin_core::index::lookup_site(&indexes, &original_host) {
-            Some(s) => s.clone(),
-            None => {
-                if !original_host.is_empty() {
-                    upstream
-                        .insert_header("Host", original_host.as_bytes())
-                        .ok();
-                }
-                return Ok(());
+        let Some(site) = ctx.site.clone() else {
+            // No site: the request never got past the site lookup.
+            // Keep the client's Host.
+            if !original_host.is_empty() {
+                upstream
+                    .insert_header("Host", original_host.as_bytes())
+                    .ok();
             }
+            return Ok(());
         };
 
-        // Build ctx.
-        let ctx = ProxyCtx {
+        // The proxy context the policy rules read.
+        let policy_ctx = ProxyCtx {
             original_host: original_host.clone(),
             original_scheme: scheme,
             host_mode: site.host_mode,
@@ -907,49 +992,20 @@ impl ProxyHttp for AppProxy {
             peer_ip: ctx.peer_ip.clone(),
         };
 
-        // Collect current headers as Vec<(String, String)>.
-        // We need this materialized view so `apply_proxy_policy`
-        // (which works on the framework-neutral `HttpRequest`
-        // shape) can mutate it. After we're done we push the
-        // changes back into the pingora `RequestHeader` using
-        // its native mutators — touching `upstream.headers`
-        // directly desyncs the name/case map and triggers an
-        // assertion in pingora-http at iteration time.
-        let req_headers: Vec<(String, String)> = upstream
-            .headers
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let method = upstream.method.as_str().to_string();
-        let target = upstream.uri.to_string();
-        let mut req = HttpRequest {
-            method,
-            target,
-            version: "HTTP/1.1".to_string(),
-            headers: req_headers,
-            body: Vec::new(),
+        // host_mode=Backend: the executor (pingora upstream peer)
+        // dials the backend, so the Host header should be the
+        // backend's authority. We know it from the target the
+        // request state carries.
+        let backend_authority = match ctx.target.as_deref() {
+            Some(BackendTarget::Http { host, port, .. })
+            | Some(BackendTarget::Https { host, port, .. }) => {
+                Some(pangolin_core::proxy::authority_of(host, *port))
+            }
+            _ => None,
         };
-        // Use the variant without hop-by-hop stripping because
-        // Pingora handles those automatically in its HTTP/1.1
-        // serialization. Stripping them here would desync the
-        // header_name_map, causing assertion failures.
-        apply_proxy_policy_without_hop_by_hop_stripping(&mut req, &ctx);
 
-        // host_mode=Backend: the executor (pingora upstream
-        // peer) will dial the backend, so the Host header
-        // should be the backend's host:port. We do that
-        // here because we know the backend authority.
-        let backend = parse_backend_to_target(&site.backend).ok();
-        if site.host_mode == HostMode::Backend
-            && let Some((
-                _,
-                BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. },
-            )) = &backend
-        {
-            let new_host = format!("{}:{}", host, port);
-            upsert_header(&mut req.headers, "Host", &new_host);
-        }
-
+        // The `X-Forwarded-For` chain the client sent, if any: the
+        // policy appends the hop to it.
         // A tunnelled backend's URL may carry a **path prefix**
         // (`office:http://10.0.0.1:8080/apis`). The prefix is part
         // of the backend's identity, so the upstream request has to
@@ -959,66 +1015,16 @@ impl ProxyHttp for AppProxy {
         // The tunnel path needs it explicitly because the CONNECT
         // instruction only carries a `host:port` — the path is the
         // request's own.
-        if let Some((
-            tun_name,
-            BackendTarget::Http { base_path, .. } | BackendTarget::Https { base_path, .. },
-        )) = &backend
-            && !tun_name.is_empty()
+        if let Some(BackendTarget::Http { base_path, .. } | BackendTarget::Https { base_path, .. }) =
+            ctx.target.as_deref()
+            && !ctx.tun_name.is_empty()
             && !base_path.is_empty()
         {
             prepend_base_path(upstream, base_path)?;
         }
 
-        // Apply the mutations back to the pingora RequestHeader.
-        // Since we're using apply_proxy_policy_without_hop_by_hop_stripping,
-        // we only need to handle:
-        //   - Host header rewrites (for Backend/Custom modes)
-        //   - X-Forwarded-* additions on every mode (issue: we
-        //     now inject X-Forwarded-For / etc on Passthrough too,
-        //     so upstreams always see the hop path)
-        //
-        // Pingora handles hop-by-hop headers automatically, so we
-        // don't need to remove them here.
-        //
-        // The four `P-*` gateway headers were already written on
-        // the downstream request header in `request_filter`; the
-        // upstream request is a clone of it, so they arrive here
-        // unchanged (the `already_same` check below skips them).
-        //
-        // For headers the policy may have MODIFIED (X-Forwarded-*
-        // chain appends, Host rewrite), we must use `insert_header`
-        // (replace) — otherwise the original client-sent value
-        // would survive alongside the policy-injected one,
-        // producing duplicate X-Forwarded-For entries on the wire. For headers the policy did NOT
-        // touch, `append_header` is the right call so we preserve
-        // legitimate multi-value headers like `Via` or RFC 7239
-        // `Forwarded` chains.
-        //
-        // Concretely: walk `req.headers` in order. The first
-        // occurrence of each name uses `insert_header` (replace);
-        // subsequent occurrences (the policy is NOT multi-value)
-        // use `append_header` so anything the client sent that
-        // the policy didn't touch (e.g. a `Cookie2:` line) still
-        // goes through. The "already" guard on identical
-        // (name, value) pairs avoids redundant rewrites.
-        let mut inserted: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (k, v) in req.headers.iter() {
-            let already_same = upstream
-                .headers
-                .iter()
-                .any(|(hk, hv)| hk.as_str().eq_ignore_ascii_case(k) && hv == v.as_str());
-            if already_same {
-                continue;
-            }
-            let Ok(value) = HeaderValue::from_str(v) else {
-                continue;
-            };
-            if inserted.insert(k.to_ascii_lowercase()) {
-                upstream.insert_header(k.clone(), value).ok();
-            } else {
-                upstream.append_header(k.clone(), value).ok();
-            }
-        }
+        // Apply the rewrites.
+        rewrite_upstream_headers(upstream, &policy_ctx, backend_authority.as_deref());
         Ok(())
     }
 
@@ -1167,6 +1173,68 @@ fn tunnel_peer(app: &Arc<App>, tun_name: &str, target: &BackendTarget) -> Result
     Ok(peer)
 }
 
+/// Build the upstream peer for a request's backend target.
+///
+/// The target comes from the **request state** — `request_filter`
+/// resolved it from one routing revision. Reading the index here
+/// could see a *newer* revision, so a request could be routed by one
+/// revision and sent to another (issue #253).
+///
+/// A tun backend gets a peer whose `custom_l4` connector opens a
+/// **tunnel byte stream** — from pingora's point of view that is an
+/// ordinary upstream connection, so the tunnel path uses pingora's
+/// own HTTP machinery (chunked bodies, upgrades, connection reuse)
+/// instead of a hand-written counterpart.
+///
+/// A direct backend is dialled at an address the **resolver**
+/// produced: a name is resolved once and cached, an IP literal is
+/// parsed. `HttpPeer::new` takes the address as it is — it never
+/// resolves anything itself, so the request path does no name
+/// resolution at all (issue #253).
+async fn upstream_peer_for(
+    app: &Arc<App>,
+    resolver: &Arc<BackendResolver>,
+    ctx: &mut RequestState,
+) -> Result<Box<HttpPeer>> {
+    // pingora re-enters this hook when it retries. The attempt
+    // number walks the addresses of a name that resolved to several,
+    // so a retry reaches the next address instead of the same dead
+    // one.
+    let attempt = ctx.upstream_attempt;
+    ctx.upstream_attempt += 1;
+
+    let Some(target) = ctx.target.clone() else {
+        return Err(Error::new_str("no backend target"));
+    };
+    let tun_name = ctx.tun_name.as_str();
+    if !tun_name.is_empty() {
+        return Ok(Box::new(tunnel_peer(app, tun_name, &target)?));
+    }
+    match &*target {
+        BackendTarget::Http { host, port, .. } => {
+            let addr = resolver.address(host, *port, attempt).await.map_err(|e| {
+                // A backend that does not resolve is a gateway error,
+                // not a crash: the client gets a 502.
+                error!("backend {}:{} could not be resolved: {}", host, port, e);
+                Error::explain(ErrorType::ReadError, format!("bad backend: {e}"))
+            })?;
+            Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        }
+        BackendTarget::Https { host, port, .. } => {
+            let addr = resolver.address(host, *port, attempt).await.map_err(|e| {
+                error!("backend {}:{} could not be resolved: {}", host, port, e);
+                Error::explain(ErrorType::ReadError, format!("bad backend: {e}"))
+            })?;
+            // The SNI stays the backend's **name**, never the address
+            // it resolved to: the certificate is issued for the name.
+            Ok(Box::new(HttpPeer::new(addr, true, host.clone())))
+        }
+        BackendTarget::File { .. } => {
+            Err(Error::explain(ErrorType::ReadError, "file:// not a peer"))
+        }
+    }
+}
+
 /// Prepend a backend's path prefix to the upstream request path.
 ///
 /// `base_path` is the prefix of the backend URL (`/apis`); the request
@@ -1214,15 +1282,68 @@ fn prepend_base_path(upstream: &mut RequestHeader, base_path: &str) -> Result<()
     Ok(())
 }
 
-fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(slot) = headers
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-    {
-        slot.1 = value.to_string();
+/// Rewrite the upstream request's headers per the proxy policy.
+///
+/// The **rules** live in [`pangolin_core::HeaderPolicy`] — the same
+/// rules the `file://` path applies — and they are applied **in
+/// place** to pingora's own header map. The headers used to be
+/// materialised into an owned `Vec<(String, String)>`, rewritten
+/// there and written back: O(n²) time and O(n) allocations per
+/// request, and a rewrite that blanked every header value that was
+/// not visible ASCII (issue #253).
+///
+/// Pingora handles the hop-by-hop headers itself, so only the `Host`
+/// header and the `X-Forwarded-*` family are touched here — and only
+/// the headers the policy actually rewrote. Every other header — the
+/// client's `Cookie`, `Via`, an RFC 7239 `Forwarded` chain, the four
+/// `P-*` gateway headers the downstream request already carried — is
+/// left exactly as it was.
+pub fn rewrite_upstream_headers(
+    upstream: &mut RequestHeader,
+    policy_ctx: &ProxyCtx,
+    backend_authority: Option<&str>,
+) {
+    // The `X-Forwarded-For` chain the client sent, if any: the
+    // policy appends the hop to it.
+    let current_xff = upstream
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let policy = HeaderPolicy::for_request(policy_ctx, backend_authority, current_xff);
+    if let Some(host) = &policy.host {
+        set_first_header(upstream, "Host", host);
+    }
+    if let Some(xff) = &policy.forwarded_for {
+        set_first_header(upstream, "X-Forwarded-For", xff);
+    }
+    if let Some(xfh) = &policy.forwarded_host {
+        set_first_header(upstream, "X-Forwarded-Host", xfh);
+    }
+    if let Some(xfp) = &policy.forwarded_proto {
+        set_first_header(upstream, "X-Forwarded-Proto", xfp);
+    }
+}
+
+/// Replace the **first** value under `name` and keep the rest.
+///
+/// The name and the value are written through pingora's own
+/// mutators: touching `upstream.headers` directly desyncs the
+/// header name/case map, and pingora-http asserts on it at
+/// iteration time.
+///
+/// The rest of the values are kept because a header may legitimately
+/// carry several of them (`Set-Cookie`, an RFC 7239 `Forwarded`
+/// chain) — dropping them would lose the client's data.
+fn set_first_header(upstream: &mut RequestHeader, name: &'static str, value: &str) {
+    let existing: Vec<HeaderValue> = upstream.headers.get_all(name).iter().cloned().collect();
+    // `insert_header` replaces **every** value under the name …
+    if upstream.insert_header(name, value).is_err() {
         return;
     }
-    headers.push((name.to_string(), value.to_string()));
+    // … so the ones we want to keep are appended back.
+    for kept in existing.into_iter().skip(1) {
+        upstream.append_header(name, kept).ok();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1478,21 +1599,24 @@ fn peer_addr_std(session: &Session) -> Option<std::net::SocketAddr> {
 /// Snapshot the first-level headers the resolver consults off the
 /// request.
 ///
-/// The resolver's header lookup is a closure over owned strings:
-/// the request header cannot be borrowed immutably while it is
-/// being mutated (we strip + write the gateway headers right
-/// after). Only the headers the configured mode actually consults
-/// are read — in `direct` mode that is none of them.
-fn snapshot_first_level_headers(
-    provider_cfg: &pangolin_core::provider::SiteProviderConfig,
-    session: &Session,
-) -> std::collections::HashMap<String, String> {
-    let mut headers = std::collections::HashMap::new();
-    for name in pangolin_core::pgl::first_level_headers(provider_cfg) {
+/// The resolver's header lookup borrows the values: the request
+/// header cannot be borrowed immutably while it is being mutated (we
+/// strip + write the gateway headers right after), so the values are
+/// read out of the session first.
+///
+/// The snapshot is a **fixed-length** structure and the names come
+/// from the routing revision, so the request path allocates neither
+/// a name list nor a map (issue #253).
+fn snapshot_first_level_headers<'a>(
+    names: &'a [String],
+    session: &'a Session,
+) -> pangolin_core::pgl::FirstLevelHeaders<'a> {
+    let mut headers = pangolin_core::pgl::FirstLevelHeaders::new();
+    for name in names {
         if let Some(value) = session.get_header(name.as_str())
             && let Ok(value) = std::str::from_utf8(value.as_bytes())
         {
-            headers.insert(name, value.to_string());
+            headers.push(name, value);
         }
     }
     headers
@@ -1629,17 +1753,29 @@ fn classify_referer(
 /// The function is synchronous for the same reason: a borrow of the
 /// request headers must not cross an `await`, which would demand
 /// `Session: Sync`.
-fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16, user_agent: Option<&str>) {
+fn record_access_log(
+    app: &Arc<App>,
+    ctx: &mut RequestState,
+    status: u16,
+    user_agent: Option<&str>,
+) {
     let duration_ms = ctx.start.elapsed().as_millis() as u64;
-    let entry = pangolin_core::AccessLogEntry {
+    // The entry takes **ownership** of the request's strings: they
+    // are moved out of the request state, not copied into it. The
+    // request path made a copy of every one of them before
+    // (issue #253).
+    //
+    // The traffic sample reads them from the entry afterwards — see
+    // [`traffic_sample`].
+    let entry = Arc::new(pangolin_core::AccessLogEntry {
         timestamp: chrono::Utc::now(),
-        method: ctx.method.clone(),
-        path: ctx.path.clone(),
-        host: ctx.host.clone(),
+        method: std::mem::take(&mut ctx.method),
+        path: std::mem::take(&mut ctx.path),
+        host: std::mem::take(&mut ctx.host),
         status,
         duration_ms,
-        backend: ctx.backend.clone(),
-        client_ip: ctx.log_client_ip.clone(),
+        backend: std::mem::take(&mut ctx.backend),
+        client_ip: std::mem::take(&mut ctx.log_client_ip),
         // The only copy of the User-Agent on the request path: it is
         // read in place from the request headers and copied once,
         // here, into the entry. Consumed by `App::push_access_log`'s
@@ -1649,27 +1785,46 @@ fn record_access_log(app: &Arc<App>, ctx: &RequestState, status: u16, user_agent
         // once (no parsing, no stripping — see `RequestState::referer`);
         // this is the copy that lands in the entry, and the bot log
         // inherits the very same string through the entry.
-        referer: ctx.referer.clone(),
-    };
+        referer: ctx.referer.take(),
+    });
     // The referer fan-out goes first: it needs a borrow of the
     // entry, and `push_access_log` consumes it.
     if let Some(hit) = ctx.referer_hit.as_ref() {
         app.push_referer_log(&entry, hit);
     }
-    app.push_access_log(entry);
+    // The verified bot identity travels with the request: the
+    // crawler was verified **once**, in `request_filter`, so the bot
+    // side-channel does not verify it again (issue #253).
+    let bot = ctx.bot.take();
+    ctx.entry = Some(entry.clone());
+    app.push_access_log_verified(entry, bot);
 }
 
 /// Build a [`pangolin_core::TrafficSample`] for the side-channel.
 /// Allocates only host + optional truncated path; everything else
 /// is `Copy`. Called from `logging` — never awaits.
+///
+/// The access-log entry took **ownership** of the request's strings,
+/// so the sample reads them from the entry when there is one — the
+/// very same values the entry carries. A request that never reached
+/// the log (a rejection, a 404) has no entry, and its own strings
+/// are still in the request state.
 fn traffic_sample(session: &Session, ctx: &RequestState) -> pangolin_core::TrafficSample {
-    let host = if ctx.host_known && !ctx.host.is_empty() {
-        ctx.host.clone()
+    let (host_value, path_value, method_value) = match ctx.entry.as_ref() {
+        Some(entry) => (
+            entry.host.as_str(),
+            entry.path.as_str(),
+            entry.method.as_str(),
+        ),
+        None => (ctx.host.as_str(), ctx.path.as_str(), ctx.method.as_str()),
+    };
+    let host = if ctx.host_known && !host_value.is_empty() {
+        host_value.to_string()
     } else {
         pangolin_core::traffic::UNKNOWN_HOST.to_string()
     };
     let path = if ctx.traffic_kind == pangolin_core::TrafficKind::Http && ctx.host_known {
-        Some(pangolin_core::normalize_path(&ctx.path))
+        Some(pangolin_core::normalize_path(path_value))
     } else {
         None
     };
@@ -1684,7 +1839,7 @@ fn traffic_sample(session: &Session, ctx: &RequestState) -> pangolin_core::Traff
     pangolin_core::TrafficSample {
         host,
         path,
-        method: pangolin_core::TrafficMethod::parse(&ctx.method),
+        method: pangolin_core::TrafficMethod::parse(method_value),
         status,
         duration_ms: ctx.start.elapsed().as_millis() as u64,
         bytes_in: session.body_bytes_read() as u64,
@@ -1711,19 +1866,38 @@ fn parse_status_from_line(status_line: &str) -> u16 {
 /// Extract the effective host from the request, preferring the
 /// `Host` header but falling back to the HTTP/2 `:authority`
 /// pseudo-header.
-fn host_from_session(session: &Session) -> String {
-    session
-        .get_header("Host")
+///
+/// The count is the request's: the gateway extracts the host **once**
+/// per request — the upstream hooks read it from the request state
+/// instead of asking the session again — and the count is what makes
+/// that observable (issue #253).
+fn host_from_session(session: &Session, ctx: &mut RequestState) -> String {
+    extract_host(session.req_header(), ctx)
+}
+
+/// Extract the request's host into the request state.
+///
+/// The count is the request's: the gateway extracts the host **once**
+/// per request — the upstream hooks read the host from the state
+/// instead of asking the session again — and the count is what makes
+/// that observable (issue #253).
+fn extract_host(req: &RequestHeader, ctx: &mut RequestState) -> String {
+    ctx.host_extractions += 1;
+    effective_host(req)
+}
+
+/// The effective host of a request header.
+///
+/// The `Host` header wins; an HTTP/2 request carries the authority
+/// in the `:authority` pseudo-header instead, which pingora has
+/// already turned into the request's URI.
+fn effective_host(req: &RequestHeader) -> String {
+    req.headers
+        .get("host")
         .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .or_else(|| {
-            session
-                .req_header()
-                .uri
-                .authority()
-                .map(|a| a.as_str().to_string())
-        })
+        .or_else(|| req.uri.authority().map(|a| a.as_str().to_string()))
         .unwrap_or_default()
 }
 
@@ -1946,6 +2120,449 @@ mod tests {
             legal_header_value("P-Known-Bot", ""),
             HeaderValue::from_static("")
         );
+    }
+
+    /// The proxy context the policy rules read.
+    fn policy_ctx(
+        host_mode: pangolin_core::types::HostMode,
+        host_custom: Option<&str>,
+        peer_ip: Option<&str>,
+    ) -> ProxyCtx {
+        ProxyCtx {
+            original_host: "public.example.com".to_string(),
+            original_scheme: Scheme::Http,
+            host_mode,
+            host_custom: host_custom.map(String::from),
+            peer_ip: peer_ip.map(String::from),
+        }
+    }
+
+    /// `host_mode = Backend`: the `Host` header becomes the
+    /// backend's authority — the executor dials the backend, so the
+    /// backend is who the request is for.
+    #[test]
+    fn the_host_header_becomes_the_backend_authority() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(pangolin_core::types::HostMode::Backend, None, None),
+            Some("backend.internal:8080"),
+        );
+        assert_eq!(header.headers.get("host").unwrap(), "backend.internal:8080");
+    }
+
+    /// `host_mode = Custom`: the `Host` header becomes the site's own
+    /// value.
+    #[test]
+    fn the_host_header_becomes_the_custom_value() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Custom,
+                Some("custom.example.com"),
+                None,
+            ),
+            None,
+        );
+        assert_eq!(header.headers.get("host").unwrap(), "custom.example.com");
+    }
+
+    /// `host_mode = Passthrough`: the client's `Host` survives.
+    #[test]
+    fn the_passthrough_mode_keeps_the_clients_host() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(pangolin_core::types::HostMode::Passthrough, None, None),
+            None,
+        );
+        assert_eq!(header.headers.get("host").unwrap(), "public.example.com");
+    }
+
+    /// The `X-Forwarded-*` family carries the hop path: the peer
+    /// address, the public host and the scheme.
+    #[test]
+    fn the_forwarded_family_carries_the_hop_path() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Passthrough,
+                None,
+                Some("203.0.113.9"),
+            ),
+            None,
+        );
+        assert_eq!(
+            header.headers.get("x-forwarded-for").unwrap(),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            header.headers.get("x-forwarded-host").unwrap(),
+            "public.example.com"
+        );
+        assert_eq!(header.headers.get("x-forwarded-proto").unwrap(), "http");
+    }
+
+    /// A chain the client sent is **appended to**, not replaced.
+    #[test]
+    fn the_forwarded_chain_is_appended_to() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header
+            .insert_header("X-Forwarded-For", "198.51.100.1")
+            .unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Passthrough,
+                None,
+                Some("203.0.113.9"),
+            ),
+            None,
+        );
+        assert_eq!(
+            header.headers.get("x-forwarded-for").unwrap(),
+            "198.51.100.1, 203.0.113.9"
+        );
+    }
+
+    /// A chain that already ends with the hop is left alone — the
+    /// policy never adds the same address twice.
+    #[test]
+    fn the_forwarded_chain_is_not_repeated() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header
+            .insert_header("X-Forwarded-For", "198.51.100.1, 203.0.113.9")
+            .unwrap();
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Passthrough,
+                None,
+                Some("203.0.113.9"),
+            ),
+            None,
+        );
+        assert_eq!(
+            header.headers.get("x-forwarded-for").unwrap(),
+            "198.51.100.1, 203.0.113.9"
+        );
+    }
+
+    /// The client's own headers are neither overwritten nor lost: a
+    /// multi-value `Via`, an RFC 7239 `Forwarded` chain and a
+    /// `Cookie` all survive the rewrite.
+    #[test]
+    fn the_clients_own_headers_survive_the_rewrite() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        header.append_header("Via", "1.1 proxy-a").unwrap();
+        header.append_header("Via", "1.1 proxy-b").unwrap();
+        header
+            .insert_header("Forwarded", "for=198.51.100.1;proto=http")
+            .unwrap();
+        header.insert_header("Cookie", "session=abc").unwrap();
+
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Backend,
+                None,
+                Some("203.0.113.9"),
+            ),
+            Some("backend.internal:8080"),
+        );
+
+        let via: Vec<&str> = header
+            .headers
+            .get_all("via")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(via, vec!["1.1 proxy-a", "1.1 proxy-b"]);
+        assert_eq!(
+            header.headers.get("forwarded").unwrap(),
+            "for=198.51.100.1;proto=http"
+        );
+        assert_eq!(header.headers.get("cookie").unwrap(), "session=abc");
+    }
+
+    /// The four gateway headers the downstream request already
+    /// carried reach the backend unchanged.
+    #[test]
+    fn the_gateway_headers_are_passed_through() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        header.insert_header("P-Known-Bot", "googlebot").unwrap();
+        header.insert_header("P-Client-Ip", "198.51.100.1").unwrap();
+        header.insert_header("P-Client-Country", "DE").unwrap();
+        header.insert_header("P-Client-Region", "BE").unwrap();
+
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Backend,
+                None,
+                Some("203.0.113.9"),
+            ),
+            Some("backend.internal:8080"),
+        );
+
+        assert_eq!(header.headers.get("p-known-bot").unwrap(), "googlebot");
+        assert_eq!(header.headers.get("p-client-ip").unwrap(), "198.51.100.1");
+        assert_eq!(header.headers.get("p-client-country").unwrap(), "DE");
+        assert_eq!(header.headers.get("p-client-region").unwrap(), "BE");
+    }
+
+    /// A header value that is not visible ASCII survives the
+    /// rewrite.
+    ///
+    /// The rewrite used to materialise every header into a
+    /// `Vec<(String, String)>` with `to_str().unwrap_or("")`, so a
+    /// value that was not visible ASCII was **blanked** on its way
+    /// upstream (issue #253). The rewrite no longer converts the
+    /// values it does not touch.
+    #[test]
+    fn a_header_value_that_is_not_visible_ascii_survives() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+        header
+            .insert_header("X-Custom", HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap())
+            .unwrap();
+
+        rewrite_upstream_headers(
+            &mut header,
+            &policy_ctx(
+                pangolin_core::types::HostMode::Passthrough,
+                None,
+                Some("203.0.113.9"),
+            ),
+            None,
+        );
+
+        assert_eq!(
+            header.headers.get("x-custom").unwrap().as_bytes(),
+            b"caf\xc3\xa9"
+        );
+    }
+
+    /// The host is extracted **once** per request (issue #253).
+    ///
+    /// The upstream hooks read the host from the request state, so
+    /// they never ask the session again.
+    #[test]
+    fn the_host_is_extracted_once() {
+        let mut header = RequestHeader::build("GET", b"/", None).unwrap();
+        header.insert_header("Host", "public.example.com").unwrap();
+
+        let mut ctx = RequestState::default();
+        ctx.host = extract_host(&header, &mut ctx);
+        assert_eq!(ctx.host, "public.example.com");
+        assert_eq!(ctx.host_extractions, 1, "one extraction, one count");
+    }
+
+    /// A request without a `Host` header falls back to the
+    /// authority — the HTTP/2 `:authority` pseudo-header, which
+    /// pingora has already turned into the request's URI.
+    #[test]
+    fn the_host_falls_back_to_the_authority() {
+        let header = RequestHeader::build("GET", b"/", None).unwrap();
+        let mut ctx = RequestState::default();
+        assert_eq!(extract_host(&header, &mut ctx), "");
+        assert_eq!(ctx.host_extractions, 1);
+    }
+
+    /// A gateway with one site, so the routing revision has an entry
+    /// to resolve.
+    async fn gateway_with_site(backend: &str) -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pangolin.db");
+        {
+            let mut conn = rusqlite::Connection::open(&db_path).expect("open db");
+            pangolin_core::db::migrate(&mut conn).expect("migrate");
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at) \
+                 VALUES (?1, ?2, 1, 'passthrough', NULL, ?3, ?3)",
+                rusqlite::params!["site", backend, now],
+            )
+            .expect("insert site");
+            conn.execute(
+                "INSERT INTO domains (domain, site_name, enabled, created_at) \
+                 VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params!["site.example.com", "site", now],
+            )
+            .expect("insert domain");
+        }
+        let app = Arc::new(
+            pangolin_core::App::new(
+                &db_path,
+                pangolin_core::config::Config::default(),
+                pangolin_core::CertManager::default(),
+            )
+            .expect("build app"),
+        );
+        (app, dir)
+    }
+
+    /// The upstream peer is built from the request's target — the one
+    /// `request_filter` resolved from **one** routing revision
+    /// (issue #253).
+    ///
+    /// A reload that publishes a new revision while the request is in
+    /// flight must not move the request to another backend: the
+    /// request was routed by the revision it started with.
+    #[tokio::test]
+    async fn the_upstream_peer_uses_the_targets_routing_revision() {
+        let (app, _dir) = gateway_with_site("http://127.0.0.1:8080").await;
+
+        // The routing entry, resolved the way `request_filter`
+        // resolves it.
+        let revision = app.indexes.read().clone();
+        let site = pangolin_core::index::lookup_site(&revision, "site.example.com")
+            .expect("the site is in the revision");
+        let (tun_name, target) =
+            parse_backend_to_target(&site.backend).expect("the backend parses");
+        let mut ctx = RequestState {
+            tun_name,
+            target: Some(Arc::new(target)),
+            ..Default::default()
+        };
+
+        // The site's backend is changed and a **new** revision is
+        // published while the request is in flight.
+        {
+            let mut changed = (*site).clone();
+            changed.backend = "http://127.0.0.1:9999".into();
+            let db = app.db.lock().await;
+            pangolin_core::db::upsert_site(&db, &changed).expect("update the site");
+        }
+        app.reload_indexes().await;
+
+        // The request still goes to the backend it was routed to.
+        let resolver = Arc::new(BackendResolver::from_system_conf().expect("the system resolver"));
+        let peer = upstream_peer_for(&app, &resolver, &mut ctx)
+            .await
+            .expect("the peer is built");
+        assert_eq!(
+            peer_address(&peer),
+            "127.0.0.1:8080",
+            "the request must keep the backend of the revision it started with"
+        );
+    }
+
+    /// A backend addressed by an **IPv6 literal** gets a peer that
+    /// carries the address (issue #253).
+    ///
+    /// The peer used to be built from the string `::1:8080`, which is
+    /// not an address — pingora's peer constructor resolves its
+    /// argument and **panics** when that fails.
+    #[tokio::test]
+    async fn an_ipv6_backend_gets_an_ipv6_peer() {
+        let (app, _dir) = gateway_with_site("http://[::1]:8080").await;
+
+        let revision = app.indexes.read().clone();
+        let site = pangolin_core::index::lookup_site(&revision, "site.example.com")
+            .expect("the site is in the revision");
+        let (tun_name, target) =
+            parse_backend_to_target(&site.backend).expect("the backend parses");
+        let mut ctx = RequestState {
+            tun_name,
+            target: Some(Arc::new(target)),
+            ..Default::default()
+        };
+
+        let resolver = Arc::new(BackendResolver::from_system_conf().expect("the system resolver"));
+        let peer = upstream_peer_for(&app, &resolver, &mut ctx)
+            .await
+            .expect("the peer is built");
+        assert_eq!(
+            peer_address(&peer),
+            "[::1]:8080",
+            "the peer must carry the IPv6 address"
+        );
+    }
+
+    /// A backend whose name does not resolve is an **error**, not a
+    /// panic (issue #253).
+    #[tokio::test]
+    async fn a_backend_that_does_not_resolve_is_an_error() {
+        let (app, _dir) = gateway_with_site("http://nowhere.invalid:8080").await;
+
+        let revision = app.indexes.read().clone();
+        let site = pangolin_core::index::lookup_site(&revision, "site.example.com")
+            .expect("the site is in the revision");
+        let (tun_name, target) =
+            parse_backend_to_target(&site.backend).expect("the backend parses");
+        let mut ctx = RequestState {
+            tun_name,
+            target: Some(Arc::new(target)),
+            ..Default::default()
+        };
+
+        let resolver = Arc::new(BackendResolver::from_system_conf().expect("the system resolver"));
+        let err = upstream_peer_for(&app, &resolver, &mut ctx)
+            .await
+            .expect_err("the name does not resolve");
+        let message = err.to_string();
+        assert!(
+            message.contains("nowhere.invalid"),
+            "the error must name the backend: {message}"
+        );
+    }
+
+    /// The access-log entry takes **ownership** of the request's
+    /// strings (issue #253).
+    ///
+    /// The entry used to be built by copying every string out of the
+    /// request state. The strings are **moved** now, so the request
+    /// path makes no copy of them — and the traffic sample reads them
+    /// from the entry afterwards.
+    #[tokio::test]
+    async fn the_access_log_entry_takes_ownership_of_the_request_strings() {
+        let (app, _dir) = gateway_with_site("http://127.0.0.1:8080").await;
+
+        let mut ctx = RequestState {
+            method: "GET".to_string(),
+            path: "/api".to_string(),
+            host: "site.example.com".to_string(),
+            backend: "direct:127.0.0.1:8080".to_string(),
+            log_client_ip: "203.0.113.7".to_string(),
+            ..Default::default()
+        };
+        record_access_log(&app, &mut ctx, 200, Some("curl/8.0"));
+
+        // The strings were moved out of the request state …
+        assert!(ctx.method.is_empty(), "the method was moved");
+        assert!(ctx.path.is_empty(), "the path was moved");
+        assert!(ctx.host.is_empty(), "the host was moved");
+        assert!(ctx.backend.is_empty(), "the backend was moved");
+        assert!(ctx.log_client_ip.is_empty(), "the client IP was moved");
+
+        // … and the entry carries them unchanged.
+        let entry = ctx.entry.expect("the entry is kept for the traffic sample");
+        assert_eq!(entry.method, "GET");
+        assert_eq!(entry.path, "/api");
+        assert_eq!(entry.host, "site.example.com");
+        assert_eq!(entry.backend, "direct:127.0.0.1:8080");
+        assert_eq!(entry.client_ip, "203.0.113.7");
+        assert_eq!(entry.user_agent.as_deref(), Some("curl/8.0"));
+        assert_eq!(entry.status, 200);
+    }
+
+    /// The address a peer carries, as text.
+    fn peer_address(peer: &HttpPeer) -> String {
+        use pingora::protocols::l4::socket::SocketAddr as PgSocketAddr;
+        match peer._address {
+            PgSocketAddr::Inet(sa) => sa.to_string(),
+            #[cfg(unix)]
+            _ => "unix".to_string(),
+        }
     }
 
     /// A UTF-8 request target gets the backend's path prefix, and

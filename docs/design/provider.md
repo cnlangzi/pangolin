@@ -104,6 +104,13 @@ The comparison happens against `session.client_addr()`, normalized
 with `pangolin_core::client_ip::normalize_addr` (an IPv4-mapped IPv6
 address is unwrapped to its IPv4 form).
 
+The allowlist is a `CidrSet` (`crates/pangolin-core/src/cidr.rs`), and
+its ranges are matched through a **prefix tree** (issue #253): the
+lookup walks the address bit by bit, so the cost of the comparison
+does not depend on how many ranges the provider publishes. The guard
+runs on the request path, and a provider's list is hundreds of
+entries — scanning it per request was work the tree does not do.
+
 ### Failure modes
 
 | Situation | Behaviour |

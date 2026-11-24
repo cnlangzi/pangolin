@@ -32,15 +32,20 @@ For the corresponding config keys, see
 
 ```
                 ┌────────────────────────────────────────────────┐
-                │           proxy.rs (existing, unchanged)       │
+                │            proxy.rs (request_filter)          │
                 │                                                │
-proxy.rs ──────►│ App::push_access_log(entry)                    │
+                │  verify_bot(ua, client_ip) — ONCE per request  │
+                │  (the verdict travels with the request)        │
+                └───────────────────┬────────────────────────────┘
+                                    │  App::push_access_log_verified(entry, bot)
+                                    ▼
+                ┌────────────────────────────────────────────────┐
+                │   App::push_access_log_verified(entry, bot)    │
                 │   ├── Arc::new(entry) — one allocation, shared │
                 │   ├── access_log_recent.push(arc)              │
                 │   ├── access_log_tx.send(arc)      ──► /api/logs/stream
                 │   └── bot side-channel (fail closed):          │
-                │         verify_bot(ua, client_ip)              │
-                │         only if Verified:                      │
+                │         only if the verdict says Verified:     │
                 │             BotLogEntry::from_access_log       │
                 │             ├── bot_log_recent.push            │
                 │             ├── bot_stats.record               │
@@ -53,6 +58,13 @@ proxy.rs ──────►│ App::push_access_log(entry)                   
 CIDR / RDNS-cache lookup). Cold RDNS and official IP-list downloads run
 in background tasks started by `App::start_bot_writer`. Disk I/O for
 JSONL happens in `BotLogWriter::run`.
+
+The crawler is verified **once** per request (issue #253): the verdict
+is computed in `request_filter` — where the `P-Known-Bot` header and
+the rate limiter's bot exemption need it — and travels with the
+request to the bot side-channel. `App::push_access_log_verified` takes
+the verdict; `App::push_access_log` is the variant for a caller that
+has none, and it verifies the crawler itself.
 
 ## Components
 

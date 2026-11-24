@@ -132,7 +132,7 @@ verifier knows can produce a verified bot.
 
 ```rust
 pub struct RateLimitPolicy { /* enabled, req_limit, req_window_secs, … */ }
-pub struct IpRules { /* exact: HashSet<IpAddr>, nets: Vec<IpNet> */ }
+pub struct IpRules { /* the CidrSet of crates/pangolin-core/src/cidr.rs */ }
 pub struct SiteLimitConfig {
     pub policy: RateLimitPolicy,
     pub whitelist: IpRules,
@@ -146,7 +146,19 @@ whitelist match wins a tie against a blacklist match of the same
 prefix length; a longer prefix always wins (`10.0.0.0/8` whitelisted +
 `10.1.2.3` blacklisted → the `/32` wins and the client is blocked).
 
-CIDR parsing and matching use `ipnet`.
+CIDR parsing uses `ipnet`; the **matching** is a prefix tree (issue
+#253). `CidrSet` keeps the ranges in a binary tree per address
+family: a lookup walks the address bit by bit (32 steps for IPv4, 128
+for IPv6) and the deepest node on the path that carries a prefix
+length is the longest match. The cost of a lookup therefore does not
+depend on how many rules the set holds — a site with a thousand rules
+does not pay a thousand comparisons per request, and `rule_match`
+(which consults the whitelist and the blacklist) does not pay two
+thousand. The rules were matched by scanning the whole list before.
+
+The **text** form of a range is unchanged: the set keeps the ranges
+as they were written, so the canonical form the `ip_rules` and
+`site_origin_allow` tables key on does not drift.
 
 `Indexes` (`crates/pangolin-core/src/index.rs`) gains:
 

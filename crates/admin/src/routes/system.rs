@@ -63,7 +63,7 @@ pub async fn handle_reload(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>
 /// }
 /// ```
 pub async fn handle_get_system_config(app: &Arc<App>) -> http::Result<Response<Full<Bytes>>> {
-    let cfg = app.system_config.read().await.clone();
+    let cfg = app.system_config.read().clone();
     let body = serde_json::json!({
         "provider": cfg.provider.to_string(),
         "pgl_headers_enabled": cfg.pgl_headers_enabled,
@@ -170,7 +170,7 @@ pub async fn parse_system_config_form_merged(
     body: &[u8],
 ) -> Result<SystemConfig, String> {
     let mut cfg = parse_system_config_form(body)?;
-    let current = app.system_config.read().await.clone();
+    let current = app.system_config.read().clone();
     if !form_has_param(body, "origin_guard_enabled") {
         cfg.origin_guard_enabled = current.origin_guard_enabled;
     } else if cfg.origin_guard_enabled

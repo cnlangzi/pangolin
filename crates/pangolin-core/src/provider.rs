@@ -363,6 +363,50 @@ impl SiteProviderConfig {
         spec(self.provider)
     }
 
+    /// The first-level header names this configuration consults.
+    ///
+    /// The fixed names come from the registry (see [`crate::provider::spec`]);
+    /// only `custom_lb` uses the operator-configured names.
+    ///
+    /// The request path does **not** call this: the names are
+    /// precomputed into the routing revision when the index is built
+    /// (issue #253) and the request path reads them from there.
+    pub fn first_level_headers(&self) -> Vec<String> {
+        match self.provider {
+            ProviderKey::Direct => Vec::new(),
+            ProviderKey::Cloudflare => {
+                let headers = spec(ProviderKey::Cloudflare).headers;
+                [
+                    headers.client_ip,
+                    headers.client_ipv6,
+                    headers.country,
+                    headers.region,
+                    headers.region_fallback,
+                ]
+                .into_iter()
+                .flatten()
+                .map(|n| n.to_string())
+                .collect()
+            }
+            ProviderKey::CustomLb => {
+                let mut names = Vec::new();
+                for key in [
+                    self.client_ip_header.as_deref(),
+                    self.country_header.as_deref(),
+                    self.region_header.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !names.iter().any(|n| n == key) {
+                        names.push(key.to_string());
+                    }
+                }
+                names
+            }
+        }
+    }
+
     /// Whether the site's effective allowlist is empty.
     ///
     /// The effective allowlist is the provider's published ranges ∪ the

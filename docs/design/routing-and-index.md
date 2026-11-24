@@ -285,6 +285,32 @@ come from the same revision, so a reload can never expose a routing
 table from one revision next to a classification from another
 (issue #212).
 
+### A request reads the revision **once** (issue #253)
+
+The request path takes the routing revision **once**, in
+`request_filter`: it resolves the site, and it parses the site's
+backend into a `BackendTarget`. Both travel with the request — in the
+per-request state — to the two upstream hooks:
+
+| Hook | What it reads |
+|---|---|
+| `upstream_peer` | the backend target from the request state |
+| `upstream_request_filter` | the site and the backend target from the request state |
+
+Neither of them reads the index. That matters for more than the work
+it saves: a **second** read could see a **newer** revision, so a
+request could be routed by one revision and sent to another — the
+site's limits from one revision and its backend from another. Because
+the upstream hooks read the request state, they belong to the same
+revision **by construction**, and no amount of re-reading can pull
+them apart.
+
+The same holds for the provider configuration: the site's effective
+provider and the first-level header **names** it consults are read
+from the revision the request started with, and the names are
+precomputed into the revision (`Indexes::provider_headers`) so the
+request path never builds them.
+
 **The window that remains is the connection's lifetime.** A connection
 that negotiated `h2` while its host was direct keeps that protocol
 after the host is re-pointed at a tunnel; the next request on it then

@@ -57,6 +57,19 @@ pub struct Indexes {
     /// configuration together. One entry per site; a site without an
     /// override inherits the global defaults.
     pub providers: HashMap<String, Arc<SiteProviderConfig>>,
+    /// site name → the first-level header names the site's provider
+    /// consults.
+    ///
+    /// Precomputed when the revision is built: the request path used
+    /// to build the list per request — a `Vec<String>` of names, and
+    /// a `HashMap<String, String>` of the values it read off the
+    /// request (issue #253). The names travel with the routing
+    /// revision, so the request path reads them from here.
+    ///
+    /// One entry per site, exactly like [`Indexes::providers`]: the
+    /// two maps are built from the same configurations, so a site
+    /// always has both.
+    pub provider_headers: HashMap<String, Arc<[String]>>,
     /// The domains that route through a tunnel — the subset of
     /// `domain` whose owning site has a `tun_name:` backend prefix.
     ///
@@ -219,6 +232,38 @@ impl Indexes {
         // 6. providers: one entry per site, the site's own override
         //    with the global defaults filled in.
         let providers = build_provider_configs(&site_names, site_providers, site_ranges, global);
+        // 6b. The first-level header names of every site, precomputed
+        //     out of the same configurations: the request path reads
+        //     them from the revision instead of building the list per
+        //     request (issue #253).
+        let provider_headers: HashMap<String, Arc<[String]>> = providers
+            .iter()
+            .map(|(name, cfg)| {
+                let names = cfg.first_level_headers();
+                // The request path snapshots the first-level headers
+                // into a fixed-length structure (see
+                // `pgl::FirstLevelHeaders`). A provider that named
+                // more headers than it holds would lose the tail — a
+                // client IP or a country that reads as unknown — so
+                // the count is asserted here, where the names are
+                // computed.
+                debug_assert!(
+                    names.len() <= crate::pgl::MAX_FIRST_LEVEL_HEADERS,
+                    "provider {name} names {} first-level headers, more than the \
+                     request-path snapshot holds",
+                    names.len()
+                );
+                if names.len() > crate::pgl::MAX_FIRST_LEVEL_HEADERS {
+                    log::warn!(
+                        "provider {name} names {} first-level headers; only the \
+                         first {} are read",
+                        names.len(),
+                        crate::pgl::MAX_FIRST_LEVEL_HEADERS
+                    );
+                }
+                (name.clone(), Arc::from(names))
+            })
+            .collect();
 
         // 7. tunnel_domains: the domains of `domain_idx` whose owning
         //    site routes through a tunnel. Derived from the map that
@@ -231,6 +276,7 @@ impl Indexes {
             tun: tun_idx,
             limits,
             providers,
+            provider_headers,
             tunnel_domains: Arc::new(tunnel_domains),
             tunnel_hosts: Arc::new(tunnel_hosts),
         }
@@ -522,6 +568,7 @@ fn guarded_wildcard_candidates(normalized: &str) -> impl Iterator<Item = String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderKey;
     use crate::types::HostMode;
     use chrono::Utc;
 
@@ -558,6 +605,56 @@ mod tests {
         let idx = Indexes::build(sites, domains);
         let s = lookup_site(&idx, "app.example.com").unwrap();
         assert_eq!(s.name, "app");
+    }
+
+    /// The first-level header names are precomputed into the routing
+    /// revision (issue #253).
+    ///
+    /// The request path used to build the list per request — a
+    /// `Vec<String>` of the names the provider consults, and a
+    /// `HashMap<String, String>` of the values it read off the
+    /// request. The revision carries the names now.
+    #[test]
+    fn the_provider_header_names_are_precomputed_into_the_revision() {
+        let sites = vec![make_site("app", "http://127.0.0.1:8080")];
+        let domains = vec![make_domain("app.example.com", "app")];
+        let global = GlobalProviderConfig {
+            provider: ProviderKey::Cloudflare,
+            ..Default::default()
+        };
+        let idx = Indexes::build_with_providers(
+            sites,
+            domains,
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &global,
+        );
+
+        let names = idx
+            .provider_headers
+            .get("app")
+            .expect("every site carries its header names");
+        assert!(names.iter().any(|n| n == "CF-Connecting-IP"));
+        assert!(names.iter().any(|n| n == "CF-IPCountry"));
+        // The names come from the site's **effective** provider, so
+        // they agree with the provider configuration of the same
+        // revision.
+        let provider = idx.providers.get("app").expect("every site has a provider");
+        assert_eq!(names.as_ref(), provider.first_level_headers());
+    }
+
+    /// A `direct` site consults no first-level header at all — the
+    /// list is empty, not a list of nothing-to-read.
+    #[test]
+    fn a_direct_site_has_no_first_level_header_names() {
+        let sites = vec![make_site("app", "http://127.0.0.1:8080")];
+        let domains = vec![make_domain("app.example.com", "app")];
+        let idx = Indexes::build(sites, domains);
+        let names = idx.provider_headers.get("app").expect("every site");
+        assert!(names.is_empty());
     }
 
     /// `host_matches_domains` is the plain-list twin of

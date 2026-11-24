@@ -409,7 +409,7 @@ pub async fn site_provider_view(
     app: &Arc<App>,
     site_name: Option<&str>,
 ) -> crate::templates::sites::SiteProviderView {
-    let global_cfg = app.system_config.read().await.clone();
+    let global_cfg = app.system_config.read().clone();
     let global = GlobalProviderConfig::from_system_config(&global_cfg);
 
     let (over, ranges) = match site_name {
@@ -507,7 +507,7 @@ pub async fn provider_view_from_submitted(
     // but only when the parse succeeded. Otherwise the stored view's
     // effective state is the honest answer.
     if let Some(over) = &parsed.over {
-        let global_cfg = app.system_config.read().await.clone();
+        let global_cfg = app.system_config.read().clone();
         let global = GlobalProviderConfig::from_system_config(&global_cfg);
         let effective = global.resolve(over);
         let (range_count, last_fetch) = provider_range_state(app, effective.provider).await;
