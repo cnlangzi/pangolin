@@ -1872,7 +1872,18 @@ fn parse_status_from_line(status_line: &str) -> u16 {
 /// instead of asking the session again — and the count is what makes
 /// that observable (issue #253).
 fn host_from_session(session: &Session, ctx: &mut RequestState) -> String {
-    effective_host(session.req_header(), &mut ctx.host_extractions)
+    extract_host(session.req_header(), ctx)
+}
+
+/// Extract the request's host into the request state.
+///
+/// The count is the request's: the gateway extracts the host **once**
+/// per request — the upstream hooks read the host from the state
+/// instead of asking the session again — and the count is what makes
+/// that observable (issue #253).
+fn extract_host(req: &RequestHeader, ctx: &mut RequestState) -> String {
+    ctx.host_extractions += 1;
+    effective_host(req)
 }
 
 /// The effective host of a request header.
@@ -1880,8 +1891,7 @@ fn host_from_session(session: &Session, ctx: &mut RequestState) -> String {
 /// The `Host` header wins; an HTTP/2 request carries the authority
 /// in the `:authority` pseudo-header instead, which pingora has
 /// already turned into the request's URI.
-pub fn effective_host(req: &RequestHeader, extractions: &mut u32) -> String {
-    *extractions += 1;
+fn effective_host(req: &RequestHeader) -> String {
     req.headers
         .get("host")
         .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
@@ -2350,12 +2360,10 @@ mod tests {
         let mut header = RequestHeader::build("GET", b"/", None).unwrap();
         header.insert_header("Host", "public.example.com").unwrap();
 
-        let mut extractions = 0u32;
-        assert_eq!(
-            effective_host(&header, &mut extractions),
-            "public.example.com"
-        );
-        assert_eq!(extractions, 1, "one extraction, one count");
+        let mut ctx = RequestState::default();
+        ctx.host = extract_host(&header, &mut ctx);
+        assert_eq!(ctx.host, "public.example.com");
+        assert_eq!(ctx.host_extractions, 1, "one extraction, one count");
     }
 
     /// A request without a `Host` header falls back to the
@@ -2364,9 +2372,9 @@ mod tests {
     #[test]
     fn the_host_falls_back_to_the_authority() {
         let header = RequestHeader::build("GET", b"/", None).unwrap();
-        let mut extractions = 0u32;
-        assert_eq!(effective_host(&header, &mut extractions), "");
-        assert_eq!(extractions, 1);
+        let mut ctx = RequestState::default();
+        assert_eq!(extract_host(&header, &mut ctx), "");
+        assert_eq!(ctx.host_extractions, 1);
     }
 
     /// A gateway with one site, so the routing revision has an entry
