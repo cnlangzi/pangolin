@@ -1163,7 +1163,15 @@ impl App {
         // crawler itself. The proxy does **not** come through here:
         // it verifies once per request and hands the verdict in (see
         // [`App::push_access_log_verified`]).
-        let bot = self.verify_entry_bot(&entry);
+        //
+        // The bot side-channel's presence is checked **first**: with
+        // no writer there is nothing to verify for, and the
+        // verification is the expensive part.
+        let bot = if self.bot_writer.is_some() {
+            self.verify_entry_bot(&entry)
+        } else {
+            None
+        };
         self.push_access_log_verified(Arc::new(entry), bot);
     }
 

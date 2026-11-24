@@ -197,8 +197,11 @@ back to a no-op when the channel is full.
 
 - `crates/pangolin-core/src/events.rs` — `AccessLogBuffer` and the
   ring buffer.
-- `crates/pangolin-core/src/app.rs::push_access_log` — the single write
-  point, called from the proxy `response_filter`.
+- `crates/pangolin-core/src/app.rs::push_access_log_verified` — the
+  single write point, called from the proxy `response_filter` with the
+  bot verdict the request already carries (issue #253).
+  `push_access_log` is the variant for a caller that has no verdict;
+  it verifies the crawler itself.
 - `crates/ngx/src/proxy.rs` — proxy hook (one line).
 - `crates/ngx/src/serve.rs` — `AdminApp` (HttpServerApp) that owns the
   `/api/logs/stream` route.
