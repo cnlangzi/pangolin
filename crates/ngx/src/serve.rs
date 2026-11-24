@@ -90,9 +90,28 @@ impl HttpServerApp for AdminApp {
             return write_text_response(session, 200, "text/plain", b"").await;
         }
         if method == "GET" && path == "/healthz" {
+            // A generation that is draining has stopped accepting new
+            // connections but is still finishing the requests it
+            // took. It says so, so the operator can tell "the gateway
+            // is busy handing over" from "the gateway is gone"
+            // (issue #234).
+            //
+            // The `pid` tells the generations apart: the endpoint is
+            // answered by whichever generation the kernel picks, and
+            // during a handover both of them are on the port.
+            if crate::runtime::is_draining() {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "draining",
+                    "reason": "reload in progress",
+                    "pid": std::process::id()
+                }))
+                .unwrap_or_default();
+                return write_response(session, 503, "application/json", body, &[]).await;
+            }
             let body = serde_json::to_vec(&serde_json::json!({
                 "status": "ok",
-                "version": pangolin_core::VERSION
+                "version": pangolin_core::VERSION,
+                "pid": std::process::id()
             }))
             .unwrap_or_default();
             return write_response(session, 200, "application/json", body, &[]).await;

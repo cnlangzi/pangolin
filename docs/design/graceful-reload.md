@@ -1,32 +1,35 @@
-# Graceful reload — the groundwork
+# Graceful reload
 
 Replacing the gateway's binary or its configuration without a
-downtime window needs three things, and this document describes the
-three the gateway has today:
+downtime window needs four things, and this document describes the
+four the gateway has today:
 
 1. **two processes can hold the same port at the same time** —
    `SO_REUSEPORT` on every listener (issue #233),
 2. **the operator can tell whether the new configuration is usable
    before the switch** — `pangolin-ngx --check` (issue #233),
 3. **the operator can address the running process by its number** —
-   the PID file (issue #233).
-
-What is **not** here yet: the handover itself. The signal that
-triggers it, the supervisor that starts the second generation, the
-readiness pipe and the drain of the first generation are a later
-issue. This document describes the infrastructure they will rest on,
-so that the three pieces can be used on their own in the meantime —
-a blue/green pair of instances is possible today, and so is "check
-the configuration before I restart".
+   the PID file (issue #233),
+4. **a handover that replaces the running process without a gap** —
+   the supervisor and the drain (issue #234).
 
 For the configuration keys, see
-[`configuration.md`](../configuration.md) → `[pid]`.
+[`configuration.md`](../configuration.md) → `[pid]` and `[reload]`.
 
 ## Contents
 
 - [`SO_REUSEPORT` on every listener](#so_reuseport-on-every-listener)
 - [`pangolin-ngx --check`](#pangolin-ngx---check)
 - [The PID file](#the-pid-file)
+- [The handover](#the-handover)
+  - [The process model](#the-process-model)
+  - [The two roles](#the-two-roles)
+  - [The readiness pipe](#the-readiness-pipe)
+  - [The three stages of the drain](#the-three-stages-of-the-drain)
+  - [What a failed handover leaves behind](#what-a-failed-handover-leaves-behind)
+  - [What a handover costs](#what-a-handover-costs)
+  - [Changing the binary](#changing-the-binary)
+  - [Upgrading from a version without `SO_REUSEPORT`](#upgrading-from-a-version-without-so_reuseport)
 
 ---
 
@@ -225,12 +228,16 @@ is theirs.
 
 ### The lifecycle
 
-- The gateway writes the file **after** it has read its configuration
-  and **before** it binds any listener. The file says "this process
-  intends to serve", not "the ports are up".
+- The **supervisor** writes the file (issue #234) — after it has
+  read the configuration and before it binds any listener. The file
+  says "this process intends to serve", not "the ports are up".
 - A graceful exit removes it.
 - A `SIGKILL` leaves it behind. The next start truncates it, so a
   stale number never survives a restart.
+
+The number in the file is the **supervisor's**: it is the process
+systemd's `MAINPID` points at, and the one `pangolin-ngx --reload`
+signals.
 
 The removal only happens when the file still carries **this** process's
 number. Two generations of the gateway may share one path during a
@@ -247,12 +254,11 @@ service.
 
 ## What is left for the handover
 
-The three pieces above are the groundwork. The handover itself —
-the signal that triggers it, the process model that starts the second
-generation, the readiness handshake and the drain of the first one —
-is a separate issue.
+Nothing — the handover is the chapter above. The three pieces before
+it are the groundwork it rests on.
 
-Two things are worth saying about it here:
+Two things are worth saying about them here, because they are the
+traps the handover had to avoid:
 
 - the PID file is written **before** the listeners are bound, so it
   cannot be used as a readiness signal. A handover that waits for the
@@ -261,3 +267,316 @@ Two things are worth saying about it here:
   handover that does not check the QUIC listener's log line would
   push every tunnel onto the WebSocket/TCP fallback without saying
   so.
+
+## The handover
+
+`systemctl reload pangolin-ngx` — or `pangolin-ngx --reload` —
+replaces the running gateway with a new one **without a gap in the
+service**. The port is held throughout, the in-flight requests are
+finished, and a handover that fails leaves the running gateway
+exactly as it was.
+
+### The process model
+
+```text
+systemd ──MAINPID（恒定）──> supervisor（常驻，不服务流量）
+                             └── generation（服务流量，可被替换）
+```
+
+The gateway is **two processes**, not one.
+
+The **supervisor** is the resident parent. It is the process
+systemd's `MAINPID` points at, it never serves a request, it never
+binds a port and it never opens the database. Its whole job is to
+start the generations, watch them and replace them. It stays alive
+across handovers — which is what makes `ExecReload` work at all: a
+parent that exited would leave `$MAINPID` pointing at nothing, the
+second `systemctl reload` would fail with "No such process", and
+`systemctl stop` would degrade into a 30-second `SIGKILL` of the
+whole cgroup.
+
+The **generation** is the child that does the work: it binds the six
+listeners, opens the database and serves the traffic. It is the
+process that is replaced.
+
+The role is decided by an argument: `pangolin-ngx --generation`
+(hidden) enters the generation role, and the supervisor starts every
+generation with that argument. The supervisor puts its own process
+number in the environment (`PANGLOLIN_SUPERVISOR_PID`), and the
+generation checks that the process is really there — a generation
+without a supervisor would hold the ports with nobody to replace it.
+
+The kernel kills the generation when its supervisor dies
+(`PR_SET_PDEATHSIG`), so a `SIGKILL`ed supervisor does not leave a
+generation behind holding the ports.
+
+### The two roles
+
+| | supervisor | generation |
+| --- | --- | --- |
+| PID file | **writes** it | — |
+| Database | never opens it | opens it |
+| Listeners | never binds one | binds all six |
+| `SIGUSR2` | performs a handover | drains and exits |
+| `SIGUSR1` | forwards it to the generation | rebuilds its indexes |
+| `SIGTERM` / `SIGINT` | forwards `SIGTERM`, waits, exits 0 | drains and exits |
+
+The PID file holds the **supervisor's** number: `pangolin-ngx
+--reload` and `pangolin-ngx --status` address the gateway through
+it, and it has to be the number `ExecReload` signals.
+
+The two systemd units need no change: `Type=simple` puts
+`MAINPID` on the supervisor, `ExecReload=/bin/kill -SIGUSR2
+$MAINPID` now reaches a handler, and `KillMode=mixed` sends the
+`SIGTERM` of a stop to the supervisor alone — which forwards it and
+waits for the generation. `TimeoutStopSec=30` still holds: the
+drain is the budget plus pingora's five seconds.
+
+Locally, `make stop-local-ngx` finds **both** processes
+(`pgrep -x pangolin-ngx` matches the supervisor and the generation
+alike) and signals both, so the local flow needs nothing either.
+
+### The readiness pipe
+
+The handover cannot rely on the new generation dying to notice that
+something is wrong: **pingora binds its own listeners inside its
+service thread, and a bind that fails leaves the process alive and
+serving nothing.** So the incoming generation has to *say* that it
+is ready, and it may only say so once every listener is bound.
+
+The supervisor creates a pipe, hands the **write end** to the
+incoming generation through an inherited file descriptor (the number
+travels in `PANGLOLIN_RELOAD_READY_FD`), and reads the read end. The
+generation writes one byte after the last bind; the descriptor is
+closed when the generation goes.
+
+The supervisor waits for that byte for at most
+`[reload] ready_timeout_secs` (30 seconds). EOF means the
+generation died — a broken configuration, a listener it could not
+bind. The timeout means it is alive but not ready. Either way the
+handover is abandoned: the incoming generation is killed and **the
+running generation never stopped accepting**.
+
+How does the generation know that its listeners are bound? It looks
+at the kernel's own view of the socket table: `/proc/net/tcp` and
+`/proc/net/tcp6` list the sockets in LISTEN state, and the socket
+inodes are matched against `/proc/self/fd` — the outgoing generation
+has a socket on the same port, and only the inode tells the two
+apart. A port of `0` is skipped: the kernel picks a free port for
+it, so the bind cannot collide with anybody.
+
+Five of the six listeners are TCP sockets and all five are checked:
+the proxy's HTTP and HTTPS ports, the admin port, the tunnel's TCP
+port and the management API's port. The sixth — the QUIC endpoint —
+is a UDP socket and is not in the table; it is covered by the strict
+bind below and by the shutdown token its failure cancels.
+
+And the handshake watches that token: a service that could not bind
+cancels it, and a generation whose service failed must **not** report
+itself as ready. Without that, the supervisor would drain a working
+gateway for a broken one — the one outcome the handover promises not
+to produce.
+
+The QUIC endpoint is different: the gateway binds it itself, so it
+knows. And for a generation that has to report itself as ready, a
+failed QUIC bind is **fatal** — the first generation of a fresh
+start degrades to the WebSocket/TCP fallback and logs a warning (a
+network that blocks UDP must not stop the gateway), but a handover
+may not: a silent downgrade would push every tunnel onto the slower
+transport for good, and the handover would look like it worked.
+
+### The three stages of the drain
+
+The handover runs in the order below. The outgoing generation stops
+accepting **only after** the incoming one has said it is ready, so
+the port is never without an owner.
+
+```text
+supervisor                新 generation              老 generation
+    │  fork + execve           │                          │
+    ├─────────────────────────>│ 绑定 6 个监听点           │
+    │                          │（SO_REUSEPORT，与老代共存）│
+    │                          ├─ 写 ready 字节 ─────────>│  supervisor 读到
+    │  ── SIGUSR2 ───────────────────────────────────────> │
+    │                          │                          │  A 段：停止接受新连接
+    │                          │                          │  B 段：关掉 tunnel 会话
+    │                          │                          │  C 段：等在途请求
+    │                          │                          │  退出
+    │  ── SIGUSR1（新代重建索引）─>│
+```
+
+**A — stop accepting (immediately).** Every listener stops taking
+new connections: the proxy's HTTP and HTTPS ports, the admin port,
+the management API's port, the tunnel's TCP listener and the QUIC
+endpoint. From this moment every new connection lands on the
+incoming generation.
+
+The listeners the gateway binds itself drop their socket when their
+accept loop ends, so they leave the `SO_REUSEPORT` group at once.
+pingora's three do the same: its accept loop breaks on the shutdown
+signal and the listening socket goes with it — which is what makes
+the promise true, because a socket that stayed in the group without
+accepting would black-hole the connections the kernel spread onto it.
+
+The QUIC endpoint is the one exception: it stops accepting **new
+sessions** but keeps its UDP socket until the drain is over, because
+the established QUIC sessions live on that socket and the requests
+travelling through them have to finish.
+
+**B — close the tunnel sessions (≤ 5 seconds).** The in-flight
+tunnel streams get their budget first — a session closed under a live
+request would fail that request. Then the sessions are closed: the
+QUIC session gets a `CONNECTION_CLOSE` frame, the WebSocket session
+has its bridge task aborted. The QUIC **endpoint** goes with them: a
+socket that stayed in the `SO_REUSEPORT` group would keep completing
+new handshakes that nobody answers, and a tun that reconnected into
+it would wait for the AUTH reply until its own timeout ran out
+(ten seconds). The tun's own reconnect loop (one second of backoff
+to start with) then brings the tunnel node back — to the incoming
+generation, which is already serving.
+
+**C — finish the in-flight requests (≤ `[reload] drain_timeout_secs`).**
+pingora's grace period is the drain budget, so the requests the
+generation took when the drain started are finished before it goes.
+pingora adds five seconds on top of it to drop its runtimes.
+
+After the outgoing generation is gone, the supervisor sends the
+incoming generation a `SIGUSR1`: the writes that landed on the
+outgoing generation (an admin POST, say) are in the database by then,
+and the incoming generation reads them back into its in-memory
+indexes.
+
+### What the health endpoint says
+
+`/healthz` answers with the process that served it, so the two
+generations can be told apart during a handover:
+
+```console
+$ curl -s http://127.0.0.1:8080/healthz
+{"status":"ok","version":"0.1.0","pid":4712}
+```
+
+A generation that is draining answers `503` with
+`{"status":"draining","reason":"reload in progress","pid":4711}` —
+it has stopped accepting new connections but is still finishing the
+requests it took. The `pid` is the only thing the endpoint gained;
+the status code of a healthy gateway and the shape of its body are
+unchanged.
+
+The 503 is visible on the connections the draining generation
+**already had** — its admin listener closes with the rest of stage A,
+so a probe that opens a new connection reaches the incoming
+generation and gets a 200. That is the right answer for a probe: the
+gateway is serving. The "draining" answer is for the operator who
+wants to know that a handover is under way, and `pangolin-ngx
+--status` is that operator's tool.
+
+`pangolin-ngx --status` prints both numbers:
+
+```console
+$ pangolin-ngx --status
+supervisor: pid 4710 (alive)
+generation: pid 4712 (ok)
+```
+
+### What a handover runs against
+
+The incoming generation opens the database and applies the pending
+migrations **while the outgoing one is still serving** — the
+supervisor never touches the database (it is not the process that
+serves traffic), so the migrations cannot run any earlier.
+
+A migration therefore has to be **additive** until the handover is
+done: the outgoing generation runs the old code against the new
+schema while it drains. A migration that drops or rewrites a column
+the running code still uses breaks the outgoing generation in the
+middle of its drain.
+
+### The platform
+
+The handover is a **Linux** feature. The readiness check reads the
+kernel's socket table (`/proc/net/tcp` and `/proc/self/fd`), and the
+parent-death signal is `PR_SET_PDEATHSIG` — both Linux-only. The
+gateway ships a macOS binary too, so the pieces are gated: the
+macOS build starts the same supervisor and generation, watches the
+parent process number instead of arming the kernel's signal, and
+**refuses the handover** with an error rather than performing one it
+cannot verify.
+
+### What a failed handover leaves behind
+
+| what went wrong | what the operator sees |
+| --- | --- |
+| the new configuration does not parse | the new generation exits during startup; the supervisor sees the end of the readiness pipe and reports it |
+| the new generation cannot bind a port | the same — the generation never writes the ready byte |
+| the QUIC endpoint cannot bind | the same — for a handover generation the failure is fatal |
+| the new generation is slow | the ready timeout runs out; the generation is killed |
+
+In every one of those cases the **running generation never stopped
+accepting**: the handover is abandoned before the outgoing generation
+is told anything. The operator gets one error line in the log, and
+the gateway goes on serving as it was.
+
+The one thing a failed handover does **not** repair is a
+configuration that is broken in a way the check does not catch. Run
+`pangolin-ngx --check` first — it is the same code path the
+generation takes, without the ports.
+
+### What a handover costs
+
+**Direct domains see nothing.** The port is held throughout, and the
+in-flight requests are finished. A request that arrives during the
+handover is answered by the incoming generation, with the same
+status code and the same headers.
+
+**Tunnel domains see a bounded window.** The tunnel sessions are
+process-local state — a live QUIC connection or WebSocket that
+cannot be inherited by another process — so they cannot be handed
+over. They are closed in stage B, and the tun reconnects in the
+window that follows. A request that arrives in that window fails
+with a 502. The window is bounded by stage B (5 seconds) plus the
+tun's reconnect backoff (one second to start with).
+
+**The admin session is gone.** The admin's session store is
+in-memory (`crates/admin/src/state.rs`), so the operator has to log
+in again after every handover.
+
+**The in-memory counters are gone.** The traffic, bot and referer
+counters start at zero, and the admin's charts show a gap where the
+old generation's numbers used to be. The side files (the JSONL logs)
+are not lost — they are flushed before the generation exits.
+
+### Changing the binary
+
+The generation is started with `execve(argv[0], argv, env)` — **not**
+`/proc/self/exe`. The operator replaces the binary with an atomic
+`mv`, and `/proc/self/exe` keeps pointing at the inode that was
+unlinked: exec'ing it would start the old binary again, and the
+handover would change nothing. The path in `argv[0]` is where the
+new binary lands.
+
+So the operator's routine is:
+
+```console
+$ install -m 0755 pangolin-ngx-new /usr/local/bin/pangolin-ngx
+$ systemctl reload pangolin-ngx
+```
+
+The new binary is picked up by the next generation. The running
+generation keeps the old one until it is replaced.
+
+### Upgrading from a version without `SO_REUSEPORT`
+
+A gateway that was started from a binary **without** `SO_REUSEPORT`
+cannot hand over: the new generation's bind of the same port fails
+with `EADDRINUSE`, the handover fails, and the running generation
+keeps serving — which is the safe outcome, but not the one the
+operator wanted.
+
+The fix is a **normal restart**: `systemctl restart pangolin-ngx`
+starts a generation from the new binary, and the generations after
+that can hand over to each other.
+
+The same is true for a gateway that was started before the PID file
+existed: the file is written by the supervisor, and the first
+supervisor writes it.

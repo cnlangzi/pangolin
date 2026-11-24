@@ -55,8 +55,9 @@ hex.workspace = true
 # Signal delivery to the spawned `pangolin-ngx` child — used by the
 # SSE-shutdown-latency e2e test to send SIGINT (not SIGKILL, which
 # `Child::start_kill` provides) so the test can observe the
-# graceful-shutdown path.
-libc = "0.2"
+# graceful-shutdown path, and by the graceful-reload tests to send
+# the handover signal.
+libc.workspace = true
 # The shutdown token the API's listener observes.
 tokio-util.workspace = true
 

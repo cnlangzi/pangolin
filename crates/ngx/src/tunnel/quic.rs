@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use log::{info, warn};
+use std::sync::{LazyLock, Mutex};
 use tokio::io::AsyncWriteExt;
 
 use pangolin_tun::{
@@ -74,6 +75,26 @@ fn bind_quic_endpoint(addr: SocketAddr, cert: &QuicCert) -> anyhow::Result<quinn
         .map_err(|e| anyhow::anyhow!("bind the quic endpoint on udp {local}: {e}"))
 }
 
+/// The QUIC endpoint of this process, kept alive across the drain.
+///
+/// The endpoint is reference counted, so a clone of it keeps the UDP
+/// socket open after the accept loop has stopped — and the
+/// established QUIC sessions live on that socket. The drain closes
+/// it with the sessions (see
+/// [`crate::tunnel::close_sessions_for_drain`]): a socket that stayed
+/// in the `SO_REUSEPORT` group would keep completing new handshakes
+/// that nobody answers, and a tun that reconnects into it would wait
+/// for the AUTH reply until its own timeout ran out.
+static ENDPOINT: LazyLock<Mutex<Option<quinn::Endpoint>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Close the QUIC endpoint, if it is still open.
+pub(crate) fn close_endpoint() {
+    let endpoint = ENDPOINT.lock().expect("the endpoint slot").take();
+    if let Some(endpoint) = endpoint {
+        endpoint.close(0u32.into(), b"the gateway is handing over");
+    }
+}
+
 /// The gateway's QUIC tunnel service.
 pub struct QuicService {
     /// The UDP address to bind — the same port number as
@@ -81,12 +102,40 @@ pub struct QuicService {
     addr: SocketAddr,
     /// Where the generated certificate lives.
     cert_dir: PathBuf,
+    /// Whether a bind failure takes the process down.
+    ///
+    /// The first generation of a fresh start degrades: it logs a
+    /// warning and serves the WebSocket/TCP fallback, because a
+    /// network that blocks UDP must not stop the gateway. The
+    /// **incoming** generation of a handover may not: a silent
+    /// downgrade would push every tunnel onto the slower transport
+    /// for good, and the handover would look like it worked. So a
+    /// generation that has to report itself as ready fails instead.
+    fatal_on_bind_failure: bool,
 }
 
 impl QuicService {
     /// Build the service.
     pub fn new(addr: SocketAddr, cert_dir: PathBuf) -> Self {
-        Self { addr, cert_dir }
+        Self {
+            addr,
+            cert_dir,
+            fatal_on_bind_failure: false,
+        }
+    }
+
+    /// Build the service for a generation that has to report itself
+    /// as ready.
+    ///
+    /// A bind failure is fatal for such a generation: the handover
+    /// would otherwise replace a working gateway with one that has
+    /// silently lost its primary transport.
+    pub fn new_strict(addr: SocketAddr, cert_dir: PathBuf) -> Self {
+        Self {
+            addr,
+            cert_dir,
+            fatal_on_bind_failure: true,
+        }
     }
 }
 
@@ -121,6 +170,17 @@ impl Service for QuicService {
         let endpoint = match bind_quic_endpoint(self.addr, &cert) {
             Ok(endpoint) => endpoint,
             Err(e) => {
+                if self.fatal_on_bind_failure {
+                    // The handover has to fail: the incoming
+                    // generation must not come up without its primary
+                    // transport.
+                    anyhow::bail!(
+                        "tunnel: could not bind the QUIC listener on udp {} ({}); \
+                         refusing to hand over to a generation without its QUIC endpoint",
+                        self.addr,
+                        e
+                    );
+                }
                 warn!(
                     "tunnel: could not bind the QUIC listener on udp {} ({}); \
                      serving the WebSocket/TCP tunnel only",
@@ -136,6 +196,15 @@ impl Service for QuicService {
                 biased;
                 _ = ctx.shutdown.cancelled() => {
                     info!("tunnel: shutdown requested, stopping the QUIC accept loop");
+                    // The endpoint outlives the accept loop: the
+                    // established QUIC sessions live on its UDP
+                    // socket, and the socket has to stay open until
+                    // the drain closes them. Without this the
+                    // sessions would die with the loop, and the
+                    // requests travelling through them would fail.
+                    // The drain closes it in turn — see
+                    // `close_endpoint`.
+                    *ENDPOINT.lock().expect("the endpoint slot") = Some(endpoint);
                     return Ok(());
                 }
                 incoming = endpoint.accept() => {
@@ -225,6 +294,19 @@ async fn handle_quic_client(app: Arc<App>, connection: quinn::Connection) -> any
         return Ok(());
     }
 
+    // The closer the drain uses to shut this session down. A QUIC
+    // connection needs a CONNECTION_CLOSE frame: dropping the
+    // transport would leave the connection alive in quinn's driver
+    // until it timed out, and the tun would sit there instead of
+    // reconnecting to the incoming generation.
+    let closer: crate::tunnel::SessionCloser = Box::new({
+        let connection = connection.clone();
+        move || {
+            connection.close(0u32.into(), b"the gateway is handing over");
+        }
+    });
+    let session_id = crate::tunnel::register_session(&tun_name, closer);
+
     crate::tunnel::mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected over quic", tun_name);
     app.add_event(pangolin_core::EventType::TunConnected {
@@ -236,6 +318,7 @@ async fn handle_quic_client(app: Arc<App>, connection: quinn::Connection) -> any
     // reconnected on the other transport must not be unregistered by
     // the old session's cleanup.
     connection.closed().await;
+    crate::tunnel::unregister_session(&tun_name, session_id);
     if app.unregister_tun_if(&tun_name, &transport).await {
         crate::tunnel::mark_tun_offline(&app, &tun_name).await;
         info!("tun {} disconnected", tun_name);

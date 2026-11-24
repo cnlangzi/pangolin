@@ -93,6 +93,11 @@ uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 httpdate = "1"
 
+# The process model of the graceful reload (issue #234): the
+# supervisor forks the generations, the readiness pipe is an
+# inherited descriptor, and the signals are sent with `kill`.
+libc.workspace = true
+
 # WebSocket
 sha1.workspace = true
 base64 = "0.23"

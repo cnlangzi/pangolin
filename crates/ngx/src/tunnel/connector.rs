@@ -162,7 +162,13 @@ impl L4Connect for TunnelConnector {
                 format!("tun {}: loopback socket: {e}", self.tun_name),
             )
         })?;
-        tokio::spawn(bridge_tunnel_to_socket(stream, bridge_end));
+        tokio::spawn(async move {
+            // The guard counts the stream as open for as long as it
+            // carries bytes: the drain waits for the count to reach
+            // zero before it closes the tunnel sessions.
+            let _guard = crate::tunnel::StreamGuard::new();
+            bridge_tunnel_to_socket(stream, bridge_end).await;
+        });
         Ok(Stream::from(socket))
     }
 }

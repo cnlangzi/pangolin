@@ -805,6 +805,16 @@ admin:
 api:
   listen: 127.0.0.1:{api}
 
+# The budgets of a handover (issue #234). The suite pins the drain
+# short: it matches the 5s pingora used to get unconditionally, so
+# the timings the rest of the suite is calibrated against do not
+# move. The ready budget has to cover the incoming generation's
+# **whole** startup (the database, the certificates, the listeners),
+# so it is the generous one.
+reload:
+  ready_timeout_secs: 20
+  drain_timeout_secs: 5
+
 acme:
   cert_dir: "{cert_dir}"
   email: ""

@@ -58,8 +58,8 @@ pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
 pub use config::{
-    ApiConfig, BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, TrafficConfig,
-    init_logger, load_config_and_init_logger,
+    ApiConfig, BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, ReloadConfig,
+    TrafficConfig, init_logger, load_config_and_init_logger,
 };
 pub use error::{DbError, PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};

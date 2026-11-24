@@ -214,6 +214,13 @@ chrono = { version = "0.4", features = ["serde"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# The raw syscalls of the process model (issue #234): the readiness
+# pipe is an inherited descriptor, the parent-death signal is armed
+# with `prctl`, and the signals are sent with `kill`. The crate is
+# published on crates.io and already in the tree — the integration
+# tests declare it too, so it lives here to keep the two in step.
+libc = "0.2"
+
 # WebSocket (for Sec-WebSocket-Accept computation)
 sha1 = "0.11"
 base64 = "0.23"

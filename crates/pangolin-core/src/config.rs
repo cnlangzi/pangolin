@@ -98,6 +98,9 @@ pub struct Config {
     /// systemd.
     #[serde(default)]
     pub pid: PidConfig,
+    /// The budgets of a graceful reload (issue #234).
+    #[serde(default)]
+    pub reload: ReloadConfig,
 }
 
 /// HTTP / HTTPS listen addresses.
@@ -196,6 +199,7 @@ impl Default for Config {
             log: LogConfig::default(),
             provider: ProviderConfig::default(),
             pid: PidConfig::default(),
+            reload: ReloadConfig::default(),
         }
     }
 }
@@ -415,6 +419,66 @@ pub struct PidConfig {
     /// `tun.pins`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_file: Option<PathBuf>,
+}
+
+/// The budgets of a graceful reload (issue #234).
+///
+/// A reload is a **handover**: the supervisor starts a second
+/// generation, waits for it to bind its listeners, and only then
+/// lets the outgoing generation drain away. These two numbers are the
+/// budgets of that dance.
+///
+/// They are seconds, not a duration string — the same convention the
+/// rest of the configuration uses (`log.bot.recent`,
+/// `provider.ip_refresh_interval_secs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReloadConfig {
+    /// How long the supervisor waits for the incoming generation to
+    /// report that it is ready, in seconds.
+    ///
+    /// The new generation writes one byte into the readiness pipe
+    /// once every one of its listeners is bound. If that byte does
+    /// not arrive within this budget, the handover is **abandoned**:
+    /// the incoming generation is killed and the outgoing one keeps
+    /// serving — it never stopped accepting.
+    ///
+    /// The budget covers the new generation's whole startup (the
+    /// database, the certificates, the listeners), so it has to be
+    /// comfortably larger than that.
+    #[serde(default = "default_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
+
+    /// How long the outgoing generation may spend draining, in
+    /// seconds.
+    ///
+    /// The budget covers the whole drain: the in-flight tunnel
+    /// streams, the tunnel sessions that are closed so the tun
+    /// reconnects, and the in-flight HTTP requests. pingora's own
+    /// grace period is set to this number, and its runtime shutdown
+    /// adds up to five seconds on top of it.
+    ///
+    /// It has to stay **below** the `TimeoutStopSec` of the systemd
+    /// unit (30 seconds), or systemd kills the generation in the
+    /// middle of its drain.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+fn default_ready_timeout_secs() -> u64 {
+    30
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    20
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            ready_timeout_secs: default_ready_timeout_secs(),
+            drain_timeout_secs: default_drain_timeout_secs(),
+        }
+    }
 }
 
 /// TLS listener tuning.
@@ -1582,6 +1646,62 @@ acme:
                 c.resolved_pid_file(Path::new("/etc/pangolin/ngx.yml")),
                 PathBuf::from("/var/lib/pangolin/pangolin-ngx.pid")
             );
+            Ok(())
+        });
+    }
+
+    /// The reload budgets have their documented defaults.
+    ///
+    /// The two numbers are the budgets of a handover: how long the
+    /// supervisor waits for the incoming generation, and how long the
+    /// outgoing one may drain. They are part of the contract with
+    /// the systemd unit (`TimeoutStopSec=30`), so a change to them is
+    /// a change to the deployment.
+    #[test]
+    fn the_reload_budgets_have_their_documented_defaults() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("").expect("an empty config must parse");
+            assert_eq!(c.reload.ready_timeout_secs, 30);
+            assert_eq!(c.reload.drain_timeout_secs, 20);
+            Ok(())
+        });
+    }
+
+    /// A configuration that carries no `[reload]` section parses
+    /// exactly as it did before the section existed (issue #234).
+    ///
+    /// The section is optional, so an `ngx.yml` written for an older
+    /// gateway must keep working — the only thing that changes is how
+    /// long a reload may take.
+    #[test]
+    fn a_config_without_a_reload_section_parses_unchanged() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c = Config::from_str("addr:\n  http: \"0.0.0.0:8000\"\n")
+                .expect("a config without a [reload] section must parse");
+            assert_eq!(c.reload, ReloadConfig::default());
+            // The rest of the configuration is untouched.
+            assert_eq!(c.addr.http, "0.0.0.0:8000");
+            assert_eq!(c.addr.https, "0.0.0.0:8443");
+            Ok(())
+        });
+    }
+
+    /// The reload budgets can be set explicitly.
+    ///
+    /// The two are separate knobs: a deployment with a slow disk may
+    /// want a longer ready budget without giving every shutdown a
+    /// longer drain.
+    #[test]
+    fn the_reload_budgets_parse_when_set() {
+        figment::Jail::expect_with(|jail| {
+            jail.clear_env();
+            let c =
+                Config::from_str("reload:\n  ready_timeout_secs: 45\n  drain_timeout_secs: 10\n")
+                    .expect("a config with a [reload] section must parse");
+            assert_eq!(c.reload.ready_timeout_secs, 45);
+            assert_eq!(c.reload.drain_timeout_secs, 10);
             Ok(())
         });
     }

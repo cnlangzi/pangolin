@@ -41,8 +41,11 @@
 pub mod connector;
 pub mod quic;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use fastwebsockets::{Role as WsRole, WebSocket};
 use log::{debug, error, info, warn};
@@ -54,6 +57,137 @@ use pangolin_tun::{
 };
 
 use crate::App;
+
+// ---- the drain ----
+
+/// How long the drain waits for the in-flight tunnel streams.
+///
+/// The second stage of the drain (issue #234): the listeners have
+/// stopped accepting, and now the tunnel sessions are closed so the
+/// tun reconnects — to the incoming generation, which is already
+/// serving. The budget is the wait for the streams that are still
+/// running: a session closed under a live request would fail it.
+///
+/// The budget is capped by the configuration's drain timeout: the
+/// whole drain has to fit into it.
+pub(crate) const TUNNEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// How a live tunnel session is closed when the generation drains.
+///
+/// The transport trait has no `close`, and the two transports close
+/// differently: a QUIC session needs a CONNECTION_CLOSE frame, a
+/// WebSocket session needs its bridge task aborted. The gateway
+/// therefore registers a closer per session and calls it when the
+/// generation drains.
+pub(crate) type SessionCloser = Box<dyn Fn() + Send + Sync>;
+
+/// The live tunnel sessions, with the closer that shuts one down.
+///
+/// The key is the tun's name and the value carries the session's
+/// identity: a tun that reconnects registers a **new** closer under
+/// the same name, and the old session's cleanup must not take the
+/// new one away with it.
+static SESSIONS: LazyLock<Mutex<HashMap<String, (SessionId, SessionCloser)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The identity of a registered tunnel session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionId(u64);
+
+/// The next session identity.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The tunnel streams that are open right now.
+///
+/// The drain waits for the count to reach zero before it closes the
+/// sessions — a session closed under a live request would fail that
+/// request, and the handover is supposed to be invisible.
+static OPEN_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Register a session's closer and return its identity.
+pub(crate) fn register_session(name: &str, closer: SessionCloser) -> SessionId {
+    let id = SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst));
+    SESSIONS
+        .lock()
+        .expect("the session registry")
+        .insert(name.to_string(), (id, closer));
+    id
+}
+
+/// Forget a session that ended on its own.
+///
+/// The identity is checked: when a tun reconnects, the **new**
+/// session's closer is under the same name, and the old session's
+/// cleanup must not take it away — the drain would then leave that
+/// live session open, and the tun would stay bound to the outgoing
+/// generation.
+pub(crate) fn unregister_session(name: &str, id: SessionId) {
+    let mut sessions = SESSIONS.lock().expect("the session registry");
+    if let Some((current, _)) = sessions.get(name)
+        && *current == id
+    {
+        sessions.remove(name);
+    }
+}
+
+/// The number of tunnel streams that are open right now.
+pub(crate) fn open_streams() -> usize {
+    OPEN_STREAMS.load(Ordering::SeqCst)
+}
+
+/// A guard that counts one open tunnel stream.
+///
+/// The guard lives as long as the bridge that carries the stream, so
+/// the count is the number of requests that are still travelling
+/// through the tunnel.
+pub(crate) struct StreamGuard;
+
+impl StreamGuard {
+    /// Count one more open stream.
+    pub(crate) fn new() -> Self {
+        OPEN_STREAMS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        OPEN_STREAMS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Close the tunnel sessions — the second stage of the drain.
+///
+/// The in-flight streams get their budget first: a session closed
+/// under a live request would fail that request, and the handover is
+/// supposed to be invisible. A stream that is still running when the
+/// budget runs out is lost — the alternative is holding the whole
+/// drain open for a request that never ends.
+///
+/// Afterwards the tun reconnects, and the reconnect lands on the
+/// incoming generation: the outgoing one has stopped accepting.
+pub(crate) async fn close_sessions_for_drain(budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while open_streams() > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let closers: Vec<SessionCloser> = {
+        let mut sessions = SESSIONS.lock().expect("the session registry");
+        sessions.drain().map(|(_, (_, closer))| closer).collect()
+    };
+    let count = closers.len();
+    for closer in closers {
+        closer();
+    }
+    // The QUIC endpoint goes with the sessions. It has to stay alive
+    // until here — the established sessions live on its UDP socket —
+    // but it must not outlive them: a socket that stays in the
+    // `SO_REUSEPORT` group keeps completing new handshakes that
+    // nobody answers, and a tun that reconnects into it waits for
+    // the AUTH reply until its own timeout runs out.
+    quic::close_endpoint();
+    info!("tunnel: closed {count} tunnel session(s) — the tun reconnects to the new generation");
+}
 
 // ---- Auth ----
 
@@ -284,6 +418,15 @@ async fn handle_client(
     let ws = WebSocket::after_handshake(tcp_stream, WsRole::Server);
     let tunnel = tunnel_over_websocket(ws, TunnelRole::Server);
 
+    // The closer the drain uses to shut this session down. The
+    // bridge task owns the WebSocket, and aborting it drops the
+    // socket — the tun sees the end of the connection and
+    // reconnects.
+    let closer: SessionCloser = Box::new({
+        let abort = tunnel.bridge_abort.clone();
+        move || abort.abort()
+    });
+
     // Register the session keyed by tun_name. Reject
     // duplicates to avoid two tuns fighting for the same
     // routing slot.
@@ -295,6 +438,7 @@ async fn handle_client(
     }
 
     mark_tun_online(&app, &tun_name).await;
+    let session_id = register_session(&tun_name, closer);
     // The transport is named in the log so the operator can tell a
     // QUIC session from a fallback session that silently happened.
     info!(
@@ -316,6 +460,7 @@ async fn handle_client(
     // registered one. A tun that reconnected (possibly on the other
     // transport) must not be unregistered by the old session's
     // cleanup.
+    unregister_session(&tun_name, session_id);
     if app.unregister_tun_if(&tun_name, &transport).await {
         mark_tun_offline(&app, &tun_name).await;
         info!("tun {} disconnected", tun_name);
