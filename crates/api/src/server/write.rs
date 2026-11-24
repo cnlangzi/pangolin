@@ -287,11 +287,10 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
         Ok(parsed) => parsed,
         Err(e) => {
             log::warn!("api: the domain form could not be parsed: {e}");
-            return ApiResponse::error(&ApiError::unprocessable(
-                "domain_invalid",
-                "the domain form could not be checked".to_string(),
-                None,
-            ));
+            // The query panicked: that is the API failing, not the
+            // submission being wrong (docs/design/api.md: 500
+            // `internal_error` is "something the API did not expect").
+            return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
         }
     };
     let parsed = match parsed {
@@ -389,11 +388,10 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         Ok(parsed) => parsed,
         Err(e) => {
             log::warn!("api: the domain form could not be parsed: {e}");
-            return ApiResponse::error(&ApiError::unprocessable(
-                "domain_invalid",
-                "the domain form could not be checked".to_string(),
-                None,
-            ));
+            // The query panicked: that is the API failing, not the
+            // submission being wrong (docs/design/api.md: 500
+            // `internal_error` is "something the API did not expect").
+            return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
         }
     };
     let parsed = match parsed {
@@ -775,10 +773,11 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
             Ok(rule) => rule,
             Err(e) => {
                 log::warn!("api: the IP rule form could not be parsed: {e}");
-                return ApiResponse::error(&ApiError::unprocessable(
-                    "ip_rule_scope_invalid",
-                    "the IP rule form could not be checked".to_string(),
-                    None,
+                // The query panicked: that is the API failing, not the
+                // submission being wrong (docs/design/api.md: 500
+                // `internal_error` is "something the API did not expect").
+                return ApiResponse::error(&ApiError::internal(
+                    "the IP rule form could not be checked",
                 ));
             }
         }

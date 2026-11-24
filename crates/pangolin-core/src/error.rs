@@ -26,7 +26,7 @@ pub enum PangolinError {
     /// The background task that ran the query died. Only
     /// [`crate::App::with_db`] produces this: the query closure
     /// panicked on the blocking pool, so the result is lost.
-    #[error("database task: {0}")]
+    #[error("database task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
 }
 
@@ -45,7 +45,7 @@ pub enum DbError {
     Query(#[from] rusqlite::Error),
 
     /// The query panicked, so its result is lost.
-    #[error("the database task failed: {0}")]
+    #[error("database task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
 }
 

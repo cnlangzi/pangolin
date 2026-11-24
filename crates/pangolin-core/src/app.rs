@@ -2458,11 +2458,11 @@ mod tests {
 
     /// A panicking query leaves the connection usable (issue #254).
     ///
-    /// The routes used to hold the connection lock across the query,
-    /// so a panic in one of them poisoned the lock and every later
-    /// request failed with a poisoned lock. The query runs on the
-    /// blocking pool now, where the panic is caught: the caller sees
-    /// the failure and the connection stays usable.
+    /// The query runs on the blocking pool, where the panic is
+    /// caught: the caller is told the query failed and the request
+    /// carries on, instead of the panic unwinding the request's own
+    /// task. The connection is handed back either way — the lock is
+    /// a `tokio::sync::Mutex`, which has no poisoning.
     #[tokio::test]
     async fn a_panicking_query_leaves_the_connection_usable() {
         let dir = tempfile::tempdir().unwrap();
@@ -2475,7 +2475,7 @@ mod tests {
             "the panic is reported to the caller, not swallowed"
         );
 
-        // The connection is still usable: the lock was not poisoned.
+        // The connection is still usable.
         let sites = app
             .with_db(|db| crate::db::list_sites(db).unwrap_or_default())
             .await

@@ -289,7 +289,7 @@ async fn delete_provider_txn(app: &Arc<App>, name: &str) -> anyhow::Result<usize
         Ok(upd)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("the database task failed: {e}"))?
+    .map_err(pangolin_core::DbError::from)?
 }
 
 fn render_create_page_with_error(
