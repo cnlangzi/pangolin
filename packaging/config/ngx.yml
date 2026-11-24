@@ -45,6 +45,12 @@ admin:
 pid:
   pid_file: /var/lib/pangolin/pangolin-ngx.pid
 
+cache:
+  # The edge cache for static assets (issue #259).  Its disk tier
+  # holds derived data that is rebuilt on demand, so it belongs under
+  # /var/cache and not under /var/lib with the state.
+  dir: /var/cache/pangolin/cache
+
 acme:
   email: ""
   cert_dir: /var/lib/pangolin/certs

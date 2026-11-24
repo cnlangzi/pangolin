@@ -59,6 +59,10 @@ Cargo.lock.bak
 /pangolin.db-shm
 /pangolin.db-wal
 
+# The edge cache's disk tier (issue #259).  A run from the repository
+# root leaves it next to `ngx.yml`, under the default `cache.dir`.
+/cache/
+
 # The gateway's PID file (issue #233).  Without `pid.pid_file` the
 # path is derived from the configuration file's own name (`ngx.yml` →
 # `ngx.pid`), so a run from the repository root leaves `ngx.pid` next

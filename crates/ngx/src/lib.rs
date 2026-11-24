@@ -5,6 +5,7 @@
 pub mod acme;
 pub mod backend_resolver;
 pub mod badbots_feed;
+pub mod cache;
 pub mod dns;
 pub mod provider_ip;
 pub mod proxy;

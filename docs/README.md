@@ -37,6 +37,7 @@ New to Pangolin? Start here:
 - [Known bots](design/knownbots.md) — the crawler verification model, the address lists a bot has to match, and the registry contract
 - [Referer log side-channel](design/referer-log.md) — inbound external referrals: the document-navigation + site-boundary detection rules, the `referer-YYYY-MM-DD.jsonl` wire format, the `/logs/referers` pages, failure modes
 - [Traffic statistics](design/traffic.md) — the in-memory counters behind the `/traffic` panel and how they are fed
+- [The edge cache](design/cache.md) — the two-tier response cache for static assets: the cache key, the hotness threshold, the freshness rules, the size policy and the "the answer is the same for every visitor" contract it rests on (issue #259)
 - [Rate limiting](design/rate-limit.md) — the rate limiter's data structures, its evaluation order and its failure behaviour
 - [Gateway headers](design/gateway-headers.md) — the `P-*` headers the gateway adds to every request it forwards
 - [Graceful reload](design/graceful-reload.md) — replacing the gateway without a downtime window: `SO_REUSEPORT` on every listener, `pangolin-ngx --check`, the PID file and the handover itself — a supervisor that replaces the generation without a gap in the service (issues #233 and #234)

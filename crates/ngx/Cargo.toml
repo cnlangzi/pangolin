@@ -25,7 +25,11 @@ pangolin-core = { path = "../pangolin-core" }
 admin = { path = "../admin" }
 # The dashboard-facing management API (issue #185).
 api = { path = "../api" }
-pingora = { workspace = true, features = ["openssl"] }
+# The `cache` feature brings in pingora's HTTP cache engine: the state
+# machine, the Cache-Control parser, the cache key, the single-flight
+# lock and the eviction framework the edge cache is built on (issue
+# #259).  No new crates.io dependency: the engine ships with pingora.
+pingora = { workspace = true, features = ["openssl", "cache"] }
 pingora-core = "0.9"
 pingora-openssl = "0.9"
 rusqlite.workspace = true

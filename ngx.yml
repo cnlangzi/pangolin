@@ -16,7 +16,6 @@
 # Some keys are accepted by the loader but NOT implemented by the
 # gateway. A configuration that carries them parses fine and nothing
 # happens:
-#   * the `cache` section — there is no response cache in the gateway;
 #   * `tunnel.tls_cert` / `tunnel.tls_key` — the tunnel listener is a
 #     plain TCP socket. The encrypted path is QUIC, which uses its own
 #     certificate under `acme.cert_dir`;
@@ -26,9 +25,9 @@
 #     SNI-based (it resolves a certificate through the pre-computed
 #     domain → cert link, not through a virtual host), and the worker
 #     count is chosen by the runtime.
-# The `cache` section and the two tunnel TLS keys are therefore left
-# out of this file; `ws_path`, `host` and `workers` are listed below
-# so the schema stays visible, but nothing reads them.
+# The two tunnel TLS keys are therefore left out of this file;
+# `ws_path`, `host` and `workers` are listed below so the schema stays
+# visible, but nothing reads them.
 #
 # Environment-variable override: any NGX_<KEY> env var wins over the
 # matching YAML path, with `__` as the nested-key separator. Examples:
@@ -145,6 +144,85 @@ api:
                         # turns the API on — a token alone is not
                         # enough: until the switch is on, every call
                         # is answered with `403 api_disabled`.
+
+cache:
+  enabled: true           # the edge cache for static assets (issue #259)
+                          # — a memory tier in front of a disk tier,
+                          # behind a hotness threshold. Set it to false
+                          # and the request path never touches the
+                          # cache.
+                          #
+                          # The rules — the cache key, the admission,
+                          # the freshness, the size policy — are in
+                          # docs/design/cache.md.
+  dir: ./cache            # the disk tier's root directory. Created at
+                          # startup if it does not exist.
+  memory_size: 67108864   # the memory tier's byte budget (64 MiB)
+  disk_size: 1073741824   # the disk tier's byte budget (1 GiB)
+  max_object_size: 10485760       # the hard per-object limit (10 MiB):
+                          # a bigger response is not cached at all
+  memory_max_object_size: 1048576 # the biggest object the memory tier
+                          # takes (1 MiB); a bigger one goes straight
+                          # to the disk tier
+  ttl: 3600               # the default freshness (seconds), and the
+                          # cap on the freshness the origin asks for
+  min_uses: 2             # the hotness threshold: the Nth request for
+                          # a key stores it
+  hot_half_life_secs: 3600 # the half-life of the hotness counter
+  types:                  # the extensions the cache may store. The
+                          # default is the static-asset extension set
+                          # the rate limiter uses.
+    - png
+    - jpg
+    - jpeg
+    - jfif
+    - gif
+    - bmp
+    - ico
+    - svg
+    - apng
+    - webp
+    - avif
+    - tif
+    - tiff
+    - heic
+    - heif
+    - js
+    - mjs
+    - cjs
+    - map
+    - wasm
+    - css
+    - woff
+    - woff2
+    - ttf
+    - otf
+    - eot
+    - mp4
+    - webm
+    - m4v
+    - mov
+    - avi
+    - mkv
+    - mp3
+    - m4a
+    - wav
+    - ogg
+    - oga
+    - opus
+    - flac
+    - aac
+    - weba
+    - m3u8
+    - mpd
+    - zip
+    - gz
+    - tgz
+    - bz2
+    - xz
+    - 7z
+    - rar
+    - tar
 
 acme:
   email: ""               # ACME registration email

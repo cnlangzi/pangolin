@@ -184,18 +184,49 @@ overwritten by the environment.
 terminates TLS. The only mitigation on the node's side is a firewall
 that limits the port to the dashboard's address.
 
-### `[cache]` — response cache (parsed, **not implemented**)
+### `[cache]` — the edge cache for static assets
 
-The gateway accepts a `cache` section, but **there is no response
-cache in the gateway**: no code path reads either key. A configuration
-that still carries the section parses fine and nothing happens — the
-section is neither an error nor a promise. Do not expect a cache to
-appear, and do not rely on `dir` being used.
+A two-tier response cache for static assets: a memory tier in front of
+a disk tier, behind a hotness threshold. The rules — the cache key,
+the admission and the freshness, the size policy — are in
+[design/cache.md](design/cache.md).
 
-| Field      | Type      | Default    | Required | Notes |
-| ---------- | --------- | ---------- | -------- | ----- |
-| `enabled`  | `bool`    | `false`    | no       | Parsed and ignored — there is no response cache. |
-| `dir`      | `string`  | `./cache`  | no       | Parsed and ignored — there is no response cache. |
+> **The default of `enabled` changed from `false` to `true`** when the
+> cache was implemented (issue #259). A gateway that ships no
+> `[cache]` section now caches its static assets. Set
+> `cache.enabled: false` to turn the cache off.
+
+| Field                     | Type            | Default              | Required | Notes |
+| ------------------------- | --------------- | -------------------- | -------- | ----- |
+| `enabled`                 | `bool`          | `true`               | no       | The cache's master switch. With it off the request path never touches the cache. |
+| `dir`                     | `string`        | `./cache`            | no       | The disk tier's root directory. Created at startup if it does not exist. |
+| `memory_size`             | `u64` (bytes)   | `67108864` (64 MiB)  | no       | The memory tier's byte budget. |
+| `disk_size`               | `u64` (bytes)   | `1073741824` (1 GiB) | no       | The disk tier's byte budget. |
+| `max_object_size`         | `u64` (bytes)   | `10485760` (10 MiB)  | no       | The hard per-object limit. A bigger response is not cached at all. |
+| `memory_max_object_size`  | `u64` (bytes)   | `1048576` (1 MiB)    | no       | The biggest object the memory tier takes. A bigger one goes straight to the disk tier. |
+| `ttl`                     | `u64` (seconds) | `3600`               | no       | The default freshness, and the cap on the freshness the origin asks for. |
+| `min_uses`                | `u32`           | `2`                  | no       | The hotness threshold: the Nth request for a key stores it. |
+| `hot_half_life_secs`      | `u64` (seconds) | `3600`               | no       | The half-life of the hotness counter. |
+| `types`                   | `list of str`   | the static-asset extensions (below) | no | The extensions the cache may store. The default is the same list the rate limiter uses. |
+
+The default `types` list is the static-asset extension set:
+`png jpg jpeg jfif gif bmp ico svg apng webp avif tif tiff heic heif
+js mjs cjs map wasm css woff woff2 ttf otf eot mp4 webm m4v mov avi
+mkv mp3 m4a wav ogg oga opus flac aac weba m3u8 mpd zip gz tgz bz2 xz
+7z rar tar`.
+
+The whitelist is the guard the cache rests on: **the response of a
+static asset that the cache serves must be the same for every
+visitor**. A request that carries a `Cookie` or an `Authorization`
+header bypasses the cache entirely — it is not stored and not served
+from it.
+
+The cache key is the scheme, the normalized host and the path
+**without the query string**, and the cache varies on the
+`Accept-Encoding` and on nothing else. `?v=2` does not make a new
+entry — see [design/cache.md](design/cache.md#the-query-string-is-not-part-of-the-key)
+for what that costs and how to answer it.
+
 
 ### `[acme]` — ACME operational config (v2)
 

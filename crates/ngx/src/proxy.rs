@@ -36,12 +36,17 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
+use http::Method;
 use http::header::HeaderValue;
 use log::{debug, error, info, warn};
+use pingora::cache::cache_control::CacheControl;
+use pingora::cache::key::HashBinary;
+use pingora::cache::{CacheKey, CacheMeta, NoCacheReason, RespCacheable};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
@@ -56,6 +61,7 @@ use pangolin_core::{
 
 use crate::App;
 use crate::backend_resolver::BackendResolver;
+use crate::cache::{self, EdgeCache};
 use crate::tunnel::connector::{TunnelConnector, tunnel_group_key};
 
 /// Longest `Referer` header value the gateway will look at.
@@ -187,6 +193,20 @@ pub struct RequestState {
     /// traffic sample reads them from here when the entry exists
     /// (issue #253).
     pub entry: Option<Arc<pangolin_core::AccessLogEntry>>,
+    /// Whether the edge cache was wired up for this request.
+    ///
+    /// `false` for every request the cache does not serve — a
+    /// request that is not a `GET`, a path whose extension is not on
+    /// the whitelist, a request that carries a cookie or an
+    /// authorization header, or a gateway that runs without the cache
+    /// (issue #259). The flag is what keeps the `X-Cache` header off
+    /// the responses the cache never had a hand in.
+    pub cache_enabled: bool,
+    /// Whether the response was served from the cache.
+    ///
+    /// Written in `response_filter`, where the cache's phase says
+    /// whether the body came from the cache or from the origin.
+    pub cache_hit: bool,
 }
 
 impl Default for RequestState {
@@ -214,6 +234,8 @@ impl Default for RequestState {
             host_extractions: 0,
             upstream_attempt: 0,
             entry: None,
+            cache_enabled: false,
+            cache_hit: false,
         }
     }
 }
@@ -226,6 +248,11 @@ pub struct AppProxy {
     ///
     /// The request path reads its cache; it never resolves a name.
     pub resolver: Arc<BackendResolver>,
+    /// The edge cache (issue #259).
+    ///
+    /// `None` when the operator turned the cache off — then the
+    /// request path never touches it and pays nothing for it.
+    pub cache: Option<Arc<EdgeCache>>,
 }
 
 #[async_trait]
@@ -1034,6 +1061,22 @@ impl ProxyHttp for AppProxy {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // The `X-Cache` header says where the body came from: the
+        // cache or the origin. It is written only for the requests
+        // the cache was wired up for, so the responses it never had a
+        // hand in stay untouched (issue #259).
+        if ctx.cache_enabled {
+            let hit = matches!(
+                session.cache.phase(),
+                pingora::cache::CachePhase::Hit
+                    | pingora::cache::CachePhase::Stale
+                    | pingora::cache::CachePhase::StaleUpdating
+            );
+            ctx.cache_hit = hit;
+            upstream_response
+                .insert_header("X-Cache", if hit { "HIT" } else { "MISS" })
+                .ok();
+        }
         // Issue #73: construct AccessLogEntry and push to App
         let status = upstream_response.status.as_u16();
         record_access_log(
@@ -1043,6 +1086,153 @@ impl ProxyHttp for AppProxy {
             request_user_agent(session.req_header()),
         );
         Ok(())
+    }
+
+    // ── The edge cache (issue #259) ────────────────────────────
+    //
+    // The cache is a **data-plane** component: it takes part in the
+    // forwarding decision, so every hook below fails *open*. A cache
+    // that cannot serve a request lets the request go to the origin;
+    // it never turns a request into an error.
+
+    /// Decide whether the request may use the cache, and wire the
+    /// cache up when it may.
+    ///
+    /// The cache is enabled only for the requests it can serve: a
+    /// `GET` for a path whose extension is on the `cache.types`
+    /// whitelist, sent without a `Cookie` or an `Authorization`
+    /// header. Every other request never touches the cache at all —
+    /// the engine's cache stays disabled and the request path pays
+    /// nothing for it.
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(());
+        };
+        let request = session.req_header();
+        // Only `GET` is cacheable: a `HEAD` answers with the same
+        // headers but no body, and the other methods change the
+        // origin's state.
+        if request.method != Method::GET {
+            return Ok(());
+        }
+        // The whitelist is the guard that says "the response of this
+        // path does not depend on the visitor".
+        if !cache.types.allows(request.uri.path()) {
+            return Ok(());
+        }
+        // A request that carries a session or credentials is not the
+        // same for every visitor: it bypasses the cache, and its
+        // answer is not stored either.
+        if request.headers.contains_key("cookie") || request.headers.contains_key("authorization") {
+            return Ok(());
+        }
+        ctx.cache_enabled = true;
+        session
+            .cache
+            .enable(cache.storage, None, None, Some(cache.lock), None);
+        session.cache.set_admission_policy(cache.admission);
+        session.cache.set_max_file_size_bytes(
+            usize::try_from(cache.config.max_object_size).unwrap_or(usize::MAX),
+        );
+        Ok(())
+    }
+
+    /// The cache key of a request: the scheme, the normalized host
+    /// and the path — **without** the query string.
+    ///
+    /// Two requests for the same path with different queries share an
+    /// entry: the whitelist is the guard that says the answer does not
+    /// depend on the query (issue #259).
+    fn cache_key_callback(&self, session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let request = session.req_header();
+        let scheme = request.uri.scheme_str().unwrap_or("http");
+        let host = pangolin_core::normalize::normalize_host(&ctx.host);
+        Ok(cache::key::primary_key(scheme, &host, request.uri.path()))
+    }
+
+    /// Decide whether a response may be stored, and how fresh it is.
+    ///
+    /// The order of the checks is the order of the contract: the
+    /// method and the status, the response's own privacy headers, the
+    /// whitelist, and only then the freshness.
+    fn response_cache_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "cache off",
+            )));
+        };
+        if session.req_header().method != Method::GET {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("method")));
+        }
+        // Only a complete `200` is stored: a `206` is a slice of
+        // something else, a `101` is an upgrade, and an error is not
+        // an asset.
+        if resp.status != http::StatusCode::OK {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        }
+        // A response that sets a cookie is per-visitor by definition.
+        if resp.headers.contains_key("set-cookie") {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "set-cookie",
+            )));
+        }
+        // An event stream never ends: caching it would pin the
+        // connection open forever.
+        if is_event_stream(resp) {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "event-stream",
+            )));
+        }
+        // The origin's own verdict comes before the whitelist: it is
+        // the origin that knows the response is private.
+        let cache_control = CacheControl::from_resp_headers(resp);
+        if let Some(cache_control) = cache_control.as_ref()
+            && (cache_control.no_store() || cache_control.private())
+        {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        }
+        if !cache.types.allows(session.req_header().uri.path()) {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("type")));
+        }
+        let now = std::time::SystemTime::now();
+        let freshness = cache::freshness::resolve(
+            now,
+            cache_control.as_ref(),
+            Duration::from_secs(cache.config.ttl),
+        );
+        let meta = CacheMeta::new(
+            freshness.fresh_until,
+            now,
+            freshness.stale_while_revalidate_sec,
+            freshness.stale_if_error_sec,
+            resp.clone(),
+        );
+        Ok(RespCacheable::Cacheable(meta))
+    }
+
+    /// The cache varies on the request's `Accept-Encoding` and on
+    /// nothing else.
+    ///
+    /// The origin's own `Vary` declaration takes no part in it: the
+    /// cache serves the static-asset whitelist, whose responses are
+    /// the same for every visitor, so the only difference a client
+    /// can provoke is the encoding (issue #259).
+    fn cache_vary_filter(
+        &self,
+        _meta: &CacheMeta,
+        _ctx: &mut Self::CTX,
+        request: &RequestHeader,
+    ) -> Option<HashBinary> {
+        let encoding = request
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok());
+        Some(cache::key::encoding_variance(encoding))
     }
 
     /// Single emit point for traffic stats. Pingora calls this on
@@ -1075,6 +1265,23 @@ fn traffic_kind_for(is_upgrade: bool, is_streaming: bool) -> pangolin_core::Traf
     } else {
         pangolin_core::TrafficKind::Http
     }
+}
+
+/// Whether a response is an event stream.
+///
+/// An event stream never ends, so it must never be cached: the entry
+/// would pin the connection open and serve a stale event forever
+/// (issue #259).
+///
+/// The rule is the shared one — the same marker the gateway uses to
+/// recognize a streaming *request* — so the two cannot disagree about
+/// what an event stream is.
+fn is_event_stream(resp: &ResponseHeader) -> bool {
+    resp.headers
+        .get_all("content-type")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| pangolin_core::is_streaming_header("content-type", value))
 }
 
 /// Whether the request's headers mark it as a streaming request.

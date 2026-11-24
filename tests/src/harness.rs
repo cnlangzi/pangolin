@@ -710,7 +710,19 @@ impl NgxProcess {
     /// which seed data is visible without an explicit
     /// `reload_indexes` admin call.
     pub async fn start<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, false, "").await
+        Self::start_inner(seed_db, false, "", "").await
+    }
+
+    /// Spawn `pangolin-ngx` with extra top-level YAML merged into its
+    /// configuration.
+    ///
+    /// `extra_config` is a YAML block that lands at the top level of
+    /// `ngx.yml`, the way an operator would write it — a `[cache]`
+    /// section, say (issue #259). The block is written as it is: it
+    /// is a top-level section, so indenting it would nest it under
+    /// the section above it, where the loader ignores it.
+    pub async fn start_with_config<F: FnOnce(&Path)>(seed_db: F, extra_config: &str) -> Self {
+        Self::start_inner(seed_db, false, "", extra_config).await
     }
 
     /// Spawn `pangolin-ngx` with extra keys merged into its `[log]`
@@ -735,7 +747,7 @@ impl NgxProcess {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Self::start_inner(seed_db, false, &indented).await
+        Self::start_inner(seed_db, false, &indented, "").await
     }
 
     /// Start ngx with the tunnel's **UDP** port already occupied by a
@@ -747,10 +759,15 @@ impl NgxProcess {
     /// That is the "the network blocks UDP" case, exercised without
     /// touching the host's firewall.
     pub async fn start_with_quic_blocked<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, true, "").await
+        Self::start_inner(seed_db, true, "", "").await
     }
 
-    async fn start_inner<F: FnOnce(&Path)>(seed_db: F, occupy_udp: bool, extra_log: &str) -> Self {
+    async fn start_inner<F: FnOnce(&Path)>(
+        seed_db: F,
+        occupy_udp: bool,
+        extra_log: &str,
+        extra_config: &str,
+    ) -> Self {
         let tmpdir = tempfile::Builder::new()
             .prefix("pangolin-e2e-ngx-")
             .tempdir()
@@ -819,7 +836,7 @@ acme:
   cert_dir: "{cert_dir}"
   email: ""
   # v2: no global autorenew — per-domain auto_issue lives in the DB
-"#,
+{extra_config}"#,
             http = http_port,
             tls = tls_port,
             tunnel_port = tunnel_port,
@@ -827,6 +844,7 @@ acme:
             api = api_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
             extra_log = extra_log,
+            extra_config = extra_config,
         );
         let config_path = tmpdir.path().join("ngx.yml");
         std::fs::write(&config_path, config).expect("write ngx.yml");
