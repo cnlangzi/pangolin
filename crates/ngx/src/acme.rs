@@ -3288,7 +3288,6 @@ impl AcmeState {
                 {
                     // The write runs on the blocking pool (issue #254).
                     let name = domain.domain.clone();
-                    let class = class.clone();
                     let _ = app
                         .with_db_res(move |conn| {
                             pangolin_core::db::set_cert_failure(
@@ -3374,7 +3373,6 @@ impl AcmeState {
                 // The write runs on the blocking pool (issue #254).
                 let name = domain.domain.clone();
                 let message = format!("pre_renew hook failed: {}", e);
-                let class = class.clone();
                 let _ = app
                     .with_db_res(move |conn| {
                         pangolin_core::db::set_cert_failure(
@@ -3645,7 +3643,6 @@ impl AcmeState {
                     // The write runs on the blocking pool (issue #254).
                     let name = domain.domain.clone();
                     let err_msg_for_db = err_msg.clone();
-                    let class = class.clone();
                     let _ = app
                         .with_db_res(move |conn| {
                             pangolin_core::db::set_cert_failure(

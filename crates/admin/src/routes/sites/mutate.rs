@@ -100,14 +100,13 @@ pub async fn handle_create(
     // the same write (issue #254).
     let app_for_db = app.clone();
     let name_for_db = name.clone();
-    let site_for_db = site.clone();
     let rate_limit = parsed.rate_limit.clone();
     let rate_limit_bots = parsed.rate_limit_bots.clone();
     let provider = parsed.provider.clone();
     let stored_bots_for_db = stored_bots.clone();
     let written = app
         .with_db(move |db| {
-            let result = pangolin_core::db::upsert_site(db, &site_for_db);
+            let result = pangolin_core::db::upsert_site(db, &site);
             // The policy is only written when the site itself was written —
             // a failed site write must not leave an orphaned policy row.
             let limit_result = match &result {
@@ -306,14 +305,13 @@ pub async fn handle_update(
     // the same write (issue #254).
     let app_for_db = app.clone();
     let name_for_db = name.clone();
-    let site_for_db = site.clone();
     let rate_limit = parsed.rate_limit.clone();
     let rate_limit_bots = parsed.rate_limit_bots.clone();
     let provider = parsed.provider.clone();
     let stored_bots_for_db = stored_bots.clone();
     let written = app
         .with_db(move |db| {
-            let result = pangolin_core::db::upsert_site(db, &site_for_db);
+            let result = pangolin_core::db::upsert_site(db, &site);
             // The policy is only written when the site itself was written —
             // a failed site write must not leave an orphaned policy row.
             let limit_result = match &result {

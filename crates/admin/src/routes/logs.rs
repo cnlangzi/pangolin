@@ -3878,7 +3878,6 @@ mod tests {
         {
             // The writes run on the blocking pool, under one connection
             // (issue #254).
-            let site = site.clone();
             let domains = domains
                 .iter()
                 .map(|d| (*d).to_string())

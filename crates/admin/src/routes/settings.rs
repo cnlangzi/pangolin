@@ -211,15 +211,9 @@ pub async fn handle_update_dashboard(
         // instance id and the learned address belong to other writers.
         //
         // The write runs on the blocking pool (issue #254).
-        let token_hash_for_db = token_hash.clone();
         let written = app
             .with_db_res(move |db| {
-                pangolin_core::db::update_api_settings(
-                    db,
-                    enabled,
-                    &token_hash_for_db,
-                    dashboard_port,
-                )
+                pangolin_core::db::update_api_settings(db, enabled, &token_hash, dashboard_port)
             })
             .await;
         if let Err(e) = written {
