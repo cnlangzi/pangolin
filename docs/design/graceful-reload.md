@@ -357,13 +357,25 @@ bind. The timeout means it is alive but not ready. Either way the
 handover is abandoned: the incoming generation is killed and **the
 running generation never stopped accepting**.
 
-How does the generation know that pingora's listeners are bound? It
-looks at the kernel's own view of the socket table:
-`/proc/net/tcp` and `/proc/net/tcp6` list the sockets in LISTEN
-state, and the socket inodes are matched against `/proc/self/fd` —
-the outgoing generation has a socket on the same port, and only the
-inode tells the two apart. A port of `0` is skipped: the kernel
-picks a free port for it, so the bind cannot collide with anybody.
+How does the generation know that its listeners are bound? It looks
+at the kernel's own view of the socket table: `/proc/net/tcp` and
+`/proc/net/tcp6` list the sockets in LISTEN state, and the socket
+inodes are matched against `/proc/self/fd` — the outgoing generation
+has a socket on the same port, and only the inode tells the two
+apart. A port of `0` is skipped: the kernel picks a free port for
+it, so the bind cannot collide with anybody.
+
+Five of the six listeners are TCP sockets and all five are checked:
+the proxy's HTTP and HTTPS ports, the admin port, the tunnel's TCP
+port and the management API's port. The sixth — the QUIC endpoint —
+is a UDP socket and is not in the table; it is covered by the strict
+bind below and by the shutdown token its failure cancels.
+
+And the handshake watches that token: a service that could not bind
+cancels it, and a generation whose service failed must **not** report
+itself as ready. Without that, the supervisor would drain a working
+gateway for a broken one — the one outcome the handover promises not
+to produce.
 
 The QUIC endpoint is different: the gateway binds it itself, so it
 knows. And for a generation that has to report itself as ready, a
@@ -415,9 +427,13 @@ travelling through them have to finish.
 tunnel streams get their budget first — a session closed under a live
 request would fail that request. Then the sessions are closed: the
 QUIC session gets a `CONNECTION_CLOSE` frame, the WebSocket session
-has its bridge task aborted. The tun's own reconnect loop (one
-second of backoff to start with) then brings the tunnel node back —
-to the incoming generation, which is already serving.
+has its bridge task aborted. The QUIC **endpoint** goes with them: a
+socket that stayed in the `SO_REUSEPORT` group would keep completing
+new handshakes that nobody answers, and a tun that reconnected into
+it would wait for the AUTH reply until its own timeout ran out
+(ten seconds). The tun's own reconnect loop (one second of backoff
+to start with) then brings the tunnel node back — to the incoming
+generation, which is already serving.
 
 **C — finish the in-flight requests (≤ `[reload] drain_timeout_secs`).**
 pingora's grace period is the drain budget, so the requests the
@@ -447,6 +463,14 @@ requests it took. The `pid` is the only thing the endpoint gained;
 the status code of a healthy gateway and the shape of its body are
 unchanged.
 
+The 503 is visible on the connections the draining generation
+**already had** — its admin listener closes with the rest of stage A,
+so a probe that opens a new connection reaches the incoming
+generation and gets a 200. That is the right answer for a probe: the
+gateway is serving. The "draining" answer is for the operator who
+wants to know that a handover is under way, and `pangolin-ngx
+--status` is that operator's tool.
+
 `pangolin-ngx --status` prints both numbers:
 
 ```console
@@ -454,6 +478,30 @@ $ pangolin-ngx --status
 supervisor: pid 4710 (alive)
 generation: pid 4712 (ok)
 ```
+
+### What a handover runs against
+
+The incoming generation opens the database and applies the pending
+migrations **while the outgoing one is still serving** — the
+supervisor never touches the database (it is not the process that
+serves traffic), so the migrations cannot run any earlier.
+
+A migration therefore has to be **additive** until the handover is
+done: the outgoing generation runs the old code against the new
+schema while it drains. A migration that drops or rewrites a column
+the running code still uses breaks the outgoing generation in the
+middle of its drain.
+
+### The platform
+
+The handover is a **Linux** feature. The readiness check reads the
+kernel's socket table (`/proc/net/tcp` and `/proc/self/fd`), and the
+parent-death signal is `PR_SET_PDEATHSIG` — both Linux-only. The
+gateway ships a macOS binary too, so the pieces are gated: the
+macOS build starts the same supervisor and generation, watches the
+parent process number instead of arming the kernel's signal, and
+**refuses the handover** with an error rather than performing one it
+cannot verify.
 
 ### What a failed handover leaves behind
 

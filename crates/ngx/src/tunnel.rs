@@ -43,7 +43,7 @@ pub mod quic;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,8 +82,20 @@ pub(crate) const TUNNEL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 pub(crate) type SessionCloser = Box<dyn Fn() + Send + Sync>;
 
 /// The live tunnel sessions, with the closer that shuts one down.
-static SESSIONS: LazyLock<Mutex<HashMap<String, SessionCloser>>> =
+///
+/// The key is the tun's name and the value carries the session's
+/// identity: a tun that reconnects registers a **new** closer under
+/// the same name, and the old session's cleanup must not take the
+/// new one away with it.
+static SESSIONS: LazyLock<Mutex<HashMap<String, (SessionId, SessionCloser)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The identity of a registered tunnel session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionId(u64);
+
+/// The next session identity.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The tunnel streams that are open right now.
 ///
@@ -92,17 +104,30 @@ static SESSIONS: LazyLock<Mutex<HashMap<String, SessionCloser>>> =
 /// request, and the handover is supposed to be invisible.
 static OPEN_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
-/// Register a session's closer.
-pub(crate) fn register_session(name: &str, closer: SessionCloser) {
+/// Register a session's closer and return its identity.
+pub(crate) fn register_session(name: &str, closer: SessionCloser) -> SessionId {
+    let id = SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst));
     SESSIONS
         .lock()
         .expect("the session registry")
-        .insert(name.to_string(), closer);
+        .insert(name.to_string(), (id, closer));
+    id
 }
 
 /// Forget a session that ended on its own.
-pub(crate) fn unregister_session(name: &str) {
-    SESSIONS.lock().expect("the session registry").remove(name);
+///
+/// The identity is checked: when a tun reconnects, the **new**
+/// session's closer is under the same name, and the old session's
+/// cleanup must not take it away — the drain would then leave that
+/// live session open, and the tun would stay bound to the outgoing
+/// generation.
+pub(crate) fn unregister_session(name: &str, id: SessionId) {
+    let mut sessions = SESSIONS.lock().expect("the session registry");
+    if let Some((current, _)) = sessions.get(name)
+        && *current == id
+    {
+        sessions.remove(name);
+    }
 }
 
 /// The number of tunnel streams that are open right now.
@@ -148,12 +173,19 @@ pub(crate) async fn close_sessions_for_drain(budget: Duration) {
     }
     let closers: Vec<SessionCloser> = {
         let mut sessions = SESSIONS.lock().expect("the session registry");
-        sessions.drain().map(|(_, closer)| closer).collect()
+        sessions.drain().map(|(_, (_, closer))| closer).collect()
     };
     let count = closers.len();
     for closer in closers {
         closer();
     }
+    // The QUIC endpoint goes with the sessions. It has to stay alive
+    // until here — the established sessions live on its UDP socket —
+    // but it must not outlive them: a socket that stays in the
+    // `SO_REUSEPORT` group keeps completing new handshakes that
+    // nobody answers, and a tun that reconnects into it waits for
+    // the AUTH reply until its own timeout runs out.
+    quic::close_endpoint();
     info!("tunnel: closed {count} tunnel session(s) — the tun reconnects to the new generation");
 }
 
@@ -393,7 +425,7 @@ async fn handle_client(
     }
 
     mark_tun_online(&app, &tun_name).await;
-    register_session(&tun_name, closer);
+    let session_id = register_session(&tun_name, closer);
     // The transport is named in the log so the operator can tell a
     // QUIC session from a fallback session that silently happened.
     info!(
@@ -415,7 +447,7 @@ async fn handle_client(
     // registered one. A tun that reconnected (possibly on the other
     // transport) must not be unregistered by the old session's
     // cleanup.
-    unregister_session(&tun_name);
+    unregister_session(&tun_name, session_id);
     if app.unregister_tun_if(&tun_name, &transport).await {
         mark_tun_offline(&app, &tun_name).await;
         info!("tun {} disconnected", tun_name);

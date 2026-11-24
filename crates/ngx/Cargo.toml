@@ -95,9 +95,8 @@ httpdate = "1"
 
 # The process model of the graceful reload (issue #234): the
 # supervisor forks the generations, the readiness pipe is an
-# inherited descriptor, and the signals are sent with `kill`. The
-# crate is published and already in the tree (the tests use it).
-libc = "0.2"
+# inherited descriptor, and the signals are sent with `kill`.
+libc.workspace = true
 
 # WebSocket
 sha1.workspace = true

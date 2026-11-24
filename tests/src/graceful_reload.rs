@@ -594,14 +594,22 @@ async fn a_handover_replaces_the_generation_without_a_gap() {
         let stop = stop.clone();
         tokio::spawn(async move {
             while !stop.load(Ordering::SeqCst) {
+                // A connection the kernel resets is **not** a
+                // failed request: joining the `SO_REUSEPORT` group
+                // re-spreads the connections that are already up
+                // (see the reuseport test above), and the outgoing
+                // generation's accept queue is dropped when its
+                // listener closes. The assertion is about the
+                // answers — a request that was answered with
+                // anything but 200.
                 let answer = try_probe(&addr, &path).await;
-                let failure = match answer {
-                    Some((status, body)) if status == 200 => None,
-                    Some((status, body)) => Some(format!("{status}: {body}")),
-                    None => Some("the connection was refused".to_string()),
-                };
-                if let Some(failure) = failure {
-                    failures.lock().expect("the failure log").push(failure);
+                if let Some((status, body)) = answer
+                    && status != 200
+                {
+                    failures
+                        .lock()
+                        .expect("the failure log")
+                        .push(format!("{status}: {body}"));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -686,7 +694,76 @@ async fn a_failed_handover_leaves_the_running_gateway_alone() {
 
     request_handover(supervisor);
 
-    // The supervisor says what went wrong.
+    // The supervisor says what went wrong — and it knows: the
+    // incoming generation **died**, which the supervisor sees as the
+    // end of the readiness pipe. The pipe's write end belongs to the
+    // supervisor too, so it has to close its copy after the spawn —
+    // otherwise the end of the file never comes and the failure is
+    // only noticed when the ready timeout runs out.
+    assert!(
+        crate::harness::wait_for_log(&ngx.log, "the handover failed", Duration::from_secs(30))
+            .await,
+        "the supervisor must report the failed handover:\n{}",
+        ngx.log_string()
+    );
+    assert!(
+        crate::harness::wait_for_log(
+            &ngx.log,
+            "exited before it was ready",
+            Duration::from_secs(5)
+        )
+        .await,
+        "the supervisor must see the generation die:\n{}",
+        ngx.log_string()
+    );
+
+    // The generation is untouched and still serving.
+    let after = generation_pid(ngx.admin_port)
+        .await
+        .expect("the generation still answers");
+    assert_eq!(after, before, "the running generation must not be replaced");
+    let (status, body) = try_probe(&addr, &path)
+        .await
+        .expect("the running gateway must keep serving");
+    assert_eq!(
+        status,
+        200,
+        "the running gateway must keep serving: {body}\nngx log:\n{}",
+        ngx.log_string()
+    );
+}
+
+/// A handover that cannot come up with its QUIC endpoint fails, and
+/// the running gateway keeps serving.
+///
+/// The QUIC endpoint is the tunnel's **primary** transport. A
+/// generation that has to report itself as ready may not come up
+/// without it — a silent downgrade would push every tunnel onto the
+/// WebSocket/TCP fallback for good. The generation fails, and the
+/// handover has to fail with it: the running generation never stopped
+/// accepting.
+///
+/// The regression this pins: the readiness handshake has to notice
+/// that a service failed (the failure cancels the shared shutdown
+/// token). A handshake that only watched the socket table would
+/// report the broken generation as ready, and the supervisor would
+/// drain the working one for it.
+#[tokio::test]
+async fn a_handover_fails_when_the_quic_endpoint_cannot_bind() {
+    // The QUIC port is occupied from the start: the first generation
+    // degrades to the WebSocket/TCP fallback (that is what the
+    // blocked-QUIC test covers), and the generation of the handover
+    // may not degrade at all.
+    let ngx = NgxProcess::start_with_quic_blocked(|_| {}).await;
+    let supervisor = supervisor_pid(&ngx);
+    let before = generation_pid(ngx.admin_port)
+        .await
+        .expect("the gateway reports the generation's pid");
+    let path = install_challenge(&ngx.cert_dir(), "quic-handover");
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    request_handover(supervisor);
+
     assert!(
         crate::harness::wait_for_log(&ngx.log, "the handover failed", Duration::from_secs(30))
             .await,
@@ -694,7 +771,7 @@ async fn a_failed_handover_leaves_the_running_gateway_alone() {
         ngx.log_string()
     );
 
-    // The generation is untouched and still serving.
+    // The running generation is untouched and still serving.
     let after = generation_pid(ngx.admin_port)
         .await
         .expect("the generation still answers");

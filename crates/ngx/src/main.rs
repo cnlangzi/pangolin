@@ -216,7 +216,7 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
     // The kernel kills the generation when its supervisor dies, so a
     // `SIGKILL`ed supervisor does not leave a generation behind
     // holding the ports.
-    crate::reload::set_parent_death_signal()?;
+    crate::reload::arm_parent_death(supervisor)?;
     if !crate::reload::supervisor_is_parent(supervisor) {
         anyhow::bail!(
             "the supervisor {supervisor} is not this process's parent — it died during the handover"
@@ -265,7 +265,7 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
 
     // The ports the handover has to see bound before it may replace
     // the running generation (issue #234).
-    let pingora_ports = crate::reload::pingora_ports(&config);
+    let listener_ports = crate::reload::listener_ports(&config);
     // The budget of the drain. The tunnel sessions are closed within
     // it, and pingora's grace period is set to it.
     let drain_budget = Duration::from_secs(config.reload.drain_timeout_secs);
@@ -425,7 +425,20 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
         // missing listener would replace a working gateway with a
         // broken one.
         if let Some(ready) = &ready {
-            let missing = crate::reload::wait_for_listeners(&pingora_ports, ready_budget).await;
+            // The handshake must not ignore a service that failed:
+            // a service that could not bind cancels the shared
+            // token, and the handover has to fail rather than
+            // replace a working gateway with a broken one.
+            let missing = tokio::select! {
+                missing = crate::reload::wait_for_listeners(&listener_ports, ready_budget) => missing?,
+                _ = ctx.shutdown.cancelled() => {
+                    // Nothing to drain: this generation never served
+                    // a request, so pingora does not have to wait out
+                    // its grace period.
+                    quick_in_host.store(true, Ordering::Release);
+                    anyhow::bail!("a service failed to start — refusing to take over");
+                }
+            };
             if !missing.is_empty() {
                 // Nothing to drain: this generation never served a
                 // request, so pingora does not have to wait out its
@@ -446,7 +459,7 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
         // A: the accept loops have stopped. The listeners take no
         // new connections any more — the new connections go to the
         // incoming generation.
-        let failure = runtime::drain_services(handles).await;
+        let failure = runtime::drain_services(handles, drain_budget).await;
 
         // B: close the tunnel sessions, so the tun reconnects to the
         // incoming generation instead of waiting for this one to go.

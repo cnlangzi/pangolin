@@ -20,11 +20,10 @@
 //! ## Why the removal is conditional
 //!
 //! The removal only happens when the file still carries *this*
-//! process's number. Two processes may share one path — the
-//! supervisor and a generation that is starting up — and the wrong
-//! one must not delete the other's file on its way out: the
-//! operator's "which process is that?" would then answer with
-//! nothing.
+//! process's number. Only the supervisor writes the file, but a
+//! **restart** replaces it: the outgoing supervisor's guard must not
+//! delete the incoming one's file on its way out, or the operator's
+//! "which process is that?" would answer with nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

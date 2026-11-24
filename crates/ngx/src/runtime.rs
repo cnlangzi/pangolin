@@ -99,6 +99,13 @@ where
 }
 
 /// How long to wait for graceful drain before giving up on a service.
+///
+/// The **deadline**, not the budget: the services observe the
+/// shutdown token and return at once, so this only matters when one
+/// of them is wedged. The budget of the drain itself is the
+/// configuration's `[reload] drain_timeout_secs` — the deadline is
+/// clamped to it, so the whole drain fits into the budget the
+/// operator configured.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Install OS signal handlers that cancel `token`. The handler tasks
@@ -235,11 +242,20 @@ pub fn spawn_service(
     info!("starting service: {name}");
     let shutdown = ctx.shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = svc.run(ctx).await {
-            warn!("service {name} returned error: {e}; cancelling shutdown");
-            shutdown.cancel();
+        // The error is **returned**, not only logged: a service that
+        // could not bind its listener is a failure of the process,
+        // and the process has to say so with a non-zero exit code.
+        // The handover watches for it — a generation that came up
+        // without a listener would look ready, and the supervisor
+        // would drain a working gateway for a broken one.
+        match svc.run(ctx).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("service {name} returned error: {e}; cancelling shutdown");
+                shutdown.cancel();
+                Err(e)
+            }
         }
-        Ok(())
     })
 }
 
@@ -253,12 +269,13 @@ pub fn spawn_service(
 /// a generation that came up without a listener would look ready.
 pub async fn drain_services(
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    budget: Duration,
 ) -> Option<anyhow::Error> {
     if handles.is_empty() {
         return None;
     }
     let mut failure: Option<anyhow::Error> = None;
-    let deadline = tokio::time::sleep(DRAIN_TIMEOUT);
+    let deadline = tokio::time::sleep(DRAIN_TIMEOUT.min(budget));
     tokio::pin!(deadline);
     for h in handles {
         tokio::select! {

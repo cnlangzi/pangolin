@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use log::{info, warn};
+use std::sync::{LazyLock, Mutex};
 use tokio::io::AsyncWriteExt;
 
 use pangolin_tun::{
@@ -72,6 +73,26 @@ fn bind_quic_endpoint(addr: SocketAddr, cert: &QuicCert) -> anyhow::Result<quinn
         .map_err(|e| anyhow::anyhow!("the quic socket has no local address: {e}"))?;
     bind_endpoint_with_socket(local, socket, cert)
         .map_err(|e| anyhow::anyhow!("bind the quic endpoint on udp {local}: {e}"))
+}
+
+/// The QUIC endpoint of this process, kept alive across the drain.
+///
+/// The endpoint is reference counted, so a clone of it keeps the UDP
+/// socket open after the accept loop has stopped — and the
+/// established QUIC sessions live on that socket. The drain closes
+/// it with the sessions (see
+/// [`crate::tunnel::close_sessions_for_drain`]): a socket that stayed
+/// in the `SO_REUSEPORT` group would keep completing new handshakes
+/// that nobody answers, and a tun that reconnects into it would wait
+/// for the AUTH reply until its own timeout ran out.
+static ENDPOINT: LazyLock<Mutex<Option<quinn::Endpoint>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Close the QUIC endpoint, if it is still open.
+pub(crate) fn close_endpoint() {
+    let endpoint = ENDPOINT.lock().expect("the endpoint slot").take();
+    if let Some(endpoint) = endpoint {
+        endpoint.close(0u32.into(), b"the gateway is handing over");
+    }
 }
 
 /// The gateway's QUIC tunnel service.
@@ -181,7 +202,9 @@ impl Service for QuicService {
                     // the drain closes them. Without this the
                     // sessions would die with the loop, and the
                     // requests travelling through them would fail.
-                    keep_endpoint_alive(endpoint);
+                    // The drain closes it in turn — see
+                    // `close_endpoint`.
+                    *ENDPOINT.lock().expect("the endpoint slot") = Some(endpoint);
                     return Ok(());
                 }
                 incoming = endpoint.accept() => {
@@ -206,19 +229,6 @@ impl Service for QuicService {
             }
         }
     }
-}
-
-/// Keep the QUIC endpoint alive until the runtime goes away.
-///
-/// The endpoint is reference counted, so a clone of it keeps the UDP
-/// socket open after the accept loop has stopped. The clone is
-/// dropped when the runtime is dropped — which is when the drain
-/// closes the last tunnel session anyway.
-fn keep_endpoint_alive(endpoint: quinn::Endpoint) {
-    tokio::spawn(async move {
-        std::future::pending::<()>().await;
-        drop(endpoint);
-    });
 }
 
 /// Authenticate one QUIC connection and register it as the tun's
@@ -295,7 +305,7 @@ async fn handle_quic_client(app: Arc<App>, connection: quinn::Connection) -> any
             connection.close(0u32.into(), b"the gateway is handing over");
         }
     });
-    crate::tunnel::register_session(&tun_name, closer);
+    let session_id = crate::tunnel::register_session(&tun_name, closer);
 
     crate::tunnel::mark_tun_online(&app, &tun_name).await;
     info!("tun {} connected over quic", tun_name);
@@ -308,7 +318,7 @@ async fn handle_quic_client(app: Arc<App>, connection: quinn::Connection) -> any
     // reconnected on the other transport must not be unregistered by
     // the old session's cleanup.
     connection.closed().await;
-    crate::tunnel::unregister_session(&tun_name);
+    crate::tunnel::unregister_session(&tun_name, session_id);
     if app.unregister_tun_if(&tun_name, &transport).await {
         crate::tunnel::mark_tun_offline(&app, &tun_name).await;
         info!("tun {} disconnected", tun_name);

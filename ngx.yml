@@ -223,7 +223,8 @@ tls:
 
 # ── Graceful reload ──────────────────────────────────────────────────────
 # The budgets of a handover (issue #234). `systemctl reload pangolin-ngx`
-# (or `pangolin-ngx --reload`) starts a second generation, waits for it
+# sends SIGUSR2 to the supervisor (or `pangolin-ngx --reload` does the
+# same by hand): the supervisor starts a second generation, waits for it
 # to bind its listeners, and only then lets the running one drain away.
 #
 # The section is commented out on purpose: the defaults suit a packaged

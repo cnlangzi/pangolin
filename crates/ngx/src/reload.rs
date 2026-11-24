@@ -71,6 +71,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use log::{error, info, warn};
+use tokio_util::sync::CancellationToken;
 
 use pangolin_core::config::Config;
 
@@ -173,7 +174,14 @@ fn resolve_program(argv0: &str) -> PathBuf {
 /// bound"; EOF means the generation died before it got there.
 struct ReadyPipe {
     read_fd: RawFd,
-    write_fd: RawFd,
+    /// The supervisor's copy of the write end.
+    ///
+    /// It is closed right after the generation is spawned: the child
+    /// has a copy of its own, and the supervisor holding one would
+    /// keep the read end from ever seeing the end of the file — so a
+    /// generation that dies during its startup would only be noticed
+    /// when the ready timeout runs out.
+    write_fd: Option<RawFd>,
 }
 
 impl ReadyPipe {
@@ -229,7 +237,25 @@ impl ReadyPipe {
             }
             return Err(err);
         }
-        Ok(Self { read_fd, write_fd })
+        Ok(Self {
+            read_fd,
+            write_fd: Some(write_fd),
+        })
+    }
+
+    /// The write end — the descriptor the child inherits.
+    fn write_fd(&self) -> RawFd {
+        self.write_fd.expect("the write end is still open")
+    }
+
+    /// Close the supervisor's copy of the write end.
+    fn close_write(&mut self) {
+        if let Some(fd) = self.write_fd.take() {
+            // SAFETY: the descriptor is owned by this pipe.
+            unsafe {
+                libc::close(fd);
+            }
+        }
     }
 }
 
@@ -253,11 +279,11 @@ fn move_above_stdio(fd: RawFd) -> io::Result<RawFd> {
 
 impl Drop for ReadyPipe {
     fn drop(&mut self) {
-        // SAFETY: both descriptors are owned by this pipe.
+        // SAFETY: the read descriptor is owned by this pipe.
         unsafe {
             libc::close(self.read_fd);
-            libc::close(self.write_fd);
         }
+        self.close_write();
     }
 }
 
@@ -325,7 +351,8 @@ impl Drop for ReadySignal {
 /// the outgoing generation has a socket on the same port, and only
 /// the inode tells the two apart.
 ///
-/// Linux-only, and the gateway only runs on Linux.
+/// Linux-only: `/proc` is where the socket table lives.
+#[cfg(target_os = "linux")]
 fn holds_listening_port(port: u16) -> bool {
     let ours = socket_inodes();
     if ours.is_empty() {
@@ -364,12 +391,14 @@ fn holds_listening_port(port: u16) -> bool {
 /// The port a `/proc/net/tcp` local address names.
 ///
 /// The address is `HEXIP:HEXPORT`, with the port in hexadecimal.
+#[cfg(target_os = "linux")]
 fn hex_port(local_address: &str) -> Option<u16> {
     let (_, port) = local_address.rsplit_once(':')?;
     u16::from_str_radix(port, 16).ok()
 }
 
 /// The socket inodes this process holds open.
+#[cfg(target_os = "linux")]
 fn socket_inodes() -> HashSet<u64> {
     let mut inodes = HashSet::new();
     let Ok(dir) = std::fs::read_dir("/proc/self/fd") else {
@@ -408,30 +437,62 @@ fn listen_port(addr: &str) -> Option<u16> {
 /// A port of `0` is skipped: the kernel picks a free port for it, so
 /// the bind cannot collide with anybody and there is nothing to
 /// verify.
-pub async fn wait_for_listeners(ports: &[u16], timeout: Duration) -> Vec<u16> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let missing: Vec<u16> = ports
-            .iter()
-            .copied()
-            .filter(|port| !holds_listening_port(*port))
-            .collect();
-        if missing.is_empty() {
-            return Vec::new();
+///
+/// Fails where the check cannot run — see
+/// [`READINESS_CHECK_AVAILABLE`].
+pub async fn wait_for_listeners(ports: &[u16], timeout: Duration) -> anyhow::Result<Vec<u16>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ports, timeout);
+        bail!("the readiness check reads /proc — the handover is a Linux feature");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let missing: Vec<u16> = ports
+                .iter()
+                .copied()
+                .filter(|port| !holds_listening_port(*port))
+                .collect();
+            if missing.is_empty() {
+                return Ok(Vec::new());
+            }
+            if Instant::now() >= deadline {
+                return Ok(missing);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if Instant::now() >= deadline {
-            return missing;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// The ports pingora's own listeners are on.
+/// Whether this platform can verify that a listener is bound.
 ///
-/// pingora binds the HTTP, HTTPS and admin listeners inside its
-/// service thread — the gateway never sees the sockets, so the
-/// handover has to look them up in the kernel's socket table.
-pub fn pingora_ports(config: &Config) -> Vec<u16> {
+/// The check reads the kernel's socket table, which is Linux-only.
+/// The gateway ships a macOS binary too, and a handover it cannot
+/// verify is a handover it must not perform: the whole point of the
+/// handshake is to know that the incoming generation really has the
+/// listeners before the outgoing one is told to stop accepting.
+pub const READINESS_CHECK_AVAILABLE: bool = cfg!(target_os = "linux");
+
+/// The ports of the listeners the handover has to see bound.
+///
+/// Five of the gateway's six listeners are TCP sockets, and the
+/// handover checks every one of them:
+///
+/// * the proxy's HTTP and HTTPS ports and the admin port are
+///   pingora's — it binds them inside its own service thread, so the
+///   gateway never sees the sockets and has to look them up in the
+///   kernel's socket table;
+/// * the tunnel's TCP port and the management API's port are the
+///   gateway's own, but they are bound by the services that run
+///   beside pingora, so the handover checks them too.
+///
+/// The sixth listener — the QUIC endpoint — is a UDP socket and is
+/// not in the table; it is covered by the strict bind (a handover
+/// generation may not come up without it) and by the shutdown token
+/// its failure cancels.
+pub fn listener_ports(config: &Config) -> Vec<u16> {
     let mut ports = Vec::new();
     if let Some(port) = listen_port(&config.addr.http) {
         ports.push(port);
@@ -443,6 +504,15 @@ pub fn pingora_ports(config: &Config) -> Vec<u16> {
         ports.push(port);
     }
     if let Some(port) = listen_port(&config.admin.addr) {
+        ports.push(port);
+    }
+    if let Some(port) = listen_port(&config.tunnel.addr) {
+        ports.push(port);
+    }
+    if config.api.listen != ":0"
+        && !config.api.listen.is_empty()
+        && let Some(port) = listen_port(&config.api.listen)
+    {
         ports.push(port);
     }
     ports
@@ -497,21 +567,47 @@ pub fn require_supervisor() -> anyhow::Result<u32> {
     Ok(pid)
 }
 
-/// Ask the kernel to kill this process when its supervisor dies.
+/// Make this process die with its supervisor.
 ///
 /// `PR_SET_PDEATHSIG` is cleared by `execve`, so the generation has
 /// to arm it itself — after the exec, not before it.
-pub fn set_parent_death_signal() -> anyhow::Result<()> {
-    // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes a signal number
-    // and has no other side effect.
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
-        return Err(anyhow!(
-            "could not arm the parent-death signal: {}",
-            io::Error::last_os_error()
-        ));
+///
+/// The kernel's parent-death signal is **Linux-only**, and the
+/// gateway ships a macOS binary too. Elsewhere the parent process
+/// number is watched instead: the kernel reparents an orphan to init,
+/// so the number changes.
+pub fn arm_parent_death(supervisor: u32) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = supervisor;
+        // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes a signal
+        // number and has no other side effect.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+            return Err(anyhow!(
+                "could not arm the parent-death signal: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PARENT_WATCH_INTERVAL).await;
+                if !supervisor_is_parent(supervisor) {
+                    error!("the supervisor {supervisor} died — the generation exits");
+                    std::process::exit(1);
+                }
+            }
+        });
     }
     Ok(())
 }
+
+/// How often the parent-death watcher looks on the platforms that
+/// have no parent-death signal.
+#[cfg(not(target_os = "linux"))]
+const PARENT_WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Whether the supervisor is still this process's parent.
 ///
@@ -546,8 +642,8 @@ impl Generation {
         cmd.args(&args[1..]);
         cmd.env(ENV_SUPERVISOR_PID, std::process::id().to_string());
         if let Some(pipe) = ready {
-            cmd.env(ENV_READY_FD, pipe.write_fd.to_string());
-            let write_fd = pipe.write_fd;
+            cmd.env(ENV_READY_FD, pipe.write_fd().to_string());
+            let write_fd = pipe.write_fd();
             let read_fd = pipe.read_fd;
             // SAFETY: the closure only calls async-signal-safe
             // functions (`fcntl`, `close`) on descriptors it owns.
@@ -631,8 +727,35 @@ pub fn supervise(config_path: &Path, config: Config) -> anyhow::Result<()> {
             signal(SignalKind::user_defined2()).context("install the SIGUSR2 handler")?;
         let mut sigusr1 =
             signal(SignalKind::user_defined1()).context("install the SIGUSR1 handler")?;
-        let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
-        let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
+
+        // The stop signals feed a **token** rather than a branch of
+        // the supervisor's select: a handover waits for the incoming
+        // generation, and a stop that arrives during that wait has to
+        // be honoured — the handover must not hold the stop past
+        // systemd's own deadline.
+        let stop = CancellationToken::new();
+        {
+            let mut sigterm =
+                signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while sigterm.recv().await.is_some() {
+                    info!("SIGTERM received — the gateway is stopping");
+                    stop.cancel();
+                }
+            });
+        }
+        {
+            let mut sigint =
+                signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while sigint.recv().await.is_some() {
+                    info!("SIGINT received — the gateway is stopping");
+                    stop.cancel();
+                }
+            });
+        }
 
         // The first generation gets no readiness pipe: there is no
         // outgoing generation to hand over to.
@@ -645,8 +768,7 @@ pub fn supervise(config_path: &Path, config: Config) -> anyhow::Result<()> {
             &config,
             &mut sigusr2,
             &mut sigusr1,
-            &mut sigterm,
-            &mut sigint,
+            &stop,
         )
         .await
     })
@@ -663,8 +785,7 @@ async fn supervise_loop(
     config: &Config,
     sigusr2: &mut tokio::signal::unix::Signal,
     sigusr1: &mut tokio::signal::unix::Signal,
-    sigterm: &mut tokio::signal::unix::Signal,
-    sigint: &mut tokio::signal::unix::Signal,
+    stop: &CancellationToken,
 ) -> anyhow::Result<()> {
     let ready_timeout = Duration::from_secs(config.reload.ready_timeout_secs);
     let drain_timeout = Duration::from_secs(config.reload.drain_timeout_secs);
@@ -672,8 +793,22 @@ async fn supervise_loop(
     loop {
         tokio::select! {
             _ = sigusr2.recv() => {
+                if !READINESS_CHECK_AVAILABLE {
+                    error!("the handover needs the readiness check, which this platform does not \
+                            have — the running generation keeps serving");
+                    continue;
+                }
                 info!("SIGUSR2 received — handing over to a new generation");
-                if let Err(e) = perform_handover(generation, invocation, ready_timeout, drain_timeout).await {
+                if let Err(e) =
+                    perform_handover(generation, invocation, ready_timeout, drain_timeout, stop)
+                        .await
+                {
+                    if stop.is_cancelled() {
+                        // The gateway is stopping: the handover is
+                        // abandoned and the generation is stopped.
+                        stop_generation(generation, drain_timeout).await;
+                        return Ok(());
+                    }
                     // The outgoing generation never stopped accepting:
                     // the gateway is exactly as it was.
                     error!("the handover failed: {e} — the running generation keeps serving");
@@ -688,13 +823,8 @@ async fn supervise_loop(
                     warn!("could not forward SIGUSR1 to the generation {}: {e}", generation.pid);
                 }
             }
-            _ = sigterm.recv() => {
-                info!("SIGTERM received — stopping the gateway");
-                stop_generation(generation, drain_timeout).await;
-                return Ok(());
-            }
-            _ = sigint.recv() => {
-                info!("SIGINT received — stopping the gateway");
+            _ = stop.cancelled() => {
+                info!("stopping the gateway");
                 stop_generation(generation, drain_timeout).await;
                 return Ok(());
             }
@@ -728,13 +858,28 @@ async fn perform_handover(
     invocation: &Invocation,
     ready_timeout: Duration,
     drain_timeout: Duration,
+    stop: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let pipe = ReadyPipe::new().context("create the readiness pipe")?;
+    let mut pipe = ReadyPipe::new().context("create the readiness pipe")?;
     let mut incoming =
         Generation::spawn(invocation, Some(&pipe)).context("start the incoming generation")?;
+    // The supervisor must not hold the write end: the child has a
+    // copy, and the supervisor's would keep the read end from seeing
+    // the end of the file when the child dies.
+    pipe.close_write();
     info!("the incoming generation {} is starting", incoming.pid);
 
-    if let Err(e) = wait_for_ready(&pipe, ready_timeout).await {
+    // A stop that arrives while the handover waits is honoured: the
+    // gateway is going away, and a handover that ran to completion
+    // would hold the stop past systemd's own deadline.
+    let ready = tokio::select! {
+        ready = wait_for_ready(&pipe, ready_timeout) => ready,
+        _ = stop.cancelled() => {
+            incoming.kill();
+            return Err(anyhow!("the gateway is stopping"));
+        }
+    };
+    if let Err(e) = ready {
         incoming.kill();
         return Err(e);
     }
@@ -916,11 +1061,14 @@ fn admin_healthz_url(addr: &str) -> String {
         Some((host, port)) => (host, port),
         None => (addr, ""),
     };
+    // A wildcard listen address is not a URL host — the status
+    // command asks the gateway on the loopback.
     let host = match host_port.0 {
-        "" | "0.0.0.0" | "[::]" => "127.0.0.1",
-        other => other,
+        "" | "0.0.0.0" | "[::]" => "127.0.0.1".to_string(),
+        // An IPv6 literal keeps its brackets: `http://::1:9000` is
+        // not a URL, `http://[::1]:9000` is.
+        other => other.to_string(),
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
     format!("http://{host}:{}/healthz", host_port.1)
 }
 
@@ -998,8 +1146,12 @@ mod tests {
     /// generation to the supervisor.
     #[tokio::test]
     async fn the_readiness_pipe_carries_one_byte() {
-        let pipe = ReadyPipe::new().expect("the pipe is created");
-        let signal = ReadySignal { fd: pipe.write_fd };
+        let mut pipe = ReadyPipe::new().expect("the pipe is created");
+        // The signal **takes** the write end: the pipe would
+        // otherwise close it a second time when it drops.
+        let signal = ReadySignal {
+            fd: pipe.write_fd.take().expect("the write end"),
+        };
         signal.signal_ready().expect("the byte is written");
         let mut buf = [0u8; 1];
         // SAFETY: reading one byte from a non-blocking pipe.
@@ -1012,10 +1164,12 @@ mod tests {
     /// and the supervisor sees the end of the file.
     #[tokio::test]
     async fn a_dead_generation_ends_the_readiness_pipe() {
-        let pipe = ReadyPipe::new().expect("the pipe is created");
+        let mut pipe = ReadyPipe::new().expect("the pipe is created");
         {
             // The write end dies with the generation.
-            let _signal = ReadySignal { fd: pipe.write_fd };
+            let _signal = ReadySignal {
+                fd: pipe.write_fd.take().expect("the write end"),
+            };
         }
         let err = wait_for_ready(&pipe, Duration::from_secs(1))
             .await
@@ -1029,9 +1183,11 @@ mod tests {
     /// The ready timeout is a hard limit.
     #[tokio::test]
     async fn the_ready_timeout_is_a_hard_limit() {
-        let pipe = ReadyPipe::new().expect("the pipe is created");
+        let mut pipe = ReadyPipe::new().expect("the pipe is created");
         // The write end stays open, but nothing is written.
-        let _signal = ReadySignal { fd: pipe.write_fd };
+        let _signal = ReadySignal {
+            fd: pipe.write_fd.take().expect("the write end"),
+        };
         let err = wait_for_ready(&pipe, Duration::from_millis(100))
             .await
             .expect_err("a generation that says nothing is not ready");
@@ -1085,6 +1241,7 @@ mod tests {
 
     /// A listener that this process holds is found in the kernel's
     /// socket table.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_bound_listener_is_found_in_the_socket_table() {
         let listener = crate::reuseport::bind_tcp("127.0.0.1:0".parse().expect("an address"))
@@ -1097,6 +1254,7 @@ mod tests {
     }
 
     /// A port nobody holds is not found.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_port_nobody_holds_is_not_found() {
         // Port 1 needs root, so it is free for an unprivileged

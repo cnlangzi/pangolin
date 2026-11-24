@@ -443,6 +443,10 @@ cannot afford that.
 The section is optional: a configuration without it parses exactly as
 it did before, and the budgets above apply.
 
+The handover itself is a **Linux** feature (the readiness check
+reads `/proc`), so a gateway built for another platform ignores these
+keys — it never hands over.
+
 See [design/graceful-reload.md](design/graceful-reload.md) for the
 process model, the handover and what it costs.
 

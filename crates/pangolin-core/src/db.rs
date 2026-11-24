@@ -72,9 +72,6 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
         path.as_ref(),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
     // A graceful reload (issue #234) runs **two** generations against
     // the same database file: the incoming one starts while the
     // outgoing one is still draining. WAL lets the readers of the two
@@ -85,7 +82,14 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     //
     // The wait is bounded, so a database that is genuinely stuck
     // still fails the write instead of hanging the gateway.
+    //
+    // It goes **before** the pragmas: switching the journal mode
+    // takes a lock of its own, so that statement needs the wait as
+    // much as the writes do.
     conn.busy_timeout(std::time::Duration::from_secs(BUSY_TIMEOUT_SECS))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
 }
 
