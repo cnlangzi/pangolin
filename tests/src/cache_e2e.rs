@@ -9,12 +9,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::harness::{NgxProcess, TunProcess, init_pangolin_db};
+use crate::harness::{
+    NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db, read_sse_data_frames,
+};
 
 // ---------------------------------------------------------------------------
 // Mock backend
@@ -749,6 +752,46 @@ async fn cache_e2e_a_tunnel_backend_is_cached() {
         backend.count(),
         1,
         "the second request must not reach the origin"
+    );
+}
+
+/// The access log says whether the cache answered the request.
+///
+/// The cache's effect has to be visible in the operator's log, not
+/// only in the `X-Cache` header the client sees (issue #259).
+#[tokio::test]
+async fn cache_e2e_the_access_log_says_whether_the_cache_answered() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Two requests: the first is a miss, the second a hit.
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    // The admin's live log stream replays the ring buffer, oldest
+    // first.
+    let cookie = admin_session_cookie(&ngx).await;
+    let frames = read_sse_data_frames(
+        &format!("127.0.0.1:{}", ngx.admin_port),
+        "/api/logs/stream",
+        Duration::from_secs(2),
+        Some(&cookie),
+    )
+    .await
+    .expect("read the access log stream");
+
+    let answers: Vec<bool> = frames
+        .iter()
+        .filter_map(|frame| {
+            let entry: serde_json::Value = serde_json::from_str(frame).ok()?;
+            entry["cache_hit"].as_bool()
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![false, true],
+        "the log must say which request the cache answered: {frames:?}"
     );
 }
 
