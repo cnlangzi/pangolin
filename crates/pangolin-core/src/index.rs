@@ -238,7 +238,31 @@ impl Indexes {
         //     request (issue #253).
         let provider_headers: HashMap<String, Arc<[String]>> = providers
             .iter()
-            .map(|(name, cfg)| (name.clone(), Arc::from(cfg.first_level_headers())))
+            .map(|(name, cfg)| {
+                let names = cfg.first_level_headers();
+                // The request path snapshots the first-level headers
+                // into a fixed-length structure (see
+                // `pgl::FirstLevelHeaders`). A provider that named
+                // more headers than it holds would lose the tail — a
+                // client IP or a country that reads as unknown — so
+                // the count is asserted here, where the names are
+                // computed.
+                debug_assert!(
+                    names.len() <= crate::pgl::MAX_FIRST_LEVEL_HEADERS,
+                    "provider {name} names {} first-level headers, more than the \
+                     request-path snapshot holds",
+                    names.len()
+                );
+                if names.len() > crate::pgl::MAX_FIRST_LEVEL_HEADERS {
+                    log::warn!(
+                        "provider {name} names {} first-level headers; only the \
+                         first {} are read",
+                        names.len(),
+                        crate::pgl::MAX_FIRST_LEVEL_HEADERS
+                    );
+                }
+                (name.clone(), Arc::from(names))
+            })
             .collect();
 
         // 7. tunnel_domains: the domains of `domain_idx` whose owning

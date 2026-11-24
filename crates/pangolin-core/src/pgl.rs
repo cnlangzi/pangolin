@@ -194,10 +194,18 @@ impl<'a> FirstLevelHeaders<'a> {
 
     /// Add one `(name, value)` pair.
     ///
-    /// A snapshot that is already full drops the pair: the ceiling is
-    /// above what any provider names, so a full snapshot means the
-    /// caller asked for more names than the contract allows.
+    /// A snapshot that is already full drops the pair — but that must
+    /// not happen silently: the ceiling is the number of names a
+    /// provider may consult, and a provider that named more would
+    /// lose its tail (a client IP or a country that reads as
+    /// unknown). The index build asserts the count, and this
+    /// assertion catches it in the tests.
     pub fn push(&mut self, name: &'a str, value: &'a str) {
+        debug_assert!(
+            self.len < MAX_FIRST_LEVEL_HEADERS,
+            "the first-level header snapshot is full — a provider names more \
+             headers than the snapshot holds"
+        );
         if self.len < MAX_FIRST_LEVEL_HEADERS {
             self.entries[self.len] = (name, value);
             self.len += 1;
