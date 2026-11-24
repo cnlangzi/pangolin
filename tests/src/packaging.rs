@@ -249,6 +249,71 @@ fn the_gateway_config_template_parses_with_the_real_parser() {
         config.log.referer.dir,
         PathBuf::from("/var/log/pangolin/referers")
     );
+    // The PID file (issue #233) has to live in the service's own
+    // directory: the derived path would sit next to the
+    // configuration in `/etc/pangolin/`, which the `pangolin` service
+    // user cannot write to.
+    assert_eq!(
+        config.pid.pid_file.as_deref(),
+        Some(Path::new("/var/lib/pangolin/pangolin-ngx.pid"))
+    );
+}
+
+/// The Ansible gateway configuration has to carry the PID file with
+/// the right key and a writable path (issue #233).
+///
+/// The template is Jinja, and the test suite has no Jinja renderer
+/// (jinja2 is not in CI), so the block is checked as it is written:
+/// the `pid:` section, the key under it and the default the template
+/// renders. A typo in the key — or a path in a directory the service
+/// user cannot write to — has to fail here rather than at the
+/// service start.
+#[test]
+fn the_ansible_gateway_config_carries_the_pid_file() {
+    let template = read_repo_file("deploy/playbooks/roles/ngx/templates/ngx.yml.j2");
+
+    // The `pid:` block: the line that opens it up to the next
+    // top-level key.
+    let mut block = String::new();
+    let mut inside = false;
+    for line in template.lines() {
+        if line.starts_with("pid:") {
+            inside = true;
+            block.push_str(line);
+            block.push('\n');
+            continue;
+        }
+        if inside {
+            // The block ends at the next top-level key.
+            if !line.starts_with(' ') && !line.trim().is_empty() {
+                break;
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    assert!(
+        !block.is_empty(),
+        "the ansible template must carry a `pid:` section — the gateway writes its process \
+         number there (issue #233)"
+    );
+
+    // The rendered value: the template's own default.
+    let rendered = block.replace(
+        "{{ ngx_pid_file | default('/usr/local/pangolin/pangolin-ngx.pid') }}",
+        "/usr/local/pangolin/pangolin-ngx.pid",
+    );
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered)
+        .expect("the pid block of the ansible template must be YAML");
+    let pid_file = parsed
+        .get("pid")
+        .and_then(|section| section.get("pid_file"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("the pid block must carry a `pid_file` key: {rendered}"));
+    assert_eq!(
+        pid_file, "/usr/local/pangolin/pangolin-ngx.pid",
+        "the ansible template must point the pid file at the gateway's own directory"
+    );
 }
 
 /// The packaged tunnel configuration has to parse with the real parser

@@ -40,6 +40,7 @@
     ngx_acme_renew_check_interval_hours: "{{ lookup('env', 'NGX_ACME__RENEW_CHECK_INTERVAL_HOURS') | default('6', true) }}"
     ngx_acme_key_type: "{{ lookup('env', 'NGX_ACME__KEY_TYPE') | default('ecdsa', true) }}"
     ngx_log_level: "{{ lookup('env', 'NGX_LOG__LEVEL') | default('info', true) }}"
+    ngx_pid_file: "{{ lookup('env', 'NGX_PID__PID_FILE') | default('/usr/local/pangolin/pangolin-ngx.pid', true) }}"
 
   roles:
     - role: ngx

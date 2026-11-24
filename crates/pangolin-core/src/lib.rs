@@ -32,6 +32,7 @@ pub mod index;
 pub mod normalize;
 pub mod parse;
 pub mod pgl;
+pub mod pidfile;
 pub mod provider;
 pub mod proxy;
 pub mod ratelimit;
@@ -57,8 +58,8 @@ pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
 pub use config::{
-    ApiConfig, BotLogConfig, Config, LogConfig, RefererLogConfig, TrafficConfig, init_logger,
-    load_config_and_init_logger,
+    ApiConfig, BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, TrafficConfig,
+    init_logger, load_config_and_init_logger,
 };
 pub use error::{PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};

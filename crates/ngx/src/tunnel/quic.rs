@@ -32,7 +32,8 @@ use tokio::io::AsyncWriteExt;
 
 use pangolin_tun::{
     QuicBiStream, QuicCert, QuicServerTransport, TUNNEL_PROTOCOL_VERSION, TunnelTransport,
-    bind_endpoint, decode_auth, encode_auth_reply, protocol_version_mismatch, read_crlf_line,
+    bind_endpoint_with_socket, decode_auth, encode_auth_reply, protocol_version_mismatch,
+    read_crlf_line,
 };
 
 use crate::App;
@@ -45,6 +46,33 @@ use crate::tunnel::validate_token;
 /// QUIC connection) forever: the transport's keep-alive would keep it
 /// open indefinitely.
 const AUTH_TIMEOUT_SECS: u64 = 10;
+
+/// Bind the QUIC endpoint on a socket that asks for `SO_REUSEPORT`.
+///
+/// The endpoint is built on a socket this crate binds itself
+/// (`pangolin_tun::bind_endpoint_with_socket`) because the option has
+/// to be set **before** the bind — quinn's own `bind_endpoint` binds
+/// the socket itself and cannot be told to ask for it.
+///
+/// The QUIC listener shares its port number with the tunnel's TCP
+/// listener, and it is the transport the gateway prefers: a QUIC
+/// endpoint that cannot bind leaves the gateway on the WebSocket/TCP
+/// fallback, and that downgrade is persistent (the tun keeps using
+/// the transport it negotiated). So the QUIC listener has to be part
+/// of the handover group like every other listener (issue #233).
+fn bind_quic_endpoint(addr: SocketAddr, cert: &QuicCert) -> anyhow::Result<quinn::Endpoint> {
+    let socket = crate::reuseport::bind_udp(addr)
+        .map_err(|e| anyhow::anyhow!("bind the quic socket on udp {addr}: {e}"))?;
+    // The endpoint is told the socket's **own** address: the crate
+    // cross-checks it against the socket and refuses a mismatch. The
+    // socket's address is the only correct answer — it also covers
+    // the "port 0" case, where the kernel picked the port.
+    let local = socket
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("the quic socket has no local address: {e}"))?;
+    bind_endpoint_with_socket(local, socket, cert)
+        .map_err(|e| anyhow::anyhow!("bind the quic endpoint on udp {local}: {e}"))
+}
 
 /// The gateway's QUIC tunnel service.
 pub struct QuicService {
@@ -90,7 +118,7 @@ impl Service for QuicService {
             self.cert_dir.display()
         );
 
-        let endpoint = match bind_endpoint(self.addr, &cert) {
+        let endpoint = match bind_quic_endpoint(self.addr, &cert) {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 warn!(

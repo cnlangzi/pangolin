@@ -112,6 +112,20 @@ sha2 = "0.11"
 # knownbots crate already depends on it for its official IP ranges.
 ipnet = "2"
 
+# The listeners the gateway owns outside pingora set SO_REUSEPORT
+# before they bind (issue #233): the tunnel listener, the QUIC
+# endpoint and the management API's listener.  (pingora's own three
+# — the HTTP, HTTPS and admin listeners — get the option through
+# pingora's `TcpSocketOptions`.)  `socket2` is already in the tree
+# (pingora-core and quinn depend on it), so declaring it here adds a
+# dependency edge and not a second copy of the crate.
+#
+# The `all` feature is what carries `Socket::set_reuse_port` — the
+# option those three listeners need.  The crate exposes it on the
+# Unix platforms that have it (everything except Solaris and
+# illumos), which is why the call sites are `#[cfg]`-guarded.
+socket2 = { version = "0.6", features = ["all"] }
+
 # Bot verification (UA + official IP ranges / RDNS) — issue #146. The
 # crate is published (github.com/cnlangzi/knownbots-rust), not part
 # of this workspace. The `full` feature compiles in the IP-list

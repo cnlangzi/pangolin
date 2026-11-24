@@ -41,6 +41,11 @@ bytes = "1"
 hyper = { version = "1.10", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 
+# The API's own listener sets SO_REUSEPORT before it binds (issue
+# #233) — the same version the tree already carries, see the root
+# Cargo.toml.
+socket2.workspace = true
+
 # Ed25519 — the dashboard's request signature. `ring` is already in the
 # tree (rustls' provider), so this adds no new crate to the build.
 ring = "0.17"

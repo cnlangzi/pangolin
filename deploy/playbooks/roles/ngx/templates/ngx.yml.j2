@@ -56,6 +56,13 @@
 #   log.bot.dir             output directory for `bot-YYYY-MM-DD.jsonl`
 #                           (UTC daily rotation). Created lazily on
 #                           first write. Default `./logs/bots`.
+#   pid.pid_file            where the gateway writes its process
+#                           number (issue #233). Absent → derived
+#                           from the configuration file's own name
+#                           (`ngx.yml` → `ngx.pid`). A packaged
+#                           deployment names it explicitly, because
+#                           its configuration lives in a directory
+#                           the service user cannot write to.
 
 # ── Proxy listen (top level) ────────────────────────────────────────────
 addr:
@@ -78,6 +85,13 @@ admin:
   addr: {{ ngx_admin_addr | default('0.0.0.0:9081') }}
   username: {{ ngx_admin_username | default('admin') }}
   password: {{ ngx_admin_password | default('admin') }}
+
+# The PID file the gateway writes its process number into. Named
+# explicitly because the derived path would follow the configuration
+# file's name (`ngx.yml` -> `ngx.pid`) — which happens to land in
+# this directory, but only as long as the file stays here.
+pid:
+  pid_file: {{ ngx_pid_file | default('/usr/local/pangolin/pangolin-ngx.pid') }}
 
 acme:
   email: {{ ngx_acme_email | default('') }}
