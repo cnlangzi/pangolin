@@ -221,6 +221,25 @@ tls:
 # pid:
 #   pid_file: /var/lib/pangolin/pangolin-ngx.pid
 
+# ── Graceful reload ──────────────────────────────────────────────────────
+# The budgets of a handover (issue #234). `systemctl reload pangolin-ngx`
+# (or `pangolin-ngx --reload`) starts a second generation, waits for it
+# to bind its listeners, and only then lets the running one drain away.
+#
+# The section is commented out on purpose: the defaults suit a packaged
+# deployment. `drain_timeout_secs` has to stay BELOW the `TimeoutStopSec`
+# of the systemd unit (30 seconds), or systemd kills the generation in
+# the middle of its drain.
+# reload:
+#   # How long the supervisor waits for the incoming generation to
+#   # report that it is ready. The budget covers the new generation's
+#   # whole startup. Default 30.
+#   ready_timeout_secs: 30
+#   # How long the outgoing generation may spend draining. The budget
+#   # covers the in-flight requests; pingora adds five seconds on top
+#   # of it. Default 20.
+#   drain_timeout_secs: 20
+
 log:
   level: debug          # env_logger filter: trace|debug|info|warn|error
   file: ""              # log file path; "" = stderr only

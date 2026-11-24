@@ -7,9 +7,12 @@
 //!
 //! ## The lifecycle
 //!
-//! * The gateway writes the file **after** it has read its
-//!   configuration and **before** it binds any listener: the file
-//!   says "this process intends to serve", not "the ports are up".
+//! * The **supervisor** writes the file (issue #234): it is the
+//!   resident parent, the process systemd's `MAINPID` points at, and
+//!   the one `pangolin-ngx --reload` signals. The number is written
+//!   **after** the configuration has been read and **before** any
+//!   listener is bound: the file says "this process intends to
+//!   serve", not "the ports are up".
 //! * A graceful exit removes it.
 //! * A `SIGKILL` leaves it behind. The next start truncates it, so
 //!   a stale number never survives a restart.
@@ -17,11 +20,11 @@
 //! ## Why the removal is conditional
 //!
 //! The removal only happens when the file still carries *this*
-//! process's number. Two generations of the gateway may share one
-//! path during a handover (issue #233 lays the groundwork for it),
-//! and the outgoing generation must not delete the incoming one's
-//! file on its way out — the operator's "which process is that?"
-//! would then answer with nothing.
+//! process's number. Two processes may share one path — the
+//! supervisor and a generation that is starting up — and the wrong
+//! one must not delete the other's file on its way out: the
+//! operator's "which process is that?" would then answer with
+//! nothing.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

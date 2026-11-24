@@ -18,6 +18,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,6 +40,31 @@ impl ServiceContext {
     pub fn new(app: Arc<App>, shutdown: CancellationToken) -> Self {
         Self { app, shutdown }
     }
+}
+
+/// Whether this process is draining.
+///
+/// A process that is draining has stopped accepting new connections
+/// but is still finishing the requests it took — the admin's
+/// `/healthz` says so (issue #234).
+///
+/// The flag lives here rather than in the reload module because the
+/// health endpoint needs it, and the health endpoint is part of the
+/// library the integration tests use.
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process is draining.
+pub fn is_draining() -> bool {
+    DRAINING.load(Ordering::Acquire)
+}
+
+/// Mark this process as draining.
+///
+/// Called from the signal handler, **before** the shutdown token is
+/// cancelled: the health endpoint has to answer "draining" before
+/// the listeners stop answering at all.
+pub fn mark_draining() {
+    DRAINING.store(true, Ordering::Release);
 }
 
 /// A long-running service managed by the host runtime.
@@ -81,7 +107,25 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// Replaces pingora's default `UnixShutdownSignalWatch` so there is
 /// exactly one set of signal handlers in the process.
-pub fn install_signal_handlers(token: CancellationToken) {
+///
+/// The signals and what they mean (issue #234):
+///
+/// - `SIGINT` / `SIGTERM` — the process is asked to stop. The token
+///   is cancelled and everything drains.
+/// - `SIGUSR2` — the **generation** is asked to hand over. The token
+///   is cancelled as well, and the generation marks itself as
+///   draining first, so the health endpoint says "draining" instead
+///   of "ok".
+/// - `SIGUSR1` — the generation is asked to rebuild its indexes. The
+///   supervisor sends it once the outgoing generation is gone, so the
+///   writes that landed on the outgoing one are in the database.
+///
+/// The supervisor has its own handlers — it is a different process
+/// with a different job (see `crate::reload`).
+pub fn install_signal_handlers(
+    token: CancellationToken,
+    on_reload_indexes: impl Fn() + Send + Sync + 'static,
+) {
     // SIGINT (Unix) / Ctrl-C (Windows) — fast shutdown
     let token_for_ctrl_c = token.clone();
     tokio::spawn(async move {
@@ -90,6 +134,7 @@ pub fn install_signal_handlers(token: CancellationToken) {
             return;
         }
         info!("ctrl_c received, cancelling shutdown token");
+        mark_draining();
         token_for_ctrl_c.cancel();
     });
 
@@ -103,9 +148,41 @@ pub fn install_signal_handlers(token: CancellationToken) {
                 Ok(mut s) => {
                     s.recv().await;
                     info!("SIGTERM received, cancelling shutdown token");
+                    mark_draining();
                     token_for_sigterm.cancel();
                 }
                 Err(e) => error!("SIGTERM handler: {e}"),
+            }
+        });
+
+        // SIGUSR2 — the generation is asked to hand over. The
+        // supervisor sends it once the incoming generation has
+        // reported that it is ready.
+        let token_for_sigusr2 = token.clone();
+        tokio::spawn(async move {
+            match signal(SignalKind::user_defined2()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                    info!("SIGUSR2 received — draining for the handover");
+                    mark_draining();
+                    token_for_sigusr2.cancel();
+                }
+                Err(e) => error!("SIGUSR2 handler: {e}"),
+            }
+        });
+
+        // SIGUSR1 — rebuild the in-memory indexes from the database.
+        // The supervisor sends it after the outgoing generation is
+        // gone: the writes that landed on the outgoing one are in
+        // the database by then.
+        tokio::spawn(async move {
+            match signal(SignalKind::user_defined1()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                    info!("SIGUSR1 received — rebuilding the indexes");
+                    on_reload_indexes();
+                }
+                Err(e) => error!("SIGUSR1 handler: {e}"),
             }
         });
     }
@@ -119,6 +196,12 @@ pub fn install_signal_handlers(token: CancellationToken) {
 /// desired behaviour for `Ctrl-C` / `kill <pid>` as well.
 pub struct TokenShutdownSignalWatch {
     pub token: CancellationToken,
+    /// Whether the shutdown has to be quick.
+    ///
+    /// A startup failure has nothing to drain — the generation never
+    /// served a request — so pingora's grace period would only
+    /// delay the error the supervisor is waiting for.
+    pub quick: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -126,7 +209,11 @@ impl ShutdownSignalWatch for TokenShutdownSignalWatch {
     async fn recv(&self) -> ShutdownSignal {
         self.token.cancelled().await;
         info!("shutdown token cancelled, signalling pingora to terminate");
-        ShutdownSignal::GracefulTerminate
+        if self.quick.load(Ordering::Acquire) {
+            ShutdownSignal::FastShutdown
+        } else {
+            ShutdownSignal::GracefulTerminate
+        }
     }
 }
 
@@ -159,23 +246,35 @@ pub fn spawn_service(
 /// Drain a list of service join handles. The first one to error or
 /// the drain deadline terminates the loop; the rest are abandoned
 /// (the process is exiting anyway).
-pub async fn drain_services(handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>) {
+///
+/// The first error is returned: a service that could not bind a
+/// listener is a failure of the **process**, and the process has to
+/// say so with a non-zero exit code. A handover watches for it —
+/// a generation that came up without a listener would look ready.
+pub async fn drain_services(
+    handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) -> Option<anyhow::Error> {
     if handles.is_empty() {
-        return;
+        return None;
     }
+    let mut failure: Option<anyhow::Error> = None;
     let deadline = tokio::time::sleep(DRAIN_TIMEOUT);
     tokio::pin!(deadline);
     for h in handles {
         tokio::select! {
             r = h => match r {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("service returned error: {e}"),
+                Ok(Err(e)) => {
+                    warn!("service returned error: {e}");
+                    failure.get_or_insert(e);
+                }
                 Err(e) => warn!("service join error: {e}"),
             },
             _ = &mut deadline => {
                 warn!("drain deadline reached; abandoning remaining services");
-                return;
+                return failure;
             }
         }
     }
+    failure
 }

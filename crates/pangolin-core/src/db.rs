@@ -75,8 +75,26 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // A graceful reload (issue #234) runs **two** generations against
+    // the same database file: the incoming one starts while the
+    // outgoing one is still draining. WAL lets the readers of the two
+    // run side by side, but the writers still collide — and without a
+    // busy timeout SQLite answers the second writer with
+    // `SQLITE_BUSY` straight away instead of waiting for the first
+    // one to commit.
+    //
+    // The wait is bounded, so a database that is genuinely stuck
+    // still fails the write instead of hanging the gateway.
+    conn.busy_timeout(std::time::Duration::from_secs(BUSY_TIMEOUT_SECS))?;
     Ok(conn)
 }
+
+/// How long a write waits for another process's write lock.
+///
+/// Five seconds is long enough for the writes of two generations to
+/// take turns (they are all short — a row update, not a migration)
+/// and short enough that a wedged database surfaces as an error.
+const BUSY_TIMEOUT_SECS: u64 = 5;
 
 /// Run pending refinery migrations. Safe to call on every startup —
 /// already-applied migrations are skipped (tracked in schema_version table).

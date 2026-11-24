@@ -188,6 +188,7 @@ breaks a contract an operator already depends on.
 | changing `install.sh`, the packaging or the release | [docs/release.md](docs/release.md) |
 | changing the pingora dependency | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) |
 | changing the API | [docs/design/api.md](docs/design/api.md) |
+| changing the process model (the supervisor and the generations) | [docs/design/graceful-reload.md](docs/design/graceful-reload.md) |
 | debugging at trace level | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) — its HTTP/1 client panics on a non-UTF-8 response header in the trace log |
 | looking up a configuration key | [docs/configuration.md](docs/configuration.md) |
 

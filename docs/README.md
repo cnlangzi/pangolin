@@ -39,7 +39,7 @@ New to Pangolin? Start here:
 - [Traffic statistics](design/traffic.md) — the in-memory counters behind the `/traffic` panel and how they are fed
 - [Rate limiting](design/rate-limit.md) — the rate limiter's data structures, its evaluation order and its failure behaviour
 - [Gateway headers](design/gateway-headers.md) — the `P-*` headers the gateway adds to every request it forwards
-- [Graceful reload](design/graceful-reload.md) — the groundwork for replacing the gateway without a downtime window: `SO_REUSEPORT` on every listener, `pangolin-ngx --check` and the PID file (issue #233)
+- [Graceful reload](design/graceful-reload.md) — replacing the gateway without a downtime window: `SO_REUSEPORT` on every listener, `pangolin-ngx --check`, the PID file and the handover itself — a supervisor that replaces the generation without a gap in the service (issues #233 and #234)
 - [The pingora dependency](design/pingora-dependency.md) — the gateway depends on the published crates.io release of pingora, not on a fork: the version rule, the upgrade procedure, the escape hatch and the 0.9.1 caveats (issue #189)
 - [Providers + origin guard](design/provider.md) — the front-CDN registry (header names + published source-IP ranges), the per-site provider inheritance chain, the peer-based origin guard and the background range fetch (issue #122)
 - [Cert link + in-memory cache](design/cert-link.md) — pre-computed domain→cert map for the SNI callback (branch `fix/cert_www`): single-level wildcard fallback, derived view over `domains` × `certs`, CRUD sync flow

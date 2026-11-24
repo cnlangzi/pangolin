@@ -805,6 +805,15 @@ admin:
 api:
   listen: 127.0.0.1:{api}
 
+# The budgets of a handover (issue #234). The suite pins them short:
+# a handover has to fit into a test, and the production defaults
+# (30 / 20) are the configuration's own business. The drain budget
+# matches the 5s pingora used to get unconditionally, so the timings
+# the rest of the suite is calibrated against do not move.
+reload:
+  ready_timeout_secs: 5
+  drain_timeout_secs: 5
+
 acme:
   cert_dir: "{cert_dir}"
   email: ""

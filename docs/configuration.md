@@ -408,8 +408,43 @@ it; a `SIGKILL` leaves it behind and the next start truncates it. A
 PID file that cannot be written is not a reason to refuse to start:
 the gateway logs the error and serves anyway.
 
+The file holds the **supervisor's** process number — the resident
+parent that systemd's `MAINPID` points at, not the generation that
+serves the traffic. `pangolin-ngx --reload` and `pangolin-ngx
+--status` address the gateway through it.
+
 See [design/graceful-reload.md](design/graceful-reload.md) for the
-PID file's role in the handover the gateway is being prepared for.
+PID file's role in the handover.
+
+### `[reload]` — the budgets of a graceful reload
+
+The two budgets of a handover (issue #234). `systemctl reload
+pangolin-ngx` — or `pangolin-ngx --reload` — starts a second
+generation of the gateway, waits for it to bind its listeners, and
+only then lets the running one drain away. These two numbers bound
+that dance.
+
+| Field               | Type  | Default | Required | Notes |
+| ------------------- | ----- | ------- | -------- | ----- |
+| `ready_timeout_secs` | `u64` | `30`  | no | How long the supervisor waits for the incoming generation to report that it is ready. The budget covers the new generation's **whole startup** — the database, the certificates, the listeners — so it has to be comfortably larger than that. When the budget runs out the handover is abandoned: the incoming generation is killed and the running one keeps serving, exactly as it was. |
+| `drain_timeout_secs` | `u64` | `20`  | no | How long the outgoing generation may spend draining. The budget covers the whole drain: the in-flight tunnel streams, the tunnel sessions that are closed so the tun reconnects, and the in-flight HTTP requests. pingora's own grace period is set to this number and its runtime shutdown adds five seconds on top of it, so a drain takes up to `drain_timeout_secs + 5` seconds. |
+
+`drain_timeout_secs` has to stay **below** the `TimeoutStopSec` of
+the systemd unit (30 seconds) — otherwise systemd kills the
+generation in the middle of its drain, and the in-flight requests
+are lost. The default (20 + 5 = 25) fits.
+
+The budget is not only about the reload: it is pingora's grace
+period, so **every** shutdown of the gateway waits it out. A
+`systemctl stop` therefore takes about `drain_timeout_secs + 5`
+seconds with the default configuration. Lower it if the deployment
+cannot afford that.
+
+The section is optional: a configuration without it parses exactly as
+it did before, and the budgets above apply.
+
+See [design/graceful-reload.md](design/graceful-reload.md) for the
+process model, the handover and what it costs.
 
 ### `system_config` table (DB) — provider + gateway headers
 
