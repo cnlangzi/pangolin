@@ -111,8 +111,8 @@ the compiler:
   second half is new for this repository: its own
   `strip_hop_by_hop_headers` in `crates/pangolin-core/src/proxy.rs`
   never covered it, and the direct proxy path deliberately relies on
-  pingora for hop-by-hop handling (see
-  `apply_proxy_policy_without_hop_by_hop_stripping`). The
+  pingora for hop-by-hop handling (see `rewrite_upstream_headers` in
+  `crates/ngx/src/proxy.rs`). The
   regression test is
   `tests/src/hop_by_hop_e2e.rs::connection_nominated_headers_are_not_forwarded`.
 - HTTP/1 upstream requests are normalised: an upgrade handshake is
