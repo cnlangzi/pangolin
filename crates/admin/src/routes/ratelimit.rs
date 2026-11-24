@@ -292,15 +292,30 @@ pub async fn api_handle_delete_rule(
 }
 
 /// Read the IP rules and the site names (for the scope picker).
+///
+/// The two queries run on the blocking pool: they are synchronous
+/// SQLite calls, and a worker thread that runs one is a worker
+/// thread that is not proxying requests (issue #253).
 async fn load_rules_and_sites(app: &Arc<App>) -> (Vec<IpRule>, Vec<String>) {
-    let db = app.db.lock().await;
-    let rules = pangolin_core::db::list_ip_rules(&db).unwrap_or_default();
-    let site_names = pangolin_core::db::list_sites(&db)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-    (rules, site_names)
+    match app
+        .with_db(|db| {
+            (
+                pangolin_core::db::list_ip_rules(db).unwrap_or_default(),
+                pangolin_core::db::list_sites(db)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect(),
+            )
+        })
+        .await
+    {
+        Ok(found) => found,
+        Err(e) => {
+            log::warn!("ratelimit: the rules query failed: {e}");
+            (Vec::new(), Vec::new())
+        }
+    }
 }
 
 /// The natural key of a rule.

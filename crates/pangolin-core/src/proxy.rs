@@ -148,12 +148,18 @@ impl BackendTarget {
         matches!(self, BackendTarget::File { .. })
     }
 
-    /// `host:port` (or `0.0.0.0:0` for file backends, which never
-    /// dial). Caller can use this for logging / metrics.
+    /// `host:port` (or the document root for file backends, which never
+    /// dial). Caller can use this for logging / metrics — and for the
+    /// `Host` header of a `host_mode = Backend` request, so it has to
+    /// be the **authority** form.
+    ///
+    /// An IPv6 literal is bracketed: `parse_authority` strips the
+    /// brackets, so the host alone is `::1` — and `::1:8080` is not
+    /// an authority, it is an ambiguous mess (issue #253).
     pub fn authority(&self) -> String {
         match self {
             BackendTarget::Http { host, port, .. } | BackendTarget::Https { host, port, .. } => {
-                format!("{}:{}", host, port)
+                authority_of(host, *port)
             }
             BackendTarget::File { doc_root } => doc_root.display().to_string(),
         }
@@ -166,6 +172,19 @@ impl BackendTarget {
 }
 
 // ── parse_backend_to_target ───────────────────────────────────
+
+/// The `host:port` authority of a backend.
+///
+/// An IPv6 literal is bracketed (RFC 3986 §3.2.2): `::1` becomes
+/// `[::1]`, so the authority is `[::1]:8080` and not the ambiguous
+/// `::1:8080`.
+pub fn authority_of(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 /// Wrap [`parse_backend`] (which returns a flat `tun_name:url`
 /// pair) into a typed return.
@@ -279,91 +298,140 @@ pub fn apply_proxy_policy(request: &mut HttpRequest, ctx: &ProxyCtx) {
     apply_host_and_forwarded_headers(request, ctx);
 }
 
-/// Apply only Host rewrite and X-Forwarded-* headers, without
-/// stripping hop-by-hop headers. Used by ngx direct proxy path
-/// where pingora handles hop-by-hop headers automatically.
-pub fn apply_proxy_policy_without_hop_by_hop_stripping(request: &mut HttpRequest, ctx: &ProxyCtx) {
-    apply_host_and_forwarded_headers(request, ctx);
+/// The header rewrites the proxy policy asks for.
+///
+/// The **rules** live here; the caller applies them to its own
+/// header map. The upstream path used to materialise every request
+/// header into an owned `Vec<(String, String)>`, run the policy over
+/// it and write the result back — O(n²) time and O(n) allocations
+/// per request (issue #253). A policy value plus the caller's own
+/// header map keeps one home for the rules and no per-request copy.
+///
+/// A `None` field means "leave the header alone".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderPolicy {
+    /// The `Host` value the policy wants.
+    pub host: Option<String>,
+    /// The `X-Forwarded-For` value the policy wants.
+    pub forwarded_for: Option<String>,
+    /// The `X-Forwarded-Host` value the policy wants.
+    pub forwarded_host: Option<String>,
+    /// The `X-Forwarded-Proto` value the policy wants.
+    pub forwarded_proto: Option<String>,
+}
+
+impl HeaderPolicy {
+    /// The policy for one request.
+    ///
+    /// `backend_authority` is the backend's authority (`host:port`) —
+    /// the value `host_mode = Backend` puts into the `Host` header.
+    /// It is `None` on the paths that do not rewrite `Host` to the
+    /// backend: the `file://` path serves a local file, so the
+    /// client's `Host` is what the file server sees.
+    ///
+    /// `current_forwarded_for` is the `X-Forwarded-For` chain the
+    /// client sent, if any: the policy appends the hop to it. The
+    /// chain is left alone when it already ends with the hop — the
+    /// policy never adds the same address twice.
+    pub fn for_request(
+        ctx: &ProxyCtx,
+        backend_authority: Option<&str>,
+        current_forwarded_for: Option<&str>,
+    ) -> Self {
+        // 1. Host rewrite per host_mode. `Passthrough` is a no-op for
+        // Host (we leave whatever the client sent — the executor
+        // doesn't need to know about the rewrite in that case).
+        // `Backend` and `Custom` set the Host to a deterministic
+        // value. The executor still has the final say: when
+        // `host_mode == Backend`, the executor overwrites Host with
+        // the backend's actual authority (host:port), because the
+        // proxy context only carries `original_host`. When `Custom`,
+        // the executor copies the value the policy just set.
+        let host = match ctx.host_mode {
+            HostMode::Passthrough => None,
+            HostMode::Backend => backend_authority.map(str::to_string),
+            HostMode::Custom => Some(
+                ctx.host_custom
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| ctx.original_host.clone()),
+            ),
+        };
+
+        // 2. X-Forwarded-* — apply on EVERY host_mode (including
+        // Passthrough) so upstreams can always see the hop path.
+        // The headers are only meaningful when the client actually
+        // went through this proxy; for direct internal traffic
+        // (test fixtures), `ctx.peer_ip` is None and the chain
+        // degrades to "no X-Forwarded-For" — the other two
+        // (X-Forwarded-Proto, X-Forwarded-Host) are still set
+        // because they're cheap and useful.
+        //
+        // Only the TCP peer is appended: the resolved client IP
+        // travels in the `P-Client-Ip` header, never here. Two
+        // headers claiming to be the client IP is exactly the
+        // inconsistency the gateway-header contract removes.
+        let forwarded_for = match ctx.peer_ip.as_deref().filter(|s| !s.is_empty()) {
+            Some(ip) => match current_forwarded_for {
+                Some(existing) => {
+                    // Append only if the chain doesn't already end
+                    // with this IP (avoid duplicates if a buggy
+                    // upstream added us to the chain and re-emitted).
+                    let last = existing.rsplit(',').next().map(|s| s.trim()).unwrap_or("");
+                    if last == ip {
+                        None
+                    } else {
+                        Some(format!("{}, {}", existing, ip))
+                    }
+                }
+                None => Some(ip.to_string()),
+            },
+            None => None,
+        };
+
+        let forwarded_host = if ctx.original_host.is_empty() {
+            None
+        } else {
+            Some(ctx.original_host.clone())
+        };
+        let forwarded_proto = Some(
+            match ctx.original_scheme {
+                Scheme::Http => "http",
+                Scheme::Https => "https",
+            }
+            .to_string(),
+        );
+
+        Self {
+            host,
+            forwarded_for,
+            forwarded_host,
+            forwarded_proto,
+        }
+    }
 }
 
 fn apply_host_and_forwarded_headers(request: &mut HttpRequest, ctx: &ProxyCtx) {
-    // 1. Host rewrite per host_mode. `Passthrough` is a no-op for
-    // Host (we leave whatever the client sent — the executor
-    // doesn't need to know about the rewrite in that case).
-    // `Backend` and `Custom` set the Host to a deterministic
-    // value. The executor still has the final say: when
-    // `host_mode == Backend`, the executor will overwrite Host
-    // with the backend's actual authority (host:port) since the
-    // proxy_ctx only carries `original_host`. When `Custom`, the
-    // executor copies the value the policy just set.
-    match ctx.host_mode {
-        HostMode::Passthrough => {
-            // No-op for Host header.
-        }
-        HostMode::Backend => {
-            // We can't pick the backend authority here (it lives
-            // in BackendTarget, not in ProxyCtx). The executor
-            // does that. But we still want to add
-            // X-Forwarded-*; both Backend and Custom do that
-            // below.
-        }
-        HostMode::Custom => {
-            let value = ctx
-                .host_custom
-                .as_ref()
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .unwrap_or_else(|| ctx.original_host.clone());
-            upsert_header(&mut request.headers, "Host", &value);
-        }
-    }
-
-    // 2. X-Forwarded-* — apply on EVERY host_mode (including
-    // Passthrough) so upstreams can always see the hop path.
-    // The headers are only meaningful when the client actually
-    // went through this proxy; for direct internal traffic
-    // (test fixtures), `ctx.peer_ip` is None and the loop
-    // degrades to "no X-Forwarded-For" — the other two
-    // (X-Forwarded-Proto, X-Forwarded-Host) are still set
-    // because they're cheap and useful.
-    //
-    // Only the TCP peer is appended: the resolved client IP
-    // travels in the `P-Client-Ip` header, never here. Two
-    // headers claiming to be the client IP is exactly the
-    // inconsistency the gateway-header contract removes.
-    if let Some(ip) = ctx.peer_ip.as_deref().filter(|s| !s.is_empty()) {
-        append_xff_chain(&mut request.headers, ip);
-    }
-    if !ctx.original_host.is_empty() {
-        upsert_header(&mut request.headers, "X-Forwarded-Host", &ctx.original_host);
-    }
-    let proto = match ctx.original_scheme {
-        Scheme::Http => "http",
-        Scheme::Https => "https",
-    };
-    upsert_header(&mut request.headers, "X-Forwarded-Proto", proto);
-}
-
-/// Append `ip` to the existing `X-Forwarded-For` chain. If the
-/// header is absent, sets it to `ip` outright. Uses
-/// comma-separated values per RFC 7239 §5.2 / the de-facto
-/// `X-Forwarded-For` convention.
-fn append_xff_chain(headers: &mut Vec<(String, String)>, ip: &str) {
-    if let Some(slot) = headers
-        .iter_mut()
+    // The current `X-Forwarded-For` chain, if the client sent one.
+    let current_xff = request
+        .headers
+        .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("X-Forwarded-For"))
-    {
-        // Append only if the chain doesn't already end with
-        // this IP (avoid duplicates if a buggy upstream added
-        // us to the chain and re-emitted).
-        let existing = slot.1.clone();
-        let last = existing.rsplit(',').next().map(|s| s.trim()).unwrap_or("");
-        if last != ip {
-            slot.1 = format!("{}, {}", existing, ip);
-        }
-        return;
+        .map(|(_, v)| v.as_str());
+    let policy = HeaderPolicy::for_request(ctx, None, current_xff);
+    if let Some(host) = &policy.host {
+        upsert_header(&mut request.headers, "Host", host);
     }
-    headers.push(("X-Forwarded-For".to_string(), ip.to_string()));
+    if let Some(xff) = &policy.forwarded_for {
+        upsert_header(&mut request.headers, "X-Forwarded-For", xff);
+    }
+    if let Some(xfh) = &policy.forwarded_host {
+        upsert_header(&mut request.headers, "X-Forwarded-Host", xfh);
+    }
+    if let Some(xfp) = &policy.forwarded_proto {
+        upsert_header(&mut request.headers, "X-Forwarded-Proto", xfp);
+    }
 }
 
 /// Set or replace a header (case-insensitive name match).

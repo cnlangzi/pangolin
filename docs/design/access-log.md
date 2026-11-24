@@ -165,6 +165,13 @@ strings, but it no longer copies the `User-Agent` at all (issue #224
 reads it in place, and the access log copies it once, when it builds the
 entry).
 
+The entry takes **ownership** of the request's strings (issue #253):
+the method, the path, the host, the backend and the client IP are
+**moved** out of the per-request state into the entry, not copied into
+it. The traffic side-channel — which needs the same host and path —
+reads them from the entry afterwards, so a request that was logged
+copies neither.
+
 `AccessLogEntry` is ~200 bytes serialised in the typical case and
 ~4.2 KB in the worst one — a client that sends a `Referer` of nearly
 4 KiB, which the capture accepts up to the header limit. The defaults

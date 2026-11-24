@@ -176,6 +176,19 @@ impl L4Connect for TunnelConnector {
 /// lookup and the connect too.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The size of the buffer the tunnel bridge copies the bytes with.
+///
+/// The bridge is a **userspace** copy: the tunnel's bytes are read
+/// out of the tunnel stream and written into the loopback socket
+/// pingora talks to. The buffer is how much of that copy is in
+/// flight, so a bigger buffer means fewer read/write pairs per
+/// kilobyte (issue #253).
+///
+/// It is a constant rather than a configuration key on purpose: the
+/// configuration keys are a published contract, and a buffer size is
+/// not an operator's decision.
+const COPY_BUFFER_LEN: usize = 64 * 1024;
+
 /// Open a tunnel stream and run the `CONNECT` exchange on it.
 ///
 /// The tun answers `OK` or `ERR <reason>` before any request byte
@@ -341,7 +354,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; COPY_BUFFER_LEN];
     let outcome = loop {
         match reader.read(&mut buf).await {
             Ok(0) => break Ok(()),
@@ -360,6 +373,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    /// A reader that reports the buffer it was handed and then ends.
+    struct BufferProbe {
+        seen: usize,
+    }
+
+    impl AsyncRead for BufferProbe {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.seen = buf.remaining();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The tunnel bridge copies the bytes with a 64 KiB buffer
+    /// (issue #253).
+    ///
+    /// The bridge is a userspace copy, so the buffer size is how
+    /// much of it is in flight: a bigger buffer means fewer
+    /// read/write pairs per kilobyte. The reader sees the buffer it
+    /// was given, so the size is observable — not just a constant in
+    /// the source.
+    #[tokio::test]
+    async fn the_bridge_copies_with_a_64_kib_buffer() {
+        let mut probe = BufferProbe { seen: 0 };
+        let mut sink: Vec<u8> = Vec::new();
+        copy_half(&mut probe, &mut sink).await.unwrap();
+        assert_eq!(probe.seen, 64 * 1024);
+    }
 
     /// Two backends that differ only by host must not share a pooled
     /// connection — that is the whole point of the group key.

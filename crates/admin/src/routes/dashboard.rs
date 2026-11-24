@@ -31,16 +31,39 @@ fn ok_html(body: String) -> http::Result<Response<Full<Bytes>>> {
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Response<Full<Bytes>>> {
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
-    let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
-    let certs = pangolin_core::db::list_certs(&db).unwrap_or_default();
-    // Per-status counts for the new Certs card badges (issue #45). The
-    // helper returns every variant (zero-valued if absent), so the
-    // template doesn't have to special-case missing keys.
-    let cert_counts = pangolin_core::db::count_certs_by_status(&db).unwrap_or_default();
-    drop(db);
+    // The five queries run on the blocking pool: they are synchronous
+    // SQLite calls, and a worker thread that runs one is a worker
+    // thread that is not proxying requests (issue #253).
+    let (sites, domains, tuns, certs, cert_counts) = match app
+        .with_db(|db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_domains(db).unwrap_or_default(),
+                pangolin_core::db::list_tuns(db).unwrap_or_default(),
+                pangolin_core::db::list_certs(db).unwrap_or_default(),
+                // Per-status counts for the new Certs card badges
+                // (issue #45). The helper returns every variant
+                // (zero-valued if absent), so the template doesn't
+                // have to special-case missing keys.
+                pangolin_core::db::count_certs_by_status(db).unwrap_or_default(),
+            )
+        })
+        .await
+    {
+        Ok(found) => found,
+        Err(e) => {
+            // The closure panicked — the dashboard answers with empty
+            // counts rather than taking the admin down with it.
+            log::warn!("dashboard: the database query failed: {e}");
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )
+        }
+    };
 
     let online_tuns = tuns.iter().filter(|t| t.online).count();
     let cert_in_flight_count = cert_counts

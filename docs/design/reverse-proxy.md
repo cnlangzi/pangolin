@@ -132,6 +132,31 @@ opens a tunnel byte stream (see §4.5). An empty `tun_name` means
 direct — or `file://`, in which case the gateway serves the request
 itself through `serve_file_target` and it never leaves the machine.
 
+#### The backend address contract
+
+A backend's `host` is one of exactly two things (issue #253):
+
+| Form | Example | How the gateway reaches it |
+|---|---|---|
+| **IP literal** | `http://10.0.0.1:8080`, `http://[::1]:8080` | parsed into a `SocketAddr`; never resolved, never cached |
+| **DNS name** | `http://api.internal:8080` | resolved **once** by the `BackendResolver` and cached |
+
+Anything else — a name that only NSS (LDAP / SSSD / mDNS) can
+resolve — is not supported: the gateway resolves names with
+`hickory-resolver`, and it does not fall back to the system
+resolver.
+
+An IPv6 literal is written in the bracketed form (`[::1]:8080`) and
+keeps its address family all the way to the peer. The authority the
+gateway puts into the `Host` header is the bracketed form too
+(`[::1]:8080`) — `::1:8080` is not an authority.
+
+A **tunnelled** backend (`tun:http://host:port`) is not resolved by
+the gateway at all: the name belongs to the operator's own network
+and the tun resolves it there. The gateway's peer for a tunnel
+backend is `0.0.0.0:<port>` and the host travels in the `CONNECT`
+instruction (see §4.5).
+
 ### 4.2 `ProxyCtx` — per-request policy context
 
 ```rust
@@ -189,17 +214,29 @@ is left to the caller because only the caller has access to
 two-phase design keeps `ProxyCtx` lightweight and allows
 `apply_proxy_policy` to remain target-agnostic.
 
-Since issue #153 the only caller is the gateway, and it calls one of
-the two variants:
+The **rules** live in one place, `HeaderPolicy`
+(`crates/pangolin-core/src/proxy.rs`): `HeaderPolicy::for_request`
+answers "what should the `Host` header and the `X-Forwarded-*` family
+say?" and the caller applies the answer to its own header map. The
+two callers are:
 
-- `upstream_request_filter` in `crates/ngx/src/proxy.rs` runs
-  `apply_proxy_policy_without_hop_by_hop_stripping` for **every**
-  backend — direct or tunnelled — and completes the Host rewrite for
-  `Backend` mode inline. It leaves the hop-by-hop headers alone
-  because pingora strips them itself on the way upstream.
-- the `file://` direct branch calls `apply_proxy_policy`, the variant
-  that strips them too, because the gateway writes that response
-  itself.
+- `upstream_request_filter` in `crates/ngx/src/proxy.rs` applies the
+  policy **in place** to pingora's own header map, for **every**
+  backend — direct or tunnelled. It leaves the hop-by-hop headers
+  alone because pingora strips them itself on the way upstream. Only
+  the four headers the policy rewrites are touched; every other
+  header the client sent survives unchanged (issue #253).
+- the `file://` direct branch calls `apply_proxy_policy`, which
+  applies the same rules to the owned request it is about to serve
+  and strips the hop-by-hop headers too, because the gateway writes
+  that response itself.
+
+The upstream path used to materialise every header into an owned
+`Vec<(String, String)>`, run the policy over it and write the result
+back — an O(n²) scan and O(n) allocations per request, and a rewrite
+that blanked every header value that was not visible ASCII. The
+rewrite is now in place: the number of allocations does not depend on
+how many headers the client sent.
 
 The tun applies nothing: the bytes it forwards are the bytes the
 gateway wrote.
@@ -224,6 +261,40 @@ seam: it opens a tunnel stream, writes the `CONNECT <host>:<port>`
 instruction on it, and hands pingora the stream — bridged onto a
 loopback socket, so pingora identifies the connection by its file
 descriptor exactly as it does for a TCP backend.
+
+#### How a direct backend's address is produced (issue #253)
+
+The peer carries an **address**, never a name. pingora's
+`HttpPeer::new` resolves its argument eagerly, with
+`std::net::ToSocketAddrs` — a synchronous, blocking `getaddrinfo`
+for a name — and **panics** when the resolution fails. `upstream_peer`
+is a per-request hook, so handing it a name meant one DNS query per
+request, on a worker thread, and a crash instead of a 502 when the
+name did not resolve.
+
+The `BackendResolver` (`crates/ngx/src/backend_resolver.rs`) resolves
+the name instead:
+
+- the resolver is `hickory-resolver` 0.26, configured from the
+  system's `/etc/resolv.conf` — a backend is often an **internal**
+  name the public resolvers cannot answer;
+- the request path reads a **cache**: a name is resolved once and the
+  addresses are served from there until the record's TTL expires;
+- a cache miss resolves **once**: concurrent requests for the same
+  name wait for that one resolution instead of each starting their
+  own;
+- an **expired** entry is served as it is and refreshed in the
+  background (stale-while-revalidate): a slow nameserver never
+  delays a request. A refresh that fails keeps the old addresses and
+  logs one line — the first, then every hundredth;
+- a name that resolves to several addresses is walked on retry, so a
+  retry reaches the next address instead of the same dead one;
+- a name that does not resolve is an **error** — the client gets a
+  502 and the log names the host. It is never a panic;
+- an IP literal is parsed, never resolved and never cached.
+
+The gateway's request path therefore does **no** name resolution at
+all.
 
 **`file://` backends do not go through the upstream path** — the
 gateway serves the file itself and writes the response to the
@@ -355,6 +426,14 @@ response. For the upstream paths the policy is applied by
 tunnelled (issue #153). pingora owns the request-header buffer at that
 point, so that is where the `Host` rewrite and the `X-Forwarded-*`
 family belong.
+
+The routing decision is made **once**: `request_filter` resolves the
+site and parses the backend, and both travel with the request (in the
+per-request state) to `upstream_peer` and `upstream_request_filter`.
+Neither of them reads the routing index again — a second read could
+see a **newer** revision, so a request could be routed by one
+revision and sent to another (issue #253). See
+[routing-and-index.md](routing-and-index.md).
 
 The streaming detection (`is_streaming_header`) is **not** part of
 the routing. It runs in `request_filter`, but all it decides is the

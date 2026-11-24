@@ -33,7 +33,7 @@ pub async fn handle_create(
     let name = params.get("name").cloned().unwrap_or_default();
     // The provider of the global configuration — a site that overrides
     // nothing inherits it, and the origin guard needs an allowlist.
-    let global_provider = app.system_config.read().await.provider;
+    let global_provider = app.system_config.read().provider;
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function, so the
     // two surfaces can never drift apart.
@@ -182,7 +182,7 @@ pub async fn handle_update(
             .flatten()
             .map(|s| s.backend)
     };
-    let global_provider = app.system_config.read().await.provider;
+    let global_provider = app.system_config.read().provider;
     let parsed = match parse_site_form(
         &params,
         &name,

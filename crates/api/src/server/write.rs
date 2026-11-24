@@ -46,7 +46,7 @@ pub async fn create_site(ctx: &Ctx<'_>) -> ApiResponse {
         Err(e) => return ApiResponse::error(&e),
     };
     let name = dto.name.clone().unwrap_or_default();
-    let global_provider = ctx.state.app.system_config.read().await.provider;
+    let global_provider = ctx.state.app.system_config.read().provider;
     let params = dto.to_params();
     let parsed = match admin::routes::sites::helpers::parse_site_form(
         &params,
@@ -125,7 +125,7 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
             .ok()
             .flatten()
     };
-    let global_provider = ctx.state.app.system_config.read().await.provider;
+    let global_provider = ctx.state.app.system_config.read().provider;
     let params = dto.to_params();
     let parsed = match admin::routes::sites::helpers::parse_site_form(
         &params,
@@ -887,7 +887,7 @@ pub async fn put_system_config(ctx: &Ctx<'_>) -> ApiResponse {
         Ok(d) => d,
         Err(e) => return ApiResponse::error(&e),
     };
-    let current = ctx.state.app.system_config.read().await.clone();
+    let current = ctx.state.app.system_config.read().clone();
     let params = dto.to_params(&current);
     let body = encode_form(&params);
     let parsed = match admin::routes::system::parse_system_config_form_merged(

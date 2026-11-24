@@ -250,8 +250,8 @@ pub async fn get_site_origin_allow(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 
 /// `GET /api/v1/system_config`
 pub async fn get_system_config(ctx: &Ctx<'_>) -> ApiResponse {
-    let cfg = ctx.state.app.system_config.read().await.clone();
-    ApiResponse::json_of(200, &cfg)
+    let cfg = ctx.state.app.system_config.read().clone();
+    ApiResponse::json_of(200, &*cfg)
 }
 
 /// `GET /api/v1/badbots_config`

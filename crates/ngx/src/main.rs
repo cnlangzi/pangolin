@@ -19,6 +19,7 @@
 
 mod acme;
 mod api_service;
+mod backend_resolver;
 mod badbots_feed;
 mod check;
 mod dns;
@@ -379,7 +380,26 @@ fn run_pingora(app: Arc<App>, config: Config, shutdown: CancellationToken) -> an
     server.bootstrap();
 
     let conf = server.configuration.clone();
-    let app_proxy = AppProxy { app: app.clone() };
+    // The backend resolver: it turns a backend's name into the
+    // addresses the gateway dials, and it caches them so the request
+    // path never resolves a name (issue #253).
+    //
+    // A resolver that could not be built does not stop the gateway:
+    // backends addressed by an IP literal still work, and a backend
+    // addressed by a name answers 502 with the reason.
+    let resolver = match backend_resolver::BackendResolver::from_system_conf() {
+        Ok(resolver) => Arc::new(resolver),
+        Err(e) => {
+            log::error!("backend resolver: {e} — backends addressed by a name will not resolve");
+            Arc::new(backend_resolver::BackendResolver::new(Arc::new(
+                backend_resolver::UnavailableLookup::new(e.to_string()),
+            )))
+        }
+    };
+    let app_proxy = AppProxy {
+        app: app.clone(),
+        resolver,
+    };
     let app_http = AppHttp {
         app: app.clone(),
         sessions: Arc::new(::admin::state::SessionStore::default()),

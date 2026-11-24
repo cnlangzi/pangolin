@@ -2084,6 +2084,53 @@ mod tests {
         assert!(rules.insert("10.0.0.0/8").is_ok());
     }
 
+    /// A site with a thousand IP rules must not pay a thousand
+    /// comparisons per request (issue #253).
+    ///
+    /// `rule_match` consults the whitelist and the blacklist, so a
+    /// linear scan cost two thousand comparisons per request. The
+    /// rules are matched through a prefix tree now, which walks the
+    /// address bit by bit — the cost no longer depends on the number
+    /// of rules. The budget is the one the issue names: 1000 matches
+    /// in under 10 ms.
+    #[test]
+    fn a_thousand_ip_rules_are_matched_in_milliseconds() {
+        let mut wl = IpRules::new();
+        let mut bl = IpRules::new();
+        for i in 0..1000u32 {
+            wl.insert(&format!("10.{}.{}.0/24", i / 256, i % 256))
+                .unwrap();
+            bl.insert(&format!("192.168.{}.0/24", i % 256)).unwrap();
+        }
+        let cfg = SiteLimitConfig {
+            policy: RateLimitPolicy::default(),
+            whitelist: wl,
+            blacklist: bl,
+            ..Default::default()
+        };
+
+        let start = std::time::Instant::now();
+        let mut whitelist_hits = 0usize;
+        for i in 0..1000u32 {
+            if cfg.rule_match(ip(10, (i / 256) as u8, (i % 256) as u8, 7))
+                == Some(RuleKind::Whitelist)
+            {
+                whitelist_hits += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            whitelist_hits, 1000,
+            "every probe hits its own whitelist rule"
+        );
+        assert!(
+            elapsed.as_millis() < 10,
+            "1000 rule matches over 1000 rules took {elapsed:?} — the matching is \
+             not independent of the number of rules"
+        );
+    }
+
     #[test]
     fn request_limit_trips_after_n_requests() {
         let (limiter, cfg) = limiter_with(policy(2, 0));

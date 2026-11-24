@@ -151,6 +151,14 @@ has to distinguish an absent header from an empty one.
 With no authoritative client IP there is nothing to verify against,
 so the value is empty.
 
+The crawler is verified **once** per request (issue #253). The
+verification is the expensive part of the bot side channel — a
+User-Agent match plus an address-range scan — and the verdict is
+needed by three consumers: this header, the rate limiter's bot
+exemption and the bot log. The gateway computes it once, in
+`request_filter`, and the verdict travels with the request; the bot log
+does not verify it a second time.
+
 The registry id comes from the operator's own YAML, so it can be
 anything — including a string that is not a legal HTTP header value.
 The header is still written in that case, with an **empty** value and
