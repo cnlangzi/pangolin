@@ -20,7 +20,7 @@
 
 use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,7 +112,17 @@ impl EdgeCacheStorage {
     /// does not goes straight to the disk tier. Whatever the memory
     /// tier has to drop to stay inside its budget is spilled into the
     /// disk tier.
-    fn commit(&self, digest: u128, meta: &(Vec<u8>, Vec<u8>), body: &[u8]) -> Result<()> {
+    ///
+    /// The disk tier's write is **blocking I/O**, so it runs on the
+    /// blocking pool: a slow disk must not stall the pingora worker
+    /// that is serving the other requests. The memory tier's write is
+    /// a copy, and it stays on the request's thread.
+    async fn commit(
+        &'static self,
+        digest: u128,
+        meta: (Vec<u8>, Vec<u8>),
+        body: Vec<u8>,
+    ) -> Result<()> {
         let size = body.len();
         if size > self.max_object_size {
             // The engine refuses to hand us more than
@@ -121,13 +131,26 @@ impl EdgeCacheStorage {
         }
         if self.memory.accepts(size as u64) {
             let entry = Arc::new(MemoryEntry {
-                meta: RwLock::new(meta.clone()),
-                body: Arc::new(body.to_vec()),
+                meta: RwLock::new(meta),
+                body: Arc::new(body),
             });
-            self.spill(self.memory.insert(digest, entry));
+            let spilled = self.memory.insert(digest, entry);
+            self.spill(spilled).await;
         } else {
             let hex = key::digest_hex(digest);
-            self.disk.put(&hex, meta, body)?;
+            let disk = &self.disk;
+            let outcome = tokio::task::spawn_blocking(move || disk.put(&hex, &meta, &body)).await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    self.stats.record_error();
+                    return Error::e_explain(
+                        ErrorType::InternalError,
+                        format!("cache: the cache writer died: {e}"),
+                    );
+                }
+            }
         }
         self.stats.record_store();
         self.publish_usage();
@@ -136,18 +159,36 @@ impl EdgeCacheStorage {
 
     /// Write the objects the memory tier dropped into the disk tier.
     ///
+    /// The writes are blocking I/O, so they run on the blocking pool.
+    ///
     /// A disk that is full must not fail the request that triggered
     /// the spill: the entry is simply lost.
-    fn spill(&self, spilled: Vec<SpilledEntry>) {
-        for victim in spilled {
-            let hex = key::digest_hex(victim.digest);
-            match self.disk.put(&hex, &victim.meta, &victim.body) {
-                Ok(()) => self.stats.record_eviction(),
-                Err(e) => {
-                    self.stats.record_error();
-                    warn!("cache: cannot spill an entry to the disk tier: {e}");
+    async fn spill(&'static self, spilled: Vec<SpilledEntry>) {
+        if spilled.is_empty() {
+            return;
+        }
+        let disk = &self.disk;
+        let stats = self.stats.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for victim in spilled {
+                // An entry whose metadata cannot be read is dropped
+                // rather than spilled: the disk copy would be
+                // unreadable too.
+                let Some(meta) = victim.meta else { continue };
+                let hex = key::digest_hex(victim.digest);
+                match disk.put(&hex, &meta, &victim.body) {
+                    Ok(()) => stats.record_eviction(),
+                    Err(e) => {
+                        stats.record_error();
+                        warn!("cache: cannot spill an entry to the disk tier: {e}");
+                    }
                 }
             }
+        })
+        .await
+        {
+            self.stats.record_error();
+            warn!("cache: the cache writer died: {e}");
         }
     }
 }
@@ -168,7 +209,29 @@ impl Storage for EdgeCacheStorage {
             return Ok(Some((meta, Box::new(EdgeHitHandler::new(entry)))));
         }
 
-        if let Some((internal, header, body)) = self.disk.get(&key::digest_hex(digest)) {
+        // The disk tier's read is **blocking I/O**: it runs on the
+        // blocking pool, so a slow disk cannot stall the pingora
+        // worker that is serving the other requests.
+        //
+        // The index answers first: a key the tier does not hold costs
+        // nothing, and the common case — a miss in the memory tier
+        // and a miss in the disk tier — never leaves the request's
+        // thread.
+        let hex = key::digest_hex(digest);
+        if !self.disk.contains(&hex) {
+            self.stats.record_miss();
+            return Ok(None);
+        }
+        let disk = &self.disk;
+        let found = match tokio::task::spawn_blocking(move || disk.get(&hex)).await {
+            Ok(found) => found,
+            Err(e) => {
+                self.stats.record_error();
+                warn!("cache: the cache reader died: {e}");
+                None
+            }
+        };
+        if let Some((internal, header, body)) = found {
             match CacheMeta::deserialize(&internal, &header) {
                 Ok(meta) => {
                     // A disk hit warms the memory tier: the next read
@@ -178,7 +241,8 @@ impl Storage for EdgeCacheStorage {
                         body: Arc::new(body),
                     });
                     if self.memory.accepts(entry.body.len() as u64) {
-                        self.spill(self.memory.insert(digest, entry.clone()));
+                        let spilled = self.memory.insert(digest, entry.clone());
+                        self.spill(spilled).await;
                     }
                     self.stats.record_hit();
                     self.publish_usage();
@@ -403,11 +467,15 @@ impl MemoryTier {
                 continue;
             };
             if let Some((digest, entry, size)) = lru.pop_lru() {
+                // The metadata may be unreadable — a poisoned lock.
+                // The object is still evicted (the caller accounts for
+                // it either way); it just cannot be spilled to the
+                // disk tier, where it would be unreadable too.
                 let meta = entry.meta.read().ok().map(|guard| guard.clone());
                 return Some(SpilledEntry {
                     digest,
                     size,
-                    meta: meta?,
+                    meta,
                     body: entry.body.clone(),
                 });
             }
@@ -452,7 +520,9 @@ impl MemoryTier {
 struct SpilledEntry {
     digest: u128,
     size: u64,
-    meta: (Vec<u8>, Vec<u8>),
+    /// The serialized metadata, or `None` when it could not be read
+    /// (a poisoned lock) — such an object cannot be spilled.
+    meta: Option<(Vec<u8>, Vec<u8>)>,
     body: Arc<Vec<u8>>,
 }
 
@@ -560,13 +630,67 @@ struct DiskIndex {
     entries: HashMap<String, DiskEntry>,
     /// The eviction order: the largest file first, and the oldest
     /// within the same size.
-    order: BTreeMap<(Reverse<u64>, u64), String>,
+    ///
+    /// The digest is **part of the key**: two files of the same size
+    /// that were last used in the same instant would otherwise share
+    /// a key, and the second one would overwrite the first one's place
+    /// in the order — leaving that file impossible to evict, and the
+    /// tier free to grow past its budget.
+    order: BTreeSet<(Reverse<u64>, u64, String)>,
 }
 
 /// One file of the disk tier.
 struct DiskEntry {
     size: u64,
     last_used: u64,
+}
+
+impl DiskIndex {
+    /// Record a file, returning the entry it replaced.
+    fn insert(&mut self, digest: String, size: u64, last_used: u64) -> Option<DiskEntry> {
+        let replaced = self
+            .entries
+            .insert(digest.clone(), DiskEntry { size, last_used });
+        if let Some(old) = &replaced {
+            self.order
+                .remove(&(Reverse(old.size), old.last_used, digest.clone()));
+        }
+        self.order.insert((Reverse(size), last_used, digest));
+        replaced
+    }
+
+    /// Forget a file, returning what it was.
+    fn remove(&mut self, digest: &str) -> Option<DiskEntry> {
+        let old = self.entries.remove(digest)?;
+        self.order
+            .remove(&(Reverse(old.size), old.last_used, digest.to_string()));
+        Some(old)
+    }
+
+    /// Mark a file as used, so it is the last one evicted.
+    fn touch(&mut self, digest: &str, last_used: u64) {
+        let Some(entry) = self.entries.get(digest) else {
+            return;
+        };
+        let size = entry.size;
+        let old_used = entry.last_used;
+        self.order
+            .remove(&(Reverse(size), old_used, digest.to_string()));
+        if let Some(entry) = self.entries.get_mut(digest) {
+            entry.last_used = last_used;
+        }
+        self.order
+            .insert((Reverse(size), last_used, digest.to_string()));
+    }
+
+    /// The file that is evicted next: the largest, and the oldest
+    /// within the same size.
+    fn victim(&self) -> Option<&str> {
+        self.order
+            .iter()
+            .next()
+            .map(|(_, _, digest)| digest.as_str())
+    }
 }
 
 impl DiskTier {
@@ -606,6 +730,10 @@ impl DiskTier {
         let Ok(shards) = fs::read_dir(root) else {
             return;
         };
+        // One timestamp for the whole sweep: the files it finds were
+        // all there when the tier opened, and one stamp keeps the
+        // order's tie-break deterministic.
+        let opened = now_nanos();
         for shard in shards.flatten() {
             let path = shard.path();
             if path.is_dir() {
@@ -613,22 +741,25 @@ impl DiskTier {
                     continue;
                 };
                 for file in files.flatten() {
-                    self.take_account(&file.path(), &file.file_name().to_string_lossy());
+                    self.take_account(&file.path(), &file.file_name().to_string_lossy(), opened);
                 }
             } else {
-                self.take_account(&path, &shard.file_name().to_string_lossy());
+                // A file in the cache root is not an entry: the
+                // tier's files live in a shard directory, and this
+                // one could neither be read nor removed through
+                // `path_for`. The only thing worth doing with it is
+                // removing the leftover of a killed write.
+                self.remove_leftover(&path, &shard.file_name().to_string_lossy());
             }
         }
     }
 
     /// Take account of one file of the tier — or delete it when it is
     /// the leftover of a write that was killed.
-    fn take_account(&self, path: &Path, name: &str) {
+    fn take_account(&self, path: &Path, name: &str, opened: u64) {
         if name.ends_with(".tmp") {
             // A write that never reached its rename: not an entry.
-            if let Err(e) = fs::remove_file(path) {
-                debug!("cache: cannot remove the leftover {}: {e}", path.display());
-            }
+            self.remove_leftover(path, name);
             return;
         }
         let Some(digest) = name.strip_suffix(".bin") else {
@@ -638,7 +769,17 @@ impl DiskTier {
             return;
         }
         let Ok(meta) = fs::metadata(path) else { return };
-        self.index_entry(digest.to_string(), meta.len());
+        self.index_entry(digest.to_string(), meta.len(), opened);
+    }
+
+    /// Delete the leftover of a write that was killed.
+    fn remove_leftover(&self, path: &Path, name: &str) {
+        if !name.ends_with(".tmp") {
+            return;
+        }
+        if let Err(e) = fs::remove_file(path) {
+            debug!("cache: cannot remove the leftover {}: {e}", path.display());
+        }
     }
 
     /// The tier's occupancy in bytes.
@@ -661,24 +802,27 @@ impl DiskTier {
         self.index.write().ok()
     }
 
+    /// Whether the tier holds a file for this digest.
+    ///
+    /// The answer comes from the index, so a key the tier does not
+    /// hold costs no I/O — the caller can skip the disk read
+    /// entirely.
+    fn contains(&self, digest: &str) -> bool {
+        let Some(index) = self.read_index() else {
+            return false;
+        };
+        index.entries.contains_key(digest)
+    }
+
     /// Record a file in the index.
-    fn index_entry(&self, digest: String, size: u64) {
-        let now = now_secs();
+    fn index_entry(&self, digest: String, size: u64, last_used: u64) {
         let Some(mut index) = self.write_index() else {
             return;
         };
-        if let Some(old) = index.entries.insert(
-            digest.clone(),
-            DiskEntry {
-                size,
-                last_used: now,
-            },
-        ) {
-            index.order.remove(&(Reverse(old.size), old.last_used));
+        if let Some(old) = index.insert(digest, size, last_used) {
             self.bytes.fetch_sub(old.size, Ordering::Relaxed);
             self.entries.fetch_sub(1, Ordering::Relaxed);
         }
-        index.order.insert((Reverse(size), now), digest);
         self.bytes.fetch_add(size, Ordering::Relaxed);
         self.entries.fetch_add(1, Ordering::Relaxed);
     }
@@ -688,8 +832,7 @@ impl DiskTier {
         let Some(mut index) = self.write_index() else {
             return;
         };
-        if let Some(old) = index.entries.remove(digest) {
-            index.order.remove(&(Reverse(old.size), old.last_used));
+        if let Some(old) = index.remove(digest) {
             self.bytes.fetch_sub(old.size, Ordering::Relaxed);
             self.entries.fetch_sub(1, Ordering::Relaxed);
         }
@@ -700,18 +843,7 @@ impl DiskTier {
         let Some(mut index) = self.write_index() else {
             return;
         };
-        let Some(entry) = index.entries.get(digest) else {
-            return;
-        };
-        let size = entry.size;
-        let old = (Reverse(size), entry.last_used);
-        index.order.remove(&old);
-        if let Some(entry) = index.entries.get_mut(digest) {
-            entry.last_used = now_secs();
-        }
-        index
-            .order
-            .insert((Reverse(size), now_secs()), digest.to_string());
+        index.touch(digest, now_nanos());
     }
 
     /// Read an entry.
@@ -786,7 +918,7 @@ impl DiskTier {
                 format!("cache: cannot publish {}: {e}", target.display()),
             );
         }
-        self.index_entry(digest.to_string(), written);
+        self.index_entry(digest.to_string(), written, now_nanos());
         self.enforce_budget();
         Ok(())
     }
@@ -820,7 +952,7 @@ impl DiskTier {
                 let Some(index) = self.read_index() else {
                     break;
                 };
-                index.order.values().next().cloned()
+                index.victim().map(|digest| digest.to_string())
             };
             let Some(victim) = victim else { break };
             self.remove(&victim);
@@ -853,11 +985,16 @@ fn is_digest(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// The current time in seconds since the epoch.
-fn now_secs() -> u64 {
+/// The current time in nanoseconds since the epoch.
+///
+/// The disk tier's eviction order breaks a tie between two files of
+/// the same size by when they were last used, and a second is too
+/// coarse for that: two files written in the same second would share
+/// a place in the order.
+fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -965,7 +1102,9 @@ impl HandleMiss for EdgeMissHandler {
         let size = self.body.len();
         // A failed write is reported, but it never fails the request:
         // the response has already been sent to the client.
-        self.storage.commit(self.digest, &self.meta, &self.body)?;
+        self.storage
+            .commit(self.digest, self.meta, self.body)
+            .await?;
         Ok(MissFinishType::Created(size))
     }
 }
@@ -1299,6 +1438,50 @@ mod tests {
             storage.lookup(&big, &span).await.expect("lookup").is_none(),
             "the big file must be the one that is dropped"
         );
+    }
+
+    /// Two files of the same size, indexed in the same instant, keep
+    /// two places in the eviction order.
+    ///
+    /// The order's key used to be the size and the last-used time
+    /// alone, so the second file overwrote the first one's place —
+    /// and the first file became impossible to evict, which let the
+    /// disk tier grow past its budget without end.
+    #[test]
+    fn two_files_of_the_same_size_keep_two_places_in_the_order() {
+        let mut index = DiskIndex::default();
+        index.insert("aaaa".into(), 100, 1_000);
+        index.insert("bbbb".into(), 100, 1_000);
+        assert_eq!(index.order.len(), 2, "both files must be in the order");
+        let mut victims: Vec<&str> = index
+            .order
+            .iter()
+            .map(|(_, _, digest)| digest.as_str())
+            .collect();
+        victims.sort_unstable();
+        assert_eq!(victims, vec!["aaaa", "bbbb"]);
+    }
+
+    /// A tier whose budget fits neither file empties itself.
+    ///
+    /// It cannot do that when one of the files is missing from the
+    /// eviction order — the file stays on the disk and its bytes stay
+    /// counted, so the tier never gets inside its budget again.
+    #[tokio::test]
+    async fn the_disk_tier_evicts_two_files_of_the_same_size() {
+        let dir = TempDir::new().expect("tempdir");
+        let first = test_key("/a.css");
+        let second = test_key("/b.css");
+        {
+            // Two files of the same size, written into the tier.
+            let storage = storage(dir.path(), 1024 * 1024, 1024 * 1024, 1024 * 1024, 1);
+            store(storage, &first, &[b'x'; 64]).await;
+            store(storage, &second, &[b'x'; 64]).await;
+        }
+        // A tier whose budget fits neither file must empty itself.
+        let storage = storage(dir.path(), 1024 * 1024, 1, 1024 * 1024, 1);
+        let (_bytes, entries) = storage.disk_usage();
+        assert_eq!(entries, 0, "the tier must evict every file it cannot hold");
     }
 
     #[tokio::test]

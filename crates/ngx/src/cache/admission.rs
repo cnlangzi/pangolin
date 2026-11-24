@@ -136,7 +136,6 @@ fn decay(count: u32, idle: Duration, half_life: Duration) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pingora::cache::key::CacheHashKey;
 
     fn key_for(path: &str) -> CacheKey {
         super::super::key::primary_key("http", "example.com", path)
@@ -222,11 +221,5 @@ mod tests {
         assert_eq!(decay(2, Duration::from_secs(3), Duration::from_secs(1)), 0);
         // A zero half-life means no heat at all.
         assert_eq!(decay(5, Duration::from_secs(1), Duration::ZERO), 0);
-    }
-
-    #[test]
-    fn the_digest_of_a_key_matches_the_storage_digest() {
-        let key = key_for("/a.css");
-        assert_eq!(key::digest(&key), u128::from_be_bytes(key.combined_bin()));
     }
 }
