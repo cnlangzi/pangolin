@@ -22,6 +22,11 @@
 //! 0.26 — asynchronous, so a resolution never blocks a worker thread —
 //! configured from the system's `/etc/resolv.conf`, because a backend
 //! is often an **internal** name the public resolvers cannot answer.
+//!
+//! The resolver reads `/etc/hosts` **once**, when it is built, and
+//! consults it for every lookup. A name added to the hosts file while
+//! the gateway runs is therefore not resolved until the gateway
+//! restarts — the old `getaddrinfo` path re-read the file per lookup.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -71,7 +76,10 @@ pub struct ResolvedBackend {
 }
 
 /// Why a backend's address could not be produced.
-#[derive(Debug, thiserror::Error)]
+///
+/// Cloneable so that the **result** of one resolution attempt can be
+/// handed to everyone who waited for it — a failure included.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     /// The name has no address record.
     #[error("backend host {host} has no address record")]
@@ -184,6 +192,13 @@ impl BackendLookup for UnavailableLookup {
     }
 }
 
+/// The result of one resolution attempt.
+///
+/// Shared by everyone who waited for that attempt: a **failure** is
+/// shared too, so a backend that does not resolve does not make every
+/// waiter pay the resolver's timeout in turn (issue #253).
+type AttemptResult = Result<Arc<ResolvedBackend>, ResolveError>;
+
 /// Resolves backend host names to the socket addresses the gateway
 /// dials.
 ///
@@ -196,13 +211,19 @@ pub struct BackendResolver {
     lookup: Arc<dyn BackendLookup>,
     /// The cached addresses, per backend.
     cache: std::sync::RwLock<HashMap<BackendKey, Arc<ResolvedBackend>>>,
-    /// The per-host lock that makes the first resolution of a host
-    /// single-flight.
+    /// The resolution attempt in flight per host — the single-flight
+    /// seam.
     ///
-    /// One entry per host that was ever looked up; the map is bounded
+    /// The **sender** is held here so that a request that arrives
+    /// while an attempt runs joins that attempt instead of starting
+    /// its own: one resolution, one answer, one failure — shared by
+    /// everyone who waited for it.
+    ///
+    /// One entry per host that is being resolved; the map is bounded
     /// by the number of distinct backends, which is bounded by the
     /// number of sites.
-    inflight: std::sync::Mutex<HashMap<BackendKey, Arc<tokio::sync::Mutex<()>>>>,
+    inflight:
+        std::sync::Mutex<HashMap<BackendKey, tokio::sync::watch::Sender<Option<AttemptResult>>>>,
     /// How many background refreshes failed — the counter that keeps
     /// the warning at a bounded rate.
     refresh_failures: std::sync::Mutex<u64>,
@@ -274,18 +295,76 @@ impl BackendResolver {
             self.refresh_in_background(key);
             return Ok(stale);
         }
-        // Single-flight: the first request for a host resolves it, the
-        // others wait for that resolution and then read the cache.
-        let lock = self.lock_for(key);
-        let _guard = lock.lock().await;
-        // Another request may have filled the cache while this one
-        // waited for the lock.
-        if let Some(fresh) = self.fresh(key) {
-            return Ok(fresh);
+        // Single-flight: the first request for a host resolves it and
+        // the others **join that attempt** — one resolution, one
+        // answer. A failure is shared too: a backend that does not
+        // resolve must not make every waiter pay the resolver's
+        // timeout in turn.
+        let (leader, sender, mut receiver) = self.join_attempt(key);
+        if !leader {
+            // Wait for the attempt's result.
+            let _ = receiver.wait_for(|result| result.is_some()).await;
+            return match receiver.borrow().clone() {
+                Some(result) => result,
+                // The attempt died without publishing a result — a
+                // panic in the lookup. The waiter answers with an
+                // error rather than panicking itself.
+                None => Err(ResolveError::Failed {
+                    host: key.host.clone(),
+                    reason: "the resolution attempt did not complete".to_string(),
+                }),
+            };
         }
-        let resolved = self.resolve_now(key).await?;
-        self.store(key, resolved.clone());
-        Ok(resolved)
+        // The leader resolves, publishes the answer to the waiters
+        // and retires the attempt: the next request starts a fresh
+        // one, so a name that starts resolving is picked up without a
+        // restart.
+        let result = self.resolve_now(key).await;
+        let _ = sender.send(Some(result.clone()));
+        self.retire_attempt(key);
+        if let Ok(resolved) = &result {
+            self.store(key, resolved.clone());
+        }
+        result
+    }
+
+    /// Join the resolution attempt in flight for a backend, or start
+    /// one.
+    ///
+    /// Returns `(is_leader, sender, receiver)`: the leader resolves
+    /// and publishes, the others wait for what it publishes.
+    fn join_attempt(
+        &self,
+        key: &BackendKey,
+    ) -> (
+        bool,
+        tokio::sync::watch::Sender<Option<AttemptResult>>,
+        tokio::sync::watch::Receiver<Option<AttemptResult>>,
+    ) {
+        let mut inflight = match self.inflight.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock must not take the gateway down: the map
+            // is a registry of attempts, and a fresh one does the job.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(sender) = inflight.get(key) {
+            return (false, sender.clone(), sender.subscribe());
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        inflight.insert(key.clone(), sender.clone());
+        (true, sender, receiver)
+    }
+
+    /// Retire the attempt in flight for a backend.
+    ///
+    /// The attempt is retired once it published its result: the next
+    /// request starts a fresh one.
+    fn retire_attempt(&self, key: &BackendKey) {
+        let mut inflight = match self.inflight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inflight.remove(key);
     }
 
     /// Resolve a backend now.
@@ -328,18 +407,21 @@ impl BackendResolver {
         let this = self.clone();
         let key = key.clone();
         handle.spawn(async move {
-            let lock = this.lock_for(&key);
-            // Another refresh is already running — nothing to do.
-            let Ok(_guard) = lock.try_lock() else {
-                return;
-            };
-            // The entry was refreshed while we waited for the lock.
-            if this.fresh(&key).is_some() {
+            // Join the attempt in flight: a refresh that is already
+            // running answers this one.
+            let (leader, sender, mut receiver) = this.join_attempt(&key);
+            if !leader {
+                let _ = receiver.wait_for(|result| result.is_some()).await;
                 return;
             }
-            match this.resolve_now(&key).await {
+            let result = this.resolve_now(&key).await;
+            let _ = sender.send(Some(result.clone()));
+            this.retire_attempt(&key);
+            match result {
                 Ok(resolved) => this.store(&key, resolved),
                 Err(e) => {
+                    // The stale addresses stay in force; the failure
+                    // is logged at a bounded rate.
                     if this.record_refresh_failure() {
                         log::warn!("backend resolver: {} could not be refreshed: {e}", key.host);
                     }
@@ -394,20 +476,6 @@ impl BackendResolver {
             stale.valid_until = Instant::now() - Duration::from_secs(1);
             cache.insert(key.clone(), Arc::new(stale));
         }
-    }
-
-    /// The lock that serializes the first resolution of a backend.
-    fn lock_for(&self, key: &BackendKey) -> Arc<tokio::sync::Mutex<()>> {
-        let mut inflight = match self.inflight.lock() {
-            Ok(guard) => guard,
-            // A poisoned lock must not take the gateway down: the map
-            // is a cache of locks, and a fresh one does the job.
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        inflight
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
     }
 }
 
@@ -578,6 +646,50 @@ mod tests {
             lookup.calls(),
             2,
             "the stale entry must be refreshed in the background"
+        );
+    }
+
+    /// A failure is **shared** with everyone who waited for the
+    /// attempt (issue #253).
+    ///
+    /// The waiters must not each resolve the name again: a backend
+    /// that does not resolve would make every concurrent request pay
+    /// the resolver's timeout in turn, so the tail of a burst waited
+    /// N times as long as the first request.
+    #[tokio::test]
+    async fn a_failure_is_shared_with_every_waiter() {
+        /// A lookup that counts its calls, waits a little and fails.
+        struct SlowFailure {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl BackendLookup for SlowFailure {
+            async fn lookup(&self, _host: &str) -> Result<(Vec<IpAddr>, Duration), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err("NXDOMAIN".to_string())
+            }
+        }
+
+        let lookup = Arc::new(SlowFailure {
+            calls: AtomicUsize::new(0),
+        });
+        let resolver = Arc::new(BackendResolver::new(lookup.clone()));
+
+        // Ten concurrent requests for a backend that does not resolve.
+        let requests: Vec<_> = (0..10)
+            .map(|_| resolver.address("api.internal", 80, 0))
+            .collect();
+        let results = futures_util::future::join_all(requests).await;
+
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every request must fail"
+        );
+        assert_eq!(
+            lookup.calls.load(Ordering::SeqCst),
+            1,
+            "the waiters must share the one attempt, not each resolve again"
         );
     }
 

@@ -146,6 +146,14 @@ resolve — is not supported: the gateway resolves names with
 `hickory-resolver`, and it does not fall back to the system
 resolver.
 
+The resolver reads **`/etc/hosts` once**, when it is built, and
+consults it for every lookup. A name that is added to the hosts file
+while the gateway runs is therefore not resolved until the gateway
+restarts — the old `getaddrinfo` path re-read the file per lookup.
+(The hosts file is read at all: hickory's default
+`ResolveHosts::Auto` loads it.) A backend whose name must change
+without a restart belongs in DNS, not in the hosts file.
+
 An IPv6 literal is written in the bracketed form (`[::1]:8080`) and
 keeps its address family all the way to the peer. The authority the
 gateway puts into the `Host` header is the bracketed form too
