@@ -180,7 +180,7 @@ pub async fn handle_create(
             log::warn!("domains: the form could not be parsed: {e}");
             return render_create_page_with_error(
                 app,
-                "the form could not be checked",
+                &lang.t("domains.error.form_check_failed"),
                 csrf,
                 None,
                 lang,
@@ -317,7 +317,7 @@ pub async fn handle_update(
             return render_edit_page_with_error(
                 app,
                 &domain_pk,
-                "the form could not be checked",
+                &lang.t("domains.error.form_check_failed"),
                 csrf,
                 &existing,
                 lang,
