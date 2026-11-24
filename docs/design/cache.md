@@ -216,6 +216,20 @@ and the digest is derived from the cache key alone: no user input
 reaches a path, so there is no path-traversal surface. A file holds
 the two metadata lengths, the metadata and the body.
 
+**The disk tier's I/O runs on the blocking pool.** The cache is a
+data-plane component — it takes part in the forwarding decision — so
+a slow disk must not stall the pingora worker that is serving the
+other requests. The memory tier's write is a copy and stays on the
+request's thread; the disk tier's read and write go to the blocking
+pool. A key the disk tier does not hold is answered from the index,
+so the common case — a miss in both tiers — never leaves the
+request's thread.
+
+A revalidation rewrites the whole file, metadata and body: the
+metadata's length can change, and a rewrite is simpler than a
+partial one. The amplification is bounded by `max_object_size` and
+the revalidation happens once per freshness window per key.
+
 ### Atomicity and self-healing
 
 - A write goes to a temporary file that is **renamed** into place. A
@@ -240,6 +254,10 @@ A response the cache had a hand in carries:
 The `X-Cache` header is written **only** for the requests the cache
 was wired up for, so the responses the cache never saw stay
 untouched.
+
+The **access log** carries the same fact as `cache_hit` — the
+operator sees which requests the cache answered, not just the client
+that asked. See [access-log.md](./access-log.md).
 
 The counters behind `crates/ngx/src/cache/stats.rs` (hits, misses,
 stores, deferrals, errors, evictions and the two tiers' occupancy)

@@ -131,6 +131,7 @@ uid                      Pangolin Archive Key <noreply@github.com>
 | `/var/log/pangolin/bots/` | 0750 pangolin:pangolin | 爬虫日志 JSONL |
 | `/var/log/pangolin/referers/` | 0750 pangolin:pangolin | 引荐日志 JSONL |
 | `/var/cache/pangolin/bots/` | 0750 pangolin:pangolin | knownbots 的地址列表缓存 |
+| `/var/cache/pangolin/cache/` | 0750 pangolin:pangolin | 边缘缓存的磁盘层（静态资源缓存，见 [design/cache.md](design/cache.md)） |
 | `/etc/tmpfiles.d/pangolin.conf` | 0644 root:root | 30 天保留期，清理旧 JSONL |
 
 隧道节点的运行期目录是 `/var/lib/pangolin-tun/`（TOFU 指纹和 QUIC 失败记录）。隧道节点不落盘日志 —— 日志走 stderr 进 journald，所以没有 tmpfiles 规则。
