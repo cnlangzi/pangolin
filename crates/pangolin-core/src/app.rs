@@ -869,6 +869,47 @@ impl App {
         .await
     }
 
+    /// Like [`App::with_db`], but the query cannot fail: a panic in
+    /// the closure is logged and the caller gets the **default**
+    /// value instead.
+    ///
+    /// For the read paths whose pre-migration behaviour was
+    /// `unwrap_or_default()` — the caller never saw a database error,
+    /// so it must not start seeing one now. The panic is still
+    /// reported, because a query that panics is a bug and not a
+    /// missing row.
+    pub async fn with_db_or<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&Connection) -> R + Send + 'static,
+        R: Send + 'static + Default,
+    {
+        match self.with_db(f).await {
+            Ok(value) => value,
+            Err(e) => {
+                log::warn!("database: the query panicked: {e}");
+                R::default()
+            }
+        }
+    }
+
+    /// Like [`App::with_db`], but the query reports its own failure:
+    /// the closure returns a [`rusqlite::Result`] and a panic in the
+    /// closure is reported as a database error too.
+    ///
+    /// For the write paths, where "the row was not written" has to
+    /// reach the operator instead of being swallowed. The query's own
+    /// error keeps its text — see [`crate::DbError`].
+    pub async fn with_db_res<R, F>(&self, f: F) -> Result<R, crate::DbError>
+    where
+        F: FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        match self.with_db(f).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Install the [`CertRetrier`] bridge once the ACME pipeline is built.
     /// Called from `ngx::main` after `AcmeState::empty()` produces the
     /// concrete retrier. Idempotent — re-installing replaces the prior
@@ -889,10 +930,10 @@ impl App {
     /// the handle under a read lock, so a request that is in flight
     /// keeps the instance it started with.
     pub async fn rebuild_badbots(&self) {
-        let library = {
-            let conn = self.db.lock().await;
-            build_badbots(&conn)
-        };
+        // The query runs on the blocking pool: a worker thread that
+        // runs it is a worker thread that is not proxying requests
+        // (issue #254).
+        let library = self.with_db_or(build_badbots).await;
         *self.badbots.write() = library;
     }
 
@@ -901,8 +942,9 @@ impl App {
     /// Read from the `badbots_config` singleton row — the settings
     /// live in the database, not in `ngx.yml`.
     pub async fn badbots_settings(&self) -> crate::Result<crate::BadbotsSettings> {
-        let conn = self.db.lock().await;
-        crate::db::get_badbots_config(&conn).map_err(Into::into)
+        self.with_db_res(crate::db::get_badbots_config)
+            .await
+            .map_err(Into::into)
     }
 
     /// Reload indexes from DB. Called after every admin write operation.
@@ -920,52 +962,94 @@ impl App {
         // database read fails. Cloned before the DB lock is taken so
         // the two locks are never held at the same time.
         let previous_system_config = self.system_config.read().clone();
-        let conn = self.db.lock().await;
-        let sites = db::list_sites(&conn).unwrap_or_default();
-        let domains = db::list_domains(&conn).unwrap_or_default();
-        let providers = db::list_dns_providers(&conn).unwrap_or_default();
-        // Issue #117: reload the per-site rate limits + IP rules with
-        // the routing table.
-        let policies = db::list_site_rate_limits(&conn).unwrap_or_default();
-        let rules = db::list_ip_rules(&conn).unwrap_or_default();
-        // Issue #131: the per-site bot lists travel with the routing
-        // table, so a site's list is always resolved against the same
-        // revision as its routing entry.
-        let bot_limits = db::list_site_rate_limit_bots(&conn).unwrap_or_default();
-        // Issue #122: the per-site provider overrides and the manual
-        // allow ranges travel with the routing table, so a site's
-        // effective provider is always resolved against the same
-        // revision as its routing entry.
-        let site_providers = db::list_site_providers(&conn).unwrap_or_default();
-        let site_ranges = db::list_site_origin_allow(&conn).unwrap_or_default();
-        // The global defaults come from `system_config`; they are
-        // read **before** the index build so the effective provider of
-        // every site is resolved against the current global value.
-        let system_config = match db::get_system_config(&conn) {
-            Ok(c) => c,
-            Err(rusqlite::Error::QueryReturnedNoRows) => default_system_config(),
+        let fallback_system_config = (*previous_system_config).clone();
+        // The cache clone shares its backing table with
+        // `self.cert_links`, so the rebuild below publishes into the
+        // table the SNI callback reads.
+        let cert_links = self.cert_links.clone();
+        // Every read runs on the blocking pool, under one lock, so
+        // the revision is built from a single view of the database
+        // (issue #254).
+        let loaded = self
+            .with_db(move |conn| {
+                let sites = db::list_sites(conn).unwrap_or_default();
+                let domains = db::list_domains(conn).unwrap_or_default();
+                let providers = db::list_dns_providers(conn).unwrap_or_default();
+                // Issue #117: reload the per-site rate limits + IP rules with
+                // the routing table.
+                let policies = db::list_site_rate_limits(conn).unwrap_or_default();
+                let rules = db::list_ip_rules(conn).unwrap_or_default();
+                // Issue #131: the per-site bot lists travel with the routing
+                // table, so a site's list is always resolved against the same
+                // revision as its routing entry.
+                let bot_limits = db::list_site_rate_limit_bots(conn).unwrap_or_default();
+                // Issue #122: the per-site provider overrides and the manual
+                // allow ranges travel with the routing table, so a site's
+                // effective provider is always resolved against the same
+                // revision as its routing entry.
+                let site_providers = db::list_site_providers(conn).unwrap_or_default();
+                let site_ranges = db::list_site_origin_allow(conn).unwrap_or_default();
+                // The global defaults come from `system_config`; they are
+                // read **before** the index build so the effective provider of
+                // every site is resolved against the current global value.
+                let system_config = match db::get_system_config(conn) {
+                    Ok(c) => c,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => default_system_config(),
+                    Err(e) => {
+                        // A transient DB error: the in-memory value is left
+                        // untouched — same policy as before the provider
+                        // change. The operator can recover by POSTing
+                        // /api/system/config (which calls
+                        // update_system_config + this reload again).
+                        log::warn!("system_config: reload from DB failed: {e}");
+                        fallback_system_config
+                    }
+                };
+                let global_provider = GlobalProviderConfig::from_system_config(&system_config);
+                let indexes = Indexes::build_with_providers(
+                    sites,
+                    domains.clone(),
+                    &policies,
+                    &rules,
+                    &bot_limits,
+                    &site_providers,
+                    &site_ranges,
+                    &global_provider,
+                );
+                let dns_index = DnsIndex::build(&providers, &domains);
+                // Rebuild cert_links (fix/cert_www). The rebuild builds a new
+                // table and publishes it under one write lock, so a handshake
+                // sees either the whole old table or the whole new one —
+                // never an empty or half-filled one (issue #213).
+                //
+                // Best-effort: if the rebuild fails (e.g. a transient DB
+                // error), it returns before the swap, so the live table keeps
+                // every link it already had. We log the error and carry on;
+                // the cache is a derived view and catches up on the next
+                // reload.
+                if let Err(e) = cert_links.reload_from_db(conn) {
+                    log::warn!("cert_links: reload from DB failed: {}", e);
+                }
+                // Issue #141: rebuild the reputation library. The admin POST
+                // rebuilds it right after it writes the row; this is the
+                // out-of-band recovery path — an operator who edited the
+                // `badbots_config` row with `sqlite3` gets the change with a
+                // `POST /api/reload`, like every other index-derived state.
+                let badbots = build_badbots(conn);
+                (indexes, dns_index, system_config, badbots)
+            })
+            .await;
+        let (indexes, dns_index, system_config, badbots) = match loaded {
+            Ok(loaded) => loaded,
             Err(e) => {
-                // A transient DB error: the in-memory value is left
-                // untouched — same policy as before the provider
-                // change. The operator can recover by POSTing
-                // /api/system/config (which calls
-                // update_system_config + this reload again).
-                log::warn!("system_config: reload from DB failed: {e}");
-                (*previous_system_config).clone()
+                // The query panicked: the previous revision stays in
+                // force. A panic in a read is a bug, and the gateway
+                // keeps serving with the revision it already has
+                // (invariant 6: failures stay local).
+                log::warn!("reload_indexes: the database read panicked: {e}");
+                return;
             }
         };
-        let global_provider = GlobalProviderConfig::from_system_config(&system_config);
-        let indexes = Indexes::build_with_providers(
-            sites,
-            domains.clone(),
-            &policies,
-            &rules,
-            &bot_limits,
-            &site_providers,
-            &site_ranges,
-            &global_provider,
-        );
-        let dns_index = DnsIndex::build(&providers, &domains);
         // Reconfigure the rate limiter *before* the new index becomes
         // visible: the runtime state (rings, penalty box) must exist
         // by the time a request sees the new policy.
@@ -990,26 +1074,6 @@ impl App {
         // (before the index build) so the effective provider of every
         // site could be resolved against it.
         *self.system_config.write() = Arc::new(system_config);
-        // Rebuild cert_links (fix/cert_www). The rebuild builds a new
-        // table and publishes it under one write lock, so a handshake
-        // sees either the whole old table or the whole new one —
-        // never an empty or half-filled one (issue #213).
-        //
-        // Best-effort: if the rebuild fails (e.g. a transient DB
-        // error), it returns before the swap, so the live table keeps
-        // every link it already had. We log the error and carry on;
-        // the cache is a derived view and catches up on the next
-        // reload.
-        if let Err(e) = self.cert_links.reload_from_db(&conn) {
-            log::warn!("cert_links: reload from DB failed: {}", e);
-        }
-        // Issue #141: rebuild the reputation library. The admin POST
-        // rebuilds it right after it writes the row; this is the
-        // out-of-band recovery path — an operator who edited the
-        // `badbots_config` row with `sqlite3` gets the change with a
-        // `POST /api/reload`, like every other index-derived state.
-        let badbots = build_badbots(&conn);
-        drop(conn);
         *self.badbots.write() = badbots;
         // Wake the AcmeState loop (if any) so it re-reads dns_providers.
         self.dns_change_notify.notify_one();
@@ -2353,6 +2417,65 @@ mod tests {
         );
 
         // The query really saw the database.
+        let sites = app
+            .with_db(|db| crate::db::list_sites(db).unwrap_or_default())
+            .await
+            .expect("the query ran");
+        assert!(sites.is_empty(), "a fresh database has no sites");
+    }
+
+    /// The two wrappers the routes use run their query off the worker
+    /// thread too (issue #254).
+    ///
+    /// `with_db_or` answers a read whose failure the caller never
+    /// sees, `with_db_res` answers a write whose failure the caller
+    /// has to see. Both move the query onto the blocking pool — a
+    /// query that ran on a worker would still borrow a worker thread
+    /// from the pool that proxies requests.
+    #[tokio::test]
+    async fn the_fallback_wrappers_run_the_query_off_the_worker_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let app = App::new(&db_path, make_log_config(50, 16), CertManager::default()).unwrap();
+
+        let worker = std::thread::current().id();
+        let read_thread = app.with_db_or(|_| Some(std::thread::current().id())).await;
+        assert_ne!(
+            read_thread,
+            Some(worker),
+            "the read must not run on the async worker thread"
+        );
+
+        let write_thread = app
+            .with_db_res(|_| Ok(std::thread::current().id()))
+            .await
+            .expect("the write ran");
+        assert_ne!(
+            write_thread, worker,
+            "the write must not run on the async worker thread"
+        );
+    }
+
+    /// A panicking query leaves the connection usable (issue #254).
+    ///
+    /// The query runs on the blocking pool, where the panic is
+    /// caught: the caller is told the query failed and the request
+    /// carries on, instead of the panic unwinding the request's own
+    /// task. The connection is handed back either way — the lock is
+    /// a `tokio::sync::Mutex`, which has no poisoning.
+    #[tokio::test]
+    async fn a_panicking_query_leaves_the_connection_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pangolin.db");
+        let app = App::new(&db_path, make_log_config(50, 16), CertManager::default()).unwrap();
+
+        let panicked = app.with_db(|_| panic!("the query panicked")).await;
+        assert!(
+            panicked.is_err(),
+            "the panic is reported to the caller, not swallowed"
+        );
+
+        // The connection is still usable.
         let sites = app
             .with_db(|db| crate::db::list_sites(db).unwrap_or_default())
             .await

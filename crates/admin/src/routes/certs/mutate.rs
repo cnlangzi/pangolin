@@ -70,25 +70,34 @@ pub async fn handle_create(
         order_url: None,
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_cert(&db, &c);
-    // fix/cert_www: a manually-uploaded cert may be the best match
-    // for any number of registered domains. Refresh the link cache
-    // so the SNI callback picks it up immediately.
-    if result.is_ok()
-        && let Err(e) = app.cert_links.relink_for_cert(&db, &c.domain)
-    {
-        log::warn!(
-            "cert_links: relink for {} after manual upload failed: {}",
-            c.domain,
-            e
-        );
-    }
-    drop(db);
+    // The write runs on the blocking pool, under one connection: the
+    // cert row and the link-cache refresh belong to the same write
+    // (issue #254). The link cache clone shares its backing table with
+    // `app.cert_links`, so the relink publishes into the table the SNI
+    // callback reads.
+    let cert_links = app.cert_links.clone();
+    let result = app
+        .with_db_res(move |db| {
+            let result = pangolin_core::db::upsert_cert(db, &c);
+            // fix/cert_www: a manually-uploaded cert may be the best match
+            // for any number of registered domains. Refresh the link cache
+            // so the SNI callback picks it up immediately.
+            if result.is_ok()
+                && let Err(e) = cert_links.relink_for_cert(db, &c.domain)
+            {
+                log::warn!(
+                    "cert_links: relink for {} after manual upload failed: {}",
+                    c.domain,
+                    e
+                );
+            }
+            result
+        })
+        .await;
 
     match result {
         Ok(()) => Ok(redirect_response("/certs")),
-        Err(e) => render_create_page_with_error(&format!("Database error: {}", e), csrf, lang),
+        Err(e) => render_create_page_with_error(&format!("Database error: {e}"), csrf, lang),
     }
 }
 
@@ -105,15 +114,19 @@ pub async fn handle_delete(
     if let Some(d) = domain
         && !d.is_empty()
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_cert(&db, &d);
-        // fix/cert_www: the cert row is gone — drop any domain link
-        // that pointed at it. `relink_for_cert` re-derives from the
-        // current certs table, so any surviving cert will replace it.
-        if let Err(e) = app.cert_links.relink_for_cert(&db, &d) {
-            log::warn!("cert_links: relink for {} after delete failed: {}", d, e);
-        }
-        drop(db);
+        let cert_links = app.cert_links.clone();
+        let _ = app
+            .with_db_res(move |db| {
+                let _ = pangolin_core::db::delete_cert(db, &d);
+                // fix/cert_www: the cert row is gone — drop any domain link
+                // that pointed at it. `relink_for_cert` re-derives from the
+                // current certs table, so any surviving cert will replace it.
+                if let Err(e) = cert_links.relink_for_cert(db, &d) {
+                    log::warn!("cert_links: relink for {} after delete failed: {}", d, e);
+                }
+                Ok(())
+            })
+            .await;
         app.reload_indexes().await;
     }
     Ok(redirect_response("/certs"))
@@ -134,17 +147,21 @@ pub async fn api_handle_delete(
     if domain.is_empty() {
         return Ok(crate::not_found(lang));
     }
-    let db = app.db.lock().await;
-    let _ = pangolin_core::db::delete_cert(&db, &domain);
-    // fix/cert_www: see handle_delete above.
-    if let Err(e) = app.cert_links.relink_for_cert(&db, &domain) {
-        log::warn!(
-            "cert_links: relink for {} after delete failed: {}",
-            domain,
-            e
-        );
-    }
-    drop(db);
+    let cert_links = app.cert_links.clone();
+    let _ = app
+        .with_db_res(move |db| {
+            let _ = pangolin_core::db::delete_cert(db, &domain);
+            // fix/cert_www: see handle_delete above.
+            if let Err(e) = cert_links.relink_for_cert(db, &domain) {
+                log::warn!(
+                    "cert_links: relink for {} after delete failed: {}",
+                    domain,
+                    e
+                );
+            }
+            Ok(())
+        })
+        .await;
     app.reload_indexes().await;
     Ok(Response::builder()
         .status(200)

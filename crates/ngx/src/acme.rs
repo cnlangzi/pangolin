@@ -1846,8 +1846,10 @@ pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         // label and ACME metadata, and (b) skip the write when the
         // row already matches the file.
         let existing = {
-            let conn = app.db.lock().await;
-            pangolin_core::db::get_cert(&conn, &domain).unwrap_or(None)
+            // The read runs on the blocking pool (issue #254).
+            let domain = domain.clone();
+            app.with_db_or(move |conn| pangolin_core::db::get_cert(conn, &domain).unwrap_or(None))
+                .await
         };
 
         // Don't disturb an in-flight issuance. At startup this should
@@ -1919,20 +1921,30 @@ pub async fn scan_and_reconcile_blobs(app: &Arc<App>) -> anyhow::Result<usize> {
         }
 
         {
-            let conn = app.db.lock().await;
-            if let Err(e) = pangolin_core::db::upsert_cert(&conn, &cert) {
+            // The write runs on the blocking pool (issue #254). The
+            // link cache clone shares its backing table with
+            // `app.cert_links`, so the relink publishes into the table
+            // the SNI callback reads.
+            let cert_links = app.cert_links.clone();
+            let upserted = app
+                .with_db_res(move |conn| {
+                    pangolin_core::db::upsert_cert(conn, &cert)?;
+                    // fix/cert_www: a cert we just imported may cover domains
+                    // that were previously linked to nothing (or to a different
+                    // cert). Refresh the link cache for this cert's row.
+                    if let Err(e) = cert_links.relink_for_cert(conn, &cert.domain) {
+                        log::warn!(
+                            "cert_links: relink for {} after scan failed: {}",
+                            cert.domain,
+                            e
+                        );
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(e) = upserted {
                 log::warn!("scan: upsert {} failed: {}", domain, e);
                 continue;
-            }
-            // fix/cert_www: a cert we just imported may cover domains
-            // that were previously linked to nothing (or to a different
-            // cert). Refresh the link cache for this cert's row.
-            if let Err(e) = app.cert_links.relink_for_cert(&conn, &cert.domain) {
-                log::warn!(
-                    "cert_links: relink for {} after scan failed: {}",
-                    cert.domain,
-                    e
-                );
             }
         }
         synced += 1;
@@ -3053,9 +3065,10 @@ impl AcmeState {
     /// Rebuild the DNS provider registry from the DB. Cheap — re-reads
     /// the `dns_providers` table and re-constructs trait objects.
     pub async fn reload(&self, app: &App) -> anyhow::Result<()> {
-        let conn = app.db.lock().await;
-        let providers = pangolin_core::db::list_dns_providers(&conn).unwrap_or_default();
-        drop(conn);
+        // The read runs on the blocking pool (issue #254).
+        let providers = app
+            .with_db_or(|db| pangolin_core::db::list_dns_providers(db).unwrap_or_default())
+            .await;
 
         let mut new_registry = HashMap::new();
         for p in providers.iter().filter(|p| p.enabled) {
@@ -3122,11 +3135,12 @@ impl AcmeState {
     /// exists on disk. If a cert exists, check expiry and renew if within
     /// threshold. If it doesn't exist, issue fresh.
     pub async fn ensure_certs(&self, app: &App) {
-        let conn = app.db.lock().await;
-        let domains = pangolin_core::db::list_domains(&conn).unwrap_or_default();
+        // The read runs on the blocking pool (issue #254).
+        let domains = app
+            .with_db_or(|db| pangolin_core::db::list_domains(db).unwrap_or_default())
+            .await;
         let dns_index_snapshot = app.dns_index.read().await.clone();
         let dns_index = dns_index_snapshot;
-        drop(conn);
 
         for d in domains
             .iter()
@@ -3152,8 +3166,12 @@ impl AcmeState {
             //     actually retries transient / rate-limited failures
             //     automatically instead of forever sitting there.
             let existing = {
-                let conn = app.db.lock().await;
-                pangolin_core::db::get_cert(&conn, &d.domain).ok().flatten()
+                // The read runs on the blocking pool (issue #254).
+                let domain = d.domain.clone();
+                app.with_db_or(move |conn| {
+                    pangolin_core::db::get_cert(conn, &domain).ok().flatten()
+                })
+                .await
             };
             if let Some(ref c) = existing {
                 // Terminal — never auto-retry, regardless of
@@ -3229,12 +3247,14 @@ impl AcmeState {
         // Issue #45 phase-1 (status transitions): seed the row if missing
         // (catches legacy auto_issue domains that pre-date V4), then plan.
         {
-            let conn = app.db.lock().await;
-            let _ = pangolin_core::db::ensure_pending_cert_row(
-                &conn,
-                &domain.domain,
-                &app.cert_manager.cert_dir,
-            );
+            // The write runs on the blocking pool (issue #254).
+            let cert_dir = app.cert_manager.cert_dir.clone();
+            let name = domain.domain.clone();
+            let _ = app
+                .with_db_res(move |conn| {
+                    pangolin_core::db::ensure_pending_cert_row(conn, &name, &cert_dir)
+                })
+                .await;
         }
 
         let plan = match pangolin_core::plan_issuance(&sans, domain, dns_index) {
@@ -3265,17 +3285,23 @@ impl AcmeState {
                 log::warn!("skipping {} (auto_issue=true): {}", domain.domain, e);
                 let class = pangolin_core::CertErrorClass::Permanent;
                 let far_future = now + std::time::Duration::from_secs(60 * 60 * 24 * 365);
-                let conn = app.db.lock().await;
-                let _ = pangolin_core::db::set_cert_failure(
-                    &conn,
-                    &domain.domain,
-                    pangolin_core::CertStatus::Skipped,
-                    &reason,
-                    &class,
-                    far_future,
-                    0,
-                );
-                drop(conn);
+                {
+                    // The write runs on the blocking pool (issue #254).
+                    let name = domain.domain.clone();
+                    let _ = app
+                        .with_db_res(move |conn| {
+                            pangolin_core::db::set_cert_failure(
+                                conn,
+                                &name,
+                                pangolin_core::CertStatus::Skipped,
+                                &reason,
+                                &class,
+                                far_future,
+                                0,
+                            )
+                        })
+                        .await;
+                }
                 return Ok(());
             }
         };
@@ -3319,14 +3345,20 @@ impl AcmeState {
         // a fresh `started_at` so the UI's "x seconds ago" relative
         // timestamp reflects this attempt.
         {
-            let conn = app.db.lock().await;
-            let _ = pangolin_core::db::set_cert_status_atomic(
-                &conn,
-                &domain.domain,
-                pangolin_core::CertStatus::Issuing,
-                None,
-                Some(chrono::Utc::now()),
-            );
+            // The write runs on the blocking pool (issue #254).
+            let name = domain.domain.clone();
+            let now = chrono::Utc::now();
+            let _ = app
+                .with_db_res(move |conn| {
+                    pangolin_core::db::set_cert_status_atomic(
+                        conn,
+                        &name,
+                        pangolin_core::CertStatus::Issuing,
+                        None,
+                        Some(now),
+                    )
+                })
+                .await;
         }
         trace("transition", "Pending/Failed → Issuing".into());
 
@@ -3337,17 +3369,24 @@ impl AcmeState {
             let now = chrono::Utc::now();
             let class = pangolin_core::CertErrorClass::Transient;
             let next_retry = now + pangolin_core::next_backoff(0);
-            let conn = app.db.lock().await;
-            let _ = pangolin_core::db::set_cert_failure(
-                &conn,
-                &domain.domain,
-                pangolin_core::CertStatus::Failed,
-                &format!("pre_renew hook failed: {}", e),
-                &class,
-                next_retry,
-                1,
-            );
-            drop(conn);
+            {
+                // The write runs on the blocking pool (issue #254).
+                let name = domain.domain.clone();
+                let message = format!("pre_renew hook failed: {}", e);
+                let _ = app
+                    .with_db_res(move |conn| {
+                        pangolin_core::db::set_cert_failure(
+                            conn,
+                            &name,
+                            pangolin_core::CertStatus::Failed,
+                            &message,
+                            &class,
+                            next_retry,
+                            1,
+                        )
+                    })
+                    .await;
+            }
             return Err(e);
         }
         trace("pre_renew", "hook ok (or not configured)".into());
@@ -3408,12 +3447,14 @@ impl AcmeState {
                 // First, persist the order URL if captured (should always
                 // be Some by the time we reach here, but guard defensively).
                 if let Some(order_url) = order_url_capture.read().await.as_ref() {
-                    let conn = app.db.lock().await;
-                    let _ = pangolin_core::db::set_cert_order_url(
-                        &conn,
-                        &domain.domain,
-                        Some(order_url),
-                    );
+                    // The write runs on the blocking pool (issue #254).
+                    let order_url = order_url.clone();
+                    let name = domain.domain.clone();
+                    let _ = app
+                        .with_db_res(move |conn| {
+                            pangolin_core::db::set_cert_order_url(conn, &name, Some(&order_url))
+                        })
+                        .await;
                 }
 
                 let elapsed = (chrono::Utc::now() - issue_started).num_seconds();
@@ -3442,48 +3483,75 @@ impl AcmeState {
                     .await
                     .ok()
                     .and_then(|blob| parse_blob_expiry(&blob).ok());
-                let conn = app.db.lock().await;
-                let existing = pangolin_core::db::get_cert(&conn, &domain.domain).unwrap_or(None);
-                let created_at = existing.as_ref().map(|c| c.created_at).unwrap_or(issued_at);
-                let started_at = existing.as_ref().and_then(|c| c.started_at);
-                let cert_row = pangolin_core::Cert {
-                    domain: domain.domain.clone(),
-                    cert_file: blob_path.clone(),
-                    key_file: blob_path,
-                    expires_at,
-                    created_at,
-                    sans: sans.clone(),
-                    source: "acme".into(),
-                    acme_dns_provider: plan.dns_provider_name.clone(),
-                    acme_account_id: None,
-                    issued_at: issued_at.timestamp(),
-                    status: pangolin_core::CertStatus::Issued,
-                    started_at,
-                    last_error: None,
-                    // V5: clear the failure-streak fields on success.
-                    // The next attempt_count=0 start gives the next
-                    // failure a clean backoff schedule.
-                    next_retry_at: None,
-                    error_class: None,
-                    attempt_count: 0,
-                    // ACME order completed; clear so the next renewal
-                    // opens a fresh order.
-                    order_url: None,
+                // The read of the existing row and the write belong to
+                // one connection: the row's `created_at` and
+                // `started_at` have to come from the state the write
+                // replaces. The whole sequence runs on the blocking
+                // pool (issue #254).
+                let cert_links = app.cert_links.clone();
+                let name = domain.domain.clone();
+                let blob_file = blob_path.clone();
+                let sans_for_db = sans.clone();
+                let provider_for_db = plan.dns_provider_name.clone();
+                let cert_row = match app
+                    .with_db(move |conn| {
+                        let existing = pangolin_core::db::get_cert(conn, &name).unwrap_or(None);
+                        let created_at =
+                            existing.as_ref().map(|c| c.created_at).unwrap_or(issued_at);
+                        let started_at = existing.as_ref().and_then(|c| c.started_at);
+                        let cert_row = pangolin_core::Cert {
+                            domain: name.clone(),
+                            cert_file: blob_file.clone(),
+                            key_file: blob_file.clone(),
+                            expires_at,
+                            created_at,
+                            sans: sans_for_db.clone(),
+                            source: "acme".into(),
+                            acme_dns_provider: provider_for_db.clone(),
+                            acme_account_id: None,
+                            issued_at: issued_at.timestamp(),
+                            status: pangolin_core::CertStatus::Issued,
+                            started_at,
+                            last_error: None,
+                            // V5: clear the failure-streak fields on success.
+                            // The next attempt_count=0 start gives the next
+                            // failure a clean backoff schedule.
+                            next_retry_at: None,
+                            error_class: None,
+                            attempt_count: 0,
+                            // ACME order completed; clear so the next renewal
+                            // opens a fresh order.
+                            order_url: None,
+                        };
+                        let _ = pangolin_core::db::upsert_cert(conn, &cert_row);
+                        // fix/cert_www: a freshly-issued cert may be the best
+                        // match for any number of registered domains (e.g. a
+                        // wildcard cert covers all matching subdomains). Refresh
+                        // the link cache so the SNI callback picks it up
+                        // immediately.
+                        if let Err(e) = cert_links.relink_for_cert(conn, &cert_row.domain) {
+                            log::warn!(
+                                "cert_links: relink for {} after issue failed: {}",
+                                cert_row.domain,
+                                e
+                            );
+                        }
+                        cert_row
+                    })
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(e) => {
+                        // The write panicked: the row was not written.
+                        // The blob is on disk, so the next renewal scan
+                        // imports it (issue #45).
+                        log::warn!(
+                            "acme: persisting the issued cert for {} failed: {e}",
+                            domain.domain
+                        );
+                        return Ok(());
+                    }
                 };
-                let _ = pangolin_core::db::upsert_cert(&conn, &cert_row);
-                // fix/cert_www: a freshly-issued cert may be the best
-                // match for any number of registered domains (e.g. a
-                // wildcard cert covers all matching subdomains). Refresh
-                // the link cache so the SNI callback picks it up
-                // immediately.
-                if let Err(e) = app.cert_links.relink_for_cert(&conn, &cert_row.domain) {
-                    log::warn!(
-                        "cert_links: relink for {} after issue failed: {}",
-                        cert_row.domain,
-                        e
-                    );
-                }
-                drop(conn);
                 trace(
                     "issued",
                     format!(
@@ -3559,25 +3627,36 @@ impl AcmeState {
                 // Load the current attempt_count so backoff escalates
                 // across failures instead of resetting.
                 let prior_attempts: u32 = {
-                    let conn = app.db.lock().await;
-                    pangolin_core::db::get_cert(&conn, &domain.domain)
-                        .ok()
-                        .flatten()
-                        .map(|c| c.attempt_count)
-                        .unwrap_or(0)
+                    // The read runs on the blocking pool (issue #254).
+                    let name = domain.domain.clone();
+                    app.with_db_or(move |conn| {
+                        pangolin_core::db::get_cert(conn, &name)
+                            .ok()
+                            .flatten()
+                            .map(|c| c.attempt_count)
+                            .unwrap_or(0)
+                    })
+                    .await
                 };
                 let new_attempts = prior_attempts.saturating_add(1);
-                let conn = app.db.lock().await;
-                let _ = pangolin_core::db::set_cert_failure(
-                    &conn,
-                    &domain.domain,
-                    row_status,
-                    &err_msg,
-                    &class,
-                    next_retry_at,
-                    new_attempts,
-                );
-                drop(conn);
+                {
+                    // The write runs on the blocking pool (issue #254).
+                    let name = domain.domain.clone();
+                    let err_msg_for_db = err_msg.clone();
+                    let _ = app
+                        .with_db_res(move |conn| {
+                            pangolin_core::db::set_cert_failure(
+                                conn,
+                                &name,
+                                row_status,
+                                &err_msg_for_db,
+                                &class,
+                                next_retry_at,
+                                new_attempts,
+                            )
+                        })
+                        .await;
+                }
                 // Surface the human-readable message in the event
                 // feed so the dashboard activity panel still works.
                 app.add_event(pangolin_core::EventType::CertRenewFailed {
@@ -3613,10 +3692,12 @@ impl pangolin_core::CertRetrier for AcmeState {
         // Load the domain row (we need its auto_issue / dns_provider for
         // `plan_issuance`).
         let (domain_row, dns_index_snapshot) = {
-            let conn = app.db.lock().await;
-            let row = pangolin_core::db::get_domain(&conn, domain)
+            // The read runs on the blocking pool (issue #254).
+            let name = domain.to_string();
+            let row = app
+                .with_db_res(move |conn| pangolin_core::db::get_domain(conn, &name))
+                .await
                 .map_err(|e| anyhow::anyhow!("db lookup failed for {}: {}", domain, e))?;
-            drop(conn);
             let dns_index = app.dns_index.read().await.clone();
             (row, dns_index)
         };
@@ -3641,15 +3722,22 @@ impl pangolin_core::CertRetrier for AcmeState {
         // `attempt_count` resets to 0 (a new failure streak starts a
         // new backoff schedule from slot 1).
         {
-            let conn = app.db.lock().await;
-            let _ = pangolin_core::db::clear_cert_failure(&conn, domain);
-            let _ = pangolin_core::db::set_cert_status_atomic(
-                &conn,
-                domain,
-                pangolin_core::CertStatus::Pending,
-                None,
-                Some(chrono::Utc::now()),
-            );
+            // The writes run on the blocking pool (issue #254).
+            let name = domain.to_string();
+            let now = chrono::Utc::now();
+            let _ = app
+                .with_db_res(move |conn| {
+                    let _ = pangolin_core::db::clear_cert_failure(conn, &name);
+                    let _ = pangolin_core::db::set_cert_status_atomic(
+                        conn,
+                        &name,
+                        pangolin_core::CertStatus::Pending,
+                        None,
+                        Some(now),
+                    );
+                    Ok(())
+                })
+                .await;
         }
 
         self.ensure_one(&app, &d, &dns_index_snapshot).await
@@ -3716,11 +3804,14 @@ impl crate::runtime::Service for AcmeService {
             // `Permanent` rows are skipped by `ensure_certs`, so they
             // don't contribute.
             let sleep_for = {
-                let conn = app.db.lock().await;
-                let next = pangolin_core::db::earliest_pending_retry(&conn)
-                    .ok()
-                    .flatten();
-                drop(conn);
+                // The read runs on the blocking pool (issue #254).
+                let next = app
+                    .with_db_or(|conn| {
+                        pangolin_core::db::earliest_pending_retry(conn)
+                            .ok()
+                            .flatten()
+                    })
+                    .await;
                 match next {
                     Some(t) => {
                         let now = chrono::Utc::now();

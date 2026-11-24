@@ -111,12 +111,16 @@ pub async fn handle_create(
     };
 
     {
-        let db = app.db.lock().await;
-        if pangolin_core::db::get_tun(&db, &name)
-            .unwrap_or_default()
-            .is_some()
-        {
-            drop(db);
+        // The read runs on the blocking pool (issue #254).
+        let key = name.clone();
+        let exists = app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_tun(db, &key)
+                    .unwrap_or_default()
+                    .is_some()
+            })
+            .await;
+        if exists {
             return render_create_page_with_error(
                 None,
                 &lang.tf("tunnels.error.already_exists", [("name", name)]),
@@ -137,15 +141,14 @@ pub async fn handle_create(
         expires_at: parsed.expires_at,
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_tun(&db, &tun);
-    drop(db);
+    // The write runs on the blocking pool (issue #254).
+    let result = app
+        .with_db_res(move |db| pangolin_core::db::upsert_tun(db, &tun))
+        .await;
 
     match result {
         Ok(()) => Ok(redirect_response("/tun")),
-        Err(e) => {
-            render_create_page_with_error(None, &format!("Database error: {}", e), csrf, lang)
-        }
+        Err(e) => render_create_page_with_error(None, &format!("Database error: {e}"), csrf, lang),
     }
 }
 
@@ -170,9 +173,11 @@ pub async fn handle_update(
 
     let params = parse_form(body);
 
-    let db = app.db.lock().await;
-    let existing = pangolin_core::db::get_tun(&db, &name).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let key = name.clone();
+    let existing = app
+        .with_db_or(move |db| pangolin_core::db::get_tun(db, &key).unwrap_or_default())
+        .await;
 
     let Some(mut tun) = existing else {
         return render_edit_page_with_error(&name, &lang.t("tunnels.error.not_found"), csrf, lang);
@@ -193,13 +198,14 @@ pub async fn handle_update(
     tun.expires_at = parsed.expires_at;
     tun.enabled = parsed.enabled;
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_tun(&db, &tun);
-    drop(db);
+    // The write runs on the blocking pool (issue #254).
+    let result = app
+        .with_db_res(move |db| pangolin_core::db::upsert_tun(db, &tun))
+        .await;
 
     match result {
         Ok(()) => Ok(redirect_response("/tun")),
-        Err(e) => render_edit_page_with_error(&name, &format!("Database error: {}", e), csrf, lang),
+        Err(e) => render_edit_page_with_error(&name, &format!("Database error: {e}"), csrf, lang),
     }
 }
 
@@ -216,9 +222,9 @@ pub async fn handle_delete(
     if let Some(n) = name
         && !n.is_empty()
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_tun(&db, &n);
-        drop(db);
+        let _ = app
+            .with_db_res(move |db| pangolin_core::db::delete_tun(db, &n))
+            .await;
     }
     Ok(redirect_response("/tun"))
 }
@@ -238,9 +244,9 @@ pub async fn api_handle_delete(
     if name.is_empty() {
         return Ok(crate::not_found(lang));
     }
-    let db = app.db.lock().await;
-    let _ = pangolin_core::db::delete_tun(&db, &name);
-    drop(db);
+    let _ = app
+        .with_db_res(move |db| pangolin_core::db::delete_tun(db, &name))
+        .await;
     Ok(Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")

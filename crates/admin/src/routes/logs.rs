@@ -3876,20 +3876,31 @@ mod tests {
             domain_count: 0,
         };
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::upsert_site(&db, &site).unwrap();
-            for d in domains {
-                let domain = pangolin_core::types::Domain {
-                    domain: (*d).into(),
-                    site_name: name.into(),
-                    enabled: true,
-                    auto_issue: false,
-                    dns_provider: None,
-                    challenge_kind: None,
-                    created_at: now,
-                };
-                pangolin_core::db::upsert_domain(&db, &domain).unwrap();
-            }
+            // The writes run on the blocking pool, under one connection
+            // (issue #254).
+            let domains = domains
+                .iter()
+                .map(|d| (*d).to_string())
+                .collect::<Vec<String>>();
+            let name = name.to_string();
+            app.with_db_res(move |db| {
+                pangolin_core::db::upsert_site(db, &site)?;
+                for d in &domains {
+                    let domain = pangolin_core::types::Domain {
+                        domain: d.clone(),
+                        site_name: name.clone(),
+                        enabled: true,
+                        auto_issue: false,
+                        dns_provider: None,
+                        challenge_kind: None,
+                        created_at: now,
+                    };
+                    pangolin_core::db::upsert_domain(db, &domain)?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("the seed write ran");
         }
         app.reload_indexes().await;
     }

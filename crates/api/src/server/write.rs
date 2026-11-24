@@ -68,11 +68,17 @@ pub async fn create_site(ctx: &Ctx<'_>) -> ApiResponse {
     };
 
     {
-        let db = ctx.state.app.db.lock().await;
-        if pangolin_core::db::get_site(&db, &parsed.name)
-            .unwrap_or(None)
-            .is_some()
-        {
+        let name = parsed.name.clone();
+        let exists = ctx
+            .state
+            .app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_site(db, &name)
+                    .unwrap_or(None)
+                    .is_some()
+            })
+            .await;
+        if exists {
             return ApiResponse::error(&read::site_exists(&parsed.name));
         }
     }
@@ -89,23 +95,31 @@ pub async fn create_site(ctx: &Ctx<'_>) -> ApiResponse {
     };
 
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_site(&db, &site) {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if let Some(policy) = &parsed.rate_limit
-            && let Err(e) = pangolin_core::db::upsert_site_rate_limit(&db, &site.name, policy)
-        {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if parsed.provider.present
-            && let Err(e) = write_site_provider(&db, &site.name, &parsed.provider)
-        {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if let Some(bots) = &parsed.rate_limit_bots
-            && let Err(e) = pangolin_core::db::set_site_rate_limit_bots(&db, &site.name, bots)
-        {
+        // The writes run on the blocking pool, under one connection:
+        // the site's row and its sub-resources belong to the same
+        // write (issue #254).
+        let site_for_db = site.clone();
+        let rate_limit = parsed.rate_limit.clone();
+        let rate_limit_bots = parsed.rate_limit_bots.clone();
+        let provider = parsed.provider;
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| {
+                pangolin_core::db::upsert_site(db, &site_for_db)?;
+                if let Some(policy) = &rate_limit {
+                    pangolin_core::db::upsert_site_rate_limit(db, &site_for_db.name, policy)?;
+                }
+                if provider.present {
+                    write_site_provider(db, &site_for_db.name, &provider)?;
+                }
+                if let Some(bots) = &rate_limit_bots {
+                    pangolin_core::db::set_site_rate_limit_bots(db, &site_for_db.name, bots)?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -119,12 +133,16 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         Ok(d) => d,
         Err(e) => return ApiResponse::error(&e),
     };
-    let stored_policy = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_site_rate_limit(&db, name)
-            .ok()
-            .flatten()
-    };
+    let key = name.to_string();
+    let stored_policy = ctx
+        .state
+        .app
+        .with_db_or(move |db| {
+            pangolin_core::db::get_site_rate_limit(db, &key)
+                .ok()
+                .flatten()
+        })
+        .await;
     let global_provider = ctx.state.app.system_config.read().provider;
     let params = dto.to_params();
     let parsed = match admin::routes::sites::helpers::parse_site_form(
@@ -147,8 +165,11 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     };
 
     let existing = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_site(&db, name).unwrap_or(None)
+        let key = name.to_string();
+        ctx.state
+            .app
+            .with_db_or(move |db| pangolin_core::db::get_site(db, &key).unwrap_or(None))
+            .await
     };
     let Some(existing) = existing else {
         return ApiResponse::error(&read::site_not_found(name));
@@ -166,23 +187,31 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     };
 
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_site(&db, &site) {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if let Some(policy) = &parsed.rate_limit
-            && let Err(e) = pangolin_core::db::upsert_site_rate_limit(&db, name, policy)
-        {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if parsed.provider.present
-            && let Err(e) = write_site_provider(&db, name, &parsed.provider)
-        {
-            return ApiResponse::error(&read::database_error(e));
-        }
-        if let Some(bots) = &parsed.rate_limit_bots
-            && let Err(e) = pangolin_core::db::set_site_rate_limit_bots(&db, name, bots)
-        {
+        // The writes run on the blocking pool, under one connection:
+        // the site's row and its sub-resources belong to the same
+        // write (issue #254).
+        let site_for_db = site.clone();
+        let rate_limit = parsed.rate_limit.clone();
+        let rate_limit_bots = parsed.rate_limit_bots.clone();
+        let provider = parsed.provider;
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| {
+                pangolin_core::db::upsert_site(db, &site_for_db)?;
+                if let Some(policy) = &rate_limit {
+                    pangolin_core::db::upsert_site_rate_limit(db, &site_for_db.name, policy)?;
+                }
+                if provider.present {
+                    write_site_provider(db, &site_for_db.name, &provider)?;
+                }
+                if let Some(bots) = &rate_limit_bots {
+                    pangolin_core::db::set_site_rate_limit_bots(db, &site_for_db.name, bots)?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -193,8 +222,12 @@ pub async fn update_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 /// `DELETE /api/v1/sites/{name}` — idempotent.
 pub async fn delete_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_site(&db, name);
+        let key = name.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_site(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
@@ -228,21 +261,37 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
     };
     let domain = dto.domain.clone().unwrap_or_default();
     let params = dto.to_params();
-    let parsed = {
-        let db = ctx.state.app.db.lock().await;
-        admin::routes::domains::mutate::parse_domain_form(
-            &params,
-            &domain,
-            None,
-            &|name| {
-                pangolin_core::db::get_dns_provider(&db, name)
-                    .unwrap_or(None)
-                    .is_some()
-            },
-            // The API is a machine-facing surface: its JSON error
-            // bodies stay in English.
-            admin::i18n::Lang::En,
-        )
+    // The parse reads the DNS providers, so it runs on the blocking
+    // pool with the connection in hand (issue #254).
+    let domain_for_db = domain.clone();
+    let parsed = match ctx
+        .state
+        .app
+        .with_db(move |conn| {
+            admin::routes::domains::mutate::parse_domain_form(
+                &params,
+                &domain_for_db,
+                None,
+                &|name| {
+                    pangolin_core::db::get_dns_provider(conn, name)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+                // The API is a machine-facing surface: its JSON error
+                // bodies stay in English.
+                admin::i18n::Lang::En,
+            )
+        })
+        .await
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::warn!("api: the domain form could not be parsed: {e}");
+            // The query panicked: that is the API failing, not the
+            // submission being wrong (docs/design/api.md: 500
+            // `internal_error` is "something the API did not expect").
+            return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
+        }
     };
     let parsed = match parsed {
         Ok(p) => p,
@@ -252,11 +301,17 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
     };
 
     {
-        let db = ctx.state.app.db.lock().await;
-        if pangolin_core::db::get_domain(&db, &domain)
-            .unwrap_or(None)
-            .is_some()
-        {
+        let key = domain.clone();
+        let exists = ctx
+            .state
+            .app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_domain(db, &key)
+                    .unwrap_or(None)
+                    .is_some()
+            })
+            .await;
+        if exists {
             return ApiResponse::error(&read::domain_exists(&domain));
         }
     }
@@ -272,8 +327,13 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
     };
 
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_domain(&db, &d) {
+        let d_for_db = d.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_domain(db, &d_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -288,8 +348,11 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         Err(e) => return ApiResponse::error(&e),
     };
     let existing = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_domain(&db, domain).unwrap_or(None)
+        let key = domain.to_string();
+        ctx.state
+            .app
+            .with_db_or(move |db| pangolin_core::db::get_domain(db, &key).unwrap_or(None))
+            .await
     };
     let Some(existing) = existing else {
         return ApiResponse::error(&ApiError::not_found(
@@ -298,21 +361,38 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         ));
     };
     let params = dto.to_params();
-    let parsed = {
-        let db = ctx.state.app.db.lock().await;
-        admin::routes::domains::mutate::parse_domain_form(
-            &params,
-            domain,
-            Some(&existing),
-            &|name| {
-                pangolin_core::db::get_dns_provider(&db, name)
-                    .unwrap_or(None)
-                    .is_some()
-            },
-            // The API is a machine-facing surface: its JSON error
-            // bodies stay in English.
-            admin::i18n::Lang::En,
-        )
+    // The parse reads the DNS providers, so it runs on the blocking
+    // pool with the connection in hand (issue #254).
+    let domain_for_db = domain.to_string();
+    let existing_for_db = existing.clone();
+    let parsed = match ctx
+        .state
+        .app
+        .with_db(move |conn| {
+            admin::routes::domains::mutate::parse_domain_form(
+                &params,
+                &domain_for_db,
+                Some(&existing_for_db),
+                &|name| {
+                    pangolin_core::db::get_dns_provider(conn, name)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+                // The API is a machine-facing surface: its JSON error
+                // bodies stay in English.
+                admin::i18n::Lang::En,
+            )
+        })
+        .await
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::warn!("api: the domain form could not be parsed: {e}");
+            // The query panicked: that is the API failing, not the
+            // submission being wrong (docs/design/api.md: 500
+            // `internal_error` is "something the API did not expect").
+            return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
+        }
     };
     let parsed = match parsed {
         Ok(p) => p,
@@ -331,8 +411,13 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         created_at: existing.created_at,
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_domain(&db, &updated) {
+        let updated_for_db = updated.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_domain(db, &updated_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -343,8 +428,12 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
 /// `DELETE /api/v1/domains/{domain}` — idempotent.
 pub async fn delete_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_domain(&db, domain);
+        let key = domain.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_domain(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(
@@ -377,11 +466,17 @@ pub async fn create_dns_provider(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if pangolin_core::db::get_dns_provider(&db, &parsed.name)
-            .unwrap_or(None)
-            .is_some()
-        {
+        let name = parsed.name.clone();
+        let exists = ctx
+            .state
+            .app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_dns_provider(db, &name)
+                    .unwrap_or(None)
+                    .is_some()
+            })
+            .await;
+        if exists {
             return ApiResponse::error(&read::dns_provider_exists(&parsed.name));
         }
     }
@@ -395,8 +490,13 @@ pub async fn create_dns_provider(ctx: &Ctx<'_>) -> ApiResponse {
         updated_at: now,
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_dns_provider(&db, &provider) {
+        let provider_for_db = provider.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_dns_provider(db, &provider_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -411,8 +511,11 @@ pub async fn update_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         Err(e) => return ApiResponse::error(&e),
     };
     let existing = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_dns_provider(&db, name).unwrap_or(None)
+        let key = name.to_string();
+        ctx.state
+            .app
+            .with_db_or(move |db| pangolin_core::db::get_dns_provider(db, &key).unwrap_or(None))
+            .await
     };
     let Some(existing) = existing else {
         return ApiResponse::error(&ApiError::not_found(
@@ -443,8 +546,13 @@ pub async fn update_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         updated_at: chrono::Utc::now(),
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_dns_provider(&db, &provider) {
+        let provider_for_db = provider.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_dns_provider(db, &provider_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -455,8 +563,12 @@ pub async fn update_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 /// `DELETE /api/v1/dns_providers/{name}` — idempotent.
 pub async fn delete_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_dns_provider(&db, name);
+        let key = name.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_dns_provider(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
@@ -492,11 +604,17 @@ pub async fn create_tun(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if pangolin_core::db::get_tun(&db, &name)
-            .unwrap_or(None)
-            .is_some()
-        {
+        let key = name.clone();
+        let exists = ctx
+            .state
+            .app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_tun(db, &key)
+                    .unwrap_or(None)
+                    .is_some()
+            })
+            .await;
+        if exists {
             return ApiResponse::error(&read::tun_exists(&name));
         }
     }
@@ -523,8 +641,13 @@ pub async fn create_tun(ctx: &Ctx<'_>) -> ApiResponse {
         expires_at: parsed.expires_at,
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_tun(&db, &tun) {
+        let tun_for_db = tun.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_tun(db, &tun_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -549,8 +672,11 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
         Err(e) => return ApiResponse::error(&e),
     };
     let existing = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_tun(&db, name).unwrap_or(None)
+        let key = name.to_string();
+        ctx.state
+            .app
+            .with_db_or(move |db| pangolin_core::db::get_tun(db, &key).unwrap_or(None))
+            .await
     };
     let Some(mut tun) = existing else {
         return ApiResponse::error(&ApiError::not_found(
@@ -586,8 +712,13 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     tun.expires_at = parsed.expires_at;
     tun.enabled = parsed.enabled;
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_tun(&db, &tun) {
+        let tun_for_db = tun.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_tun(db, &tun_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -602,8 +733,12 @@ pub async fn update_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 /// `DELETE /api/v1/tun/{name}` — idempotent.
 pub async fn delete_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_tun(&db, name);
+        let key = name.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_tun(db, &key))
+            .await;
     }
     ApiResponse::json_of(200, &serde_json::json!({ "name": name, "deleted": true }))
 }
@@ -618,15 +753,34 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
     };
     let params = dto.to_params();
     let rule = {
-        let db = ctx.state.app.db.lock().await;
-        let sites = pangolin_core::db::list_sites(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| s.name)
-            .collect::<Vec<_>>();
-        admin::routes::ratelimit::parse_ip_rule_form(&params, &|scope| {
-            sites.iter().any(|s| s == scope)
-        })
+        // The parse reads the site names, so it runs on the blocking
+        // pool with the connection in hand (issue #254).
+        match ctx
+            .state
+            .app
+            .with_db(move |db| {
+                let sites = pangolin_core::db::list_sites(db)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect::<Vec<_>>();
+                admin::routes::ratelimit::parse_ip_rule_form(&params, &|scope| {
+                    sites.iter().any(|s| s == scope)
+                })
+            })
+            .await
+        {
+            Ok(rule) => rule,
+            Err(e) => {
+                log::warn!("api: the IP rule form could not be parsed: {e}");
+                // The query panicked: that is the API failing, not the
+                // submission being wrong (docs/design/api.md: 500
+                // `internal_error` is "something the API did not expect").
+                return ApiResponse::error(&ApiError::internal(
+                    "the IP rule form could not be checked",
+                ));
+            }
+        }
     };
     let rule = match rule {
         Ok(r) => r,
@@ -646,8 +800,13 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_ip_rule(&db, &rule) {
+        let rule_for_db = rule.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_ip_rule(db, &rule_for_db))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -660,8 +819,12 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
 /// The id is the rule's natural key, `<scope>|<kind>|<cidr>`.
 pub async fn delete_ip_rule(ctx: &Ctx<'_>, id: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_ip_rule(&db, id);
+        let key = id.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_ip_rule(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(200, &serde_json::json!({ "id": id, "deleted": true }))
@@ -676,10 +839,15 @@ pub async fn delete_ip_rule(ctx: &Ctx<'_>, id: &str) -> ApiResponse {
 /// the orphan would attach itself to a site of that name created
 /// later.
 async fn site_exists(ctx: &Ctx<'_>, site: &str) -> bool {
-    let db = ctx.state.app.db.lock().await;
-    pangolin_core::db::get_site(&db, site)
-        .unwrap_or(None)
-        .is_some()
+    let key = site.to_string();
+    ctx.state
+        .app
+        .with_db_or(move |db| {
+            pangolin_core::db::get_site(db, &key)
+                .unwrap_or(None)
+                .is_some()
+        })
+        .await
 }
 
 /// `PUT /api/v1/site_rate_limits/{site}` — full replace.
@@ -701,8 +869,14 @@ pub async fn put_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
         ));
     }
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::upsert_site_rate_limit(&db, site, &parsed.policy) {
+        let key = site.to_string();
+        let policy = parsed.policy.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::upsert_site_rate_limit(db, &key, &policy))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -719,8 +893,12 @@ pub async fn put_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 /// `DELETE /api/v1/site_rate_limits/{site}` — idempotent.
 pub async fn delete_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_site_rate_limit(&db, site);
+        let key = site.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_site_rate_limit(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(
@@ -758,8 +936,16 @@ pub async fn put_site_rate_limit_bots(ctx: &Ctx<'_>, site: &str) -> ApiResponse 
         bots.insert(id.clone());
     }
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::set_site_rate_limit_bots(&db, site, &bots) {
+        let key = site.to_string();
+        let bots_for_db = bots.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| {
+                pangolin_core::db::set_site_rate_limit_bots(db, &key, &bots_for_db)
+            })
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -797,17 +983,29 @@ pub async fn put_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
         ));
     }
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = write_site_provider(&db, site, &parsed) {
+        let key = site.to_string();
+        let provider = parsed;
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| write_site_provider(db, &key, &provider))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
     ctx.state.app.reload_indexes().await;
     let view = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_site_provider(&db, site)
-            .unwrap_or(None)
-            .map(|over| crate::dto::views::SiteProviderView::of(site, &over))
+        let key = site.to_string();
+        let site_name = site.to_string();
+        ctx.state
+            .app
+            .with_db_or(move |db| {
+                pangolin_core::db::get_site_provider(db, &key)
+                    .unwrap_or(None)
+                    .map(|over| crate::dto::views::SiteProviderView::of(&site_name, &over))
+            })
+            .await
     };
     match view {
         Some(v) => ApiResponse::json_of(200, &v),
@@ -821,8 +1019,12 @@ pub async fn put_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 /// `DELETE /api/v1/site_providers/{site}` — idempotent.
 pub async fn delete_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
     {
-        let db = ctx.state.app.db.lock().await;
-        let _ = pangolin_core::db::delete_site_provider(&db, site);
+        let key = site.to_string();
+        let _ = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::delete_site_provider(db, &key))
+            .await;
     }
     ctx.state.app.reload_indexes().await;
     ApiResponse::json_of(
@@ -864,8 +1066,16 @@ pub async fn put_site_origin_allow(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
         }
     }
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::replace_site_origin_allow(&db, site, &cidrs) {
+        let key = site.to_string();
+        let cidrs_for_db = cidrs.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| {
+                pangolin_core::db::replace_site_origin_allow(db, &key, &cidrs_for_db)
+            })
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -906,8 +1116,13 @@ pub async fn put_system_config(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::update_system_config(&db, &parsed) {
+        let cfg = parsed.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::update_system_config(db, &cfg))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }
@@ -942,8 +1157,13 @@ pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     {
-        let db = ctx.state.app.db.lock().await;
-        if let Err(e) = pangolin_core::db::update_badbots_config(&db, &parsed) {
+        let cfg = parsed.clone();
+        let written = ctx
+            .state
+            .app
+            .with_db_res(move |db| pangolin_core::db::update_badbots_config(db, &cfg))
+            .await;
+        if let Err(e) = written {
             return ApiResponse::error(&read::database_error(e));
         }
     }

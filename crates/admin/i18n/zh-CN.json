@@ -315,6 +315,7 @@
   "domains.edit.subtitle": "把域名映射到已配置的某个站点",
   "domains.edit.title": "编辑域名",
   "domains.error.dns_provider_missing": "DNS 服务商 {name} 不存在，请先在 DNS 中创建",
+  "domains.error.form_check_failed": "无法从数据库校验该域名，请重试",
   "domains.error.invalid_format": "域名格式不正确（请使用 example.com，不要带协议）",
   "domains.error.name_required": "请填写域名",
   "domains.error.select_site": "请选择站点",

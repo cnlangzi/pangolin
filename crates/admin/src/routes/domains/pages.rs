@@ -24,10 +24,16 @@ fn ok_html(body: String) -> http::Result<Resp> {
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (domains, sites) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_domains(db).unwrap_or_default(),
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let html = DomainsListTemplate {
         domains,
         sites,
@@ -40,10 +46,16 @@ pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp
 }
 
 pub async fn render_create_page(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (sites, dns_providers) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_dns_providers(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let html = DomainsNewTemplate {
         sites,
         dns_providers,
@@ -84,11 +96,17 @@ pub async fn render_edit_page(
     if domain_pk.is_empty() {
         return Ok(crate::not_found(lang));
     }
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    let existing = pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None);
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (sites, dns_providers, existing) = app
+        .with_db_or(move |db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_dns_providers(db).unwrap_or_default(),
+                pangolin_core::db::get_domain(db, &domain_pk).unwrap_or(None),
+            )
+        })
+        .await;
 
     let Some(existing) = existing else {
         return Ok(crate::not_found(lang));
@@ -129,11 +147,17 @@ pub async fn render_for_site(
     csrf: &str,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let all_domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (all_domains, sites) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_domains(db).unwrap_or_default(),
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let site = sites.iter().find(|s| s.name == site_name).cloned();
-    drop(db);
 
     let site_name_owned = site_name.to_owned();
     let domains: Vec<_> = all_domains
@@ -177,10 +201,16 @@ pub async fn api_render_form_new(
     use crate::templates::DomainsNewTemplate;
     use askama::Template;
 
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (sites, dns_providers) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_dns_providers(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let html = DomainsNewTemplate {
         sites,
         dns_providers,

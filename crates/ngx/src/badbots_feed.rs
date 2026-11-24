@@ -159,11 +159,9 @@ mod tests {
         );
         // The seeded row has the check on — turn it off, so the
         // service has no library to refresh.
-        {
-            let conn = app.db.lock().await;
-            conn.execute("UPDATE badbots_config SET enabled = 0 WHERE id = 1", [])
-                .expect("turn the check off");
-        }
+        app.with_db_res(|db| db.execute("UPDATE badbots_config SET enabled = 0 WHERE id = 1", []))
+            .await
+            .expect("turn the check off");
         app.rebuild_badbots().await;
         assert!(
             app.badbots.read().is_none(),

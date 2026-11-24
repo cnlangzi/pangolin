@@ -315,6 +315,7 @@
   "domains.edit.subtitle": "Map a hostname to one of your configured sites",
   "domains.edit.title": "Edit domain",
   "domains.error.dns_provider_missing": "DNS provider '{name}' does not exist; create it under DNS first",
+  "domains.error.form_check_failed": "The domain could not be checked against the database; try again",
   "domains.error.invalid_format": "Invalid domain format (use example.com, no scheme)",
   "domains.error.name_required": "Domain name is required",
   "domains.error.select_site": "Please select a site",

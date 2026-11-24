@@ -63,10 +63,19 @@ use crate::App;
 /// against `tun.token_hash`. We hash *here* in the call
 /// path; the DB lookup is just the equality check.
 pub(crate) async fn validate_token(app: &App, token: &str, tun_name: &str) -> Result<(), u16> {
-    let conn = app.db.lock().await;
-    let row = match pangolin_core::db::auth_tun(&conn, tun_name, token) {
-        Ok(r) => r,
-        Err(_) => return Err(500),
+    // The lookup runs on the blocking pool: it is a synchronous
+    // SQLite call, and a worker thread that runs one is a worker
+    // thread that is not proxying requests (issue #254).
+    let token = token.to_string();
+    let tun_name = tun_name.to_string();
+    let row = match app
+        .with_db(move |conn| pangolin_core::db::auth_tun(conn, &tun_name, &token))
+        .await
+    {
+        Ok(Ok(row)) => row,
+        // A refused read and a panicked read are the same answer for
+        // the client: the gateway could not check the token.
+        Ok(Err(_)) | Err(_) => return Err(500),
     };
     let now = chrono::Utc::now();
     match row {
@@ -79,13 +88,17 @@ pub(crate) async fn validate_token(app: &App, token: &str, tun_name: &str) -> Re
 }
 
 pub(crate) async fn mark_tun_online(app: &App, tun_name: &str) {
-    let conn = app.db.lock().await;
-    let _ = pangolin_core::db::set_tun_online(&conn, tun_name, true);
+    let tun_name = tun_name.to_string();
+    let _ = app
+        .with_db(move |conn| pangolin_core::db::set_tun_online(conn, &tun_name, true))
+        .await;
 }
 
 pub(crate) async fn mark_tun_offline(app: &App, tun_name: &str) {
-    let conn = app.db.lock().await;
-    let _ = pangolin_core::db::set_tun_online(&conn, tun_name, false);
+    let tun_name = tun_name.to_string();
+    let _ = app
+        .with_db(move |conn| pangolin_core::db::set_tun_online(conn, &tun_name, false))
+        .await;
 }
 
 // ---- Main tunnel server ----

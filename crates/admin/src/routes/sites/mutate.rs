@@ -59,10 +59,14 @@ pub async fn handle_create(
     };
     // The site's stored list, read before the write: the ids the form
     // cannot show have to survive the save (see `merge_bot_list`).
-    let stored_bots: BTreeSet<String> = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default()
-    };
+    //
+    // The read runs on the blocking pool (issue #254).
+    let key = name.clone();
+    let stored_bots: BTreeSet<String> = app
+        .with_db_or(move |db| {
+            pangolin_core::db::get_site_rate_limit_bots(db, &key).unwrap_or_default()
+        })
+        .await;
 
     let site = Site {
         name: parsed.name.clone(),
@@ -75,30 +79,72 @@ pub async fn handle_create(
         domain_count: 0,
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_site(&db, &site);
-    // The policy is only written when the site itself was written —
-    // a failed site write must not leave an orphaned policy row.
-    let limit_result = match &result {
-        Ok(()) => parsed
-            .rate_limit
-            .as_ref()
-            .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p)),
-        Err(_) => None,
+    // The page the operator gets when the write failed: the form's
+    // own values, so nothing has to be retyped.
+    let error_context = FormContext {
+        site: Some(site_prefill(&params, &name)),
+        rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
+        // A submission that carried no list leaves the
+        // stored one alone — the re-render has to show
+        // it, or the operator would uncheck every box by
+        // accident.
+        rate_limit_bots: parsed
+            .rate_limit_bots
+            .clone()
+            .unwrap_or_else(|| stored_bots.clone()),
+        provider: Some(&parsed.provider),
     };
-    let provider_result = match &result {
-        Ok(()) => save_provider(&db, &name, &parsed.provider),
-        Err(_) => None,
+
+    // The write runs on the blocking pool, under one connection: the
+    // site's row, its policy, its provider and its bot list belong to
+    // the same write (issue #254).
+    let app_for_db = app.clone();
+    let name_for_db = name.clone();
+    let rate_limit = parsed.rate_limit.clone();
+    let rate_limit_bots = parsed.rate_limit_bots.clone();
+    let provider = parsed.provider.clone();
+    let stored_bots_for_db = stored_bots.clone();
+    let written = app
+        .with_db(move |db| {
+            let result = pangolin_core::db::upsert_site(db, &site);
+            // The policy is only written when the site itself was written —
+            // a failed site write must not leave an orphaned policy row.
+            let limit_result = match &result {
+                Ok(()) => rate_limit
+                    .as_ref()
+                    .map(|p| pangolin_core::db::upsert_site_rate_limit(db, &name_for_db, p)),
+                Err(_) => None,
+            };
+            let provider_result = match &result {
+                Ok(()) => save_provider(db, &name_for_db, &provider),
+                Err(_) => None,
+            };
+            let bots_result = save_bot_list(
+                db,
+                &app_for_db,
+                &name_for_db,
+                &result,
+                rate_limit_bots.as_ref(),
+                &stored_bots_for_db,
+            );
+            (result, limit_result, provider_result, bots_result)
+        })
+        .await;
+    let (result, limit_result, provider_result, bots_result) = match written {
+        Ok(written) => written,
+        Err(e) => {
+            log::warn!("sites: the write of {name} panicked: {e}");
+            return render_create_page_with_error(
+                app,
+                error_context,
+                &format!("Database error: {e}"),
+                None,
+                csrf,
+                lang,
+            )
+            .await;
+        }
     };
-    let bots_result = save_bot_list(
-        &db,
-        app,
-        &name,
-        &result,
-        parsed.rate_limit_bots.as_ref(),
-        &stored_bots,
-    );
-    drop(db);
 
     match result {
         Ok(()) => {
@@ -117,19 +163,7 @@ pub async fn handle_create(
         Err(e) => {
             render_create_page_with_error(
                 app,
-                FormContext {
-                    site: Some(site_prefill(&params, &name)),
-                    rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
-                    // A submission that carried no list leaves the
-                    // stored one alone — the re-render has to show
-                    // it, or the operator would uncheck every box by
-                    // accident.
-                    rate_limit_bots: parsed
-                        .rate_limit_bots
-                        .clone()
-                        .unwrap_or_else(|| stored_bots.clone()),
-                    provider: Some(&parsed.provider),
-                },
+                error_context,
                 &format!("Database error: {}", e),
                 None,
                 csrf,
@@ -165,22 +199,31 @@ pub async fn handle_update(
     // mention, and the bot list supplies the ids the form cannot show
     // (see `merge_bot_list`).
     let (stored_policy, stored_bots) = {
-        let db = app.db.lock().await;
-        let policy = pangolin_core::db::get_site_rate_limit(&db, &name)
-            .ok()
-            .flatten();
-        let bots = pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default();
-        (policy, bots)
+        // The reads run on the blocking pool, under one connection
+        // (issue #254).
+        let key = name.clone();
+        app.with_db_or(move |db| {
+            let policy = pangolin_core::db::get_site_rate_limit(db, &key)
+                .ok()
+                .flatten();
+            let bots = pangolin_core::db::get_site_rate_limit_bots(db, &key).unwrap_or_default();
+            (policy, bots)
+        })
+        .await
     };
     // For edit mode, fetch the existing site once so we can fall back to
     // its backend when the submission was empty (better UX than a
     // blanked-out form on the error path).
     let existing_backend: Option<String> = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_site(&db, &name)
-            .ok()
-            .flatten()
-            .map(|s| s.backend)
+        // The read runs on the blocking pool (issue #254).
+        let key = name.clone();
+        app.with_db_or(move |db| {
+            pangolin_core::db::get_site(db, &key)
+                .ok()
+                .flatten()
+                .map(|s| s.backend)
+        })
+        .await
     };
     let global_provider = app.system_config.read().provider;
     let parsed = match parse_site_form(
@@ -233,30 +276,80 @@ pub async fn handle_update(
         domain_count: 0,
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_site(&db, &site);
-    // The policy is only written when the site itself was written —
-    // a failed site write must not leave an orphaned policy row.
-    let limit_result = match &result {
-        Ok(()) => parsed
-            .rate_limit
-            .as_ref()
-            .map(|p| pangolin_core::db::upsert_site_rate_limit(&db, &name, p)),
-        Err(_) => None,
+    // The page the operator gets when the write failed: the form's
+    // own values, so nothing has to be retyped.
+    let error_context = FormContext {
+        site: Some({
+            let mut prefill = site_prefill(&params, &name);
+            if prefill.backend.is_empty()
+                && let Some(backend) = existing_backend.clone()
+            {
+                prefill.backend = backend;
+            }
+            prefill
+        }),
+        rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
+        // A submission that carried no list leaves the
+        // stored one alone — the re-render has to show
+        // it, or the operator would uncheck every box by
+        // accident.
+        rate_limit_bots: parsed
+            .rate_limit_bots
+            .clone()
+            .unwrap_or_else(|| stored_bots.clone()),
+        provider: Some(&parsed.provider),
     };
-    let provider_result = match &result {
-        Ok(()) => save_provider(&db, &name, &parsed.provider),
-        Err(_) => None,
+
+    // The write runs on the blocking pool, under one connection: the
+    // site's row, its policy, its provider and its bot list belong to
+    // the same write (issue #254).
+    let app_for_db = app.clone();
+    let name_for_db = name.clone();
+    let rate_limit = parsed.rate_limit.clone();
+    let rate_limit_bots = parsed.rate_limit_bots.clone();
+    let provider = parsed.provider.clone();
+    let stored_bots_for_db = stored_bots.clone();
+    let written = app
+        .with_db(move |db| {
+            let result = pangolin_core::db::upsert_site(db, &site);
+            // The policy is only written when the site itself was written —
+            // a failed site write must not leave an orphaned policy row.
+            let limit_result = match &result {
+                Ok(()) => rate_limit
+                    .as_ref()
+                    .map(|p| pangolin_core::db::upsert_site_rate_limit(db, &name_for_db, p)),
+                Err(_) => None,
+            };
+            let provider_result = match &result {
+                Ok(()) => save_provider(db, &name_for_db, &provider),
+                Err(_) => None,
+            };
+            let bots_result = save_bot_list(
+                db,
+                &app_for_db,
+                &name_for_db,
+                &result,
+                rate_limit_bots.as_ref(),
+                &stored_bots_for_db,
+            );
+            (result, limit_result, provider_result, bots_result)
+        })
+        .await;
+    let (result, limit_result, provider_result, bots_result) = match written {
+        Ok(written) => written,
+        Err(e) => {
+            log::warn!("sites: the write of {name} panicked: {e}");
+            return render_edit_page_with_error(
+                app,
+                error_context,
+                &format!("Database error: {e}"),
+                None,
+                csrf,
+                lang,
+            )
+            .await;
+        }
     };
-    let bots_result = save_bot_list(
-        &db,
-        app,
-        &name,
-        &result,
-        parsed.rate_limit_bots.as_ref(),
-        &stored_bots,
-    );
-    drop(db);
 
     match result {
         Ok(()) => {
@@ -273,27 +366,9 @@ pub async fn handle_update(
             Ok(redirect_response("/sites"))
         }
         Err(e) => {
-            let mut prefill = site_prefill(&params, &name);
-            if prefill.backend.is_empty()
-                && let Some(backend) = existing_backend
-            {
-                prefill.backend = backend;
-            }
             render_edit_page_with_error(
                 app,
-                FormContext {
-                    site: Some(prefill),
-                    rate_limit: parsed.rate_limit.clone().unwrap_or_default(),
-                    // A submission that carried no list leaves the
-                    // stored one alone — the re-render has to show
-                    // it, or the operator would uncheck every box by
-                    // accident.
-                    rate_limit_bots: parsed
-                        .rate_limit_bots
-                        .clone()
-                        .unwrap_or_else(|| stored_bots.clone()),
-                    provider: Some(&parsed.provider),
-                },
+                error_context,
                 &format!("Database error: {}", e),
                 None,
                 csrf,
@@ -382,9 +457,9 @@ pub async fn handle_delete(
     if let Some(n) = name
         && !n.is_empty()
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_site(&db, &n);
-        drop(db);
+        let _ = app
+            .with_db_res(move |db| pangolin_core::db::delete_site(db, &n))
+            .await;
         app.reload_indexes().await;
     }
     Ok(redirect_response("/sites"))
@@ -405,9 +480,9 @@ pub async fn api_handle_delete(
     if name.is_empty() {
         return Ok(crate::not_found(lang));
     }
-    let db = app.db.lock().await;
-    let _ = pangolin_core::db::delete_site(&db, &name);
-    drop(db);
+    let _ = app
+        .with_db_res(move |db| pangolin_core::db::delete_site(db, &name))
+        .await;
     app.reload_indexes().await;
     Ok(Response::builder()
         .status(200)
@@ -450,6 +525,43 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Sixteen concurrent site writes all land (issue #254).
+    ///
+    /// The writes go through `App::with_db`, which serialises them on
+    /// the one connection the gateway has. Every write has to
+    /// succeed: a busy database would fail one of them, and the row
+    /// would be missing.
+    #[tokio::test]
+    async fn sixteen_concurrent_site_writes_all_land() {
+        const WRITES: usize = 16;
+        let (_dir, app) = make_test_app();
+        let mut tasks = Vec::new();
+        for i in 0..WRITES {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = format!("name=s{i}&backend=http://127.0.0.1:8080").into_bytes();
+                handle_create(&app, &body, "csrf", Lang::En).await
+            }));
+        }
+        for task in tasks {
+            let resp = task
+                .await
+                .expect("the task ran")
+                .expect("the handler answered");
+            assert_eq!(
+                resp.status().as_u16(),
+                302,
+                "every write must succeed — a busy database would fail one"
+            );
+        }
+        let sites = app
+            .with_db(pangolin_core::db::list_sites)
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
+        assert_eq!(sites.len(), WRITES, "every site is in the database");
+    }
+
     /// The site's list is written next to the policy — the form's
     /// checked boxes become the site's list (issue #131).
     #[tokio::test]
@@ -464,8 +576,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status().as_u16(), 302);
 
-        let db = app.db.lock().await;
-        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        let stored = app
+            .with_db(|db| pangolin_core::db::get_site_rate_limit_bots(db, "a"))
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
         assert_eq!(stored, bots(&["gptbot", "ccbot"]));
     }
 
@@ -494,8 +609,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status().as_u16(), 302);
 
-        let db = app.db.lock().await;
-        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        let stored = app
+            .with_db(|db| pangolin_core::db::get_site_rate_limit_bots(db, "a"))
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
         assert_eq!(stored, bots(&["gptbot"]));
     }
 
@@ -523,8 +641,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status().as_u16(), 302);
 
-        let db = app.db.lock().await;
-        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        let stored = app
+            .with_db(|db| pangolin_core::db::get_site_rate_limit_bots(db, "a"))
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
         assert!(stored.is_empty());
     }
 
@@ -561,15 +682,12 @@ mod tests {
         // never rendered as a checkbox — it can only be in the table
         // through the API or by hand.
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::set_site_rate_limit_bots(
-                &db,
-                "a",
-                &["gptbot".to_string(), "my.bot".to_string()]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
+            let bots = ["gptbot".to_string(), "my.bot".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>();
+            app.with_db_res(move |db| pangolin_core::db::set_site_rate_limit_bots(db, "a", &bots))
+                .await
+                .expect("the write ran");
         }
 
         // The operator saves the site with no box checked.
@@ -584,8 +702,11 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status().as_u16(), 302);
 
-        let db = app.db.lock().await;
-        let stored = pangolin_core::db::get_site_rate_limit_bots(&db, "a").unwrap();
+        let stored = app
+            .with_db(|db| pangolin_core::db::get_site_rate_limit_bots(db, "a"))
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
         assert_eq!(
             stored,
             ["my.bot".to_string()]

@@ -852,8 +852,8 @@ pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
 /// Update the singleton system config row in place.
 ///
 /// Caller is responsible for holding the DB write lock if used
-/// concurrently. The admin route handler takes `app.db.lock()`
-/// around this call.
+/// concurrently. The admin route handler runs this inside
+/// `App::with_db`, which holds the lock for the whole closure.
 pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE system_config
@@ -898,8 +898,8 @@ pub fn get_badbots_config(conn: &Connection) -> rusqlite::Result<BadbotsSettings
 /// Update the singleton IP-reputation configuration row in place.
 ///
 /// Caller is responsible for holding the DB write lock if used
-/// concurrently. The admin route handler takes `app.db.lock()`
-/// around this call.
+/// concurrently. The admin route handler runs this inside
+/// `App::with_db`, which holds the lock for the whole closure.
 pub fn update_badbots_config(conn: &Connection, cfg: &BadbotsSettings) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE badbots_config

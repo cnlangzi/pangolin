@@ -27,17 +27,17 @@ fn ok_html(body: String) -> http::Result<Resp> {
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let providers = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_dns_providers(&db).unwrap_or_default()
-    };
+    // The reads run on the blocking pool (issue #254).
+    let providers = app
+        .with_db_or(|db| pangolin_core::db::list_dns_providers(db).unwrap_or_default())
+        .await;
     let mut domain_counts: HashMap<String, usize> = HashMap::new();
-    {
-        let db = app.db.lock().await;
-        for d in pangolin_core::db::list_domains(&db).unwrap_or_default() {
-            if let Some(p) = d.dns_provider {
-                *domain_counts.entry(p).or_insert(0) += 1;
-            }
+    let domains = app
+        .with_db_or(|db| pangolin_core::db::list_domains(db).unwrap_or_default())
+        .await;
+    for d in domains {
+        if let Some(p) = d.dns_provider {
+            *domain_counts.entry(p).or_insert(0) += 1;
         }
     }
     let html = DnsProvidersListTemplate {
@@ -65,10 +65,9 @@ pub async fn render_edit_page(
     let Some(name) = name else {
         return Ok(crate::not_found(lang));
     };
-    let provider = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_dns_provider(&db, &name).unwrap_or(None)
-    };
+    let provider = app
+        .with_db_or(move |db| pangolin_core::db::get_dns_provider(db, &name).unwrap_or(None))
+        .await;
     let Some(provider) = provider else {
         return Ok(crate::not_found(lang));
     };

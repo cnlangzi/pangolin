@@ -139,10 +139,10 @@ pub async fn route(state: &ApiState, req: ApiRequest) -> ApiResponse {
     // 2 — the operator's switch. A gateway that was never configured
     // has no token, so it fails closed; one that was configured but
     // switched off refuses every call.
-    let runtime = {
-        let db = state.app.db.lock().await;
-        pangolin_core::db::get_api_config(&db).unwrap_or(None)
-    };
+    let runtime = state
+        .app
+        .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
+        .await;
     let Some(runtime) = runtime else {
         return ApiResponse::error(&ApiError::unauthorized(
             codes::INVALID_TOKEN,
@@ -242,11 +242,16 @@ async fn learn_dashboard_ip(
     if runtime.dashboard_ip.as_deref() == Some(ip.as_str()) {
         return;
     }
-    let db = state.app.db.lock().await;
     // Only the address column is written: the operator's settings
     // (the token, the switch, the port) must not be reverted by a
     // copy read before the authentication.
-    if let Err(e) = pangolin_core::db::update_api_dashboard_ip(&db, &ip) {
+    //
+    // The write runs on the blocking pool (issue #254).
+    if let Err(e) = state
+        .app
+        .with_db_res(move |db| pangolin_core::db::update_api_dashboard_ip(db, &ip))
+        .await
+    {
         log::warn!("api: storing the dashboard's address failed: {e}");
     }
 }

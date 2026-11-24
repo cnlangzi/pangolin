@@ -38,9 +38,10 @@ fn bad_request(lang: Lang, message: &str) -> Resp {
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let sites = app
+        .with_db_or(|db| pangolin_core::db::list_sites(db).unwrap_or_default())
+        .await;
     let html = SitesListTemplate {
         sites,
         active_nav: "sites",
@@ -53,10 +54,10 @@ pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp
 
 /// Render the New site page.
 pub async fn render_create_page(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let tunnels = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_tuns(&db).unwrap_or_default()
-    };
+    // The read runs on the blocking pool (issue #254).
+    let tunnels = app
+        .with_db_or(|db| pangolin_core::db::list_tuns(db).unwrap_or_default())
+        .await;
     let html = SitesNewTemplate {
         site: None,
         error: None,
@@ -89,20 +90,26 @@ pub async fn render_edit_page(
             return Ok(bad_request(lang, &lang.t("sites.error.missing_name")));
         }
     };
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let tunnels = pangolin_core::db::list_tuns(&db).unwrap_or_default();
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let key = name.clone();
+    let (sites, tunnels, rate_limit, rate_limit_bots) = app
+        .with_db_or(move |db| {
+            let sites = pangolin_core::db::list_sites(db).unwrap_or_default();
+            let tunnels = pangolin_core::db::list_tuns(db).unwrap_or_default();
+            // Issue #117: the per-site rate-limit policy.
+            let rate_limit = pangolin_core::db::get_site_rate_limit(db, &key)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            // Issue #131: the site's bot-limited list — the boxes that are
+            // pre-checked on the form.
+            let rate_limit_bots =
+                pangolin_core::db::get_site_rate_limit_bots(db, &key).unwrap_or_default();
+            (sites, tunnels, rate_limit, rate_limit_bots)
+        })
+        .await;
     let site = sites.into_iter().find(|s| s.name == name);
-    // Issue #117: the per-site rate-limit policy.
-    let rate_limit = pangolin_core::db::get_site_rate_limit(&db, &name)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    // Issue #131: the site's bot-limited list — the boxes that are
-    // pre-checked on the form.
-    let rate_limit_bots =
-        pangolin_core::db::get_site_rate_limit_bots(&db, &name).unwrap_or_default();
-    drop(db);
     let html = SitesEditTemplate {
         site,
         error: None,
@@ -150,10 +157,10 @@ pub(super) async fn render_create_page_with_error(
     csrf: &str,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let tunnels = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_tuns(&db).unwrap_or_default()
-    };
+    // The read runs on the blocking pool (issue #254).
+    let tunnels = app
+        .with_db_or(|db| pangolin_core::db::list_tuns(db).unwrap_or_default())
+        .await;
     // The operator's typed provider fields are kept, exactly like the
     // rate-limit fields: they only have to fix the one that was
     // wrong.
@@ -190,10 +197,10 @@ pub(super) async fn render_edit_page_with_error(
     csrf: &str,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let tunnels = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_tuns(&db).unwrap_or_default()
-    };
+    // The read runs on the blocking pool (issue #254).
+    let tunnels = app
+        .with_db_or(|db| pangolin_core::db::list_tuns(db).unwrap_or_default())
+        .await;
     let site_name = ctx
         .site
         .as_ref()

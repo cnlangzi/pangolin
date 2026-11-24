@@ -83,39 +83,48 @@ impl Service for ApiService {
 /// accepts nothing. The environment's token is only used when the
 /// gateway has no token of its own yet.
 async fn seed_api_config(app: &Arc<App>, env_token: Option<&str>) {
-    let db = app.db.lock().await;
-    let env_hash = env_token
-        .map(pangolin_core::db::sha256_hex)
-        .unwrap_or_default();
-    let existed = pangolin_core::db::get_api_config(&db)
-        .unwrap_or(None)
-        .is_some();
-    // The row is created on the first boot: a fresh instance id, the
-    // token the environment offers and the API **switched off** — a
-    // gateway that was never configured accepts nothing.
-    let row =
-        match pangolin_core::db::ensure_api_config(&db, &api::generate_instance_id(), &env_hash) {
-            Ok(row) => row,
-            Err(e) => {
-                log::warn!("api: seeding the API configuration failed: {e}");
-                return;
-            }
-        };
-    if !existed {
-        log::info!("api: the management API is seeded and switched off");
-    }
-    // The environment only seeds the token of a gateway that has none
-    // of its own yet — a token configured afterwards is never
-    // overwritten.
-    if row.token_hash.is_empty()
-        && let Some(hash) = env_token.map(pangolin_core::db::sha256_hex)
-    {
-        if let Err(e) = pangolin_core::db::update_api_token_hash(&db, &hash) {
-            log::warn!("api: storing the token from {ENV_TOKEN} failed: {e}");
-        } else {
-            log::info!("api: the bearer token came from {ENV_TOKEN}");
+    // The whole seeding runs on the blocking pool: it is synchronous
+    // SQLite work, and the sequence belongs to one connection
+    // (issue #254). The closure owns its copy of the token — it
+    // moves to another thread.
+    let env_token = env_token.map(str::to_string);
+    app.with_db_or(move |db| {
+        let env_hash = env_token
+            .as_deref()
+            .map(pangolin_core::db::sha256_hex)
+            .unwrap_or_default();
+        let existed = pangolin_core::db::get_api_config(db)
+            .unwrap_or(None)
+            .is_some();
+        // The row is created on the first boot: a fresh instance id, the
+        // token the environment offers and the API **switched off** — a
+        // gateway that was never configured accepts nothing.
+        let row =
+            match pangolin_core::db::ensure_api_config(db, &api::generate_instance_id(), &env_hash)
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    log::warn!("api: seeding the API configuration failed: {e}");
+                    return;
+                }
+            };
+        if !existed {
+            log::info!("api: the management API is seeded and switched off");
         }
-    }
+        // The environment only seeds the token of a gateway that has none
+        // of its own yet — a token configured afterwards is never
+        // overwritten.
+        if row.token_hash.is_empty()
+            && let Some(hash) = env_token.as_deref().map(pangolin_core::db::sha256_hex)
+        {
+            if let Err(e) = pangolin_core::db::update_api_token_hash(db, &hash) {
+                log::warn!("api: storing the token from {ENV_TOKEN} failed: {e}");
+            } else {
+                log::info!("api: the bearer token came from {ENV_TOKEN}");
+            }
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -163,9 +172,11 @@ mod tests {
         let (_dir, app) = test_app().await;
         seed_api_config(&app, None).await;
 
-        let db = app.db.lock().await;
-        let row = pangolin_core::db::get_api_config(&db)
-            .expect("read")
+        let row = app
+            .with_db(pangolin_core::db::get_api_config)
+            .await
+            .expect("the query ran")
+            .expect("the row was read")
             .expect("the row exists");
         assert!(!row.enabled, "a fresh gateway accepts nothing");
         assert!(row.token_hash.is_empty(), "no token was configured");
@@ -185,18 +196,21 @@ mod tests {
         let (_dir, app) = test_app().await;
         seed_api_config(&app, Some("the-token")).await;
 
-        let db = app.db.lock().await;
-        let row = pangolin_core::db::get_api_config(&db)
-            .expect("read")
+        let row = app
+            .with_db(pangolin_core::db::get_api_config)
+            .await
+            .expect("the query ran")
+            .expect("the row was read")
             .expect("the row exists");
         assert_eq!(row.token_hash, pangolin_core::db::sha256_hex("the-token"));
 
         // A second boot does not touch it.
-        drop(db);
         seed_api_config(&app, Some("another-token")).await;
-        let db = app.db.lock().await;
-        let row = pangolin_core::db::get_api_config(&db)
-            .expect("read")
+        let row = app
+            .with_db(pangolin_core::db::get_api_config)
+            .await
+            .expect("the query ran")
+            .expect("the row was read")
             .expect("the row exists");
         assert_eq!(
             row.token_hash,

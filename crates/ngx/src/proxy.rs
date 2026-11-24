@@ -2439,8 +2439,9 @@ mod tests {
         {
             let mut changed = (*site).clone();
             changed.backend = "http://127.0.0.1:9999".into();
-            let db = app.db.lock().await;
-            pangolin_core::db::upsert_site(&db, &changed).expect("update the site");
+            app.with_db_res(move |db| pangolin_core::db::upsert_site(db, &changed))
+                .await
+                .expect("update the site");
         }
         app.reload_indexes().await;
 
