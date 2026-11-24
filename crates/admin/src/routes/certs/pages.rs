@@ -38,14 +38,19 @@ pub async fn render(
     lang: Lang,
 ) -> http::Result<Resp> {
     let parsed: Vec<CertStatus> = parse_status_filter(status_filter);
-    let db = app.db.lock().await;
-    let certs = if parsed.is_empty() {
-        pangolin_core::db::list_certs(&db).unwrap_or_default()
-    } else {
-        pangolin_core::db::list_certs_by_status(&db, &parsed).unwrap_or_default()
-    };
-    let counts = pangolin_core::db::count_certs_by_status(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (certs, counts) = app
+        .with_db_or(move |db| {
+            let certs = if parsed.is_empty() {
+                pangolin_core::db::list_certs(db).unwrap_or_default()
+            } else {
+                pangolin_core::db::list_certs_by_status(db, &parsed).unwrap_or_default()
+            };
+            let counts = pangolin_core::db::count_certs_by_status(db).unwrap_or_default();
+            (certs, counts)
+        })
+        .await;
     let now = chrono::Utc::now();
     // Pre-compute view-model rows: status as string, retryable bool,
     // pre-formatted relative-time + expires-at. Keeps the template free

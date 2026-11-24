@@ -38,9 +38,10 @@ pub async fn render_table_for_site(
     csrf: &str,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let all_domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let all_domains = app
+        .with_db_or(|db| pangolin_core::db::list_domains(db).unwrap_or_default())
+        .await;
     let site_name_owned = site_name.to_owned();
     let domains: Vec<_> = all_domains
         .into_iter()

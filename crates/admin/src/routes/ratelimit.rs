@@ -231,13 +231,25 @@ pub async fn handle_add_rule(
     let params = parse_form(body);
 
     let rule = {
-        let db = app.db.lock().await;
-        let known_sites = pangolin_core::db::list_sites(&db)
-            .unwrap_or_default()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>();
-        parse_ip_rule_form(&params, &|scope| known_sites.iter().any(|s| s == scope))
+        // The parse reads the site names, so it runs on the blocking
+        // pool with the connection in hand (issue #254).
+        match app
+            .with_db(move |db| {
+                let known_sites = pangolin_core::db::list_sites(db)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>();
+                parse_ip_rule_form(&params, &|scope| known_sites.iter().any(|s| s == scope))
+            })
+            .await
+        {
+            Ok(rule) => rule,
+            Err(e) => {
+                log::warn!("ratelimit: the rule form could not be parsed: {e}");
+                return Ok(redirect("/ratelimit?error=ip_rule_form"));
+            }
+        }
     };
 
     let rule = match rule {
@@ -252,8 +264,11 @@ pub async fn handle_add_rule(
     };
 
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::upsert_ip_rule(&db, &rule);
+        // The write runs on the blocking pool (issue #254).
+        let rule_for_db = rule.clone();
+        let _ = app
+            .with_db_res(move |db| pangolin_core::db::upsert_ip_rule(db, &rule_for_db))
+            .await;
     }
     app.reload_indexes().await;
     Ok(redirect("/ratelimit"))
@@ -280,8 +295,10 @@ pub async fn api_handle_delete_rule(
     };
     let id = rule_id(&scope, kind, &normalized);
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_ip_rule(&db, &id);
+        // The write runs on the blocking pool (issue #254).
+        let _ = app
+            .with_db_res(move |db| pangolin_core::db::delete_ip_rule(db, &id))
+            .await;
     }
     app.reload_indexes().await;
     Ok(Response::builder()
@@ -771,9 +788,15 @@ mod tests {
             custom_403_body: None,
         };
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::upsert_site(&db, &site).unwrap();
-            pangolin_core::db::upsert_site_rate_limit(&db, "a", &policy).unwrap();
+            // The writes run on the blocking pool, under one connection
+            // (issue #254).
+            app.with_db_res(move |db| {
+                pangolin_core::db::upsert_site(db, &site)?;
+                pangolin_core::db::upsert_site_rate_limit(db, "a", &policy)?;
+                Ok(())
+            })
+            .await
+            .expect("the seed write ran");
         }
         app.reload_indexes().await;
     }
@@ -803,13 +826,11 @@ mod tests {
     async fn seed_bot_limited_site(app: &Arc<App>) {
         seed_limited_site(app).await;
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::set_site_rate_limit_bots(
-                &db,
-                "a",
-                &BTreeSet::from(["googlebot".to_string()]),
-            )
-            .unwrap();
+            // The write runs on the blocking pool (issue #254).
+            let bots = BTreeSet::from(["googlebot".to_string()]);
+            app.with_db_res(move |db| pangolin_core::db::set_site_rate_limit_bots(db, "a", &bots))
+                .await
+                .expect("the write ran");
         }
         app.reload_indexes().await;
     }
@@ -1365,8 +1386,11 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::upsert_ip_rule(&db, &rule).unwrap();
+            // The write runs on the blocking pool (issue #254).
+            let rule_for_db = rule.clone();
+            app.with_db_res(move |db| pangolin_core::db::upsert_ip_rule(db, &rule_for_db))
+                .await
+                .expect("the write ran");
         }
         app.reload_indexes().await;
         let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
@@ -1384,8 +1408,11 @@ mod tests {
 
         // The rule is removed — the client is now only over the limit.
         {
-            let db = app.db.lock().await;
-            pangolin_core::db::delete_ip_rule(&db, &rule.id).unwrap();
+            // The write runs on the blocking pool (issue #254).
+            let id = rule.id.clone();
+            app.with_db_res(move |db| pangolin_core::db::delete_ip_rule(db, &id))
+                .await
+                .expect("the write ran");
         }
         app.reload_indexes().await;
         let cfg = app.indexes.read().limits.get("a").cloned().unwrap();
@@ -1450,8 +1477,11 @@ mod tests {
         assert_eq!(resp.status(), 302);
 
         {
-            let db = app.db.lock().await;
-            let rules = pangolin_core::db::list_ip_rules(&db).unwrap();
+            let rules = app
+                .with_db(pangolin_core::db::list_ip_rules)
+                .await
+                .expect("the query ran")
+                .expect("the rows were read");
             assert_eq!(rules.len(), 1);
             assert_eq!(rules[0].scope, "global");
             assert_eq!(rules[0].kind, RuleKind::Blacklist);
@@ -1472,8 +1502,12 @@ mod tests {
         .await
         .expect("delete rule");
         assert_eq!(resp.status(), 200);
-        let db = app.db.lock().await;
-        assert!(pangolin_core::db::list_ip_rules(&db).unwrap().is_empty());
+        let rules = app
+            .with_db(pangolin_core::db::list_ip_rules)
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
+        assert!(rules.is_empty());
     }
 
     #[tokio::test]
@@ -1484,8 +1518,12 @@ mod tests {
             .await
             .expect("add rule");
         assert_eq!(resp.status(), 302);
-        let db = app.db.lock().await;
-        assert!(pangolin_core::db::list_ip_rules(&db).unwrap().is_empty());
+        let rules = app
+            .with_db(pangolin_core::db::list_ip_rules)
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
+        assert!(rules.is_empty());
     }
 
     #[tokio::test]
@@ -1498,8 +1536,12 @@ mod tests {
             .await
             .expect("add rule");
         assert_eq!(resp.status(), 302);
-        let db = app.db.lock().await;
-        assert!(pangolin_core::db::list_ip_rules(&db).unwrap().is_empty());
+        let rules = app
+            .with_db(pangolin_core::db::list_ip_rules)
+            .await
+            .expect("the query ran")
+            .expect("the rows were read");
+        assert!(rules.is_empty());
     }
 
     #[test]

@@ -94,9 +94,10 @@ pub async fn handle_create(
         created_at: now,
         updated_at: now,
     };
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_dns_provider(&db, &p);
-    drop(db);
+    // The write runs on the blocking pool (issue #254).
+    let result = app
+        .with_db_res(move |db| pangolin_core::db::upsert_dns_provider(db, &p))
+        .await;
     match result {
         Ok(()) => {
             app.reload_indexes().await;
@@ -119,8 +120,10 @@ pub async fn handle_update(
     let params = parse_form(body);
 
     let existing = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_dns_provider(&db, &name).unwrap_or(None)
+        // The read runs on the blocking pool (issue #254).
+        let key = name.clone();
+        app.with_db_or(move |db| pangolin_core::db::get_dns_provider(db, &key).unwrap_or(None))
+            .await
     };
     let Some(existing) = existing else {
         return Ok(crate::not_found(lang));
@@ -139,9 +142,10 @@ pub async fn handle_update(
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_dns_provider(&db, &updated);
-    drop(db);
+    // The write runs on the blocking pool (issue #254).
+    let result = app
+        .with_db_res(move |db| pangolin_core::db::upsert_dns_provider(db, &updated))
+        .await;
     match result {
         Ok(()) => {
             app.reload_indexes().await;
@@ -166,11 +170,15 @@ pub async fn handle_test(app: &Arc<App>, body: &[u8], lang: Lang) -> http::Resul
 
     let name = params.get("name").cloned().unwrap_or_default();
     let existing_config = if !name.is_empty() {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_dns_provider(&db, &name)
-            .ok()
-            .flatten()
-            .map(|p| p.config)
+        // The read runs on the blocking pool (issue #254).
+        let key = name.clone();
+        app.with_db_or(move |db| {
+            pangolin_core::db::get_dns_provider(db, &key)
+                .ok()
+                .flatten()
+                .map(|p| p.config)
+        })
+        .await
     } else {
         None
     };
@@ -260,21 +268,28 @@ pub async fn api_handle_delete(
 }
 
 async fn delete_provider_txn(app: &Arc<App>, name: &str) -> anyhow::Result<usize> {
-    let mut conn = app.db.lock().await;
-    let tx = conn.transaction().context("begin tx")?;
-    let upd = tx
-        .execute(
-            "UPDATE domains SET dns_provider = NULL WHERE dns_provider = ?1",
+    // The whole delete runs on the blocking pool, inside one
+    // transaction: the domains that referenced the provider and the
+    // provider row itself are removed together (issue #254).
+    let name = name.to_string();
+    app.with_db(move |conn| {
+        let tx = conn.unchecked_transaction().context("begin tx")?;
+        let upd = tx
+            .execute(
+                "UPDATE domains SET dns_provider = NULL WHERE dns_provider = ?1",
+                rusqlite::params![name],
+            )
+            .context("update domains")?;
+        tx.execute(
+            "DELETE FROM dns_providers WHERE name = ?1",
             rusqlite::params![name],
         )
-        .context("update domains")?;
-    tx.execute(
-        "DELETE FROM dns_providers WHERE name = ?1",
-        rusqlite::params![name],
-    )
-    .context("delete provider")?;
-    tx.commit().context("commit")?;
-    Ok(upd)
+        .context("delete provider")?;
+        tx.commit().context("commit")?;
+        Ok(upd)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the database task failed: {e}"))?
 }
 
 fn render_create_page_with_error(

@@ -61,10 +61,10 @@ pub struct ProviderRangeStatus {
 /// fetched) is still listed — the operator has to be able to see that
 /// the guard would have nothing to work with.
 pub async fn provider_range_statuses(app: &Arc<App>, lang: Lang) -> Vec<ProviderRangeStatus> {
-    let stored = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_provider_ip_lists(&db).unwrap_or_default()
-    };
+    // The read runs on the blocking pool (issue #254).
+    let stored = app
+        .with_db_or(|db| pangolin_core::db::list_provider_ip_lists(db).unwrap_or_default())
+        .await;
 
     let stored: HashMap<(ProviderKey, String), pangolin_core::provider::ProviderIpList> = stored
         .into_iter()
@@ -129,6 +129,10 @@ pub fn total_guard_rejections(app: &Arc<App>) -> u64 {
 }
 
 /// The outcome of parsing the provider fields of the site form.
+///
+/// Cloneable because the write path hands it to the database task
+/// that runs the site's write off the async worker (issue #254).
+#[derive(Clone)]
 pub struct ParsedProvider {
     /// The per-site override. `None` → the site inherits every global
     /// default (no row is written).
@@ -415,16 +419,22 @@ pub async fn site_provider_view(
     let (over, ranges) = match site_name {
         None => (SiteProviderOverride::default(), Vec::new()),
         Some(name) => {
-            let db = app.db.lock().await;
-            let over = pangolin_core::db::get_site_provider(&db, name)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let ranges = pangolin_core::db::list_site_origin_allow(&db)
-                .ok()
-                .unwrap_or_default()
-                .remove(name)
-                .unwrap_or_default();
+            // The reads run on the blocking pool (issue #254).
+            let key = name.to_string();
+            let (over, ranges) = app
+                .with_db_or(move |db| {
+                    let over = pangolin_core::db::get_site_provider(db, &key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let ranges = pangolin_core::db::list_site_origin_allow(db)
+                        .ok()
+                        .unwrap_or_default()
+                        .remove(&key)
+                        .unwrap_or_default();
+                    (over, ranges)
+                })
+                .await;
             (over, ranges)
         }
     };
@@ -534,9 +544,10 @@ pub async fn provider_view_from_submitted(
 /// uses); the timestamp comes from the persisted row.
 pub async fn provider_range_state(app: &Arc<App>, key: ProviderKey) -> (usize, Option<String>) {
     let count = provider_range_count(app, key);
-    let db = app.db.lock().await;
-    let rows = pangolin_core::db::list_provider_ip_lists(&db).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let rows = app
+        .with_db_or(|db| pangolin_core::db::list_provider_ip_lists(db).unwrap_or_default())
+        .await;
     let fetched_at = rows
         .iter()
         .filter(|r| r.provider == key)

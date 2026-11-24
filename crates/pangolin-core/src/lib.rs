@@ -61,7 +61,7 @@ pub use config::{
     ApiConfig, BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, TrafficConfig,
     init_logger, load_config_and_init_logger,
 };
-pub use error::{PangolinError, Result};
+pub use error::{DbError, PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, TunnelClassification, host_matches_domains, lookup_site, site_of_host};
 pub use parse::{

@@ -156,19 +156,37 @@ pub async fn handle_create(
     let domain = params.get("domain").cloned().unwrap_or_default();
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function.
-    let parsed = {
-        let db = app.db.lock().await;
-        parse_domain_form(
-            &params,
-            &domain,
-            None,
-            &|name| {
-                pangolin_core::db::get_dns_provider(&db, name)
-                    .unwrap_or(None)
-                    .is_some()
-            },
-            lang,
-        )
+    // The parse reads the DNS providers, so it runs on the blocking
+    // pool with the connection in hand (issue #254).
+    let domain_for_db = domain.clone();
+    let parsed = match app
+        .with_db(move |conn| {
+            parse_domain_form(
+                &params,
+                &domain_for_db,
+                None,
+                &|name| {
+                    pangolin_core::db::get_dns_provider(conn, name)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+                lang,
+            )
+        })
+        .await
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::warn!("domains: the form could not be parsed: {e}");
+            return render_create_page_with_error(
+                app,
+                "the form could not be checked",
+                csrf,
+                None,
+                lang,
+            )
+            .await;
+        }
     };
     let parsed = match parsed {
         Ok(p) => p,
@@ -185,34 +203,41 @@ pub async fn handle_create(
         created_at: chrono::Utc::now(),
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_domain(&db, &d);
-    // Phase-1 lifecycle write (issue #45): an auto-issue domain gets a
-    // Pending placeholder row in `certs` immediately, so the dashboard
-    // and `/certs` table reflect the operator's intent before the
-    // background ACME loop has had a chance to tick. The helper is
-    // idempotent — pre-existing rows (Issued, Failed, …) are preserved
-    // so the operator's history isn't clobbered by a re-save of the
-    // domain form.
-    if matches!(result, Ok(())) && d.auto_issue {
-        let _ =
-            pangolin_core::db::ensure_pending_cert_row(&db, &d.domain, &app.cert_manager.cert_dir);
-    }
-    // fix/cert_www: refresh the domain → cert link cache. If the
-    // upsert succeeded, recompute this domain's link (it may have
-    // gained a cert, or the cert it points to may have changed).
-    // Failures are logged and ignored — a stale cache entry is
-    // recoverable via `load_from_db` at next startup.
-    if result.is_ok()
-        && let Err(e) = app.cert_links.relink_for_domain(&db, &d.domain)
-    {
-        log::warn!(
-            "cert_links: relink for {} after create failed: {}",
-            d.domain,
-            e
-        );
-    }
-    drop(db);
+    // The write runs on the blocking pool, under one connection: the
+    // domain row, its cert placeholder and the link-cache refresh
+    // belong to the same write (issue #254).
+    let cert_links = app.cert_links.clone();
+    let cert_dir = app.cert_manager.cert_dir.clone();
+    let result = app
+        .with_db_res(move |db| {
+            let result = pangolin_core::db::upsert_domain(db, &d);
+            // Phase-1 lifecycle write (issue #45): an auto-issue domain gets a
+            // Pending placeholder row in `certs` immediately, so the dashboard
+            // and `/certs` table reflect the operator's intent before the
+            // background ACME loop has had a chance to tick. The helper is
+            // idempotent — pre-existing rows (Issued, Failed, …) are preserved
+            // so the operator's history isn't clobbered by a re-save of the
+            // domain form.
+            if matches!(result, Ok(())) && d.auto_issue {
+                let _ = pangolin_core::db::ensure_pending_cert_row(db, &d.domain, &cert_dir);
+            }
+            // fix/cert_www: refresh the domain → cert link cache. If the
+            // upsert succeeded, recompute this domain's link (it may have
+            // gained a cert, or the cert it points to may have changed).
+            // Failures are logged and ignored — a stale cache entry is
+            // recoverable via `load_from_db` at next startup.
+            if result.is_ok()
+                && let Err(e) = cert_links.relink_for_domain(db, &d.domain)
+            {
+                log::warn!(
+                    "cert_links: relink for {} after create failed: {}",
+                    d.domain,
+                    e
+                );
+            }
+            result
+        })
+        .await;
 
     match result {
         Ok(()) => {
@@ -220,7 +245,7 @@ pub async fn handle_create(
             Ok(redirect_response("/domains"))
         }
         Err(e) => {
-            render_create_page_with_error(app, &format!("Database error: {}", e), csrf, None, lang)
+            render_create_page_with_error(app, &format!("Database error: {e}"), csrf, None, lang)
                 .await
         }
     }
@@ -254,8 +279,10 @@ pub async fn handle_update(
     // Look up the existing row — 404 if absent. The PK is immutable;
     // we read everything else from the DB and overlay the form fields.
     let existing = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_domain(&db, &domain_pk).unwrap_or(None)
+        // The read runs on the blocking pool (issue #254).
+        let key = domain_pk.clone();
+        app.with_db_or(move |db| pangolin_core::db::get_domain(db, &key).unwrap_or(None))
+            .await
     };
     let Some(existing) = existing else {
         return Ok(crate::not_found(lang));
@@ -263,19 +290,40 @@ pub async fn handle_update(
 
     // The whole form is validated by one shared parser (issue #185):
     // the JSON API validates through the very same function.
-    let parsed = {
-        let db = app.db.lock().await;
-        parse_domain_form(
-            &params,
-            &domain_pk,
-            Some(&existing),
-            &|name| {
-                pangolin_core::db::get_dns_provider(&db, name)
-                    .unwrap_or(None)
-                    .is_some()
-            },
-            lang,
-        )
+    //
+    // The parse reads the DNS providers, so it runs on the blocking
+    // pool with the connection in hand (issue #254).
+    let domain_for_db = domain_pk.clone();
+    let existing_for_db = existing.clone();
+    let parsed = match app
+        .with_db(move |conn| {
+            parse_domain_form(
+                &params,
+                &domain_for_db,
+                Some(&existing_for_db),
+                &|name| {
+                    pangolin_core::db::get_dns_provider(conn, name)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+                lang,
+            )
+        })
+        .await
+    {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::warn!("domains: the form could not be parsed: {e}");
+            return render_edit_page_with_error(
+                app,
+                &domain_pk,
+                "the form could not be checked",
+                csrf,
+                &existing,
+                lang,
+            )
+            .await;
+        }
     };
     let parsed = match parsed {
         Ok(p) => p,
@@ -295,32 +343,36 @@ pub async fn handle_update(
         created_at: existing.created_at,
     };
 
-    let db = app.db.lock().await;
-    let result = pangolin_core::db::upsert_domain(&db, &updated);
-    // Phase-1 lifecycle write (issue #45): if the operator turned
-    // auto-issue on (or left it on) and there's no cert row yet, plant
-    // a Pending placeholder so the dashboard reflects intent before
-    // the background ACME loop ticks. The helper is idempotent so
-    // pre-existing rows (Issued, Failed, …) are preserved.
-    if matches!(result, Ok(())) && updated.auto_issue {
-        let _ = pangolin_core::db::ensure_pending_cert_row(
-            &db,
-            &updated.domain,
-            &app.cert_manager.cert_dir,
-        );
-    }
-    // fix/cert_www: refresh the cert link. See handle_create for
-    // the rationale; same warning-on-failure pattern.
-    if result.is_ok()
-        && let Err(e) = app.cert_links.relink_for_domain(&db, &updated.domain)
-    {
-        log::warn!(
-            "cert_links: relink for {} after update failed: {}",
-            updated.domain,
-            e
-        );
-    }
-    drop(db);
+    // The write runs on the blocking pool, under one connection: the
+    // domain row, its cert placeholder and the link-cache refresh
+    // belong to the same write (issue #254).
+    let cert_links = app.cert_links.clone();
+    let cert_dir = app.cert_manager.cert_dir.clone();
+    let result = app
+        .with_db_res(move |db| {
+            let result = pangolin_core::db::upsert_domain(db, &updated);
+            // Phase-1 lifecycle write (issue #45): if the operator turned
+            // auto-issue on (or left it on) and there's no cert row yet, plant
+            // a Pending placeholder so the dashboard reflects intent before
+            // the background ACME loop ticks. The helper is idempotent so
+            // pre-existing rows (Issued, Failed, …) are preserved.
+            if matches!(result, Ok(())) && updated.auto_issue {
+                let _ = pangolin_core::db::ensure_pending_cert_row(db, &updated.domain, &cert_dir);
+            }
+            // fix/cert_www: refresh the cert link. See handle_create for
+            // the rationale; same warning-on-failure pattern.
+            if result.is_ok()
+                && let Err(e) = cert_links.relink_for_domain(db, &updated.domain)
+            {
+                log::warn!(
+                    "cert_links: relink for {} after update failed: {}",
+                    updated.domain,
+                    e
+                );
+            }
+            result
+        })
+        .await;
 
     match result {
         Ok(()) => {
@@ -334,7 +386,7 @@ pub async fn handle_update(
             render_edit_page_with_error(
                 app,
                 &domain_pk,
-                &format!("Database error: {}", e),
+                &format!("Database error: {e}"),
                 csrf,
                 &existing,
                 lang,
@@ -356,10 +408,16 @@ async fn render_edit_page_with_error(
     existing: &pangolin_core::types::Domain,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (sites, dns_providers) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_dns_providers(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let html = DomainsEditTemplate {
         sites,
         dns_providers,
@@ -395,10 +453,16 @@ async fn render_create_page_with_error(
     preselected_site: Option<&str>,
     lang: Lang,
 ) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
-    let dns_providers = pangolin_core::db::list_dns_providers(&db).unwrap_or_default();
-    drop(db);
+    // The reads run on the blocking pool, under one connection
+    // (issue #254).
+    let (sites, dns_providers) = app
+        .with_db_or(|db| {
+            (
+                pangolin_core::db::list_sites(db).unwrap_or_default(),
+                pangolin_core::db::list_dns_providers(db).unwrap_or_default(),
+            )
+        })
+        .await;
     let html = DomainsNewTemplate {
         sites,
         dns_providers,
@@ -432,9 +496,10 @@ pub async fn handle_delete(
     if let Some(d) = domain
         && !d.is_empty()
     {
-        let db = app.db.lock().await;
-        let _ = pangolin_core::db::delete_domain(&db, &d);
-        drop(db);
+        let key = d.clone();
+        let _ = app
+            .with_db_res(move |db| pangolin_core::db::delete_domain(db, &key))
+            .await;
         // fix/cert_www: drop this domain's link from the cache. Any
         // cert row that previously covered it is left in place — the
         // cert may still be serving other domains — but this one
@@ -456,9 +521,10 @@ pub async fn api_handle_delete(
     if domain.is_empty() {
         return Ok(crate::not_found(lang));
     }
-    let db = app.db.lock().await;
-    let _ = pangolin_core::db::delete_domain(&db, &domain);
-    drop(db);
+    let key = domain.clone();
+    let _ = app
+        .with_db_res(move |db| pangolin_core::db::delete_domain(db, &key))
+        .await;
     // fix/cert_www: see handle_delete above.
     app.cert_links.remove_domain(&domain);
     app.reload_indexes().await;

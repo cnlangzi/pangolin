@@ -105,10 +105,10 @@ pub async fn handle_render_settings(
 /// then shows the empty state and the operator has to restart the
 /// gateway once (the row is seeded on the first boot).
 async fn dashboard_view(app: &Arc<App>) -> DashboardApiView {
-    let row = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_api_config(&db).unwrap_or(None)
-    };
+    // The read runs on the blocking pool (issue #254).
+    let row = app
+        .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
+        .await;
     match row {
         Some(row) => DashboardApiView {
             instance_id: row.instance_id,
@@ -154,10 +154,9 @@ pub async fn handle_update_dashboard(
 ) -> http::Result<Response<Full<Bytes>>> {
     let params = super::helpers::parse_form(body);
 
-    let row = {
-        let db = app.db.lock().await;
-        pangolin_core::db::get_api_config(&db).unwrap_or(None)
-    };
+    let row = app
+        .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
+        .await;
     let Some(row) = row else {
         return render_with_dashboard_error(
             app,
@@ -208,12 +207,22 @@ pub async fn handle_update_dashboard(
     };
 
     {
-        let db = app.db.lock().await;
         // Only the three columns this form owns are written: the
         // instance id and the learned address belong to other writers.
-        if let Err(e) =
-            pangolin_core::db::update_api_settings(&db, enabled, &token_hash, dashboard_port)
-        {
+        //
+        // The write runs on the blocking pool (issue #254).
+        let token_hash_for_db = token_hash.clone();
+        let written = app
+            .with_db_res(move |db| {
+                pangolin_core::db::update_api_settings(
+                    db,
+                    enabled,
+                    &token_hash_for_db,
+                    dashboard_port,
+                )
+            })
+            .await;
+        if let Err(e) = written {
             return render_with_dashboard_error(
                 app,
                 csrf,

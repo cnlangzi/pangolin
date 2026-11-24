@@ -94,11 +94,10 @@ fn api_key(body: &[u8], field: &str, clear_field: &str, current: Option<String>)
 /// no way to change one in place. The rebuild happens **after** the
 /// row is written, so the new instance always carries the stored key.
 pub async fn save_badbots_settings(app: &Arc<App>, cfg: BadbotsSettings) -> Result<(), String> {
-    {
-        let db = app.db.lock().await;
-        pangolin_core::db::update_badbots_config(&db, &cfg)
-            .map_err(|e| format!("Database error: {e}"))?;
-    }
+    // The write runs on the blocking pool (issue #254).
+    app.with_db_res(move |db| pangolin_core::db::update_badbots_config(db, &cfg))
+        .await
+        .map_err(|e| format!("Database error: {e}"))?;
     app.rebuild_badbots().await;
     Ok(())
 }

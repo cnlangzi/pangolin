@@ -217,11 +217,10 @@ fn header_key(body: &[u8], field: &str) -> Result<Option<String>, String> {
 /// on DB failure (the only failure mode — validation has already
 /// happened upstream via [`parse_system_config_form`]).
 pub async fn save_system_config(app: &Arc<App>, cfg: SystemConfig) -> Result<(), String> {
-    {
-        let db = app.db.lock().await;
-        pangolin_core::db::update_system_config(&db, &cfg)
-            .map_err(|e| format!("Database error: {e}"))?;
-    }
+    // The write runs on the blocking pool (issue #254).
+    app.with_db_res(move |db| pangolin_core::db::update_system_config(db, &cfg))
+        .await
+        .map_err(|e| format!("Database error: {e}"))?;
     app.reload_indexes().await;
     Ok(())
 }

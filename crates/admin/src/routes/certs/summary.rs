@@ -24,9 +24,10 @@ use crate::App;
 type Resp = Response<Full<Bytes>>;
 
 pub async fn handle_summary(app: &Arc<App>) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let counts = pangolin_core::db::count_certs_by_status(&db).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let counts = app
+        .with_db_or(|db| pangolin_core::db::count_certs_by_status(db).unwrap_or_default())
+        .await;
 
     let total: usize = counts.values().sum();
     // Hand-rolled JSON keeps the response body cheap (no serde_json::Value

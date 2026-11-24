@@ -96,10 +96,12 @@ impl ProviderIpService {
     /// a restart, when the network may be down), so the stored ranges
     /// are the starting point.
     pub async fn load_persisted(&self, app: &Arc<App>) {
-        let stored = {
-            let db = app.db.lock().await;
-            pangolin_core::db::list_provider_ip_lists(&db).unwrap_or_default()
-        };
+        // The read runs on the blocking pool: it is a synchronous
+        // SQLite call, and a worker thread that runs one is a worker
+        // thread that is not proxying requests (issue #254).
+        let stored = app
+            .with_db_or(|db| pangolin_core::db::list_provider_ip_lists(db).unwrap_or_default())
+            .await;
         let mut sets: std::collections::HashMap<ProviderKey, CidrSet> =
             std::collections::HashMap::new();
         for row in &stored {
@@ -222,11 +224,17 @@ async fn fetch_range_list_inner(
     url: &str,
 ) -> Result<FetchOutcome, String> {
     let stored = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_provider_ip_lists(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|r| r.provider == provider && r.url == url)
+        // The read runs on the blocking pool (issue #254). The
+        // closure owns its copy of the URL: it moves to another
+        // thread.
+        let url = url.to_string();
+        app.with_db_or(move |db| {
+            pangolin_core::db::list_provider_ip_lists(db)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|r| r.provider == provider && r.url == url)
+        })
+        .await
     };
 
     let mut req = client.get(url);
@@ -317,11 +325,17 @@ async fn fetch_range_list_inner(
 /// becomes `error` and the error text is kept for the admin UI.
 async fn record_error(app: &Arc<App>, provider: ProviderKey, url: &str, message: &str) {
     let stored = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_provider_ip_lists(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|r| r.provider == provider && r.url == url)
+        // The read runs on the blocking pool (issue #254). The
+        // closure owns its copy of the URL: it moves to another
+        // thread.
+        let url = url.to_string();
+        app.with_db_or(move |db| {
+            pangolin_core::db::list_provider_ip_lists(db)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|r| r.provider == provider && r.url == url)
+        })
+        .await
     };
     let row = ProviderIpList {
         provider,
@@ -347,8 +361,9 @@ async fn record_error(app: &Arc<App>, provider: ProviderKey, url: &str, message:
 
 /// Persist one range list.
 async fn write_list(app: &Arc<App>, row: ProviderIpList) -> Result<(), String> {
-    let db = app.db.lock().await;
-    pangolin_core::db::upsert_provider_ip_list(&db, &row)
+    // The write runs on the blocking pool (issue #254).
+    app.with_db_res(move |db| pangolin_core::db::upsert_provider_ip_list(db, &row))
+        .await
         .map_err(|e| format!("storing the range list failed: {e}"))
 }
 
@@ -358,10 +373,10 @@ async fn write_list(app: &Arc<App>, row: ProviderIpList) -> Result<(), String> {
 /// The set is the union of the lists of all the provider's URLs, so
 /// one URL changing does not drop the others.
 pub async fn rebuild_provider_ranges(app: &Arc<App>, provider: ProviderKey) {
-    let stored = {
-        let db = app.db.lock().await;
-        pangolin_core::db::list_provider_ip_lists(&db).unwrap_or_default()
-    };
+    // The read runs on the blocking pool (issue #254).
+    let stored = app
+        .with_db_or(|db| pangolin_core::db::list_provider_ip_lists(db).unwrap_or_default())
+        .await;
     let mut set = CidrSet::new();
     for row in stored.iter().filter(|r| r.provider == provider) {
         for cidr in row.cidrs.lines() {

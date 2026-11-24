@@ -23,9 +23,10 @@ fn ok_html(body: String) -> http::Result<Resp> {
 }
 
 pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
-    let db = app.db.lock().await;
-    let tuns = pangolin_core::db::list_tuns(&db).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let tuns = app
+        .with_db_or(|db| pangolin_core::db::list_tuns(db).unwrap_or_default())
+        .await;
     let html = TunnelsListTemplate {
         tuns,
         active_nav: "tun",
@@ -67,9 +68,11 @@ pub async fn render_edit_page(
         }
     };
 
-    let db = app.db.lock().await;
-    let tun = pangolin_core::db::get_tun(&db, &name).unwrap_or_default();
-    drop(db);
+    // The read runs on the blocking pool (issue #254).
+    let key = name.clone();
+    let tun = app
+        .with_db_or(move |db| pangolin_core::db::get_tun(db, &key).unwrap_or_default())
+        .await;
 
     if tun.is_none() {
         return render_edit_page_with_error(&name, &lang.t("tunnels.error.not_found"), csrf, lang);

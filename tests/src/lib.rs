@@ -80,6 +80,13 @@ mod pingora_dependency;
 #[cfg(test)]
 mod badbots_migrations;
 
+// The database reads run on the blocking pool, not on an async
+// worker (issue #254).  Like the mirror tests above, these need
+// neither the `integration` feature nor a real binary: they scan the
+// sources of the crates that talk to the database.
+#[cfg(test)]
+mod db_lock_guard;
+
 // One-line installer regression tests (issue #175).  Like the mirror
 // tests above, these need neither the `integration` feature nor a
 // real binary: they drive the repository's `install.sh` against a

@@ -16,10 +16,14 @@ use crate::protocol::error::ApiError;
 
 /// `GET /api/v1/instance` — what this node tells about itself.
 pub async fn instance(ctx: &Ctx<'_>) -> ApiResponse {
-    let runtime = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::get_api_config(&db).unwrap_or(None)
-    };
+    // The reads run on the blocking pool: they are synchronous
+    // SQLite calls, and a worker thread that runs one is a worker
+    // thread that is not proxying requests (issue #254).
+    let runtime = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
+        .await;
     let (instance_id, dashboard) = match runtime {
         Some(row) => (
             row.instance_id,
@@ -30,18 +34,21 @@ pub async fn instance(ctx: &Ctx<'_>) -> ApiResponse {
         ),
         None => (String::new(), DashboardAddress { ip: None, port: 0 }),
     };
-    let tunnel_nodes = {
-        let db = ctx.state.app.db.lock().await;
-        pangolin_core::db::list_tuns(&db)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| TunnelNodeView {
-                name: t.name,
-                online: t.online,
-                last_seen_at: t.last_seen_at,
-            })
-            .collect::<Vec<_>>()
-    };
+    let tunnel_nodes = ctx
+        .state
+        .app
+        .with_db_or(|db| {
+            pangolin_core::db::list_tuns(db)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| TunnelNodeView {
+                    name: t.name,
+                    online: t.online,
+                    last_seen_at: t.last_seen_at,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
     let view = InstanceView {
         instance_id,
         version: pangolin_core::VERSION,
@@ -58,15 +65,23 @@ pub async fn instance(ctx: &Ctx<'_>) -> ApiResponse {
 
 /// `GET /api/v1/sites`
 pub async fn list_sites(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let sites = pangolin_core::db::list_sites(&db).unwrap_or_default();
+    let sites = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_sites(db).unwrap_or_default())
+        .await;
     ApiResponse::json_of(200, &sites)
 }
 
 /// `GET /api/v1/sites/{name}`
 pub async fn get_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_site(&db, name).unwrap_or(None) {
+    let key = name.to_string();
+    let site = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_site(db, &key).unwrap_or(None))
+        .await;
+    match site {
         Some(site) => ApiResponse::json_of(200, &site),
         None => ApiResponse::error(&site_not_found(name)),
     }
@@ -74,15 +89,23 @@ pub async fn get_site(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 
 /// `GET /api/v1/domains`
 pub async fn list_domains(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let domains = pangolin_core::db::list_domains(&db).unwrap_or_default();
+    let domains = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_domains(db).unwrap_or_default())
+        .await;
     ApiResponse::json_of(200, &domains)
 }
 
 /// `GET /api/v1/domains/{domain}`
 pub async fn get_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_domain(&db, domain).unwrap_or(None) {
+    let key = domain.to_string();
+    let found = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_domain(db, &key).unwrap_or(None))
+        .await;
+    match found {
         Some(d) => ApiResponse::json_of(200, &d),
         None => ApiResponse::error(&ApiError::not_found(
             "domain_not_found",
@@ -93,19 +116,29 @@ pub async fn get_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
 
 /// `GET /api/v1/dns_providers`
 pub async fn list_dns_providers(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let providers = pangolin_core::db::list_dns_providers(&db)
-        .unwrap_or_default()
-        .iter()
-        .map(DnsProviderView::of)
-        .collect::<Vec<_>>();
+    let providers = ctx
+        .state
+        .app
+        .with_db_or(|db| {
+            pangolin_core::db::list_dns_providers(db)
+                .unwrap_or_default()
+                .iter()
+                .map(DnsProviderView::of)
+                .collect::<Vec<_>>()
+        })
+        .await;
     ApiResponse::json_of(200, &providers)
 }
 
 /// `GET /api/v1/dns_providers/{name}`
 pub async fn get_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_dns_provider(&db, name).unwrap_or(None) {
+    let key = name.to_string();
+    let found = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_dns_provider(db, &key).unwrap_or(None))
+        .await;
+    match found {
         Some(p) => ApiResponse::json_of(200, &DnsProviderView::of(&p)),
         None => ApiResponse::error(&ApiError::not_found(
             "dns_provider_not_found",
@@ -116,19 +149,29 @@ pub async fn get_dns_provider(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 
 /// `GET /api/v1/tun`
 pub async fn list_tuns(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let tuns = pangolin_core::db::list_tuns(&db)
-        .unwrap_or_default()
-        .iter()
-        .map(TunView::of)
-        .collect::<Vec<_>>();
+    let tuns = ctx
+        .state
+        .app
+        .with_db_or(|db| {
+            pangolin_core::db::list_tuns(db)
+                .unwrap_or_default()
+                .iter()
+                .map(TunView::of)
+                .collect::<Vec<_>>()
+        })
+        .await;
     ApiResponse::json_of(200, &tuns)
 }
 
 /// `GET /api/v1/tun/{name}`
 pub async fn get_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_tun(&db, name).unwrap_or(None) {
+    let key = name.to_string();
+    let found = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_tun(db, &key).unwrap_or(None))
+        .await;
+    match found {
         Some(t) => ApiResponse::json_of(200, &TunView::of(&t)),
         None => ApiResponse::error(&ApiError::not_found(
             "tun_not_found",
@@ -139,15 +182,21 @@ pub async fn get_tun(ctx: &Ctx<'_>, name: &str) -> ApiResponse {
 
 /// `GET /api/v1/ip_rules`
 pub async fn list_ip_rules(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let rules = pangolin_core::db::list_ip_rules(&db).unwrap_or_default();
+    let rules = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_ip_rules(db).unwrap_or_default())
+        .await;
     ApiResponse::json_of(200, &rules)
 }
 
 /// `GET /api/v1/site_rate_limits`
 pub async fn list_site_rate_limits(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let limits = pangolin_core::db::list_site_rate_limits(&db).unwrap_or_default();
+    let limits = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_site_rate_limits(db).unwrap_or_default())
+        .await;
     let views = limits
         .into_iter()
         .map(|(site_name, policy)| SiteRateLimitView { site_name, policy })
@@ -157,8 +206,13 @@ pub async fn list_site_rate_limits(ctx: &Ctx<'_>) -> ApiResponse {
 
 /// `GET /api/v1/site_rate_limits/{site}`
 pub async fn get_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_site_rate_limit(&db, site).unwrap_or(None) {
+    let key = site.to_string();
+    let policy = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_site_rate_limit(db, &key).unwrap_or(None))
+        .await;
+    match policy {
         Some(policy) => ApiResponse::json_of(
             200,
             &SiteRateLimitView {
@@ -175,8 +229,11 @@ pub async fn get_site_rate_limit(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 
 /// `GET /api/v1/site_rate_limit_bots`
 pub async fn list_site_rate_limit_bots(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let bots = pangolin_core::db::list_site_rate_limit_bots(&db).unwrap_or_default();
+    let bots = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_site_rate_limit_bots(db).unwrap_or_default())
+        .await;
     let views = bots
         .into_iter()
         .map(|(site_name, bots)| SiteRateLimitBotsView {
@@ -189,8 +246,14 @@ pub async fn list_site_rate_limit_bots(ctx: &Ctx<'_>) -> ApiResponse {
 
 /// `GET /api/v1/site_rate_limit_bots/{site}`
 pub async fn get_site_rate_limit_bots(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let bots = pangolin_core::db::get_site_rate_limit_bots(&db, site).unwrap_or_default();
+    let key = site.to_string();
+    let bots = ctx
+        .state
+        .app
+        .with_db_or(move |db| {
+            pangolin_core::db::get_site_rate_limit_bots(db, &key).unwrap_or_default()
+        })
+        .await;
     ApiResponse::json_of(
         200,
         &SiteRateLimitBotsView {
@@ -202,8 +265,11 @@ pub async fn get_site_rate_limit_bots(ctx: &Ctx<'_>, site: &str) -> ApiResponse 
 
 /// `GET /api/v1/site_providers`
 pub async fn list_site_providers(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let providers = pangolin_core::db::list_site_providers(&db).unwrap_or_default();
+    let providers = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_site_providers(db).unwrap_or_default())
+        .await;
     let views = providers
         .into_iter()
         .map(|(site_name, over)| SiteProviderView::of(&site_name, &over))
@@ -213,8 +279,13 @@ pub async fn list_site_providers(ctx: &Ctx<'_>) -> ApiResponse {
 
 /// `GET /api/v1/site_providers/{site}`
 pub async fn get_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    match pangolin_core::db::get_site_provider(&db, site).unwrap_or(None) {
+    let key = site.to_string();
+    let over = ctx
+        .state
+        .app
+        .with_db_or(move |db| pangolin_core::db::get_site_provider(db, &key).unwrap_or(None))
+        .await;
+    match over {
         Some(over) => ApiResponse::json_of(200, &SiteProviderView::of(site, &over)),
         None => ApiResponse::error(&ApiError::not_found(
             "site_provider_not_found",
@@ -225,8 +296,11 @@ pub async fn get_site_provider(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 
 /// `GET /api/v1/site_origin_allow`
 pub async fn list_site_origin_allow(ctx: &Ctx<'_>) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let ranges = pangolin_core::db::list_site_origin_allow(&db).unwrap_or_default();
+    let ranges = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_site_origin_allow(db).unwrap_or_default())
+        .await;
     let views = ranges
         .into_iter()
         .map(|(site_name, cidrs)| SiteOriginAllowView { site_name, cidrs })
@@ -236,8 +310,11 @@ pub async fn list_site_origin_allow(ctx: &Ctx<'_>) -> ApiResponse {
 
 /// `GET /api/v1/site_origin_allow/{site}`
 pub async fn get_site_origin_allow(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
-    let db = ctx.state.app.db.lock().await;
-    let ranges = pangolin_core::db::list_site_origin_allow(&db).unwrap_or_default();
+    let ranges = ctx
+        .state
+        .app
+        .with_db_or(|db| pangolin_core::db::list_site_origin_allow(db).unwrap_or_default())
+        .await;
     let cidrs = ranges.get(site).cloned().unwrap_or_default();
     ApiResponse::json_of(
         200,
