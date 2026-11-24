@@ -1673,6 +1673,7 @@ mod tests {
             client_ip: "66.249.66.1".into(),
             user_agent: ua.map(String::from),
             referer: None,
+            cache_hit: None,
         }
     }
 
@@ -1985,6 +1986,7 @@ mod tests {
             client_ip: "10.0.0.1".into(),
             user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
             referer: None,
+            cache_hit: None,
         };
         let identity = BotIdentity {
             name: name.into(),
@@ -2886,6 +2888,7 @@ mod tests {
                 client_ip: "203.0.113.7".into(),
                 user_agent: Some("Mozilla/5.0 (compatible; Googlebot/2.1)".into()),
                 referer: None,
+                cache_hit: None,
             },
             crate::bot::BotIdentity {
                 name: "googlebot".into(),

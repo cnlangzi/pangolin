@@ -312,6 +312,7 @@ mod tests {
             client_ip: "10.0.0.1".into(),
             user_agent: Some(ua.into()),
             referer: None,
+            cache_hit: None,
         };
         let identity = if ua.to_ascii_lowercase().contains("bingbot") {
             bot("Bingbot", "Microsoft")

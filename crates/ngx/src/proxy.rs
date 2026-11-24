@@ -205,7 +205,9 @@ pub struct RequestState {
     /// Whether the response was served from the cache.
     ///
     /// Written in `response_filter`, where the cache's phase says
-    /// whether the body came from the cache or from the origin.
+    /// whether the body came from the cache or from the origin, and
+    /// read by the access log — the operator sees which requests the
+    /// cache answered (issue #259).
     pub cache_hit: bool,
 }
 
@@ -1993,6 +1995,9 @@ fn record_access_log(
         // this is the copy that lands in the entry, and the bot log
         // inherits the very same string through the entry.
         referer: ctx.referer.take(),
+        // Whether the edge cache answered this request (issue #259).
+        // `None` when the cache was not involved at all.
+        cache_hit: ctx.cache_enabled.then_some(ctx.cache_hit),
     });
     // The referer fan-out goes first: it needs a borrow of the
     // entry, and `push_access_log` consumes it.

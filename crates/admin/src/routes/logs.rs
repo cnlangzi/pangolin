@@ -1872,6 +1872,7 @@ mod tests {
                 "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".into(),
             ),
             referer: None,
+            cache_hit: None,
         };
         let bot = BotIdentity {
             name: "Googlebot".into(),
@@ -2934,6 +2935,7 @@ mod tests {
             client_ip: "10.0.0.1".into(),
             user_agent: Some("Mozilla/5.0 (compatible; testbot)".into()),
             referer: None,
+            cache_hit: None,
         };
         let identity = BotIdentity {
             name: name.into(),
@@ -3925,6 +3927,7 @@ mod tests {
                 client_ip: ip.into(),
                 user_agent: Some("Mozilla/5.0".into()),
                 referer: None,
+                cache_hit: None,
             },
             &pangolin_core::RefererHit {
                 referer: format!("https://{referer_host}{path}"),
@@ -4217,6 +4220,7 @@ mod tests {
             client_ip: "1.1.1.1".into(),
             user_agent: None,
             referer: None,
+            cache_hit: None,
         };
         let hit = pangolin_core::RefererHit {
             referer: "https://news.example.org/a".into(),
@@ -4349,6 +4353,7 @@ mod tests {
             client_ip: "1.1.1.1".into(),
             user_agent: None,
             referer: None,
+            cache_hit: None,
         };
         let hit = pangolin_core::RefererHit {
             referer: "https://news.example.org/a".into(),
@@ -4468,6 +4473,7 @@ mod tests {
             client_ip: "1.1.1.1".into(),
             user_agent: None,
             referer: None,
+            cache_hit: None,
         };
         let hit = pangolin_core::RefererHit {
             referer: format!("https://{referer_host}/a"),
