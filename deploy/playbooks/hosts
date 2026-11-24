@@ -10,7 +10,7 @@ sj-us ansible_host=sj-us ansible_user=yaitoo
 ansible_python_interpreter=auto_silent
 
 [tun]
-# xiajie ansible_host=xiajie ansible_user=dayi 
+xiajie ansible_host=xiajie ansible_user=dayi 
 xiage ansible_host=xiage ansible_user=devin
 
 
