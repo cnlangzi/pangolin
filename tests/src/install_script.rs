@@ -361,6 +361,8 @@ struct Sandbox {
     calls: PathBuf,
     install_dir: PathBuf,
     systemd_dir: PathBuf,
+    /// The digest tool the sandbox offers, if any.
+    digest_tool: Option<&'static str>,
 }
 
 impl Sandbox {
@@ -373,21 +375,10 @@ impl Sandbox {
     /// A sandbox with exactly one digest tool — `None` leaves the
     /// host without one, which is how the "no digest tool at all" case
     /// is exercised.
-    fn with_digest(digest_tool: Option<&str>) -> Sandbox {
+    fn with_digest(digest_tool: Option<&'static str>) -> Sandbox {
         let dir = TempDir::new().expect("temp dir");
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).expect("create the private bin directory");
-
-        for tool in TOOLS {
-            if let Some(path) = host_tool(tool) {
-                fs::copy(&path, bin.join(tool)).expect("copy the tool");
-            }
-        }
-        if let Some(tool) = digest_tool {
-            let path = host_tool(tool)
-                .unwrap_or_else(|| panic!("the host has no {tool} — the test cannot use it"));
-            fs::copy(&path, bin.join(tool)).expect("copy the digest tool");
-        }
 
         let calls = dir.path().join("calls.log");
         let sandbox = Sandbox {
@@ -396,7 +387,9 @@ impl Sandbox {
             bin,
             calls,
             dir,
+            digest_tool,
         };
+        sandbox.refresh_tools();
         sandbox.write_fake("uname", FAKE_UNAME);
         sandbox.write_fake("hostname", FAKE_HOSTNAME);
         sandbox.write_fake("id", FAKE_ID);
@@ -423,7 +416,50 @@ impl Sandbox {
     }
 
     /// Run the installer with the sandbox's defaults.
+    ///
+    /// The sandbox copies the host's tools into its private `PATH`.
+    /// The kernel refuses to exec a file that is still open for
+    /// writing (`ETXTBSY`), and on a busy filesystem a copy can be
+    /// in that state for a moment after it was made — the installer
+    /// then dies with "Text file busy" before it has done anything.
+    ///
+    /// That failure is in the sandbox, not in the installer, so the
+    /// copies are refreshed and the run is repeated. A run that fails
+    /// for any other reason is returned as it is.
     fn run(&self, base_url: &str, extra: &[(&str, &str)]) -> Output {
+        const ATTEMPTS: usize = 3;
+        for attempt in 1..=ATTEMPTS {
+            let output = self.run_once(base_url, extra);
+            if output.status.success() || attempt == ATTEMPTS || !is_text_file_busy(&output) {
+                return output;
+            }
+            // The failed attempt's calls are noise: the log describes
+            // the run that answered, not the one that could not start.
+            let _ = fs::write(&self.calls, "");
+            self.refresh_tools();
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// Copy the host's tools into the private `PATH` again.
+    ///
+    /// A copy that was busy when the installer exec'd it is replaced
+    /// by a fresh one.
+    fn refresh_tools(&self) {
+        for tool in TOOLS {
+            if let Some(path) = host_tool(tool) {
+                copy_tool(&path, &self.bin.join(tool));
+            }
+        }
+        if let Some(tool) = self.digest_tool {
+            let path = host_tool(tool)
+                .unwrap_or_else(|| panic!("the host has no {tool} — the test cannot use it"));
+            copy_tool(&path, &self.bin.join(tool));
+        }
+    }
+
+    /// One run of the installer.
+    fn run_once(&self, base_url: &str, extra: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(host_tool("sh").expect("sh"));
         cmd.arg(repo_root().join("install.sh"))
             .current_dir(self.dir.path())
@@ -480,9 +516,42 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Copy a host tool into the sandbox's private `PATH`.
+///
+/// The bytes are written and the file closed — the way the fakes are
+/// written — instead of being copied with [`fs::copy`]. The kernel
+/// refuses to exec a file that is still open for writing, and a file
+/// copied with `copy_file_range` can be in that state for a moment
+/// on a busy filesystem: the installer then dies with "Text file
+/// busy" before it has done anything, and the failure says nothing
+/// about the installer.
+///
+/// The old file is removed first, so a refresh produces a **new**
+/// inode: a file that is held open for writing is busy because of
+/// *its* inode, and writing over it in place would leave it just as
+/// busy.
+fn copy_tool(source: &Path, target: &Path) {
+    let bytes = fs::read(source).expect("read the tool");
+    let _ = fs::remove_file(target);
+    fs::write(target, &bytes).expect("write the tool");
+    let mut permissions = fs::metadata(target).expect("stat the tool").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(target, permissions).expect("make the tool executable");
+}
+
 /// The stderr of a run.
 fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Whether a run failed because a copied tool was momentarily busy.
+///
+/// The kernel refuses to exec a file that is still open for writing
+/// (`ETXTBSY`), and the shell reports it as "Text file busy". The
+/// sandbox's copies of the host's tools are the files that can be in
+/// that state, so the failure says nothing about the installer.
+fn is_text_file_busy(output: &Output) -> bool {
+    stderr_of(output).contains("Text file busy")
 }
 
 /// The paths the fake release was asked for.
@@ -740,6 +809,43 @@ fn install_script_is_executable() {
             "install.sh must be tracked with mode 100755, git says: {listed}"
         );
     }
+}
+
+/// The sandbox survives a tool that cannot be exec'd at that moment.
+///
+/// The kernel refuses to exec a file that is still open for writing
+/// (`ETXTBSY`), and the shell reports it as "Text file busy". The
+/// installer then dies before it has done anything — a failure of
+/// the sandbox, not of the installer — so the run is repeated with a
+/// fresh copy of the tools.
+///
+/// This is the CI runner's flake (the run died at `install.sh:313`,
+/// the installer's first `mktemp -d`), pinned so the recovery cannot
+/// rot.
+#[test]
+fn the_sandbox_recovers_from_a_tool_that_cannot_be_executed() {
+    if !prerequisites_available() {
+        eprintln!("sh or curl is missing — skipping");
+        return;
+    }
+
+    let release = FakeRelease::new();
+    let sandbox = Sandbox::new();
+    // Hold the sandbox's `mktemp` open for writing: the installer
+    // cannot exec it.
+    let busy = fs::OpenOptions::new()
+        .write(true)
+        .open(sandbox.bin.join("mktemp"))
+        .expect("open the tool");
+    let output = sandbox.run(&release.base_url, &[]);
+    drop(busy);
+
+    assert!(
+        output.status.success(),
+        "the run must recover from the busy tool:\n{}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
 }
 
 // ── the platform table ──────────────────────────────────────────────────────
