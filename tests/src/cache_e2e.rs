@@ -868,6 +868,36 @@ async fn cache_card(client: &AdminClient) -> HashMap<String, String> {
     out
 }
 
+/// The CSRF token the card's own "clear the cache" button carries.
+///
+/// The dashboard replaces the card with the polled fragment every two
+/// seconds, so the token has to be substituted **in the fragment**:
+/// a placeholder left there would break the button two seconds after
+/// the page was loaded.
+async fn card_csrf(client: &AdminClient) -> String {
+    let resp = client
+        .get("/api/cache/card")
+        .await
+        .expect("GET /api/cache/card");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.expect("body");
+    let doc = Html::parse_document(&body);
+    let selector = Selector::parse("button[hx-post=\"/cache/clear\"]").expect("selector");
+    let button = doc
+        .select(&selector)
+        .next()
+        .expect("the card carries the clear button");
+    let vals = button
+        .value()
+        .attr("hx-vals")
+        .expect("the button carries the token");
+    let json: serde_json::Value = serde_json::from_str(vals).expect("the hx-vals are JSON");
+    json["_csrf"]
+        .as_str()
+        .expect("the button carries a token")
+        .to_string()
+}
+
 /// A purge drops the entry, so the next request goes to the origin.
 ///
 /// The contract: `PURGE /a.css` answers `200`, and the `GET /a.css`
@@ -1160,6 +1190,49 @@ async fn cache_e2e_the_admin_card_counts_the_misses_that_were_not_stored() {
     );
 }
 
+/// The card's own button clears the cache.
+///
+/// The token comes from the **polled fragment**, not from the page:
+/// the dashboard replaces the card with that fragment every two
+/// seconds, so a placeholder left in it would break the button two
+/// seconds after the page was loaded.
+#[tokio::test]
+async fn cache_e2e_the_clear_button_carries_its_own_csrf_token() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    let csrf = card_csrf(&client).await;
+    assert!(
+        !csrf.is_empty() && csrf != "__CSRF__",
+        "the fragment must carry a substituted token, got {csrf:?}"
+    );
+
+    let resp = client
+        .post_form("/cache/clear", &[("_csrf", &csrf)])
+        .await
+        .expect("POST /cache/clear");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the button's own token must clear the cache"
+    );
+
+    // The cache is empty.
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the cleared asset must be fetched from the origin again: {response}"
+    );
+}
+
 /// The admin can empty the whole cache.
 ///
 /// After the clear, every cached asset is fetched from the origin
@@ -1269,6 +1342,7 @@ async fn cache_e2e_the_traffic_stats_count_the_cache_route() {
     client.login("admin", "admin").await.expect("login");
 
     let mut cache_req = None;
+    let mut cache_bytes = None;
     for _ in 0..20 {
         let resp = client
             .get("/api/traffic/kpis")
@@ -1277,6 +1351,7 @@ async fn cache_e2e_the_traffic_stats_count_the_cache_route() {
         assert_eq!(resp.status().as_u16(), 200);
         let body = resp.text().await.expect("body");
         if let Some(value) = data_metric(&body, "traffic", "cache_req") {
+            cache_bytes = data_metric(&body, "traffic", "cache_bytes");
             if value == "1" {
                 cache_req = Some(value);
                 break;
@@ -1289,5 +1364,17 @@ async fn cache_e2e_the_traffic_stats_count_the_cache_route() {
         cache_req.as_deref(),
         Some("1"),
         "the cache route must count the request the cache answered"
+    );
+    // The body the cache served is counted under the same route. The
+    // exact number is the proxy's business; what matters is that the
+    // route counts the bytes at all.
+    let bytes: u64 = cache_bytes
+        .as_deref()
+        .and_then(|value| value.strip_suffix(" B"))
+        .and_then(|value| value.parse().ok())
+        .expect("the card must show the bytes the cache served");
+    assert!(
+        bytes > 0,
+        "the cache route must count the bytes the cache served: {cache_bytes:?}"
     );
 }

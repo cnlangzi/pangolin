@@ -270,6 +270,20 @@ A purge never reaches the origin and never creates an entry: it
 only ever removes one. It does not count as a lookup either — a
 purge is not a hit and not a miss.
 
+**The purge is not authenticated.** Any client that can reach the
+gateway may drop any cached entry. That is a deliberate trade-off:
+the purge is an operational tool, and the operator's way of using it
+is a `curl` from wherever they sit — a shared secret or an IP
+allowlist would put a second mechanism between the operator and the
+cache. What an unauthenticated purge can do is limited: it can only
+**remove** an entry, never inject one, so the worst case is a cold
+cache — the origin serves the assets it would have served on the
+first request anyway. The answers are a small oracle (a `200` says
+the asset was cached, a `404` that it was not), and the asset URLs
+are public. A deployment that cannot accept even that should put the
+gateway behind an authenticating proxy; the cache has no
+configuration of its own for it.
+
 **What a purge drops.** The key is the path *without* the query
 string, so `PURGE /app.css` drops `/app.css?v=1` and `/app.css?v=2`
 as well: they are one entry.
@@ -290,7 +304,10 @@ The dashboard carries a cache card with the cache's counters and a
 **clear cache** button. The button empties the cache: the memory
 tier in one go, the disk tier's files one by one. A file that
 cannot be deleted is skipped and logged — the rest of the cache is
-still emptied, and the request path is not affected.
+still emptied, and the request path is not affected. A file that
+survived is not served any more (the index no longer knows it), but
+it comes back when the process restarts: the startup sweep adopts
+every file it finds.
 
 The action goes through the admin's own cookie session and CSRF
 check, like every other write the admin UI makes. A request without
