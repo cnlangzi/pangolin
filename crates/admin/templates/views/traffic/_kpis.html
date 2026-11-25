@@ -40,7 +40,7 @@
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
   <div class="card p-4">
     <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">{{ lang.t("traffic.network") }}</h2>
-    <div class="grid grid-cols-3 gap-3 text-sm">
+    <div class="grid grid-cols-4 gap-3 text-sm">
       <div>
         <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.direct") }}</div>
         <div class="tabular-nums font-medium">{{ snap.route_direct_req }}</div>
@@ -55,6 +55,14 @@
         <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.file") }}</div>
         <div class="tabular-nums font-medium">{{ snap.route_file_req }}</div>
         <div class="text-xs text-slate-500">{{ snap.route_file_bytes }} B</div>
+      </div>
+      {# The cache route: the requests the edge cache answered (issue #260). #}
+      <div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">{{ lang.t("traffic.cache") }}</div>
+        {# The `data-traffic` attribute carries the raw number, so a test
+           can assert on it without scraping the rendered cell. #}
+        <div data-traffic="cache_req" class="tabular-nums font-medium">{{ snap.route_cache_req }}</div>
+        <div data-traffic="cache_bytes" class="text-xs text-slate-500">{{ snap.route_cache_bytes }} B</div>
       </div>
     </div>
     <div class="mt-3 text-xs text-slate-500 dark:text-slate-400">

@@ -1,0 +1,46 @@
+{# The edge cache's card (issue #260) — the counters and the "clear the
+   cache" button. Refreshed through htmx from GET /api/cache/card.
+
+   Every counter carries a `data-cache` attribute: the value is the raw
+   number, so a test can read it without scraping the rendered cell. #}
+<div class="card p-4 md:p-5">
+  <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+    <h2 class="text-sm font-semibold text-slate-700 dark:text-slate-200">{{ lang.t("cache.title") }}</h2>
+    <button hx-post="/cache/clear"
+            hx-vals='{"_csrf": "__CSRF__"}'
+            hx-swap="none"
+            hx-confirm="{{ lang.t("cache.clear_confirm") }}"
+            class="px-3 py-1.5 rounded-lg text-sm font-medium border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800">
+      {{ lang.t("cache.clear") }}
+    </button>
+  </div>
+  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.hits") }}</div>
+      <div data-cache="hits" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.hits }}</div>
+      <div class="text-xs text-slate-500 dark:text-slate-400">{{ cache_stats.hit_rate_display() }}</div>
+    </div>
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.misses") }}</div>
+      <div data-cache="misses" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.misses }}</div>
+    </div>
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.deferred") }}</div>
+      <div data-cache="deferred" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.deferred }}</div>
+    </div>
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.memory") }}</div>
+      <div data-cache="memory_bytes" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.memory_display() }}</div>
+      <div data-cache="memory_entries" class="text-xs text-slate-500 dark:text-slate-400">{{ cache_stats.memory_entries }} {{ lang.t("cache.entries") }}</div>
+    </div>
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.disk") }}</div>
+      <div data-cache="disk_bytes" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.disk_display() }}</div>
+      <div data-cache="disk_entries" class="text-xs text-slate-500 dark:text-slate-400">{{ cache_stats.disk_entries }} {{ lang.t("cache.entries") }}</div>
+    </div>
+    <div>
+      <div class="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400">{{ lang.t("cache.evictions") }}</div>
+      <div data-cache="evictions" class="text-xl font-semibold tabular-nums text-slate-900 dark:text-white">{{ cache_stats.evictions }}</div>
+    </div>
+  </div>
+</div>

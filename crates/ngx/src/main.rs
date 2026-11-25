@@ -593,6 +593,14 @@ fn run_pingora(
         log::info!("cache: edge cache off");
         None
     };
+    // The admin UI's bridge to the cache (issue #260): the statistics
+    // card reads its counters, and the "clear the cache" button
+    // empties it. The handle is installed here because the cache is
+    // built here — the admin crate cannot depend on `ngx`, so the
+    // bridge is a trait on the shared `App`.
+    if let Some(cache) = cache.as_ref() {
+        app.set_cache_admin(Arc::clone(cache) as Arc<dyn pangolin_core::CacheAdmin>);
+    }
     let app_proxy = AppProxy {
         app: app.clone(),
         resolver,

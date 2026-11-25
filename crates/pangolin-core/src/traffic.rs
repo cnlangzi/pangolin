@@ -52,12 +52,17 @@ const AGGREGATOR_TICK: Duration = Duration::from_millis(200);
 
 /// How the request was routed. Recorded on the request ctx at site
 /// lookup time so `logging` never re-takes the indexes lock.
+///
+/// `Cache` is the exception: it is not a route to a backend but the
+/// absence of one — the answer came from the edge cache and the
+/// origin was never contacted (issue #260).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficRoute {
     Direct,
     Tunnel,
     File,
+    Cache,
     #[default]
     Unknown,
 }
@@ -192,6 +197,8 @@ pub struct TrafficSnapshot {
     pub route_tunnel_bytes: u64,
     pub route_file_req: u64,
     pub route_file_bytes: u64,
+    pub route_cache_req: u64,
+    pub route_cache_bytes: u64,
     pub method_get: u64,
     pub method_head: u64,
     pub method_post: u64,
@@ -532,6 +539,8 @@ struct Inner {
     route_tunnel_bytes: u64,
     route_file_req: u64,
     route_file_bytes: u64,
+    route_cache_req: u64,
+    route_cache_bytes: u64,
     method_get: u64,
     method_head: u64,
     method_post: u64,
@@ -574,6 +583,8 @@ impl Inner {
             route_tunnel_bytes: 0,
             route_file_req: 0,
             route_file_bytes: 0,
+            route_cache_req: 0,
+            route_cache_bytes: 0,
             method_get: 0,
             method_head: 0,
             method_post: 0,
@@ -648,12 +659,22 @@ impl Inner {
                 self.route_file_req += 1;
                 self.route_file_bytes += s.bytes_out;
             }
+            TrafficRoute::Cache => {
+                self.route_cache_req += 1;
+                self.route_cache_bytes += s.bytes_out;
+            }
             TrafficRoute::Unknown => {}
         }
 
         if !s.host_known {
             self.unknown_req += 1;
         } else {
+            // A cache hit is a request, but its duration is not a
+            // latency: the origin was never contacted, so the number
+            // says how fast the cache is, not how slow the host is
+            // (issue #260). It counts in `req`, and it stays out of
+            // the host's latency average.
+            let timed = s.kind == TrafficKind::Http && s.route != TrafficRoute::Cache;
             if let Some(row) = self.by_host.get_mut(&s.host) {
                 row.req += 1;
                 row.bytes_out += s.bytes_out;
@@ -663,21 +684,20 @@ impl Inner {
                 if (500..600).contains(&s.status) {
                     row.s5xx += 1;
                 }
-                if s.kind == TrafficKind::Http {
+                if timed {
                     row.http_req += 1;
                     row.latency_sum_ms += s.duration_ms;
                 }
             } else if self.by_host.len() < MAX_HOSTS {
-                let http = s.kind == TrafficKind::Http;
                 self.by_host.insert(
                     s.host.clone(),
                     HostRow {
                         req: 1,
-                        http_req: u64::from(http),
+                        http_req: u64::from(timed),
                         bytes_out: s.bytes_out,
                         s4xx: u64::from((400..500).contains(&s.status)),
                         s5xx: u64::from((500..600).contains(&s.status)),
-                        latency_sum_ms: if http { s.duration_ms } else { 0 },
+                        latency_sum_ms: if timed { s.duration_ms } else { 0 },
                     },
                 );
             } else {
@@ -697,10 +717,17 @@ impl Inner {
 
         let is_http = s.kind == TrafficKind::Http;
         if is_http {
-            let idx = latency_bucket(s.duration_ms);
-            self.latency_buckets[idx] += 1;
-            self.latency_sum_ms += s.duration_ms;
-            self.latency_count += 1;
+            // The latency histogram describes the requests that
+            // reached an origin. A cache hit is counted as a request
+            // and its bytes are counted, but it does not enter the
+            // histogram: it took microseconds, and mixing it in would
+            // pull the p95 down to nothing (issue #260).
+            if s.route != TrafficRoute::Cache {
+                let idx = latency_bucket(s.duration_ms);
+                self.latency_buckets[idx] += 1;
+                self.latency_sum_ms += s.duration_ms;
+                self.latency_count += 1;
+            }
             let elapsed = now.saturating_duration_since(self.started_at);
             let sec = elapsed.as_secs();
             let min = sec / 60;
@@ -800,6 +827,8 @@ impl Inner {
             route_tunnel_bytes: self.route_tunnel_bytes,
             route_file_req: self.route_file_req,
             route_file_bytes: self.route_file_bytes,
+            route_cache_req: self.route_cache_req,
+            route_cache_bytes: self.route_cache_bytes,
             method_get: self.method_get,
             method_head: self.method_head,
             method_post: self.method_post,
@@ -1125,6 +1154,56 @@ mod tests {
         assert_eq!(snap.requests_total, 1);
         assert!(snap.p95_ms.is_none(), "ws must not enter the histogram");
         assert_eq!(snap.rps, 0.0);
+    }
+
+    /// A cache hit is counted under the cache route, not under the
+    /// route the site would have taken (issue #260).
+    #[test]
+    fn a_cache_hit_is_counted_under_the_cache_route() {
+        let mut inner = Inner::new(Instant::now());
+        let mut hit = sample("a.example.com", 200, 0);
+        hit.route = TrafficRoute::Cache;
+        inner.record(hit, Instant::now());
+        inner.record(sample("a.example.com", 200, 12), Instant::now());
+
+        assert_eq!(inner.route_cache_req, 1);
+        assert_eq!(inner.route_cache_bytes, 100);
+        assert_eq!(inner.route_direct_req, 1);
+        assert_eq!(inner.route_direct_bytes, 100);
+    }
+
+    /// A cache hit does not enter the latency histogram (issue #260).
+    ///
+    /// Its duration is microseconds: mixed into the distribution, it
+    /// would pull the p95 down to nothing and say nothing about how
+    /// slow the origin is. The request count still grows.
+    #[test]
+    fn a_cache_hit_is_counted_but_does_not_enter_the_histogram() {
+        let mut inner = Inner::new(Instant::now());
+        let mut hit = sample("a.example.com", 200, 0);
+        hit.route = TrafficRoute::Cache;
+        inner.record(hit, Instant::now());
+
+        assert_eq!(inner.requests_total, 1, "the request is still counted");
+        assert_eq!(inner.latency_count, 0, "the hit must not be timed");
+        assert_eq!(inner.latency_sum_ms, 0);
+        assert_eq!(inner.latency_buckets.iter().sum::<u64>(), 0);
+    }
+
+    /// The host's average latency describes the requests that reached
+    /// an origin — a cache hit is not one of them.
+    #[test]
+    fn the_host_average_ignores_the_cache_hits() {
+        let mut inner = Inner::new(Instant::now());
+        let mut hit = sample("a.example.com", 200, 0);
+        hit.route = TrafficRoute::Cache;
+        inner.record(hit, Instant::now());
+        inner.record(sample("a.example.com", 200, 10), Instant::now());
+
+        let row = inner.by_host.get("a.example.com").expect("host row");
+        assert_eq!(row.req, 2, "both requests are counted");
+        assert_eq!(row.http_req, 1, "only the origin-served one is timed");
+        assert_eq!(row.latency_sum_ms.checked_div(row.http_req), Some(10));
     }
 
     #[test]

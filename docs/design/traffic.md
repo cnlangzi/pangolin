@@ -20,7 +20,7 @@ persistence — restart clears everything. Complements the per-request
 
 - Persistence / JSONL / cross-restart.
 - Prometheus text exposition (same atomics can feed it later).
-- Cache HIT/MISS, GeoIP, unique visitors, top client IP.
+- GeoIP, unique visitors, top client IP.
 - TLS handshake failures (they never reach HTTP `logging`).
 - tun-process-local stats (tunnel is a *route* dimension on ngx).
 
@@ -55,7 +55,7 @@ Built in `ngx/src/proxy.rs::traffic_sample`:
 - path: query-stripped, 128-byte cap; omitted for Stream / Websocket
 - method / status / duration_ms
 - `bytes_in` / `bytes_out` from pingora `body_bytes_read/sent`
-- route: Direct / Tunnel / File / Unknown
+- route: Direct / Tunnel / File / Cache / Unknown
 - kind: Http / Stream / Websocket
 - tls: `digest.ssl_digest` present
 
@@ -64,6 +64,32 @@ enter the latency histogram or the RPS rings.
 
 Unknown hosts increment `unknown_req` and never occupy the 4k
 by-host table.
+
+## The cache route
+
+A request the edge cache answered never reached a backend, so it is
+counted under the `Cache` route and **not** under the route the site
+would have taken (issue #260). The direct and the tunnelled counters
+therefore describe the traffic that actually went to an origin.
+
+The `Cache` route is a counting bucket, not a measurement: a cache
+hit is a request and its bytes are counted, but its **duration is
+not a latency**. The lookup took microseconds — the origin was
+never contacted — so the number says how fast the cache is, not how
+slow the host is. Mixing it into the latency distribution would pull
+the p95 down to nothing and make it say nothing about the origin.
+
+So a cache hit:
+
+- increments `requests_total` and the byte counters;
+- increments the cache route's request and byte counters;
+- enters the RPS rings (it is a request the client made);
+- **does not** enter the latency histogram, and does not count
+  towards a host's average latency.
+
+The rule is the same one the Stream and Websocket classes follow:
+a sample that does not measure the origin's latency does not go into
+the latency distribution.
 
 ## Capacity
 
@@ -104,3 +130,4 @@ not spawned and `on_start` / `on_finish` are no-ops.
 - `crates/pangolin-core/src/traffic.rs`
 - `crates/ngx/src/proxy.rs` (`new_ctx`, `logging`, `traffic_sample`)
 - Pingora `ProxyHttp::logging` (called on short-circuit, finish, error)
+- [cache.md](./cache.md) — the edge cache the `Cache` route belongs to

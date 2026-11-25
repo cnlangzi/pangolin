@@ -15,6 +15,7 @@
 //! [`AdmissionPolicy::observe`] must be fast, must not block and must
 //! not panic.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pingora::cache::CacheKey;
@@ -22,6 +23,7 @@ use pingora::cache::admission::{AdmissionPolicy, Decision};
 use pingora::cache::hashtable::ConcurrentLruCache;
 
 use super::key;
+use super::stats::CacheCounters;
 
 /// How many shards the counter table has.
 const COUNTER_SHARDS: usize = 16;
@@ -40,6 +42,14 @@ pub struct HotAdmissionPolicy {
     half_life: Duration,
     /// The counters, sharded and bounded.
     counters: ConcurrentLruCache<Counter, COUNTER_SHARDS>,
+    /// The cache's counters.
+    ///
+    /// The policy is where the "not stored" decision is made, so it
+    /// is also where that decision is counted: a miss that was not
+    /// hot enough is neither a hit nor a stored entry, and the
+    /// operator needs to see it apart from the other misses
+    /// (issue #260).
+    stats: Arc<CacheCounters>,
 }
 
 /// One key's hotness.
@@ -54,11 +64,12 @@ struct Counter {
 impl HotAdmissionPolicy {
     /// A policy that stores a key once it has been observed
     /// `min_uses` times, with the given half-life.
-    pub fn new(min_uses: u32, half_life: Duration) -> Self {
+    pub fn new(min_uses: u32, half_life: Duration, stats: Arc<CacheCounters>) -> Self {
         Self {
             min_uses,
             half_life,
             counters: ConcurrentLruCache::new(SHARD_CAPACITY),
+            stats,
         }
     }
 
@@ -98,6 +109,8 @@ impl AdmissionPolicy for HotAdmissionPolicy {
         if observed >= self.min_uses {
             Decision::Ready { observed }
         } else {
+            // The miss is not stored: the key is not hot enough yet.
+            self.stats.record_deferred();
             Decision::Defer { observed }
         }
     }
@@ -137,13 +150,18 @@ fn decay(count: u32, idle: Duration, half_life: Duration) -> u32 {
 mod tests {
     use super::*;
 
+    /// The counters a policy counts into.
+    fn counters() -> Arc<CacheCounters> {
+        Arc::new(CacheCounters::new())
+    }
+
     fn key_for(path: &str) -> CacheKey {
         super::super::key::primary_key("http", "example.com", path)
     }
 
     #[test]
     fn a_key_below_the_threshold_is_deferred() {
-        let policy = HotAdmissionPolicy::new(2, Duration::from_secs(3600));
+        let policy = HotAdmissionPolicy::new(2, Duration::from_secs(3600), counters());
         let key = key_for("/a.css");
         assert_eq!(policy.observe(&key), Decision::Defer { observed: 1 });
         assert_eq!(policy.observe(&key), Decision::Ready { observed: 2 });
@@ -151,7 +169,7 @@ mod tests {
 
     #[test]
     fn a_threshold_of_one_stores_the_first_observation() {
-        let policy = HotAdmissionPolicy::new(1, Duration::from_secs(3600));
+        let policy = HotAdmissionPolicy::new(1, Duration::from_secs(3600), counters());
         assert_eq!(
             policy.observe(&key_for("/a.css")),
             Decision::Ready { observed: 1 }
@@ -160,7 +178,7 @@ mod tests {
 
     #[test]
     fn a_threshold_of_zero_stores_everything() {
-        let policy = HotAdmissionPolicy::new(0, Duration::from_secs(3600));
+        let policy = HotAdmissionPolicy::new(0, Duration::from_secs(3600), counters());
         assert_eq!(
             policy.observe(&key_for("/a.css")),
             Decision::Ready { observed: 1 }
@@ -173,7 +191,7 @@ mod tests {
     #[test]
     fn a_key_that_went_quiet_is_no_longer_hot() {
         let half_life = Duration::from_millis(50);
-        let policy = HotAdmissionPolicy::new(2, half_life);
+        let policy = HotAdmissionPolicy::new(2, half_life, counters());
         let key = key_for("/a.css");
         assert_eq!(policy.observe(&key), Decision::Defer { observed: 1 });
         assert_eq!(policy.observe(&key), Decision::Ready { observed: 2 });
@@ -191,7 +209,7 @@ mod tests {
 
     #[test]
     fn two_keys_are_counted_separately() {
-        let policy = HotAdmissionPolicy::new(2, Duration::from_secs(3600));
+        let policy = HotAdmissionPolicy::new(2, Duration::from_secs(3600), counters());
         assert_eq!(
             policy.observe(&key_for("/a.css")),
             Decision::Defer { observed: 1 }
@@ -203,6 +221,29 @@ mod tests {
         assert_eq!(
             policy.observe(&key_for("/a.css")),
             Decision::Ready { observed: 2 }
+        );
+    }
+
+    /// A miss that was not hot enough is counted as such (issue #260).
+    ///
+    /// The operator has to see it apart from the misses that became
+    /// entries: "the cache is not used" and "the cache is used, but
+    /// the files are cold" are two different problems.
+    #[test]
+    fn a_deferred_miss_is_counted() {
+        let stats = counters();
+        let policy = HotAdmissionPolicy::new(2, Duration::from_secs(3600), stats.clone());
+        let key = key_for("/a.css");
+
+        assert_eq!(policy.observe(&key), Decision::Defer { observed: 1 });
+        assert_eq!(stats.snapshot().deferred, 1);
+
+        // The second observation is hot enough: the key is stored.
+        assert_eq!(policy.observe(&key), Decision::Ready { observed: 2 });
+        assert_eq!(
+            stats.snapshot().deferred,
+            1,
+            "a stored entry is not a deferral"
         );
     }
 

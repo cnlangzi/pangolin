@@ -5,14 +5,19 @@
 //! request down or fail one. Every counter here is a relaxed atomic
 //! increment — no lock, no allocation, no error path.
 //!
-//! Nothing reads the counters today. The admin statistics card is a
-//! later issue; this module is the seam it will read.
+//! The counters are read by the admin statistics card, through the
+//! [`pangolin_core::cache::CacheAdmin`] bridge. The snapshot they
+//! produce is [`pangolin_core::cache::CacheStats`] — the public shape
+//! lives in the core crate, because the admin UI cannot depend on
+//! `ngx` (issue #260).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pangolin_core::cache::CacheStats;
+
 /// The counters the edge cache keeps.
 #[derive(Debug, Default)]
-pub struct CacheStats {
+pub struct CacheCounters {
     /// A request that was answered from the cache.
     hits: AtomicU64,
     /// A request that had to go to the origin.
@@ -36,7 +41,7 @@ pub struct CacheStats {
     disk_entries: AtomicU64,
 }
 
-impl CacheStats {
+impl CacheCounters {
     /// A fresh, empty set of counters.
     pub fn new() -> Self {
         Self::default()
@@ -86,8 +91,8 @@ impl CacheStats {
     }
 
     /// A snapshot of the counters.
-    pub fn snapshot(&self) -> CacheStatsSnapshot {
-        CacheStatsSnapshot {
+    pub fn snapshot(&self) -> CacheStats {
+        CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             stores: self.stores.load(Ordering::Relaxed),
@@ -102,17 +107,40 @@ impl CacheStats {
     }
 }
 
-/// A point-in-time copy of the cache's counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CacheStatsSnapshot {
-    pub hits: u64,
-    pub misses: u64,
-    pub stores: u64,
-    pub deferred: u64,
-    pub errors: u64,
-    pub evictions: u64,
-    pub memory_bytes: u64,
-    pub memory_entries: u64,
-    pub disk_bytes: u64,
-    pub disk_entries: u64,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_counters_read_back_what_they_recorded() {
+        let counters = CacheCounters::new();
+        counters.record_hit();
+        counters.record_hit();
+        counters.record_miss();
+        counters.record_deferred();
+        counters.record_store();
+        counters.record_eviction();
+        counters.record_error();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.hits, 2);
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.deferred, 1);
+        assert_eq!(snapshot.stores, 1);
+        assert_eq!(snapshot.evictions, 1);
+        assert_eq!(snapshot.errors, 1);
+    }
+
+    #[test]
+    fn the_occupancy_is_published_as_a_pair() {
+        let counters = CacheCounters::new();
+        counters.set_memory_usage(1024, 4);
+        counters.set_disk_usage(4096, 2);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.memory_bytes, 1024);
+        assert_eq!(snapshot.memory_entries, 4);
+        assert_eq!(snapshot.disk_bytes, 4096);
+        assert_eq!(snapshot.disk_entries, 2);
+    }
 }

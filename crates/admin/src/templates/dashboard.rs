@@ -94,6 +94,11 @@ pub struct DashboardTemplate<'a> {
     pub traffic_active: u64,
     /// The live "blocked clients" list (issue #117).
     pub blocked: Vec<BlockedRow>,
+    /// The edge cache's counters (issue #260).
+    ///
+    /// The card is rendered from these numbers, and the same numbers
+    /// are served by the polled `GET /api/cache/card` fragment.
+    pub cache_stats: pangolin_core::CacheStats,
     pub active_nav: &'a str,
     /// The interface language this page is rendered in.
     pub lang: Lang,

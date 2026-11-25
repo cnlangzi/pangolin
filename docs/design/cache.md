@@ -21,9 +21,9 @@ document is about the two decisions the engine cannot make for us:
 
 ## Non-goals
 
-- Cache invalidation (a PURGE method, an admin "clear the cache"
-  button) and the cache statistics card — a later issue, built on
-  top of this one.
+- Exposing the invalidation or the counters on `/api/v1/` — the
+  dashboard-facing API is a published contract, and extending it is
+  a change of its own.
 - Per-site cache policies (a database table, an admin page, an
   `/api/v1/` endpoint).
 - Varying on the origin's own `Vary` declaration.
@@ -113,9 +113,9 @@ mitigations, in the order they are worth reaching for:
 2. **Let it expire.** The entry's freshness is the origin's
    `max-age` (capped by `cache.ttl`), so a stale answer is a
    `max-age` away.
-3. **Flush the cache.** The invalidation interface is a later issue;
-   until it exists, restarting the gateway with an empty `cache.dir`
-   is the blunt version of it.
+3. **Invalidate the path.** A `PURGE /app.css` drops the entry, and
+   the next request goes to the origin — see
+   [Invalidation](#invalidation).
 
 **What it buys.** A file that is requested with a changing query
 string — a signed URL, a cache-buster that changes every build —
@@ -242,6 +242,90 @@ the revalidation happens once per freshness window per key.
   the entry and nothing else. The request is answered from the origin
   and the client sees no `5xx`.
 
+## Invalidation
+
+A cached asset that was published again has to take effect at once.
+There are two ways to make that happen, and they answer two
+different questions.
+
+### `PURGE` — one path
+
+A `PURGE` request for a path drops the entry that path names:
+
+```http
+PURGE /app.css HTTP/1.1
+Host: example.com
+```
+
+The answer is the cache engine's own:
+
+| Answer | Meaning |
+| --- | --- |
+| `200` | the entry was there and is gone |
+| `404` | there was no entry for that path |
+| `405` | the path could never be cached — its extension is not on `cache.types` |
+| `500` | the storage failed; the entry is still there |
+
+A purge never reaches the origin and never creates an entry: it
+only ever removes one. It does not count as a lookup either — a
+purge is not a hit and not a miss.
+
+**The purge is not authenticated.** Any client that can reach the
+gateway may drop any cached entry. That is a deliberate trade-off:
+the purge is an operational tool, and the operator's way of using it
+is a `curl` from wherever they sit — a shared secret or an IP
+allowlist would put a second mechanism between the operator and the
+cache. What an unauthenticated purge can do is limited: it can only
+**remove** an entry, never inject one, so the worst case is a cold
+cache — the origin serves the assets it would have served on the
+first request anyway. The answers are a small oracle (a `200` says
+the asset was cached, a `404` that it was not), and the asset URLs
+are public. A deployment that cannot accept even that should put the
+gateway behind an authenticating proxy; the cache has no
+configuration of its own for it.
+
+**What a purge drops.** The key is the path *without* the query
+string, so `PURGE /app.css` drops `/app.css?v=1` and `/app.css?v=2`
+as well: they are one entry.
+
+The encoding is a *variant* of the entry, and a variant lives in a
+secondary slot. A secondary slot is only reachable through the
+primary one — the lookup finds the primary first, and only a
+mismatch sends it on to the variants. A purge drops the primary
+slot, so no variant is reachable any more. The primary's
+provenance timestamp is the tombstone of its variants: a variant
+that was stored before the purge is older than the primary that
+replaced it, so the engine does not serve it either. The next
+request for the path — in any encoding — goes to the origin.
+
+### The admin's "clear the cache" — everything
+
+The dashboard carries a cache card with the cache's counters and a
+**clear cache** button. The button empties the cache: the memory
+tier in one go, the disk tier's files one by one. A file that
+cannot be deleted is skipped and logged — the rest of the cache is
+still emptied, and the request path is not affected. A file that
+survived is not served any more (the index no longer knows it), but
+it comes back when the process restarts: the startup sweep adopts
+every file it finds.
+
+The action goes through the admin's own cookie session and CSRF
+check, like every other write the admin UI makes. A request without
+a valid token is refused with a `403`, and nothing is cleared.
+
+The counters are **not** reset: they are the cache's history, not
+its occupancy. The occupancy they publish *is* reset, because the
+tiers are empty afterwards.
+
+### What is not here
+
+- **Per-site invalidation.** There is no way to say "drop the cache
+  of this one site": a purge names a path, and the clear empties
+  everything.
+- **A published API.** Neither the purge nor the counters are on
+  `/api/v1/`: that API is a contract with the dashboard, and
+  extending it is a change of its own.
+
 ## Observability
 
 A response the cache had a hand in carries:
@@ -259,9 +343,26 @@ The **access log** carries the same fact as `cache_hit` — the
 operator sees which requests the cache answered, not just the client
 that asked. See [access-log.md](./access-log.md).
 
-The counters behind `crates/ngx/src/cache/stats.rs` (hits, misses,
-stores, deferrals, errors, evictions and the two tiers' occupancy)
-are process-local. The admin statistics card is a later issue.
+The **traffic stats** carry it as a route: a request the cache
+answered never reached a backend, so it is counted under the cache
+route and not under the direct or the tunnelled one. See
+[traffic.md](./traffic.md).
+
+### The counters
+
+The cache keeps its own counters (hits, misses, stores, deferrals,
+errors, evictions and the two tiers' occupancy). They are relaxed
+atomics — no lock, no allocation, no error path — so they can never
+slow a request down or fail one.
+
+They are **process-local** and reset when the process restarts. A
+gateway that runs without a cache answers with zeros, so the reader
+does not have to know whether the cache exists.
+
+The dashboard's cache card reads them live: the counters are read as
+they are, with no publishing thread and no snapshot to wait for. The
+card is polled every two seconds, like the other live panels of the
+dashboard.
 
 ## Where the cache sits in the request
 
@@ -271,6 +372,7 @@ request_filter        site lookup, rate limit, origin guard
         ▼
 proxy_cache
    request_cache_filter   the cache is enabled for the eligible requests
+   is_purge               a PURGE stops here and never reaches the origin
    cache_key_callback     scheme + host + path
    cache_lookup           memory tier, then disk tier
    admission              the hotness threshold
@@ -285,6 +387,10 @@ does. That is the same order the gateway has always had, and it is
 what an operator expects: the cache does not become a way around the
 rate limiter.
 
+A `PURGE` goes through the same two gates and then stops at the
+cache: it is a request about the cache, not a request for the
+asset.
+
 ## Configuration
 
 See [the configuration reference](../configuration.md#cache--the-edge-cache-for-static-assets)
@@ -294,10 +400,12 @@ for the keys and their defaults.
 
 | File | What it holds |
 | --- | --- |
-| `crates/ngx/src/cache/mod.rs` | the runtime handle and the extension whitelist |
+| `crates/ngx/src/cache/mod.rs` | the runtime handle, the extension whitelist and the `CacheAdmin` bridge |
 | `crates/ngx/src/cache/storage.rs` | the two tiers and the `Storage` implementation |
 | `crates/ngx/src/cache/admission.rs` | the hotness threshold and its decay |
 | `crates/ngx/src/cache/freshness.rs` | how a response's freshness is decided |
 | `crates/ngx/src/cache/key.rs` | the cache key and its variance |
 | `crates/ngx/src/cache/stats.rs` | the counters |
+| `crates/pangolin-core/src/cache.rs` | the public counters and the `CacheAdmin` trait |
 | `crates/ngx/src/proxy.rs` | the `ProxyHttp` hooks that wire the cache up |
+| `crates/admin/src/routes/cache.rs` | the admin's cache card and the "clear the cache" action |

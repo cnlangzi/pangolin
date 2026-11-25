@@ -94,6 +94,9 @@ pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp
     // The live "blocked clients" list (issue #117): the client IPs
     // the rate limiter rejected, most recent first.
     let blocked = blocked_rows(app, lang);
+    // The edge cache's counters (issue #260). A gateway that runs
+    // without a cache answers with zeros.
+    let cache_stats = app.cache_stats();
     let dashboard = DashboardTemplate {
         site_count: sites.len(),
         domain_count: domains.len(),
@@ -107,6 +110,7 @@ pub async fn render(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp
         traffic_error_pct: traffic.error_pct_display(),
         traffic_active: traffic.active_requests,
         blocked,
+        cache_stats,
         active_nav: "dashboard",
         lang,
     };

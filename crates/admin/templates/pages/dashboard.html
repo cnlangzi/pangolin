@@ -86,6 +86,16 @@
     <div class="ml-auto text-sm text-accent-600 dark:text-accent-400">{{ lang.t("dashboard.traffic_link") }}</div>
   </a>
 
+  {# The edge cache's card (issue #260) — the counters and the "clear
+     the cache" button. Refreshed through htmx every 2 s, so the
+     operator sees the hit rate move. #}
+  <div id="dashboard-cache" class="mb-8"
+       hx-get="/api/cache/card"
+       hx-trigger="every 2s"
+       hx-swap="innerHTML">
+    {% include "views/dashboard/_cache.html" %}
+  </div>
+
   {# Live "blocked clients" list (issue #117) — the client IPs the rate
      limiter rejected. Refreshed through htmx every 2 s. #}
   <div id="dashboard-blocked" class="mb-8"

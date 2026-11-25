@@ -29,6 +29,7 @@
 //! `LoginTemplate` → `pages/auth/login.html`.)
 
 pub mod auth;
+pub mod cache;
 pub mod certs;
 pub mod dashboard;
 pub mod dns;
@@ -43,6 +44,7 @@ pub mod tun;
 // Re-export per-resource template structs for ergonomic use at the call site:
 // `use crate::templates::SitesListTemplate;`
 pub use auth::LoginTemplate;
+pub use cache::CacheCardView;
 pub use certs::{CertRow, CertsListTemplate, CertsNewTemplate};
 pub use dashboard::{ActivityRow, BlockedRow, DashboardBlockedView, DashboardTemplate};
 pub use dns::{
