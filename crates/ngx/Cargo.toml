@@ -19,16 +19,8 @@ default = []
 # Enable integration tests (requires Pebble ACME test server running on port 14000).
 # Run with: cargo test --features integration -p ngx
 integration = []
-# The **mock** dashboard key (issue #262).
-#
-# The production build verifies the dashboard's Ed25519 signature
-# against the public key compiled into the binary. This feature swaps
-# that verifier for a mock that accepts one sentinel signature — so
-# the end-to-end suite never needs a real key pair and never touches
-# the production key.
-#
-# A build with this feature **must not** be pointed at a real
-# dashboard: it says so loudly on startup.
+# The **mock** dashboard key (issue #262) — see the `api` crate's
+# feature of the same name for what it does and what it costs.
 test-dashboard-key = ["api/test-dashboard-key"]
 
 [dependencies]
@@ -114,7 +106,7 @@ hickory-resolver = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots"] }
 # The jitter of the reconnection backoff.
 rand = "0.8"
-hmac = "0.13"
+hmac.workspace = true
 sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 

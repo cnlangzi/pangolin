@@ -53,10 +53,10 @@ http = "1"
 # tree (rustls' provider), so this adds no new crate to the build.
 ring = "0.17"
 
-# HMAC-SHA256 — the node's signature. `hmac` is already in the tree
-# (the DNS provider's request signing), so this adds no new crate
-# either.
-hmac = "0.13"
+# HMAC-SHA256 — the node's signature. The version is the workspace's
+# (see the root manifest): `hmac` is already in the tree, so this adds
+# no new crate.
+hmac.workspace = true
 
 # The nonce cache's lock — sync, non-poisoning, no hot path.
 parking_lot.workspace = true

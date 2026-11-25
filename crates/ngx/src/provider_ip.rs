@@ -404,12 +404,10 @@ fn header_value(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> 
 ///
 /// The requests are **verified**: the range list decides which
 /// addresses may reach the origin, so an attacker who could tamper
-/// with it could widen the allowlist. The root store is the system's
-/// own (the same one the ACME client relies on to talk to the CA).
-/// The client the range lists are fetched with.
-///
-/// The **same** builder every other outbound HTTPS request of the
-/// gateway uses: the roots are the system's own certificate store.
+/// with it could widen the allowlist. The client is the **same**
+/// builder every other outbound HTTPS request of the gateway uses, so
+/// the roots are the system's own certificate store (the same one the
+/// ACME client relies on to talk to the CA).
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
     crate::http_client::build_request_client(REQUEST_TIMEOUT)
 }

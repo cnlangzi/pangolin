@@ -29,9 +29,10 @@
 use http::HeaderMap;
 
 use crate::protocol::canonical::{
-    CanonicalRequest, canonical_string, is_in_window, is_valid_nonce,
+    CanonicalRequest, NONCE_TTL_SECS, canonical_string, is_in_window, is_valid_nonce,
 };
 use crate::protocol::error::{ApiError, codes};
+use crate::protocol::nonce::NonceCache;
 use crate::protocol::signature::{
     HEADER_AUTHORIZATION, HEADER_NODE_NONCE, HEADER_NODE_SIG, HEADER_NODE_TS, hmac_sha256_b64url,
 };
@@ -61,10 +62,19 @@ pub struct NodeClient {
 
 impl NodeClient {
     /// A client that authenticates with `token`.
-    pub fn new(token: impl Into<String>) -> Self {
-        Self {
-            token: token.into(),
+    ///
+    /// The token has to be a value an `Authorization` header can
+    /// carry — visible ASCII, no space. A token that cannot is
+    /// refused here: the channel would die on its first request
+    /// otherwise, and the failure would look like a dead dashboard.
+    pub fn new(token: impl Into<String>) -> Result<Self, ApiError> {
+        let token = token.into();
+        if !pangolin_core::credential::is_valid_token(&token) {
+            return Err(ApiError::malformed(
+                "the token must be visible ASCII without spaces — it cannot be sent in a header",
+            ));
         }
+        Ok(Self { token })
     }
 
     /// The token this client authenticates with.
@@ -237,7 +247,7 @@ pub fn verify_node_request(
     }
 
     // 3 — the bearer token. The dashboard looks the node up by it.
-    if presented_token != token {
+    if !constant_time_eq(presented_token, token) {
         return Err(ApiError::unauthorized(
             codes::INVALID_TOKEN,
             "the bearer token does not match",
@@ -261,6 +271,63 @@ pub fn verify_node_request(
         ));
     }
     Ok(())
+}
+
+/// The dashboard's side of the channel.
+///
+/// It authenticates the node's requests and remembers the nonces it
+/// has spent, so a request the dashboard has already answered cannot
+/// be replayed at it.
+///
+/// The node does the mirror image: it verifies the dashboard's answer
+/// to its `join` request by checking that the answer echoes the nonce
+/// the node just generated — a nonce that is fresh by construction,
+/// so a replayed answer cannot pass.
+#[derive(Debug)]
+pub struct NodeAuthenticator {
+    token: String,
+    nonces: NonceCache,
+}
+
+impl NodeAuthenticator {
+    /// An authenticator for the node that holds `token`.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            nonces: NonceCache::new(),
+        }
+    }
+
+    /// Authenticate a request the node sent.
+    ///
+    /// The checks are the four of [`verify_node_request`] plus the
+    /// replay check: a nonce may be used **once** inside the ±300 s
+    /// window. The nonce is remembered only after every check passed,
+    /// so a request that was refused leaves no trace.
+    pub fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        now: i64,
+    ) -> Result<(), ApiError> {
+        verify_node_request(headers, method, path, body, &self.token, now)?;
+
+        let nonce = headers
+            .get(HEADER_NODE_NONCE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if self.nonces.is_replay(&nonce, now) {
+            return Err(ApiError::unauthorized(
+                codes::REPLAYED_NONCE,
+                "the nonce was already used inside the accepted window",
+            ));
+        }
+        self.nonces.remember(&nonce, now, NONCE_TTL_SECS);
+        Ok(())
+    }
 }
 
 /// Compare two strings in constant time.
@@ -288,7 +355,7 @@ mod tests {
     const TOKEN: &str = "the-shared-token";
 
     fn client() -> NodeClient {
-        NodeClient::new(TOKEN)
+        NodeClient::new(TOKEN).expect("the token is usable")
     }
 
     #[test]
@@ -378,6 +445,20 @@ mod tests {
             .expect_err("the request is refused");
         assert_eq!(err.status, 401);
         assert_eq!(err.code, codes::TIMESTAMP_OUT_OF_WINDOW);
+    }
+
+    #[test]
+    fn a_token_that_cannot_travel_in_a_header_is_refused() {
+        // A token with a space, a control character or a non-ASCII
+        // character cannot go into the `Authorization` header: the
+        // channel would die on its first request.
+        for token in ["the token", "the\ntoken", "tökén", ""] {
+            assert!(
+                NodeClient::new(token).is_err(),
+                "the token {token:?} must be refused"
+            );
+        }
+        assert!(NodeClient::new("the-token").is_ok());
     }
 
     #[test]

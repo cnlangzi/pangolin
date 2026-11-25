@@ -92,7 +92,7 @@ pub struct SettingsTemplate<'a> {
 ///
 /// The API keys are **not** part of this view: the form shows whether
 /// a key is configured and takes a new one to replace it. The stored
-/// key never leaves the database.
+/// key is never rendered back.
 #[derive(Clone, Debug)]
 pub struct BadbotsSettingsView {
     /// Whether the reputation check runs.
@@ -112,7 +112,7 @@ pub struct BadbotsSettingsView {
 ///
 /// The bearer token is **not** part of this view: the form shows
 /// whether one is configured and takes a new one to replace it. The
-/// stored token never leaves the database.
+/// stored token is never rendered back.
 #[derive(Clone, Debug)]
 pub struct DashboardApiView {
     /// The id this node is known by in the dashboard.

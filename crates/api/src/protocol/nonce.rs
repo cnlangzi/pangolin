@@ -4,10 +4,12 @@
 //! remembers the nonces that were already spent and drops the ones
 //! that fell out of the window.
 //!
-//! On the outbound channel (issue #262) the node spends a nonce when
-//! it accepts the dashboard's response to its `join` request: a
-//! response that echoes a nonce the node already spent is a replayed
-//! response, and the node refuses it.
+//! On the outbound channel (issue #262) the cache belongs to the
+//! **dashboard**: it remembers the nonces of the node's requests it
+//! has already answered, so a captured request cannot be replayed at
+//! it (see [`crate::client::NodeAuthenticator`]). The node's side
+//! needs no cache — it generates a fresh nonce for every request and
+//! checks that the dashboard's answer echoes exactly that one.
 //!
 //! The cache is in-memory: a restart empties it, and with it the
 //! replay protection for the window that spanned the restart. The

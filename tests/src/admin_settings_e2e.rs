@@ -482,6 +482,89 @@ async fn settings_page_renders_the_dashboard_card() {
     );
 }
 
+/// A token that cannot travel in a request header is refused.
+///
+/// The channel puts the token in the `Authorization` header of every
+/// request: a token with a space or a non-ASCII character would kill
+/// the channel on its first request, so it is refused at the door.
+#[tokio::test]
+async fn settings_post_dashboard_refuses_a_token_that_cannot_travel_in_a_header() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_token", "the token with a space"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="dashboard-error""#),
+        "the error must be shown in the dashboard card: {body}"
+    );
+
+    // Nothing was written.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let token: String = conn
+        .query_row("SELECT token FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(token, "", "a refused form must not write");
+}
+
+/// A plain-HTTP dashboard address that leaves the machine is refused.
+///
+/// The channel carries the token in every request, so a plain-HTTP
+/// address would put the credential on the wire in clear text.
+#[tokio::test]
+async fn settings_post_dashboard_refuses_an_insecure_dashboard_address() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_dash_api", "http://dash.example.com/api/v1/"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="dashboard-error""#),
+        "the error must be shown in the dashboard card: {body}"
+    );
+
+    // Nothing was written.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let dash_api: String = conn
+        .query_row("SELECT dash_api FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(dash_api, "", "a refused form must not write");
+}
+
 /// The dashboard form writes the row — the token in the clear (the
 /// node signs with it) and the dash API as it was typed.
 #[tokio::test]

@@ -52,10 +52,13 @@ impl DashboardStatus {
     }
 
     /// The status of a channel that failed.
-    pub fn failed(error: impl Into<String>) -> Self {
+    ///
+    /// The last handshake is kept: the operator wants to know when
+    /// the channel was last up, not only that it is down now.
+    pub fn failed(error: impl Into<String>, last_handshake_at: Option<String>) -> Self {
         Self {
             online: false,
-            last_handshake_at: None,
+            last_handshake_at,
             last_error: Some(error.into()),
             ..Self::default()
         }
@@ -86,12 +89,19 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_status_carries_the_error() {
-        let status = DashboardStatus::failed("the dashboard refused the connection");
+    fn a_failed_status_carries_the_error_and_keeps_the_last_handshake() {
+        let status = DashboardStatus::failed(
+            "the dashboard refused the connection",
+            Some("2026-11-25T10:00:00Z".to_string()),
+        );
         assert!(!status.online);
         assert_eq!(
             status.last_error.as_deref(),
             Some("the dashboard refused the connection")
+        );
+        assert_eq!(
+            status.last_handshake_at.as_deref(),
+            Some("2026-11-25T10:00:00Z")
         );
     }
 }

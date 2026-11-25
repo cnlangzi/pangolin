@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use api::client::verify_node_request;
+use api::client::NodeAuthenticator;
 use api::protocol::signature::{
     HEADER_DASHBOARD_NONCE, HEADER_DASHBOARD_SIG, HEADER_DASHBOARD_TS, HEADER_NODE_NONCE,
 };
@@ -54,8 +54,8 @@ pub enum Handshake {
 /// The state the mock shares between its connections.
 #[derive(Debug)]
 struct MockState {
-    /// The token the node authenticates with.
-    token: String,
+    /// The authenticator: the four checks plus the replay cache.
+    auth: Arc<NodeAuthenticator>,
     /// The commands the test queued.
     commands: Mutex<VecDeque<serde_json::Value>>,
     /// Wakes the connection that is waiting for a command.
@@ -100,7 +100,7 @@ impl MockDashboard {
             .expect("bind the mock dashboard");
         let port = listener.local_addr().expect("the local address").port();
         let state = Arc::new(MockState {
-            token: token.to_string(),
+            auth: Arc::new(NodeAuthenticator::new(token)),
             commands: Mutex::new(VecDeque::new()),
             command_notify: Notify::new(),
             reports: Mutex::new(Vec::new()),
@@ -150,6 +150,17 @@ impl MockDashboard {
     /// Queue a command; the node receives it on the open subscription.
     pub async fn send_command(&self, command: serde_json::Value) {
         self.state.commands.lock().await.push_back(command);
+        self.state.command_notify.notify_waiters();
+    }
+
+    /// Queue a frame of another type — the dashboard's own control
+    /// traffic. The node must not run it as a command.
+    pub async fn send_frame(&self, event: &str, data: &str) {
+        self.state
+            .commands
+            .lock()
+            .await
+            .push_back(serde_json::json!({ "__event": event, "__data": data }));
         self.state.command_notify.notify_waiters();
     }
 
@@ -243,7 +254,10 @@ async fn join(state: Arc<MockState>, req: hyper::Request<Incoming>) -> hyper::Re
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_default();
-    if let Err(e) = verify_node_request(&req.headers(), "GET", &path, b"", &state.token, now) {
+    if let Err(e) = state
+        .auth
+        .authenticate(&req.headers(), "GET", &path, b"", now)
+    {
         return hyper::Response::builder()
             .status(401)
             .body(BoxBody::new(Full::new(Bytes::from(e.message))))
@@ -270,7 +284,18 @@ async fn join(state: Arc<MockState>, req: hyper::Request<Incoming>) -> hyper::Re
             let command = pump_state.next_command().await;
             match command {
                 Some(command) => {
-                    let frame = format!("data: {command}\n\n");
+                    // A frame with an event type carries its payload
+                    // under `__data` — the dashboard's control traffic.
+                    let frame = match command.get("__event") {
+                        Some(event) => format!(
+                            "event: {event}\ndata: {}\n\n",
+                            command
+                                .get("__data")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default()
+                        ),
+                        None => format!("data: {command}\n\n"),
+                    };
                     log::debug!("mock dashboard: pushing a frame: {frame}");
                     if tx.send(Bytes::from(frame)).await.is_err() {
                         break;
@@ -324,12 +349,11 @@ async fn report(state: Arc<MockState>, req: hyper::Request<Incoming>) -> hyper::
     // The dashboard verifies the node's signature with the very
     // function the real one uses.
     let now = api::protocol::now_secs();
-    let verified = verify_node_request(
+    let verified = state.auth.authenticate(
         &headers,
         method.as_str(),
         path.as_deref().unwrap_or(""),
         &body,
-        &state.token,
         now,
     );
     if let Err(e) = verified {

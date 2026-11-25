@@ -13,7 +13,7 @@ path = "src/lib.rs"
 pangolin-core = { path = "../crates/pangolin-core" }
 # The gateway's library — the outbound channel lives in it. The
 # `test-dashboard-key` feature is the same one the API crate gets
-# above (issue #262, R9).
+# below (issue #262, R9).
 ngx = { path = "../crates/ngx", features = ["test-dashboard-key"] }
 tun = { path = "../crates/tun" }
 # The dashboard-facing management API (issue #185, reworked by issue

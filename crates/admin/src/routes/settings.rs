@@ -179,6 +179,18 @@ pub async fn handle_update_dashboard(
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
     {
+        // The token travels in an HTTP header on every request, so it
+        // has to be a value a header can carry. A token that is not
+        // would kill the channel on its first request.
+        if !pangolin_core::credential::is_valid_token(token) {
+            return render_with_dashboard_error(
+                app,
+                csrf,
+                &lang.t("settings.dashboard.bad_token"),
+                lang,
+            )
+            .await;
+        }
         token.to_string()
     } else {
         row.token.clone()
@@ -191,6 +203,24 @@ pub async fn handle_update_dashboard(
         Some(value) => value.trim().to_string(),
         None => row.dash_api.clone(),
     };
+    // The channel carries the token, so the address has to be one the
+    // token may travel to: https, or plain HTTP on the loopback.
+    if !dash_api.is_empty()
+        && let Err(e) = pangolin_core::credential::validate_dash_api(&dash_api)
+    {
+        let message = match e {
+            pangolin_core::credential::DashApiError::NotAUrl => {
+                lang.t("settings.dashboard.bad_dash_api_url")
+            }
+            pangolin_core::credential::DashApiError::NoHost => {
+                lang.t("settings.dashboard.bad_dash_api_host")
+            }
+            pangolin_core::credential::DashApiError::NotSecure => {
+                lang.t("settings.dashboard.bad_dash_api_scheme")
+            }
+        };
+        return render_with_dashboard_error(app, csrf, &message, lang).await;
+    }
 
     {
         // Only the two columns this form owns are written: the

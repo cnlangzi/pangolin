@@ -5,9 +5,13 @@
 //!
 //! * **node → dashboard** — the node proves it holds the shared token
 //!   by signing the canonical string of its request with
-//!   **HMAC-SHA256** under that token. The token itself never crosses
-//!   the network: the canonical string carries `sha256_hex(token)`,
-//!   and the signature is the HMAC over the whole canonical string.
+//!   **HMAC-SHA256** under that token. The canonical string carries
+//!   `sha256_hex(token)` rather than the token, and the HMAC binds the
+//!   timestamp, the nonce and the body — so a captured request cannot
+//!   be replayed or edited. The token itself does cross the network,
+//!   as the bearer credential of the `Authorization` header: the
+//!   channel is a TLS session, and the token never leaves it in clear
+//!   text.
 //! * **dashboard → node** — the dashboard proves it holds the
 //!   dashboard's private key by signing the canonical string of its
 //!   response with **Ed25519**. The node verifies it against the
@@ -135,11 +139,12 @@ pub fn public_key_from_seed(seed: &[u8; 32]) -> Option<[u8; PUBLIC_KEY_LEN]> {
 /// encoded.
 ///
 /// The node signs its requests with the **token** as the key, so the
-/// dashboard can recompute the signature and compare it — without the
-/// token ever crossing the network.
+/// dashboard can recompute the signature and compare it.
 ///
-/// The comparison is what makes the token a secret: an attacker who
-/// captures a request has the signature, not the key.
+/// The signature binds the timestamp, the nonce and the body, so a
+/// captured request cannot be replayed at the dashboard or edited on
+/// the way. The token itself is the credential of the channel: it
+/// travels in the `Authorization` header, inside the TLS session.
 pub fn hmac_sha256_b64url(key: &[u8], message: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(message);

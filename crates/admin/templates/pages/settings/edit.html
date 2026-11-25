@@ -328,6 +328,7 @@
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
           {{ lang.t("settings.dashboard.dash_api_hint") }}
           <span class="font-mono" data-testid="dashboard-effective-dash-api">{{ dashboard.effective_dash_api }}</span>
+          {{ lang.t("settings.dashboard.dash_api_in_force") }}
         </p>
       </div>
     </div>
@@ -380,7 +381,7 @@
           {% endif %}
         </p>
         {% if !dashboard.last_error.is_empty() %}
-        <p class="text-xs text-danger-600 dark:text-danger-400 mt-1">
+        <p class="text-xs text-red-600 dark:text-red-400 mt-1">
           {{ lang.t("settings.dashboard.status_last_error") }}
           <span class="font-mono">{{ dashboard.last_error }}</span>
         </p>

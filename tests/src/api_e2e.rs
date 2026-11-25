@@ -111,6 +111,86 @@ fn the_sse_parser_reads_a_command_frame() {
     assert_eq!(frames[0].data, "{\"id\":\"c-1\"}");
 }
 
+/// A frame that is not a command is not executed.
+///
+/// The dashboard's own control traffic must not be run as an API
+/// request — the node only executes the frames it is told to.
+#[tokio::test]
+async fn a_frame_that_is_not_a_command_is_not_executed() {
+    let dashboard = MockDashboard::start(TOKEN).await;
+    let _node = start_node(dashboard.base_url(), TOKEN).await;
+
+    dashboard
+        .send_frame(
+            "keepalive",
+            "{\"id\":\"c-12\",\"method\":\"GET\",\"path\":\"/api/v1/sites\"}",
+        )
+        .await;
+    assert!(
+        dashboard
+            .wait_for_report(Duration::from_secs(3))
+            .await
+            .is_none(),
+        "a frame that is not a command must not be executed"
+    );
+}
+
+/// The node does not dial a dashboard whose address would put the
+/// token on the wire in clear text.
+///
+/// The channel carries the bearer token in every request, so a
+/// plain-HTTP address that leaves the machine is refused — by the
+/// settings page and, again, by the client before it dials.
+#[tokio::test]
+async fn the_node_refuses_to_dial_an_insecure_dashboard_address() {
+    let dashboard = MockDashboard::start(TOKEN).await;
+    // A plain-HTTP address on a host that is not the loopback: the
+    // token would travel in clear text.
+    let insecure = dashboard.base_url().replace("127.0.0.1", "example.com");
+    let _node = start_node(&insecure, TOKEN).await;
+
+    dashboard.send_get("c-10", "/api/v1/sites").await;
+    assert!(
+        dashboard
+            .wait_for_report(Duration::from_secs(3))
+            .await
+            .is_none(),
+        "the node must not dial an insecure address"
+    );
+    assert_eq!(dashboard.joins(), 0, "the dashboard must not be called");
+}
+
+/// An answer that does not fit in a report is reported as an error.
+///
+/// The raw log of a busy day is bigger than a report may carry. The
+/// dashboard has to learn that the command failed — not wait for an
+/// answer that never comes.
+#[tokio::test]
+async fn an_answer_that_does_not_fit_is_reported_as_an_error() {
+    let dashboard = MockDashboard::start(TOKEN).await;
+    let node = start_node(dashboard.base_url(), TOKEN).await;
+
+    // A bot log bigger than a report may carry.
+    let dir = node.app.config.log.bot.dir.clone();
+    std::fs::create_dir_all(&dir).expect("mkdir the bot log dir");
+    let date = chrono::Utc::now().date_naive();
+    let path = pangolin_core::bot_log::file_path_for(&dir, date);
+    std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).expect("write the log file");
+
+    let path = format!("/api/v1/logs/bot/raw?date={}", date.format("%Y-%m-%d"));
+    dashboard.send_get("c-11", &path).await;
+    let report = dashboard
+        .wait_for_report(REPORT_TIMEOUT)
+        .await
+        .expect("the node reports the result");
+
+    assert_eq!(report["id"], "c-11");
+    assert_eq!(report["status"], 413, "{report}");
+    let body = decode_body(&report);
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("the body is json");
+    assert_eq!(json["error"]["code"], "result_too_large");
+}
+
 /// The node subscribes and executes the command the dashboard sends.
 #[tokio::test]
 async fn the_node_executes_a_command_the_dashboard_sends() {

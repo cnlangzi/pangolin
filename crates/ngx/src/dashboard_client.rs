@@ -34,10 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::client::NodeClient;
-use api::protocol::canonical::{
-    CanonicalRequest, NONCE_TTL_SECS, canonical_string, is_in_window, is_valid_nonce,
-};
-use api::protocol::nonce::NonceCache;
+use api::protocol::canonical::{CanonicalRequest, canonical_string, is_in_window, is_valid_nonce};
 use api::protocol::signature::{
     DashboardKey, HEADER_DASHBOARD_NONCE, HEADER_DASHBOARD_SIG, HEADER_DASHBOARD_TS,
 };
@@ -75,6 +72,14 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the node checks whether the operator changed the
 /// settings while the subscription is up.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How many results may wait for the dashboard.
+///
+/// The queue is bounded: a dashboard that accepts the subscription but
+/// refuses the reports would otherwise make the node hold a result
+/// per command — up to a megabyte each — until the process runs out
+/// of memory. The oldest result is dropped when the queue is full.
+const MAX_PENDING_RESULTS: usize = 64;
 
 /// The largest report the node sends, in bytes.
 ///
@@ -207,9 +212,6 @@ pub struct DashboardClient {
     http: reqwest::Client,
     key: Arc<dyn DashboardKey>,
     state: Arc<ApiState>,
-    /// The nonces the dashboard already spent — a response that echoes
-    /// one of them is a replayed response.
-    nonces: NonceCache,
     /// The results that could not be reported yet.
     pending: Arc<Mutex<VecDeque<CommandResult>>>,
     /// Wakes the reporting task when a result is queued.
@@ -230,7 +232,6 @@ impl DashboardClient {
             http,
             key,
             state,
-            nonces: NonceCache::new(),
             pending: Arc::new(Mutex::new(VecDeque::new())),
             notify: Arc::new(Notify::new()),
         })
@@ -322,8 +323,18 @@ impl DashboardClient {
         config: &ChannelConfig,
         shutdown: &CancellationToken,
     ) -> anyhow::Result<Disconnect> {
+        // The address must be one the channel may use: the token
+        // travels in every request, so a plain-HTTP address that
+        // leaves the machine is refused (the settings page refuses it
+        // too — this is the second line of defence).
+        if let Err(e) = pangolin_core::credential::validate_dash_api(&config.dash_api) {
+            anyhow::bail!(
+                "the dashboard address {:?} is not usable: {e:?}",
+                config.dash_api
+            );
+        }
         let join = endpoint(&config.dash_api, JOIN_PATH)?;
-        let client = NodeClient::new(config.token.clone());
+        let client = NodeClient::new(config.token.clone())?;
         let signed = client.get(&join.target);
 
         let mut builder = self
@@ -458,11 +469,6 @@ impl DashboardClient {
         if !is_in_window(now, ts) {
             anyhow::bail!("the answer's timestamp is outside the accepted window");
         }
-        // A nonce the node already spent is a replayed answer.
-        if self.nonces.is_replay(&nonce, now) {
-            anyhow::bail!("the answer replays a nonce the node already spent");
-        }
-
         let canonical = canonical_string(&CanonicalRequest {
             method: "GET",
             path: target,
@@ -474,9 +480,6 @@ impl DashboardClient {
         if !self.key.verify(canonical.as_bytes(), &signature) {
             anyhow::bail!("the answer's signature does not verify");
         }
-        // The nonce is spent now: a second answer that echoes it is a
-        // replay.
-        self.nonces.remember(&nonce, now, NONCE_TTL_SECS);
         Ok(())
     }
 
@@ -490,6 +493,16 @@ impl DashboardClient {
 
     /// Execute one command frame.
     async fn handle_frame(&self, frame: SseFrame) {
+        // Only a command frame is executed: the dashboard's own
+        // control traffic (a keep-alive, a future control frame) must
+        // not be run as an API request.
+        match frame.event.as_deref() {
+            None | Some("command") => {}
+            Some(other) => {
+                log::debug!("dashboard: a {other} frame arrived — not a command, skipped");
+                return;
+            }
+        }
         if frame.data.trim().is_empty() {
             return;
         }
@@ -522,17 +535,60 @@ impl DashboardClient {
             "content-type".to_string(),
             response.content_type.to_string(),
         );
-        CommandResult {
+        let result = CommandResult {
             id: command.id.clone(),
             status: response.status,
             headers,
             body: BASE64.encode(&response.body),
+        };
+        if self.fits_in_a_report(&result) {
+            return result;
+        }
+        log::error!(
+            "dashboard: the answer to {} does not fit in a report — the command is answered with an error",
+            command.id
+        );
+        let error = api::protocol::error::error_body(&api::protocol::error::ApiError::new(
+            413,
+            "result_too_large",
+            format!("the answer is larger than the {MAX_REPORT_BYTES} bytes a report may carry"),
+        ));
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        CommandResult {
+            id: command.id.clone(),
+            status: 413,
+            headers,
+            body: BASE64.encode(&error),
         }
     }
 
+    /// Whether a result fits in a report.
+    fn fits_in_a_report(&self, result: &CommandResult) -> bool {
+        serde_json::to_vec(result)
+            .map(|body| body.len() <= MAX_REPORT_BYTES)
+            .unwrap_or(false)
+    }
+
     /// Queue a result for reporting.
+    ///
+    /// The queue is **bounded**: the oldest result is dropped when it
+    /// is full. A dashboard that never takes the reports must not be
+    /// able to make the node eat its memory.
     async fn enqueue(&self, result: CommandResult) {
-        self.pending.lock().await.push_back(result);
+        let mut pending = self.pending.lock().await;
+        while pending.len() >= MAX_PENDING_RESULTS {
+            let dropped = pending.pop_front();
+            if let Some(dropped) = dropped {
+                log::error!(
+                    "dashboard: the result of {} is dropped — {} results are already waiting",
+                    dropped.id,
+                    MAX_PENDING_RESULTS
+                );
+            }
+        }
+        pending.push_back(result);
+        drop(pending);
         self.notify.notify_one();
     }
 
@@ -546,23 +602,17 @@ impl DashboardClient {
 
     /// The channel is up.
     fn publish_online(&self) {
-        self.publish(DashboardStatus {
-            online: true,
-            last_handshake_at: Some(chrono::Utc::now().to_rfc3339()),
-            last_error: None,
-            ..DashboardStatus::default()
-        });
+        self.publish(DashboardStatus::online_at(&chrono::Utc::now().to_rfc3339()));
     }
 
     /// The channel is down; `error` says why.
     fn publish_offline(&self, error: Option<String>) {
         let previous = self.app.dashboard_status();
-        self.publish(DashboardStatus {
-            online: false,
-            last_handshake_at: previous.last_handshake_at,
-            last_error: error,
-            ..DashboardStatus::default()
-        });
+        let status = match error {
+            Some(error) => DashboardStatus::failed(error, previous.last_handshake_at),
+            None => DashboardStatus::offline(),
+        };
+        self.publish(status);
     }
 
     /// A handle that shares the client's state.
@@ -656,7 +706,9 @@ impl DashboardHandle {
                 body.len()
             )));
         }
-        let client = NodeClient::new(row.token.clone());
+        let client = NodeClient::new(row.token.clone()).map_err(|e| {
+            ReportFailure::Transient(anyhow::anyhow!("the token is not usable: {e}"))
+        })?;
         let signed = client.signed_request(
             "POST",
             &report.target,
@@ -682,9 +734,16 @@ impl DashboardHandle {
         log::debug!("dashboard: the report was answered: {}", response.status());
         let status = response.status();
         if !status.is_success() {
-            return Err(ReportFailure::Transient(anyhow::anyhow!(
-                "the dashboard refused the report: {status}"
-            )));
+            // A 4xx other than "try again later" is definitive: the
+            // dashboard will not take this result, and retrying it
+            // would hold the queue for ever.
+            let definitive = status.is_client_error() && status != 408 && status != 429;
+            let message = anyhow::anyhow!("the dashboard refused the report: {status}");
+            return Err(if definitive {
+                ReportFailure::Permanent(message)
+            } else {
+                ReportFailure::Transient(message)
+            });
         }
         Ok(())
     }
