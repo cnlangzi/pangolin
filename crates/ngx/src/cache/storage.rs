@@ -429,6 +429,33 @@ impl MemoryTier {
         self.entries.load(Ordering::Relaxed)
     }
 
+    /// The tier's occupancy: the byte counter and the sum of the LRU's
+    /// weights, read as **one** snapshot.
+    ///
+    /// Every class lock is held at once, so the two numbers describe
+    /// the same instant. The byte counter is only ever changed while a
+    /// class lock is held, so it cannot move under the reader.
+    ///
+    /// The two must be equal: the counter is the tier's occupancy, and
+    /// the weights are the occupancy itself. A counter that drifted
+    /// away from them would make the tier believe it is full — or
+    /// empty — and the next eviction would underflow it.
+    #[cfg(test)]
+    fn occupancy(&self) -> (u64, u64) {
+        let guards: Vec<_> = self
+            .classes
+            .iter()
+            .filter_map(|class| class.lru.read().ok())
+            .collect();
+        let weights: u64 = guards
+            .iter()
+            .map(|guard| guard.entries.values().map(|node| node.weight).sum::<u64>())
+            .sum();
+        let bytes = self.bytes();
+        drop(guards);
+        (bytes, weights)
+    }
+
     /// Look an object up.
     fn get(&self, digest: u128) -> Option<Arc<MemoryEntry>> {
         for class in &self.classes {
@@ -447,20 +474,26 @@ impl MemoryTier {
         let Some(index) = self.class_of(size) else {
             return Vec::new();
         };
-        let replaced = {
+        {
             let Ok(mut lru) = self.classes[index].lru.write() else {
                 return Vec::new();
             };
-            lru.put(digest, entry, size)
-        };
-        match replaced {
-            Some((_old, old_size)) => {
-                self.bytes.fetch_sub(old_size, Ordering::Relaxed);
-                self.bytes.fetch_add(size, Ordering::Relaxed);
-            }
-            None => {
-                self.bytes.fetch_add(size, Ordering::Relaxed);
-                self.entries.fetch_add(1, Ordering::Relaxed);
+            let replaced = lru.put(digest, entry, size);
+            // The accounting happens **inside** the lock, next to the
+            // LRU write it describes. A `clear()` that empties the
+            // tier must not be able to land between the two: the
+            // counters would describe an entry that is no longer
+            // there, and the next eviction would underflow them
+            // (issue #260).
+            match &replaced {
+                Some((_old, old_size)) => {
+                    self.bytes.fetch_sub(*old_size, Ordering::Relaxed);
+                    self.bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                None => {
+                    self.bytes.fetch_add(size, Ordering::Relaxed);
+                    self.entries.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -469,8 +502,6 @@ impl MemoryTier {
             let Some(victim) = self.evict_one() else {
                 break;
             };
-            self.bytes.fetch_sub(victim.size, Ordering::Relaxed);
-            self.entries.fetch_sub(1, Ordering::Relaxed);
             spilled.push(victim);
         }
         spilled
@@ -483,6 +514,10 @@ impl MemoryTier {
                 continue;
             };
             if let Some((digest, entry, size)) = lru.pop_lru() {
+                // The accounting happens inside the lock, for the same
+                // reason as `insert`'s.
+                self.bytes.fetch_sub(size, Ordering::Relaxed);
+                self.entries.fetch_sub(1, Ordering::Relaxed);
                 // The metadata may be unreadable — a poisoned lock.
                 // The object is still evicted (the caller accounts for
                 // it either way); it just cannot be spilled to the
@@ -490,7 +525,6 @@ impl MemoryTier {
                 let meta = entry.meta.read().ok().map(|guard| guard.clone());
                 return Some(SpilledEntry {
                     digest,
-                    size,
                     meta,
                     body: entry.body.clone(),
                 });
@@ -533,25 +567,35 @@ impl MemoryTier {
 
     /// Drop every object the tier holds.
     ///
-    /// The counters are reset rather than decremented: the tier is
-    /// empty afterwards, and the LRU's own bookkeeping is gone with
-    /// the objects.
+    /// **Every** class lock is held at once. An insert that slipped
+    /// in between two classes would leave the counters describing an
+    /// entry that is no longer there — and the next eviction would
+    /// underflow them, which leaves the tier believing it is full
+    /// until the process restarts (issue #260).
     fn clear(&self) {
-        for class in &self.classes {
-            let Ok(mut lru) = class.lru.write() else {
-                continue;
-            };
-            lru.clear();
+        let mut guards: Vec<_> = self
+            .classes
+            .iter()
+            .filter_map(|class| class.lru.write().ok())
+            .collect();
+        for guard in guards.iter_mut() {
+            guard.clear();
         }
+        // The counters are reset **inside** the locks: an insert that
+        // starts after they are released sees an empty tier and
+        // accounts for itself.
         self.bytes.store(0, Ordering::Relaxed);
         self.entries.store(0, Ordering::Relaxed);
+        drop(guards);
     }
 }
 
 /// An object the memory tier dropped.
+///
+/// The size is not carried: the tier's counters were already adjusted
+/// when the object was popped, under the lock that popped it.
 struct SpilledEntry {
     digest: u128,
-    size: u64,
     /// The serialized metadata, or `None` when it could not be read
     /// (a poisoned lock) — such an object cannot be spilled.
     meta: Option<(Vec<u8>, Vec<u8>)>,
@@ -999,28 +1043,38 @@ impl DiskTier {
 
     /// Delete every file the tier holds (issue #260).
     ///
-    /// The files are deleted one by one and the index is emptied
-    /// afterwards. A file that cannot be deleted is **skipped and
-    /// logged**: the rest of the cache is still emptied, and the
-    /// request path is not affected.
+    /// The index is **swapped out first** and the files are deleted
+    /// afterwards. An entry written while the deletion runs is not in
+    /// the old index: its file survives and its index row survives
+    /// with it. An entry written before the swap is in the old index:
+    /// its file is deleted and it is not served any more — a race the
+    /// request that wrote it cannot tell, because it was answered
+    /// anyway.
     ///
-    /// The index is emptied even when a file survived — the tier must
-    /// not hand out an entry it cannot delete, and a file the
-    /// operator cannot remove is a file the operator has to look at.
+    /// A file that cannot be deleted is **skipped and logged**: the
+    /// rest of the cache is still emptied, and the request path is
+    /// not affected. The entry is not served any more — the index no
+    /// longer knows it. It comes back when the process restarts and
+    /// the startup sweep adopts the file (see [`Self::sweep`]).
     fn clear(&self) {
         let Some(root) = self.root.as_ref() else {
             // The disk tier is off: there is nothing to delete, and
             // the index is empty anyway.
             return;
         };
-        let digests: Vec<String> = {
-            let Some(index) = self.read_index() else {
+        let old = {
+            let Some(mut index) = self.write_index() else {
                 return;
             };
-            index.entries.keys().cloned().collect()
+            let old = std::mem::take(&mut *index);
+            // The counters are reset with the index: an entry stored
+            // after the swap accounts for itself on top of them.
+            self.bytes.store(0, Ordering::Relaxed);
+            self.entries.store(0, Ordering::Relaxed);
+            old
         };
         let mut failed = 0usize;
-        for digest in &digests {
+        for digest in old.entries.keys() {
             if fs::remove_file(path_for(root, digest)).is_err() {
                 failed += 1;
                 warn!(
@@ -1032,18 +1086,9 @@ impl DiskTier {
         if failed > 0 {
             warn!(
                 "cache: {failed} of {} files could not be deleted",
-                digests.len()
+                old.entries.len()
             );
         }
-        // The index is emptied whatever happened: an entry the
-        // operator asked to be dropped must not be served afterwards,
-        // even when its file could not be deleted.
-        if let Some(mut index) = self.write_index() {
-            index.entries.clear();
-            index.order.clear();
-        }
-        self.bytes.store(0, Ordering::Relaxed);
-        self.entries.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1512,6 +1557,69 @@ mod tests {
                 .join(format!("{hex}.bin"))
                 .exists(),
             "the file of a deleted entry must be gone"
+        );
+    }
+
+    /// A clear that races with an insert leaves the counters right.
+    ///
+    /// The byte counter is the tier's occupancy. If the accounting
+    /// were not taken under the same lock as the LRU write, a clear
+    /// could land between the two: the counter would describe an entry
+    /// that is no longer there, and the next eviction would underflow
+    /// it — leaving the tier convinced it is full until the process
+    /// restarts (issue #260).
+    #[test]
+    fn a_clear_that_races_with_an_insert_leaves_the_counters_right() {
+        let tier = Arc::new(MemoryTier::new(1024 * 1024, 1024 * 1024));
+        let body = Arc::new(vec![b'x'; 4096]);
+        let entry = Arc::new(MemoryEntry {
+            meta: RwLock::new((Vec::new(), Vec::new())),
+            body,
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let writers: Vec<_> = (0..4)
+            .map(|worker| {
+                let tier = tier.clone();
+                let entry = entry.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20_000 {
+                        tier.insert((worker * 20_000 + i) as u128, entry.clone());
+                        // The byte counter must describe the tier:
+                        // it is the sum of the LRU's weights.
+                        let (bytes, weights) = tier.occupancy();
+                        assert_eq!(
+                            bytes, weights,
+                            "the byte counter drifted away from the tier"
+                        );
+                    }
+                })
+            })
+            .collect();
+        let clearer = {
+            let tier = tier.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tier.clear();
+                }
+            })
+        };
+        for writer in writers {
+            writer.join().expect("the writer thread");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        clearer.join().expect("the clearer thread");
+
+        let (bytes, weights) = tier.occupancy();
+        assert_eq!(
+            bytes, weights,
+            "the counter must describe the tier the clear left behind"
+        );
+        assert!(
+            bytes <= tier.budget,
+            "the tier must not believe it is over its budget: {bytes} > {}",
+            tier.budget
         );
     }
 
