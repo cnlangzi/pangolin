@@ -37,7 +37,13 @@ type Resp = Response<Full<Bytes>>;
 /// The card carries live counters, so the response says `no-store`: a
 /// cached fragment would show the operator numbers that are already
 /// stale.
-pub async fn api_card(app: &Arc<App>, lang: Lang) -> http::Result<Resp> {
+///
+/// The **CSRF token is substituted here**: the fragment carries the
+/// "clear the cache" button, and the dashboard replaces the card with
+/// this fragment every two seconds. An unsubstituted `__CSRF__` would
+/// leave the button posting a placeholder, and every click would be
+/// refused with a `403` two seconds after the page was loaded.
+pub async fn api_card(app: &Arc<App>, csrf: &str, lang: Lang) -> http::Result<Resp> {
     let stats = app.cache_stats();
     let html = CacheCardView {
         cache_stats: stats,
@@ -45,7 +51,7 @@ pub async fn api_card(app: &Arc<App>, lang: Lang) -> http::Result<Resp> {
     }
     .render()
     .unwrap_or_default();
-    ok_html_no_store(html)
+    ok_html_no_store(crate::render_with_csrf(html, csrf))
 }
 
 /// `POST /cache/clear` — drop every entry the cache holds.
@@ -69,18 +75,7 @@ pub async fn handle_clear(app: &Arc<App>) -> http::Result<Resp> {
     let body = serde_json::json!({
         "status": "ok",
         "cleared": had_cache,
-        "stats": {
-            "hits": stats.hits,
-            "misses": stats.misses,
-            "stores": stats.stores,
-            "deferred": stats.deferred,
-            "errors": stats.errors,
-            "evictions": stats.evictions,
-            "memory_bytes": stats.memory_bytes,
-            "memory_entries": stats.memory_entries,
-            "disk_bytes": stats.disk_bytes,
-            "disk_entries": stats.disk_entries,
-        }
+        "stats": stats,
     });
     Response::builder()
         .status(StatusCode::OK)
@@ -114,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn the_card_renders_without_a_cache() {
         let (_dir, app) = make_test_app();
-        let resp = api_card(&app, Lang::En).await.expect("card");
+        let resp = api_card(&app, "csrf-token", Lang::En).await.expect("card");
         assert_eq!(resp.status(), 200);
         let body = resp.into_body();
         let bytes = http_body_util::BodyExt::collect(body)
@@ -125,6 +120,29 @@ mod tests {
         assert!(html.contains("Edge cache"), "{html}");
         assert!(html.contains("Clear cache"), "{html}");
         assert!(html.contains("data-cache=\"hits\""), "{html}");
+    }
+
+    /// The card's button carries a usable CSRF token.
+    ///
+    /// The dashboard replaces the card with this fragment every two
+    /// seconds, so a placeholder left in the fragment would break the
+    /// "clear the cache" button two seconds after the page was
+    /// loaded (issue #260).
+    #[tokio::test]
+    async fn the_card_substitutes_the_csrf_token() {
+        let (_dir, app) = make_test_app();
+        let resp = api_card(&app, "abc123", Lang::En).await.expect("card");
+        let body = resp.into_body();
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("body")
+            .to_bytes();
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            !html.contains("__CSRF__"),
+            "the placeholder must be substituted: {html}"
+        );
+        assert!(html.contains("abc123"), "{html}");
     }
 
     /// The clear answers with JSON and reports that there was no

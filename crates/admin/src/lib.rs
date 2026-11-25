@@ -438,8 +438,9 @@ pub async fn handle(
                 } else if rest == "cache/card" && method == "GET" {
                     // The polled cache card of the dashboard: the
                     // counters and the "clear the cache" button
-                    // (issue #260).
-                    routes::cache::api_card(&app, lang).await?
+                    // (issue #260). The button needs the CSRF token,
+                    // so the fragment carries a substituted one.
+                    routes::cache::api_card(&app, &csrf_token, lang).await?
                 } else if rest == "logs/referers/summary" && method == "GET" {
                     // The polled summary region of `/logs/referers`:
                     // the same partial the page inlined, scoped to the

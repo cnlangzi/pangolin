@@ -15,6 +15,8 @@
 //!
 //! The rules the cache follows are in `docs/design/cache.md`.
 
+use serde::Serialize;
+
 /// A point-in-time copy of the edge cache's counters.
 ///
 /// The counters are process-local and reset when the process
@@ -23,7 +25,11 @@
 ///
 /// A cache that is switched off reports zeros — the same shape, so
 /// the reader does not have to know whether the cache exists.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// The struct serializes as it is: the admin's JSON answer carries
+/// the counters, and a counter added here shows up there without
+/// anybody having to remember to add it (issue #260).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CacheStats {
     /// A request that was answered from the cache.
     pub hits: u64,
