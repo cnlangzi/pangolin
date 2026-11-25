@@ -111,11 +111,22 @@ tunnel:
                         # `/tunnel`.
 
 admin:
-  addr: 0.0.0.0:9081    # admin UI/API bind addr. Default `0.0.0.0:9081`
+  addr: 0.0.0.0:9081    # admin UI bind addr. Default `0.0.0.0:9081`
                         # accepts remote admin (e.g. via SSH port
                         # forward). Set the password directly in
                         # this file; restrict access via ufw/iptables
                         # if exposing to a non-trusted network.
+                        #
+                        # The admin UI has a listener of its own (issue
+                        # #261), separate from the proxy's — the
+                        # dashboard-facing API listens separately, on
+                        # `api.listen` below. A hostname is accepted
+                        # here; the gateway resolves it and takes the
+                        # first answer. If the port cannot be bound,
+                        # the gateway says so, retries, and keeps
+                        # serving the proxy — the admin UI is the only
+                        # thing that is lost. `pangolin-ngx --check`
+                        # refuses an address that does not resolve.
   username: admin
   password: admin       # the shipped default is `admin` — change it
                         # before the admin port is reachable from an

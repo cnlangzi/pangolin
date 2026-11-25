@@ -64,14 +64,17 @@ For the corresponding config keys, see
 
 ### Why the SSE writer lives in `ngx`, not `admin`
 
-The streaming endpoint owns a `pingora::protocols::http::ServerSession` and
-calls `write_response_body(…, false)` repeatedly. The
-`pingora::apps::http_app::ServeHttp` pipeline (used by `admin::handle()`)
-materialises the whole body before returning and is documented as "not
-suitable for streaming response or interactive communications". The
-`/api/logs/stream` endpoint therefore goes one level deeper and implements
-`HttpServerApp::process_new_http` directly (`crates/ngx/src/serve.rs`).
+The streaming endpoint owns the response **body** and pushes frames into
+it as they arrive. `admin::handle()` returns a complete `http::Response`
+— it cannot express a stream that never ends. The `/api/logs/stream`
+endpoint therefore lives in the `ngx` crate
+(`crates/ngx/src/sse.rs`), which hands the listener a streaming body.
 `admin::handle()` still owns the page handler (no streaming involved).
+
+Since issue #261 the admin UI is served by a listener of the gateway's
+own (`crates/ngx/src/serve.rs`) and not by pingora: the admin UI is
+control plane — it renders pages and streams log feeds, it forwards
+nothing — and it does not belong in the data plane's server.
 
 ## Wire format
 
@@ -203,13 +206,13 @@ back to a no-op when the channel is full.
   `push_access_log` is the variant for a caller that has no verdict;
   it verifies the crawler itself.
 - `crates/ngx/src/proxy.rs` — proxy hook (one line).
-- `crates/ngx/src/serve.rs` — `AdminApp` (HttpServerApp) that owns the
-  `/api/logs/stream` route.
+- `crates/ngx/src/serve.rs` — the admin listener: it owns the
+  `/api/logs/stream` route and hands the three streams their bodies.
 - `crates/ngx/src/sse.rs` — `handle_stream`, the shared implementation
   behind the three admin log streams (`/api/logs/stream`,
   `/api/logs/bots/stream`, `/api/logs/referers/stream`); each public
   handler (`handle_access_log_stream` and its two siblings) is a thin
-  wrapper over it. `write_sse_unauth` writes the 401.
+  wrapper over it. `unauthorized` writes the 401.
 - `crates/admin/src/routes/logs.rs` — `/logs` page handler.
 - `crates/admin/templates/pages/logs.html` — browser-side EventSource
   consumer.

@@ -685,6 +685,10 @@ pub struct NgxProcess {
     /// Held so the occupied UDP port stays occupied for the lifetime
     /// of the process (see [`NgxProcess::start_with_quic_blocked`]).
     _udp_blocker: Option<std::net::UdpSocket>,
+    /// Held so the occupied admin port stays occupied for the
+    /// lifetime of the process (see
+    /// [`NgxProcess::start_with_admin_port_blocked`]).
+    _admin_blocker: Option<std::net::TcpListener>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub cert_dir: PathBuf,
@@ -710,7 +714,7 @@ impl NgxProcess {
     /// which seed data is visible without an explicit
     /// `reload_indexes` admin call.
     pub async fn start<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, false, "").await
+        Self::start_inner(seed_db, false, false, "").await
     }
 
     /// Spawn `pangolin-ngx` with extra keys merged into its `[log]`
@@ -735,7 +739,7 @@ impl NgxProcess {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Self::start_inner(seed_db, false, &indented).await
+        Self::start_inner(seed_db, false, false, &indented).await
     }
 
     /// Start ngx with the tunnel's **UDP** port already occupied by a
@@ -747,10 +751,29 @@ impl NgxProcess {
     /// That is the "the network blocks UDP" case, exercised without
     /// touching the host's firewall.
     pub async fn start_with_quic_blocked<F: FnOnce(&Path)>(seed_db: F) -> Self {
-        Self::start_inner(seed_db, true, "").await
+        Self::start_inner(seed_db, true, false, "").await
     }
 
-    async fn start_inner<F: FnOnce(&Path)>(seed_db: F, occupy_udp: bool, extra_log: &str) -> Self {
+    /// Start ngx with its **admin port** already occupied by another
+    /// socket.
+    ///
+    /// The admin listener of the gateway cannot bind then, so it
+    /// logs the failure and retries — and the gateway keeps serving
+    /// the proxy. That is the "the admin UI is unavailable" case
+    /// (issue #261), exercised without touching the host's firewall.
+    ///
+    /// The harness does **not** wait for the admin port to answer:
+    /// it never will.
+    pub async fn start_with_admin_port_blocked<F: FnOnce(&Path)>(seed_db: F) -> Self {
+        Self::start_inner(seed_db, false, true, "").await
+    }
+
+    async fn start_inner<F: FnOnce(&Path)>(
+        seed_db: F,
+        occupy_udp: bool,
+        occupy_admin: bool,
+        extra_log: &str,
+    ) -> Self {
         let tmpdir = tempfile::Builder::new()
             .prefix("pangolin-e2e-ngx-")
             .tempdir()
@@ -779,6 +802,17 @@ impl NgxProcess {
             Some(
                 std::net::UdpSocket::bind(("127.0.0.1", tunnel_port))
                     .expect("bind the udp port to block quic"),
+            )
+        } else {
+            None
+        };
+
+        // The admin port is occupied before the gateway starts, so the
+        // gateway's admin listener cannot bind it.
+        let _admin_blocker = if occupy_admin {
+            Some(
+                std::net::TcpListener::bind(("127.0.0.1", admin_port))
+                    .expect("bind the admin port to block it"),
             )
         } else {
             None
@@ -893,14 +927,18 @@ acme:
         // If the binary still fails to boot, the captured log is
         // dumped into the panic message — no more guessing why
         // startup timed out.
-        for &port in &[http_port, tls_port, tunnel_port, admin_port, api_port] {
+        for &port in &[http_port, tls_port, tunnel_port, api_port] {
             wait_for_port(port, Duration::from_secs(30), &log).await;
+        }
+        if !occupy_admin {
+            wait_for_port(admin_port, Duration::from_secs(30), &log).await;
         }
 
         Self {
             child: Some(child),
             log_tasks,
             _udp_blocker,
+            _admin_blocker,
             http_port,
             tls_port,
             tunnel_port,

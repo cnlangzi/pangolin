@@ -35,7 +35,7 @@
 //! directory (or points `acme.cert_dir` at an existing one) and runs
 //! the check again.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -101,14 +101,18 @@ fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
 
 /// Check every listen address the gateway parses at startup.
 ///
-/// Two shapes, because the startup parses them two ways:
+/// Three shapes, because the startup parses them three ways:
 ///
 /// * `tunnel.addr` and `api.listen` are parsed by the gateway itself
 ///   as a `SocketAddr` — a hostname is not a valid value there.
-/// * `addr.http`, `addr.https` and `admin.addr` are parsed by
-///   pingora, which resolves them with `to_socket_addrs()` and so
-///   accepts a hostname. The check resolves them the same way, which
-///   is what makes the two agree on what "usable" means.
+/// * `addr.http` and `addr.https` are parsed by pingora, which
+///   resolves them with `to_socket_addrs()` and so accepts a
+///   hostname. The check resolves them the same way, which is what
+///   makes the two agree on what "usable" means.
+/// * `admin.addr` is parsed by the admin listener of the gateway
+///   itself (issue #261). The check resolves it with the very
+///   function the listener resolves it with, so the two cannot drift
+///   apart.
 ///
 /// The "off" switches are the ones the gateway honours: `api.listen:
 /// ":0"` and an empty `api.listen` switch the management API off, and
@@ -134,12 +138,13 @@ fn check_listen_addresses(config: &Config) -> anyhow::Result<()> {
         })?;
     }
 
-    for (key, value) in [
-        ("addr.http", &config.addr.http),
-        ("admin.addr", &config.admin.addr),
-    ] {
-        resolve_listen_address(key, value)?;
-    }
+    resolve_listen_address("addr.http", &config.addr.http)?;
+
+    // The admin listener resolves the address itself — the check
+    // asks the very same function, so a hostname that the runtime
+    // would accept is a hostname the check accepts, and an address
+    // that does not resolve fails both.
+    resolve_listen_address("admin.addr", &config.admin.addr)?;
 
     if config.addr.https != ":0" && !config.addr.https.is_empty() {
         resolve_listen_address("addr.https", &config.addr.https)?;
@@ -148,18 +153,14 @@ fn check_listen_addresses(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve one of pingora's listen addresses.
+/// Resolve one of the listen addresses.
 ///
-/// pingora resolves them with `to_socket_addrs()` and takes the first
-/// answer, so the check does the same: a hostname is a valid value,
-/// and one that does not resolve is not.
+/// The resolution is the gateway's own — the same function the admin
+/// listener uses — so the check and the runtime cannot disagree on
+/// what "usable" means. A hostname is a valid value; one that does
+/// not resolve is not.
 fn resolve_listen_address(key: &str, value: &str) -> anyhow::Result<()> {
-    value
-        .to_socket_addrs()
-        .map_err(|e| anyhow::anyhow!("{key} is not a valid listen address ({value:?}): {e}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("{key} does not resolve to an address ({value:?})"))?;
-    Ok(())
+    crate::serve::resolve_listen_address(key, value).map(|_| ())
 }
 
 #[cfg(test)]
@@ -247,6 +248,50 @@ mod tests {
 
         let db_path = dir.path().join("pangolin.db");
         run_check_in(config, &db_path).expect("the disabled listeners are not an error");
+    }
+
+    /// A hostname is a valid admin address.
+    ///
+    /// The regression this pins: the gateway resolves `admin.addr`
+    /// itself now (issue #261), and a deployment that exposes the
+    /// admin UI by name has to pass the check — the check and the
+    /// runtime have to agree on what "usable" means.
+    #[test]
+    fn a_hostname_is_a_valid_admin_address() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_dir = dir.path().join("certs");
+        std::fs::create_dir_all(&cert_dir).expect("create the cert dir");
+
+        let mut config = Config::default();
+        config.acme.cert_dir = cert_dir.display().to_string();
+        config.admin.addr = "localhost:9081".to_string();
+
+        let db_path = dir.path().join("pangolin.db");
+        run_check_in(config, &db_path).expect("a hostname is a valid admin address");
+    }
+
+    /// An admin address that does not resolve fails the check.
+    ///
+    /// The regression this pins: the same agreement as above — an
+    /// address the runtime cannot resolve is an address the check has
+    /// to refuse, and it has to name the key.
+    #[test]
+    fn an_unresolvable_admin_address_fails_the_check() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cert_dir = dir.path().join("certs");
+        std::fs::create_dir_all(&cert_dir).expect("create the cert dir");
+
+        let mut config = Config::default();
+        config.acme.cert_dir = cert_dir.display().to_string();
+        config.admin.addr = "no-such-host.invalid:9081".to_string();
+
+        let db_path = dir.path().join("pangolin.db");
+        let error = run_check_in(config, &db_path)
+            .expect_err("an admin address that does not resolve must fail the check");
+        assert!(
+            error.to_string().contains("admin.addr"),
+            "the error has to name the key: {error}"
+        );
     }
 
     /// A cert dir that is not there fails the check.
