@@ -195,6 +195,12 @@ mod tunnel_transport;
 #[cfg(feature = "integration")]
 mod admin_ui_e2e;
 
+// The admin listener's own failure domain (issue #261): the admin UI
+// is served by a listener of the gateway's own, so a failure of that
+// listener degrades the admin UI and nothing else.
+#[cfg(feature = "integration")]
+mod admin_listener;
+
 #[cfg(feature = "integration")]
 mod admin_dns_e2e;
 

@@ -3,13 +3,13 @@
 //! `/api/logs/referers/stream` (referer).
 //!
 //! Lives in the `ngx` crate (not `admin`) because:
-//!   - The SSE writer owns the `ServerSession` and calls
-//!     `write_response_body(.., false)` repeatedly — only pingora's
-//!     `HttpServerApp` path allows this (admin's `ServeHttp`-based
-//!     pipeline materialises the whole body before returning).
+//!   - The SSE writer owns the transport's response body and has to
+//!     push frames into it as they arrive — the admin crate's
+//!     `handle()` returns a complete `http::Response`, so it cannot
+//!     express a stream that never ends.
 //!   - The admin route layer still owns the page handler (no
 //!     streaming involved); this module only owns the streaming
-//!     chunk-writer.
+//!     body.
 //!
 //! ## Design
 //!
@@ -19,7 +19,7 @@
 //! topic word that names the stream in the 401 body and in the log
 //! lines. Everything else (auth, the SSE prelude, the
 //! replay-then-tail loop, the lag / closed / shutdown handling and
-//! the final `finish()`) is identical, so it is implemented **once**
+//! the end of the stream) is identical, so it is implemented **once**
 //! in `handle_stream`; the three public handlers are thin wrappers
 //! over it.
 //!
@@ -28,34 +28,48 @@
 //!    not public). CSRF is not enforced — SSE is a read-only stream
 //!    and the `EventSource` browser API can't send custom headers /
 //!    POST body to set a CSRF token anyway.
-//! 2. Write the SSE prelude:
+//! 2. The response carries the SSE prelude:
 //!      - Status 200
 //!      - `Content-Type: text/event-stream`
 //!      - `Cache-Control: no-cache`
 //!      - `X-Accel-Buffering: no` (disable nginx-level buffering)
-//! 3. Drain the ring buffer snapshot as `data: <json>\n\n` frames
-//!    (oldest first).
-//! 4. Forward each entry that arrives on the broadcast channel as
-//!    it arrives. On `LagError(N)`, write `: lagged N events\n\n` (an
-//!    SSE comment that the browser ignores) and continue.
-//! 5. Drop the receiver cleanly when the client disconnects (the
-//!    `write_response_body` call returns an error → break the loop).
+//! 3. The body replays the ring buffer snapshot as `data: <json>\n\n`
+//!    frames (oldest first).
+//! 4. It then forwards each entry that arrives on the broadcast
+//!    channel as it arrives. On `LagError(N)`, it yields
+//!    `: lagged N events\n\n` (an SSE comment that the browser
+//!    ignores) and continues.
+//! 5. The body ends when the shutdown token is cancelled, when the
+//!    channel closes, or when the client goes away — the last one
+//!    because the body is dropped with the connection.
+//!
+//! ## Why the body is pulled, not pushed
+//!
+//! The frames are produced **on demand**: the response body is a
+//! stream that waits for the next entry when hyper asks for one.
+//! The alternative — a task that pushes the frames into a channel —
+//! leaves that task behind when the client disconnects in the middle
+//! of a quiet period: it would sit in `rx.recv()` until the next log
+//! entry arrived. A pulled body has no task to leave behind: the
+//! broadcast receiver goes away with the body.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use log::{debug, info, warn};
+use http_body_util::BodyExt;
+use hyper::body::Frame;
+use log::{info, warn};
 use pangolin_core::AccessLogEntry;
 use pangolin_core::BotLogEntry;
 use pangolin_core::RefererLogEntry;
-use pingora::apps::ReusedHttpStream;
-use pingora::http::ResponseHeader;
-use pingora::protocols::http::ServerSession;
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
 
 use crate::App;
+use crate::serve::AdminBody;
 
 /// The one implementation behind the three admin log SSE streams.
 ///
@@ -67,30 +81,28 @@ use crate::App;
 /// line this function writes.
 ///
 /// `T: Clone` is a hard constraint: `broadcast::Receiver::recv()`
-/// hands the entry out by value. `T: Send` is one too: the public
-/// handlers are awaited from `#[async_trait]`, so the whole future
-/// chain (wrapper → `handle_stream` → `recv()`) must be `Send`.
+/// hands the entry out by value. `T: Send` is one too: the stream is
+/// held by the connection task, which the host runtime spawns.
 ///
 /// The parameter list is long because the three streams pass their
 /// own channel, snapshot and encoder; grouping them into a struct
 /// would only move the same values one level down.
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream<T, Sub, Rep, Enc>(
-    mut session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
-    mut shutdown: pingora::server::ShutdownWatch,
+    shutdown: CancellationToken,
     topic: &'static str,
     subscribe: Sub,
     replay: Rep,
     encode: Enc,
-) -> Option<ReusedHttpStream>
+) -> hyper::Response<AdminBody>
 where
     T: Clone + Send + 'static,
     Sub: FnOnce(&App) -> broadcast::Receiver<T> + Send,
     Rep: FnOnce(&App) -> Vec<T> + Send,
-    Enc: Fn(&T) -> Bytes + Send + Sync,
+    Enc: Fn(&T) -> Bytes + Send + Sync + 'static,
 {
     // 1) Auth — admin-only. Non-admin attempts get a normal 401
     //    JSON response, not an SSE frame.
@@ -100,13 +112,106 @@ where
         None => false,
     };
     if !authed {
-        return write_sse_unauth(session, topic).await;
+        return unauthorized(topic);
     }
 
-    // 2) SSE prelude.
-    let status = http::StatusCode::OK;
-    let builder = http::Response::builder()
-        .status(status)
+    // 2) Subscribe FIRST, then snapshot. Subscribing first guarantees
+    //    we capture every entry pushed from this moment forward; the
+    //    snapshot then covers everything pushed before. The window
+    //    between the two operations can produce at most one DUPLICATE
+    //    per entry (snapshot saw it AND the channel later delivers
+    //    it), never a gap — which is the correct trade-off for an
+    //    operator viewer ("show me everything, possibly with brief
+    //    duplicates" beats "show me almost everything").
+    //
+    //    The previous order (snapshot → subscribe) had a TOCTOU race:
+    //    entries pushed between the two calls were in neither the
+    //    snapshot nor the live stream and were silently lost.
+    let rx = subscribe(&app);
+    let snapshot = replay(&app);
+
+    // 3) The frames that are already known: the replay and the
+    //    comment that tells the operator how much of it there was.
+    let mut pending: VecDeque<Bytes> = VecDeque::new();
+    if snapshot.is_empty() {
+        // Tell the client there is no replay. SSE comments are
+        // ignored by `EventSource` but visible in devtools, which
+        // is exactly the right surface for an operator debugging a
+        // missing-events report.
+        pending.push_back(frame_comment("replay: empty"));
+    } else {
+        // Capture the length BEFORE the `for` loop consumes the
+        // Vec — moving `snapshot` into the iterator drops the
+        // value before we can read `.len()` again.
+        let snapshot_len = snapshot.len();
+        for entry in snapshot {
+            pending.push_back(encode(&entry));
+        }
+        pending.push_back(frame_comment(&format!("replay: done ({})", snapshot_len)));
+    }
+
+    let state = SseState {
+        rx,
+        pending,
+        shutdown,
+        topic,
+        encode,
+        done: false,
+    };
+
+    // The stream is pulled by hyper: every `poll_next` yields one
+    // frame — a replayed entry, a live entry, or a comment.
+    let frames = futures_util::stream::unfold(state, |mut state| async move {
+        if let Some(frame) = state.pending.pop_front() {
+            return Some((Ok(Frame::data(frame)), state));
+        }
+        if state.done {
+            return None;
+        }
+        // Live broadcast loop. Race the broadcast receiver against the
+        // shutdown token so a Ctrl-C during a long-lived SSE
+        // connection drops the connection promptly instead of waiting
+        // for the full drain window.
+        let next = tokio::select! {
+            // Bias toward shutdown so a Ctrl-C during a long
+            // broadcast gap doesn't have to wait for the next entry
+            // to arrive.
+            biased;
+            _ = state.shutdown.cancelled() => {
+                info!("SSE: [{}] shutdown observed, ending live tail", state.topic);
+                state.done = true;
+                Some(frame_comment("shutdown"))
+            }
+            recv = state.rx.recv() => match recv {
+                Ok(entry) => Some((state.encode)(&entry)),
+                Err(RecvError::Lagged(n)) => {
+                    // Subscriber fell behind. Surface as an SSE
+                    // comment (browsers ignore these, devtools shows
+                    // them). The next successful recv() will deliver
+                    // the newest message the channel still has.
+                    warn!("SSE: [{}] subscriber lagged by {n} events", state.topic);
+                    Some(frame_comment(&format!("lagged {n} events")))
+                }
+                Err(RecvError::Closed) => {
+                    // Broadcast channel closed (app shutdown). Send a
+                    // terminal comment and end the stream cleanly.
+                    state.done = true;
+                    Some(frame_comment("closed"))
+                }
+            },
+        };
+        next.map(|frame| (Ok(Frame::data(frame)), state))
+    });
+
+    let body = http_body_util::StreamBody::new(frames).boxed_unsync();
+
+    // The SSE prelude.
+    //
+    // We deliberately do NOT set `Transfer-Encoding: chunked` here:
+    // hyper frames the body itself when the length is unknown, and
+    // on HTTP/2 the header is forbidden entirely.
+    let response = hyper::Response::builder()
+        .status(http::StatusCode::OK)
         // text/event-stream is the SSE content type per the WHATWG
         // server-sent events spec. charset=utf-8 is implicit but
         // some intermediaries (CDNs, devtools) display it.
@@ -121,165 +226,58 @@ where
         // Connection: keep-alive is the default for HTTP/1.1 but
         // we set it explicitly because some intermediaries drop the
         // connection otherwise.
-        .header("Connection", "keep-alive");
-    // We deliberately do NOT set `Transfer-Encoding: chunked` here.
-    // Pingora sets it automatically when the body is streamed via
-    // `write_response_body(.., false)`. On HTTP/2 the header is
-    // forbidden entirely (HTTP/2 frames its own body), so setting
-    // it explicitly risks an "illegal connection-specific header"
-    // rejection from pingora's h2 layer.
-
-    let resp: http::Response<()> = match builder.body(()) {
+        .header("Connection", "keep-alive")
+        .body(body);
+    match response {
         Ok(r) => r,
         Err(e) => {
+            // The prelude is fixed and valid, so this cannot happen —
+            // but a client must not be told "unauthenticated" because
+            // the server had a bad day.
             warn!("SSE: [{topic}] failed to build response: {e}");
-            return None;
-        }
-    };
-    let (parts, _body) = resp.into_parts();
-    let header: ResponseHeader = parts.into();
-    if let Err(e) = session.write_response_header(Box::new(header)).await {
-        warn!("SSE: [{topic}] write_response_header failed: {e}");
-        return None;
-    }
-
-    // 3) Subscribe FIRST, then snapshot. Subscribing first guarantees
-    //    we capture every entry pushed from this moment forward; the
-    //    snapshot then covers everything pushed before. The window
-    //    between the two operations can produce at most one DUPLICATE
-    //    per entry (snapshot saw it AND the channel later delivers
-    //    it), never a gap — which is the correct trade-off for an
-    //    operator viewer ("show me everything, possibly with brief
-    //    duplicates" beats "show me almost everything").
-    //
-    //    The previous order (snapshot → subscribe) had a TOCTOU race:
-    //    entries pushed between the two calls were in neither the
-    //    snapshot nor the live stream and were silently lost.
-    let mut rx = subscribe(&app);
-    let snapshot = replay(&app);
-    if snapshot.is_empty() {
-        // Tell the client there is no replay. SSE comments are
-        // ignored by `EventSource` but visible in devtools, which
-        // is exactly the right surface for an operator debugging a
-        // missing-events report.
-        write_chunk(&mut session, frame_comment("replay: empty")).await?;
-    } else {
-        // Capture the length BEFORE the `for` loop consumes the
-        // Vec — moving `snapshot` into the iterator drops the
-        // value before we can read `.len()` again.
-        let snapshot_len = snapshot.len();
-        for entry in snapshot {
-            write_chunk(&mut session, encode(&entry)).await?;
-        }
-        write_chunk(
-            &mut session,
-            frame_comment(&format!("replay: done ({})", snapshot_len)),
-        )
-        .await?;
-    }
-
-    // 4) Live broadcast loop. Race the broadcast receiver
-    //    against pingora's ShutdownWatch so a Ctrl-C during
-    //    a long-lived SSE connection drops the connection
-    //    promptly instead of waiting for the full
-    //    `graceful_shutdown_timeout_seconds` window.
-    //
-    // `ShutdownWatch` is a `tokio::sync::watch::Receiver<bool>`
-    // (pingora-core/src/server/mod.rs) — its `changed()` future
-    // resolves the moment the server flips its shutdown flag.
-    // Calling `borrow()` first is the cheap fast path: if the
-    // flag is *already* set (e.g. the loop is entered after a
-    // shutdown that arrived between subscribe() and the first
-    // poll), we break without consuming a broadcast slot. The
-    // `select!` below would catch it too, but the early
-    // check keeps the log line ("shutdown observed") distinct
-    // from a poll that races on shutdown mid-loop.
-    loop {
-        if *shutdown.borrow() {
-            info!("SSE: [{topic}] shutdown already signalled, ending live tail");
-            let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-            break;
-        }
-        tokio::select! {
-            // Bias toward shutdown so a Ctrl-C during a long
-            // broadcast gap doesn't have to wait for the next
-            // entry to arrive.
-            biased;
-            _ = shutdown.changed() => {
-                info!("SSE: [{topic}] shutdown observed, ending live tail");
-                let _ = write_chunk(&mut session, frame_comment("shutdown")).await;
-                break;
-            }
-            recv = rx.recv() => match recv {
-                Ok(entry) => {
-                    if write_chunk(&mut session, encode(&entry))
-                        .await
-                        .is_none()
-                    {
-                        // Client disconnected.
-                        debug!("SSE: [{topic}] client disconnected, stopping live tail");
-                        return None;
-                    }
-                }
-                Err(RecvError::Lagged(n)) => {
-                    // Subscriber fell behind. Surface as an SSE comment
-                    // (browsers ignore these, devtools shows them).
-                    // The next successful recv() will deliver the
-                    // newest message the channel still has.
-                    write_chunk(&mut session, frame_comment(&format!("lagged {n} events"))).await?;
-                    warn!("SSE: [{topic}] subscriber lagged by {n} events");
-                }
-                Err(RecvError::Closed) => {
-                    // Broadcast channel closed (app shutdown). Send a
-                    // terminal comment and end the stream cleanly.
-                    let _ = write_chunk(&mut session, frame_comment("closed")).await;
-                    break;
-                }
-            }
-        }
-    }
-
-    // 5) Final chunk (end=true) and return the connection.
-    let settings = pingora::apps::HttpPersistentSettings::for_session(&session);
-    match session.finish().await {
-        Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
-        Err(e) => {
-            warn!("SSE: [{topic}] finish failed: {e}");
-            None
+            crate::serve::respond(500, "text/plain", Bytes::new(), &[])
         }
     }
 }
 
+/// The state one SSE stream carries from frame to frame.
+struct SseState<T, Enc> {
+    /// The broadcast channel the live entries arrive on.
+    rx: broadcast::Receiver<T>,
+    /// The frames that are already known — the replay and its
+    /// comment.
+    pending: VecDeque<Bytes>,
+    /// Cancelled when the gateway shuts down.
+    shutdown: CancellationToken,
+    /// The name of the stream, for the log lines.
+    topic: &'static str,
+    /// Turns one entry into a `data:` frame.
+    encode: Enc,
+    /// Whether the stream has said its last word.
+    done: bool,
+}
+
 /// Handle the `/api/logs/stream` SSE request.
-///
-/// Returns `Some(ReusedHttpStream)` on a clean shutdown (the
-/// connection may be reused); `None` on error (the caller logs).
-///
-/// `shutdown` is an owned clone of pingora's
-/// `ShutdownWatch` — a `tokio::sync::watch::Receiver<bool>`
-/// the runtime flips on SIGINT/SIGTERM. We `select!` on it
-/// inside the live broadcast loop so a Ctrl-C doesn't have to
-/// wait for `graceful_shutdown_timeout_seconds` to expire
-/// before the SSE handler yields. Without this, an idle SSE
-/// client (no new access-log entries) would hold the runtime
-/// open for the full 5 s pingora-configured drain window —
-/// visible in the log as
-/// `Waiting for service runtime pangolin-http to exit` — and
-/// the operator-facing shutdown latency would be `grace_period
-/// + graceful_shutdown_timeout` instead of `grace_period`
-///   alone.
 ///
 /// The stream itself is implemented by `handle_stream`; this
 /// wrapper only names the access-log channel, snapshot and encoder.
+///
+/// `shutdown` is the gateway's shared cancellation token — the same
+/// one SIGINT and SIGTERM cancel. We `select!` on it inside the live
+/// broadcast loop so a Ctrl-C doesn't have to wait for the drain
+/// window to expire before the SSE handler yields. Without this, an
+/// idle SSE client (no new access-log entries) would hold the
+/// runtime open for the whole drain — visible in the log as
+/// `Waiting for service runtime pangolin-http to exit` — and the
+/// operator-facing shutdown latency would be the drain budget
+/// instead of the grace period alone.
 pub async fn handle_access_log_stream(
-    session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
-    shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
+    shutdown: CancellationToken,
+) -> hyper::Response<AdminBody> {
     handle_stream(
-        session,
         app,
         sessions,
         cookie,
@@ -308,14 +306,12 @@ pub async fn handle_access_log_stream(
 /// The auth / prelude / replay / live-loop / shutdown handling is
 /// shared with the other two streams — see `handle_stream`.
 pub async fn handle_bot_log_stream(
-    session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
-    shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
+    shutdown: CancellationToken,
+) -> hyper::Response<AdminBody> {
     handle_stream(
-        session,
         app,
         sessions,
         cookie,
@@ -339,14 +335,12 @@ pub async fn handle_bot_log_stream(
 /// The auth / prelude / replay / live-loop / shutdown handling is
 /// shared with the other two streams — see `handle_stream`.
 pub async fn handle_referer_log_stream(
-    session: ServerSession,
     app: Arc<App>,
     sessions: Arc<::admin::state::SessionStore>,
     cookie: Option<&str>,
-    shutdown: pingora::server::ShutdownWatch,
-) -> Option<ReusedHttpStream> {
+    shutdown: CancellationToken,
+) -> hyper::Response<AdminBody> {
     handle_stream(
-        session,
         app,
         sessions,
         cookie,
@@ -362,7 +356,7 @@ pub async fn handle_referer_log_stream(
 /// Build an SSE `data:` frame for one access log entry.
 ///
 /// Returns owned `Bytes` (not `Vec<u8>`) so the caller can hand it
-/// straight to `session.write_response_body` without an extra copy.
+/// straight to the response body without an extra copy.
 /// The JSON is serialised inline (no extra newline escapes needed
 /// because serde_json does not emit raw newlines inside a string
 /// — only escaped `\n` characters, which are valid in an SSE
@@ -421,23 +415,6 @@ fn frame_comment(msg: &str) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Write one SSE chunk to the wire. Returns `None` if the write
-/// failed (client disconnect / network error); the caller should
-/// treat that as "stream done". The underlying `io::Error` is
-/// logged at `debug!` level so a production debug session can see
-/// the actual cause (EPIPE / ECONNRESET / buffer full) — losing
-/// the error silently was a real maintenance hazard for SSE
-/// connection-drop investigations.
-async fn write_chunk(session: &mut ServerSession, bytes: Bytes) -> Option<()> {
-    match session.write_response_body(bytes, false).await {
-        Ok(()) => Some(()),
-        Err(e) => {
-            debug!("SSE: write_response_body failed: {e}");
-            None
-        }
-    }
-}
-
 /// Write a 401 response for an unauthenticated SSE request.
 ///
 /// The response is **not** SSE-shaped: it carries
@@ -449,31 +426,16 @@ async fn write_chunk(session: &mut ServerSession, bytes: Bytes) -> Option<()> {
 /// `topic` names the stream in the message body ("Admin login
 /// required to view *bot logs*."), so the error doesn't lie to the
 /// operator about which stream they tried to open.
-async fn write_sse_unauth(mut session: ServerSession, topic: &str) -> Option<ReusedHttpStream> {
+fn unauthorized(topic: &str) -> hyper::Response<AdminBody> {
     let body = json!({
         "error": "unauthenticated",
         "message": format!("Admin login required to view {topic}."),
     })
     .to_string();
-    let resp: http::Response<()> = http::Response::builder()
-        .status(http::StatusCode::UNAUTHORIZED)
-        .header("Content-Type", "application/json")
-        .header("WWW-Authenticate", "Cookie")
-        .body(())
-        .ok()?;
-    let (parts, _) = resp.into_parts();
-    let header: ResponseHeader = parts.into();
-    session.write_response_header(Box::new(header)).await.ok()?;
-    session
-        .write_response_body(Bytes::from(body), true)
-        .await
-        .ok()?;
-    let settings = pingora::apps::HttpPersistentSettings::for_session(&session);
-    match session.finish().await {
-        Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, settings)),
-        Err(e) => {
-            warn!("SSE: [{topic}] finish failed: {e}");
-            None
-        }
-    }
+    crate::serve::respond(
+        http::StatusCode::UNAUTHORIZED.as_u16(),
+        "application/json",
+        Bytes::from(body),
+        &[("WWW-Authenticate", "Cookie")],
+    )
 }

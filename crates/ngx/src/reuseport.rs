@@ -1,8 +1,10 @@
 //! The listeners the gateway binds outside pingora.
 //!
 //! pingora's own listeners take a `TcpSocketOptions`, but the tunnel
-//! listener and the QUIC endpoint are plain sockets this crate binds
-//! itself. Both set `SO_REUSEPORT` **before** the bind.
+//! listener, the QUIC endpoint and the admin listener are plain
+//! sockets this crate binds itself. The first two set `SO_REUSEPORT`
+//! **before** the bind; the admin listener deliberately does not
+//! (issue #261).
 //!
 //! ## Why
 //!
@@ -19,6 +21,13 @@
 //! it. A listener that binds without it takes the port away from the
 //! next process that tries: the second generation would fail with
 //! `EADDRINUSE` and the handover would not happen at all.
+//!
+//! The admin listener is the exception: the handover's value is in
+//! the **proxy's** port, and a socket in a reuseport group cannot
+//! fail to bind — it would silently share the port with whoever
+//! holds it. An admin listener that fails loudly lets the gateway
+//! say "the admin UI is unavailable" and keep serving the proxy
+//! (issue #261).
 //!
 //! ## What else the socket carries
 //!
@@ -54,7 +63,36 @@ const BACKLOG: i32 = 128;
 /// The socket comes back **non-blocking** and listening, ready to be
 /// handed to tokio.
 pub fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-    let socket = socket(addr, Type::STREAM, Protocol::TCP)?;
+    bind_tcp_with(addr, true)
+}
+
+/// Bind a TCP listener to `addr` **without** `SO_REUSEPORT`.
+///
+/// This is the admin UI's listener (issue #261). It keeps
+/// `SO_REUSEADDR` — the option `std::net::TcpListener::bind` sets, so
+/// a port that still holds TIME_WAIT sockets from the previous run
+/// does not refuse the bind — but it does not join a reuseport group:
+///
+/// * a bind that fails with `EADDRINUSE` is a **fact** the gateway
+///   can report. In a reuseport group the bind would have succeeded
+///   and the admin port would have been shared with a stranger,
+///   with neither side knowing.
+/// * the handover's value is in the proxy's port. The admin port may
+///   be unavailable for the length of the switch window, and the
+///   gateway keeps serving the traffic the whole time.
+///
+/// The socket comes back **non-blocking** and listening, ready to be
+/// handed to tokio.
+pub fn bind_tcp_without_reuseport(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    bind_tcp_with(addr, false)
+}
+
+/// Bind a TCP listener, with or without `SO_REUSEPORT`.
+///
+/// The socket comes back **non-blocking** and listening, ready to be
+/// handed to tokio.
+fn bind_tcp_with(addr: SocketAddr, reuseport: bool) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = socket(addr, Type::STREAM, Protocol::TCP, reuseport)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(BACKLOG)?;
@@ -66,14 +104,23 @@ pub fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
 /// The socket stays **blocking**: quinn takes the raw socket over
 /// and configures it itself (`pangolin_tun::bind_endpoint_with_socket`).
 pub fn bind_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let socket = socket(addr, Type::DGRAM, Protocol::UDP)?;
+    let socket = socket(addr, Type::DGRAM, Protocol::UDP, true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
 }
 
 /// A fresh socket of `ty` with the options every listener of the
 /// gateway shares.
-fn socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Socket> {
+///
+/// `reuseport` decides whether the socket asks for `SO_REUSEPORT` —
+/// see [`bind_tcp_without_reuseport`] for the one listener that does
+/// not.
+fn socket(
+    addr: SocketAddr,
+    ty: Type,
+    protocol: Protocol,
+    reuseport: bool,
+) -> std::io::Result<Socket> {
     let socket = Socket::new(Domain::for_address(addr), ty, Some(protocol))?;
     // `SO_REUSEADDR` — what `std::net::TcpListener::bind` sets, and
     // what the listeners had before their socket moved into this
@@ -94,7 +141,13 @@ fn socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Soc
     // this option is for is a Linux feature, so on the other
     // platforms the listener stays a plain one.
     #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
-    socket.set_reuse_port(true)?;
+    if reuseport {
+        socket.set_reuse_port(true)?;
+    }
+    // The flag only says something on the platforms that have the
+    // option; elsewhere it is simply unused.
+    #[cfg(not(all(unix, not(any(target_os = "solaris", target_os = "illumos")))))]
+    let _ = reuseport;
     Ok(socket)
 }
 
@@ -180,7 +233,8 @@ mod tests {
     /// listener takes the whole gateway down.
     #[tokio::test]
     async fn the_listener_carries_so_reuseaddr() {
-        let socket = socket(loopback(0), Type::STREAM, Protocol::TCP).expect("build the socket");
+        let socket =
+            socket(loopback(0), Type::STREAM, Protocol::TCP, true).expect("build the socket");
         assert!(
             socket.reuse_address().expect("read SO_REUSEADDR"),
             "the listener must carry SO_REUSEADDR — the option std::net::TcpListener::bind sets"
@@ -208,5 +262,57 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         bind_tcp(loopback(port)).expect("the listener binds over the TIME_WAIT socket");
+    }
+
+    /// The admin listener does **not** ask for `SO_REUSEPORT`.
+    ///
+    /// The regression this pins: an admin listener in a reuseport
+    /// group cannot fail to bind — the kernel would let it share the
+    /// port with whoever holds it, and the gateway would serve the
+    /// admin UI on a port it does not own. Without the option the
+    /// bind fails with `EADDRINUSE`, and the gateway can say so and
+    /// keep serving the proxy (issue #261).
+    #[tokio::test]
+    async fn the_admin_listener_does_not_use_so_reuseport() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe socket");
+        let port = probe.local_addr().expect("the probe's address").port();
+        drop(probe);
+
+        // Somebody else holds the port.
+        let _holder = std::net::TcpListener::bind(loopback(port)).expect("the port is taken");
+
+        let error = bind_tcp_without_reuseport(loopback(port))
+            .expect_err("the admin listener must not join a group it did not ask for");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the bind must fail with EADDRINUSE, got {error}"
+        );
+    }
+
+    /// The admin listener binds a port that still holds a TIME_WAIT
+    /// socket.
+    ///
+    /// The regression this pins: without `SO_REUSEADDR` — the option
+    /// `std::net::TcpListener::bind` sets — the bind fails, so an
+    /// admin UI that is restarted right after it was killed could not
+    /// come back (issue #261).
+    #[tokio::test]
+    async fn the_admin_listener_binds_over_a_time_wait_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe socket");
+        let port = listener.local_addr().expect("the probe's address").port();
+
+        // A connection that leaves a TIME_WAIT socket on the port:
+        // the server side closes first.
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        drop(server);
+        drop(client);
+        drop(listener);
+        // The TIME_WAIT socket outlives the listener.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        bind_tcp_without_reuseport(loopback(port))
+            .expect("the admin listener binds over the TIME_WAIT socket");
     }
 }

@@ -477,16 +477,24 @@ pub const READINESS_CHECK_AVAILABLE: bool = cfg!(target_os = "linux");
 
 /// The ports of the listeners the handover has to see bound.
 ///
-/// Five of the gateway's six listeners are TCP sockets, and the
-/// handover checks every one of them:
+/// Five of the gateway's six listeners are TCP sockets; four of them
+/// are checked:
 ///
-/// * the proxy's HTTP and HTTPS ports and the admin port are
-///   pingora's — it binds them inside its own service thread, so the
-///   gateway never sees the sockets and has to look them up in the
-///   kernel's socket table;
+/// * the proxy's HTTP and HTTPS ports are pingora's — it binds them
+///   inside its own service thread, so the gateway never sees the
+///   sockets and has to look them up in the kernel's socket table;
 /// * the tunnel's TCP port and the management API's port are the
 ///   gateway's own, but they are bound by the services that run
 ///   beside pingora, so the handover checks them too.
+///
+/// The admin port is **not** one of them. The admin listener does
+/// not ask for `SO_REUSEPORT` (issue #261), so the incoming
+/// generation cannot bind the port while the outgoing one still
+/// holds it: a readiness check that waited for it would fail every
+/// handover. The admin UI is unavailable for the length of the
+/// switch window instead — the incoming generation binds the port as
+/// soon as the outgoing one lets go of it, and the proxy is serving
+/// the whole time.
 ///
 /// The sixth listener — the QUIC endpoint — is a UDP socket and is
 /// not in the table; it is covered by the strict bind (a handover
@@ -501,9 +509,6 @@ pub fn listener_ports(config: &Config) -> Vec<u16> {
         && !config.addr.https.is_empty()
         && let Some(port) = listen_port(&config.addr.https)
     {
-        ports.push(port);
-    }
-    if let Some(port) = listen_port(&config.admin.addr) {
         ports.push(port);
     }
     if let Some(port) = listen_port(&config.tunnel.addr) {

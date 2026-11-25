@@ -6,9 +6,11 @@
 //!
 //! * `AcmeService`   — periodic cert renewal + initial scan
 //! * `TunnelService` — WebSocket listener for tun nodes
-//! * pingora (driven by `run_pingora` in `main.rs`) — HTTP proxy +
-//!   admin API. pingora owns its own tokio runtime, so it lives on
-//!   a dedicated `std::thread` rather than the host runtime.
+//! * `AdminService`  — the admin UI's own HTTP listener (issue #261)
+//! * `ApiService`    — the dashboard-facing management API's listener
+//! * pingora (driven by `run_pingora` in `main.rs`) — the HTTP proxy.
+//!   pingora owns its own tokio runtime, so it lives on a dedicated
+//!   `std::thread` rather than the host runtime.
 //!
 //! All non-pingora services run on a single host tokio runtime and
 //! observe a shared [`CancellationToken`] for coordinated shutdown.
@@ -79,12 +81,17 @@ pub trait Service: Send + Sync + 'static {
 
 /// Build the host runtime and run `f` to completion on it.
 ///
-/// The host runtime drives only the long-lived non-pingora services
-/// (ACME renewal loop, tunnel accept loop) plus a couple of signal
-/// handler tasks. None of them are CPU-bound and the work is
-/// dominated by network I/O, so two worker threads is plenty —
-/// `num_cpus` (the `new_multi_thread` default) would just park a
-/// herd of idle OS threads.
+/// The host runtime drives the long-lived non-pingora services (the
+/// ACME renewal loop, the tunnel accept loop, the admin UI's
+/// listener, the management API's listener) plus a couple of signal
+/// handler tasks. The work is dominated by network I/O, so two worker
+/// threads is plenty — `num_cpus` (the `new_multi_thread` default)
+/// would just park a herd of idle OS threads.
+///
+/// The admin UI's requests are the one thing here that is not pure
+/// I/O: rendering a page reads the database. That work runs on the
+/// blocking pool (issue #254), so it does not occupy a worker
+/// thread; the two threads carry the accept loops and the streams.
 pub fn block_on_host<F>(f: F) -> F::Output
 where
     F: Future,
