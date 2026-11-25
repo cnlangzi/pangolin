@@ -6,13 +6,16 @@ pub mod acme;
 pub mod backend_resolver;
 pub mod badbots_feed;
 pub mod cache;
+pub mod dashboard_client;
 pub mod dns;
+pub mod http_client;
 pub mod provider_ip;
 pub mod proxy;
 pub mod reuseport;
 pub mod runtime;
 pub mod serve;
 pub mod sse;
+pub mod sse_client;
 pub mod tunnel;
 
 // Re-export shared types so they are accessible as `crate::App` etc.

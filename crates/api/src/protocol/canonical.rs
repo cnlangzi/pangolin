@@ -7,7 +7,7 @@
 //! string.
 //!
 //! ```text
-//! PANGOLIN-API-V1\n
+//! PANGOLIN-API-V2\n
 //! {METHOD}\n
 //! {PATH}\n
 //! {TS}\n
@@ -23,17 +23,23 @@
 //! * `TS` — the decimal Unix timestamp in seconds.
 //! * `NONCE` — the nonce, verbatim.
 //! * `sha256_hex(token)` — the SHA-256 hex digest of the bearer token.
-//!   The node stores exactly this digest, so the server never needs
-//!   the cleartext token to check the signature.
+//!   The token is the shared secret of the channel: the node signs
+//!   with it, the dashboard verifies with it, and neither puts it on
+//!   the wire.
 //! * `sha256_hex(body)` — the SHA-256 hex digest of the raw request
 //!   body. An empty body hashes the empty string.
+//!
+//! The **v2** prefix marks the outbound channel of issue #262. The
+//! shape of the string did not change — the version line names the
+//! protocol so a future change to the shape cannot be produced by an
+//! old client by accident.
 
 use sha2::{Digest, Sha256};
 
 /// The first line of every canonical string. It names the protocol
-/// version, so a future v2 can change the shape without a v1 client
-/// ever producing a v2 string by accident.
-pub const CANONICAL_PREFIX: &str = "PANGOLIN-API-V1";
+/// version, so a future v3 can change the shape without a v2 client
+/// ever producing a v3 string by accident.
+pub const CANONICAL_PREFIX: &str = "PANGOLIN-API-V2";
 
 /// How far the request's timestamp may be from the node's clock, in
 /// seconds. A request older or newer than that is refused.
@@ -136,7 +142,7 @@ mod tests {
         // The exact bytes are the contract with the dashboard — a
         // regression here silently breaks every client.
         let expected = format!(
-            "PANGOLIN-API-V1\nGET\n/api/v1/sites\n1700000000\n0123456789abcdef0123456789abcdef\n{}\n{}\n",
+            "PANGOLIN-API-V2\nGET\n/api/v1/sites\n1700000000\n0123456789abcdef0123456789abcdef\n{}\n{}\n",
             sha256_hex(b"s3cr3t"),
             sha256_hex(b""),
         );

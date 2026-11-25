@@ -110,7 +110,7 @@ because they apply to the whole file, not just one section.
 
 | Field         | Type            | Default      | Required | Notes |
 | ------------- | --------------- | ------------ | -------- | ----- |
-| `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Unlike `addr.https` and `api.listen`, it has **no** `"off"` switch: `":0"` is not a value pingora can resolve, and its listener thread panics — the process stays up and serves nothing. Leave the listener on and put the TLS listener in front of it. |
+| `addr.http`   | `string`        | `0.0.0.0:80` | no       | Full `host:port` for the HTTP listener. Unlike `addr.https`, it has **no** `"off"` switch: `":0"` is not a value pingora can resolve, and its listener thread panics — the process stays up and serves nothing. Leave the listener on and put the TLS listener in front of it. |
 | `addr.https`  | `string`        | `0.0.0.0:443`| no       | Full `host:port` for the HTTPS listener. Set to `":0"` to disable TLS entirely. |
 | `host`        | `string \| null` | `null`      | no       | Parsed, but **not read by the gateway**. It used to name the virtual host that resolved the per-domain certificate; since v2 the TLS listener is SNI-based and resolves a certificate through the pre-computed domain → cert link, so there is no virtual host any more. Setting it changes nothing. |
 | `workers`     | `usize \| null` | `null`       | no       | Parsed, but **not read by the gateway** — the worker count is chosen by the runtime, not by the configuration. Setting it changes nothing. |
@@ -177,29 +177,30 @@ server. Two things follow from that:
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
 | `password`  | `string` | `admin`          | no       | HTTP basic auth password. **Security**: stored in plaintext in `ngx.yml`; use `NGX_ADMIN__PASSWORD` env var to avoid committing secrets. Restrict port 9081 access via firewall (`ufw` / `iptables`) if exposing to untrusted networks. |
 
-### `[api]` — the dashboard-facing management API
+### The dashboard channel — no configuration section
 
-A second bind, next to the admin UI. It serves the JSON API a central
-dashboard calls to manage this node — its own namespace
-(`/api/v1/`), its own authentication and its own router. See
+**There is no `[api]` section any more.** Since issue #262 the gateway
+exposes **no** management port: it dials **out** to the dashboard,
+opens a subscription and executes the commands that arrive on it. A
+gateway behind a NAT — or on a private network — is reachable, because
+it is the one that opens the connection. See
 [design/api.md](design/api.md) for the protocol.
 
-| Field    | Type     | Default        | Required | Notes |
-| -------- | -------- | -------------- | -------- | ----- |
-| `listen` | `string` | `0.0.0.0:9443` | no       | Full `host:port` string for the API server. `":0"` disables the listener entirely. |
+Everything the channel needs is **runtime state** in the `api_config`
+table — the bearer token, the dashboard's API base address and the
+instance id — so an operator changes them from the node's `/settings`
+page without restarting the gateway; see
+[schema.md](schema.md#api_config).
 
-**Only the listen address is configuration.** The bearer token, the
-instance id, the dashboard's address and the on/off switch live in the
-`api_config` table, so an operator changes them from the node's
-`/settings` page without restarting the gateway — see
-[schema.md](schema.md#api_config). The `NGX_API__TOKEN` environment
-variable seeds the token on the **first** boot, when the gateway has
-none of its own yet; a token configured afterwards is never
-overwritten by the environment.
+A configuration that still carries an `api:` section is **ignored**:
+the gateway reads no key from it.
 
-**Security**: the API is plaintext HTTP — the dashboard's proxy
-terminates TLS. The only mitigation on the node's side is a firewall
-that limits the port to the dashboard's address.
+**Security**: the channel is HTTPS in both directions, and the node
+verifies the dashboard's certificate against the system's own
+certificate store — there is no "skip verification" path. The bearer
+token is stored in cleartext (the node signs its requests with it) and
+must be at least 128 bits of random data; the dashboard generates it
+and hands it to the operator.
 
 ### `[cache]` — the edge cache for static assets
 

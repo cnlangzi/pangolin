@@ -92,7 +92,7 @@ pub struct SettingsTemplate<'a> {
 ///
 /// The API keys are **not** part of this view: the form shows whether
 /// a key is configured and takes a new one to replace it. The stored
-/// key never leaves the database.
+/// key is never rendered back.
 #[derive(Clone, Debug)]
 pub struct BadbotsSettingsView {
     /// Whether the reputation check runs.
@@ -107,29 +107,32 @@ pub struct BadbotsSettingsView {
     pub updated_at: String,
 }
 
-/// The dashboard API's connection settings as the settings page
-/// renders them (issue #185).
+/// The dashboard channel's settings as the settings page renders them
+/// (issue #185, reworked by issue #262).
 ///
 /// The bearer token is **not** part of this view: the form shows
 /// whether one is configured and takes a new one to replace it. The
-/// stored token never leaves the database — the node keeps only its
-/// SHA-256 hash.
+/// stored token is never rendered back.
 #[derive(Clone, Debug)]
 pub struct DashboardApiView {
     /// The id this node is known by in the dashboard.
     pub instance_id: String,
-    /// Whether the API accepts calls at all.
-    pub enabled: bool,
+    /// The dashboard's API base address, as the operator configured
+    /// it. Empty means "the built-in default is in force".
+    pub dash_api: String,
+    /// The dashboard's API base address in force — the configured one,
+    /// or the built-in default.
+    pub effective_dash_api: String,
     /// Whether a bearer token is configured.
     pub has_token: bool,
-    /// The dashboard's port, as the operator configured it.
-    pub dashboard_port: u16,
-    /// The dashboard's address, as learned from the inbound calls.
-    /// Empty when the dashboard has not called yet.
-    pub dashboard_ip: String,
-    /// The address the API itself listens on.
-    pub listen_addr: String,
-    /// Whether the API listens at all — `api.listen: ":0"` switches
-    /// the listener off.
-    pub listen_enabled: bool,
+    /// The fingerprint of the dashboard key this node trusts.
+    pub key_fingerprint: String,
+    /// Whether the channel is up.
+    pub online: bool,
+    /// When the last successful handshake happened. Empty when there
+    /// was none yet.
+    pub last_handshake_at: String,
+    /// The last error the channel ran into. Empty when there was
+    /// none.
+    pub last_error: String,
 }

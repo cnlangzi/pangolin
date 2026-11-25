@@ -4,56 +4,112 @@ The management API is the **second** interface of a gateway, next to
 the admin UI. It exists so a central dashboard can manage a fleet of
 nodes without anybody logging into the node's browser interface.
 
-- **listener** — its own, `api.listen` in `ngx.yml` (default
-  `0.0.0.0:9443`). `":0"` means "do not listen".
-- **namespace** — `/api/v1/`. The admin UI's routes do not exist on
-  this listener; a request outside the namespace is a `404`.
-- **authentication** — its own: a bearer token, a timestamp, a nonce
-  and an Ed25519 signature.
-- **transport** — plaintext HTTP. The dashboard's proxy terminates
-  TLS; the node does not.
+- **direction** — the node dials **out**. Since issue #262 the gateway
+  exposes **no** management port: it opens a subscription to the
+  dashboard and executes the commands that arrive on it. A gateway
+  behind a NAT — or on a private network — is reachable, because it is
+  the one that opens the connection.
+- **namespace** — `/api/v1/`. A command outside the namespace is a
+  `404`; the admin UI's routes are not reachable through the channel.
+- **authentication** — its own, and in **both** directions: the node
+  signs every request it sends with an HMAC-SHA256 under the shared
+  token, and the dashboard signs every response with its Ed25519 key.
+- **transport** — HTTPS for both directions. The node verifies the
+  dashboard's certificate against the system's own certificate store;
+  there is no "skip verification" path.
 
 This document is the **specification**: it is what the dashboard side
 implements against. The reference implementation lives in
 `crates/api/` — `crates/api/src/client.rs` is the client the
-dashboard side mirrors, and the end-to-end suite
-(`tests/src/api_e2e.rs`) pins the behaviour described here.
+dashboard side mirrors — and the end-to-end suite
+(`tests/src/api_e2e.rs`) pins the behaviour described here against a
+mock dashboard.
 
 ## Contents
 
-- [The request](#the-request)
+- [The channel](#the-channel)
 - [The canonical string](#the-canonical-string)
-- [The authentication](#the-authentication)
+- [The signatures](#the-signatures)
+- [The handshake](#the-handshake)
+- [The commands and the results](#the-commands-and-the-results)
 - [The error envelope](#the-error-envelope)
 - [The endpoints](#the-endpoints)
 - [The resources](#the-resources)
 - [The write semantics](#the-write-semantics)
 - [The logs](#the-logs)
+- [The limits](#the-limits)
+- [The runtime state](#the-runtime-state)
+- [The versions](#the-versions)
 
-## The request
+## The channel
 
-Every request carries four headers:
+Two endpoints, both relative to the **dash API** — the dashboard's API
+base address, `https://dash.kynocdn.com/api/v1/` by default:
+
+| endpoint | direction | what |
+| --- | --- | --- |
+| `GET {dash_api}join` | node → dashboard | the **subscription**: an SSE stream of commands |
+| `POST {dash_api}report` | node → dashboard | the **result** of one command |
+
+The base address ends with a slash; a base without one is normalised
+(`{base}/join`, not `{base}join` replacing the last segment).
+
+It must be an `https` address — or a plain `http` one on the
+loopback interface. The channel carries the token in every request,
+so a plain-HTTP address that leaves the machine would put the
+credential on the wire in clear text. The settings page refuses such
+an address, and the client refuses it again before it dials.
+
+There is **nothing else**: the gateway binds no port for the dashboard,
+and the command channel shares nothing with the admin UI — no cookie,
+no session, no CSRF.
+
+### The join request
 
 ```http
+GET /api/v1/join HTTP/1.1
 Authorization: Bearer <token>
-X-Pangolin-Dashboard-Ts: <unix seconds>
-X-Pangolin-Dashboard-Nonce: <32 hex characters>
-X-Pangolin-Dashboard-Sig: <base64url(ed25519 signature)>
+X-Pangolin-Node-Ts: <unix seconds>
+X-Pangolin-Node-Nonce: <32 hex characters>
+X-Pangolin-Node-Sig: <base64url(hmac-sha256(token, canonical))>
+Accept: text/event-stream
 ```
 
 | header | value |
 | --- | --- |
-| `Authorization` | `Bearer` followed by the instance's token. The scheme is case-insensitive; the token must not be empty. |
-| `X-Pangolin-Dashboard-Ts` | The request's Unix timestamp in seconds, decimal. |
-| `X-Pangolin-Dashboard-Nonce` | 32 hex characters (16 random bytes). A nonce may be used **once** inside the window. |
-| `X-Pangolin-Dashboard-Sig` | The base64url (no padding) Ed25519 signature of the canonical string. |
+| `Authorization` | `Bearer` followed by the node's token. The scheme is case-insensitive; the token must not be empty and must be visible ASCII — it travels in this header, inside the TLS session. |
+| `X-Pangolin-Node-Ts` | The request's Unix timestamp in seconds, decimal. |
+| `X-Pangolin-Node-Nonce` | 32 hex characters (16 random bytes). A nonce is used **once**. |
+| `X-Pangolin-Node-Sig` | The base64url (no padding) HMAC-SHA256 signature of the canonical string, keyed with the token. |
+| `Accept` | `text/event-stream`. |
 
 The **path** is signed **as it is sent** — the query string included,
-and without percent-decoding. The client signs the exact bytes it
-puts on the wire.
+and without percent-decoding. The node signs the exact bytes it puts
+on the wire.
 
 The request body is signed as well: the SHA-256 digest of the raw
-body bytes. An empty body hashes the empty string.
+body bytes. The join request has no body, so it hashes the empty
+string.
+
+### The report request
+
+```http
+POST /api/v1/report HTTP/1.1
+Authorization: Bearer <token>
+X-Pangolin-Node-Ts: <unix seconds>
+X-Pangolin-Node-Nonce: <32 hex characters>
+X-Pangolin-Node-Sig: <base64url(hmac-sha256(token, canonical))>
+Content-Type: application/json
+
+{"id":"c-42","status":200,"headers":{"content-type":"application/json"},"body":"eyJ…"}
+```
+
+The four credentials are the same, and the canonical string covers the
+report's **own** method, path and body — not the command's.
+
+The dashboard answers `200` when it has taken the result, and a
+non-`2xx` status when it has not. A result the dashboard refused stays
+in the node's queue and is reported again after a backoff.
 
 ## The canonical string
 
@@ -63,7 +119,7 @@ contain a newline and no two different requests share a canonical
 string.
 
 ```text
-PANGOLIN-API-V1\n
+PANGOLIN-API-V2\n
 {METHOD}\n
 {PATH}\n
 {TS}\n
@@ -78,16 +134,16 @@ PANGOLIN-API-V1\n
 | `PATH` | The request target as sent — path **and** query string. Not percent-decoded. |
 | `TS` | The timestamp, decimal Unix seconds. |
 | `NONCE` | The nonce, verbatim. |
-| `sha256_hex(token)` | The SHA-256 hex digest of the bearer token, lower-case. It is the same digest the node stores, so the node never needs the cleartext token to check the signature. |
+| `sha256_hex(token)` | The SHA-256 hex digest of the bearer token, lower-case. |
 | `sha256_hex(body)` | The SHA-256 hex digest of the raw request body, lower-case. |
 
-A worked example — `GET /api/v1/sites` with the token `secret` and an
+A worked example — `GET /api/v1/join` with the token `secret` and an
 empty body:
 
 ```text
-PANGOLIN-API-V1\n
+PANGOLIN-API-V2\n
 GET\n
-/api/v1/sites\n
+/api/v1/join\n
 1700000000\n
 0123456789abcdef0123456789abcdef\n
 2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b\n
@@ -97,59 +153,132 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n
 (The three lines above are one line each; the example is wrapped for
 readability.)
 
-## The authentication
+**Both sides sign the same string.** The node signs its own requests;
+the dashboard signs its answers with the very same shape — the method
+and path of the request it is answering, its own timestamp, and the
+node's nonce echoed back.
 
-The checks run **cheapest first**, and no step reveals more than its
-own error code:
+## The signatures
+
+The two directions use **different** key material, because the two
+sides hold different secrets:
+
+| direction | algorithm | key |
+| --- | --- | --- |
+| node → dashboard | HMAC-SHA256 | the shared token |
+| dashboard → node | Ed25519 | the dashboard's private key |
+
+The token is the node's credential: it is stored in the database (the
+node has to compute the HMAC, so a digest would not do). The
+canonical string carries `sha256_hex(token)` rather than the token,
+and the HMAC binds the timestamp, the nonce and the body — so a
+captured request cannot be replayed at the dashboard or edited on the
+way. The token itself travels as the bearer credential of the
+`Authorization` header, inside the TLS session.
+
+The dashboard's key is **compiled into the binary**
+(`crates/api/src/dashboard.pub`). There is no runtime path that reads
+a key file and no configuration knob that replaces it — changing the
+dashboard's key means a new release. The node publishes the key's
+fingerprint (the SHA-256 hex digest of the raw public key) on the
+settings page and in `GET /api/v1/instance`, so an operator can see
+which key the node trusts.
+
+The dashboard verifies the node's request with the same four checks
+the inbound API used to run, cheapest first:
 
 | # | check | failure |
 | --- | --- | --- |
 | 1 | the four headers are present and well-formed | `400 malformed_request` |
 | 2 | `\|now - ts\| ≤ 300` | `401 timestamp_out_of_window` |
-| 3 | the token's digest matches the stored one (constant time) | `401 invalid_token` |
-| 4 | the nonce was not used inside the window | `401 replayed_nonce` |
-| 5 | the Ed25519 signature verifies against the embedded key | `401 invalid_signature` |
+| 3 | the bearer token matches | `401 invalid_token` |
+| 4 | the signature verifies | `401 invalid_signature` |
 
-The nonce is written into the replay cache **only after every check
-passed**. A rejected request leaves no trace, so a client that got
-its credentials wrong can retry with the same nonce once they are
-right.
+The reference implementation of the dashboard's side is
+`api::client::verify_node_request`.
 
-The replay cache is in-memory: a restart empties it. The ±300 s
-window is still the upper bound on how long a captured request stays
-replayable.
+## The handshake
 
-The verifying key is **compiled into the binary**
-(`crates/api/src/dashboard.pub`). There is no runtime path that reads
-a key file and no configuration knob that replaces it — changing the
-dashboard's key means a new release.
+The dashboard answers the `join` request with the three headers that
+prove it holds the dashboard's private key:
 
-### The switch
+```http
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+X-Pangolin-Dashboard-Ts: <unix seconds>
+X-Pangolin-Dashboard-Nonce: <the node's nonce, echoed>
+X-Pangolin-Dashboard-Sig: <base64url(ed25519 signature)>
+```
 
-`api_config.enabled` decides whether the API answers at all. While it
-is off, every call is answered with `403 api_disabled`. A gateway
-that was never configured has no token, and every call is answered
-with `401 invalid_token`.
+The node refuses the subscription unless **all** of the following
+hold:
 
-### The runtime state
+1. the echoed nonce is **the nonce the node just sent**;
+2. the timestamp is inside the ±300 s window;
+3. the signature verifies against the compiled-in key.
 
-The API's connection state lives in the `api_config` table, not in
-`ngx.yml`:
+The signature covers the canonical string of the **join request**,
+with the dashboard's own timestamp and the echoed nonce:
 
-| column | meaning |
+```text
+PANGOLIN-API-V2\n
+GET\n
+/api/v1/join\n
+{dashboard's ts}\n
+{node's nonce}\n
+{sha256_hex(token)}\n
+{sha256_hex("")}\n
+```
+
+The nonce is the replay protection: the node generates a **fresh** one
+for every request, and the answer has to echo exactly that one — so a
+captured answer from an earlier attempt cannot pass. The dashboard
+mirrors the rule on its side: it remembers the nonces it has already
+answered and refuses a request that reuses one.
+
+A refused handshake is not fatal: the node backs off and tries again.
+
+## The commands and the results
+
+The subscription is a plain [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+stream. The dashboard sends one `data:` frame per command:
+
+```json
+{ "id": "c-42", "method": "GET", "path": "/api/v1/sites", "body": null }
+```
+
+| field | meaning |
 | --- | --- |
-| `id` | Always 1 — the table is a singleton. |
-| `instance_id` | The id this node is known by in the dashboard. Generated once, on the first boot. |
-| `token_hash` | The SHA-256 hex digest of the bearer token. The token itself is never stored. |
-| `dashboard_port` | The port the dashboard is reachable on, as the operator configured it. |
-| `dashboard_ip` | The dashboard's address, learned from the source address of an authenticated call. |
-| `enabled` | Whether the API accepts calls. |
-| `updated_at` | RFC-3339 timestamp of the last change. |
+| `id` | The dashboard's id for this command. The node carries it back verbatim. |
+| `method` | The HTTP method, upper-case. |
+| `path` | The request target — path **and** query string, as in today's REST API (`/api/v1/logs/bot/raw?date=2026-01-02`). |
+| `body` | The request body as a JSON value. `null` or absent means "no body". The node serialises it compactly. |
 
-The operator sets the token, the port and the switch on the node's
-`/settings` page ("Dashboard" card). `NGX_API__TOKEN` seeds the token
-on the **first** boot, when the gateway has none of its own yet; a
-token configured afterwards is never overwritten by the environment.
+The node executes the command with the very same router the REST API
+used — the resource shapes, the error envelope, the write semantics
+and the validators are **unchanged**. A command whose path is not
+inside `/api/v1/` is answered with the namespace's `404`, and a command
+that fails is answered with its error envelope. Neither ends the
+subscription.
+
+The node reports the result with `POST {dash_api}report`:
+
+```json
+{ "id": "c-42", "status": 200, "headers": { "content-type": "application/json" }, "body": "eyJ…" }
+```
+
+| field | meaning |
+| --- | --- |
+| `id` | The id of the command this result belongs to. |
+| `status` | The HTTP status the command's request answered with. |
+| `headers` | The response headers, as a map of lower-case names to values. |
+| `body` | The response body, **base64**-encoded. Base64 and not text: the body of a raw-log command is arbitrary bytes, and the encoding has to survive the round trip unchanged. |
+
+The dashboard correlates the result with the command by `id`. A command
+the dashboard retried — because its answer did not arrive — is
+executed **again**: the second answer is the resource's own conflict
+(`409 site_exists`), and the first write is not undone. The dashboard
+treats the conflict as "the write happened".
 
 ## The error envelope
 
@@ -173,12 +302,10 @@ Every failure answers with the same shape:
 | `invalid_token` | 401 | the token does not match |
 | `replayed_nonce` | 401 | the nonce was already used inside the window |
 | `invalid_signature` | 401 | the signature does not verify |
-| `api_disabled` | 403 | the operator switched the API off |
 | `not_found` | 404 | no such endpoint |
 | `<resource>_not_found` | 404 | no such resource (e.g. `site_not_found`) |
 | `<resource>_exists` | 409 | the resource already exists (e.g. `site_exists`) |
 | `<field>_invalid` | 422 | a field failed validation (e.g. `backend_invalid`) |
-| `body_too_large` | 413 | the request body is larger than 1 MiB |
 | `internal_error` | 500 | something the API did not expect |
 
 A successful response is the **resource itself** — a list is a JSON
@@ -362,8 +489,8 @@ keeps the stored one.
 ```
 
 The token is **never** part of a read answer. It is returned exactly
-once — in the answer of the `POST` that created the tunnel, and in
-the answer of the `PUT` that rotated it.
+once — in the answer of the `POST` that created the tunnel, and in the
+answer of the `PUT` that rotated it.
 
 **Write body**:
 
@@ -400,8 +527,7 @@ one; on create, one is generated.
 
 The id carries characters a request target may not (`|` and `/`), so
 it is **percent-encoded** in the path — `global%7Cblacklist%7C10.0.0.0%2F8`
-— and the signature covers the encoded form. The reference client
-(`api::client::ApiClient`) encodes the target for you.
+— and the router decodes the segments before it matches them.
 
 **Write body**:
 
@@ -432,8 +558,8 @@ The `policy` is the rate-limit policy:
 }
 ```
 
-**Write body** — the same fields, all optional. The object replaces
-the stored policy as a whole, so an omitted field falls back to its
+**Write body** — the same fields, all optional. The object replaces the
+stored policy as a whole, so an omitted field falls back to its
 default (not to the stored value).
 
 ### `SiteRateLimitBotsView`
@@ -539,7 +665,7 @@ omitted credential keeps the stored one.
   "version": "0.1.0",
   "uptime_seconds": 3600,
   "dashboard_key_fingerprint": "…",
-  "dashboard": { "ip": "10.0.0.7", "port": 443 },
+  "dash_api": "https://dash.kynocdn.com/api/v1/",
   "tunnel_nodes": [
     { "name": "office", "online": true, "last_seen_at": "2026-01-01T00:00:00Z" }
   ],
@@ -550,6 +676,11 @@ omitted credential keeps the stored one.
 `dashboard_key_fingerprint` is the SHA-256 hex digest of the public
 key the node trusts — the dashboard shows it so an operator can tell
 at a glance which key the node has.
+
+`dash_api` is the dashboard's API base address the node dials out to.
+It replaced the old `dashboard` object: the node no longer learns the
+dashboard's address from an inbound call, and the dashboard does not
+need one — the node comes to it.
 
 ### `ProvidersView`
 
@@ -611,14 +742,6 @@ later.
 
 ## The logs
 
-## The limits
-
-The request body is capped at **1 MiB**. A body that announces more
-is answered `413 body_too_large` before a byte of it is read — the
-body is read before the authentication gate runs, so an
-unauthenticated client must not be able to make the node buffer an
-arbitrary amount of memory.
-
 The API serves the logs **raw**: the analysis belongs to the
 dashboard.
 
@@ -639,3 +762,99 @@ material, like the rest of the access log.
 A `date` that is not `YYYY-MM-DD` is a `422 date_invalid`; a file
 that does not exist is a `404 bot_log_not_found` (or
 `referer_log_not_found`).
+
+The raw log is **binary** as far as the channel is concerned: it travels
+base64-encoded in the result's `body`, so a byte-for-byte read is
+guaranteed.
+
+## The limits
+
+The **report** — the POST the node sends — is capped at **1 MiB**, the
+same limit the inbound API put on a request body. The dashboard
+refuses a bigger one with a `413`.
+
+A command whose **answer** is bigger than the limit — the raw log of a
+busy day, say — is answered with an **error**: the node reports
+`413 result_too_large` instead of the body. The dashboard learns that
+the command failed; it does not wait for an answer that never comes.
+A resource that does not fit has to be fetched in pieces.
+
+## The runtime state
+
+The channel's settings live in the `api_config` table, not in
+`ngx.yml`:
+
+| column | meaning |
+| --- | --- |
+| `id` | Always 1 — the table is a singleton. |
+| `instance_id` | The id this node is known by in the dashboard. Generated once, on the first boot. |
+| `token` | The bearer token, **in cleartext** — the node signs its requests with it. Empty means "not configured". |
+| `dash_api` | The dashboard's API base address. Empty means "the built-in default". |
+| `updated_at` | RFC-3339 timestamp of the last change. |
+
+The operator sets the token and the dash API on the node's `/settings`
+page ("Dashboard" card). The token field is **write-only**: an empty
+field keeps the stored token, and a separate checkbox clears it. The
+card also shows the instance id, the fingerprint of the key the node
+trusts, and the state of the connection (online or offline, the last
+handshake, the last error).
+
+**The token's entropy is the dashboard's responsibility.** It must be
+at least 128 bits of random data, generated by the dashboard and handed
+to the operator. The node stores it as it is — it has to compute the
+HMAC with it — and it travels in the `Authorization` header of every
+request, inside the TLS session. A database dump therefore carries a
+live credential.
+
+There is **no switch**: the API is always on. A node without a token
+simply does not dial the dashboard, and the gateway serves the traffic
+as usual.
+
+## The versions
+
+### v1 — the inbound listener (issue #185, superseded)
+
+The first version of the API was an **inbound** HTTP listener
+(`api.listen` in `ngx.yml`, default `0.0.0.0:9443`) that the dashboard
+called with `GET /api/v1/…`. Every request carried a bearer token, a
+timestamp, a nonce and an **Ed25519** signature over the canonical
+string, and the node verified it against the compiled-in key.
+
+That model does not work for the fleet this project serves: a gateway
+behind a NAT — or on a private network — is not reachable on a
+management port, and exposing the admin port to the internet is not an
+acceptable default. Hence v2.
+
+### v2 — the outbound channel (issue #262)
+
+What changed:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| direction | the dashboard calls the node | the node calls the dashboard |
+| listener | `api.listen` in `ngx.yml` | none |
+| node's signature | — | HMAC-SHA256 under the token |
+| dashboard's signature | Ed25519 | Ed25519 |
+| canonical prefix | `PANGOLIN-API-V1` | `PANGOLIN-API-V2` |
+| the token | stored as a digest | stored in cleartext (the node signs with it) |
+| the switch | `api_config.enabled` | none |
+| `GET /api/v1/instance` | reported the dashboard's address | reports the dash API |
+
+The **resource shapes, the error envelope, the write semantics and the
+validators did not change** — a dashboard that knows the v1 resources
+knows the v2 ones. What changed is the transport, and the two
+signatures that go with it.
+
+### The upgrade
+
+The `V16` migration rewrites the `api_config` table. The old
+`token_hash` was a one-way hash of the token, so the token **cannot**
+be recovered from it: after the upgrade the node has no token and does
+not dial the dashboard until the dashboard hands the operator a fresh
+one and the operator pastes it into the "Dashboard" card.
+
+The `api.listen` configuration key is **gone** — a configuration that
+still carries an `api:` section is ignored, and the gateway binds no
+port for the dashboard.
+
+The error code `api_disabled` is gone with the switch.

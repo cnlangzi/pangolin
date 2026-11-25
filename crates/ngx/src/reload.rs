@@ -514,12 +514,6 @@ pub fn listener_ports(config: &Config) -> Vec<u16> {
     if let Some(port) = listen_port(&config.tunnel.addr) {
         ports.push(port);
     }
-    if config.api.listen != ":0"
-        && !config.api.listen.is_empty()
-        && let Some(port) = listen_port(&config.api.listen)
-    {
-        ports.push(port);
-    }
     ports
 }
 

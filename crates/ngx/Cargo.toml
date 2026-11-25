@@ -19,6 +19,9 @@ default = []
 # Enable integration tests (requires Pebble ACME test server running on port 14000).
 # Run with: cargo test --features integration -p ngx
 integration = []
+# The **mock** dashboard key (issue #262) — see the `api` crate's
+# feature of the same name for what it does and what it costs.
+test-dashboard-key = ["api/test-dashboard-key"]
 
 [dependencies]
 pangolin-core = { path = "../pangolin-core" }
@@ -95,8 +98,15 @@ time = "0.3"
 
 # DNS-01 challenge
 hickory-resolver = "0.26"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
-hmac = "0.13"
+# The control-plane HTTP client (issue #262): the dashboard channel
+# reads the SSE stream, so the client needs the `stream` feature. The
+# roots are the system's own certificate store — the client is built
+# with `rustls-tls-manual-roots` and the native roots are added
+# explicitly, the same way the provider range fetch does it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots"] }
+# The jitter of the reconnection backoff.
+rand = "0.8"
+hmac.workspace = true
 sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 

@@ -7,7 +7,7 @@
 //! * `AcmeService`   — periodic cert renewal + initial scan
 //! * `TunnelService` — WebSocket listener for tun nodes
 //! * `AdminService`  — the admin UI's own HTTP listener (issue #261)
-//! * `ApiService`    — the dashboard-facing management API's listener
+//! * `DashboardService` — the outbound channel to the dashboard
 //! * pingora (driven by `run_pingora` in `main.rs`) — the HTTP proxy.
 //!   pingora owns its own tokio runtime, so it lives on a dedicated
 //!   `std::thread` rather than the host runtime.
@@ -83,7 +83,7 @@ pub trait Service: Send + Sync + 'static {
 ///
 /// The host runtime drives the long-lived non-pingora services (the
 /// ACME renewal loop, the tunnel accept loop, the admin UI's
-/// listener, the management API's listener) plus a couple of signal
+/// listener, the outbound dashboard channel) plus a couple of signal
 /// handler tasks. The work is dominated by network I/O, so two worker
 /// threads is plenty — `num_cpus` (the `new_multi_thread` default)
 /// would just park a herd of idle OS threads.

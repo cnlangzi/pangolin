@@ -25,6 +25,8 @@ pub mod cert_link;
 pub mod cidr;
 pub mod client_ip;
 pub mod config;
+pub mod credential;
+pub mod dashboard;
 pub mod db;
 pub mod embedded_migrations;
 pub mod error;
@@ -60,9 +62,11 @@ pub use cache::{CacheAdmin, CacheStats};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
 pub use config::{
-    ApiConfig, BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, ReloadConfig,
-    TrafficConfig, init_logger, load_config_and_init_logger,
+    BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, ReloadConfig, TrafficConfig,
+    init_logger, load_config_and_init_logger,
 };
+pub use credential::{DashApiError, is_valid_token, validate_dash_api};
+pub use dashboard::DashboardStatus;
 pub use error::{DbError, PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};
 pub use index::{Indexes, TunnelClassification, host_matches_domains, lookup_site, site_of_host};

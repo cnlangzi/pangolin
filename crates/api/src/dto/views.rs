@@ -81,16 +81,6 @@ pub struct BadbotsSettingsView {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Where the dashboard is reachable from this node.
-#[derive(Debug, Clone, Serialize)]
-pub struct DashboardAddress {
-    /// The dashboard's address, as learned from the source address of
-    /// the inbound API connection.
-    pub ip: Option<String>,
-    /// The dashboard's port, as the operator configured it.
-    pub port: u16,
-}
-
 /// One tunnel node's state.
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelNodeView {
@@ -110,8 +100,12 @@ pub struct InstanceView {
     pub uptime_seconds: u64,
     /// The SHA-256 hex digest of the dashboard key this node trusts.
     pub dashboard_key_fingerprint: String,
-    /// Where the dashboard is reachable from this node.
-    pub dashboard: DashboardAddress,
+    /// The dashboard's API base address this node dials out to.
+    ///
+    /// The node connects **out** to the dashboard (issue #262), so the
+    /// address the dashboard has to know is the one the node dials —
+    /// not the address the dashboard happens to be reachable on.
+    pub dash_api: String,
     /// The tunnel nodes registered with this gateway.
     pub tunnel_nodes: Vec<TunnelNodeView>,
     /// The capabilities this API offers.

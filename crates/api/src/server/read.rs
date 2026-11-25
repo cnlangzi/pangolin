@@ -8,9 +8,9 @@ use chrono::NaiveDate;
 
 use super::{ApiResponse, Ctx};
 use crate::dto::views::{
-    BadbotsSettingsView, DashboardAddress, DnsProviderView, InstanceView, ProviderStatusView,
-    ProvidersView, SiteOriginAllowView, SiteProviderView, SiteRateLimitBotsView, SiteRateLimitView,
-    TunView, TunnelNodeView,
+    BadbotsSettingsView, DnsProviderView, InstanceView, ProviderStatusView, ProvidersView,
+    SiteOriginAllowView, SiteProviderView, SiteRateLimitBotsView, SiteRateLimitView, TunView,
+    TunnelNodeView,
 };
 use crate::protocol::error::ApiError;
 
@@ -24,15 +24,18 @@ pub async fn instance(ctx: &Ctx<'_>) -> ApiResponse {
         .app
         .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
         .await;
-    let (instance_id, dashboard) = match runtime {
-        Some(row) => (
-            row.instance_id,
-            DashboardAddress {
-                ip: row.dashboard_ip,
-                port: row.dashboard_port.clamp(0, u16::MAX as i64) as u16,
-            },
+    // The node dials the dashboard, so the address the dashboard has
+    // to reach is the one the node dials **out** to — the dash API.
+    let (instance_id, dash_api) = match runtime {
+        Some(row) => {
+            // The effective address is read before the row is moved.
+            let dash_api = row.effective_dash_api().to_string();
+            (row.instance_id, dash_api)
+        }
+        None => (
+            String::new(),
+            pangolin_core::db::DEFAULT_DASH_API.to_string(),
         ),
-        None => (String::new(), DashboardAddress { ip: None, port: 0 }),
     };
     let tunnel_nodes = ctx
         .state
@@ -53,10 +56,8 @@ pub async fn instance(ctx: &Ctx<'_>) -> ApiResponse {
         instance_id,
         version: pangolin_core::VERSION,
         uptime_seconds: ctx.state.app.ratelimit_snapshot().uptime_secs,
-        dashboard_key_fingerprint: crate::protocol::signature::fingerprint(
-            &ctx.state.authenticator.verifying_key,
-        ),
-        dashboard,
+        dashboard_key_fingerprint: ctx.state.dashboard_key.fingerprint(),
+        dash_api,
         tunnel_nodes,
         capabilities: super::CAPABILITIES.to_vec(),
     };

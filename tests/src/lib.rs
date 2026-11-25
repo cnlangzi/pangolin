@@ -120,14 +120,18 @@ mod proxy_tunnel;
 #[cfg(feature = "integration")]
 mod admin_api;
 
-// The dashboard-facing management API (issue #185). `management_api`
-// drives the server in process over a real port; `api_e2e` drives the
-// real binary.
+// The dashboard-facing management API (issue #185, reworked by issue
+// #262). `management_api` drives the router in process; `api_e2e`
+// drives the outbound channel against a mock dashboard.
 #[cfg(feature = "integration")]
 mod management_api;
 
 #[cfg(feature = "integration")]
 mod api_e2e;
+
+// The mock dashboard the outbound channel talks to (issue #262).
+#[cfg(feature = "integration")]
+mod mock_dashboard;
 
 #[cfg(feature = "integration")]
 mod admin_reload;
@@ -164,6 +168,14 @@ mod upstream_host;
 #[ctor::ctor]
 fn init_crypto() {
     pangolin_core::install_crypto_provider();
+    // The in-process suites (the dashboard channel) log through the
+    // `log` crate: without a logger the node's warnings are lost and
+    // a failing handshake is invisible.
+    let _ = env_logger::builder()
+        .is_test(false)
+        .filter_level(log::LevelFilter::Info)
+        .parse_env("RUST_LOG")
+        .try_init();
 }
 
 #[cfg(feature = "integration")]

@@ -107,16 +107,23 @@ figment = { version = "0.10", features = ["yaml", "env", "toml"] }
 # `digest` versions never meet at a type boundary here — no public
 # API of ours mentions a digest type.
 sha2 = "0.11"
+# The keyed hashing of the dashboard channel (issue #262): the node
+# signs its requests with HMAC-SHA256 under the shared token.  It
+# belongs here for the reason `sha2` does — `hmac 0.13` is the
+# digest-0.11 release, so every crate in *this* workspace takes the
+# hash crates from one place and never straddles the two digest
+# ecosystems.
+hmac = "0.13"
 
 # CIDR parsing / matching for the IP rules (issue #117). The
 # knownbots crate already depends on it for its official IP ranges.
 ipnet = "2"
 
 # The listeners the gateway owns outside pingora set SO_REUSEPORT
-# before they bind (issue #233): the tunnel listener, the QUIC
-# endpoint and the management API's listener.  (pingora's own three
-# — the HTTP, HTTPS and admin listeners — get the option through
-# pingora's `TcpSocketOptions`.)  `socket2` is already in the tree
+# before they bind (issue #233): the tunnel listener and the QUIC
+# endpoint.  (pingora's own three — the HTTP, HTTPS and admin
+# listeners — get the option through pingora's `TcpSocketOptions`.)
+# `socket2` is already in the tree
 # (pingora-core and quinn depend on it), so declaring it here adds a
 # dependency edge and not a second copy of the crate.
 #

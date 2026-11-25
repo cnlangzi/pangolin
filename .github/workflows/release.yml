@@ -153,10 +153,12 @@ jobs:
 
       - name: Assert the dashboard key is not the development placeholder
         # The dashboard's Ed25519 public key is compiled into the
-        # binary (issue #185). The repository ships a DEVELOPMENT
-        # placeholder whose private half lives in
-        # `tests/fixtures/` — the end-to-end suite needs it to sign a
-        # request — so it must never reach a release.
+        # binary (issue #185). The repository carries the published
+        # key; the DEVELOPMENT key that used to live here — together
+        # with its private half in `tests/fixtures/` — must never
+        # reach a release. The end-to-end suite no longer needs a
+        # private key at all: it verifies the dashboard's signature
+        # with a mock verifier (issue #262).
         #
         # The other build jobs compile the same source, so this one
         # check is enough to stop the whole release.
@@ -166,7 +168,7 @@ jobs:
           placeholder=439a24963d8250a37a685231546de534176238a9b43e7e1ce23c48d01b3795ea
           key=$(grep -v '^[[:space:]]*#' "$key_file" | tr -d '[:space:]')
           if [[ "$key" == "$placeholder" ]]; then
-            echo "::error::$key_file still holds the development key — replace it (and tests/fixtures/dashboard_dev_seed.hex) with the production key pair before tagging"
+            echo "::error::$key_file still holds the retired development key — put the published dashboard key there before tagging"
             exit 1
           fi
           echo "the dashboard key is not the development placeholder"

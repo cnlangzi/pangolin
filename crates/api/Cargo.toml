@@ -10,6 +10,20 @@ description = "Pangolin dashboard-facing management API (issue #185)"
 name = "api"
 path = "src/lib.rs"
 
+[features]
+default = []
+# The **mock** dashboard key (issue #262).
+#
+# The production build verifies the dashboard's Ed25519 signature
+# against the public key compiled into the binary. This feature swaps
+# that verifier for a mock that accepts one sentinel signature — so
+# the end-to-end suite never needs a real key pair and never touches
+# the production key.
+#
+# A build with this feature **must not** be pointed at a real
+# dashboard: it says so loudly on startup.
+test-dashboard-key = []
+
 [dependencies]
 pangolin-core = { path = "../pangolin-core" }
 # The admin UI's form parsers. The API validates through the very same
@@ -27,28 +41,22 @@ admin = { path = "../admin" }
 serde = { workspace = true }
 serde_json.workspace = true
 tokio.workspace = true
-tokio-util = { workspace = true }
 log.workspace = true
-anyhow.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 
-# HTTP plumbing for the standalone listener.
+# The header map the command carries.
 http = "1"
-http-body-util = "0.1"
-bytes = "1"
-hyper = { version = "1.10", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 
-# The API's own listener sets SO_REUSEPORT before it binds (issue
-# #233) — the same version the tree already carries, see the root
-# Cargo.toml.
-socket2.workspace = true
-
-# Ed25519 — the dashboard's request signature. `ring` is already in the
+# Ed25519 — the dashboard's signature. `ring` is already in the
 # tree (rustls' provider), so this adds no new crate to the build.
 ring = "0.17"
+
+# HMAC-SHA256 — the node's signature. The version is the workspace's
+# (see the root manifest): `hmac` is already in the tree, so this adds
+# no new crate.
+hmac.workspace = true
 
 # The nonce cache's lock — sync, non-poisoning, no hot path.
 parking_lot.workspace = true

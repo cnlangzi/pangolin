@@ -1,21 +1,22 @@
-//! The API server — the router, the authentication gate and the
-//! handlers.
+//! The API server — the router and the handlers.
 //!
-//! The API is a **second, parallel** management surface next to the
-//! admin UI: it has its own listener, its own namespace
-//! (`/api/v1/`) and its own authentication. Nothing here renders HTML
-//! and nothing here reuses the admin's cookie session or CSRF.
+//! The API is the **second** management surface next to the admin
+//! UI: it has its own namespace (`/api/v1/`) and it never renders
+//! HTML. Nothing here reuses the admin's cookie session or CSRF.
+//!
+//! Since issue #262 the API has **no listener of its own**: the node
+//! dials the dashboard, the dashboard sends commands down an SSE
+//! subscription, and the node executes them here. A command's
+//! credentials are checked by the **channel**, not by the router — a
+//! command that reaches `route()` has already been authenticated by
+//! the outbound client.
 //!
 //! ## The request path
 //!
 //! 1. The request target must be inside `/api/v1/` — anything else is
-//!    a `404`, so the admin's HTML routes do not exist on this
-//!    listener.
-//! 2. The operator must have switched the API on
-//!    (`api_config.enabled`) and configured a token — otherwise the
-//!    request is refused.
-//! 3. The four credentials are checked (see [`crate::protocol::auth`]).
-//! 4. The request is dispatched to a handler.
+//!    a `404`, so the admin's HTML routes are not reachable through
+//!    the channel either.
+//! 2. The request is dispatched to a handler.
 
 pub mod read;
 pub mod write;
@@ -25,8 +26,8 @@ use std::sync::Arc;
 use http::HeaderMap;
 use pangolin_core::App;
 
-use crate::protocol::auth::{Authenticator, now_secs};
 use crate::protocol::error::{ApiError, codes, error_body};
+use crate::protocol::signature::DashboardKey;
 
 /// The namespace every route of this API lives in.
 pub const API_PREFIX: &str = "/api/v1/";
@@ -36,27 +37,22 @@ pub const API_PREFIX: &str = "/api/v1/";
 pub struct ApiRequest {
     /// The HTTP method.
     pub method: String,
-    /// The request target as sent — path **and** query string. This
-    /// is the string the signature covers.
+    /// The request target as sent — path **and** query string.
     pub path: String,
     /// The request headers.
     pub headers: HeaderMap,
     /// The raw request body.
     pub body: Vec<u8>,
-    /// The address of the peer, when the transport knows it. The
-    /// dashboard's address is learned from it.
-    pub peer: Option<std::net::SocketAddr>,
 }
 
 impl ApiRequest {
-    /// A request without a peer address.
+    /// A request.
     pub fn new(method: &str, path: &str, body: Vec<u8>) -> Self {
         Self {
             method: method.to_string(),
             path: path.to_string(),
             headers: HeaderMap::new(),
             body,
-            peer: None,
         }
     }
 }
@@ -105,24 +101,25 @@ impl ApiResponse {
 pub struct ApiState {
     /// The gateway's shared state.
     pub app: Arc<App>,
-    /// The authenticator: the trusted key and the replay cache.
-    pub authenticator: Authenticator,
+    /// The dashboard key this node trusts.
+    ///
+    /// The **production** build holds the compile-time embedded key,
+    /// so there is no runtime path that replaces it. The `instance`
+    /// view reports its fingerprint, so an operator can tell which key
+    /// the node trusts.
+    pub dashboard_key: Arc<dyn DashboardKey>,
 }
 
 impl ApiState {
     /// Build the state of one node.
-    pub fn new(app: Arc<App>, verifying_key: [u8; 32]) -> Self {
-        Self {
-            app,
-            authenticator: Authenticator::new(verifying_key),
-        }
+    pub fn new(app: Arc<App>, dashboard_key: Arc<dyn DashboardKey>) -> Self {
+        Self { app, dashboard_key }
     }
 }
 
 /// Route a request.
 ///
-/// This is the whole API: the namespace check, the authentication gate
-/// and the dispatch.
+/// This is the whole API: the namespace check and the dispatch.
 pub async fn route(state: &ApiState, req: ApiRequest) -> ApiResponse {
     // 1 — the namespace. The admin's HTML routes do not exist here.
     let (path_only, query) = match req.path.split_once('?') {
@@ -132,45 +129,11 @@ pub async fn route(state: &ApiState, req: ApiRequest) -> ApiResponse {
     let Some(rest) = path_only.strip_prefix(API_PREFIX) else {
         return ApiResponse::error(&ApiError::not_found(
             codes::NOT_FOUND,
-            "this listener only serves the /api/v1/ namespace",
+            "this channel only serves the /api/v1/ namespace",
         ));
     };
 
-    // 2 — the operator's switch. A gateway that was never configured
-    // has no token, so it fails closed; one that was configured but
-    // switched off refuses every call.
-    let runtime = state
-        .app
-        .with_db_or(|db| pangolin_core::db::get_api_config(db).unwrap_or(None))
-        .await;
-    let Some(runtime) = runtime else {
-        return ApiResponse::error(&ApiError::unauthorized(
-            codes::INVALID_TOKEN,
-            "the dashboard API is not configured",
-        ));
-    };
-    if !runtime.enabled {
-        return ApiResponse::error(&ApiError::disabled());
-    }
-
-    // 3 — the credentials.
-    let now = now_secs();
-    if let Err(err) = state.authenticator.authenticate(
-        &req.headers,
-        &req.method,
-        &req.path,
-        &req.body,
-        &runtime.token_hash,
-        now,
-    ) {
-        return ApiResponse::error(&err);
-    }
-
-    // The dashboard's address is learned from the peer of the call
-    // that got this far — the one that carried a valid signature.
-    learn_dashboard_ip(state, &runtime, req.peer.as_ref()).await;
-
-    // 4 — the dispatch.
+    // 2 — the dispatch.
     let ctx = Ctx {
         state,
         method: req.method.as_str(),
@@ -228,32 +191,6 @@ fn percent_decode(value: &str) -> String {
     urlencoding::decode(value)
         .map(|c| c.into_owned())
         .unwrap_or_else(|_| value.to_string())
-}
-
-/// Remember the dashboard's address, learned from the peer of an
-/// authenticated call.
-async fn learn_dashboard_ip(
-    state: &ApiState,
-    runtime: &pangolin_core::db::ApiConfigRow,
-    peer: Option<&std::net::SocketAddr>,
-) {
-    let Some(peer) = peer else { return };
-    let ip = peer.ip().to_string();
-    if runtime.dashboard_ip.as_deref() == Some(ip.as_str()) {
-        return;
-    }
-    // Only the address column is written: the operator's settings
-    // (the token, the switch, the port) must not be reverted by a
-    // copy read before the authentication.
-    //
-    // The write runs on the blocking pool (issue #254).
-    if let Err(e) = state
-        .app
-        .with_db_res(move |db| pangolin_core::db::update_api_dashboard_ip(db, &ip))
-        .await
-    {
-        log::warn!("api: storing the dashboard's address failed: {e}");
-    }
 }
 
 /// The dispatch table.

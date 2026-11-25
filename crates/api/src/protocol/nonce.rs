@@ -1,13 +1,20 @@
 //! The replay cache.
 //!
 //! A nonce may be used **once** inside the ±300 s window. The cache
-//! remembers the nonces of the requests that passed authentication and
-//! drops the ones that fell out of the window.
+//! remembers the nonces that were already spent and drops the ones
+//! that fell out of the window.
+//!
+//! On the outbound channel (issue #262) the cache belongs to the
+//! **dashboard**: it remembers the nonces of the node's requests it
+//! has already answered, so a captured request cannot be replayed at
+//! it (see [`crate::client::NodeAuthenticator`]). The node's side
+//! needs no cache — it generates a fresh nonce for every request and
+//! checks that the dashboard's answer echoes exactly that one.
 //!
 //! The cache is in-memory: a restart empties it, and with it the
 //! replay protection for the window that spanned the restart. The
 //! window itself is still the upper bound on how long a captured
-//! request stays replayable.
+//! response stays replayable.
 
 use std::collections::HashMap;
 

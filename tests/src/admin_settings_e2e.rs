@@ -435,15 +435,14 @@ async fn settings_post_reputation_rejects_a_bad_policy_inline() {
     assert_eq!(policy, "lenient", "a rejected form must not write");
 }
 
-// ── The dashboard card (issue #185) ─────────────────────────────────────────
+// ── The dashboard card (issue #185, reworked by issue #262) ───────────────
 //
-// The management API's connection settings live in the database, not
-// in `ngx.yml`: the operator sets the bearer token, the dashboard's
-// port and the switch from this card, and the change takes effect
-// without a restart.
+// The dashboard channel's settings live in the database, not in
+// `ngx.yml`: the operator sets the bearer token and the dash API from
+// this card, and the change takes effect without a restart.
 
-/// The settings page shows the dashboard card, with the instance id
-/// and the listen address — and never the token.
+/// The settings page shows the dashboard card, with the instance id,
+/// the dash API and the key fingerprint — and never the token.
 #[tokio::test]
 async fn settings_page_renders_the_dashboard_card() {
     let ngx = start_ngx().await;
@@ -456,14 +455,10 @@ async fn settings_page_renders_the_dashboard_card() {
         "the dashboard form must be present"
     );
     for field in [
-        "dashboard_enabled",
+        "dashboard_dash_api",
         "dashboard_token",
-        "dashboard_port",
-        "dashboard_instance_id",
+        "dashboard_token_clear",
     ] {
-        if field == "dashboard_instance_id" {
-            continue;
-        }
         assert!(
             body.contains(&format!(r#"name="{field}""#)),
             "{field} input missing"
@@ -475,6 +470,11 @@ async fn settings_page_renders_the_dashboard_card() {
         body.contains(r#"id="dashboard-instance-id""#),
         "the instance id must be shown"
     );
+    // The fingerprint of the key the node trusts is shown too.
+    assert!(
+        body.contains(r#"id="dashboard-key-fingerprint""#),
+        "the key fingerprint must be shown"
+    );
     // The token is write-only: the stored token never comes back.
     assert!(
         !body.contains("dashboard_token_clear\" value=\"true\" checked"),
@@ -482,8 +482,91 @@ async fn settings_page_renders_the_dashboard_card() {
     );
 }
 
-/// The dashboard form writes the row — and the token is stored as a
-/// digest, never in the clear.
+/// A token that cannot travel in a request header is refused.
+///
+/// The channel puts the token in the `Authorization` header of every
+/// request: a token with a space or a non-ASCII character would kill
+/// the channel on its first request, so it is refused at the door.
+#[tokio::test]
+async fn settings_post_dashboard_refuses_a_token_that_cannot_travel_in_a_header() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_token", "the token with a space"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="dashboard-error""#),
+        "the error must be shown in the dashboard card: {body}"
+    );
+
+    // Nothing was written.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let token: String = conn
+        .query_row("SELECT token FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(token, "", "a refused form must not write");
+}
+
+/// A plain-HTTP dashboard address that leaves the machine is refused.
+///
+/// The channel carries the token in every request, so a plain-HTTP
+/// address would put the credential on the wire in clear text.
+#[tokio::test]
+async fn settings_post_dashboard_refuses_an_insecure_dashboard_address() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_dash_api", "http://dash.example.com/api/v1/"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="dashboard-error""#),
+        "the error must be shown in the dashboard card: {body}"
+    );
+
+    // Nothing was written.
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let dash_api: String = conn
+        .query_row("SELECT dash_api FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(dash_api, "", "a refused form must not write");
+}
+
+/// The dashboard form writes the row — the token in the clear (the
+/// node signs with it) and the dash API as it was typed.
 #[tokio::test]
 async fn settings_post_dashboard_saves_the_row_without_echoing_the_token() {
     let ngx = start_ngx().await;
@@ -499,9 +582,8 @@ async fn settings_post_dashboard_saves_the_row_without_echoing_the_token() {
             "/settings/dashboard",
             &[
                 ("_csrf", &csrf),
-                ("dashboard_enabled", "true"),
                 ("dashboard_token", "the-operator-token"),
-                ("dashboard_port", "8443"),
+                ("dashboard_dash_api", "https://dash.example.com/api/v1/"),
             ],
         )
         .await
@@ -514,23 +596,17 @@ async fn settings_post_dashboard_saves_the_row_without_echoing_the_token() {
 
     // The row carries the new settings.
     let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
-    let (enabled, token_hash, port): (i64, String, i64) = conn
+    let (token, dash_api): (String, String) = conn
         .query_row(
-            "SELECT enabled, token_hash, dashboard_port FROM api_config WHERE id = 1",
+            "SELECT token, dash_api FROM api_config WHERE id = 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .expect("the row exists");
-    assert_eq!(enabled, 1, "the API must be switched on");
-    assert_eq!(port, 8443, "the dashboard's port must be stored");
+    assert_eq!(token, "the-operator-token", "the token must be stored");
     assert_eq!(
-        token_hash,
-        pangolin_core::db::sha256_hex("the-operator-token"),
-        "the token must be stored as a digest"
-    );
-    assert!(
-        !token_hash.contains("the-operator-token"),
-        "the token must not be stored in the clear"
+        dash_api, "https://dash.example.com/api/v1/",
+        "the dash API must be stored"
     );
 
     // And the page never renders it back.
@@ -541,10 +617,9 @@ async fn settings_post_dashboard_saves_the_row_without_echoing_the_token() {
     );
 }
 
-/// A rejected dashboard form re-renders with the message in the
-/// dashboard card — and writes nothing.
+/// An empty token field keeps the stored token.
 #[tokio::test]
-async fn settings_post_dashboard_rejects_a_bad_port_without_writing() {
+async fn settings_post_dashboard_keeps_the_token_when_the_field_is_empty() {
     let ngx = start_ngx().await;
     let client = AdminClient::new(&ngx);
     client.login("admin", "admin").await.unwrap();
@@ -553,34 +628,138 @@ async fn settings_post_dashboard_rejects_a_bad_port_without_writing() {
         .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
         .expect("csrf on /settings");
 
+    client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_token", "the-operator-token"),
+                ("dashboard_dash_api", "https://dash.example.com/api/v1/"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // A second save with an empty token field keeps the stored one.
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
     let resp = client
         .post_form(
             "/settings/dashboard",
             &[
                 ("_csrf", &csrf),
-                ("dashboard_enabled", "true"),
-                ("dashboard_port", "not-a-port"),
+                ("dashboard_token", ""),
+                ("dashboard_dash_api", "https://dash.example.com/api/v1/"),
             ],
         )
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 200, "the page is re-rendered");
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("must be a number between 0 and 65535"),
-        "the error must name the offending value: {body}"
-    );
-    assert!(
-        body.contains(r#"data-testid="dashboard-error""#),
-        "the error must be shown in the dashboard card: {body}"
-    );
+    assert_eq!(resp.status().as_u16(), 302);
 
-    // The row is unchanged — a rejected form never writes.
     let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
-    let enabled: i64 = conn
-        .query_row("SELECT enabled FROM api_config WHERE id = 1", [], |r| {
+    let token: String = conn
+        .query_row("SELECT token FROM api_config WHERE id = 1", [], |r| {
             r.get(0)
         })
         .expect("the row exists");
-    assert_eq!(enabled, 0, "a rejected form must not write");
+    assert_eq!(
+        token, "the-operator-token",
+        "an empty token field must keep the stored token"
+    );
+}
+
+/// The "remove" checkbox clears the token.
+#[tokio::test]
+async fn settings_post_dashboard_clears_the_token_on_request() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    client
+        .post_form(
+            "/settings/dashboard",
+            &[("_csrf", &csrf), ("dashboard_token", "the-operator-token")],
+        )
+        .await
+        .unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[("_csrf", &csrf), ("dashboard_token_clear", "true")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let token: String = conn
+        .query_row("SELECT token FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(token, "", "the token must be cleared");
+}
+
+/// An empty dash API field puts the built-in default back in force.
+#[tokio::test]
+async fn settings_post_dashboard_falls_back_to_the_built_in_dash_api() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    client
+        .post_form(
+            "/settings/dashboard",
+            &[
+                ("_csrf", &csrf),
+                ("dashboard_dash_api", "https://dash.example.com/api/v1/"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    // The card shows the configured address.
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains("https://dash.example.com/api/v1/"),
+        "the configured dash API must be shown: {body}"
+    );
+
+    // Clearing the field puts the built-in default back in force.
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+    let resp = client
+        .post_form(
+            "/settings/dashboard",
+            &[("_csrf", &csrf), ("dashboard_dash_api", "")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let dash_api: String = conn
+        .query_row("SELECT dash_api FROM api_config WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .expect("the row exists");
+    assert_eq!(dash_api, "", "the stored dash API must be empty");
+
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(pangolin_core::db::DEFAULT_DASH_API),
+        "the built-in default must be shown: {body}"
+    );
 }

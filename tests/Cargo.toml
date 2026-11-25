@@ -11,17 +11,31 @@ path = "src/lib.rs"
 [dependencies]
 # Core crates
 pangolin-core = { path = "../crates/pangolin-core" }
-ngx = { path = "../crates/ngx" }
+# The gateway's library — the outbound channel lives in it. The
+# `test-dashboard-key` feature is the same one the API crate gets
+# below (issue #262, R9).
+ngx = { path = "../crates/ngx", features = ["test-dashboard-key"] }
 tun = { path = "../crates/tun" }
-# The dashboard-facing management API (issue #185). The suite signs
-# with it and drives the server it starts.
-api = { path = "../crates/api" }
+# The dashboard-facing management API (issue #185, reworked by issue
+# #262). The suite drives the outbound channel against a mock
+# dashboard and signs with the crate's helpers.
+#
+# The `test-dashboard-key` feature swaps the dashboard's Ed25519
+# verifier for a mock that accepts one sentinel signature: the suite
+# therefore never needs a real key pair and never touches the
+# production key (issue #262, R9).
+api = { path = "../crates/api", features = ["test-dashboard-key"] }
 # The tunnel's wire protocol (issue #159) — the suite drives the
 # published crate's codecs, not an in-tree copy.
 pangolin-tun.workspace = true
 
 # Test infra
 tokio = { version = "1", features = ["full"] }
+# The mock dashboard's HTTP server (issue #262). The crates are
+# already in the tree — the gateway's own listeners use them.
+hyper = { version = "1.10", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json", "cookies"] }
 tempfile = "3"
 http-body-util = "0.1"
