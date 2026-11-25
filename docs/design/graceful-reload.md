@@ -5,7 +5,8 @@ downtime window needs four things, and this document describes the
 four the gateway has today:
 
 1. **two processes can hold the same port at the same time** —
-   `SO_REUSEPORT` on every listener (issue #233),
+   `SO_REUSEPORT` on every listener but the admin one (issue #233,
+   issue #261),
 2. **the operator can tell whether the new configuration is usable
    before the switch** — `pangolin-ngx --check` (issue #233),
 3. **the operator can address the running process by its number** —
@@ -18,7 +19,7 @@ For the configuration keys, see
 
 ## Contents
 
-- [`SO_REUSEPORT` on every listener](#so_reuseport-on-every-listener)
+- [`SO_REUSEPORT` on every listener but the admin](#so_reuseport-on-every-listener-but-the-admin)
 - [`pangolin-ngx --check`](#pangolin-ngx---check)
 - [The PID file](#the-pid-file)
 - [The handover](#the-handover)
@@ -30,10 +31,11 @@ For the configuration keys, see
   - [What a handover costs](#what-a-handover-costs)
   - [Changing the binary](#changing-the-binary)
   - [Upgrading from a version without `SO_REUSEPORT`](#upgrading-from-a-version-without-so_reuseport)
+  - [What the admin port does during a handover](#what-the-admin-port-does-during-a-handover)
 
 ---
 
-## `SO_REUSEPORT` on every listener
+## `SO_REUSEPORT` on every listener but the admin
 
 `SO_REUSEPORT` is a Unix socket option that lets **several sockets
 bind the same address and port**. Under Linux's semantics the kernel
@@ -50,28 +52,46 @@ fail with `EADDRINUSE` and the handover would not happen at all.
 
 ### The six listeners
 
-The gateway binds six sockets. All of them ask for the option:
+The gateway binds six sockets. Five of them ask for the option:
 
-| listener | where | bound by |
-| --- | --- | --- |
-| `addr.http` | the public HTTP port | pingora (`add_tcp_with_settings`) |
-| `addr.https` | the public HTTPS port | pingora (`add_tls_with_settings`) |
-| `admin.addr` | the admin UI / admin API | pingora (`add_tcp_with_settings`) |
-| `api.listen` | the dashboard-facing management API | `crates/api/src/http.rs` |
-| `tunnel.addr` | the tunnel's WebSocket/TCP endpoint | `crates/ngx/src/tunnel.rs` |
-| `tunnel.addr` (UDP) | the tunnel's QUIC endpoint — the same port number, a separate port space | `crates/ngx/src/tunnel/quic.rs` |
+| listener | where | bound by | `SO_REUSEPORT` |
+| --- | --- | --- | --- |
+| `addr.http` | the public HTTP port | pingora (`add_tcp_with_settings`) | yes |
+| `addr.https` | the public HTTPS port | pingora (`add_tls_with_settings`) | yes |
+| `api.listen` | the dashboard-facing management API | `crates/api/src/http.rs` | yes |
+| `tunnel.addr` | the tunnel's WebSocket/TCP endpoint | `crates/ngx/src/tunnel.rs` | yes |
+| `tunnel.addr` (UDP) | the tunnel's QUIC endpoint — the same port number, a separate port space | `crates/ngx/src/tunnel/quic.rs` | yes |
+| `admin.addr` | the admin UI / admin API | `crates/ngx/src/serve.rs` | **no** |
 
-The first three are pingora's: it takes a `TcpSocketOptions` with
+The first two are pingora's: it takes a `TcpSocketOptions` with
 `so_reuseport: Some(true)`, so no change to pingora itself was
 needed.
 
-The other three are plain sockets the gateway binds itself. They set
-the option on the socket **before** the bind and then hand the socket
-over — to tokio for the two TCP listeners, to `pangolin_tun` for the
-QUIC endpoint (whose `bind_endpoint_with_socket` takes a socket the
-caller bound itself).
+Three of the others are plain sockets the gateway binds itself. They
+set the option on the socket **before** the bind and then hand the
+socket over — to tokio for the two TCP listeners, to `pangolin_tun`
+for the QUIC endpoint (whose `bind_endpoint_with_socket` takes a
+socket the caller bound itself).
 
-### Why all six, and not the three that are obvious
+### Why the admin listener is the exception
+
+The admin UI is control plane: it renders the pages and streams the
+log feeds — it forwards nothing. Since issue #261 it has a listener
+of its own, and that listener deliberately does **not** ask for the
+option:
+
+- A bind that fails is a **fact** the gateway can report. In a
+  reuseport group the bind would have succeeded and the admin port
+  would have been shared with a stranger, with neither side knowing.
+- The handover's value is in the **proxy's** port. The admin port may
+  be unavailable for the length of the switch window, and the proxy
+  is serving the traffic the whole time.
+
+The admin listener keeps `SO_REUSEADDR` — the option
+`std::net::TcpListener::bind` sets, so a port that still holds
+TIME_WAIT sockets from the previous run does not refuse the bind.
+
+### Why the other five, and not the three that are obvious
 
 The QUIC endpoint is the one that is easy to leave out, and leaving
 it out is expensive. QUIC is the tunnel's **primary** transport; when
@@ -96,11 +116,12 @@ Two sockets on one port: the kernel hashes the connection's 4-tuple
 onto one of them. The hash is stable for the life of the connection,
 so a connection never migrates between the sockets — but a connection
 that was **already up** when the group grew is re-spread, and roughly
-half of the sessions that were up lose their packets to the socket
+half of the sessions that are up lose their packets to the socket
 that joined. The tun reconnects (the crate's own client is back in
 about a second) and the gateway's requests on those sessions fail.
 That is the price of the handover, and it is paid once, during the
 switch.
+
 
 ---
 
@@ -135,9 +156,12 @@ The steps, in the order the real startup takes them:
 1. the rustls crypto provider is installed (the process does this
    before the arguments are parsed — rustls needs it),
 2. the configuration is parsed,
-3. the **listen addresses** are parsed — the three the gateway
-   parses itself (`tunnel.addr`, `api.listen`) and the three
-   pingora parses (`addr.http`, `addr.https`, `admin.addr`),
+3. the **listen addresses** are parsed — the two the gateway
+   parses as an address (`tunnel.addr`, `api.listen`), the two
+   pingora parses (`addr.http`, `addr.https`), and `admin.addr`,
+   which the admin listener of the gateway resolves itself (issue
+   #261 — the check calls the very function the listener calls, so
+   the two cannot disagree on what "usable" means),
 4. the database is opened (`App::new`, which applies the pending
    migrations),
 5. the cert dir has to exist and has to be a directory,
@@ -365,11 +389,19 @@ has a socket on the same port, and only the inode tells the two
 apart. A port of `0` is skipped: the kernel picks a free port for
 it, so the bind cannot collide with anybody.
 
-Five of the six listeners are TCP sockets and all five are checked:
-the proxy's HTTP and HTTPS ports, the admin port, the tunnel's TCP
-port and the management API's port. The sixth — the QUIC endpoint —
-is a UDP socket and is not in the table; it is covered by the strict
-bind below and by the shutdown token its failure cancels.
+Four of the six listeners are TCP sockets and all four are checked:
+the proxy's HTTP and HTTPS ports, the tunnel's TCP port and the
+management API's port. The QUIC endpoint is a UDP socket and is not
+in the table; it is covered by the strict bind below and by the
+shutdown token its failure cancels.
+
+The admin port is **not** checked, and cannot be: the admin listener
+does not ask for `SO_REUSEPORT` (issue #261), so the incoming
+generation cannot bind the port while the outgoing one still holds
+it. A readiness check that waited for it would fail every handover.
+The admin UI is unavailable for the length of the switch window
+instead — see [What the admin port does during a
+handover](#what-the-admin-port-does-during-a-handover).
 
 And the handshake watches that token: a service that could not bind
 cancels it, and a generation whose service failed must **not** report
@@ -394,7 +426,7 @@ the port is never without an owner.
 ```text
 supervisor                新 generation              老 generation
     │  fork + execve           │                          │
-    ├─────────────────────────>│ 绑定 6 个监听点           │
+    ├─────────────────────────>│ 绑定 5 个监听点           │
     │                          │（SO_REUSEPORT，与老代共存）│
     │                          ├─ 写 ready 字节 ─────────>│  supervisor 读到
     │  ── SIGUSR2 ───────────────────────────────────────> │
@@ -409,7 +441,9 @@ supervisor                新 generation              老 generation
 new connections: the proxy's HTTP and HTTPS ports, the admin port,
 the management API's port, the tunnel's TCP listener and the QUIC
 endpoint. From this moment every new connection lands on the
-incoming generation.
+incoming generation — except on the admin port, which the incoming
+generation takes a moment later (it cannot bind the port while the
+outgoing one holds it).
 
 The listeners the gateway binds itself drop their socket when their
 accept loop ends, so they leave the `SO_REUSEPORT` group at once.
@@ -470,6 +504,16 @@ generation and gets a 200. That is the right answer for a probe: the
 gateway is serving. The "draining" answer is for the operator who
 wants to know that a handover is under way, and `pangolin-ngx
 --status` is that operator's tool.
+
+There is one window in which a probe on the **admin port** gets
+nothing at all: between the moment the outgoing generation closes its
+admin listener and the moment the incoming generation binds the port
+— up to five seconds, the longest the listener waits between two
+attempts. The admin listener does not use `SO_REUSEPORT`, so
+the incoming generation cannot take the port while the outgoing one
+holds it — see [What the admin port does during a
+handover](#what-the-admin-port-does-during-a-handover). The proxy's
+ports have no such window.
 
 `pangolin-ngx --status` prints both numbers:
 
@@ -580,3 +624,34 @@ that can hand over to each other.
 The same is true for a gateway that was started before the PID file
 existed: the file is written by the supervisor, and the first
 supervisor writes it.
+
+### What the admin port does during a handover
+
+The admin listener does not ask for `SO_REUSEPORT` (issue #261), so
+the two generations cannot hold the admin port at the same time. The
+handover runs like this:
+
+1. the incoming generation starts and binds its five reuseport
+   listeners; its admin listener fails with `EADDRINUSE`, logs it and
+   waits to retry,
+2. the incoming generation reports itself as ready — the admin port
+   is **not** part of the readiness check, because it could never be
+   bound at that moment,
+3. the supervisor tells the outgoing generation to drain; its admin
+   listener closes with the rest of stage A and lets go of the port,
+4. the incoming generation's next retry binds the admin port. The
+   retry backs off from a second up to five, so the port comes back
+   within five seconds of the outgoing generation letting go of it.
+
+So the admin UI is unavailable for the length of that window, and the
+operator has to log in again afterwards (the session store is
+in-memory). The **proxy is serving the whole time**: the admin port
+is not in the reuseport group, so nothing about the traffic depends
+on it.
+
+An operator who wants the admin UI to be up at every moment of a
+handover has to give it a port of its own — a second gateway
+instance behind a load balancer, or an admin listener that is
+restarted by hand. The gateway does not pretend the window does not
+exist: it says in the log that the admin listener could not bind and
+that it is retrying.

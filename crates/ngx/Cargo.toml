@@ -52,7 +52,12 @@ clap = { workspace = true, features = ["cargo"] }
 # HTTP protocol
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1.10", features = ["client", "http1"] }
+# The admin listener is the gateway's own hyper server (issue #261),
+# so hyper's `server` side is needed here too.
+hyper = { version = "1.10", features = ["client", "http1", "server"] }
+# `TokioIo` adapts the tokio socket to hyper's IO traits and
+# `TokioTimer` gives hyper the clock its read timeout needs.
+hyper-util = { version = "0.1", features = ["tokio"] }
 hyper-rustls = "0.27"
 
 # WebSocket
@@ -119,6 +124,10 @@ bytes = "1"
 http-body = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1.10", features = ["http1"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: it
+# lets the admin listener's sixty-second idle timeout be observed in
+# virtual time instead of in a minute of wall clock.
+tokio = { workspace = true, features = ["test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots"] }
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

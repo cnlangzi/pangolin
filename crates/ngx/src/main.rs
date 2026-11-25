@@ -47,7 +47,6 @@ mod tls;
 mod tunnel;
 
 pub use proxy::AppProxy;
-pub use serve::AppHttp;
 
 // Bring the external admin UI crate into the bin's crate root so that
 // `crate::admin::...` works inside `serve` and other bin-only modules.
@@ -67,7 +66,6 @@ use clap::Parser;
 use pingora::listeners::TcpSocketOptions;
 use pingora::proxy::http_proxy_service;
 use pingora::server::{RunArgs, Server};
-use pingora::services::listening::Service;
 
 use pangolin_core::config::Config;
 use tokio_util::sync::CancellationToken;
@@ -390,6 +388,10 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
             Box::new(crate::api_service::ApiService::new(
                 config.api.listen.clone(),
             )),
+            // Issue #261: the admin UI — its own listener, its own
+            // hyper server. A bind that fails degrades the admin UI
+            // and nothing else: the proxy keeps serving.
+            Box::new(crate::serve::AdminService::new(config.admin.addr.clone())),
         ];
 
         // `ServiceContext` takes ownership of the `App`; keep a
@@ -596,10 +598,6 @@ fn run_pingora(
         resolver,
         cache,
     };
-    let app_http = AppHttp {
-        app: app.clone(),
-        sessions: Arc::new(::admin::state::SessionStore::default()),
-    };
 
     // The socket options every listener of the gateway shares.
     //
@@ -609,6 +607,10 @@ fn run_pingora(
     // incoming one already serves. The kernel spreads the connections
     // over the sockets of the group by the hash of each connection's
     // 4-tuple.
+    //
+    // The admin listener is the one exception — it has a socket of
+    // its own and deliberately does not ask for the option (issue
+    // #261).
     let mut sock_opt = TcpSocketOptions::default();
     sock_opt.so_reuseport = Some(true);
 
@@ -649,14 +651,10 @@ fn run_pingora(
     }
     server.add_service(proxy_service);
 
-    // Admin HTTP server (admin API + static files).
-    // Issue #73: `AppHttp` now implements `HttpServerApp` directly
-    // so the `/api/logs/stream` SSE endpoint can chunk its writes
-    // over a long-lived connection (ServeHttp materialises the
-    // whole body before returning, which would defeat SSE).
-    let mut http_server = Service::new("pangolin-http".to_string(), app_http);
-    http_server.add_tcp_with_settings(&config.admin.addr, sock_opt);
-    server.add_service(http_server);
+    // The admin UI has a listener of its own (issue #261): it is
+    // registered as a service of the host runtime, not as a pingora
+    // service, so a failure of the admin listener cannot take the
+    // proxy down with it.
 
     // Drive pingora with our shared shutdown token.
     let run_args = RunArgs {

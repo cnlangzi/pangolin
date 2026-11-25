@@ -154,9 +154,26 @@ The admin server is a separate bind from the proxy. The default
 admin (via SSH port forward, or a dedicated mgmt network) works
 without an explicit override.
 
+The admin UI is **control plane**: it renders the pages, serves the
+static assets and streams the three log feeds — it forwards nothing.
+Since issue #261 it therefore has a listener of its own (a plain
+HTTP/1.1 server the gateway runs), not a service of the proxy's
+server. Two things follow from that:
+
+- **A bind that fails costs the admin UI and nothing else.** The
+  gateway logs the failure, retries with a backoff, and keeps serving
+  the proxy. The admin port is not shared with another process: the
+  bind fails loudly instead of joining a `SO_REUSEPORT` group.
+- **The admin UI is briefly unavailable during a handover.** The
+  listener does not use `SO_REUSEPORT`, so the incoming generation
+  cannot take the port while the outgoing one still holds it — it
+  binds the port a moment after the outgoing generation lets go of
+  it. The proxy is serving the whole time. See
+  [design/graceful-reload.md](design/graceful-reload.md).
+
 | Field       | Type     | Default          | Required | Notes |
 | ----------- | -------- | ---------------- | -------- | ----- |
-| `addr`      | `string` | `0.0.0.0:9081`   | no       | Full `host:port` string for the admin HTTP server. Override to `127.0.0.1:9081` for local-only access. |
+| `addr`      | `string` | `0.0.0.0:9081`   | no       | Full `host:port` string for the admin HTTP server. Override to `127.0.0.1:9081` for local-only access. A hostname is accepted: the gateway resolves it and takes the first answer, the same way `pangolin-ngx --check` validates it. |
 | `username`  | `string` | `admin`          | no       | HTTP basic auth user. |
 | `password`  | `string` | `admin`          | no       | HTTP basic auth password. **Security**: stored in plaintext in `ngx.yml`; use `NGX_ADMIN__PASSWORD` env var to avoid committing secrets. Restrict port 9081 access via firewall (`ufw` / `iptables`) if exposing to untrusted networks. |
 
