@@ -922,7 +922,6 @@ impl ReplaceableGateway {
         let tls_port = free_port();
         let tunnel_port = free_port();
         let admin_port = free_port();
-        let api_port = free_port();
         let cert_dir = work_dir.path().join("certs");
         std::fs::create_dir_all(&cert_dir).expect("mkdir the cert dir");
 
@@ -943,9 +942,6 @@ log:
 admin:
   addr: 127.0.0.1:{admin}
 
-api:
-  listen: 127.0.0.1:{api}
-
 reload:
   ready_timeout_secs: 5
   drain_timeout_secs: 5
@@ -958,7 +954,6 @@ acme:
             tls = tls_port,
             tunnel_port = tunnel_port,
             admin = admin_port,
-            api = api_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
         );
         let config_path = work_dir.path().join("ngx.yml");

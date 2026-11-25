@@ -1,10 +1,25 @@
-//! The reference client — how the dashboard calls the API.
+//! The reference client — how the node talks to the dashboard, and how
+//! the dashboard checks what the node sent.
 //!
-//! The client builds a **signed** request: the canonical string of
-//! the request, signed with the dashboard's Ed25519 key, and the four
-//! headers the node expects. The dashboard side implements the same
-//! thing against `docs/design/api.md`; this module is the reference
-//! the tests use, so the two cannot drift apart silently.
+//! Since issue #262 the node **dials out**: it opens the `join`
+//! subscription and posts the result of every command to `report`.
+//! Both requests carry the same four credentials:
+//!
+//! ```http
+//! Authorization: Bearer <token>
+//! X-Pangolin-Node-Ts: <unix seconds>
+//! X-Pangolin-Node-Nonce: <32 hex characters>
+//! X-Pangolin-Node-Sig: <base64url(hmac-sha256(token, canonical))>
+//! ```
+//!
+//! The signature is an **HMAC-SHA256** under the shared token, over
+//! the request's canonical string. The token itself never crosses the
+//! network — the canonical string carries `sha256_hex(token)`, and
+//! the HMAC is computed over the whole string.
+//!
+//! This module is the reference implementation of the node's side: the
+//! dashboard side mirrors it, and the end-to-end suite drives it — so
+//! the two cannot drift apart silently.
 //!
 //! The client does not open a socket — it hands the caller a
 //! [`SignedRequest`] to put on the wire. That keeps the crate free of
@@ -12,52 +27,14 @@
 //! transport it already has.
 
 use http::HeaderMap;
-use ring::rand::SecureRandom;
 
-use crate::protocol::auth::{HEADER_AUTHORIZATION, HEADER_NONCE, HEADER_SIG, HEADER_TS};
-use crate::protocol::canonical::{CanonicalRequest, canonical_string};
-use crate::protocol::signature;
-
-/// Percent-encode a request target.
-///
-/// The signature covers the target **as it goes on the wire**, and an
-/// HTTP client rewrites the characters it does not like — the `|` of
-/// an IP rule's natural key, for one. A client that signs the raw
-/// target and lets the library encode it produces a signature over
-/// bytes that never reach the node.
-///
-/// The encoding keeps the characters that carry the target's
-/// structure (the path separator, the query and its delimiters) and
-/// every character that is safe in a request target; everything else
-/// is percent-encoded.
-pub fn encode_target(target: &str) -> String {
-    let mut out = String::with_capacity(target.len());
-    for byte in target.bytes() {
-        match byte {
-            b'/' | b'?' | b'=' | b'&' => out.push(byte as char),
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~'
-            | b':'
-            | b'@'
-            | b','
-            | b';'
-            | b'+'
-            | b'!'
-            | b'$'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
+use crate::protocol::canonical::{
+    CanonicalRequest, canonical_string, is_in_window, is_valid_nonce,
+};
+use crate::protocol::error::{ApiError, codes};
+use crate::protocol::signature::{
+    HEADER_AUTHORIZATION, HEADER_NODE_NONCE, HEADER_NODE_SIG, HEADER_NODE_TS, hmac_sha256_b64url,
+};
 
 /// A request that is ready to be sent.
 #[derive(Debug, Clone)]
@@ -73,28 +50,31 @@ pub struct SignedRequest {
     pub body: Vec<u8>,
 }
 
-/// The dashboard's side of the API.
+/// The node's side of the channel.
+///
+/// The client holds the **token**: the secret both sides share. The
+/// dashboard holds it too; nobody else does.
 #[derive(Debug, Clone)]
-pub struct ApiClient {
-    /// The bearer token.
+pub struct NodeClient {
     token: String,
-    /// The Ed25519 seed of the dashboard's private key.
-    seed: [u8; 32],
 }
 
-impl ApiClient {
-    /// A client that signs with `seed` and authenticates with
-    /// `token`.
-    pub fn new(token: impl Into<String>, seed: [u8; 32]) -> Self {
+impl NodeClient {
+    /// A client that authenticates with `token`.
+    pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
-            seed,
         }
     }
 
-    /// A fresh nonce: 16 random bytes as 32 lower-case hex
-    /// characters.
+    /// The token this client authenticates with.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// A fresh nonce: 16 random bytes as 32 lower-case hex characters.
     pub fn nonce() -> String {
+        use ring::rand::SecureRandom;
         let mut bytes = [0u8; 16];
         ring::rand::SystemRandom::new()
             .fill(&mut bytes)
@@ -106,8 +86,8 @@ impl ApiClient {
     ///
     /// `path` is the request target — the query string included. The
     /// signature covers the target **as it goes on the wire**, so the
-    /// client encodes it itself (see [`encode_target`]) and signs the
-    /// encoded form: the bytes it signs are the bytes it sends.
+    /// caller has to pass the target it is going to send, not the one
+    /// it meant to send.
     pub fn signed_request(
         &self,
         method: &str,
@@ -116,21 +96,15 @@ impl ApiClient {
         ts: i64,
         nonce: &str,
     ) -> SignedRequest {
-        let path = encode_target(path);
         let canonical = canonical_string(&CanonicalRequest {
             method,
-            path: &path,
+            path,
             ts,
             nonce,
             token: &self.token,
             body,
         });
-        let signature =
-            signature::sign_with_seed(&self.seed, canonical.as_bytes()).expect("the seed signs");
-        let signature_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            &signature,
-        );
+        let signature = hmac_sha256_b64url(self.token.as_bytes(), canonical.as_bytes());
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -140,16 +114,16 @@ impl ApiClient {
                 .expect("the header value is valid"),
         );
         headers.insert(
-            HEADER_TS,
+            HEADER_NODE_TS,
             ts.to_string().parse().expect("the header value is valid"),
         );
         headers.insert(
-            HEADER_NONCE,
+            HEADER_NODE_NONCE,
             nonce.parse().expect("the header value is valid"),
         );
         headers.insert(
-            HEADER_SIG,
-            signature_b64.parse().expect("the header value is valid"),
+            HEADER_NODE_SIG,
+            signature.parse().expect("the header value is valid"),
         );
 
         SignedRequest {
@@ -166,7 +140,7 @@ impl ApiClient {
             "GET",
             path,
             b"",
-            crate::protocol::auth::now_secs(),
+            crate::protocol::now_secs(),
             &Self::nonce(),
         )
     }
@@ -177,98 +151,242 @@ impl ApiClient {
             "POST",
             path,
             body,
-            crate::protocol::auth::now_secs(),
-            &Self::nonce(),
-        )
-    }
-
-    /// A signed `PUT`.
-    pub fn put(&self, path: &str, body: &[u8]) -> SignedRequest {
-        self.signed_request(
-            "PUT",
-            path,
-            body,
-            crate::protocol::auth::now_secs(),
-            &Self::nonce(),
-        )
-    }
-
-    /// A signed `DELETE`.
-    pub fn delete(&self, path: &str) -> SignedRequest {
-        self.signed_request(
-            "DELETE",
-            path,
-            b"",
-            crate::protocol::auth::now_secs(),
+            crate::protocol::now_secs(),
             &Self::nonce(),
         )
     }
 }
 
+/// Verify a request the node sent — the dashboard's side of the
+/// channel.
+///
+/// The dashboard recomputes the HMAC under the token it holds for this
+/// node and compares it with the one the node sent. A request signed
+/// with a different token does not verify, so the token never has to
+/// be compared separately — but the **bearer** token in the
+/// `Authorization` header is what identifies the node, so it is
+/// checked on its own.
+///
+/// The checks run cheapest-first, and no step reveals which one
+/// failed beyond the stable error code:
+///
+/// | # | check | failure |
+/// | --- | --- | --- |
+/// | 1 | the four headers are present and well-formed | `400 malformed_request` |
+/// | 2 | `\|now - ts\| ≤ 300` | `401 timestamp_out_of_window` |
+/// | 3 | the bearer token matches | `401 invalid_token` |
+/// | 4 | the signature verifies | `401 invalid_signature` |
+///
+/// The replay protection is the dashboard's own business: it
+/// remembers the nonces it has seen (see [`crate::protocol::nonce`]).
+pub fn verify_node_request(
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    token: &str,
+    now: i64,
+) -> Result<(), ApiError> {
+    // 1 — the headers.
+    let ts = headers
+        .get(HEADER_NODE_TS)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::malformed(format!("the {HEADER_NODE_TS} header is missing")))?
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| {
+            ApiError::malformed(format!(
+                "the {HEADER_NODE_TS} header is not a Unix timestamp"
+            ))
+        })?;
+    let nonce = headers
+        .get(HEADER_NODE_NONCE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::malformed(format!("the {HEADER_NODE_NONCE} header is missing")))?
+        .trim()
+        .to_string();
+    if !is_valid_nonce(&nonce) {
+        return Err(ApiError::malformed(format!(
+            "the {HEADER_NODE_NONCE} header must be 32 hex characters"
+        )));
+    }
+    let signature = headers
+        .get(HEADER_NODE_SIG)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::malformed(format!("the {HEADER_NODE_SIG} header is missing")))?
+        .trim()
+        .to_string();
+    let presented = headers
+        .get(HEADER_AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::malformed("the Authorization header is missing"))?
+        .trim();
+    let presented_token = presented
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| ApiError::malformed("the Authorization header is not a bearer token"))?;
+
+    // 2 — the timestamp window.
+    if !is_in_window(now, ts) {
+        return Err(ApiError::unauthorized(
+            codes::TIMESTAMP_OUT_OF_WINDOW,
+            "the request's timestamp is outside the accepted window",
+        ));
+    }
+
+    // 3 — the bearer token. The dashboard looks the node up by it.
+    if presented_token != token {
+        return Err(ApiError::unauthorized(
+            codes::INVALID_TOKEN,
+            "the bearer token does not match",
+        ));
+    }
+
+    // 4 — the signature over the canonical string.
+    let canonical = canonical_string(&CanonicalRequest {
+        method,
+        path,
+        ts,
+        nonce: &nonce,
+        token,
+        body,
+    });
+    let expected = hmac_sha256_b64url(token.as_bytes(), canonical.as_bytes());
+    if !constant_time_eq(&expected, &signature) {
+        return Err(ApiError::unauthorized(
+            codes::INVALID_SIGNATURE,
+            "the request signature does not verify",
+        ));
+    }
+    Ok(())
+}
+
+/// Compare two strings in constant time.
+///
+/// The strings have a fixed length (the base64url signature), so the
+/// length check cannot leak anything; the loop compares every byte
+/// regardless of where the first difference is.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::auth::Authenticator;
-    use crate::protocol::canonical::sha256_hex;
 
-    const SEED: [u8; 32] = [5u8; 32];
-    const TOKEN: &str = "the-token";
+    const TOKEN: &str = "the-shared-token";
+
+    fn client() -> NodeClient {
+        NodeClient::new(TOKEN)
+    }
 
     #[test]
     fn a_signed_request_carries_the_four_credentials() {
-        let client = ApiClient::new(TOKEN, SEED);
-        let req = client.get("/api/v1/sites");
+        let req = client().get("/api/v1/join");
         assert_eq!(req.headers.len(), 4);
-        assert!(req.headers.contains_key(HEADER_AUTHORIZATION));
-        assert!(req.headers.contains_key(HEADER_TS));
-        assert!(req.headers.contains_key(HEADER_NONCE));
-        assert!(req.headers.contains_key(HEADER_SIG));
+        assert_eq!(
+            req.headers.get(HEADER_AUTHORIZATION).unwrap(),
+            "Bearer the-shared-token"
+        );
+        assert!(req.headers.get(HEADER_NODE_TS).is_some());
+        assert!(req.headers.get(HEADER_NODE_NONCE).is_some());
+        assert!(req.headers.get(HEADER_NODE_SIG).is_some());
     }
 
     #[test]
-    fn a_signed_request_is_accepted_by_the_node() {
-        let client = ApiClient::new(TOKEN, SEED);
-        let key = signature::public_key_from_seed(&SEED).expect("the seed yields a key");
-        let auth = Authenticator::new(key);
-        let req = client.get("/api/v1/sites");
-        let stored = sha256_hex(TOKEN.as_bytes());
-        assert!(
-            auth.authenticate(
-                &req.headers,
-                &req.method,
-                &req.path,
-                &req.body,
-                &stored,
-                crate::protocol::auth::now_secs(),
-            )
-            .is_ok()
-        );
+    fn a_signed_request_is_accepted_by_the_dashboard_side() {
+        let req = client().get("/api/v1/join");
+        let now = crate::protocol::now_secs();
+        assert!(verify_node_request(&req.headers, "GET", "/api/v1/join", b"", TOKEN, now).is_ok());
     }
 
     #[test]
-    fn the_target_is_encoded_before_it_is_signed() {
-        // The `|` of an IP rule's natural key is not a character a
-        // request target may carry unencoded — the client encodes it
-        // and signs the encoded form.
-        assert_eq!(
-            encode_target("/api/v1/ip_rules/example|blacklist|10.0.0.0/8"),
-            "/api/v1/ip_rules/example%7Cblacklist%7C10.0.0.0/8"
+    fn a_request_signed_with_another_token_is_refused() {
+        let req = client().get("/api/v1/join");
+        let now = crate::protocol::now_secs();
+        let err = verify_node_request(
+            &req.headers,
+            "GET",
+            "/api/v1/join",
+            b"",
+            "another-token",
+            now,
+        )
+        .expect_err("the request is refused");
+        assert_eq!(err.code, codes::INVALID_TOKEN);
+    }
+
+    #[test]
+    fn a_tampered_path_is_refused() {
+        let req = client().get("/api/v1/join");
+        let now = crate::protocol::now_secs();
+        let err = verify_node_request(&req.headers, "GET", "/api/v1/report", b"", TOKEN, now)
+            .expect_err("the request is refused");
+        assert_eq!(err.code, codes::INVALID_SIGNATURE);
+    }
+
+    #[test]
+    fn a_tampered_body_is_refused() {
+        let req = client().post("/api/v1/report", b"{}");
+        let now = crate::protocol::now_secs();
+        let err = verify_node_request(
+            &req.headers,
+            "POST",
+            "/api/v1/report",
+            b"{\"id\":\"c-1\"}",
+            TOKEN,
+            now,
+        )
+        .expect_err("the request is refused");
+        assert_eq!(err.code, codes::INVALID_SIGNATURE);
+    }
+
+    #[test]
+    fn a_request_without_the_credentials_is_malformed() {
+        let req = client().get("/api/v1/join");
+        let now = crate::protocol::now_secs();
+        let mut headers = req.headers.clone();
+        headers.remove(HEADER_NODE_SIG);
+        let err = verify_node_request(&headers, "GET", "/api/v1/join", b"", TOKEN, now)
+            .expect_err("the request is refused");
+        assert_eq!(err.status, 400);
+        assert_eq!(err.code, codes::MALFORMED_REQUEST);
+    }
+
+    #[test]
+    fn a_timestamp_outside_the_window_is_refused() {
+        let req = client().signed_request(
+            "GET",
+            "/api/v1/join",
+            b"",
+            crate::protocol::now_secs() - 301,
+            &NodeClient::nonce(),
         );
-        // The structure of the target survives.
-        assert_eq!(
-            encode_target("/api/v1/logs/bot/raw?date=2026-01-02"),
-            "/api/v1/logs/bot/raw?date=2026-01-02"
-        );
+        let now = crate::protocol::now_secs();
+        let err = verify_node_request(&req.headers, "GET", "/api/v1/join", b"", TOKEN, now)
+            .expect_err("the request is refused");
+        assert_eq!(err.status, 401);
+        assert_eq!(err.code, codes::TIMESTAMP_OUT_OF_WINDOW);
     }
 
     #[test]
     fn two_requests_carry_two_nonces() {
-        let client = ApiClient::new(TOKEN, SEED);
-        let a = client.get("/api/v1/sites");
-        let b = client.get("/api/v1/sites");
+        let a = client().get("/api/v1/join");
+        let b = client().get("/api/v1/join");
         assert_ne!(
-            a.headers.get(HEADER_NONCE).map(|v| v.as_bytes()),
-            b.headers.get(HEADER_NONCE).map(|v| v.as_bytes())
+            a.headers.get(HEADER_NODE_NONCE),
+            b.headers.get(HEADER_NODE_NONCE)
         );
     }
 }

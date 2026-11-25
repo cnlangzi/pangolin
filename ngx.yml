@@ -117,44 +117,20 @@ admin:
                         # if exposing to a non-trusted network.
                         #
                         # The admin UI has a listener of its own (issue
-                        # #261), separate from the proxy's — the
-                        # dashboard-facing API listens separately, on
-                        # `api.listen` below. A hostname is accepted
-                        # here; the gateway resolves it and takes the
-                        # first answer. If the port cannot be bound,
-                        # the gateway says so, retries, and keeps
-                        # serving the proxy — the admin UI is the only
-                        # thing that is lost. `pangolin-ngx --check`
-                        # refuses an address that does not resolve.
+                        # #261), separate from the proxy's. A hostname
+                        # is accepted here; the gateway resolves it
+                        # and takes the first answer. If the port
+                        # cannot be bound, the gateway says so,
+                        # retries, and keeps serving the proxy — the
+                        # admin UI is the only thing that is lost.
+                        # `pangolin-ngx --check` refuses an address
+                        # that does not resolve.
   username: admin
   password: admin       # the shipped default is `admin` — change it
                         # before the admin port is reachable from an
                         # untrusted network. The gateway logs no
                         # warning about it, so this file is the only
                         # place the operator is told.
-
-api:
-  listen: 0.0.0.0:9443  # the dashboard-facing management API (issue
-                        # #185) — its own listener, its own `/api/v1/`
-                        # namespace, its own authentication. Set it to
-                        # ":0" to not listen at all.
-                        #
-                        # The listener is PLAIN HTTP: the bearer token
-                        # and the request body cross the network in
-                        # clear text. Put the port behind the
-                        # dashboard's TLS-terminating proxy, or behind
-                        # a firewall that limits it to the dashboard's
-                        # address.
-                        #
-                        # The bearer token is NOT configured here: it
-                        # lives in the database and is set from the
-                        # admin UI's "Dashboard" card on the
-                        # /settings page (or from the NGX_API__TOKEN
-                        # environment variable on the very first
-                        # boot). The card also carries the switch that
-                        # turns the API on — a token alone is not
-                        # enough: until the switch is on, every call
-                        # is answered with `403 api_disabled`.
 
 cache:
   enabled: true           # the edge cache for static assets (issue #259)

@@ -288,10 +288,10 @@
     </div>
   </form>
 
-  {# The dashboard API's connection settings (issue #185). A separate
-     form: the token and the switch live in the database, not in
-     `ngx.yml`, and a failure to save them must not block the other
-     cards. #}
+  {# The dashboard channel's settings (issue #185, reworked by issue
+     #262). A separate form: the token and the dash API live in the
+     database, not in `ngx.yml`, and a failure to save them must not
+     block the other cards. #}
   <form method="POST" action="/settings/dashboard" class="card p-6 mt-6 space-y-6" data-testid="dashboard-form">
     {% include "components/_csrf.html" %}
 
@@ -308,14 +308,6 @@
       <p class="text-xs text-slate-500 dark:text-slate-400">
         {{ lang.t("settings.dashboard.intro_1") }} <code class="font-mono">/api/v1/</code> {{ lang.t("settings.dashboard.intro_2") }}
       </p>
-      <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">
-        {{ lang.t("settings.dashboard.switch_1") }} <strong>{{ lang.t("settings.dashboard.switched_off") }}</strong> {{ lang.t("settings.dashboard.switch_2") }} <code class="font-mono">api.listen</code> {{ lang.t("settings.dashboard.switch_3") }} <code class="font-mono">ngx.yml</code> {{ lang.t("settings.dashboard.switch_4") }}<span class="font-mono">{{ dashboard.listen_addr }}</span>{{ lang.t("settings.dashboard.switch_5") }} <strong>{{ lang.t("settings.dashboard.database") }}</strong>{{ lang.t("settings.dashboard.switch_6") }}
-        {% if dashboard.listen_enabled %}
-        {{ lang.t("settings.dashboard.plain_1") }} <strong>{{ lang.t("settings.dashboard.plain_http") }}</strong>{{ lang.t("settings.dashboard.plain_2") }}
-        {% else %}
-        {{ lang.t("settings.dashboard.not_listening_1") }} <code class="font-mono">":0"</code> {{ lang.t("settings.dashboard.not_listening_2") }} <strong>{{ lang.t("settings.dashboard.not_listening_3") }}</strong>{{ lang.t("settings.dashboard.not_listening_4") }} <code class="font-mono">api.listen</code> {{ lang.t("settings.dashboard.not_listening_5") }} <code class="font-mono">ngx.yml</code> {{ lang.t("settings.dashboard.not_listening_6") }}
-        {% endif %}
-      </p>
     </div>
 
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -329,36 +321,15 @@
         </p>
       </div>
       <div>
-        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-port">{{ lang.t("settings.dashboard.port") }}</label>
-        <input type="number" name="dashboard_port" id="dashboard-port" min="0" max="65535"
-          value="{{ dashboard.dashboard_port }}"
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-dash-api">{{ lang.t("settings.dashboard.dash_api") }}</label>
+        <input type="text" name="dashboard_dash_api" id="dashboard-dash-api" value="{{ dashboard.dash_api }}"
+          spellcheck="false" autocomplete="off"
           class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
         <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          {{ lang.t("settings.dashboard.port_hint") }}
-          {% if !dashboard.dashboard_ip.is_empty() %}
-          {{ lang.t("settings.dashboard.learned_address") }}
-          <span class="font-mono">{{ dashboard.dashboard_ip }}</span>.
-          {% else %}
-          {{ lang.t("settings.dashboard.learned_address_none") }}
-          {% endif %}
+          {{ lang.t("settings.dashboard.dash_api_hint") }}
+          <span class="font-mono" data-testid="dashboard-effective-dash-api">{{ dashboard.effective_dash_api }}</span>
         </p>
       </div>
-    </div>
-
-    <div>
-      <label class="flex items-start gap-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors">
-        {# Hidden field first: an unchecked checkbox is not submitted at all, so the
-           form always carries an explicit value. #}
-        <input type="hidden" name="dashboard_enabled" value="false">
-        <input type="checkbox" name="dashboard_enabled" value="true" {% if dashboard.enabled %}checked{% endif %}
-          class="mt-1 h-4 w-4 border-slate-300 text-accent-600 focus:ring-2 focus:ring-accent-500 focus:ring-offset-1">
-        <div>
-          <div class="text-sm font-medium text-slate-900 dark:text-slate-100">{{ lang.t("settings.dashboard.accept") }}</div>
-          <div class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            {{ lang.t("settings.dashboard.accept_hint_1") }} <code class="font-mono">403 api_disabled</code>{% if dashboard.listen_enabled %} {{ lang.t("settings.dashboard.accept_hint_2") }}{% endif %}.
-          </div>
-        </div>
-      </label>
     </div>
 
     <div>
@@ -372,13 +343,55 @@
         {{ lang.t("settings.dashboard.remove_token") }}
       </label>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
-        {{ lang.t("settings.dashboard.token_hint_1") }} <strong>{{ lang.t("settings.dashboard.write_only") }}</strong>{{ lang.t("settings.dashboard.token_hint_2") }}
+        {{ lang.t("settings.dashboard.token_hint_1") }} <strong>{{ lang.t("settings.dashboard.write_only") }}</strong> {{ lang.t("settings.dashboard.token_hint_2") }}
       </p>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div>
+        <label class="block text-sm font-medium text-slate-700 dark:text-slate-200 mb-2" for="dashboard-key-fingerprint">{{ lang.t("settings.dashboard.key_fingerprint") }}</label>
+        <input type="text" id="dashboard-key-fingerprint" value="{{ dashboard.key_fingerprint }}"
+          readonly spellcheck="false"
+          class="w-full border border-slate-300 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500">
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          {{ lang.t("settings.dashboard.key_fingerprint_hint") }}
+        </p>
+      </div>
+      <div>
+        <div class="text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">{{ lang.t("settings.dashboard.status") }}</div>
+        <p class="text-xs text-slate-500 dark:text-slate-400" data-testid="dashboard-status">
+          {% if !dashboard.has_token %}
+          {{ lang.t("settings.dashboard.status_not_configured") }}
+          {% else %}
+          {% if dashboard.online %}
+          {{ lang.t("settings.dashboard.status_online") }}
+          {% else %}
+          {{ lang.t("settings.dashboard.status_offline") }}
+          {% endif %}
+          {% endif %}
+        </p>
+        {% if dashboard.has_token %}
+        <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          {{ lang.t("settings.dashboard.status_last_handshake") }}
+          {% if dashboard.last_handshake_at.is_empty() %}
+          {{ lang.t("settings.dashboard.status_never") }}
+          {% else %}
+          <span class="font-mono">{{ dashboard.last_handshake_at }}</span>
+          {% endif %}
+        </p>
+        {% if !dashboard.last_error.is_empty() %}
+        <p class="text-xs text-danger-600 dark:text-danger-400 mt-1">
+          {{ lang.t("settings.dashboard.status_last_error") }}
+          <span class="font-mono">{{ dashboard.last_error }}</span>
+        </p>
+        {% endif %}
+        {% endif %}
+      </div>
     </div>
 
     <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
       <div class="text-xs text-slate-500 dark:text-slate-400">
-        {{ lang.t("settings.dashboard.public_key_hint") }}
+        {{ lang.t("settings.dashboard.database_hint") }}
       </div>
       <div class="flex gap-2">
         <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">{{ lang.t("common.save") }}</button>

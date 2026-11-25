@@ -406,25 +406,10 @@ fn header_value(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> 
 /// addresses may reach the origin, so an attacker who could tamper
 /// with it could widen the allowlist. The root store is the system's
 /// own (the same one the ACME client relies on to talk to the CA).
+/// The client the range lists are fetched with.
+///
+/// The **same** builder every other outbound HTTPS request of the
+/// gateway uses: the roots are the system's own certificate store.
 fn build_http_client() -> anyhow::Result<reqwest::Client> {
-    let certs = rustls_native_certs::load_native_certs()
-        .map_err(|e| anyhow::anyhow!("loading the native certificate store failed: {e}"))?;
-    if certs.is_empty() {
-        warn!(
-            "provider ranges: the native certificate store is empty — the range lists \
-             cannot be fetched over HTTPS"
-        );
-    }
-    let mut builder = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("pangolin-ngx/", env!("CARGO_PKG_VERSION")));
-    for cert in certs {
-        // A certificate reqwest rejects is skipped — the others
-        // still make the client usable.
-        match reqwest::Certificate::from_der(cert.as_ref()) {
-            Ok(c) => builder = builder.add_root_certificate(c),
-            Err(e) => warn!("provider ranges: skipping a native certificate: {e}"),
-        }
-    }
-    Ok(builder.build()?)
+    crate::http_client::build_request_client(REQUEST_TIMEOUT)
 }

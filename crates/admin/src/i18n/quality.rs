@@ -199,8 +199,6 @@ const ALLOWED_ENGLISH_TEXT: &[&str] = &[
     "http",
     "https",
     // The configuration keys the log pages quote.
-    "api.listen",
-    "api_disabled",
     "client_ip",
     "dns_providers.config",
     "domains.dns_provider",

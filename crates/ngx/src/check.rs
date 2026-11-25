@@ -55,11 +55,11 @@ pub fn run_check(config: Config) -> anyhow::Result<()> {
 fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
     // 3. The listen addresses. Every one of them is parsed by the
     // real startup, and every one of them is fatal when it does not
-    // parse: `tunnel.addr` and `api.listen` by the gateway itself
-    // (a clear error), the three pingora ones by pingora's listener
-    // thread — which leaves the process alive and serving nothing.
-    // A check that skipped them would answer "yes" for a
-    // configuration the gateway refuses to start with.
+    // parse: `tunnel.addr` by the gateway itself (a clear error),
+    // the three pingora ones by pingora's listener thread — which
+    // leaves the process alive and serving nothing. A check that
+    // skipped them would answer "yes" for a configuration the gateway
+    // refuses to start with.
     check_listen_addresses(&config)?;
 
     // 4. The database. `App::new` opens it and applies the pending
@@ -103,8 +103,8 @@ fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
 ///
 /// Three shapes, because the startup parses them three ways:
 ///
-/// * `tunnel.addr` and `api.listen` are parsed by the gateway itself
-///   as a `SocketAddr` — a hostname is not a valid value there.
+/// * `tunnel.addr` is parsed by the gateway itself as a `SocketAddr`
+///   — a hostname is not a valid value there.
 /// * `addr.http` and `addr.https` are parsed by pingora, which
 ///   resolves them with `to_socket_addrs()` and so accepts a
 ///   hostname. The check resolves them the same way, which is what
@@ -114,13 +114,12 @@ fn run_check_in(config: Config, db_path: &Path) -> anyhow::Result<()> {
 ///   function the listener resolves it with, so the two cannot drift
 ///   apart.
 ///
-/// The "off" switches are the ones the gateway honours: `api.listen:
-/// ":0"` and an empty `api.listen` switch the management API off, and
-/// `addr.https: ":0"` (or empty) keeps the gateway from adding the
-/// TLS listener at all — pingora never sees those. `addr.http` has
-/// no such switch: the gateway hands it to pingora as it is, and
-/// pingora cannot resolve `":0"` — its listener thread panics and the
-/// process stays up serving nothing.
+/// The "off" switches are the ones the gateway honours: `addr.https:
+/// ":0"` (or empty) keeps the gateway from adding the TLS listener at
+/// all — pingora never sees those. `addr.http` has no such switch:
+/// the gateway hands it to pingora as it is, and pingora cannot
+/// resolve `":0"` — its listener thread panics and the process stays
+/// up serving nothing.
 fn check_listen_addresses(config: &Config) -> anyhow::Result<()> {
     config.tunnel.addr.parse::<SocketAddr>().map_err(|e| {
         anyhow::anyhow!(
@@ -128,15 +127,6 @@ fn check_listen_addresses(config: &Config) -> anyhow::Result<()> {
             config.tunnel.addr
         )
     })?;
-
-    if config.api.listen != ":0" && !config.api.listen.is_empty() {
-        config.api.listen.parse::<SocketAddr>().map_err(|e| {
-            anyhow::anyhow!(
-                "api.listen is not a valid host:port address ({:?}): {e}",
-                config.api.listen
-            )
-        })?;
-    }
 
     resolve_listen_address("addr.http", &config.addr.http)?;
 
@@ -199,7 +189,6 @@ mod tests {
 
         for (key, value) in [
             ("tunnel.addr", "not-an-address"),
-            ("api.listen", "also-not-an-address"),
             ("addr.http", "http://127.0.0.1:8000"),
             ("admin.addr", "127.0.0.1:not-a-port"),
         ] {
@@ -207,7 +196,6 @@ mod tests {
             config.acme.cert_dir = cert_dir.display().to_string();
             match key {
                 "tunnel.addr" => config.tunnel.addr = value.to_string(),
-                "api.listen" => config.api.listen = value.to_string(),
                 "addr.http" => config.addr.http = value.to_string(),
                 "admin.addr" => config.admin.addr = value.to_string(),
                 _ => unreachable!(),
@@ -224,9 +212,8 @@ mod tests {
 
     /// The "do not listen" switches are valid addresses.
     ///
-    /// `api.listen: ":0"` switches the management API off and
     /// `addr.https: ":0"` keeps the gateway from adding the TLS
-    /// listener — neither is an error, and a check that refused them
+    /// listener — it is not an error, and a check that refused it
     /// would send the operator chasing a problem that does not
     /// exist.
     ///
@@ -242,7 +229,6 @@ mod tests {
 
         let mut config = Config::default();
         config.acme.cert_dir = cert_dir.display().to_string();
-        config.api.listen = ":0".to_string();
         config.addr.https = ":0".to_string();
         config.addr.http = "127.0.0.1:0".to_string();
 

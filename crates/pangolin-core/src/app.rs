@@ -17,6 +17,7 @@ use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
 use crate::cache::CacheAdmin;
 use crate::cidr::CidrSet;
+use crate::dashboard::DashboardStatus;
 use crate::index::TunnelClassification;
 use crate::provider::{GlobalProviderConfig, GuardRejectionCounter, ProviderKey};
 use crate::ratelimit::RateLimiter;
@@ -355,6 +356,16 @@ pub struct App {
     pub system_config: Arc<parking_lot::RwLock<Arc<SystemConfig>>>,
     /// Global configuration
     pub config: Config,
+    /// The state of the outbound dashboard channel (issue #262).
+    ///
+    /// The node dials **out** to the dashboard, so the connection is
+    /// not visible from the socket table — the node publishes it here
+    /// and the settings page reads it.
+    ///
+    /// In-memory on purpose: it describes a moment, not a fact about
+    /// the node's configuration. A restart empties it and the channel
+    /// re-establishes itself.
+    pub dashboard_status: Arc<parking_lot::RwLock<DashboardStatus>>,
     /// WebSocket path for tunnel registration (e.g. "/tunnel")
     pub ws_path: String,
     /// Active tunnel sessions: tun_name → transport handle.
@@ -813,6 +824,7 @@ impl App {
             dns_index: Arc::new(RwLock::new(dns_index)),
             system_config,
             config,
+            dashboard_status: Arc::new(parking_lot::RwLock::new(DashboardStatus::default())),
             tun_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             tun_kinds: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             tun_last_seen: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -843,6 +855,24 @@ impl App {
             provider_ranges: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             guard_rejections: Arc::new(GuardRejectionCounter::new()),
         })
+    }
+
+    /// The state of the outbound dashboard channel (issue #262).
+    ///
+    /// A snapshot: the caller gets a copy and releases the lock
+    /// immediately, so a request future never holds a lock guard
+    /// across an `.await`.
+    pub fn dashboard_status(&self) -> DashboardStatus {
+        self.dashboard_status.read().clone()
+    }
+
+    /// Publish the state of the outbound dashboard channel.
+    ///
+    /// The lock is **sync** (`parking_lot`): the outbound client
+    /// writes the state from an async task, but the write is a single
+    /// assignment and must not await.
+    pub fn set_dashboard_status(&self, status: DashboardStatus) {
+        *self.dashboard_status.write() = status;
     }
 
     /// Run a synchronous SQLite query **off** the async worker

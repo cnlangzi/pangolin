@@ -26,8 +26,6 @@ pub mod codes {
     pub const REPLAYED_NONCE: &str = "replayed_nonce";
     /// The Ed25519 signature does not verify.
     pub const INVALID_SIGNATURE: &str = "invalid_signature";
-    /// The operator turned the API off.
-    pub const API_DISABLED: &str = "api_disabled";
     /// The requested resource does not exist.
     pub const NOT_FOUND: &str = "not_found";
     /// The resource already exists.
@@ -76,11 +74,6 @@ impl ApiError {
     /// 401 — the request could not be authenticated.
     pub fn unauthorized(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(401, code, message)
-    }
-
-    /// 403 — the API is switched off.
-    pub fn disabled() -> Self {
-        Self::new(403, codes::API_DISABLED, "the dashboard API is disabled")
     }
 
     /// 404 — the resource does not exist.

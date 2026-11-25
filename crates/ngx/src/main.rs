@@ -30,12 +30,13 @@
 //! `crate::reload` for the process model and the handover.
 
 mod acme;
-mod api_service;
 mod backend_resolver;
 mod badbots_feed;
 mod cache;
 mod check;
+mod dashboard_client;
 mod dns;
+mod http_client;
 mod provider_ip;
 mod proxy;
 mod reload;
@@ -43,6 +44,7 @@ mod reuseport;
 mod runtime;
 mod serve;
 mod sse;
+mod sse_client;
 mod tls;
 mod tunnel;
 
@@ -383,11 +385,10 @@ fn serve_generation(config: Config) -> anyhow::Result<()> {
             // operator can turn the check on from the dashboard, and
             // the service picks the new instance up on its next tick.
             Box::new(crate::badbots_feed::BadbotsFeedService::new()),
-            // Issue #185: the dashboard-facing management API — its
-            // own listener, its own namespace, its own authentication.
-            Box::new(crate::api_service::ApiService::new(
-                config.api.listen.clone(),
-            )),
+            // Issue #262: the dashboard channel. The node dials **out**
+            // to the dashboard and executes the commands it receives —
+            // the gateway exposes no management port of its own.
+            Box::new(crate::dashboard_client::DashboardService::new(app.clone())?),
             // Issue #261: the admin UI — its own listener, its own
             // hyper server. A bind that fails degrades the admin UI
             // and nothing else: the proxy keeps serving.

@@ -1,13 +1,18 @@
 //! The replay cache.
 //!
 //! A nonce may be used **once** inside the ±300 s window. The cache
-//! remembers the nonces of the requests that passed authentication and
-//! drops the ones that fell out of the window.
+//! remembers the nonces that were already spent and drops the ones
+//! that fell out of the window.
+//!
+//! On the outbound channel (issue #262) the node spends a nonce when
+//! it accepts the dashboard's response to its `join` request: a
+//! response that echoes a nonce the node already spent is a replayed
+//! response, and the node refuses it.
 //!
 //! The cache is in-memory: a restart empties it, and with it the
 //! replay protection for the window that spanned the restart. The
 //! window itself is still the upper bound on how long a captured
-//! request stays replayable.
+//! response stays replayable.
 
 use std::collections::HashMap;
 

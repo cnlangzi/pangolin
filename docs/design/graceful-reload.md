@@ -52,13 +52,12 @@ fail with `EADDRINUSE` and the handover would not happen at all.
 
 ### The six listeners
 
-The gateway binds six sockets. Five of them ask for the option:
+The gateway binds five sockets. Four of them ask for the option:
 
 | listener | where | bound by | `SO_REUSEPORT` |
 | --- | --- | --- | --- |
 | `addr.http` | the public HTTP port | pingora (`add_tcp_with_settings`) | yes |
 | `addr.https` | the public HTTPS port | pingora (`add_tls_with_settings`) | yes |
-| `api.listen` | the dashboard-facing management API | `crates/api/src/http.rs` | yes |
 | `tunnel.addr` | the tunnel's WebSocket/TCP endpoint | `crates/ngx/src/tunnel.rs` | yes |
 | `tunnel.addr` (UDP) | the tunnel's QUIC endpoint — the same port number, a separate port space | `crates/ngx/src/tunnel/quic.rs` | yes |
 | `admin.addr` | the admin UI / admin API | `crates/ngx/src/serve.rs` | **no** |
@@ -101,8 +100,9 @@ tun keeps using the transport it negotiated, and the sessions that
 are up stay on the fallback. A handover that lost the QUIC port would
 silently push every tunnel onto the slower transport.
 
-`api.listen` is not optional either: a second generation that cannot
-bind the management API is a gateway the dashboard cannot talk to.
+The dashboard channel needs no port at all: the node dials **out** to
+the dashboard (issue #262), so a generation that cannot reach the
+dashboard loses the management channel and nothing else.
 
 ### What it does not change
 
@@ -156,8 +156,8 @@ The steps, in the order the real startup takes them:
 1. the rustls crypto provider is installed (the process does this
    before the arguments are parsed — rustls needs it),
 2. the configuration is parsed,
-3. the **listen addresses** are parsed — the two the gateway
-   parses as an address (`tunnel.addr`, `api.listen`), the two
+3. the **listen addresses** are parsed — the one the gateway
+   parses as an address (`tunnel.addr`), the two
    pingora parses (`addr.http`, `addr.https`), and `admin.addr`,
    which the admin listener of the gateway resolves itself (issue
    #261 — the check calls the very function the listener calls, so
@@ -389,11 +389,10 @@ has a socket on the same port, and only the inode tells the two
 apart. A port of `0` is skipped: the kernel picks a free port for
 it, so the bind cannot collide with anybody.
 
-Four of the six listeners are TCP sockets and all four are checked:
-the proxy's HTTP and HTTPS ports, the tunnel's TCP port and the
-management API's port. The QUIC endpoint is a UDP socket and is not
-in the table; it is covered by the strict bind below and by the
-shutdown token its failure cancels.
+Three of the five listeners are TCP sockets and all three are checked:
+the proxy's HTTP and HTTPS ports and the tunnel's TCP port. The QUIC
+endpoint is a UDP socket and is not in the table; it is covered by the
+strict bind below and by the shutdown token its failure cancels.
 
 The admin port is **not** checked, and cannot be: the admin listener
 does not ask for `SO_REUSEPORT` (issue #261), so the incoming
@@ -439,8 +438,7 @@ supervisor                新 generation              老 generation
 
 **A — stop accepting (immediately).** Every listener stops taking
 new connections: the proxy's HTTP and HTTPS ports, the admin port,
-the management API's port, the tunnel's TCP listener and the QUIC
-endpoint. From this moment every new connection lands on the
+the tunnel's TCP listener and the QUIC endpoint. From this moment every new connection lands on the
 incoming generation — except on the admin port, which the incoming
 generation takes a moment later (it cannot bind the port while the
 outgoing one holds it).

@@ -8,9 +8,9 @@ pub mod views;
 pub mod write;
 
 pub use views::{
-    BadbotsSettingsView, DashboardAddress, DnsProviderView, InstanceView, ProviderStatusView,
-    ProvidersView, SiteOriginAllowView, SiteProviderView, SiteRateLimitBotsView, SiteRateLimitView,
-    TunView, TunnelNodeView,
+    BadbotsSettingsView, DnsProviderView, InstanceView, ProviderStatusView, ProvidersView,
+    SiteOriginAllowView, SiteProviderView, SiteRateLimitBotsView, SiteRateLimitView, TunView,
+    TunnelNodeView,
 };
 pub use write::{
     BadbotsConfigDto, Credential, DnsProviderDto, DomainDto, IpRuleDto, Params, RateLimitDto,

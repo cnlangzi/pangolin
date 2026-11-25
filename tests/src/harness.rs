@@ -680,8 +680,6 @@ pub struct NgxProcess {
     pub tls_port: u16,
     pub tunnel_port: u16,
     pub admin_port: u16,
-    /// The dashboard-facing management API's port (issue #185).
-    pub api_port: u16,
     /// Held so the occupied UDP port stays occupied for the lifetime
     /// of the process (see [`NgxProcess::start_with_quic_blocked`]).
     _udp_blocker: Option<std::net::UdpSocket>,
@@ -806,7 +804,6 @@ impl NgxProcess {
         let tunnel_port = free_port();
         let admin_port = free_port();
         // Issue #185: the management API's own listener.
-        let api_port = free_port();
 
         // Occupy the tunnel's UDP port before the gateway starts. TCP
         // and UDP have separate port spaces, so the TCP listener still
@@ -849,9 +846,6 @@ log:
 admin:
   addr: 127.0.0.1:{admin}
 
-api:
-  listen: 127.0.0.1:{api}
-
 # The budgets of a handover (issue #234). The suite pins the drain
 # short: it matches the 5s pingora used to get unconditionally, so
 # the timings the rest of the suite is calibrated against do not
@@ -871,7 +865,6 @@ acme:
             tls = tls_port,
             tunnel_port = tunnel_port,
             admin = admin_port,
-            api = api_port,
             cert_dir = cert_dir.display().to_string().replace('\\', "\\\\"),
             extra_log = extra_log,
             extra_config = extra_config,
@@ -941,7 +934,7 @@ acme:
         // If the binary still fails to boot, the captured log is
         // dumped into the panic message — no more guessing why
         // startup timed out.
-        for &port in &[http_port, tls_port, tunnel_port, api_port] {
+        for &port in &[http_port, tls_port, tunnel_port] {
             wait_for_port(port, Duration::from_secs(30), &log).await;
         }
         if !occupy_admin {
@@ -957,7 +950,6 @@ acme:
             tls_port,
             tunnel_port,
             admin_port,
-            api_port,
             data_dir,
             config_path,
             cert_dir,
@@ -971,11 +963,6 @@ acme:
     /// `Host` header).
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.admin_port, path)
-    }
-
-    /// The management API's base URL (issue #185).
-    pub fn api_url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.api_port, path)
     }
 
     /// Cert directory used by the running `pangolin-ngx`. SNI

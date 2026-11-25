@@ -41,7 +41,7 @@ breaks a contract an operator already depends on.
 | 1 | **One forwarding path.** A direct backend and a tun backend go through the same pingora machinery; the tun is a byte splice and does not speak HTTP. | [tunnel](docs/design/tunnel.md), [reverse-proxy](docs/design/reverse-proxy.md) |
 | 2 | **One HTTP client on the data plane.** pingora carries every forwarded request; `reqwest` in the gateway is control plane (the DNS provider API, the provider range fetch), and the DNS-01 TXT check goes through hickory-resolver. | [reverse-proxy](docs/design/reverse-proxy.md) |
 | 3 | **Configuration in YAML, state in SQLite, only derived data in memory.** The indexes over domains, limits, providers, certs and tuns are rebuilt after the admin writes them; a new process-local cache has to say how it reconciles with the database. | [routing-and-index](docs/design/routing-and-index.md) |
-| 4 | **admin and API are two listeners with two authentication schemes.** admin is the node's own browser interface (cookie session plus CSRF); the API is the dashboard-facing JSON interface with its own authentication; the dashboard is not a caller of admin and the two must not share a session. | [api](docs/design/api.md) |
+| 4 | **admin and the command channel are two surfaces with two authentication schemes.** admin is the node's own browser interface (cookie session plus CSRF); the dashboard-facing API is an **outbound** channel — the node dials out, so the gateway exposes no management port — with its own two-way signatures; the dashboard is not a caller of admin and the two must not share a session. | [api](docs/design/api.md) |
 | 5 | **Side channels do not take part in the forwarding decision.** The access log, bot log, referer log and traffic counters are in-memory ring buffers plus side files; their failure must not affect request forwarding. | [access-log](docs/design/access-log.md), [bot-log](docs/design/bot-log.md), [referer-log](docs/design/referer-log.md), [traffic](docs/design/traffic.md) |
 | 6 | **Failures stay local.** A tun going offline, a site that fails to resolve, a missing certificate, a provider list that fails to download — none of them may take the gateway down. | [rate-limit](docs/design/rate-limit.md), [cert-link](docs/design/cert-link.md), [provider](docs/design/provider.md) |
 | 7 | **What is published is a contract.** The tun wire protocol, the API contract, the configuration keys and the database schema are interfaces that have shipped; changing them is a breaking change that needs a version and a migration note. | [tunnel](docs/design/tunnel.md), [api](docs/design/api.md), [migrations](docs/migrations.md) |
@@ -88,8 +88,12 @@ breaks a contract an operator already depends on.
    ([api](docs/design/api.md))
 
 10. **`.env` stays out of the repository; `.env.example` is committed.** The
-   tracked test material `crates/ngx/tests/pebble-root.pem` and
-   `tests/fixtures/dashboard_dev_seed.hex` may look secret; keep them.
+   tracked test material `crates/ngx/tests/pebble-root.pem` may look
+   secret; keep it. The dashboard's key pair is **not** in the
+   repository: the public key is compiled into the binary
+   (`crates/api/src/dashboard.pub`) and the end-to-end suite verifies
+   the dashboard's signature with a **mock** verifier (issue #262) — no
+   test ever holds a real private key.
 
 11. **Generated artefacts are never edited by hand:** `assets/app.css` and the
    `gh-pages` branch are produced by the build.
