@@ -72,11 +72,11 @@ pub struct Config {
     /// on its own port.
     #[serde(default)]
     pub api: ApiConfig,
-    /// Parsed, but **not implemented** — the gateway never reads it.
+    /// The edge cache for static assets (issue #259).
     ///
-    /// There is no response cache in the gateway. A configuration
-    /// that carries the section parses fine and nothing happens; the
-    /// shipped `ngx.yml` omits it.
+    /// Two tiers — a memory tier in front of a disk tier — behind a
+    /// hotness threshold. The rules live in
+    /// `docs/design/cache.md`.
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -273,28 +273,117 @@ impl Default for ApiConfig {
     }
 }
 
-/// A response-cache section that the gateway does not implement.
+/// The edge cache section of `ngx.yml`.
 ///
-/// Both fields are parsed and ignored — there is no response cache.
+/// The gateway keeps a **two-tier** response cache for static assets
+/// (issue #259): a memory tier in front of a disk tier. The rules
+/// live in `docs/design/cache.md`; this struct is only the
+/// configuration surface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// Parsed and ignored — there is no response cache.
-    #[serde(default)]
+    /// Whether the edge cache is on.
+    ///
+    /// **The default changed from `false` to `true`** when the cache
+    /// was implemented (issue #259) — a default-value change, and
+    /// therefore a published-contract change. See
+    /// `docs/configuration.md`.
+    #[serde(default = "default_cache_enabled")]
     pub enabled: bool,
-    /// Parsed and ignored — there is no response cache.
+    /// The disk tier's root directory. The directory is created at
+    /// startup if it does not exist.
     #[serde(default = "default_cache_dir")]
     pub dir: String,
+    /// The memory tier's byte budget. The whole tier is capped at
+    /// this many bytes of response bodies.
+    #[serde(default = "default_cache_memory_size")]
+    pub memory_size: u64,
+    /// The disk tier's byte budget. Files are evicted once the tier
+    /// grows past it.
+    #[serde(default = "default_cache_disk_size")]
+    pub disk_size: u64,
+    /// The hard per-object limit: a response bigger than this is not
+    /// cached at all, and no half-written entry is left behind.
+    #[serde(default = "default_cache_max_object_size")]
+    pub max_object_size: u64,
+    /// The biggest object the memory tier accepts. An object above it
+    /// goes straight to the disk tier.
+    #[serde(default = "default_cache_memory_max_object_size")]
+    pub memory_max_object_size: u64,
+    /// The default freshness, in seconds — and the cap on the
+    /// freshness the origin asks for.
+    #[serde(default = "default_cache_ttl")]
+    pub ttl: u64,
+    /// The hotness threshold: the Nth request for a key stores it.
+    #[serde(default = "default_cache_min_uses")]
+    pub min_uses: u32,
+    /// The half-life, in seconds, of the hotness counter.
+    #[serde(default = "default_cache_hot_half_life_secs")]
+    pub hot_half_life_secs: u64,
+    /// The extensions the cache may store.
+    ///
+    /// The default is the static-asset extension list the rate
+    /// limiter already uses ([`crate::static_asset::STATIC_ASSET_EXTENSIONS`]),
+    /// so the two classifications cannot drift apart.
+    #[serde(default = "default_cache_types")]
+    pub types: Vec<String>,
+}
+
+fn default_cache_enabled() -> bool {
+    true
 }
 
 fn default_cache_dir() -> String {
     "./cache".into()
 }
 
+fn default_cache_memory_size() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_cache_disk_size() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_cache_max_object_size() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_cache_memory_max_object_size() -> u64 {
+    1024 * 1024
+}
+
+fn default_cache_ttl() -> u64 {
+    3600
+}
+
+fn default_cache_min_uses() -> u32 {
+    2
+}
+
+fn default_cache_hot_half_life_secs() -> u64 {
+    3600
+}
+
+fn default_cache_types() -> Vec<String> {
+    crate::static_asset::STATIC_ASSET_EXTENSIONS
+        .iter()
+        .map(|extension| (*extension).to_string())
+        .collect()
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            dir: "./cache".into(),
+            enabled: default_cache_enabled(),
+            dir: default_cache_dir(),
+            memory_size: default_cache_memory_size(),
+            disk_size: default_cache_disk_size(),
+            max_object_size: default_cache_max_object_size(),
+            memory_max_object_size: default_cache_memory_max_object_size(),
+            ttl: default_cache_ttl(),
+            min_uses: default_cache_min_uses(),
+            hot_half_life_secs: default_cache_hot_half_life_secs(),
+            types: default_cache_types(),
         }
     }
 }
@@ -1134,14 +1223,17 @@ mod tests {
     /// The release archive carries this file, so an operator receives
     /// it as the starting point. A key that is parsed and ignored is
     /// worse than a missing one: the operator sets it and expects a
-    /// feature that does not exist. The `cache` section and the two
-    /// tunnel TLS keys are exactly that — the loader accepts them and
-    /// no code path reads them.
+    /// feature that does not exist. The two tunnel TLS keys are
+    /// exactly that — the loader accepts them and no code path reads
+    /// them.
+    ///
+    /// The `cache` section used to be on this list; it left it when
+    /// the edge cache was implemented (issue #259).
     #[test]
     fn the_shipped_example_config_omits_the_unimplemented_keys() {
         let document = shipped_ngx_document();
 
-        for key in ["cache", "tunnel.tls_cert", "tunnel.tls_key"] {
+        for key in ["tunnel.tls_cert", "tunnel.tls_key"] {
             assert!(
                 document.find_value(key).is_err(),
                 "ngx.yml must not carry `{key}` — the gateway does not implement it, and the \
@@ -1169,6 +1261,19 @@ mod tests {
             "log.bot.cache_dir",
             "log.bot.refresh_interval_secs",
             "log.traffic.enabled",
+            // The edge cache (issue #259): every key it acts on has
+            // to be in the file, or an operator who reads only the
+            // file does not know the knob exists.
+            "cache.enabled",
+            "cache.dir",
+            "cache.memory_size",
+            "cache.disk_size",
+            "cache.max_object_size",
+            "cache.memory_max_object_size",
+            "cache.ttl",
+            "cache.min_uses",
+            "cache.hot_half_life_secs",
+            "cache.types",
         ] {
             assert!(
                 document.find_value(key).is_ok(),
@@ -1223,6 +1328,34 @@ mod tests {
 
         // The traffic side-channel's master switch.
         assert!(c.log.traffic.enabled);
+
+        // The edge cache's knobs (issue #259) carry the compiled-in
+        // defaults, so that "change nothing" still means "get the
+        // documented behaviour".
+        assert!(c.cache.enabled);
+        assert_eq!(c.cache.dir, PathBuf::from("./cache"));
+        assert_eq!(c.cache.memory_size, 67_108_864);
+        assert_eq!(c.cache.disk_size, 1_073_741_824);
+        assert_eq!(c.cache.max_object_size, 10_485_760);
+        assert_eq!(c.cache.memory_max_object_size, 1_048_576);
+        assert_eq!(c.cache.ttl, 3_600);
+        assert_eq!(c.cache.min_uses, 2);
+        assert_eq!(c.cache.hot_half_life_secs, 3_600);
+        // The shipped whitelist must be the static-asset extension
+        // set.  The order is not the point — the shipped file groups
+        // the extensions by kind, the list itself is sorted for the
+        // binary search — so the two are compared as sets.
+        let mut shipped_types = c.cache.types.clone();
+        shipped_types.sort();
+        let mut expected_types: Vec<String> = crate::static_asset::STATIC_ASSET_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string())
+            .collect();
+        expected_types.sort();
+        assert_eq!(
+            shipped_types, expected_types,
+            "the shipped whitelist must be the static-asset extension set"
+        );
     }
 
     /// The shipped `ngx.yml` must carry the listen addresses (issue

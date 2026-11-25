@@ -131,6 +131,7 @@ The gateway's runtime directories:
 | `/var/log/pangolin/bots/` | 0750 pangolin:pangolin | the crawler log JSONL |
 | `/var/log/pangolin/referers/` | 0750 pangolin:pangolin | the referral log JSONL |
 | `/var/cache/pangolin/bots/` | 0750 pangolin:pangolin | the knownbots address-list cache |
+| `/var/cache/pangolin/cache/` | 0750 pangolin:pangolin | the edge cache's disk tier (the static-asset cache — see [design/cache.md](design/cache.md)) |
 | `/etc/tmpfiles.d/pangolin.conf` | 0644 root:root | a 30-day retention window for the old JSONL |
 
 The tunnel node's runtime directory is `/var/lib/pangolin-tun/` (the TOFU pin file and the QUIC-failure record). It writes no logs to disk — its log lines go to stderr and from there into the journal — so it has no tmpfiles rule.

@@ -91,7 +91,8 @@ Each `data:` frame is one `AccessLogEntry` serialised as JSON:
   "backend":     "http://10.0.0.7:8080",
   "client_ip":   "203.0.113.42",
   "user_agent":  "curl/8.0",
-  "referer":     "https://news.example.org/a/b?q=1"
+  "referer":     "https://news.example.org/a/b?q=1",
+  "cache_hit":   true
 }
 ```
 
@@ -99,6 +100,13 @@ Each `data:` frame is one `AccessLogEntry` serialised as JSON:
 `User-Agent` header, and it carries the value the request arrived with
 (issue #224 reads it in place out of the request headers and copies it
 once, into the entry).
+
+`cache_hit` is optional in the same way (issue #259): it is present
+only when the edge cache was involved with the request — `true` when
+the body came from the cache, `false` when the cache was asked and the
+origin answered. A request the cache does not serve (a page, a
+request with a cookie) carries no `cache_hit` at all, so the rows of a
+gateway that runs without the cache keep the wire format they had.
 
 `referer` is optional in the same way (issue #228): it is present only
 when the client sent a `Referer` header, and it carries that header

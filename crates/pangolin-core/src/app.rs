@@ -2341,6 +2341,7 @@ mod tests {
             client_ip: "10.0.0.1".into(),
             user_agent: None,
             referer: None,
+            cache_hit: None,
         }
     }
 
@@ -2359,6 +2360,7 @@ mod tests {
             client_ip: "66.249.66.1".into(),
             user_agent: Some(ua.into()),
             referer: None,
+            cache_hit: None,
         }
     }
 

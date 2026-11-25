@@ -70,3 +70,13 @@
     mode: 0750
     owner: pangolin
     group: pangolin
+
+# The edge cache's disk tier (issue #259).  It holds derived data
+# that is rebuilt on demand, so it sits under /var/cache next to the
+# knownbots address lists and not under /var/lib with the state.
+- type: dir
+  dst: /var/cache/pangolin/cache
+  file_info:
+    mode: 0750
+    owner: pangolin
+    group: pangolin

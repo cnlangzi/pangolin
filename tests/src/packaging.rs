@@ -249,6 +249,10 @@ fn the_gateway_config_template_parses_with_the_real_parser() {
         config.log.referer.dir,
         PathBuf::from("/var/log/pangolin/referers")
     );
+    // The edge cache's disk tier (issue #259) holds derived data, so
+    // it belongs under /var/cache and not under the service's working
+    // directory.
+    assert_eq!(config.cache.dir, "/var/cache/pangolin/cache");
     // The PID file (issue #233) has to live in the service's own
     // directory: the derived path would sit next to the
     // configuration in `/etc/pangolin/`, which the `pangolin` service
@@ -416,6 +420,7 @@ fn every_path_in_the_config_templates_is_absolute() {
         ngx.log.bot.dir.clone(),
         ngx.log.bot.cache_dir.clone(),
         ngx.log.referer.dir.clone(),
+        PathBuf::from(&ngx.cache.dir),
     ];
     if let Some(pin) = &tun.pin_path {
         paths.push(pin.clone());
@@ -660,6 +665,13 @@ fn the_package_file_lists_match_the_documented_layout() {
         },
         Content {
             dst: "/var/cache/pangolin/bots".into(),
+            kind: "dir".into(),
+            mode: "0750".into(),
+            owner: "pangolin".into(),
+            group: "pangolin".into(),
+        },
+        Content {
+            dst: "/var/cache/pangolin/cache".into(),
             kind: "dir".into(),
             mode: "0750".into(),
             owner: "pangolin".into(),

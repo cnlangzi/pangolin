@@ -137,6 +137,7 @@ if unit_path "$NGX_UNIT" >/dev/null 2>&1; then
     ensure_dir "$root/var/log/pangolin/bots"
     ensure_dir "$root/var/log/pangolin/referers"
     ensure_dir "$root/var/cache/pangolin/bots"
+    ensure_dir "$root/var/cache/pangolin/cache"
 fi
 
 if unit_path "$TUN_UNIT" >/dev/null 2>&1; then

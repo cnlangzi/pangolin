@@ -58,6 +58,18 @@ pub struct AccessLogEntry {
     /// own, sanitised copy — see `docs/design/referer-log.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub referer: Option<String>,
+    /// Whether the edge cache answered this request (issue #259).
+    ///
+    /// `None` when the cache was not involved at all — the request
+    /// was not one the cache serves, or the gateway runs without the
+    /// cache. `Some(true)` when the body came from the cache,
+    /// `Some(false)` when the cache was asked and the origin answered.
+    ///
+    /// The field is skipped when it is `None`, so the rows of a
+    /// gateway that does not cache anything keep the wire format
+    /// they had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
 }
 
 /// Bounded ring buffer of recent access log entries.
@@ -301,6 +313,7 @@ mod tests {
             client_ip: "192.168.1.1".into(),
             user_agent: Some("curl/8.0".into()),
             referer: Some("https://news.example.org/a/b?q=1".into()),
+            cache_hit: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: AccessLogEntry = serde_json::from_str(&json).unwrap();
@@ -365,6 +378,7 @@ mod tests {
             client_ip: "192.168.1.1".into(),
             user_agent: None,
             referer: None,
+            cache_hit: None,
         }
     }
 

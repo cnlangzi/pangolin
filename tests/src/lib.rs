@@ -216,6 +216,11 @@ mod bot_log_e2e;
 #[cfg(feature = "integration")]
 mod traffic_e2e;
 
+// The edge cache for static assets (issue #259). The rules live in
+// docs/design/cache.md.
+#[cfg(feature = "integration")]
+mod cache_e2e;
+
 // Hop-by-hop header handling against the real gateway (issue #189).
 // pingora 0.9 strips the headers a request's own `Connection` header
 // nominates; this pins that, and that the gateway's own headers

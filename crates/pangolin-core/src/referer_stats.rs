@@ -290,6 +290,7 @@ mod tests {
                 client_ip: "203.0.113.7".into(),
                 user_agent: None,
                 referer: None,
+                cache_hit: None,
             },
             &RefererHit {
                 referer: format!("https://{referer_host}/page"),

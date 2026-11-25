@@ -33,6 +33,7 @@ mod acme;
 mod api_service;
 mod backend_resolver;
 mod badbots_feed;
+mod cache;
 mod check;
 mod dns;
 mod provider_ip;
@@ -568,9 +569,34 @@ fn run_pingora(
             )))
         }
     };
+    // The edge cache (issue #259).
+    //
+    // The cache is built once and lives for the life of the process:
+    // pingora's cache engine wants `&'static` references to the
+    // storage and to the admission policy, and a reload forks a
+    // generation, so each generation has its own copy.
+    //
+    // The cache cannot fail to build: a cache directory that cannot
+    // created leaves the disk tier off, and the memory tier carries
+    // the cache alone. A request the cache cannot serve goes to the
+    // origin, which is what the cache would have done anyway.
+    let cache = if config.cache.enabled {
+        log::info!(
+            "cache: edge cache on — memory={}B disk={}B dir={} min_uses={}",
+            config.cache.memory_size,
+            config.cache.disk_size,
+            config.cache.dir,
+            config.cache.min_uses,
+        );
+        Some(Arc::new(crate::cache::EdgeCache::new(&config.cache)))
+    } else {
+        log::info!("cache: edge cache off");
+        None
+    };
     let app_proxy = AppProxy {
         app: app.clone(),
         resolver,
+        cache,
     };
 
     // The socket options every listener of the gateway shares.
