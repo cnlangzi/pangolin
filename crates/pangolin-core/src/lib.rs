@@ -25,6 +25,7 @@ pub mod cert_link;
 pub mod cidr;
 pub mod client_ip;
 pub mod config;
+pub mod credential;
 pub mod dashboard;
 pub mod db;
 pub mod embedded_migrations;
@@ -64,6 +65,7 @@ pub use config::{
     BotLogConfig, Config, LogConfig, PidConfig, RefererLogConfig, ReloadConfig, TrafficConfig,
     init_logger, load_config_and_init_logger,
 };
+pub use credential::{DashApiError, is_valid_token, validate_dash_api};
 pub use dashboard::DashboardStatus;
 pub use error::{DbError, PangolinError, Result};
 pub use events::{AccessLogBuffer, AccessLogEntry, Event, EventBuffer, EventType, MAX_EVENTS};

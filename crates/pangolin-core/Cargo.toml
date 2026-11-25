@@ -17,6 +17,8 @@ thiserror.workspace = true
 chrono.workspace = true
 env_logger.workspace = true
 sha2.workspace = true
+# The dash API address the dashboard channel dials (issue #262).
+url = "2"
 tokio = { workspace = true }
 parking_lot.workspace = true
 anyhow.workspace = true

@@ -1370,7 +1370,9 @@ pub struct ApiConfigRow {
     /// more — the token itself is stored.
     ///
     /// The token is written by the dashboard and handed to the
-    /// operator; it never travels over the network.
+    /// operator. It travels in the `Authorization` header of every
+    /// request, inside the TLS session — and a database dump carries
+    /// it, so the dump is as sensitive as the credential.
     pub token: String,
     /// The dashboard's API base address. Empty means "use the
     /// built-in default".
@@ -1460,29 +1462,6 @@ pub fn ensure_api_config(conn: &Connection, instance_id: &str) -> rusqlite::Resu
     };
     upsert_api_config(conn, &row)?;
     Ok(row)
-}
-
-/// Write the bearer token.
-///
-/// **Only the `token` column is touched** — the dash API belongs to
-/// the other field of the same form.
-pub fn update_api_token(conn: &Connection, token: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE api_config SET token = ?1, updated_at = ?2 WHERE id = 1",
-        params![token, Utc::now().to_rfc3339()],
-    )?;
-    Ok(())
-}
-
-/// Write the dashboard's API base address.
-///
-/// An empty value means "use the built-in default".
-pub fn update_api_dash_api(conn: &Connection, dash_api: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE api_config SET dash_api = ?1, updated_at = ?2 WHERE id = 1",
-        params![dash_api, Utc::now().to_rfc3339()],
-    )?;
-    Ok(())
 }
 
 /// Write the operator's dashboard settings.
