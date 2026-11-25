@@ -18,6 +18,7 @@
 
 pub mod auth;
 pub mod badbots;
+pub mod cache;
 pub mod certs;
 pub mod dashboard;
 pub mod dns;

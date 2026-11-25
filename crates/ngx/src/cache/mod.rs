@@ -12,8 +12,8 @@
 //! * [`admission::HotAdmissionPolicy`] — the hotness threshold: a
 //!   key is stored once it has been asked for often enough.
 //! * [`key`] — the cache key and its variance.
-//! * [`stats::CacheStats`] — the counters the admin statistics card
-//!   will read.
+//! * [`stats::CacheCounters`] — the counters the admin statistics card
+//!   reads.
 //!
 //! The engine's API wants `&'static` instances, so the runtime is
 //! built once and lives for the life of the process — see
@@ -29,12 +29,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pangolin_core::cache::{CacheAdmin, CacheStats};
 use pangolin_core::config::CacheConfig;
 use pangolin_core::static_asset::lower_extension;
 use pingora::cache::lock::{CacheKeyLockImpl, CacheLock};
 
 use admission::HotAdmissionPolicy;
-use stats::CacheStats;
+use stats::CacheCounters;
 use storage::EdgeCacheStorage;
 
 /// How long a writer may hold the cache lock before the readers give
@@ -61,7 +62,7 @@ pub struct EdgeCache {
     /// The extensions the cache may store.
     pub types: CacheTypes,
     /// The counters.
-    pub stats: Arc<CacheStats>,
+    pub counters: Arc<CacheCounters>,
 }
 
 impl EdgeCache {
@@ -77,18 +78,19 @@ impl EdgeCache {
     /// created leaves the disk tier off, and the memory tier carries
     /// the cache alone.
     pub fn new(config: &CacheConfig) -> Self {
-        let stats = Arc::new(CacheStats::new());
+        let counters = Arc::new(CacheCounters::new());
         let storage: &'static EdgeCacheStorage = Box::leak(Box::new(EdgeCacheStorage::new(
             Path::new(&config.dir),
             config.memory_size,
             config.disk_size,
             config.max_object_size,
             config.memory_max_object_size,
-            stats.clone(),
+            counters.clone(),
         )));
         let admission: &'static HotAdmissionPolicy = Box::leak(Box::new(HotAdmissionPolicy::new(
             config.min_uses,
             Duration::from_secs(config.hot_half_life_secs),
+            counters.clone(),
         )));
         let lock: &'static CacheKeyLockImpl = Box::leak(CacheLock::new_boxed(LOCK_AGE_TIMEOUT));
         Self {
@@ -97,13 +99,28 @@ impl EdgeCache {
             lock,
             config: config.clone(),
             types: CacheTypes::new(&config.types),
-            stats,
+            counters,
         }
     }
 
     /// The counters, for the admin statistics card.
-    pub fn stats(&self) -> &Arc<CacheStats> {
-        &self.stats
+    pub fn counters(&self) -> &Arc<CacheCounters> {
+        &self.counters
+    }
+}
+
+/// The admin UI's bridge to the cache (issue #260).
+///
+/// The handle is registered on the [`pangolin_core::App`] by
+/// `ngx::main`, so the admin UI can empty the cache and read its
+/// counters without depending on `ngx`.
+impl CacheAdmin for EdgeCache {
+    fn clear_all(&self) {
+        self.storage.clear_all();
+    }
+
+    fn stats(&self) -> CacheStats {
+        self.counters.snapshot()
     }
 }
 

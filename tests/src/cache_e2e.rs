@@ -4,7 +4,8 @@
 //! that counts the requests it receives, so every assertion about the
 //! origin's request count is an assertion about what the cache did.
 //!
-//! The cache's own rules live in `docs/design/cache.md`.
+//! The cache's own rules live in `docs/design/cache.md`; the
+//! invalidation and the statistics card are issue #260.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,9 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rusqlite::Connection;
+use scraper::{Html, Selector};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::admin_harness::AdminClient;
 use crate::harness::{
     NgxProcess, TunProcess, admin_session_cookie, init_pangolin_db, read_sse_data_frames,
 };
@@ -819,4 +822,472 @@ async fn cache_e2e_the_cache_answers_while_it_keeps_its_counters() {
     assert_eq!(misses, 1);
     assert_eq!(hits, 4);
     assert_eq!(backend.count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation and observability (issue #260)
+// ---------------------------------------------------------------------------
+
+/// The value of a `data-<attribute>="<metric>"` element of the
+/// admin's HTML.
+///
+/// The cache card and the traffic KPI fragment carry the raw numbers
+/// in `data-` attributes, so a test reads them without scraping the
+/// rendered cell.
+fn data_metric(html: &str, attribute: &str, metric: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let selector = Selector::parse(&format!("[data-{attribute}=\"{metric}\"]")).ok()?;
+    doc.select(&selector)
+        .next()
+        .map(|el| el.text().collect::<String>().trim().to_string())
+}
+
+/// The cache card's counters, read from the admin's fragment.
+async fn cache_card(client: &AdminClient) -> HashMap<String, String> {
+    let resp = client
+        .get("/api/cache/card")
+        .await
+        .expect("GET /api/cache/card");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.expect("body");
+    let mut out = HashMap::new();
+    for name in [
+        "hits",
+        "misses",
+        "deferred",
+        "memory_bytes",
+        "memory_entries",
+        "disk_bytes",
+        "disk_entries",
+        "evictions",
+    ] {
+        if let Some(value) = data_metric(&body, "cache", name) {
+            out.insert(name.to_string(), value);
+        }
+    }
+    out
+}
+
+/// A purge drops the entry, so the next request goes to the origin.
+///
+/// The contract: `PURGE /a.css` answers `200`, and the `GET /a.css`
+/// that follows is a miss — the origin sees it.
+#[tokio::test]
+async fn cache_e2e_a_purge_drops_the_entry() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // The asset is cached.
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(header(&response, "X-Cache").as_deref(), Some("MISS"));
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(header(&response, "X-Cache").as_deref(), Some("HIT"));
+    assert_eq!(backend.count(), 1);
+
+    // The purge.
+    let response = request(&addr, "cache.test", "PURGE", "/a.css", &[]).await;
+    assert!(
+        response.contains("200 OK"),
+        "the purge must answer 200: {response}"
+    );
+    assert!(
+        !response.contains("X-Cache"),
+        "a purge does not read the cache: {response}"
+    );
+
+    // The asset is gone: the next request goes to the origin.
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the purged asset must be fetched from the origin again: {response}"
+    );
+    assert_eq!(backend.count(), 2, "the origin must see the request again");
+}
+
+/// A purge of an entry the cache does not hold answers `404`.
+///
+/// The `404` is the engine's own semantic: there was nothing to
+/// invalidate.
+#[tokio::test]
+async fn cache_e2e_a_purge_of_an_absent_entry_is_not_found() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Nothing was ever cached for this path.
+    let response = request(&addr, "cache.test", "PURGE", "/never.css", &[]).await;
+    assert!(
+        response.contains("404"),
+        "a purge of an absent entry must answer 404: {response}"
+    );
+}
+
+/// A purge of a path the cache could never hold answers `405`.
+///
+/// `/index.html` is not on the whitelist, so there is nothing to
+/// invalidate — the engine says "not purgeable".
+#[tokio::test]
+async fn cache_e2e_a_purge_of_an_uncacheable_path_is_not_allowed() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let response = request(&addr, "cache.test", "PURGE", "/index.html", &[]).await;
+    assert!(
+        response.contains("405"),
+        "a purge of an uncacheable path must answer 405: {response}"
+    );
+    assert_eq!(backend.count(), 0, "a purge must never reach the origin");
+}
+
+/// A purge drops every encoding variant of the path.
+///
+/// The cache varies on the encoding, so `gzip` and `br` are two
+/// entries. A purge names the path, not a variant — both are gone.
+#[tokio::test]
+async fn cache_e2e_a_purge_drops_every_encoding_variant() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Two variants: the first one fills the primary slot, the second
+    // one its own.
+    let _ = request(
+        &addr,
+        "cache.test",
+        "GET",
+        "/a.css",
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+    let _ = request(
+        &addr,
+        "cache.test",
+        "GET",
+        "/a.css",
+        &[("Accept-Encoding", "br")],
+    )
+    .await;
+    assert_eq!(backend.count(), 2, "the two encodings are two entries");
+
+    let response = request(&addr, "cache.test", "PURGE", "/a.css", &[]).await;
+    assert!(response.contains("200 OK"), "{response}");
+
+    // Both variants are gone: both go to the origin again.
+    let response = request(
+        &addr,
+        "cache.test",
+        "GET",
+        "/a.css",
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the gzip variant must be gone: {response}"
+    );
+    let response = request(
+        &addr,
+        "cache.test",
+        "GET",
+        "/a.css",
+        &[("Accept-Encoding", "br")],
+    )
+    .await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the br variant must be gone: {response}"
+    );
+    assert_eq!(backend.count(), 4, "both variants must reach the origin");
+}
+
+/// A purge drops the query variants too.
+///
+/// The key does not carry the query string, so `/a.css?v=1` and
+/// `/a.css?v=2` are one entry — and a purge of the path drops it.
+#[tokio::test]
+async fn cache_e2e_a_purge_drops_the_query_variants() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css?v=1", &[]).await;
+    let response = request(&addr, "cache.test", "GET", "/a.css?v=2", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("HIT"),
+        "the query is not part of the key: {response}"
+    );
+    assert_eq!(backend.count(), 1);
+
+    let response = request(&addr, "cache.test", "PURGE", "/a.css", &[]).await;
+    assert!(response.contains("200 OK"), "{response}");
+
+    let response = request(&addr, "cache.test", "GET", "/a.css?v=2", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the purged asset must be fetched from the origin again: {response}"
+    );
+    assert_eq!(backend.count(), 2);
+}
+
+/// The admin's card reads the cache's counters.
+///
+/// One hit and one miss: the card says one hit and one miss. The
+/// numbers are the cache's own atomics — there is no publishing
+/// thread in between.
+#[tokio::test]
+async fn cache_e2e_the_admin_card_reads_the_cache_counters() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    let mut card = cache_card(&client).await;
+    for _ in 0..20 {
+        if card.get("hits").map(String::as_str) == Some("1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        card = cache_card(&client).await;
+    }
+    assert_eq!(
+        card.get("hits").map(String::as_str),
+        Some("1"),
+        "the card must show one hit: {card:?}"
+    );
+    assert_eq!(
+        card.get("misses").map(String::as_str),
+        Some("1"),
+        "the card must show one miss: {card:?}"
+    );
+    assert_eq!(
+        card.get("memory_entries").map(String::as_str),
+        Some("1 entries"),
+        "the card must show the entry the memory tier holds: {card:?}"
+    );
+}
+
+/// The card shows the tiers' occupancy and the evictions.
+///
+/// A memory budget of one byte cannot hold the asset, so the memory
+/// tier drops it and the disk tier takes it: the card says one entry
+/// on the disk, none in memory, and one eviction.
+#[tokio::test]
+async fn cache_e2e_the_admin_card_shows_the_occupancy_and_the_evictions() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(
+        &backend,
+        "cache:\n  enabled: true\n  dir: ./cache\n  min_uses: 1\n  ttl: 3600\n  memory_size: 1\n",
+    )
+    .await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    let mut card = cache_card(&client).await;
+    for _ in 0..20 {
+        if card.get("evictions").map(String::as_str) == Some("1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        card = cache_card(&client).await;
+    }
+    assert_eq!(
+        card.get("evictions").map(String::as_str),
+        Some("1"),
+        "the card must show the eviction: {card:?}"
+    );
+    assert_eq!(
+        card.get("disk_entries").map(String::as_str),
+        Some("1 entries"),
+        "the card must show the entry the disk tier holds: {card:?}"
+    );
+    assert_eq!(
+        card.get("memory_entries").map(String::as_str),
+        Some("0 entries"),
+        "the memory tier could not hold the entry: {card:?}"
+    );
+}
+
+/// The admin's card shows a miss that was not stored.
+///
+/// With `min_uses: 2` the first request is not stored: it is a miss
+/// that never became an entry. The card counts it separately, so the
+/// operator can tell "the cache is not used" from "the cache is used
+/// but the files are cold".
+#[tokio::test]
+async fn cache_e2e_the_admin_card_counts_the_misses_that_were_not_stored() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(2)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    let mut card = cache_card(&client).await;
+    for _ in 0..20 {
+        if card.get("deferred").map(String::as_str) == Some("1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        card = cache_card(&client).await;
+    }
+    assert_eq!(
+        card.get("deferred").map(String::as_str),
+        Some("1"),
+        "the card must show the miss that was not stored: {card:?}"
+    );
+    assert_eq!(
+        card.get("misses").map(String::as_str),
+        Some("1"),
+        "the card must show the miss: {card:?}"
+    );
+}
+
+/// The admin can empty the whole cache.
+///
+/// After the clear, every cached asset is fetched from the origin
+/// again.
+#[tokio::test]
+async fn cache_e2e_the_admin_can_clear_the_cache() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // Two assets are cached.
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/b.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/b.css", &[]).await;
+    assert_eq!(backend.count(), 2);
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+    let page = client
+        .get("/")
+        .await
+        .expect("GET /")
+        .text()
+        .await
+        .expect("body");
+    let csrf = client
+        .csrf_token(&page)
+        .expect("the dashboard carries a CSRF token");
+
+    let resp = client
+        .post_form("/cache/clear", &[("_csrf", &csrf)])
+        .await
+        .expect("POST /cache/clear");
+    assert_eq!(resp.status().as_u16(), 200, "the clear must succeed");
+
+    // Both assets are gone.
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the cleared asset must be fetched from the origin again: {response}"
+    );
+    let response = request(&addr, "cache.test", "GET", "/b.css", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("MISS"),
+        "the cleared asset must be fetched from the origin again: {response}"
+    );
+    assert_eq!(backend.count(), 4, "both assets must reach the origin");
+}
+
+/// The clear needs a CSRF token.
+///
+/// A request without one is refused with a `403`, and the cache is
+/// **not** cleared.
+#[tokio::test]
+async fn cache_e2e_clearing_the_cache_without_a_csrf_token_is_forbidden() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(backend.count(), 1);
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    // No CSRF token at all.
+    let resp = client
+        .post_form("/cache/clear", &[])
+        .await
+        .expect("POST /cache/clear");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "a clear without a CSRF token must be forbidden"
+    );
+
+    // The cache is untouched.
+    let response = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    assert_eq!(
+        header(&response, "X-Cache").as_deref(),
+        Some("HIT"),
+        "a refused clear must not empty the cache: {response}"
+    );
+    assert_eq!(backend.count(), 1);
+}
+
+/// A request the cache answered is counted under the cache route.
+///
+/// The traffic snapshot has a route for the cache: the requests the
+/// cache answered never reached a backend, so they are counted apart
+/// from the direct and the tunnelled ones.
+#[tokio::test]
+async fn cache_e2e_the_traffic_stats_count_the_cache_route() {
+    let backend = CountingBackend::start().await;
+    let ngx = start_gateway(&backend, &cache_config(1)).await;
+    let addr = format!("127.0.0.1:{}", ngx.http_port);
+
+    // One miss and one hit.
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+    let _ = request(&addr, "cache.test", "GET", "/a.css", &[]).await;
+
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.expect("login");
+
+    let mut cache_req = None;
+    for _ in 0..20 {
+        let resp = client
+            .get("/api/traffic/kpis")
+            .await
+            .expect("GET /api/traffic/kpis");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.text().await.expect("body");
+        if let Some(value) = data_metric(&body, "traffic", "cache_req") {
+            if value == "1" {
+                cache_req = Some(value);
+                break;
+            }
+            cache_req = Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        cache_req.as_deref(),
+        Some("1"),
+        "the cache route must count the request the cache answered"
+    );
 }

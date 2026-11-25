@@ -106,7 +106,9 @@ only when the edge cache was involved with the request — `true` when
 the body came from the cache, `false` when the cache was asked and the
 origin answered. A request the cache does not serve (a page, a
 request with a cookie) carries no `cache_hit` at all, so the rows of a
-gateway that runs without the cache keep the wire format they had.
+gateway that runs without the cache keep the wire format they had. A
+`PURGE` carries none either (issue #260): it neither serves nor
+stores a body, so it has nothing to report about the answer.
 
 `referer` is optional in the same way (issue #228): it is present only
 when the client sent a `Referer` header, and it carries that header

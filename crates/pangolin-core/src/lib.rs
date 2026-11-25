@@ -20,6 +20,7 @@ pub mod app;
 pub mod bot;
 pub mod bot_log;
 pub mod bot_stats;
+pub mod cache;
 pub mod cert_link;
 pub mod cidr;
 pub mod client_ip;
@@ -55,6 +56,7 @@ pub use app::{
 pub use bot::{BotCategory, BotIdentity, verify_bot};
 pub use bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter, MAX_BOT_LOG_BUFFER};
 pub use bot_stats::{BotStats, BotStatsRow, BotStatsSummary};
+pub use cache::{CacheAdmin, CacheStats};
 pub use cert_link::CertLinkCache;
 pub use cidr::CidrSet;
 pub use config::{

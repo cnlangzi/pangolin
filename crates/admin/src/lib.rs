@@ -272,6 +272,10 @@ pub async fn handle(
         }
         ("traffic", "GET") => routes::traffic::render(&app, &csrf_token, lang).await?,
         ("traffic/reset", "POST") => routes::traffic::handle_reset(&app).await?,
+        // ── The edge cache (issue #260) ──────────────────────────────
+        // The clear empties the cache; the card shows what the cache
+        // is doing. The CSRF check above covers the POST.
+        ("cache/clear", "POST") => routes::cache::handle_clear(&app).await?,
         // ── Rate limits + IP rules (issue #117) ───────────────────
         ("ratelimit", "GET") => {
             routes::ratelimit::render(
@@ -431,6 +435,11 @@ pub async fn handle(
                     routes::ratelimit::api_rules(&app, &csrf_token, lang).await?
                 } else if rest == "ratelimit/blocked" && method == "GET" {
                     routes::ratelimit::api_blocked(&app, lang).await?
+                } else if rest == "cache/card" && method == "GET" {
+                    // The polled cache card of the dashboard: the
+                    // counters and the "clear the cache" button
+                    // (issue #260).
+                    routes::cache::api_card(&app, lang).await?
                 } else if rest == "logs/referers/summary" && method == "GET" {
                     // The polled summary region of `/logs/referers`:
                     // the same partial the page inlined, scoped to the

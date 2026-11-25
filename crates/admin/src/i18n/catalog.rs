@@ -52,6 +52,7 @@ pub const AREAS: &[&str] = &[
     "bots",
     "referers",
     "traffic",
+    "cache",
     "time",
     "activity",
     "lang",
@@ -92,9 +93,14 @@ pub const AREAS: &[&str] = &[
 /// live tail, the history and the stats) and the traffic page. They
 /// share one issue for the same reason — a host, a path, a hit count
 /// are the same words on both pages.
+///
+/// Issue #260 added the cache area: the edge cache's card and its
+/// "clear the cache" button. It is listed here because the card is
+/// translated with the rest of the dashboard.
 pub const COMPLETED_AREAS: &[&str] = &[
     "activity",
     "bots",
+    "cache",
     "certs",
     "common",
     "components",

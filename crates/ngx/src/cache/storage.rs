@@ -42,7 +42,7 @@ use pingora::cache::{CacheKey, CacheMeta};
 use pingora_core::prelude::*;
 
 use super::key;
-use super::stats::CacheStats;
+use super::stats::CacheCounters;
 
 /// The size classes of the memory tier.
 ///
@@ -57,7 +57,7 @@ const SIZE_CLASSES: [u64; 4] = [16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024];
 pub struct EdgeCacheStorage {
     memory: MemoryTier,
     disk: DiskTier,
-    stats: Arc<CacheStats>,
+    counters: Arc<CacheCounters>,
     /// The biggest object the cache stores at all.
     max_object_size: usize,
 }
@@ -74,14 +74,14 @@ impl EdgeCacheStorage {
         disk_size: u64,
         max_object_size: u64,
         memory_max_object_size: u64,
-        stats: Arc<CacheStats>,
+        counters: Arc<CacheCounters>,
     ) -> Self {
         let memory = MemoryTier::new(memory_size, memory_max_object_size);
         let disk = DiskTier::open(dir, disk_size);
         let storage = Self {
             memory,
             disk,
-            stats,
+            counters,
             max_object_size: usize::try_from(max_object_size).unwrap_or(usize::MAX),
         };
         storage.publish_usage();
@@ -102,8 +102,24 @@ impl EdgeCacheStorage {
     fn publish_usage(&self) {
         let (memory_bytes, memory_entries) = self.memory_usage();
         let (disk_bytes, disk_entries) = self.disk_usage();
-        self.stats.set_memory_usage(memory_bytes, memory_entries);
-        self.stats.set_disk_usage(disk_bytes, disk_entries);
+        self.counters.set_memory_usage(memory_bytes, memory_entries);
+        self.counters.set_disk_usage(disk_bytes, disk_entries);
+    }
+
+    /// Drop every entry the cache holds (issue #260).
+    ///
+    /// The memory tier is emptied in one go; the disk tier's files are
+    /// deleted one by one. A file that cannot be deleted is **skipped
+    /// and logged** — the rest of the cache is still emptied, and the
+    /// request path is not affected.
+    ///
+    /// The counters are **not** reset: they are the cache's history,
+    /// not its occupancy. The occupancy they publish *is* reset,
+    /// because the tiers are empty afterwards.
+    pub fn clear_all(&self) {
+        self.memory.clear();
+        self.disk.clear();
+        self.publish_usage();
     }
 
     /// Store an entry.
@@ -144,7 +160,7 @@ impl EdgeCacheStorage {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(e) => {
-                    self.stats.record_error();
+                    self.counters.record_error();
                     return Error::e_explain(
                         ErrorType::InternalError,
                         format!("cache: the cache writer died: {e}"),
@@ -152,7 +168,7 @@ impl EdgeCacheStorage {
                 }
             }
         }
-        self.stats.record_store();
+        self.counters.record_store();
         self.publish_usage();
         Ok(())
     }
@@ -168,7 +184,7 @@ impl EdgeCacheStorage {
             return;
         }
         let disk = &self.disk;
-        let stats = self.stats.clone();
+        let counters = self.counters.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             for victim in spilled {
                 // An entry whose metadata cannot be read is dropped
@@ -177,9 +193,9 @@ impl EdgeCacheStorage {
                 let Some(meta) = victim.meta else { continue };
                 let hex = key::digest_hex(victim.digest);
                 match disk.put(&hex, &meta, &victim.body) {
-                    Ok(()) => stats.record_eviction(),
+                    Ok(()) => counters.record_eviction(),
                     Err(e) => {
-                        stats.record_error();
+                        counters.record_error();
                         warn!("cache: cannot spill an entry to the disk tier: {e}");
                     }
                 }
@@ -187,7 +203,7 @@ impl EdgeCacheStorage {
         })
         .await
         {
-            self.stats.record_error();
+            self.counters.record_error();
             warn!("cache: the cache writer died: {e}");
         }
     }
@@ -205,7 +221,7 @@ impl Storage for EdgeCacheStorage {
         if let Some(entry) = self.memory.get(digest)
             && let Some(meta) = entry.meta()
         {
-            self.stats.record_hit();
+            self.counters.record_hit();
             return Ok(Some((meta, Box::new(EdgeHitHandler::new(entry)))));
         }
 
@@ -219,14 +235,14 @@ impl Storage for EdgeCacheStorage {
         // thread.
         let hex = key::digest_hex(digest);
         if !self.disk.contains(&hex) {
-            self.stats.record_miss();
+            self.counters.record_miss();
             return Ok(None);
         }
         let disk = &self.disk;
         let found = match tokio::task::spawn_blocking(move || disk.get(&hex)).await {
             Ok(found) => found,
             Err(e) => {
-                self.stats.record_error();
+                self.counters.record_error();
                 warn!("cache: the cache reader died: {e}");
                 None
             }
@@ -244,7 +260,7 @@ impl Storage for EdgeCacheStorage {
                         let spilled = self.memory.insert(digest, entry.clone());
                         self.spill(spilled).await;
                     }
-                    self.stats.record_hit();
+                    self.counters.record_hit();
                     self.publish_usage();
                     return Ok(Some((meta, Box::new(EdgeHitHandler::new(entry)))));
                 }
@@ -252,7 +268,7 @@ impl Storage for EdgeCacheStorage {
                     // The metadata cannot be read — the entry is from
                     // another format or is damaged. Treat it as a miss
                     // and delete it, so the cache heals itself.
-                    self.stats.record_error();
+                    self.counters.record_error();
                     warn!("cache: dropping an entry with unreadable metadata: {e}");
                     self.disk.remove(&key::digest_hex(digest));
                     self.publish_usage();
@@ -260,7 +276,7 @@ impl Storage for EdgeCacheStorage {
             }
         }
 
-        self.stats.record_miss();
+        self.counters.record_miss();
         Ok(None)
     }
 
@@ -514,6 +530,22 @@ impl MemoryTier {
         }
         false
     }
+
+    /// Drop every object the tier holds.
+    ///
+    /// The counters are reset rather than decremented: the tier is
+    /// empty afterwards, and the LRU's own bookkeeping is gone with
+    /// the objects.
+    fn clear(&self) {
+        for class in &self.classes {
+            let Ok(mut lru) = class.lru.write() else {
+                continue;
+            };
+            lru.clear();
+        }
+        self.bytes.store(0, Ordering::Relaxed);
+        self.entries.store(0, Ordering::Relaxed);
+    }
 }
 
 /// An object the memory tier dropped.
@@ -592,6 +624,12 @@ impl<V> ByteLru<V> {
         let node = self.entries.remove(&key)?;
         self.order.remove(&node.seq);
         Some((node.value, node.weight))
+    }
+
+    /// Drop every entry.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
 
     /// Remove the least recently used entry.
@@ -958,6 +996,55 @@ impl DiskTier {
             self.remove(&victim);
         }
     }
+
+    /// Delete every file the tier holds (issue #260).
+    ///
+    /// The files are deleted one by one and the index is emptied
+    /// afterwards. A file that cannot be deleted is **skipped and
+    /// logged**: the rest of the cache is still emptied, and the
+    /// request path is not affected.
+    ///
+    /// The index is emptied even when a file survived — the tier must
+    /// not hand out an entry it cannot delete, and a file the
+    /// operator cannot remove is a file the operator has to look at.
+    fn clear(&self) {
+        let Some(root) = self.root.as_ref() else {
+            // The disk tier is off: there is nothing to delete, and
+            // the index is empty anyway.
+            return;
+        };
+        let digests: Vec<String> = {
+            let Some(index) = self.read_index() else {
+                return;
+            };
+            index.entries.keys().cloned().collect()
+        };
+        let mut failed = 0usize;
+        for digest in &digests {
+            if fs::remove_file(path_for(root, digest)).is_err() {
+                failed += 1;
+                warn!(
+                    "cache: cannot delete the entry {}: the file is still there",
+                    digest
+                );
+            }
+        }
+        if failed > 0 {
+            warn!(
+                "cache: {failed} of {} files could not be deleted",
+                digests.len()
+            );
+        }
+        // The index is emptied whatever happened: an entry the
+        // operator asked to be dropped must not be served afterwards,
+        // even when its file could not be deleted.
+        if let Some(mut index) = self.write_index() {
+            index.entries.clear();
+            index.order.clear();
+        }
+        self.bytes.store(0, Ordering::Relaxed);
+        self.entries.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Write an entry's bytes to a file.
@@ -1145,7 +1232,7 @@ mod tests {
             disk,
             max,
             memory_max,
-            Arc::new(CacheStats::new()),
+            Arc::new(CacheCounters::new()),
         )))
     }
 
@@ -1377,6 +1464,111 @@ mod tests {
         assert!(found.is_none());
         let (_memory_bytes, memory_entries) = storage.memory_usage();
         assert_eq!(memory_entries, 0);
+    }
+
+    /// The clear empties both tiers.
+    ///
+    /// The point of the "clear the cache" button: after it, no entry
+    /// is left, so the next request for a cached asset goes to the
+    /// origin.
+    #[tokio::test]
+    async fn the_clear_empties_both_tiers() {
+        let dir = TempDir::new().expect("tempdir");
+        // The memory tier takes objects up to 1 KiB; the body is 2 KiB,
+        // so it lands on the disk tier.
+        let storage = storage(dir.path(), 1024 * 1024, 1024 * 1024, 1024 * 1024, 1024);
+        let small = test_key("/small.css");
+        let big = test_key("/big.css");
+        store(storage, &small, b"body").await;
+        store(storage, &big, &[b'x'; 2048]).await;
+        assert_eq!(storage.memory_usage().1, 1);
+        assert_eq!(storage.disk_usage().1, 1);
+
+        storage.clear_all();
+
+        assert_eq!(storage.memory_usage().1, 0, "the memory tier must be empty");
+        assert_eq!(storage.memory_usage().0, 0);
+        assert_eq!(storage.disk_usage().1, 0, "the disk tier must be empty");
+        assert_eq!(storage.disk_usage().0, 0);
+
+        let span = Span::inactive().handle();
+        assert!(
+            storage
+                .lookup(&small, &span)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "the entry must be gone"
+        );
+        assert!(
+            storage.lookup(&big, &span).await.expect("lookup").is_none(),
+            "the entry must be gone"
+        );
+        // The file itself is gone, not just the index.
+        let hex = key::digest_hex(key::digest(&big));
+        assert!(
+            !dir.path()
+                .join(&hex[..2])
+                .join(format!("{hex}.bin"))
+                .exists(),
+            "the file of a deleted entry must be gone"
+        );
+    }
+
+    /// A purge drops the entry it names.
+    ///
+    /// The purge is the engine's `Storage::purge`, and the target is
+    /// the request's key — the path without the query string.
+    #[tokio::test]
+    async fn a_purge_drops_the_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = storage(
+            dir.path(),
+            1024 * 1024,
+            1024 * 1024,
+            1024 * 1024,
+            1024 * 1024,
+        );
+        let key = test_key("/a.css");
+        store(storage, &key, b"body").await;
+
+        let span = Span::inactive().handle();
+        let target = PurgeTarget::Active(&key.to_compact());
+        let outcome = storage
+            .purge(target, PurgeType::Invalidation, &span)
+            .await
+            .expect("purge");
+        assert!(
+            matches!(outcome, PurgeOutcome::Purged(_)),
+            "the entry must be purged: {outcome:?}"
+        );
+
+        let found = storage.lookup(&key, &span).await.expect("lookup");
+        assert!(found.is_none(), "the entry must be gone");
+    }
+
+    /// A purge of an entry the cache does not hold says so.
+    #[tokio::test]
+    async fn a_purge_of_an_absent_entry_is_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = storage(
+            dir.path(),
+            1024 * 1024,
+            1024 * 1024,
+            1024 * 1024,
+            1024 * 1024,
+        );
+        let key = test_key("/a.css");
+        let span = Span::inactive().handle();
+        let target = PurgeTarget::Active(&key.to_compact());
+        let outcome = storage
+            .purge(target, PurgeType::Invalidation, &span)
+            .await
+            .expect("purge");
+        assert!(
+            matches!(outcome, PurgeOutcome::NotFound),
+            "an absent entry must not be reported as purged: {outcome:?}"
+        );
     }
 
     #[tokio::test]

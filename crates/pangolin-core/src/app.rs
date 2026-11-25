@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use crate::bot::{BotIdentity, verify_bot};
 use crate::bot_log::{BotLogBuffer, BotLogEntry, BotLogWriter};
 use crate::bot_stats::BotStats;
+use crate::cache::CacheAdmin;
 use crate::cidr::CidrSet;
 use crate::index::TunnelClassification;
 use crate::provider::{GlobalProviderConfig, GuardRejectionCounter, ProviderKey};
@@ -399,6 +400,18 @@ pub struct App {
     /// admin-only unit tests), in which case the retry endpoint returns
     /// a 503 with a clear message.
     pub cert_retrier: RwLock<Option<Arc<dyn CertRetrier>>>,
+    /// Bridge from the admin UI to the edge cache (issue #260).
+    ///
+    /// Wired by `ngx::main` once the cache runtime exists; `None` when
+    /// the operator turned the cache off (or in the admin-only unit
+    /// tests), in which case the statistics card reads zeros and the
+    /// "clear the cache" button does nothing.
+    ///
+    /// The lock is a **sync** `parking_lot::RwLock`: the cache is
+    /// built on pingora's own thread, which has no tokio runtime to
+    /// await on. The handle is read on the admin path only, so the
+    /// lock is never on a request's hot path.
+    pub cache_admin: parking_lot::RwLock<Option<Arc<dyn CacheAdmin>>>,
     /// Live access log broadcast channel (issue #73). `ngx`'s
     /// `response_filter` calls [`App::push_access_log`] on every
     /// proxied request, which sends through this channel. Admin's
@@ -807,6 +820,7 @@ impl App {
             events: Arc::new(EventBuffer::new()),
             dns_change_notify: Arc::new(tokio::sync::Notify::new()),
             cert_retrier: RwLock::new(None),
+            cache_admin: parking_lot::RwLock::new(None),
             access_log_tx,
             access_log_recent: Arc::new(AccessLogBuffer::new(access_log_recent_capacity)),
             bot_log_tx,
@@ -917,6 +931,42 @@ impl App {
     /// fake during one process lifetime).
     pub async fn set_cert_retrier(&self, retrier: Arc<dyn CertRetrier>) {
         *self.cert_retrier.write().await = Some(retrier);
+    }
+
+    /// Install the [`CacheAdmin`] bridge once the edge cache is built.
+    ///
+    /// Called from `ngx::main` after the cache runtime exists. The
+    /// handle is what the admin UI's statistics card and its "clear
+    /// the cache" button talk to (issue #260).
+    pub fn set_cache_admin(&self, admin: Arc<dyn CacheAdmin>) {
+        *self.cache_admin.write() = Some(admin);
+    }
+
+    /// The edge cache's counters.
+    ///
+    /// A gateway that runs without a cache answers with zeros rather
+    /// than an error: the statistics card has to render either way,
+    /// and a missing cache is not a failure (issue #260).
+    pub fn cache_stats(&self) -> crate::CacheStats {
+        let admin = self.cache_admin.read().clone();
+        admin.map(|admin| admin.stats()).unwrap_or_default()
+    }
+
+    /// Drop every entry the edge cache holds.
+    ///
+    /// A gateway that runs without a cache does nothing.
+    ///
+    /// The disk tier's deletion is **blocking I/O**, so it runs on the
+    /// blocking pool: emptying a cache with a thousand files must not
+    /// stall the admin listener (issue #260).
+    pub async fn clear_cache(&self) {
+        let admin = self.cache_admin.read().clone();
+        let Some(admin) = admin else {
+            return;
+        };
+        if let Err(e) = tokio::task::spawn_blocking(move || admin.clear_all()).await {
+            log::warn!("cache: the cache cleaner died: {e}");
+        }
     }
 
     /// Rebuild the IP reputation library from the operator's settings

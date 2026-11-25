@@ -46,7 +46,7 @@ use http::header::HeaderValue;
 use log::{debug, error, info, warn};
 use pingora::cache::cache_control::CacheControl;
 use pingora::cache::key::HashBinary;
-use pingora::cache::{CacheKey, CacheMeta, NoCacheReason, RespCacheable};
+use pingora::cache::{CacheKey, CacheMeta, NoCacheReason, PurgeAction, RespCacheable};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
@@ -72,6 +72,13 @@ use crate::tunnel::connector::{TunnelConnector, tunnel_group_key};
 /// linking URL is orders of magnitude shorter; a longer value is a
 /// sign of abuse and is treated as "no referer".
 const MAX_REFERRER_HEADER_LEN: usize = 4_096;
+
+/// The `PURGE` method, as it arrives on the wire.
+///
+/// `http::Method` carries a constant for every standard method, and
+/// `PURGE` is not one of them — it is a cache-control method, not a
+/// standard one — so the gateway compares the method's text.
+const PURGE_METHOD: &str = "PURGE";
 
 // ─────────────────────────────────────────────────────────────────
 //  AppProxy (pingora)
@@ -201,6 +208,10 @@ pub struct RequestState {
     /// authorization header, or a gateway that runs without the cache
     /// (issue #259). The flag is what keeps the `X-Cache` header off
     /// the responses the cache never had a hand in.
+    ///
+    /// A `PURGE` is not a `GET` and does not set it either: the
+    /// engine is wired up so it can drop the entry, but the request
+    /// neither serves nor stores a body (issue #260).
     pub cache_enabled: bool,
     /// Whether the response was served from the cache.
     ///
@@ -1106,11 +1117,33 @@ impl ProxyHttp for AppProxy {
     /// header. Every other request never touches the cache at all —
     /// the engine's cache stays disabled and the request path pays
     /// nothing for it.
+    ///
+    /// A `PURGE` is the one exception: it needs the cache **wired
+    /// up** so the engine can act on it, but it neither reads nor
+    /// writes an entry (issue #260).
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
         let Some(cache) = self.cache.as_ref() else {
             return Ok(());
         };
         let request = session.req_header();
+        // A purge needs the cache enabled: the engine refuses to act
+        // on a request whose cache is disabled, and answers "405 —
+        // not purgeable" instead (issue #260).
+        //
+        // The flag stays down: a purge neither serves a body nor
+        // stores one, so the request had no hand in the cache's
+        // contents and the access log says nothing about a hit.
+        if request.method.as_str() == PURGE_METHOD {
+            // A path the cache could never hold has nothing to purge.
+            // The cache stays disabled and the engine answers 405.
+            if !cache.types.allows(request.uri.path()) {
+                return Ok(());
+            }
+            session
+                .cache
+                .enable(cache.storage, None, None, Some(cache.lock), None);
+            return Ok(());
+        }
         // Only `GET` is cacheable: a `HEAD` answers with the same
         // headers but no body, and the other methods change the
         // origin's state.
@@ -1137,6 +1170,33 @@ impl ProxyHttp for AppProxy {
             usize::try_from(cache.config.max_object_size).unwrap_or(usize::MAX),
         );
         Ok(())
+    }
+
+    /// Whether the request invalidates a cache entry (issue #260).
+    ///
+    /// The method is the whole decision: a `PURGE` for a path the
+    /// cache could hold asks the engine to drop that entry. Every
+    /// other request is a normal request.
+    ///
+    /// The answer does not depend on the whitelist: a `PURGE` for a
+    /// path the cache never holds is answered "405 — not purgeable"
+    /// by the engine, which is the operator's answer too.
+    fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        session.req_header().method.as_str() == PURGE_METHOD
+    }
+
+    /// What a purge does to the entry it names.
+    ///
+    /// The entry is **deleted**: a static asset that was published
+    /// again has to take effect at once, and a conditional request to
+    /// the origin would only buy one more round trip to say the same
+    /// thing (issue #260).
+    ///
+    /// The alternative — [`PurgeAction::Expire`], which keeps the
+    /// entry and marks it stale — is one line away, for the day the
+    /// gateway wants to revalidate instead of refetching.
+    fn purge_action(&self, _session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        PurgeAction::Delete
     }
 
     /// The cache key of a request: the scheme, the normalized host
@@ -2048,6 +2108,14 @@ fn traffic_sample(session: &Session, ctx: &RequestState) -> pangolin_core::Traff
         .digest()
         .and_then(|d| d.ssl_digest.as_ref())
         .is_some();
+    // A request the cache answered never reached a backend: it is
+    // counted under the cache route, not under the route the site
+    // would have taken (issue #260).
+    let route = if ctx.cache_hit {
+        pangolin_core::TrafficRoute::Cache
+    } else {
+        ctx.traffic_route
+    };
     pangolin_core::TrafficSample {
         host,
         path,
@@ -2056,7 +2124,7 @@ fn traffic_sample(session: &Session, ctx: &RequestState) -> pangolin_core::Traff
         duration_ms: ctx.start.elapsed().as_millis() as u64,
         bytes_in: session.body_bytes_read() as u64,
         bytes_out: session.body_bytes_sent() as u64,
-        route: ctx.traffic_route,
+        route,
         kind: ctx.traffic_kind,
         tls,
         host_known: ctx.host_known,
