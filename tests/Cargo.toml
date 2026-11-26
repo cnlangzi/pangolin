@@ -97,7 +97,7 @@ integration = []
 # workspace enables figment's "toml" feature): both must resolve to the
 # same `toml` release, or the tree grows a second copy of the crate.
 [dev-dependencies]
-toml = "0.8"
+toml = "1.2"
 
 # The packaging regression tests (issue #176) parse the rendered nfpm
 # configuration, which is YAML.  `serde_yaml` is already in the lock
