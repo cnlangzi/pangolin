@@ -27,18 +27,59 @@ use crate::i18n::Lang;
 ///
 /// `current` is the stored row: a key field that is empty keeps the
 /// stored key, and only the matching "clear" checkbox removes it.
+/// A field the form does not carry keeps its stored value as well —
+/// this is the **merge** flavour, the one the admin form uses.
+///
+/// The two version counters are left at zero: they are the **write
+/// layer's** business — `db::update_badbots_config` decides them and
+/// ignores whatever the parser put here (issue #273).
 pub fn parse_badbots_form(
     body: &[u8],
     current: &BadbotsSettings,
 ) -> Result<BadbotsSettings, String> {
+    parse_badbots_form_with(body, current, current.evidence_policy, current.enabled)
+}
+
+/// Parse the form-encoded body of the reputation form the way the
+/// **dashboard** writes it: the body is the desired state (issue
+/// #273).
+///
+/// A field the body does not mention falls back to its default — the
+/// check is on and the evidence bar is `lenient`. The credentials are
+/// the exception: a key the body does not mention **keeps the stored
+/// one**, because the dashboard only ever sees *whether* a key is
+/// configured and could not restore a key it never read.
+pub fn parse_badbots_form_replaced(
+    body: &[u8],
+    current: &BadbotsSettings,
+) -> Result<BadbotsSettings, String> {
+    parse_badbots_form_with(body, current, BadbotsEvidencePolicy::Lenient, true)
+}
+
+/// The shared body of the two flavours of the reputation form.
+///
+/// The two flavours differ in exactly two values — what an omitted
+/// field falls back to — and in nothing else, so they share one
+/// parser: the **merge** flavour passes the stored values, the
+/// **replace** flavour the documented defaults.
+///
+/// `current` is the stored row. It is the fallback for the
+/// credentials in both flavours: a key the body does not mention
+/// keeps the stored one, because a credential is write-only.
+fn parse_badbots_form_with(
+    body: &[u8],
+    current: &BadbotsSettings,
+    policy_fallback: BadbotsEvidencePolicy,
+    enabled_fallback: bool,
+) -> Result<BadbotsSettings, String> {
     let policy_raw = super::helpers::require_param(body, "badbots_evidence_policy")
-        .unwrap_or_else(|| current.evidence_policy.as_str().to_string());
+        .unwrap_or_else(|| policy_fallback.as_str().to_string());
     let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
         format!("Invalid evidence policy '{policy_raw}'. Expected one of: strict, lenient.")
     })?;
 
     Ok(BadbotsSettings {
-        enabled: param_bool(body, "badbots_enabled", current.enabled),
+        enabled: param_bool(body, "badbots_enabled", enabled_fallback),
         evidence_policy,
         abuseipdb_api_key: api_key(
             body,
@@ -52,6 +93,8 @@ pub fn parse_badbots_form(
             "badbots_crowdsec_clear",
             current.crowdsec_api_key.clone(),
         ),
+        revision: 0,
+        synced_revision: 0,
         updated_at: chrono::Utc::now(),
     })
 }
@@ -93,11 +136,17 @@ fn api_key(body: &[u8], field: &str, clear_field: &str, current: Option<String>)
 /// instance when it is built: a new key needs a new instance, there is
 /// no way to change one in place. The rebuild happens **after** the
 /// row is written, so the new instance always carries the stored key.
+///
+/// The write is a **local** one: the write layer leaves the sync
+/// counter alone, so the row counts as drifted from what the
+/// dashboard last pushed (issue #273).
 pub async fn save_badbots_settings(app: &Arc<App>, cfg: BadbotsSettings) -> Result<(), String> {
     // The write runs on the blocking pool (issue #254).
-    app.with_db_res(move |db| pangolin_core::db::update_badbots_config(db, &cfg))
-        .await
-        .map_err(|e| format!("Database error: {e}"))?;
+    app.with_db_res(move |db| {
+        pangolin_core::db::update_badbots_config(db, &cfg, pangolin_core::ConfigWriteSource::Admin)
+    })
+    .await
+    .map_err(|e| format!("Database error: {e}"))?;
     app.rebuild_badbots().await;
     Ok(())
 }
@@ -180,6 +229,8 @@ mod tests {
             evidence_policy: BadbotsEvidencePolicy::Lenient,
             abuseipdb_api_key: Some("stored-key".into()),
             crowdsec_api_key: None,
+            revision: 1,
+            synced_revision: 0,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -195,6 +246,46 @@ mod tests {
         )
         .expect("the form parses");
         assert_eq!(parsed.abuseipdb_api_key.as_deref(), Some("stored-key"));
+    }
+
+    /// The **replace** flavour: a field the body does not mention
+    /// falls back to its default (issue #273, R2/R5).
+    #[test]
+    fn the_replace_parser_falls_back_to_the_defaults() {
+        let parsed = parse_badbots_form_replaced(b"", &current()).expect("the body parses");
+        assert!(
+            parsed.enabled,
+            "an omitted switch falls back to its documented default"
+        );
+        assert_eq!(
+            parsed.evidence_policy,
+            BadbotsEvidencePolicy::Lenient,
+            "an omitted policy falls back to its documented default"
+        );
+    }
+
+    /// The credentials are the exception: a key the body does not
+    /// mention keeps the stored one (issue #273, R3).
+    #[test]
+    fn the_replace_parser_keeps_the_stored_credentials() {
+        let parsed = parse_badbots_form_replaced(b"badbots_enabled=false", &current())
+            .expect("the body parses");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.abuseipdb_api_key.as_deref(), Some("stored-key"));
+        assert_eq!(parsed.crowdsec_api_key, None);
+    }
+
+    /// The clear flag removes the stored key, a value replaces it.
+    #[test]
+    fn the_replace_parser_clears_and_replaces_the_credentials() {
+        let cleared = parse_badbots_form_replaced(b"badbots_abuseipdb_clear=true", &current())
+            .expect("the body parses");
+        assert_eq!(cleared.abuseipdb_api_key, None);
+
+        let replaced =
+            parse_badbots_form_replaced(b"badbots_abuseipdb_api_key=new-key", &current())
+                .expect("the body parses");
+        assert_eq!(replaced.abuseipdb_api_key.as_deref(), Some("new-key"));
     }
 
     #[test]

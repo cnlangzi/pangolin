@@ -128,7 +128,7 @@ contain a newline and no two different requests share a canonical
 string.
 
 ```text
-PANGOLIN-API-V2\n
+PANGOLIN-API-V3\n
 {METHOD}\n
 {PATH}\n
 {TS}\n
@@ -150,7 +150,7 @@ A worked example — `GET /api/v1/join` with the token `secret` and an
 empty body:
 
 ```text
-PANGOLIN-API-V2\n
+PANGOLIN-API-V3\n
 GET\n
 /api/v1/join\n
 1700000000\n
@@ -230,7 +230,7 @@ The signature covers the canonical string of the **join request**,
 with the dashboard's own timestamp and the echoed nonce:
 
 ```text
-PANGOLIN-API-V2\n
+PANGOLIN-API-V3\n
 GET\n
 /api/v1/join\n
 {dashboard's ts}\n
@@ -265,10 +265,10 @@ stream. The dashboard sends one `data:` frame per command:
 
 The node executes the command with the very same router the REST API
 used — the resource shapes, the error envelope, the write semantics
-and the validators are **unchanged**. A command whose path is not
-inside `/api/v1/` is answered with the namespace's `404`, and a command
-that fails is answered with its error envelope. Neither ends the
-subscription.
+and the validators are **the ones this document describes**. A command
+whose path is not inside `/api/v1/` is answered with the namespace's
+`404`, and a command that fails is answered with its error envelope.
+Neither ends the subscription.
 
 The node reports the result with `POST {dash_api}report`:
 
@@ -373,8 +373,8 @@ it.
 | `PUT` | `/api/v1/site_providers/{site}` | full replace |
 | `DELETE` | `/api/v1/site_providers/{site}` | idempotent |
 | `PUT` | `/api/v1/site_origin_allow/{site}` | **replace** |
-| `PUT` | `/api/v1/system_config` | **merge** |
-| `PUT` | `/api/v1/badbots_config` | **merge** |
+| `PUT` | `/api/v1/system_config` | full replace (issue #273) |
+| `PUT` | `/api/v1/badbots_config` | full replace (issue #273) |
 | `POST` | `/api/v1/reload` | — |
 
 Every write reloads the in-memory indexes, so the next proxied
@@ -633,12 +633,20 @@ so an entry the body omits is **removed**.
   "client_country_header": null,
   "client_region_header": null,
   "origin_guard_enabled": false,
-  "updated_at": "2026-01-01T00:00:00Z"
+  "updated_at": "2026-01-01T00:00:00Z",
+  "revision": 7,
+  "synced_revision": 7
 }
 ```
 
-**Write body** — every field is optional, and the write **merges**:
-a field the body omits keeps the stored value.
+**Write body** — the write **replaces** the stored configuration: the
+body is the desired state, and a field the body omits is cleared or
+falls back to its default. `provider` is the one field with no
+default: the enum has no "unset" member, so a body without one is
+refused with `422 system_config_invalid`.
+
+`revision` and `synced_revision` are the two version counters — see
+[the versions](#v3--the-dashboard-owns-the-global-configuration-issue-273).
 
 ### `BadbotsSettingsView`
 
@@ -648,11 +656,13 @@ a field the body omits keeps the stored value.
   "evidence_policy": "lenient",
   "has_abuseipdb_api_key": true,
   "has_crowdsec_api_key": false,
-  "updated_at": "2026-01-01T00:00:00Z"
+  "updated_at": "2026-01-01T00:00:00Z",
+  "revision": 3,
+  "synced_revision": 3
 }
 ```
 
-**Write body** — every field is optional, and the write **merges**:
+**Write body** — the write **replaces** the stored configuration:
 
 ```json
 {
@@ -663,8 +673,12 @@ a field the body omits keeps the stored value.
 }
 ```
 
-A credential is `null` to **clear** it and a string to replace it; an
-omitted credential keeps the stored one.
+A credential is `null` to **clear** it and a non-empty string to
+replace it; an omitted credential — or an empty one — **keeps the stored
+one**. The credential is the one exception to the replace semantics,
+because the dashboard cannot read a key back and could never restore
+one it never saw: "omitted" must not wipe a credential the dashboard
+does not even know about.
 
 ### `InstanceView`
 
@@ -714,15 +728,19 @@ need one — the node comes to it.
 
 ## The write semantics
 
-Three rules, and the resource decides which one applies:
+Two rules, and the resource decides which one applies:
 
 - **replace** — the body is the final set. An entry the body omits is
   **removed**. `site_rate_limit_bots` and `site_origin_allow`.
-- **merge** — a field the body omits keeps the **stored** value.
-  `system_config` and `badbots_config`.
 - **full replace** — the body replaces the resource as a whole; an
   optional field the body omits is cleared or falls back to its
-  default. Everything else.
+  default. Everything else, including the two global singletons
+  `system_config` and `badbots_config` (issue #273).
+
+There is **no merge** any more. Until v3 the two global singletons were
+merged — a field the body omitted kept the stored value — and the two
+writers of those rows each changed half of them. The dashboard is now
+the single source of truth: what it pushes is what the node gets.
 
 The API validates through the **admin UI's own parsers**, so a body
 the HTML form would reject is rejected here too — with the same
@@ -730,7 +748,7 @@ message. What differs is only what an omitted field means.
 
 ### The exceptions
 
-Two places keep the stored value instead of clearing it, because
+Three places keep the stored value instead of clearing it, because
 clearing it would be a trap:
 
 - **`enabled`** (a site and a domain) — an omitted `enabled` keeps the
@@ -743,6 +761,10 @@ clearing it would be a trap:
   omitted sub-object leaves that sub-resource alone; a present one
   replaces it as the sub-resource's own rule says. The site's own
   fields — `backend`, `host_mode`, `host_custom` — are replaced.
+- **The credentials** (`badbots_config`) — an omitted (or empty)
+  `abuseipdb_api_key` or `crowdsec_api_key` keeps the stored key. A
+  credential is write-only: the dashboard only ever sees *whether* a
+  key is configured, so it could never restore a key it has not read.
 
 A `PUT` of a per-site sub-resource for a site that does not exist is
 a `404 site_not_found`: the sub-resource tables carry no foreign key,
@@ -854,7 +876,108 @@ validators did not change** — a dashboard that knows the v1 resources
 knows the v2 ones. What changed is the transport, and the two
 signatures that go with it.
 
-### The upgrade
+### v3 — the dashboard owns the global configuration (issue #273)
+
+The two global singletons — `system_config` and `badbots_config` —
+have **two** writers: the node's own admin UI and the dashboard. Both
+wrote the same row, and both **merged**: a field the body did not
+mention kept the stored value. So each of the two writers changed half
+of the row, neither knew what the final state was, and the dashboard
+could not tell a clean node from a drifted one — there was no version
+number on the row to compare.
+
+v3 makes the dashboard the **single source of truth** for the two
+singletons:
+
+| | v2 | v3 |
+| --- | --- | --- |
+| canonical prefix | `PANGOLIN-API-V2` | `PANGOLIN-API-V3` |
+| `PUT /api/v1/system_config` | merge | **full replace** |
+| `PUT /api/v1/badbots_config` | merge | **full replace** |
+| the version counters | — | `revision`, `synced_revision` on both singletons |
+
+Everything else is unchanged: the error envelope, the validators and
+the exceptions (a site's `enabled`, the site's sub-objects) are the
+same as in v2, and the only shape change is the two counters the two
+singletons now carry.
+
+#### The write semantics changed
+
+A `PUT` of a global singleton is now a **replace**: the body is the
+desired state, and a field the body does not mention is cleared or
+falls back to its default.
+
+| resource | field | the body omits it → |
+| --- | --- | --- |
+| `system_config` | `provider` | **refused** — `422 system_config_invalid`; the enum has no "unset" member |
+| | `pgl_headers_enabled` | `true` |
+| | `origin_guard_enabled` | `false` |
+| | `client_ip_header`, `client_country_header`, `client_region_header` | cleared |
+| `badbots_config` | `enabled` | `true` |
+| | `evidence_policy` | `lenient` |
+| | `abuseipdb_api_key`, `crowdsec_api_key` | **the stored key is kept** |
+
+The credentials are the exception. A credential is write-only: the
+dashboard only ever sees *whether* a key is configured, so it could
+never restore a key it has not read. "Omitted" therefore keeps the
+stored key, `null` clears it and a non-empty string replaces it —
+exactly as in v2.
+
+**A dashboard written against v2 must not be used against a v3 node.**
+Under v2 a body that changed one field left the others alone; under v3
+the same body clears them. The prefix is what makes the mismatch
+visible instead of silent: both sides build the canonical string with
+the version line, so a v2 dashboard's signature does not verify against
+a v3 node — the channel fails at the signature instead of quietly
+overwriting a configuration the dashboard never asked for.
+
+#### The two version counters
+
+Every answer about a global singleton carries two numbers:
+
+| number | who moves it | what it means |
+| --- | --- | --- |
+| `revision` | the node, **only when the content really changes** | the version of the row the node holds |
+| `synced_revision` | the dashboard's writes | the value `revision` had when the dashboard's last write landed |
+
+`revision == synced_revision` means the row still holds what the
+dashboard pushed — **for the fields the dashboard manages**. The
+credentials are the exception: the dashboard cannot read a key back,
+so a key the operator rotated locally survives every sync. The two
+numbers differ once something changed the row locally — a **drift**.
+`synced_revision = 0` means "never synchronised".
+
+The dashboard's rule is one line: **read the two numbers; if they
+differ, push the whole desired configuration again.** The node answers
+the push with `synced_revision` aligned to `revision`, so the row is
+clean afterwards. No field-level diff is needed — under the replace
+semantics "what I push is what you get" for every field the dashboard
+manages.
+
+The node does **not** push a drift notification of its own: the
+dashboard reads the two numbers in the `GET` answer, and one more
+upstream channel would buy nothing.
+
+A **local** write — the operator saving the settings form — moves
+`revision` and leaves `synced_revision` alone. The settings page shows
+both numbers and says that the dashboard's next sync will overwrite the
+local change, so the operator is not surprised by it.
+
+### The upgrades
+
+#### To v3 (issue #273)
+
+The `V17` migration adds `revision` and `synced_revision` to the two
+global singletons. The seeded rows read `revision = 1` and
+`synced_revision = 0`, so the two differ: an upgraded node tells the
+dashboard that it has to push its desired state once — which it needs
+anyway, because the write semantics changed with it.
+
+Nothing else has to be done on the node. On the dashboard side the
+canonical prefix becomes `PANGOLIN-API-V3` and the two `PUT`s become
+replaces.
+
+#### To v2 (issue #262)
 
 The `V16` migration rewrites the `api_config` table. The old
 `token_hash` was a one-way hash of the token, so the token **cannot**
@@ -932,7 +1055,7 @@ The canonical string is built the same way on both sides:
 
 ```text
 canonical(method, path, ts, nonce, token, body) =
-    "PANGOLIN-API-V2\n"
+    "PANGOLIN-API-V3\n"
   + upper(method) + "\n"
   + path + "\n"
   + ts + "\n"
@@ -1054,7 +1177,7 @@ The signature covers the canonical string of the **join** request,
 with the dashboard's own timestamp and the node's nonce echoed back:
 
 ```text
-PANGOLIN-API-V2\n
+PANGOLIN-API-V3\n
 GET\n
 /api/v1/join\n
 {dashboard's ts}\n

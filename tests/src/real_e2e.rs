@@ -2509,8 +2509,11 @@ async fn real_e2e_gateway_headers_read_cloudflare_first_level_headers() {
                     client_country_header: None,
                     client_region_header: None,
                     origin_guard_enabled: false,
+                    revision: 0,
+                    synced_revision: 0,
                     updated_at: Utc::now(),
                 },
+                pangolin_core::ConfigWriteSource::Admin,
             )
             .expect("seed system config");
         }
@@ -2560,8 +2563,11 @@ async fn real_e2e_gateway_headers_read_custom_lb_first_level_headers() {
                     client_country_header: Some("X-Client-Country".into()),
                     client_region_header: None,
                     origin_guard_enabled: false,
+                    revision: 0,
+                    synced_revision: 0,
                     updated_at: Utc::now(),
                 },
+                pangolin_core::ConfigWriteSource::Admin,
             )
             .expect("seed system config");
         }
@@ -2759,8 +2765,11 @@ async fn real_e2e_gateway_headers_disabled_strips_client_values() {
                     client_country_header: None,
                     client_region_header: None,
                     origin_guard_enabled: false,
+                    revision: 0,
+                    synced_revision: 0,
                     updated_at: Utc::now(),
                 },
+                pangolin_core::ConfigWriteSource::Admin,
             )
             .expect("seed system config");
         }

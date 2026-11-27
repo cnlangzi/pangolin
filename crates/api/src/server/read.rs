@@ -342,13 +342,7 @@ pub async fn get_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
             )));
         }
     };
-    let view = BadbotsSettingsView {
-        enabled: settings.enabled,
-        evidence_policy: settings.evidence_policy.as_str().to_string(),
-        has_abuseipdb_api_key: settings.abuseipdb_api_key.is_some(),
-        has_crowdsec_api_key: settings.crowdsec_api_key.is_some(),
-        updated_at: settings.updated_at,
-    };
+    let view = BadbotsSettingsView::from(&settings);
     ApiResponse::json_of(200, &view)
 }
 

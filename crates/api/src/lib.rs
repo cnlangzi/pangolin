@@ -33,16 +33,18 @@
 //!
 //! * `site_rate_limit_bots` and `site_origin_allow` — **replace**:
 //!   the body is the final set;
-//! * `system_config` and `badbots_config` — **merge**: a field the
-//!   body omits keeps the stored value;
 //! * everything else — **full replace**: a field the body omits is
-//!   cleared or falls back to its default.
+//!   cleared or falls back to its default. The two global singletons
+//!   (`system_config` and `badbots_config`) belong here since issue
+//!   #273: the dashboard owns them, and what it pushes is what the
+//!   node gets.
 //!
-//! Two exceptions keep the stored value instead, because clearing it
-//! would be a trap: the `enabled` flag of a site and a domain, and the
+//! Three exceptions keep the stored value instead, because clearing it
+//! would be a trap: the `enabled` flag of a site and a domain, the
 //! three sub-objects of a site (its rate limit, its bot list and its
 //! provider override) — those are writes to sub-resources that have
-//! their own endpoints.
+//! their own endpoints — and the reputation credentials, which the
+//! dashboard cannot read back.
 //!
 //! See `docs/apis/dash.md` for the byte-level specification.
 

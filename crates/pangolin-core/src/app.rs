@@ -309,6 +309,10 @@ fn default_system_config() -> SystemConfig {
         client_country_header: None,
         client_region_header: None,
         origin_guard_enabled: false,
+        // The fallback is not a row the dashboard ever pushed, so it
+        // is never "synchronised" (issue #273).
+        revision: 1,
+        synced_revision: 0,
         updated_at: chrono::Utc::now(),
     }
 }

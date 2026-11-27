@@ -263,7 +263,11 @@ scanner.
 * a checkbox for the global guard default;
 * a table of the providers' range sets: range count, last fetch time,
   status and last error;
-* the guard rejection counter.
+* the guard rejection counter;
+* the two version counters of the global configuration, so an operator
+  can see whether the dashboard's next sync will overwrite a local
+  change (issue #273 — see [the API
+  specification](../apis/dash.md)).
 
 ## Not in scope
 

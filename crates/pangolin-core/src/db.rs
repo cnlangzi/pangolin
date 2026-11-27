@@ -47,7 +47,7 @@ use crate::provider::{ProviderIpList, ProviderKey, SiteProviderOverride};
 use crate::ratelimit::{IpRule, RateLimitPolicy, RuleKind};
 use crate::types::{
     BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus, ChallengeKind,
-    DnsProvider, Domain, Site, SystemConfig, Tun,
+    ConfigWriteSource, DnsProvider, Domain, Site, SystemConfig, Tun,
 };
 
 /// SHA-256 hex of an auth token. Lowercase, 64 chars.
@@ -865,28 +865,58 @@ pub fn get_system_config(conn: &Connection) -> rusqlite::Result<SystemConfig> {
     let mut stmt = conn.prepare(
         "SELECT provider, pgl_headers_enabled, client_ip_header,
                 client_country_header, client_region_header,
-                origin_guard_enabled, updated_at
+                origin_guard_enabled, revision, synced_revision, updated_at
          FROM system_config WHERE id = 1",
     )?;
     stmt.query_row([], row_to_system_config)
 }
 
-/// Update the singleton system config row in place.
+/// Update the singleton system config row in place and answer the row
+/// as it was written.
+///
+/// This is the **only** place that moves the version counters
+/// (issue #273), and it is the only place that may do so: the
+/// caller's own `revision` / `synced_revision` are ignored.
+///
+/// * `revision` goes up by one **only when the content really
+///   changes**. `updated_at` and the two counters are not content —
+///   a write that changes nothing leaves the revision alone.
+/// * `synced_revision` follows the writer: a dashboard write aligns
+///   it with the revision (the row is what the dashboard pushed), a
+///   local admin write leaves it alone (the row drifted away from
+///   what the dashboard pushed).
 ///
 /// Caller is responsible for holding the DB write lock if used
 /// concurrently. The admin route handler runs this inside
 /// `App::with_db`, which holds the lock for the whole closure.
-pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::Result<()> {
+pub fn update_system_config(
+    conn: &Connection,
+    cfg: &SystemConfig,
+    source: ConfigWriteSource,
+) -> rusqlite::Result<SystemConfig> {
+    // The current row is the base of the version. A missing row (a
+    // manual DELETE slipped through) is written back as revision 1,
+    // never synchronised — the operator's next dashboard sync
+    // overwrites it anyway.
+    let current = stored_system_config(conn)?;
+    let revision = match &current {
+        Some(c) if system_config_content_eq(c, cfg) => c.revision,
+        Some(c) => c.revision + 1,
+        None => 1,
+    };
+    let synced_revision = match source {
+        ConfigWriteSource::Dashboard => revision,
+        ConfigWriteSource::Admin => current.map(|c| c.synced_revision).unwrap_or(0),
+    };
+    // `INSERT OR REPLACE` rather than `UPDATE`: a row that is gone
+    // (a manual DELETE) is written back, so the operator's recovery
+    // path — POST the form again — works.
     conn.execute(
-        "UPDATE system_config
-            SET provider = ?1,
-                pgl_headers_enabled = ?2,
-                client_ip_header = ?3,
-                client_country_header = ?4,
-                client_region_header = ?5,
-                origin_guard_enabled = ?6,
-                updated_at = ?7
-          WHERE id = 1",
+        "INSERT OR REPLACE INTO system_config
+            (id, provider, pgl_headers_enabled, client_ip_header,
+             client_country_header, client_region_header, origin_guard_enabled,
+             revision, synced_revision, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             cfg.provider.to_string(),
             cfg.pgl_headers_enabled as i64,
@@ -894,10 +924,59 @@ pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::
             cfg.client_country_header,
             cfg.client_region_header,
             cfg.origin_guard_enabled as i64,
+            revision,
+            synced_revision,
             cfg.updated_at.to_rfc3339(),
         ],
     )?;
-    Ok(())
+    Ok(SystemConfig {
+        revision,
+        synced_revision,
+        ..cfg.clone()
+    })
+}
+
+/// Whether two system-config rows carry the same **content**.
+///
+/// The version counters and `updated_at` are not content: they say
+/// *when* the row was written, not *what* it says. Only the fields
+/// the gateway acts on decide whether the revision moves.
+fn system_config_content_eq(a: &SystemConfig, b: &SystemConfig) -> bool {
+    a.provider == b.provider
+        && a.pgl_headers_enabled == b.pgl_headers_enabled
+        && a.client_ip_header == b.client_ip_header
+        && a.client_country_header == b.client_country_header
+        && a.client_region_header == b.client_region_header
+        && a.origin_guard_enabled == b.origin_guard_enabled
+}
+
+/// The stored system-config row, or `None` when the row is gone.
+///
+/// Only a **missing** row is `None` — a manual `DELETE FROM
+/// system_config` slipped through, which the write re-creates. Every
+/// other error is propagated: a row the read cannot parse is a corrupt
+/// row, and the write has to fail loudly instead of resetting the
+/// counters and overwriting the evidence. The enum columns carry a
+/// CHECK constraint, so the timestamp is the field a hand-edited row
+/// can break.
+fn stored_system_config(conn: &Connection) -> rusqlite::Result<Option<SystemConfig>> {
+    match get_system_config(conn) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The stored reputation row, or `None` when the row is gone.
+///
+/// The same rule as [`stored_system_config`]: only a missing row is
+/// `None`, a corrupt one is an error the write propagates.
+fn stored_badbots_config(conn: &Connection) -> rusqlite::Result<Option<BadbotsSettings>> {
+    match get_badbots_config(conn) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ---- IP reputation configuration (V12) ----
@@ -911,35 +990,69 @@ pub fn update_system_config(conn: &Connection, cfg: &SystemConfig) -> rusqlite::
 pub fn get_badbots_config(conn: &Connection) -> rusqlite::Result<BadbotsSettings> {
     let mut stmt = conn.prepare(
         "SELECT enabled, evidence_policy,
-                abuseipdb_api_key, crowdsec_api_key, updated_at
+                abuseipdb_api_key, crowdsec_api_key,
+                revision, synced_revision, updated_at
          FROM badbots_config WHERE id = 1",
     )?;
     stmt.query_row([], row_to_badbots_config)
 }
 
-/// Update the singleton IP-reputation configuration row in place.
+/// Update the singleton IP-reputation configuration row in place and
+/// answer the row as it was written.
 ///
-/// Caller is responsible for holding the DB write lock if used
-/// concurrently. The admin route handler runs this inside
-/// `App::with_db`, which holds the lock for the whole closure.
-pub fn update_badbots_config(conn: &Connection, cfg: &BadbotsSettings) -> rusqlite::Result<()> {
+/// The version counters are decided here, exactly as in
+/// [`update_system_config`]: the revision moves only when the
+/// content really changes, and the sync counter follows the writer.
+pub fn update_badbots_config(
+    conn: &Connection,
+    cfg: &BadbotsSettings,
+    source: ConfigWriteSource,
+) -> rusqlite::Result<BadbotsSettings> {
+    let current = stored_badbots_config(conn)?;
+    let revision = match &current {
+        Some(c) if badbots_content_eq(c, cfg) => c.revision,
+        Some(c) => c.revision + 1,
+        None => 1,
+    };
+    let synced_revision = match source {
+        ConfigWriteSource::Dashboard => revision,
+        ConfigWriteSource::Admin => current.map(|c| c.synced_revision).unwrap_or(0),
+    };
+    // `INSERT OR REPLACE` rather than `UPDATE`: a row that is gone
+    // (a manual DELETE) is written back, so the operator's recovery
+    // path — POST the form again — works.
     conn.execute(
-        "UPDATE badbots_config
-            SET enabled = ?1,
-                evidence_policy = ?2,
-                abuseipdb_api_key = ?3,
-                crowdsec_api_key = ?4,
-                updated_at = ?5
-          WHERE id = 1",
+        "INSERT OR REPLACE INTO badbots_config
+            (id, enabled, evidence_policy, abuseipdb_api_key, crowdsec_api_key,
+             revision, synced_revision, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             cfg.enabled as i64,
             cfg.evidence_policy.as_str(),
             cfg.abuseipdb_api_key,
             cfg.crowdsec_api_key,
+            revision,
+            synced_revision,
             cfg.updated_at.to_rfc3339(),
         ],
     )?;
-    Ok(())
+    Ok(BadbotsSettings {
+        revision,
+        synced_revision,
+        ..cfg.clone()
+    })
+}
+
+/// Whether two reputation rows carry the same **content**.
+///
+/// The credentials are content: replacing a key with another one is
+/// a change, even though the dashboard only ever sees *whether* a
+/// key is configured.
+fn badbots_content_eq(a: &BadbotsSettings, b: &BadbotsSettings) -> bool {
+    a.enabled == b.enabled
+        && a.evidence_policy == b.evidence_policy
+        && a.abuseipdb_api_key == b.abuseipdb_api_key
+        && a.crowdsec_api_key == b.crowdsec_api_key
 }
 
 fn row_to_badbots_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<BadbotsSettings> {
@@ -947,7 +1060,9 @@ fn row_to_badbots_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<BadbotsSet
     let policy_raw: String = row.get(1)?;
     let abuseipdb_api_key: Option<String> = row.get(2)?;
     let crowdsec_api_key: Option<String> = row.get(3)?;
-    let updated_at: String = row.get(4)?;
+    let revision: i64 = row.get(4)?;
+    let synced_revision: i64 = row.get(5)?;
+    let updated_at: String = row.get(6)?;
     let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
         rusqlite::Error::InvalidParameterName(format!("invalid evidence policy: {policy_raw}"))
     })?;
@@ -956,6 +1071,8 @@ fn row_to_badbots_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<BadbotsSet
         evidence_policy,
         abuseipdb_api_key,
         crowdsec_api_key,
+        revision,
+        synced_revision,
         updated_at: parse_dt(&updated_at)?,
     })
 }
@@ -1579,7 +1696,9 @@ fn row_to_system_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<SystemConfi
     let client_country_header: Option<String> = row.get(3)?;
     let client_region_header: Option<String> = row.get(4)?;
     let origin_guard_enabled: i64 = row.get(5)?;
-    let updated_at: String = row.get(6)?;
+    let revision: i64 = row.get(6)?;
+    let synced_revision: i64 = row.get(7)?;
+    let updated_at: String = row.get(8)?;
     let provider: ProviderKey = provider_raw.parse().map_err(|e: String| {
         rusqlite::Error::InvalidParameterName(format!("invalid provider: {e}"))
     })?;
@@ -1590,6 +1709,8 @@ fn row_to_system_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<SystemConfi
         client_country_header,
         client_region_header,
         origin_guard_enabled: origin_guard_enabled != 0,
+        revision,
+        synced_revision,
         updated_at: parse_dt(&updated_at)?,
     })
 }
@@ -1932,15 +2053,16 @@ mod tests {
         // drops the list-refresh-interval setting for issue #151; V14
         // rewrites the per-site bot list for the removed crawlers; V15
         // adds the api_config singleton for issue #185; V16 rewrites it
-        // for the outbound dashboard channel of issue #262.)
+        // for the outbound dashboard channel of issue #262; V17 adds the
+        // revision counters of the two global singletons for issue #273.)
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM refinery_schema_history", [], |r| {
                 r.get(0)
             })
             .expect("refinery_schema_history must exist after migrate()");
         assert_eq!(
-            count, 16,
-            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 + V15 + V16 to be applied"
+            count, 17,
+            "expected V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10 + V11 + V12 + V13 + V14 + V15 + V16 + V17 to be applied"
         );
 
         // Verify V2 is recorded.
@@ -2846,6 +2968,283 @@ mod tests {
         );
     }
 
+    /// V17 adds the two version counters to both global singletons
+    /// (issue #273).
+    ///
+    /// The seeded rows read `revision = 1` — the row is the first
+    /// version of itself — and `synced_revision = 0`, which means
+    /// "never synchronised with the dashboard". The two differ, so an
+    /// upgraded node tells the dashboard to push its desired state
+    /// once.
+    #[test]
+    fn the_v17_migration_adds_the_revision_counters() {
+        for table in ["system_config", "badbots_config"] {
+            let conn = make_conn();
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("the table is readable");
+            let columns: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                columns.iter().any(|c| c == "revision"),
+                "{table} must carry the revision column: {columns:?}"
+            );
+            assert!(
+                columns.iter().any(|c| c == "synced_revision"),
+                "{table} must carry the synced_revision column: {columns:?}"
+            );
+        }
+
+        let conn = make_conn();
+        let cfg = get_system_config(&conn).expect("the system_config row exists");
+        assert_eq!(cfg.revision, 1);
+        assert_eq!(cfg.synced_revision, 0);
+
+        let badbots = get_badbots_config(&conn).expect("the badbots_config row exists");
+        assert_eq!(badbots.revision, 1);
+        assert_eq!(badbots.synced_revision, 0);
+    }
+
+    /// The V17 migration upgrades a database that already carries the
+    /// two rows (issue #273, R17).
+    ///
+    /// The rows keep their content and read `revision = 1` /
+    /// `synced_revision = 0` — "never synchronised" — so an upgraded
+    /// node tells the dashboard to push its desired state once.
+    #[test]
+    fn the_v17_migration_upgrades_an_existing_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::embedded_migrations::run_migrations_up_to(&mut conn, 16).unwrap();
+        conn.execute(
+            "UPDATE system_config SET provider = 'cloudflare' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        crate::embedded_migrations::run_migrations_up_to(&mut conn, 17).unwrap();
+
+        let cfg = get_system_config(&conn).expect("the row survived");
+        assert_eq!(cfg.provider, ProviderKey::Cloudflare);
+        assert_eq!(cfg.revision, 1);
+        assert_eq!(cfg.synced_revision, 0);
+
+        let badbots = get_badbots_config(&conn).expect("the row survived");
+        assert_eq!(badbots.revision, 1);
+        assert_eq!(badbots.synced_revision, 0);
+    }
+
+    /// A write that changes nothing does not move the revision
+    /// (issue #273, R7).
+    ///
+    /// The `updated_at` timestamp and the two counters are not
+    /// content: a write that re-states the same configuration leaves
+    /// the revision alone, so the dashboard's "has this drifted?"
+    /// question is not answered by a no-op write.
+    #[test]
+    fn a_write_that_changes_nothing_leaves_the_revision_alone() {
+        let conn = make_conn();
+        let stored = get_system_config(&conn).unwrap();
+        let mut same = stored.clone();
+        same.updated_at = dt("2026-05-01T00:00:00Z");
+        let written = update_system_config(&conn, &same, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(
+            written.revision, stored.revision,
+            "the revision must not move when the content does not change"
+        );
+        assert_eq!(written.synced_revision, stored.synced_revision);
+    }
+
+    /// A local write after a dashboard write leaves the row drifted
+    /// (issue #273, R9).
+    ///
+    /// The dashboard's write marks the row as synchronised; a local
+    /// change moves the revision but not the sync counter, so the two
+    /// differ and the dashboard can see that it has to push again.
+    #[test]
+    fn a_local_write_makes_the_row_drift() {
+        let conn = make_conn();
+        let mut cfg = get_system_config(&conn).unwrap();
+        cfg.provider = ProviderKey::Cloudflare;
+        let pushed = update_system_config(&conn, &cfg, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(pushed.revision, pushed.synced_revision);
+        assert_eq!(
+            pushed.revision, 2,
+            "the content changed, so the revision moved"
+        );
+
+        let mut local = pushed.clone();
+        local.provider = ProviderKey::CustomLb;
+        local.updated_at = dt("2026-05-02T00:00:00Z");
+        let drifted = update_system_config(&conn, &local, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(drifted.revision, 3);
+        assert_eq!(
+            drifted.synced_revision, pushed.synced_revision,
+            "a local write must not move the sync counter"
+        );
+        assert_ne!(drifted.revision, drifted.synced_revision);
+    }
+
+    /// A dashboard write aligns the sync counter even when the content
+    /// did not change (issue #273, R8).
+    ///
+    /// The dashboard's push is the desired state — re-stating it is
+    /// still a synchronisation, so the row counts as clean afterwards.
+    #[test]
+    fn a_dashboard_write_aligns_the_sync_counter_even_without_a_change() {
+        let conn = make_conn();
+        let mut cfg = get_system_config(&conn).unwrap();
+        cfg.provider = ProviderKey::Cloudflare;
+        let pushed = update_system_config(&conn, &cfg, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(pushed.revision, 2);
+        assert_eq!(pushed.synced_revision, 2);
+
+        // The same content again — the revision stays, the row is
+        // clean.
+        let mut same = pushed.clone();
+        same.updated_at = dt("2026-05-03T00:00:00Z");
+        let again = update_system_config(&conn, &same, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(again.revision, 2, "the content did not change");
+        assert_eq!(again.synced_revision, 2, "the row is synchronised");
+        assert_eq!(again.revision, again.synced_revision);
+    }
+
+    /// A corrupt row fails the write loudly (issue #273).
+    ///
+    /// A row the read cannot parse is a corrupt row, not a missing
+    /// one: the write must fail instead of resetting the counters to
+    /// 1 / 0 and overwriting the evidence. The enum columns carry a
+    /// CHECK constraint, so the timestamp is the field a hand-edited
+    /// row can break.
+    #[test]
+    fn a_corrupt_row_fails_the_write_instead_of_resetting_the_counters() {
+        let conn = make_conn();
+        conn.execute(
+            "UPDATE system_config SET updated_at = 'not a timestamp' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let cfg = SystemConfig {
+            provider: ProviderKey::Cloudflare,
+            pgl_headers_enabled: true,
+            client_ip_header: None,
+            client_country_header: None,
+            client_region_header: None,
+            origin_guard_enabled: false,
+            revision: 0,
+            synced_revision: 0,
+            updated_at: dt("2026-05-06T00:00:00Z"),
+        };
+        let err = update_system_config(&conn, &cfg, ConfigWriteSource::Admin)
+            .expect_err("the corrupt row must fail the write");
+        assert!(
+            err.to_string().contains("invalid"),
+            "the read error must surface: {err}"
+        );
+        // The row is untouched — the counters did not move.
+        let (provider, updated_at): (String, String) = conn
+            .query_row(
+                "SELECT provider, updated_at FROM system_config WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "direct", "the corrupt row must survive");
+        assert_eq!(updated_at, "not a timestamp");
+    }
+
+    /// A row that is gone is written back.
+    ///
+    /// The operator's recovery path after a manual `DELETE FROM
+    /// system_config` is to save the form again — the write has to
+    /// land, and the row it re-creates has never been synchronised.
+    #[test]
+    fn a_deleted_row_is_written_back() {
+        let conn = make_conn();
+        conn.execute("DELETE FROM system_config WHERE id = 1", [])
+            .unwrap();
+        let cfg = SystemConfig {
+            provider: ProviderKey::Cloudflare,
+            pgl_headers_enabled: true,
+            client_ip_header: None,
+            client_country_header: None,
+            client_region_header: None,
+            origin_guard_enabled: false,
+            revision: 0,
+            synced_revision: 0,
+            updated_at: dt("2026-05-05T00:00:00Z"),
+        };
+        let written = update_system_config(&conn, &cfg, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(written.revision, 1);
+        assert_eq!(written.synced_revision, 0);
+        let back = get_system_config(&conn).expect("the row is back");
+        assert_eq!(back.provider, ProviderKey::Cloudflare);
+        assert_eq!(back, written);
+    }
+
+    /// A local credential rotation survives the next dashboard push
+    /// (issue #273, R3).
+    ///
+    /// The credential is the one field the dashboard cannot read back,
+    /// so a key the operator rotated locally survives every sync: the
+    /// counters go back to "in sync" while the row still holds a key
+    /// the dashboard never sent. That is why the wording says "the
+    /// fields the dashboard manages".
+    #[test]
+    fn a_local_credential_rotation_survives_the_next_dashboard_push() {
+        let conn = make_conn();
+        let mut cfg = get_badbots_config(&conn).unwrap();
+        cfg.abuseipdb_api_key = Some("key-1".into());
+        let pushed = update_badbots_config(&conn, &cfg, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(pushed.revision, 2);
+
+        // The operator rotates the key locally.
+        let mut local = pushed.clone();
+        local.abuseipdb_api_key = Some("key-2".into());
+        local.updated_at = dt("2026-05-07T00:00:00Z");
+        let drifted = update_badbots_config(&conn, &local, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(drifted.revision, 3);
+        assert_eq!(
+            drifted.synced_revision, 2,
+            "the local write did not sync it"
+        );
+
+        // The dashboard pushes its desired state again. The body does
+        // not mention the key, so the parser kept the stored one —
+        // and the write aligns the counters.
+        let mut again = drifted.clone();
+        again.updated_at = dt("2026-05-08T00:00:00Z");
+        let resynced = update_badbots_config(&conn, &again, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(resynced.revision, 3, "the content did not change");
+        assert_eq!(resynced.synced_revision, 3, "the row is in sync again");
+        assert_eq!(
+            resynced.abuseipdb_api_key.as_deref(),
+            Some("key-2"),
+            "the operator's key survives the dashboard's push"
+        );
+    }
+
+    /// The reputation row carries the same counters (issue #273).
+    #[test]
+    fn the_reputation_row_counts_its_revisions_too() {
+        let conn = make_conn();
+        let mut cfg = get_badbots_config(&conn).unwrap();
+        cfg.evidence_policy = BadbotsEvidencePolicy::Strict;
+        let pushed = update_badbots_config(&conn, &cfg, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(pushed.revision, 2);
+        assert_eq!(pushed.synced_revision, 2);
+
+        let mut local = pushed.clone();
+        local.enabled = false;
+        local.updated_at = dt("2026-05-04T00:00:00Z");
+        let drifted = update_badbots_config(&conn, &local, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(drifted.revision, 3);
+        assert_eq!(drifted.synced_revision, 2);
+        assert_ne!(drifted.revision, drifted.synced_revision);
+    }
+
     #[test]
     fn badbots_config_seeded_after_migrate() {
         // V12 must INSERT the default row as part of the migration, so
@@ -2877,7 +3276,7 @@ mod tests {
         cfg.abuseipdb_api_key = Some("key-a".into());
         cfg.crowdsec_api_key = Some("key-c".into());
         cfg.updated_at = dt("2026-01-02T03:04:05Z");
-        update_badbots_config(&conn, &cfg).unwrap();
+        let written = update_badbots_config(&conn, &cfg, ConfigWriteSource::Admin).unwrap();
 
         let read = get_badbots_config(&conn).unwrap();
         assert!(!read.enabled);
@@ -2885,6 +3284,7 @@ mod tests {
         assert_eq!(read.abuseipdb_api_key.as_deref(), Some("key-a"));
         assert_eq!(read.crowdsec_api_key.as_deref(), Some("key-c"));
         assert_eq!(read.updated_at, dt("2026-01-02T03:04:05Z"));
+        assert_eq!(read, written);
     }
 
     #[test]
@@ -2919,11 +3319,13 @@ mod tests {
                 client_country_header: Some("X-Client-Country".into()),
                 client_region_header: None,
                 origin_guard_enabled: true,
+                revision: 0,
+                synced_revision: 0,
                 updated_at: dt("2026-03-15T12:34:56+00:00"),
             };
-            update_system_config(&conn, &updated).unwrap();
+            let written = update_system_config(&conn, &updated, ConfigWriteSource::Admin).unwrap();
             let back = get_system_config(&conn).unwrap();
-            assert_eq!(back, updated);
+            assert_eq!(back, written);
         }
     }
 

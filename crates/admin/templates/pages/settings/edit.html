@@ -177,8 +177,22 @@
     {% endif %}
 
     <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
-      <div class="text-xs text-slate-500 dark:text-slate-400">
-        {{ lang.t("settings.last_updated") }} <span class="font-mono">{{ updated_at }}</span>
+      <div class="space-y-1">
+        <div class="text-xs text-slate-500 dark:text-slate-400">
+          {{ lang.t("settings.last_updated") }} <span class="font-mono">{{ updated_at }}</span>
+        </div>
+        {# The two version counters (issue #273). They differ once the
+           configuration was changed locally: the dashboard's next
+           sync overwrites the local change. #}
+        <div class="text-xs text-slate-500 dark:text-slate-400" data-testid="system-config-revision">
+          {{ lang.t("settings.revision") }} <span class="font-mono">{{ revision }}</span>
+          · {{ lang.t("settings.synced_revision") }} <span class="font-mono">{{ synced_revision }}</span>
+        </div>
+        {% if revision != synced_revision %}
+        <p class="text-xs text-amber-600 dark:text-amber-400" data-testid="system-config-drift">
+          {{ lang.t("settings.dashboard_overwrites_local") }}
+        </p>
+        {% endif %}
       </div>
       <div class="flex gap-2">
         <a href="/" class="inline-flex items-center justify-center rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">{{ lang.t("common.cancel") }}</a>
@@ -279,8 +293,20 @@
     </div>
 
     <div class="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
-      <div class="text-xs text-slate-500 dark:text-slate-400">
-        {{ lang.t("settings.last_updated") }} <span class="font-mono">{{ badbots.updated_at }}</span>
+      <div class="space-y-1">
+        <div class="text-xs text-slate-500 dark:text-slate-400">
+          {{ lang.t("settings.last_updated") }} <span class="font-mono">{{ badbots.updated_at }}</span>
+        </div>
+        {# The two version counters (issue #273). #}
+        <div class="text-xs text-slate-500 dark:text-slate-400" data-testid="badbots-revision">
+          {{ lang.t("settings.revision") }} <span class="font-mono">{{ badbots.revision }}</span>
+          · {{ lang.t("settings.synced_revision") }} <span class="font-mono">{{ badbots.synced_revision }}</span>
+        </div>
+        {% if badbots.revision != badbots.synced_revision %}
+        <p class="text-xs text-amber-600 dark:text-amber-400" data-testid="badbots-drift">
+          {{ lang.t("settings.dashboard_overwrites_local_except_keys") }}
+        </p>
+        {% endif %}
       </div>
       <div class="flex gap-2">
         <button type="submit" class="inline-flex items-center justify-center rounded-lg bg-accent-500 hover:bg-accent-600 active:bg-accent-700 px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:shadow-md hover:-translate-y-px active:translate-y-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition">{{ lang.t("common.save") }}</button>

@@ -120,6 +120,10 @@ pub async fn handle_update_system_config(
 /// current UTC time) on success, or a human-readable error message
 /// on failure. Shared between the JSON API handler and the HTML
 /// `/settings` page so both endpoints enforce identical validation.
+///
+/// The two version counters are left at zero: they are the **write
+/// layer's** business — `db::update_system_config` decides them and
+/// ignores whatever the parser put here (issue #273).
 pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
     let provider_str = require_param(body, "provider").unwrap_or_default();
     let provider: ProviderKey = provider_str.parse().map_err(|e: String| {
@@ -148,6 +152,8 @@ pub fn parse_system_config_form(body: &[u8]) -> Result<SystemConfig, String> {
         // Absent → the documented default (`false`); the settings
         // form always sends it explicitly.
         origin_guard_enabled: param_bool(body, "origin_guard_enabled", false),
+        revision: 0,
+        synced_revision: 0,
         updated_at: chrono::Utc::now(),
     })
 }
@@ -173,18 +179,57 @@ pub async fn parse_system_config_form_merged(
     let current = app.system_config.read().clone();
     if !form_has_param(body, "origin_guard_enabled") {
         cfg.origin_guard_enabled = current.origin_guard_enabled;
-    } else if cfg.origin_guard_enabled
-        && !current.origin_guard_enabled
-        && pangolin_core::provider::spec(cfg.provider).ranges.is_none()
-    {
-        return Err(format!(
-            "The global origin guard cannot be enabled: the provider '{}' publishes no \
-             source-IP ranges, so the guard would not reject anything. Protect the \
-             individual sites with their manual ranges instead.",
-            cfg.provider
-        ));
+    } else if let Some(msg) = origin_guard_conflict(
+        cfg.provider,
+        cfg.origin_guard_enabled && !current.origin_guard_enabled,
+    ) {
+        return Err(msg);
     }
     Ok(cfg)
+}
+
+/// Parse the system-config form the way the **dashboard** writes it:
+/// the body is the desired state (issue #273).
+///
+/// A field the body does not mention is cleared or falls back to its
+/// default — the three first-level header names become "not
+/// configured", `pgl_headers_enabled` becomes `true` and
+/// `origin_guard_enabled` becomes `false`. The `provider` is the one
+/// field with no default: the enum has no "unset" member, so a body
+/// without one is refused.
+///
+/// The origin guard is checked the way the admin form checks it: the
+/// desired state may not enable the guard for a provider that
+/// publishes no source-IP ranges.
+pub fn parse_system_config_form_replaced(body: &[u8]) -> Result<SystemConfig, String> {
+    let cfg = parse_system_config_form(body)?;
+    if let Some(msg) = origin_guard_conflict(cfg.provider, cfg.origin_guard_enabled) {
+        return Err(msg);
+    }
+    Ok(cfg)
+}
+
+/// The global origin guard may not be switched on for a provider that
+/// publishes no source-IP ranges.
+///
+/// The guard rejects a request whose peer is outside the allowlist;
+/// with an empty allowlist it fails open, so switching it on would
+/// give the operator a false sense of protection. A site that
+/// protects itself with manual ranges turns the guard on at the site
+/// level instead.
+///
+/// The answer is the message both flavours give, so the HTML form and
+/// the API refuse the same input with the same words.
+fn origin_guard_conflict(provider: ProviderKey, switches_on: bool) -> Option<String> {
+    if !switches_on || pangolin_core::provider::spec(provider).ranges.is_some() {
+        return None;
+    }
+    Some(format!(
+        "The global origin guard cannot be enabled: the provider '{}' publishes no \
+         source-IP ranges, so the guard would not reject anything. Protect the \
+         individual sites with their manual ranges instead.",
+        provider
+    ))
 }
 
 /// Read + validate one first-level header name from the form body.
@@ -213,14 +258,72 @@ fn header_key(body: &[u8], field: &str) -> Result<Option<String>, String> {
 /// `Arc<RwLock<SystemConfig>>` on the [`App`] so the next proxied
 /// request picks up the new mode without a process restart.
 ///
+/// The write is a **local** one: the write layer leaves the sync
+/// counter alone, so the row counts as drifted from what the
+/// dashboard last pushed (issue #273).
+///
 /// Returns `Ok(())` on success, or a human-readable error message
 /// on DB failure (the only failure mode — validation has already
 /// happened upstream via [`parse_system_config_form`]).
 pub async fn save_system_config(app: &Arc<App>, cfg: SystemConfig) -> Result<(), String> {
     // The write runs on the blocking pool (issue #254).
-    app.with_db_res(move |db| pangolin_core::db::update_system_config(db, &cfg))
-        .await
-        .map_err(|e| format!("Database error: {e}"))?;
+    app.with_db_res(move |db| {
+        pangolin_core::db::update_system_config(db, &cfg, pangolin_core::ConfigWriteSource::Admin)
+    })
+    .await
+    .map_err(|e| format!("Database error: {e}"))?;
     app.reload_indexes().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The **replace** flavour: a field the body does not mention is
+    /// cleared or falls back to its default (issue #273, R1/R4).
+    #[test]
+    fn the_replace_parser_clears_the_omitted_fields() {
+        let cfg =
+            parse_system_config_form_replaced(b"provider=cloudflare").expect("the body parses");
+        assert_eq!(cfg.provider, ProviderKey::Cloudflare);
+        assert_eq!(cfg.client_ip_header, None);
+        assert_eq!(cfg.client_country_header, None);
+        assert_eq!(cfg.client_region_header, None);
+        assert!(
+            cfg.pgl_headers_enabled,
+            "an omitted switch falls back to its documented default"
+        );
+        assert!(
+            !cfg.origin_guard_enabled,
+            "an omitted switch falls back to its documented default"
+        );
+    }
+
+    /// The provider has no "unset" member, so a body without one is
+    /// refused (issue #273, R4).
+    #[test]
+    fn the_replace_parser_refuses_a_body_without_a_provider() {
+        let err = parse_system_config_form_replaced(b"pgl_headers_enabled=true")
+            .expect_err("the provider is required");
+        assert!(err.contains("provider"), "{err}");
+    }
+
+    /// The origin guard may not be switched on for a provider that
+    /// publishes no source-IP ranges (issue #273, R6).
+    #[test]
+    fn the_replace_parser_refuses_the_guard_for_a_provider_without_ranges() {
+        let err = parse_system_config_form_replaced(b"provider=direct&origin_guard_enabled=true")
+            .expect_err("the guard would fail open");
+        assert!(err.contains("origin guard"), "{err}");
+    }
+
+    /// The same body is accepted for a provider that publishes ranges.
+    #[test]
+    fn the_replace_parser_accepts_the_guard_for_a_provider_with_ranges() {
+        let cfg =
+            parse_system_config_form_replaced(b"provider=cloudflare&origin_guard_enabled=true")
+                .expect("the body parses");
+        assert!(cfg.origin_guard_enabled);
+    }
 }

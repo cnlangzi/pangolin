@@ -66,6 +66,12 @@ pub struct SettingsTemplate<'a> {
     /// a small "Last updated" line under the form so operators can
     /// tell at a glance how stale the config is.
     pub updated_at: String,
+    /// The node's own version of the global configuration (issue
+    /// #273).
+    pub revision: i64,
+    /// The version the dashboard last pushed. The two differ once
+    /// something changed the configuration locally.
+    pub synced_revision: i64,
     /// The IP reputation settings (issue #141).
     ///
     /// The settings live in the database, not in `ngx.yml` — the only
@@ -105,6 +111,12 @@ pub struct BadbotsSettingsView {
     pub crowdsec_key_configured: bool,
     /// RFC-3339 timestamp of the last successful update.
     pub updated_at: String,
+    /// The node's own version of the reputation configuration
+    /// (issue #273).
+    pub revision: i64,
+    /// The version the dashboard last pushed. The two differ once
+    /// something changed the configuration locally.
+    pub synced_revision: i64,
 }
 
 /// The dashboard channel's settings as the settings page renders them
