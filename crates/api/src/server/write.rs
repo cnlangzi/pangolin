@@ -3,7 +3,7 @@
 //! Every write validates through the **admin UI's own parsers**, so a
 //! body the HTML form would reject is rejected here too — with the
 //! same message (issue #185, R11). The write semantics differ per
-//! resource and are documented in [`docs/design/api.md`](../../../docs/design/api.md):
+//! resource and are documented in `docs/apis/dash.md`:
 //!
 //! | resource | semantics |
 //! | --- | --- |
@@ -288,7 +288,7 @@ pub async fn create_domain(ctx: &Ctx<'_>) -> ApiResponse {
         Err(e) => {
             log::warn!("api: the domain form could not be parsed: {e}");
             // The query panicked: that is the API failing, not the
-            // submission being wrong (docs/design/api.md: 500
+            // submission being wrong (docs/apis/dash.md: 500
             // `internal_error` is "something the API did not expect").
             return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
         }
@@ -389,7 +389,7 @@ pub async fn update_domain(ctx: &Ctx<'_>, domain: &str) -> ApiResponse {
         Err(e) => {
             log::warn!("api: the domain form could not be parsed: {e}");
             // The query panicked: that is the API failing, not the
-            // submission being wrong (docs/design/api.md: 500
+            // submission being wrong (docs/apis/dash.md: 500
             // `internal_error` is "something the API did not expect").
             return ApiResponse::error(&ApiError::internal("the domain form could not be checked"));
         }
@@ -774,7 +774,7 @@ pub async fn create_ip_rule(ctx: &Ctx<'_>) -> ApiResponse {
             Err(e) => {
                 log::warn!("api: the IP rule form could not be parsed: {e}");
                 // The query panicked: that is the API failing, not the
-                // submission being wrong (docs/design/api.md: 500
+                // submission being wrong (docs/apis/dash.md: 500
                 // `internal_error` is "something the API did not expect").
                 return ApiResponse::error(&ApiError::internal(
                     "the IP rule form could not be checked",

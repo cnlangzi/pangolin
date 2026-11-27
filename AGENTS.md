@@ -23,7 +23,7 @@ the code, the documentation and the UI.
 - **API** — the dashboard-facing management interface of one node: a
   JSON API under `/api/v1/`, on its own listener, with its own
   authentication. Lives in `crates/api/`, specified in
-  [docs/design/api.md](docs/design/api.md).
+  [docs/apis/dash.md](docs/apis/dash.md).
 - **tun** — the tunnel client: the `pangolin-tun` process that opens
   the tunnel to a gateway. Lives in `crates/tun/` and in the
   `tun` table.
@@ -41,10 +41,10 @@ breaks a contract an operator already depends on.
 | 1 | **One forwarding path.** A direct backend and a tun backend go through the same pingora machinery; the tun is a byte splice and does not speak HTTP. | [tunnel](docs/design/tunnel.md), [reverse-proxy](docs/design/reverse-proxy.md) |
 | 2 | **One HTTP client on the data plane.** pingora carries every forwarded request; `reqwest` in the gateway is control plane (the DNS provider API, the provider range fetch), and the DNS-01 TXT check goes through hickory-resolver. | [reverse-proxy](docs/design/reverse-proxy.md) |
 | 3 | **Configuration in YAML, state in SQLite, only derived data in memory.** The indexes over domains, limits, providers, certs and tuns are rebuilt after the admin writes them; a new process-local cache has to say how it reconciles with the database. | [routing-and-index](docs/design/routing-and-index.md) |
-| 4 | **admin and the command channel are two surfaces with two authentication schemes.** admin is the node's own browser interface (cookie session plus CSRF); the dashboard-facing API is an **outbound** channel — the node dials out, so the gateway exposes no management port — with its own two-way signatures; the dashboard is not a caller of admin and the two must not share a session. | [api](docs/design/api.md) |
+| 4 | **admin and the command channel are two surfaces with two authentication schemes.** admin is the node's own browser interface (cookie session plus CSRF); the dashboard-facing API is an **outbound** channel — the node dials out, so the gateway exposes no management port — with its own two-way signatures; the dashboard is not a caller of admin and the two must not share a session. | [api](docs/apis/dash.md) |
 | 5 | **Side channels do not take part in the forwarding decision.** The access log, bot log, referer log and traffic counters are in-memory ring buffers plus side files; their failure must not affect request forwarding. | [access-log](docs/design/access-log.md), [bot-log](docs/design/bot-log.md), [referer-log](docs/design/referer-log.md), [traffic](docs/design/traffic.md) |
 | 6 | **Failures stay local.** A tun going offline, a site that fails to resolve, a missing certificate, a provider list that fails to download — none of them may take the gateway down. | [rate-limit](docs/design/rate-limit.md), [cert-link](docs/design/cert-link.md), [provider](docs/design/provider.md) |
-| 7 | **What is published is a contract.** The tun wire protocol, the API contract, the configuration keys and the database schema are interfaces that have shipped; changing them is a breaking change that needs a version and a migration note. | [tunnel](docs/design/tunnel.md), [api](docs/design/api.md), [migrations](docs/migrations.md) |
+| 7 | **What is published is a contract.** The tun wire protocol, the API contract, the configuration keys and the database schema are interfaces that have shipped; changing them is a breaking change that needs a version and a migration note. | [tunnel](docs/design/tunnel.md), [api](docs/apis/dash.md), [migrations](docs/migrations.md) |
 
 ## Rules
 
@@ -85,7 +85,7 @@ breaks a contract an operator already depends on.
 
 9. **The `/api/v1/` signing protocol, error codes and resource shapes are
    published to the dashboard**; changing them is a breaking change.
-   ([api](docs/design/api.md))
+   ([api](docs/apis/dash.md))
 
 10. **`.env` stays out of the repository; `.env.example` is committed.** The
    tracked test material `crates/ngx/tests/pebble-root.pem` may look
@@ -191,7 +191,8 @@ breaks a contract an operator already depends on.
 | building, running and testing | [docs/development.md](docs/development.md) |
 | changing `install.sh`, the packaging or the release | [docs/release.md](docs/release.md) |
 | changing the pingora dependency | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) |
-| changing the API | [docs/design/api.md](docs/design/api.md) |
+| changing the API | [docs/apis/dash.md](docs/apis/dash.md) |
+| changing the admin UI's HTTP surface | [docs/apis/admin.md](docs/apis/admin.md) |
 | changing the process model (the supervisor and the generations) | [docs/design/graceful-reload.md](docs/design/graceful-reload.md) |
 | debugging at trace level | [docs/design/pingora-dependency.md](docs/design/pingora-dependency.md) — its HTTP/1 client panics on a non-UTF-8 response header in the trace log |
 | looking up a configuration key | [docs/configuration.md](docs/configuration.md) |

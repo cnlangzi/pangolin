@@ -44,7 +44,7 @@
 //! provider override) — those are writes to sub-resources that have
 //! their own endpoints.
 //!
-//! See `docs/design/api.md` for the byte-level specification.
+//! See `docs/apis/dash.md` for the byte-level specification.
 
 pub mod client;
 pub mod dto;
