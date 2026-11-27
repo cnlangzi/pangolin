@@ -3,7 +3,7 @@
 //! Every write validates through the **admin UI's own parsers**, so a
 //! body the HTML form would reject is rejected here too — with the
 //! same message (issue #185, R11). The write semantics differ per
-//! resource and are documented in [`docs/apis/dash.md`](../../../docs/apis/dash.md):
+//! resource and are documented in `docs/apis/dash.md`:
 //!
 //! | resource | semantics |
 //! | --- | --- |
