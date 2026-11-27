@@ -898,7 +898,7 @@ pub fn update_system_config(
     // manual DELETE slipped through) is written back as revision 1,
     // never synchronised — the operator's next dashboard sync
     // overwrites it anyway.
-    let current = get_system_config(conn).ok();
+    let current = stored_system_config(conn)?;
     let revision = match &current {
         Some(c) if system_config_content_eq(c, cfg) => c.revision,
         Some(c) => c.revision + 1,
@@ -950,6 +950,35 @@ fn system_config_content_eq(a: &SystemConfig, b: &SystemConfig) -> bool {
         && a.origin_guard_enabled == b.origin_guard_enabled
 }
 
+/// The stored system-config row, or `None` when the row is gone.
+///
+/// Only a **missing** row is `None` — a manual `DELETE FROM
+/// system_config` slipped through, which the write re-creates. Every
+/// other error is propagated: a row the read cannot parse is a corrupt
+/// row, and the write has to fail loudly instead of resetting the
+/// counters and overwriting the evidence. The enum columns carry a
+/// CHECK constraint, so the timestamp is the field a hand-edited row
+/// can break.
+fn stored_system_config(conn: &Connection) -> rusqlite::Result<Option<SystemConfig>> {
+    match get_system_config(conn) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The stored reputation row, or `None` when the row is gone.
+///
+/// The same rule as [`stored_system_config`]: only a missing row is
+/// `None`, a corrupt one is an error the write propagates.
+fn stored_badbots_config(conn: &Connection) -> rusqlite::Result<Option<BadbotsSettings>> {
+    match get_badbots_config(conn) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 // ---- IP reputation configuration (V12) ----
 
 /// Read the singleton IP-reputation configuration row.
@@ -979,7 +1008,7 @@ pub fn update_badbots_config(
     cfg: &BadbotsSettings,
     source: ConfigWriteSource,
 ) -> rusqlite::Result<BadbotsSettings> {
-    let current = get_badbots_config(conn).ok();
+    let current = stored_badbots_config(conn)?;
     let revision = match &current {
         Some(c) if badbots_content_eq(c, cfg) => c.revision,
         Some(c) => c.revision + 1,
@@ -3082,6 +3111,50 @@ mod tests {
         assert_eq!(again.revision, again.synced_revision);
     }
 
+    /// A corrupt row fails the write loudly (issue #273).
+    ///
+    /// A row the read cannot parse is a corrupt row, not a missing
+    /// one: the write must fail instead of resetting the counters to
+    /// 1 / 0 and overwriting the evidence. The enum columns carry a
+    /// CHECK constraint, so the timestamp is the field a hand-edited
+    /// row can break.
+    #[test]
+    fn a_corrupt_row_fails_the_write_instead_of_resetting_the_counters() {
+        let conn = make_conn();
+        conn.execute(
+            "UPDATE system_config SET updated_at = 'not a timestamp' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let cfg = SystemConfig {
+            provider: ProviderKey::Cloudflare,
+            pgl_headers_enabled: true,
+            client_ip_header: None,
+            client_country_header: None,
+            client_region_header: None,
+            origin_guard_enabled: false,
+            revision: 0,
+            synced_revision: 0,
+            updated_at: dt("2026-05-06T00:00:00Z"),
+        };
+        let err = update_system_config(&conn, &cfg, ConfigWriteSource::Admin)
+            .expect_err("the corrupt row must fail the write");
+        assert!(
+            err.to_string().contains("invalid"),
+            "the read error must surface: {err}"
+        );
+        // The row is untouched — the counters did not move.
+        let (provider, updated_at): (String, String) = conn
+            .query_row(
+                "SELECT provider, updated_at FROM system_config WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "direct", "the corrupt row must survive");
+        assert_eq!(updated_at, "not a timestamp");
+    }
+
     /// A row that is gone is written back.
     ///
     /// The operator's recovery path after a manual `DELETE FROM
@@ -3109,6 +3182,48 @@ mod tests {
         let back = get_system_config(&conn).expect("the row is back");
         assert_eq!(back.provider, ProviderKey::Cloudflare);
         assert_eq!(back, written);
+    }
+
+    /// A local credential rotation survives the next dashboard push
+    /// (issue #273, R3).
+    ///
+    /// The credential is the one field the dashboard cannot read back,
+    /// so a key the operator rotated locally survives every sync: the
+    /// counters go back to "in sync" while the row still holds a key
+    /// the dashboard never sent. That is why the wording says "the
+    /// fields the dashboard manages".
+    #[test]
+    fn a_local_credential_rotation_survives_the_next_dashboard_push() {
+        let conn = make_conn();
+        let mut cfg = get_badbots_config(&conn).unwrap();
+        cfg.abuseipdb_api_key = Some("key-1".into());
+        let pushed = update_badbots_config(&conn, &cfg, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(pushed.revision, 2);
+
+        // The operator rotates the key locally.
+        let mut local = pushed.clone();
+        local.abuseipdb_api_key = Some("key-2".into());
+        local.updated_at = dt("2026-05-07T00:00:00Z");
+        let drifted = update_badbots_config(&conn, &local, ConfigWriteSource::Admin).unwrap();
+        assert_eq!(drifted.revision, 3);
+        assert_eq!(
+            drifted.synced_revision, 2,
+            "the local write did not sync it"
+        );
+
+        // The dashboard pushes its desired state again. The body does
+        // not mention the key, so the parser kept the stored one —
+        // and the write aligns the counters.
+        let mut again = drifted.clone();
+        again.updated_at = dt("2026-05-08T00:00:00Z");
+        let resynced = update_badbots_config(&conn, &again, ConfigWriteSource::Dashboard).unwrap();
+        assert_eq!(resynced.revision, 3, "the content did not change");
+        assert_eq!(resynced.synced_revision, 3, "the row is in sync again");
+        assert_eq!(
+            resynced.abuseipdb_api_key.as_deref(),
+            Some("key-2"),
+            "the operator's key survives the dashboard's push"
+        );
     }
 
     /// The reputation row carries the same counters (issue #273).

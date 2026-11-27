@@ -563,6 +563,7 @@
   "settings.dashboard.token_hint_2": "—— 节点需要令牌本身，因此按原样保存，且不会回显。留空则保留已存的令牌。",
   "settings.dashboard.write_only": "只写",
   "settings.dashboard_overwrites_local": "仪表盘的下次同步会覆盖这里的本地修改。",
+  "settings.dashboard_overwrites_local_except_keys": "仪表盘下次同步会覆盖这里的修改，API 密钥除外。",
   "settings.enable_reputation": "启用信誉检查",
   "settings.enable_reputation_hint": "默认开启。这五家名单发布方（Spamhaus、DShield、Blocklist.de、steeman、CINS Army）不需要凭据，检查开启期间始终会查询它们。",
   "settings.evidence_policy": "证据策略",

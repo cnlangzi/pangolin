@@ -563,6 +563,7 @@
   "settings.dashboard.token_hint_2": "— the node needs the token itself, so it is stored as it is and never rendered back. Leave the field empty to keep the stored one.",
   "settings.dashboard.write_only": "write-only",
   "settings.dashboard_overwrites_local": "The dashboard's next sync overwrites the changes made here.",
+  "settings.dashboard_overwrites_local_except_keys": "The dashboard's next sync overwrites the changes made here — except the API keys.",
   "settings.enable_reputation": "Enable the reputation check",
   "settings.enable_reputation_hint": "On by default. The five list publishers (Spamhaus, DShield, Blocklist.de, steeman, CINS Army) need no credential and are always queried while the check is on.",
   "settings.evidence_policy": "Evidence policy",

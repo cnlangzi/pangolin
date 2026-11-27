@@ -1118,7 +1118,7 @@ pub async fn put_system_config(ctx: &Ctx<'_>) -> ApiResponse {
         }
     };
     let written = {
-        let cfg = parsed.clone();
+        let cfg = parsed;
         ctx.state
             .app
             .with_db_res(move |db| {
@@ -1172,7 +1172,7 @@ pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
             }
         };
     let written = {
-        let cfg = parsed.clone();
+        let cfg = parsed;
         ctx.state
             .app
             .with_db_res(move |db| {
@@ -1189,15 +1189,7 @@ pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
         Err(e) => return ApiResponse::error(&read::database_error(e)),
     };
     ctx.state.app.rebuild_badbots().await;
-    let view = crate::dto::views::BadbotsSettingsView {
-        enabled: written.enabled,
-        evidence_policy: written.evidence_policy.as_str().to_string(),
-        has_abuseipdb_api_key: written.abuseipdb_api_key.is_some(),
-        has_crowdsec_api_key: written.crowdsec_api_key.is_some(),
-        updated_at: written.updated_at,
-        revision: written.revision,
-        synced_revision: written.synced_revision,
-    };
+    let view = crate::dto::views::BadbotsSettingsView::from(&written);
     ApiResponse::json_of(200, &view)
 }
 

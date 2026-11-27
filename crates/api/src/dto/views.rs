@@ -86,9 +86,31 @@ pub struct BadbotsSettingsView {
     /// The value `revision` had when the dashboard's last write
     /// landed.
     ///
-    /// The two are equal if and only if the row is still exactly what
-    /// the dashboard pushed; `0` means "never synchronised".
+    /// The two are equal if and only if the row still holds what the
+    /// dashboard pushed — for the fields the dashboard manages. The
+    /// credentials are the exception: the dashboard cannot read a key
+    /// back, so a key the operator rotated locally survives every
+    /// sync. `0` means "never synchronised".
     pub synced_revision: i64,
+}
+
+impl From<&pangolin_core::types::BadbotsSettings> for BadbotsSettingsView {
+    /// The view of a stored reputation row.
+    ///
+    /// The one place the view is built: the `GET` and the `PUT` answer
+    /// the same shape, so a field added to the row is added to the
+    /// answer once.
+    fn from(settings: &pangolin_core::types::BadbotsSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            evidence_policy: settings.evidence_policy.as_str().to_string(),
+            has_abuseipdb_api_key: settings.abuseipdb_api_key.is_some(),
+            has_crowdsec_api_key: settings.crowdsec_api_key.is_some(),
+            updated_at: settings.updated_at,
+            revision: settings.revision,
+            synced_revision: settings.synced_revision,
+        }
+    }
 }
 
 /// One tunnel node's state.

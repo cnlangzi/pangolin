@@ -170,7 +170,7 @@ The global settings, in a singleton row.
 | `client_region_header` | TEXT | The header carrying the visitor's region. Only consulted in `custom_lb` mode. |
 | `origin_guard_enabled` | INTEGER NOT NULL DEFAULT 0 | The global default of the origin guard: whether a site that does not override it refuses requests whose TCP peer is outside its allowlist. |
 | `revision` | INTEGER NOT NULL DEFAULT 1 | The node's own version of the row. It goes up by one when the **content** really changes; a write that changes nothing leaves it alone. |
-| `synced_revision` | INTEGER NOT NULL DEFAULT 0 | The value `revision` had when the dashboard's last write landed. `revision == synced_revision` means the row is still exactly what the dashboard pushed; `0` means "never synchronised". |
+| `synced_revision` | INTEGER NOT NULL DEFAULT 0 | The value `revision` had when the dashboard's last write landed. `revision == synced_revision` means the row still holds what the dashboard pushed — every field of this row is one the dashboard manages; `0` means "never synchronised". |
 | `updated_at` | TEXT NOT NULL | RFC-3339 UTC timestamp of the last write. |
 
 The two version counters are written by the **write layer** alone
@@ -302,7 +302,7 @@ backups, config management systems and shell histories.
 | `abuseipdb_api_key` | TEXT | The AbuseIPDB key. `NULL` means the provider is not queried. |
 | `crowdsec_api_key` | TEXT | The CrowdSec key. `NULL` means the provider is not queried. |
 | `revision` | INTEGER NOT NULL DEFAULT 1 | The node's own version of the row. It goes up by one when the **content** really changes; a write that changes nothing leaves it alone. |
-| `synced_revision` | INTEGER NOT NULL DEFAULT 0 | The value `revision` had when the dashboard's last write landed. `revision == synced_revision` means the row is still exactly what the dashboard pushed; `0` means "never synchronised". |
+| `synced_revision` | INTEGER NOT NULL DEFAULT 0 | The value `revision` had when the dashboard's last write landed. `revision == synced_revision` means the row still holds what the dashboard pushed — for the fields the dashboard manages; the credentials are the exception, because the dashboard cannot read a key back; `0` means "never synchronised". |
 | `updated_at` | TEXT NOT NULL | RFC-3339 UTC timestamp of the last write. |
 
 The three providers that need no credential — Spamhaus DROP, DShield and

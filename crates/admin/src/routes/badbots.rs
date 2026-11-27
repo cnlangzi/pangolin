@@ -37,31 +37,7 @@ pub fn parse_badbots_form(
     body: &[u8],
     current: &BadbotsSettings,
 ) -> Result<BadbotsSettings, String> {
-    let policy_raw = super::helpers::require_param(body, "badbots_evidence_policy")
-        .unwrap_or_else(|| current.evidence_policy.as_str().to_string());
-    let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
-        format!("Invalid evidence policy '{policy_raw}'. Expected one of: strict, lenient.")
-    })?;
-
-    Ok(BadbotsSettings {
-        enabled: param_bool(body, "badbots_enabled", current.enabled),
-        evidence_policy,
-        abuseipdb_api_key: api_key(
-            body,
-            "badbots_abuseipdb_api_key",
-            "badbots_abuseipdb_clear",
-            current.abuseipdb_api_key.clone(),
-        ),
-        crowdsec_api_key: api_key(
-            body,
-            "badbots_crowdsec_api_key",
-            "badbots_crowdsec_clear",
-            current.crowdsec_api_key.clone(),
-        ),
-        revision: 0,
-        synced_revision: 0,
-        updated_at: chrono::Utc::now(),
-    })
+    parse_badbots_form_with(body, current, current.evidence_policy, current.enabled)
 }
 
 /// Parse the form-encoded body of the reputation form the way the
@@ -77,14 +53,33 @@ pub fn parse_badbots_form_replaced(
     body: &[u8],
     current: &BadbotsSettings,
 ) -> Result<BadbotsSettings, String> {
+    parse_badbots_form_with(body, current, BadbotsEvidencePolicy::Lenient, true)
+}
+
+/// The shared body of the two flavours of the reputation form.
+///
+/// The two flavours differ in exactly two values — what an omitted
+/// field falls back to — and in nothing else, so they share one
+/// parser: the **merge** flavour passes the stored values, the
+/// **replace** flavour the documented defaults.
+///
+/// `current` is the stored row. It is the fallback for the
+/// credentials in both flavours: a key the body does not mention
+/// keeps the stored one, because a credential is write-only.
+fn parse_badbots_form_with(
+    body: &[u8],
+    current: &BadbotsSettings,
+    policy_fallback: BadbotsEvidencePolicy,
+    enabled_fallback: bool,
+) -> Result<BadbotsSettings, String> {
     let policy_raw = super::helpers::require_param(body, "badbots_evidence_policy")
-        .unwrap_or_else(|| BadbotsEvidencePolicy::Lenient.as_str().to_string());
+        .unwrap_or_else(|| policy_fallback.as_str().to_string());
     let evidence_policy = BadbotsEvidencePolicy::parse(&policy_raw).ok_or_else(|| {
         format!("Invalid evidence policy '{policy_raw}'. Expected one of: strict, lenient.")
     })?;
 
     Ok(BadbotsSettings {
-        enabled: param_bool(body, "badbots_enabled", true),
+        enabled: param_bool(body, "badbots_enabled", enabled_fallback),
         evidence_policy,
         abuseipdb_api_key: api_key(
             body,

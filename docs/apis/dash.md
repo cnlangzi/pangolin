@@ -940,16 +940,19 @@ Every answer about a global singleton carries two numbers:
 | `revision` | the node, **only when the content really changes** | the version of the row the node holds |
 | `synced_revision` | the dashboard's writes | the value `revision` had when the dashboard's last write landed |
 
-`revision == synced_revision` means the row is still exactly what the
-dashboard pushed. The two differ once something changed the row
-locally — a **drift**. `synced_revision = 0` means "never
-synchronised".
+`revision == synced_revision` means the row still holds what the
+dashboard pushed — **for the fields the dashboard manages**. The
+credentials are the exception: the dashboard cannot read a key back,
+so a key the operator rotated locally survives every sync. The two
+numbers differ once something changed the row locally — a **drift**.
+`synced_revision = 0` means "never synchronised".
 
 The dashboard's rule is one line: **read the two numbers; if they
 differ, push the whole desired configuration again.** The node answers
 the push with `synced_revision` aligned to `revision`, so the row is
 clean afterwards. No field-level diff is needed — under the replace
-semantics "what I push is what you get".
+semantics "what I push is what you get" for every field the dashboard
+manages.
 
 The node does **not** push a drift notification of its own: the
 dashboard reads the two numbers in the `GET` answer, and one more

@@ -841,9 +841,10 @@ pub struct SystemConfig {
     /// The value [`Self::revision`] had when the dashboard's last
     /// write landed.
     ///
-    /// `revision == synced_revision` means the row is still exactly
-    /// what the dashboard pushed; the two differ once something
-    /// changed the row locally. `0` means "never synchronised".
+    /// `revision == synced_revision` means the row still holds what
+    /// the dashboard pushed — every field of this row is one the
+    /// dashboard manages. The two differ once something changed the
+    /// row locally. `0` means "never synchronised".
     pub synced_revision: i64,
     pub updated_at: DateTime<Utc>,
 }
@@ -888,9 +889,12 @@ pub struct BadbotsSettings {
     /// The value [`Self::revision`] had when the dashboard's last
     /// write landed.
     ///
-    /// `revision == synced_revision` means the row is still exactly
-    /// what the dashboard pushed; the two differ once something
-    /// changed the row locally. `0` means "never synchronised".
+    /// `revision == synced_revision` means the row still holds what
+    /// the dashboard pushed — for the fields the dashboard manages.
+    /// The credentials are the exception: the dashboard cannot read a
+    /// key back, so a key the operator rotated locally survives
+    /// every sync. The two differ once something changed the row
+    /// locally. `0` means "never synchronised".
     pub synced_revision: i64,
     pub updated_at: DateTime<Utc>,
 }

@@ -348,6 +348,20 @@ mod tests {
         String::from_utf8_lossy(&body).into_owned()
     }
 
+    /// The text of the element with the given `data-testid`.
+    fn element_text(body: &str, testid: &str) -> String {
+        let marker = format!(r#"data-testid="{testid}""#);
+        let start = body
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{testid} is on the page"))
+            + marker.len();
+        let end = body[start..]
+            .find("</p>")
+            .unwrap_or_else(|| panic!("{testid} is closed"))
+            + start;
+        body[start..end].to_string()
+    }
+
     /// The page shows the two version counters of the global
     /// configuration (issue #273, R15).
     #[tokio::test]
@@ -379,6 +393,31 @@ mod tests {
         assert!(
             body.contains(r#"data-testid="badbots-drift""#),
             "the reputation card must warn the operator too: {body}"
+        );
+    }
+
+    /// The reputation card names the exception (issue #273, R3).
+    ///
+    /// The dashboard cannot read a credential back, so a key the
+    /// operator rotated locally survives every sync — promising that
+    /// the change will be overwritten would be a lie on that card.
+    #[tokio::test]
+    async fn the_reputation_card_names_the_credential_exception() {
+        let (app, _dir) = start().await;
+        let body = page(&app).await;
+        let system = element_text(&body, "system-config-drift");
+        assert!(
+            system.contains("overwrites the changes made here"),
+            "the global card warns that the sync overwrites the change: {system}"
+        );
+        assert!(
+            !system.contains("except the API keys"),
+            "every field of the global configuration is dashboard-managed: {system}"
+        );
+        let badbots = element_text(&body, "badbots-drift");
+        assert!(
+            badbots.contains("except the API keys"),
+            "the reputation card must say the keys are the exception: {badbots}"
         );
     }
 

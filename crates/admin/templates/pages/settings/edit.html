@@ -304,7 +304,7 @@
         </div>
         {% if badbots.revision != badbots.synced_revision %}
         <p class="text-xs text-amber-600 dark:text-amber-400" data-testid="badbots-drift">
-          {{ lang.t("settings.dashboard_overwrites_local") }}
+          {{ lang.t("settings.dashboard_overwrites_local_except_keys") }}
         </p>
         {% endif %}
       </div>
