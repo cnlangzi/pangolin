@@ -26,9 +26,13 @@ New to Pangolin? Start here:
 
 - [Development](development.md) — the build chain, the admin asset pipeline, the crates.io mirror, the Docker build context, the test tiers and the Pebble test server
 
+## APIs
+
+- [The management API](apis/dash.md) — the dashboard-facing JSON API (`/api/v1/`): the outbound command channel, the two signatures, the error codes, every resource's shape and the per-resource write semantics, plus the onboarding guide for a dashboard implementer (issue #185, issue #262)
+- [The admin API](apis/admin.md) — the admin listener's own `/api/*` endpoints: the HTMX fragments, the mutations, the JSON endpoints and the three SSE streams
+
 ## Design
 
-- [The management API](design/api.md) — the dashboard-facing JSON API (`/api/v1/`): the outbound command channel, the two signatures, the error codes, every resource's shape and the per-resource write semantics (issue #185, issue #262)
 - [Routing and the in-memory index](design/routing-and-index.md) — the wildcard-domain resolution rule, the four in-memory indexes, the reload triggers and the tunnel registration flow
 - [Tunnel](design/tunnel.md) — the tunnel as a byte splice: the two transports (QUIC + WebSocket/TCP), the CONNECT instruction, the certificate and the trust model, the fallback policy
 - [Reverse Proxy](design/reverse-proxy.md) — the forwarding design (v8): one forwarding path, the tunnel as a byte splice, `apply_proxy_policy`, pingora as the single HTTP client, `file://` parity, WS upgrade

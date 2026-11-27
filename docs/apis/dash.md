@@ -25,6 +25,14 @@ dashboard side mirrors — and the end-to-end suite
 (`tests/src/api_e2e.rs`) pins the behaviour described here against a
 mock dashboard.
 
+[The onboarding guide](#the-onboarding-guide) at the end is the
+companion: how to bring a node onto the channel, how to sign what you
+send it and what to do when it refuses. The guide explains how to use
+the specification above — it does not restate it.
+
+The admin listener's own `/api/*` surface is a different thing and
+lives in its own document: [admin.md](admin.md).
+
 ## Contents
 
 - [The channel](#the-channel)
@@ -40,6 +48,7 @@ mock dashboard.
 - [The limits](#the-limits)
 - [The runtime state](#the-runtime-state)
 - [The versions](#the-versions)
+- [The onboarding guide](#the-onboarding-guide)
 
 ## The channel
 
@@ -858,3 +867,316 @@ still carries an `api:` section is ignored, and the gateway binds no
 port for the dashboard.
 
 The error code `api_disabled` is gone with the switch.
+
+## The onboarding guide
+
+This section is for the dashboard side: how to bring a node onto the
+channel, how to check what it sends, how to sign what you send back
+and what to do when something is refused. The sections above are the
+specification; the guide only says how to *use* it. When the two
+disagree, the specification wins.
+
+### Onboarding a node
+
+Two sides meet here: the **node** (the gateway) and the **dashboard**
+(the central product). The node dials **out**, so there is nothing to
+open on the node — no management port, and no `api.listen` key: that
+key is gone since the outbound channel (issue #262).
+
+**On the node**, the operator opens the node's `/settings` page and
+fills in the "Dashboard" card:
+
+| field | editable | what it is |
+| --- | --- | --- |
+| the dashboard's API base address | yes | where the node dials. `https` — or plain `http` on the loopback interface. An empty value means the built-in default is in force. |
+| the token | yes | the bearer credential. **Write-only**: an empty field keeps the stored token, the "remove token" checkbox clears it. |
+| the instance id | no | the id the node is known by in the dashboard. The node generated it on the first boot. |
+
+The card also shows the fingerprint of the key the node trusts, and
+whether the channel is up (the last handshake, the last error). The
+state behind it is the `api_config` table — a singleton row — so
+everything is changed from that one card and nothing has to be
+restarted.
+
+One exception: the row itself is seeded on the **first boot** of the
+gateway. A node whose database predates the channel has no row yet,
+and its card says so instead of accepting the token; the operator has
+to restart the gateway once, and the row appears.
+
+**On the dashboard**, three things have to exist before a node can
+join:
+
+| thing | who makes it |
+| --- | --- |
+| the **token** | the dashboard generates it — at least 128 bits of random data — and hands it to the operator, who pastes it into the card. It must be visible ASCII without spaces: it travels in a header, on every request. |
+| the **instance id** | the node generates it on the first boot; the operator reads it off the card and registers the node under it. The node reports it in `GET /api/v1/instance` too. |
+| the **Ed25519 seed** | the dashboard's own private key — 32 bytes. The node never has it: the node trusts the **public** key compiled into the binary (`crates/api/src/dashboard.pub`). |
+
+The last one is the trap worth knowing before the first handshake: the
+node's trust anchor is **compiled in**. A dashboard whose key does not
+match the shipped `crates/api/src/dashboard.pub` cannot talk to the
+node at all — every handshake fails with `invalid_signature`. Changing
+that key means a new release of the node.
+
+The token's entropy is the dashboard's responsibility. The node stores
+it as it is — it has to compute the HMAC with it — and it travels in
+the `Authorization` header of every request, inside the TLS session.
+A database dump of a node therefore carries a live credential.
+
+### Signing a request
+
+Two signatures, one per direction. Both cover the same canonical
+string; they differ in the key and in the algorithm.
+
+The canonical string is built the same way on both sides:
+
+```text
+canonical(method, path, ts, nonce, token, body) =
+    "PANGOLIN-API-V2\n"
+  + upper(method) + "\n"
+  + path + "\n"
+  + ts + "\n"
+  + nonce + "\n"
+  + lower_hex(sha256(token)) + "\n"
+  + lower_hex(sha256(body)) + "\n"
+```
+
+Every line ends with `\n` — **the last one included**. `path` is the
+request target as it goes on the wire: query string included, not
+percent-decoded.
+
+The **node** signs its requests with the shared token:
+
+```text
+signature = base64url_no_pad(hmac_sha256(key = token, message = canonical))
+```
+
+The **dashboard** signs its answers with its own key:
+
+```text
+signature = base64url_no_pad(ed25519_sign(key = key_from_seed(seed), message = canonical))
+```
+
+#### Three notes for a Go implementation
+
+1. **`base64.RawURLEncoding`** — not `base64.URLEncoding` and not
+   `base64.StdEncoding`. The protocol uses base64url **without
+   padding**: `URLEncoding` appends `=`, and `StdEncoding` produces
+   `+` and `/`. Neither is accepted — the signature does not verify.
+
+2. **`ed25519.NewKeyFromSeed(seed)`** — the dashboard's key comes from
+   a **32-byte seed**, not from a private-key file. The seed is the
+   32 bytes `ed25519.NewKeyFromSeed` takes; `ed25519.PrivateKey` is
+   the 64-byte `seed || public` form, and handing that to
+   `NewKeyFromSeed` panics. The argument order of `ed25519.Sign` is
+   the other way round from most libraries:
+   `ed25519.Sign(privateKey, message)`.
+
+3. **Sign the bytes that go on the wire.** The request target is
+   signed as it is sent. In Go, `url.URL.String()` is the *absolute*
+   URL — it adds the scheme and the host and re-escapes the path — so
+   it is **not** the request target; the target that goes into the
+   request line is `url.URL.RequestURI()`. Build the target **once**,
+   sign that exact string and send the same string: never sign one
+   form and send another.
+
+### The reference client
+
+`crates/api/src/client.rs` is the reference implementation of the
+node's side — the dashboard side mirrors it, and the end-to-end suite
+drives it, so the two cannot drift apart silently.
+
+| symbol | what it is |
+| --- | --- |
+| `NodeClient::new(token)` | the node's client. It refuses a token an `Authorization` header could not carry, so a bad token fails at construction instead of on the first request. |
+| `NodeClient::nonce()` | a fresh nonce: 16 random bytes as 32 lower-case hex characters. |
+| `NodeClient::get(path)` | a signed `GET` — a `SignedRequest`. |
+| `NodeClient::post(path, body)` | a signed `POST` — a `SignedRequest`. |
+| `NodeClient::signed_request(method, path, body, ts, nonce)` | a signed request with **any** method and a pinned timestamp and nonce — this is the one for `PUT` and `DELETE`. |
+| `verify_node_request(headers, method, path, body, token, now)` | the dashboard's four checks, without the replay check. |
+| `NodeAuthenticator::new(token)` + `authenticate(...)` | the dashboard's side in full: the four checks **plus** the replay check. |
+
+The client does not open a socket: it hands the caller a
+`SignedRequest` — the method, the target, the headers and the body —
+and the transport is the caller's business. That is why the crate
+carries no HTTP client dependency.
+
+The Ed25519 half lives in `crates/api/src/protocol/signature.rs`:
+`sign_with_seed(&[u8; 32], message)` and `public_key_from_seed(&[u8; 32])`.
+The public key the node trusts is the compiled-in
+`crates/api/src/dashboard.pub`.
+
+There is **no** sample key pair in the repository — the dashboard's
+key pair is not in the repository at all, and the end-to-end suite
+verifies the dashboard's signature with a **mock** verifier (issue
+#262): a build with the `test-dashboard-key` feature accepts one
+sentinel signature and refuses every other one. So there is nothing to
+copy for a local run; the seed is the dashboard's to keep.
+
+### A walkthrough
+
+The whole loop, from the dashboard's side.
+
+**1 — the node dials out.** It opens the subscription:
+
+```http
+GET /api/v1/join HTTP/1.1
+Host: dash.example.com
+Authorization: Bearer <token>
+X-Pangolin-Node-Ts: 1700000000
+X-Pangolin-Node-Nonce: 0123456789abcdef0123456789abcdef
+X-Pangolin-Node-Sig: <base64url(hmac-sha256(token, canonical))>
+Accept: text/event-stream
+```
+
+**2 — the dashboard verifies it,** cheapest check first:
+
+| # | check | failure |
+| --- | --- | --- |
+| 1 | the four headers are present and well-formed | `400 malformed_request` |
+| 2 | `\|now - ts\| ≤ 300` | `401 timestamp_out_of_window` |
+| 3 | the bearer token matches | `401 invalid_token` |
+| 4 | the signature verifies | `401 invalid_signature` |
+| 5 | the nonce was not used inside the window | `401 replayed_nonce` |
+
+**3 — the dashboard answers with the handshake,** three headers that
+prove it holds the private key:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+X-Pangolin-Dashboard-Ts: 1700000001
+X-Pangolin-Dashboard-Nonce: 0123456789abcdef0123456789abcdef
+X-Pangolin-Dashboard-Sig: <base64url(ed25519 signature)>
+```
+
+The signature covers the canonical string of the **join** request,
+with the dashboard's own timestamp and the node's nonce echoed back:
+
+```text
+PANGOLIN-API-V2\n
+GET\n
+/api/v1/join\n
+{dashboard's ts}\n
+{node's nonce}\n
+{sha256_hex(token)}\n
+{sha256_hex("")}\n
+```
+
+The node refuses the subscription unless the echoed nonce is the nonce
+it just sent, the timestamp is inside ±300 s and the signature
+verifies against the compiled-in key.
+
+**4 — the dashboard sends a command** down the subscription, one
+`data:` frame per command:
+
+```text
+data: {"id":"c-42","method":"GET","path":"/api/v1/sites","body":null}
+```
+
+The node runs it through the very same router the REST API used — the
+resource shapes, the error envelope, the write semantics and the
+validators are unchanged — and answers a command that is not inside
+`/api/v1/` with the namespace's `404`.
+
+**5 — the node reports the result:**
+
+```json
+{ "id": "c-42", "status": 200, "headers": { "content-type": "application/json" }, "body": "eyJ…" }
+```
+
+The dashboard correlates the result with the command by `id`. A command
+the dashboard retried — because its answer did not arrive — is
+executed **again**: the second answer is the resource's own conflict
+(`409 site_exists`), and the first write is not undone. Treat the
+conflict as "the write happened".
+
+### Troubleshooting
+
+Every code of [the error envelope](#the-error-envelope), with what it
+looks like, what causes it and what to do about it.
+
+| code | symptom | cause | what to do |
+| --- | --- | --- | --- |
+| `malformed_request` | the request is refused before it is authenticated | a header is missing or malformed — the timestamp is not a number, the nonce is not 32 hex characters, the `Authorization` header is not a bearer token — or the body is not valid JSON | check the four headers against the table in "The join request"; the body has to be JSON the dashboard can parse |
+| `unauthorized` | the request is refused and no other code explains why | the catch-all for an authentication failure | check the token and the signature; one of the codes below says more |
+| `timestamp_out_of_window` | every request is refused, a fresh one too | the node's clock is more than 300 s away from the dashboard's | sync the node's clock (NTP); the window is ±300 s |
+| `invalid_token` | the request is refused although the timestamp is fine | the bearer token does not match the one the dashboard holds for this node | the token is **write-only** on the node: hand the operator a fresh one and paste it into the "Dashboard" card |
+| `replayed_nonce` | a retry is refused while a fresh request passes | the nonce was already used inside the window | a fresh nonce per request — 16 random bytes as 32 hex characters — and never reuse one |
+| `invalid_signature` | the request is refused although the token is right | the signature does not verify: the canonical string does not match the bytes that arrived | compare the canonical string field by field — the method upper-cased, the target **as sent**, the timestamp, the nonce, `sha256_hex(token)`, `sha256_hex(body)` — and remember that the trailing `\n` on the last line is part of the contract |
+| `not_found` | the command is answered with a `404` | no such endpoint; a target outside `/api/v1/` is refused here too | check the namespace — the admin UI's own routes are not reachable through the channel |
+| `<resource>_not_found` | the command is answered with a `404` and a specific code | the resource does not exist — e.g. `site_not_found` | read the node's state first; a `PUT` of a per-site sub-resource for a site that does not exist is this error too |
+| `<resource>_exists` | a `POST` is answered with a `409` | the resource already exists — e.g. `site_exists` | a retried command lands here: treat the conflict as "the write happened" |
+| `<field>_invalid` | the write is refused and the error names a field | a field failed validation — e.g. `backend_invalid` | the envelope's `field` key names it; the API validates through the admin UI's own parsers, so the message is the form's own message |
+| `internal_error` | the write is refused with a `500` | something the API did not expect | the node's log has the details; the write did **not** happen — retry later |
+
+### Integration notes
+
+Eight things that are easy to get wrong when a dashboard drives a
+node for the first time.
+
+1. **`DELETE` is idempotent.** `DELETE /api/v1/sites/{name}` on a site
+   that does not exist is a success, not a `404`. The dashboard can
+   delete without reading first.
+
+2. **`PUT` is a full replace.** The body replaces the resource as a
+   whole: a field the body omits is cleared or falls back to its
+   default. Send the whole resource, or read it first and merge on the
+   dashboard side. The two exceptions — the `enabled` flag and the
+   site's sub-objects — keep the stored value; see
+   [The write semantics](#the-write-semantics).
+
+3. **The report is capped at 1 MiB.** The result the node sends back
+   may not be bigger than that. A command whose *answer* does not fit
+   — the raw log of a busy day, say — comes back as an **error**:
+   `413 result_too_large`. The dashboard learns that the command
+   failed instead of waiting for an answer that never comes, so a
+   resource that does not fit has to be fetched in pieces.
+
+4. **Every write reloads the indexes.** Each write calls
+   `reload_indexes()`, so the next proxied request sees the change. A
+   dashboard that writes in a loop pays the reload on every write.
+
+5. **The log endpoints serve raw content.** The analysis belongs to
+   the dashboard: `/api/v1/logs/bot/raw` is the
+   `bot-YYYY-MM-DD.jsonl` byte for byte, and `/api/v1/logs/access` is
+   the in-memory ring buffer. The node neither aggregates nor counts
+   nor classifies.
+
+6. **Credentials are never echoed.** A read answers `has_api_token`,
+   `has_token`, `has_abuseipdb_api_key` — booleans, not the secret.
+   The tunnel token comes back **exactly once**: in the answer of the
+   `POST` that created the tunnel and of the `PUT` that rotated it.
+   Keep it — the dashboard cannot read it back.
+
+7. **Clock skew is the only symptom.** A node whose clock drifted out
+   of the ±300 s window is refused with `timestamp_out_of_window` and
+   nothing else: no retry hint, no different code. Sync the clock
+   before looking anywhere else.
+
+8. **A nonce is used once.** 32 hex characters — 16 random bytes —
+   and a fresh one per request. The dashboard remembers the nonces it
+   has answered for **twice** the window (600 s), so a reused nonce is
+   refused for longer than the window it was signed in.
+
+### Versioning
+
+`/api/v1/` is a **published contract**. The dashboard is a separate
+product; it may run a different version than the node, and the two
+have to keep talking. So:
+
+- changing the **signing protocol**, the **error codes** or the
+  **resource shapes** is a **breaking change**: it needs a version
+  bump and a migration note, and the node and the dashboard have to be
+  shipped together;
+- changing a **message**, the **order of the fields** or a field that
+  is not part of a resource's shape is not;
+- the **canonical prefix** names the protocol version, so an old
+  client cannot produce a new string by accident;
+- the **dashboard's public key** is compiled into the binary
+  (`crates/api/src/dashboard.pub`): changing it means a new release of
+  the node.
+
+[The versions](#the-versions) says which versions have shipped and
+what changed between them; the rules above decide whether the next
+change needs one.

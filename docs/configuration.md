@@ -184,7 +184,7 @@ exposes **no** management port: it dials **out** to the dashboard,
 opens a subscription and executes the commands that arrive on it. A
 gateway behind a NAT — or on a private network — is reachable, because
 it is the one that opens the connection. See
-[design/api.md](design/api.md) for the protocol.
+[apis/dash.md](apis/dash.md) for the protocol.
 
 Everything the channel needs is **runtime state** in the `api_config`
 table — the bearer token, the dashboard's API base address and the
