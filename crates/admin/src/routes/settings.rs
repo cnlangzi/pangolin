@@ -52,6 +52,8 @@ async fn render_page(
             abuseipdb_key_configured: s.abuseipdb_api_key.is_some(),
             crowdsec_key_configured: s.crowdsec_api_key.is_some(),
             updated_at: s.updated_at.to_rfc3339(),
+            revision: s.revision,
+            synced_revision: s.synced_revision,
         },
         Err(e) => {
             log::warn!("settings: reading the badbots configuration failed: {e}");
@@ -61,6 +63,8 @@ async fn render_page(
                 abuseipdb_key_configured: false,
                 crowdsec_key_configured: false,
                 updated_at: String::new(),
+                revision: 0,
+                synced_revision: 0,
             }
         }
     };
@@ -77,6 +81,8 @@ async fn render_page(
         provider_ranges: provider_range_statuses(app, lang).await,
         guard_rejections: total_guard_rejections(app),
         updated_at: cfg.updated_at.to_rfc3339(),
+        revision: cfg.revision,
+        synced_revision: cfg.synced_revision,
         badbots,
         dashboard: dashboard_view(app).await,
         error,
@@ -306,4 +312,115 @@ pub async fn render_with_dashboard_error(
     lang: Lang,
 ) -> http::Result<Response<Full<Bytes>>> {
     render_page(app, csrf, None, Some(error), lang).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    /// A gateway with an empty database.
+    async fn start() -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let app = Arc::new(
+            App::new(
+                db_path.to_str().expect("utf8"),
+                pangolin_core::Config::default(),
+                pangolin_core::CertManager::default(),
+            )
+            .expect("App::new"),
+        );
+        (app, dir)
+    }
+
+    /// The rendered settings page.
+    async fn page(app: &Arc<App>) -> String {
+        let response = handle_render_settings(app, "the-csrf-token", Lang::En)
+            .await
+            .expect("the page renders");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body")
+            .to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// The page shows the two version counters of the global
+    /// configuration (issue #273, R15).
+    #[tokio::test]
+    async fn the_settings_page_shows_the_two_versions() {
+        let (app, _dir) = start().await;
+        let body = page(&app).await;
+        assert!(
+            body.contains(r#"data-testid="system-config-revision""#),
+            "the page must show the version counters: {body}"
+        );
+        assert!(
+            body.contains(r#"data-testid="badbots-revision""#),
+            "the page must show the reputation counters: {body}"
+        );
+    }
+
+    /// A node that never synchronised with the dashboard says so: the
+    /// two counters differ, and the dashboard's next sync will
+    /// overwrite the local configuration (issue #273, R15).
+    #[tokio::test]
+    async fn a_drifted_configuration_says_that_the_dashboard_overwrites_it() {
+        let (app, _dir) = start().await;
+        let body = page(&app).await;
+        // The seeded row reads revision 1 and synced_revision 0.
+        assert!(
+            body.contains(r#"data-testid="system-config-drift""#),
+            "a node that never synchronised must warn the operator: {body}"
+        );
+        assert!(
+            body.contains(r#"data-testid="badbots-drift""#),
+            "the reputation card must warn the operator too: {body}"
+        );
+    }
+
+    /// A configuration the dashboard pushed is clean: the two counters
+    /// are equal and the page says nothing about an overwrite.
+    #[tokio::test]
+    async fn a_synchronised_configuration_shows_no_overwrite_notice() {
+        let (app, _dir) = start().await;
+        // The write runs on the blocking pool (issue #254) — a route
+        // never takes the database lock on an async worker.
+        app.with_db_res(|db| {
+            let mut cfg = pangolin_core::db::get_system_config(db)?;
+            cfg.provider = pangolin_core::ProviderKey::Cloudflare;
+            pangolin_core::db::update_system_config(
+                db,
+                &cfg,
+                pangolin_core::ConfigWriteSource::Dashboard,
+            )?;
+            let mut badbots = pangolin_core::db::get_badbots_config(db)?;
+            badbots.evidence_policy = pangolin_core::BadbotsEvidencePolicy::Strict;
+            pangolin_core::db::update_badbots_config(
+                db,
+                &badbots,
+                pangolin_core::ConfigWriteSource::Dashboard,
+            )
+        })
+        .await
+        .expect("the dashboard writes land");
+        app.reload_indexes().await;
+
+        let body = page(&app).await;
+        assert!(
+            body.contains(r#"data-testid="system-config-revision""#),
+            "the page must still show the counters: {body}"
+        );
+        assert!(
+            !body.contains(r#"data-testid="system-config-drift""#),
+            "a synchronised configuration must not warn about an overwrite: {body}"
+        );
+        assert!(
+            !body.contains(r#"data-testid="badbots-drift""#),
+            "a synchronised reputation configuration must not warn either: {body}"
+        );
+    }
 }

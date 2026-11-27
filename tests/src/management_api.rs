@@ -229,8 +229,13 @@ async fn a_tun_never_echoes_its_token_but_returns_it_once() {
 
 // ── The write semantics ─────────────────────────────────────────────────
 
+/// The global configuration is **replaced** by a dashboard write
+/// (issue #273, R1).
+///
+/// The body is the desired state: a field it does not mention is
+/// cleared or falls back to its default.
 #[tokio::test]
-async fn the_system_config_is_merged() {
+async fn the_system_config_is_replaced() {
     let server = start_api().await;
     // Set a value first.
     let body = serde_json::json!({
@@ -243,16 +248,66 @@ async fn the_system_config_is_merged() {
         .await;
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["provider"], "cloudflare");
+    assert_eq!(json["client_ip_header"], "CF-Connecting-IP");
 
-    // A second write that mentions nothing keeps it.
-    let body = serde_json::json!({ "pgl_headers_enabled": false }).to_string();
+    // A second write that does not mention the header clears it.
+    let body = serde_json::json!({ "provider": "cloudflare" }).to_string();
     let (status, json) = server
         .call("PUT", "/api/v1/system_config", body.as_bytes())
         .await;
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["provider"], "cloudflare");
-    assert_eq!(json["client_ip_header"], "CF-Connecting-IP");
-    assert_eq!(json["pgl_headers_enabled"], false);
+    assert!(
+        json["client_ip_header"].is_null(),
+        "the header the body does not mention must be cleared: {json}"
+    );
+    assert_eq!(json["client_country_header"], serde_json::Value::Null);
+    assert_eq!(json["client_region_header"], serde_json::Value::Null);
+    assert_eq!(
+        json["pgl_headers_enabled"], true,
+        "an omitted switch falls back to its default: {json}"
+    );
+    assert_eq!(
+        json["origin_guard_enabled"], false,
+        "an omitted switch falls back to its default: {json}"
+    );
+}
+
+/// The provider has no "unset" member, so a body without one is
+/// refused (issue #273, R4).
+#[tokio::test]
+async fn a_system_config_without_a_provider_is_refused() {
+    let server = start_api().await;
+    let body = serde_json::json!({ "pgl_headers_enabled": false }).to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 422, "{json}");
+    assert_eq!(error_code(&json), "system_config_invalid");
+}
+
+/// The global origin guard may not be switched on for a provider that
+/// publishes no source-IP ranges (issue #273, R6).
+#[tokio::test]
+async fn a_system_config_that_opens_the_guard_for_a_provider_without_ranges_is_refused() {
+    let server = start_api().await;
+    let body = serde_json::json!({
+        "provider": "direct",
+        "origin_guard_enabled": true,
+    })
+    .to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 422, "{json}");
+    assert_eq!(error_code(&json), "system_config_invalid");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin guard"),
+        "the message must be the one the admin form gives: {json}"
+    );
 }
 
 #[tokio::test]
@@ -303,7 +358,7 @@ async fn the_origin_allow_list_is_replaced() {
 }
 
 #[tokio::test]
-async fn a_reputation_key_is_merged_and_can_be_cleared() {
+async fn a_reputation_key_is_kept_and_can_be_cleared() {
     let server = start_api().await;
     let body = serde_json::json!({ "abuseipdb_api_key": "key-1" }).to_string();
     let (status, json) = server
@@ -313,7 +368,8 @@ async fn a_reputation_key_is_merged_and_can_be_cleared() {
     assert_eq!(json["has_abuseipdb_api_key"], true);
     assert_eq!(json["has_crowdsec_api_key"], false);
 
-    // A write that mentions nothing keeps the key.
+    // A write that mentions nothing keeps the key — the credential
+    // exception of the replace semantics (issue #273, R3).
     let body = serde_json::json!({ "enabled": false }).to_string();
     let (status, json) = server
         .call("PUT", "/api/v1/badbots_config", body.as_bytes())
@@ -321,6 +377,10 @@ async fn a_reputation_key_is_merged_and_can_be_cleared() {
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["has_abuseipdb_api_key"], true);
     assert_eq!(json["enabled"], false);
+    assert_eq!(
+        json["evidence_policy"], "lenient",
+        "an omitted policy falls back to its default: {json}"
+    );
 
     // `null` clears it.
     let body = serde_json::json!({ "abuseipdb_api_key": null }).to_string();
@@ -329,6 +389,119 @@ async fn a_reputation_key_is_merged_and_can_be_cleared() {
         .await;
     assert_eq!(status, 200, "{json}");
     assert_eq!(json["has_abuseipdb_api_key"], false);
+}
+
+// ── The version counters ────────────────────────────────────────────────
+
+/// The two counters travel with every answer (issue #273, R11).
+#[tokio::test]
+async fn the_system_config_reports_its_two_versions() {
+    let server = start_api().await;
+    let (status, json) = server.call("GET", "/api/v1/system_config", b"").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 1, "{json}");
+    assert_eq!(json["synced_revision"], 0, "{json}");
+
+    let body = serde_json::json!({ "provider": "cloudflare" }).to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 2, "{json}");
+    assert_eq!(
+        json["synced_revision"], 2,
+        "a dashboard write marks the row as synchronised: {json}"
+    );
+
+    let (status, json) = server.call("GET", "/api/v1/system_config", b"").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 2, "{json}");
+    assert_eq!(json["synced_revision"], 2, "{json}");
+}
+
+/// A write that changes nothing does not move the revision
+/// (issue #273, R7).
+#[tokio::test]
+async fn a_dashboard_write_that_changes_nothing_leaves_the_revision_alone() {
+    let server = start_api().await;
+    let body = serde_json::json!({ "provider": "cloudflare" }).to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 2, "{json}");
+
+    // The same content again.
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(
+        json["revision"], 2,
+        "the content did not change, so the revision must not move: {json}"
+    );
+    assert_eq!(json["synced_revision"], 2, "{json}");
+}
+
+/// A local write makes the row drift: the revision moves, the sync
+/// counter does not (issue #273, R9).
+#[tokio::test]
+async fn a_local_write_leaves_the_row_drifted() {
+    let server = start_api().await;
+    let body = serde_json::json!({ "provider": "cloudflare" }).to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/system_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 2, "{json}");
+
+    // The operator changes the configuration in the admin UI.
+    let mut local = server
+        .app
+        .with_db_res(pangolin_core::db::get_system_config)
+        .await
+        .expect("the row exists");
+    local.provider = pangolin_core::ProviderKey::CustomLb;
+    server
+        .app
+        .with_db_res(move |db| {
+            pangolin_core::db::update_system_config(
+                db,
+                &local,
+                pangolin_core::ConfigWriteSource::Admin,
+            )
+        })
+        .await
+        .expect("the local write lands");
+    server.app.reload_indexes().await;
+
+    let (status, json) = server.call("GET", "/api/v1/system_config", b"").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 3, "{json}");
+    assert_eq!(
+        json["synced_revision"], 2,
+        "a local write must not move the sync counter: {json}"
+    );
+    assert_ne!(json["revision"], json["synced_revision"]);
+}
+
+/// The reputation configuration carries the same counters
+/// (issue #273, R11).
+#[tokio::test]
+async fn the_reputation_config_reports_its_two_versions() {
+    let server = start_api().await;
+    let (status, json) = server.call("GET", "/api/v1/badbots_config", b"").await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 1, "{json}");
+    assert_eq!(json["synced_revision"], 0, "{json}");
+
+    let body = serde_json::json!({ "enabled": false }).to_string();
+    let (status, json) = server
+        .call("PUT", "/api/v1/badbots_config", body.as_bytes())
+        .await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["revision"], 2, "{json}");
+    assert_eq!(json["synced_revision"], 2, "{json}");
 }
 
 #[tokio::test]

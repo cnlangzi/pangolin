@@ -105,8 +105,8 @@ pub use traffic::{
 };
 pub use types::{
     BackendKind, BadbotsEvidencePolicy, BadbotsSettings, Cert, CertErrorClass, CertStatus,
-    ChallengeKind, ChallengeType, DnsProvider, DnsProviderKind, Domain, HostMode, Site,
-    SystemConfig, Tun, next_backoff,
+    ChallengeKind, ChallengeType, ConfigWriteSource, DnsProvider, DnsProviderKind, Domain,
+    HostMode, Site, SystemConfig, Tun, next_backoff,
 };
 
 /// Library version, e.g. for admin templates and log lines.

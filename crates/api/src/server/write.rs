@@ -8,8 +8,11 @@
 //! | resource | semantics |
 //! | --- | --- |
 //! | `site_rate_limit_bots`, `site_origin_allow` | **replace** |
-//! | `system_config`, `badbots_config` | **merge** |
 //! | everything else | **full replace** |
+//!
+//! The two global singletons (`system_config`, `badbots_config`) are a
+//! **full replace** too since issue #273 — the dashboard owns them,
+//! and what it pushes is what the node gets.
 
 use std::collections::BTreeSet;
 
@@ -1091,21 +1094,20 @@ pub async fn put_site_origin_allow(ctx: &Ctx<'_>, site: &str) -> ApiResponse {
 
 // ── The singletons ──────────────────────────────────────────────────────
 
-/// `PUT /api/v1/system_config` — merge.
+/// `PUT /api/v1/system_config` — replace.
+///
+/// The body is the desired state: a field the body does not mention is
+/// cleared or falls back to its default. The write is the dashboard's,
+/// so the write layer marks the row as synchronised and the answer
+/// carries the two version counters (issue #273).
 pub async fn put_system_config(ctx: &Ctx<'_>) -> ApiResponse {
     let dto: SystemConfigDto = match ctx.json_body() {
         Ok(d) => d,
         Err(e) => return ApiResponse::error(&e),
     };
-    let current = ctx.state.app.system_config.read().clone();
-    let params = dto.to_params(&current);
+    let params = dto.to_params();
     let body = encode_form(&params);
-    let parsed = match admin::routes::system::parse_system_config_form_merged(
-        &ctx.state.app,
-        body.as_bytes(),
-    )
-    .await
-    {
+    let parsed = match admin::routes::system::parse_system_config_form_replaced(body.as_bytes()) {
         Ok(c) => c,
         Err(msg) => {
             return ApiResponse::error(&ApiError::unprocessable(
@@ -1115,22 +1117,34 @@ pub async fn put_system_config(ctx: &Ctx<'_>) -> ApiResponse {
             ));
         }
     };
-    {
+    let written = {
         let cfg = parsed.clone();
-        let written = ctx
-            .state
+        ctx.state
             .app
-            .with_db_res(move |db| pangolin_core::db::update_system_config(db, &cfg))
-            .await;
-        if let Err(e) = written {
-            return ApiResponse::error(&read::database_error(e));
-        }
-    }
+            .with_db_res(move |db| {
+                pangolin_core::db::update_system_config(
+                    db,
+                    &cfg,
+                    pangolin_core::ConfigWriteSource::Dashboard,
+                )
+            })
+            .await
+    };
+    let written = match written {
+        Ok(w) => w,
+        Err(e) => return ApiResponse::error(&read::database_error(e)),
+    };
     ctx.state.app.reload_indexes().await;
-    ApiResponse::json_of(200, &parsed)
+    ApiResponse::json_of(200, &written)
 }
 
-/// `PUT /api/v1/badbots_config` — merge.
+/// `PUT /api/v1/badbots_config` — replace.
+///
+/// The body is the desired state: a field the body does not mention
+/// falls back to its default. The credentials are the exception — a
+/// key the body does not mention keeps the stored one. The write is
+/// the dashboard's, so the write layer marks the row as synchronised
+/// and the answer carries the two version counters (issue #273).
 pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
     let dto: BadbotsConfigDto = match ctx.json_body() {
         Ok(d) => d,
@@ -1146,34 +1160,43 @@ pub async fn put_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
     };
     let params = dto.to_params();
     let body = encode_form(&params);
-    let parsed = match admin::routes::badbots::parse_badbots_form(body.as_bytes(), &current) {
-        Ok(c) => c,
-        Err(msg) => {
-            return ApiResponse::error(&ApiError::unprocessable(
-                "badbots_config_invalid",
-                msg,
-                None,
-            ));
-        }
-    };
-    {
+    let parsed =
+        match admin::routes::badbots::parse_badbots_form_replaced(body.as_bytes(), &current) {
+            Ok(c) => c,
+            Err(msg) => {
+                return ApiResponse::error(&ApiError::unprocessable(
+                    "badbots_config_invalid",
+                    msg,
+                    None,
+                ));
+            }
+        };
+    let written = {
         let cfg = parsed.clone();
-        let written = ctx
-            .state
+        ctx.state
             .app
-            .with_db_res(move |db| pangolin_core::db::update_badbots_config(db, &cfg))
-            .await;
-        if let Err(e) = written {
-            return ApiResponse::error(&read::database_error(e));
-        }
-    }
+            .with_db_res(move |db| {
+                pangolin_core::db::update_badbots_config(
+                    db,
+                    &cfg,
+                    pangolin_core::ConfigWriteSource::Dashboard,
+                )
+            })
+            .await
+    };
+    let written = match written {
+        Ok(w) => w,
+        Err(e) => return ApiResponse::error(&read::database_error(e)),
+    };
     ctx.state.app.rebuild_badbots().await;
     let view = crate::dto::views::BadbotsSettingsView {
-        enabled: parsed.enabled,
-        evidence_policy: parsed.evidence_policy.as_str().to_string(),
-        has_abuseipdb_api_key: parsed.abuseipdb_api_key.is_some(),
-        has_crowdsec_api_key: parsed.crowdsec_api_key.is_some(),
-        updated_at: parsed.updated_at,
+        enabled: written.enabled,
+        evidence_policy: written.evidence_policy.as_str().to_string(),
+        has_abuseipdb_api_key: written.abuseipdb_api_key.is_some(),
+        has_crowdsec_api_key: written.crowdsec_api_key.is_some(),
+        updated_at: written.updated_at,
+        revision: written.revision,
+        synced_revision: written.synced_revision,
     };
     ApiResponse::json_of(200, &view)
 }

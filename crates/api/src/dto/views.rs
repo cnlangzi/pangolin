@@ -79,6 +79,16 @@ pub struct BadbotsSettingsView {
     pub has_abuseipdb_api_key: bool,
     pub has_crowdsec_api_key: bool,
     pub updated_at: DateTime<Utc>,
+    /// The node's own version of the row (issue #273).
+    ///
+    /// It goes up by one when the content really changes.
+    pub revision: i64,
+    /// The value `revision` had when the dashboard's last write
+    /// landed.
+    ///
+    /// The two are equal if and only if the row is still exactly what
+    /// the dashboard pushed; `0` means "never synchronised".
+    pub synced_revision: i64,
 }
 
 /// One tunnel node's state.

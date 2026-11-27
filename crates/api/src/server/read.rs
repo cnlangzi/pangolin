@@ -348,6 +348,8 @@ pub async fn get_badbots_config(ctx: &Ctx<'_>) -> ApiResponse {
         has_abuseipdb_api_key: settings.abuseipdb_api_key.is_some(),
         has_crowdsec_api_key: settings.crowdsec_api_key.is_some(),
         updated_at: settings.updated_at,
+        revision: settings.revision,
+        synced_revision: settings.synced_revision,
     };
     ApiResponse::json_of(200, &view)
 }

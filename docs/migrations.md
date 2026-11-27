@@ -172,6 +172,7 @@ If the database has fewer rows than files, those migrations are pending and will
 | V14     | `rewrite_removed_bot_ids` | #151 | Rewrites the per-site bot lists for crawlers the knownbots registry no longer has: deletes `google-extended` and `cloudflare-alwaysonline` (no successor), and renames `applebot-extended` to `applebot` |
 | V15     | `add_api_config` | #185 | The `api_config` singleton — the runtime state of the dashboard-facing management API: the instance id, the bearer token's SHA-256 hash, the dashboard's address and the enabled switch |
 | V16     | `api_config_outbound_channel` | #262 | Rewrites `api_config` for the outbound dashboard channel: `token_hash` becomes the plaintext `token` (the node signs its requests with it), `dash_api` replaces the dashboard's learned address, and `enabled`, `dashboard_port` and `dashboard_ip` are dropped. **The old token cannot be recovered** — it was a one-way hash — so an upgraded node needs a new token before it dials the dashboard |
+| V17     | `config_revisions` | #273 | Adds the two version counters (`revision`, `synced_revision`) to the two global singletons (`system_config`, `badbots_config`). The seeded rows read `revision = 1` and `synced_revision = 0` — "never synchronised" — so the dashboard pushes its desired state once after the upgrade |
 
 ## Troubleshooting
 

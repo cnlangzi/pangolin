@@ -763,3 +763,125 @@ async fn settings_post_dashboard_falls_back_to_the_built_in_dash_api() {
         "the built-in default must be shown: {body}"
     );
 }
+
+// ── §8 — The version counters (issue #273) ─────────────────────────────────
+//
+// The two global singletons carry two version counters: the node's own
+// `revision` and the `synced_revision` the dashboard last pushed. The
+// settings page shows both, and says that the dashboard's next sync
+// overwrites a local change when the two differ.
+
+#[tokio::test]
+async fn the_settings_page_shows_the_two_versions_and_the_overwrite_notice() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="system-config-revision""#),
+        "the page must show the version counters: {body}"
+    );
+    assert!(
+        body.contains(r#"data-testid="badbots-revision""#),
+        "the page must show the reputation counters: {body}"
+    );
+    // A node that never synchronised with the dashboard carries
+    // revision 1 and synced_revision 0 — the two differ, so the page
+    // warns that the dashboard's next sync overwrites the local
+    // configuration.
+    assert!(
+        body.contains(r#"data-testid="system-config-drift""#),
+        "a node that never synchronised must warn the operator: {body}"
+    );
+    assert!(
+        body.contains(r#"data-testid="badbots-drift""#),
+        "the reputation card must warn the operator too: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_synchronised_configuration_shows_no_overwrite_notice() {
+    // The row is seeded as the dashboard left it: the two counters
+    // are equal, so nothing is going to be overwritten.
+    let ngx = NgxProcess::start(|db_path| {
+        init_pangolin_db(db_path);
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.execute(
+            "UPDATE system_config SET revision = 3, synced_revision = 3 WHERE id = 1",
+            [],
+        )
+        .expect("seed the counters");
+        conn.execute(
+            "UPDATE badbots_config SET revision = 2, synced_revision = 2 WHERE id = 1",
+            [],
+        )
+        .expect("seed the counters");
+    })
+    .await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="system-config-revision""#),
+        "the page must still show the counters: {body}"
+    );
+    assert!(
+        !body.contains(r#"data-testid="system-config-drift""#),
+        "a synchronised configuration must not warn about an overwrite: {body}"
+    );
+    assert!(
+        !body.contains(r#"data-testid="badbots-drift""#),
+        "a synchronised reputation configuration must not warn either: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_local_change_moves_the_revision_and_keeps_the_drift_notice() {
+    let ngx = start_ngx().await;
+    let client = AdminClient::new(&ngx);
+    client.login("admin", "admin").await.unwrap();
+
+    let csrf = client
+        .csrf_token(&client.get("/settings").await.unwrap().text().await.unwrap())
+        .expect("csrf on /settings");
+
+    // The operator changes the provider in the admin UI — a **local**
+    // write: the revision moves, the sync counter does not.
+    let resp = client
+        .post_form(
+            "/settings",
+            &[
+                ("_csrf", &csrf),
+                ("provider", "cloudflare"),
+                ("origin_guard_enabled", "false"),
+                ("pgl_headers_enabled", "true"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 302);
+
+    let conn = rusqlite::Connection::open(ngx.db_path()).expect("open db");
+    let (revision, synced_revision): (i64, i64) = conn
+        .query_row(
+            "SELECT revision, synced_revision FROM system_config WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("the row exists");
+    assert_eq!(revision, 2, "the content changed, so the revision moved");
+    assert_eq!(
+        synced_revision, 0,
+        "a local write must not move the sync counter"
+    );
+
+    // The page still warns that the dashboard's next sync overwrites
+    // the local change.
+    let body = client.get("/settings").await.unwrap().text().await.unwrap();
+    assert!(
+        body.contains(r#"data-testid="system-config-drift""#),
+        "a local change must warn the operator: {body}"
+    );
+}

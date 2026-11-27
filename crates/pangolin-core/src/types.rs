@@ -782,6 +782,22 @@ pub enum BackendKind {
 // the provider's published IP ranges. What sits here is only the
 // *global default* every site inherits unless it overrides it.
 
+/// Who wrote a global configuration row (issue #273).
+///
+/// The two global singletons have two writers: the node's own admin
+/// UI and the dashboard, which pushes the desired state down the
+/// outbound channel. The write layer needs to know which one it is
+/// serving, because only the dashboard's write marks the row as
+/// synchronised — a local write leaves the sync counter alone, and
+/// the two counters then say that the row drifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigWriteSource {
+    /// A local write from the node's own admin UI.
+    Admin,
+    /// A write the dashboard pushed down the outbound channel.
+    Dashboard,
+}
+
 /// Singleton system config row (system_config table, V7).
 ///
 /// Loaded once at startup via `db::get_system_config` and refreshed
@@ -816,6 +832,19 @@ pub struct SystemConfig {
     /// does not override it refuses requests whose TCP peer is
     /// outside its allowlist.
     pub origin_guard_enabled: bool,
+    /// The node's own version of this row (issue #273).
+    ///
+    /// It goes up by one when the **content** really changes — a
+    /// write that changes nothing leaves it alone. The dashboard
+    /// reads it to tell whether the row is still what it last pushed.
+    pub revision: i64,
+    /// The value [`Self::revision`] had when the dashboard's last
+    /// write landed.
+    ///
+    /// `revision == synced_revision` means the row is still exactly
+    /// what the dashboard pushed; the two differ once something
+    /// changed the row locally. `0` means "never synchronised".
+    pub synced_revision: i64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -850,6 +879,19 @@ pub struct BadbotsSettings {
     pub abuseipdb_api_key: Option<String>,
     /// The CrowdSec key. `None` = the provider is not queried.
     pub crowdsec_api_key: Option<String>,
+    /// The node's own version of this row (issue #273).
+    ///
+    /// It goes up by one when the **content** really changes — a
+    /// write that changes nothing leaves it alone. The dashboard
+    /// reads it to tell whether the row is still what it last pushed.
+    pub revision: i64,
+    /// The value [`Self::revision`] had when the dashboard's last
+    /// write landed.
+    ///
+    /// `revision == synced_revision` means the row is still exactly
+    /// what the dashboard pushed; the two differ once something
+    /// changed the row locally. `0` means "never synchronised".
+    pub synced_revision: i64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -900,6 +942,8 @@ impl Default for BadbotsSettings {
             evidence_policy: BadbotsEvidencePolicy::Lenient,
             abuseipdb_api_key: None,
             crowdsec_api_key: None,
+            revision: 1,
+            synced_revision: 0,
             updated_at: DateTime::<Utc>::UNIX_EPOCH,
         }
     }
@@ -1173,6 +1217,8 @@ mod tests {
                 client_country_header: Some("X-Client-Country".into()),
                 client_region_header: None,
                 origin_guard_enabled: false,
+                revision: 1,
+                synced_revision: 0,
                 updated_at: ts,
             };
             let json = serde_json::to_string(&cfg).unwrap();

@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use pangolin_core::types::{DnsProviderKind, HostMode, SystemConfig};
+use pangolin_core::types::{DnsProviderKind, HostMode};
 use serde::Deserialize;
 
 use crate::protocol::error::ApiError;
@@ -557,12 +557,15 @@ impl IpRuleDto {
 
 /// The body of `PUT /api/v1/system_config`.
 ///
-/// The write semantics are **merge**: a field the body does not
-/// mention keeps the stored value.
+/// The write semantics are **replace** (issue #273): the body is the
+/// desired state, so a field the body does not mention is cleared or
+/// falls back to its default.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemConfigDto {
     /// The provider in front of every site that does not override it.
+    ///
+    /// Required: the enum has no "unset" member.
     #[serde(default)]
     pub provider: Option<String>,
     /// The master switch of the `P-*` gateway headers.
@@ -585,50 +588,30 @@ pub struct SystemConfigDto {
 impl SystemConfigDto {
     /// The parameter map the admin's system-config parser reads.
     ///
-    /// The stored configuration fills the gaps: the write semantics
-    /// are **merge**, so a field the body does not mention keeps the
-    /// stored value.
-    pub fn to_params(&self, current: &SystemConfig) -> Params {
+    /// The stored configuration does **not** fill the gaps: the write
+    /// semantics are **replace**, so a field the body does not mention
+    /// is left out and the parser falls back to its default — the
+    /// headers become "not configured", `pgl_headers_enabled` becomes
+    /// `true` and `origin_guard_enabled` becomes `false`.
+    ///
+    /// The `provider` is left out when the body does not carry it, so
+    /// the parser refuses the body with the same message the HTML
+    /// form gives for an empty provider.
+    pub fn to_params(&self) -> Params {
         let mut p = Params::new();
-        p.insert(
-            "provider".into(),
-            self.provider
-                .clone()
-                .unwrap_or_else(|| current.provider.as_str().to_string()),
-        );
-        put_value_flag(
-            &mut p,
-            "pgl_headers_enabled",
-            Some(
-                self.pgl_headers_enabled
-                    .unwrap_or(current.pgl_headers_enabled),
-            ),
-        );
-        p.insert(
-            "origin_guard_enabled".into(),
-            if self
-                .origin_guard_enabled
-                .unwrap_or(current.origin_guard_enabled)
-            {
-                "1".into()
-            } else {
-                "0".into()
-            },
-        );
-        let header = |value: &Option<String>, stored: &Option<String>| -> Option<String> {
-            match value {
-                Some(v) => Some(v.clone()),
-                None => stored.clone(),
-            }
-        };
-        if let Some(v) = header(&self.client_ip_header, &current.client_ip_header) {
-            p.insert("client_ip_header".into(), v);
+        if let Some(v) = &self.provider {
+            p.insert("provider".into(), v.clone());
         }
-        if let Some(v) = header(&self.client_country_header, &current.client_country_header) {
-            p.insert("client_country_header".into(), v);
+        put_value_flag(&mut p, "pgl_headers_enabled", self.pgl_headers_enabled);
+        put_value_flag(&mut p, "origin_guard_enabled", self.origin_guard_enabled);
+        if let Some(v) = &self.client_ip_header {
+            p.insert("client_ip_header".into(), v.clone());
         }
-        if let Some(v) = header(&self.client_region_header, &current.client_region_header) {
-            p.insert("client_region_header".into(), v);
+        if let Some(v) = &self.client_country_header {
+            p.insert("client_country_header".into(), v.clone());
+        }
+        if let Some(v) = &self.client_region_header {
+            p.insert("client_region_header".into(), v.clone());
         }
         p
     }
@@ -638,8 +621,10 @@ impl SystemConfigDto {
 
 /// The body of `PUT /api/v1/badbots_config`.
 ///
-/// The write semantics are **merge**: a field the body does not
-/// mention keeps the stored value.
+/// The write semantics are **replace** (issue #273): the body is the
+/// desired state, so a field the body does not mention falls back to
+/// its default. The credentials are the exception — a key the body
+/// does not mention keeps the stored one.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BadbotsConfigDto {
@@ -840,6 +825,34 @@ mod tests {
         assert_eq!(dto.abuseipdb_api_key, None);
         let p = dto.to_params();
         assert!(!p.contains_key("badbots_abuseipdb_clear"));
+    }
+
+    #[test]
+    fn the_system_config_body_does_not_fill_the_gaps_from_the_stored_row() {
+        // The write semantics are **replace** (issue #273): a field
+        // the body does not mention is left out of the parameter map,
+        // so the parser falls back to its default instead of the
+        // stored value.
+        let dto: SystemConfigDto =
+            serde_json::from_str(r#"{"provider": "cloudflare"}"#).expect("the body parses");
+        let p = dto.to_params();
+        assert_eq!(p.get("provider").map(String::as_str), Some("cloudflare"));
+        assert!(!p.contains_key("client_ip_header"));
+        assert!(!p.contains_key("client_country_header"));
+        assert!(!p.contains_key("client_region_header"));
+        assert!(!p.contains_key("pgl_headers_enabled"));
+        assert!(!p.contains_key("origin_guard_enabled"));
+    }
+
+    #[test]
+    fn an_explicit_null_header_is_cleared() {
+        // `null` and "absent" both mean "not configured" under the
+        // replace semantics — the header is cleared either way.
+        let dto: SystemConfigDto =
+            serde_json::from_str(r#"{"provider": "cloudflare", "client_ip_header": null}"#)
+                .expect("the body parses");
+        let p = dto.to_params();
+        assert!(!p.contains_key("client_ip_header"));
     }
 
     #[test]

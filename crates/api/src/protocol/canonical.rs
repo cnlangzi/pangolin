@@ -7,7 +7,7 @@
 //! string.
 //!
 //! ```text
-//! PANGOLIN-API-V2\n
+//! PANGOLIN-API-V3\n
 //! {METHOD}\n
 //! {PATH}\n
 //! {TS}\n
@@ -29,17 +29,20 @@
 //! * `sha256_hex(body)` — the SHA-256 hex digest of the raw request
 //!   body. An empty body hashes the empty string.
 //!
-//! The **v2** prefix marks the outbound channel of issue #262. The
-//! shape of the string did not change — the version line names the
-//! protocol so a future change to the shape cannot be produced by an
-//! old client by accident.
+//! The **v3** prefix marks the write semantics of issue #273: the
+//! two global singletons are **replaced** by a dashboard write
+//! instead of merged, so a dashboard written against v2 would
+//! silently clear the fields it does not mention. The shape of the
+//! string did not change — the version line names the protocol so a
+//! future change to the shape cannot be produced by an old client by
+//! accident.
 
 use sha2::{Digest, Sha256};
 
 /// The first line of every canonical string. It names the protocol
-/// version, so a future v3 can change the shape without a v2 client
-/// ever producing a v3 string by accident.
-pub const CANONICAL_PREFIX: &str = "PANGOLIN-API-V2";
+/// version, so a future v4 can change the shape without a v3 client
+/// ever producing a v4 string by accident.
+pub const CANONICAL_PREFIX: &str = "PANGOLIN-API-V3";
 
 /// How far the request's timestamp may be from the node's clock, in
 /// seconds. A request older or newer than that is refused.
@@ -142,11 +145,20 @@ mod tests {
         // The exact bytes are the contract with the dashboard — a
         // regression here silently breaks every client.
         let expected = format!(
-            "PANGOLIN-API-V2\nGET\n/api/v1/sites\n1700000000\n0123456789abcdef0123456789abcdef\n{}\n{}\n",
+            "PANGOLIN-API-V3\nGET\n/api/v1/sites\n1700000000\n0123456789abcdef0123456789abcdef\n{}\n{}\n",
             sha256_hex(b"s3cr3t"),
             sha256_hex(b""),
         );
         assert_eq!(canonical_string(&req(b"")), expected);
+    }
+
+    #[test]
+    fn the_protocol_prefix_is_v3() {
+        // v3 is the version of the **replace** write semantics
+        // (issue #273). A dashboard that still speaks v2 has to be
+        // told, not silently accepted — the write semantics changed.
+        assert_eq!(CANONICAL_PREFIX, "PANGOLIN-API-V3");
+        assert!(canonical_string(&req(b"")).starts_with("PANGOLIN-API-V3\n"));
     }
 
     #[test]
