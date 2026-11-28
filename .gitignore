@@ -2,6 +2,8 @@
 /bin/
 /target
 /build/output
+# The staging context of the runtime images (`make container-build`).
+/build/container
 **/*.rs.bk
 Cargo.lock.bak
 

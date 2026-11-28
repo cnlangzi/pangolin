@@ -57,7 +57,7 @@ warn-env-fallback:
 		echo "  ℹ no .env found; using binary defaults (cp .env.example .env to override)" >&2; \
 	fi
 
-.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-js test-e2e fmt fmt-check clippy ci ci-full dist init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa cargo-mirror cargo-mirror-off
+.PHONY: help setup build build-ngx build-tun build-dist build-debug build-css build-ui dev-ui download-ui-tools purge-ui-cache warn-env-fallback clean lint test test-js test-e2e fmt fmt-check clippy ci ci-full dist container-build init-data start-ngx start-tun stop-local-ngx install-ngx install-tun install-service stop stop-ngx stop-tun status-ngx status-tun env-show env-load play-ngx-qa cargo-mirror cargo-mirror-off
 
 help:
 	@echo "=== Config ==="
@@ -72,6 +72,7 @@ help:
 	@echo "  make dev-ui        # Opt-in: watch templates + assets, rebuild UI on save"
 	@echo "  make build-dist    # Docker build (UI minified in-container), export to build/output/"
 	@echo "  make dist          # Same as build-dist"
+	@echo "  make container-build # Runtime images (pangolin-ngx:local, pangolin-tun:local) from the release binaries"
 	@echo "  make purge-ui-cache # Wipe the system UI-tools cache (re-download on next build-ui)"
 	@echo ""
 	@echo "=== Cargo ==="
@@ -372,6 +373,43 @@ build-dist: dist
 dist:
 	./build/dist.sh
 
+# ── Runtime container images ────────────────────────────────────────────────
+#
+# The two images the release publishes to GHCR — `pangolin-ngx` and
+# `pangolin-tun` — built locally out of the release binaries.  The
+# binary is *assembled* into the image and never compiled inside it:
+# the image has to carry the same bytes as the GitHub Release assets,
+# and the image in `build/docker/dist.dockerfile` is compiled with a
+# different toolchain (rustc 1.98.1) on a different glibc floor.
+#
+# The build context is a staging directory of four files (the two
+# binaries and the two packaged configuration templates), assembled by
+# `packaging/container/stage.sh`.  The repository root is not the
+# context, so `.dockerignore` does not apply to this build and does
+# not have to change.
+#
+# CONTAINER_BIN_DIR points the assembly at another set of binaries
+# (`./bin` after a local `make build`).  With the default the long
+# Docker build runs first, so the target works from a fresh checkout;
+# with another directory it is skipped — the binaries are already
+# there.
+CONTAINER_BIN_DIR ?= build/output
+CONTAINER_STAGE_DIR ?= build/container
+CONTAINER_TAG ?= local
+
+ifeq ($(CONTAINER_BIN_DIR),build/output)
+container-build: dist
+else
+container-build:
+endif
+
+container-build:
+	sh packaging/container/stage.sh --bin-dir $(CONTAINER_BIN_DIR) --out-dir $(CONTAINER_STAGE_DIR)
+	docker build --file packaging/container/runtime.dockerfile --target ngx \
+		--tag pangolin-ngx:$(CONTAINER_TAG) $(CONTAINER_STAGE_DIR)
+	docker build --file packaging/container/runtime.dockerfile --target tun \
+		--tag pangolin-tun:$(CONTAINER_TAG) $(CONTAINER_STAGE_DIR)
+
 # ── Host-side crates.io mirror ─────────────────────────────────────────────
 #
 # `build/cargo-mirror.toml` is the single canonical mirror block: the
@@ -395,6 +433,7 @@ cargo-mirror-off:
 # UI bundles + docker export dir).
 clean:
 	rm -rf ./build/output
+	rm -rf ./build/container
 	rm -f $(TAILWIND_OUTPUT)
 	$(CARGO) clean
 

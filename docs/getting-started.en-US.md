@@ -2,7 +2,7 @@
 
 [中文](./getting-started.md)
 
-This document takes a site operator from zero to live: the two installation
+This document takes a site operator from zero to live: the three installation
 paths, the checklist of things that must be changed before production, and the
 operational facts about where the configuration lives. What the gateway does
 for you is in [features.en-US.md](./features.en-US.md).
@@ -50,6 +50,70 @@ sudo systemctl start pangolin-ngx
 The tunnel node is a separate package (`sudo apt install pangolin-tun`); it is not even enabled, because it needs a `(name, token)` row in the gateway's admin UI before it can connect.
 
 The full procedure — the key's fingerprint, the supported distributions, upgrading, uninstalling, migrating from `/usr/local/pangolin` and the troubleshooting notes — is in [packaging.en-US.md](./packaging.en-US.md).
+
+### Install with a container image
+
+If you would rather not install a package on the host, use the official
+image (`linux/amd64` and `linux/arm64` are both covered):
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+The image carries **exactly** the binary and the configuration the deb
+package installs (the configuration is at `/etc/pangolin/ngx.yml`, the
+ports are `80` / `443`) — only the way it runs differs. Start it:
+
+```bash
+docker run -d --name pangolin-ngx \
+  -p 80:80 -p 443:443 -p 9081:9081 \
+  -p 9001:9001/udp -p 9001:9001 \
+  -v pangolin-data:/var/lib/pangolin \
+  -v pangolin-logs:/var/log/pangolin \
+  -v pangolin-cache:/var/cache/pangolin \
+  ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+The three volumes hold the database, the certificates and the logs, and
+the crawler cache — **without them, removing the container takes the
+data with it**.
+
+The tunnel node is a second image:
+
+```bash
+docker run -d --name pangolin-tun \
+  -v pangolin-tun-data:/var/lib/pangolin-tun \
+  ghcr.io/cnlangzi/pangolin-tun:v0.3.0
+```
+
+The tunnel node needs **no inbound port** — it dials the gateway's
+`tunnel.addr` (`0.0.0.0:9001` by default) itself, and the gateway
+opens the request streams back over that connection. All the container
+has to be able to do is reach the gateway's port 9001 **outbound**.
+
+Both images run as **root**: the packaged configuration binds the
+privileged ports 80 and 443, and a non-root process cannot bind them.
+The container is the isolation boundary.
+
+⚠ **Before you go to production** (the full checklist is in [Before you
+go to production](#before-you-go-to-production)):
+
+- [ ] **Change `admin.password`.** The configuration in the image says
+  `admin`, which is a public value, and the gateway does **not** warn
+  about it.
+- [ ] **Narrow `admin.addr`.** It is `0.0.0.0:9081`, which exposes the
+  admin UI to the whole network.
+- [ ] **Put a real mailbox in `acme.email`.** It is empty in the image.
+- [ ] **Mount your own configuration when you change it.** Mount the
+  edited `ngx.yml` at `/etc/pangolin/ngx.yml` and the container reads
+  that file at startup — the copy in the image is not promised to be
+  immutable, the same conffile semantics the deb package has.
+- [ ] **Create the `(name, token)` row in the gateway's admin UI before
+  the tunnel node connects**, and put the token in the mounted
+  `tun.yml`, or the handshake is rejected.
+
+The image contract and the publishing procedure are in
+[release.md](./release.md).
 
 ### Build from source
 

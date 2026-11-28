@@ -2,7 +2,7 @@
 
 [English](./getting-started.en-US.md)
 
-这份文档带一个站点运营者从零到上线：两条安装路径、上线前必须逐条改的清单、以及日常运维要知道的配置位置。网关到底能替你做什么，见 [features.md](./features.md)。
+这份文档带一个站点运营者从零到上线：三条安装路径、上线前必须逐条改的清单、以及日常运维要知道的配置位置。网关到底能替你做什么，见 [features.md](./features.md)。
 
 ## 快速开始
 
@@ -47,6 +47,50 @@ sudo systemctl start pangolin-ngx
 隧道节点是另一个包（`sudo apt install pangolin-tun`），它连 enable 都不做：它得先在网关的管理界面里建好 `(name, token)` 行才能连上。
 
 完整流程 —— 公钥指纹、受支持的发行版、升级、卸载、从 `/usr/local/pangolin` 迁移、故障排查 —— 见 [用包管理器安装](./packaging.md)。
+
+### 用容器镜像安装
+
+不想在机器上装包，直接用官方镜像（`linux/amd64` 和 `linux/arm64` 都有）：
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+镜像里的二进制和配置和 deb 包**完全一样**（配置在 `/etc/pangolin/ngx.yml`，端口是 `80` / `443`），只是换了个运行方式。跑起来：
+
+```bash
+docker run -d --name pangolin-ngx \
+  -p 80:80 -p 443:443 -p 9081:9081 \
+  -p 9001:9001/udp -p 9001:9001 \
+  -v pangolin-data:/var/lib/pangolin \
+  -v pangolin-logs:/var/log/pangolin \
+  -v pangolin-cache:/var/cache/pangolin \
+  ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+三个 volume 分别对应数据库、证书和日志、爬虫缓存 —— **不挂 volume，容器删了数据就没了**。
+
+隧道节点是另一个镜像：
+
+```bash
+docker run -d --name pangolin-tun \
+  -v pangolin-tun-data:/var/lib/pangolin-tun \
+  ghcr.io/cnlangzi/pangolin-tun:v0.3.0
+```
+
+隧道节点**不需要任何入站端口** —— 它主动去连网关的 `tunnel.addr`（默认 `0.0.0.0:9001`），连接建立后网关在这条连接上反向开流。所以只要这个容器能**出站**连到网关的 9001 就行。
+
+镜像以 **root** 运行：打包版配置绑的是 `80` / `443` 特权端口，非 root 绑不了。容器本身就是隔离边界。
+
+⚠ **上生产之前**（完整清单见[上线前必改](#上线前必改)）：
+
+- [ ] **`admin.password` 换掉。** 镜像里的配置默认是 `admin`，这是公开值，网关**不会**对它告警。
+- [ ] **`admin.addr` 收窄。** 默认 `0.0.0.0:9081`，等于把管理界面对整个网络开放。
+- [ ] **`acme.email` 填真的邮箱。** 默认是空字符串。
+- [ ] **改配置就挂自己的文件。** 把改好的 `ngx.yml` 挂到 `/etc/pangolin/ngx.yml`，容器启动时读挂进来的那份 —— 镜像里那份不承诺不可变，和 deb 包的 conffile 语义一致。
+- [ ] **隧道节点要先在网关管理界面里建 `(name, token)` 行**，再把 token 填进挂进去的 `tun.yml`，否则握手被拒。
+
+镜像契约和发布流程见 [release 流程](release.md)。
 
 ### 从源码构建
 

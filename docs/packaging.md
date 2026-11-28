@@ -11,6 +11,8 @@ sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
 
 不想用包管理器的话，还有两条路：[一键安装脚本](./getting-started.md#一键安装)（`curl … | sudo sh`，macOS 的唯一路径）和[手动装归档](./getting-started.md#手动安装)。三条路装出来的东西是一样的，区别只在谁替你管理升级。
 
+另外还有[容器镜像](./getting-started.md#用容器镜像安装) —— 另一种分发形态，跑的是和这个包一模一样的二进制和配置：`ghcr.io/cnlangzi/pangolin-ngx`（网关）、`ghcr.io/cnlangzi/pangolin-tun`（隧道节点），`docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0`。
+
 ## 装之前
 
 ### 支持的发行版

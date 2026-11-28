@@ -21,6 +21,7 @@ ones a change usually needs.
 | `make build-ui` | Unminified `assets/app.css` — the dev convenience |
 | `make dev-ui` | The same, in watch mode |
 | `make build-dist` | Docker build, exported to `build/output/` |
+| `make container-build` | The two runtime images (`pangolin-ngx:local`, `pangolin-tun:local`), assembled from the release binaries |
 | `make lint` | `fmt-check` + `clippy` + `test` + `test-js` — the gate CI runs |
 | `make test` | Unit tests (`cargo test --workspace --lib --bins`) |
 | `make test-js` | The client-side tests for `assets/app.js` (node) |
@@ -225,6 +226,61 @@ allow-list above: the top-level entries must match, every row of the
 table must be present, and nothing hidden, generated, or secret may
 appear. Then re-run `make build-dist` — the builder stage is the real
 end-to-end check.
+
+---
+
+## The runtime images
+
+Every release publishes two container images to GitHub Container
+Registry: `ghcr.io/cnlangzi/pangolin-ngx` (the gateway) and
+`ghcr.io/cnlangzi/pangolin-tun` (the tunnel node). Their definition
+is `packaging/container/runtime.dockerfile`, and the release workflow
+builds and pushes them.
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+Two things are worth knowing before you touch either:
+
+- **The image is assembled, not compiled.** The binary in the image
+  is the release binary — the same bytes the GitHub Release assets
+  carry. The pipeline in `build/docker/dist.dockerfile` compiles
+  instead, but with rustc 1.98.1 (the release uses Rust 1.96, the
+  version CI tests) and on a base image with a different glibc
+  floor; a release that compiled here would publish "another
+  binary", for another 26 minutes.
+- **The build context is a staging directory, not the repository
+  root.** `packaging/container/stage.sh` assembles the four files the
+  image needs — the two binaries and the two **packaged**
+  configuration templates — into `build/container/`, and that
+  directory is the context. `.dockerignore` therefore does not apply
+  to this build and does not have to change; the allow-list rule
+  above governs the other pipeline, whose context *is* the repository
+  root.
+
+The configuration templates in the image are the **packaged** ones
+(`packaging/config/*.yml`), not the development ones the release
+archive carries: the packaged templates name the absolute paths and
+the privileged ports the packaged service runs with.
+
+### Building them locally
+
+```bash
+make container-build
+```
+
+The target assembles the staging context out of `build/output/` (the
+binaries `make build-dist` exports) and builds `pangolin-ngx:local`
+and `pangolin-tun:local`. Point it at another set of binaries to skip
+the long Docker build:
+
+```bash
+make build && make container-build CONTAINER_BIN_DIR=./bin
+```
+
+The staging script is POSIX `sh`, like `install.sh` and the packaging
+scripts, and `sh -n packaging/container/stage.sh` has to pass.
 
 ---
 

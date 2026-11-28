@@ -11,6 +11,8 @@ sudo dnf install pangolin-ngx     # RHEL / Rocky / Alma
 
 Two other paths exist if a package manager is not what you want: the [one-line installer](./getting-started.en-US.md#one-line-installer) (`curl … | sudo sh`, the only path on macOS) and the [manual archive install](./getting-started.en-US.md#manual-install). All three produce the same gateway; the difference is who manages the upgrades.
 
+There is also the [container image](./getting-started.en-US.md#install-with-a-container-image) — another distribution shape, running the very binary and configuration this package installs: `ghcr.io/cnlangzi/pangolin-ngx` (the gateway) and `ghcr.io/cnlangzi/pangolin-tun` (the tunnel node), `docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0`.
+
 ## Before you install
 
 ### Supported distributions

@@ -261,6 +261,7 @@ through to release day.
 | Package | One job per Linux architecture, on the runner of that architecture. It unpacks the binaries, measures the glibc floor, renders the nfpm configuration and builds the four packages of that architecture (a `.deb` and an `.rpm` for each of the two packages). nfpm names the files itself, so the name and the architecture inside the package cannot drift apart. Read-only permissions. |
 | Publish | The publishing job checks the repository out (it needs the installer and the two systemd units), copies them next to the archives, and attaches the six archives, the eight packages, `install.sh`, the two units and `SHA256SUMS.txt` to the GitHub Release of the tag, with GitHub-generated release notes (there is no `CHANGELOG.md` in the repository). |
 | Deploy | The repository job builds the site tree, signs it with the archive key and replaces the `gh-pages` branch with it. It is the only job that holds the key. |
+| Container | One job per Linux architecture assembles the runtime image from the binaries the `build` job produced and pushes it to GHCR **by digest**; the manifest job merges the digests into the `v<version>` and `latest` manifest lists. The image jobs are **not** in the publishing job's `needs` — a registry that is down does not hold back the Release or the package repository. See [Container images](#container-images). |
 
 The build jobs run read-only; only the publishing job and the
 repository job hold a write-scoped token. A failed platform build
@@ -392,6 +393,139 @@ keeps the package off a host that could run it, or lets it onto a
 host that cannot. The measurement runs on the runner of the
 architecture being packaged, because Ubuntu's `objdump` only knows
 the architecture it was built for.
+
+## Container images
+
+Besides the archives and the packages, a release publishes two
+container images on GitHub Container Registry:
+
+| Image | What it runs |
+| --- | --- |
+| `ghcr.io/cnlangzi/pangolin-ngx` | the gateway |
+| `ghcr.io/cnlangzi/pangolin-tun` | the tunnel node |
+
+Each of them is a multi-architecture manifest list — `linux/amd64` and
+`linux/arm64` — under two tags: the release tag, verbatim
+(`v0.3.0`), and `latest`. The tag keeps its leading `v` the way the
+archive name and `--version` do. `latest` points at the last version
+whose images were pushed successfully; a failed push leaves it where
+it was.
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+The operator-facing instructions are in
+[getting-started.md](./getting-started.md) (and its English twin).
+
+### The images are assembled, not compiled
+
+The image carries the **release binary** — the same bytes the
+archives carry. The workflow does not compile inside the container:
+`build/docker/dist.dockerfile` compiles with rustc 1.98.1, a
+toolchain no CI job runs, on a base image with a different glibc
+floor, and would produce "another binary" for another 26 minutes.
+
+The build context is a staging directory of four files — the two
+binaries and the two **packaged** configuration templates
+(`packaging/config/ngx.yml` and `packaging/config/tun.yml`, not the
+development ones the archives carry) — assembled by
+`packaging/container/stage.sh`. The repository root is not the
+context, so `.dockerignore` does not apply to this build and does
+not have to change.
+
+The base image is `debian:bookworm-slim` with `ca-certificates`
+installed: the gateway talks HTTPS to the ACME directory and to the
+dashboard, and both need a CA bundle, which the slim image does not
+ship. Before anything is pushed, the workflow measures the glibc
+floor of the binaries with `objdump -T` and compares it with the
+base image's own glibc — the same measurement the packages declare,
+see [The glibc floor](#the-glibc-floor). A base image older than the
+binaries fails the job with both versions in the message, before a
+single byte is pushed.
+
+### The image layout
+
+The layout is the package layout — the same paths, so an operator who
+migrates from the deb package to the container changes nothing in the
+configuration:
+
+| Path | `pangolin-ngx` | `pangolin-tun` |
+| --- | --- | --- |
+| `/usr/bin/pangolin-ngx` | ✓ | |
+| `/usr/bin/pangolin-tun` | | ✓ |
+| `/etc/pangolin/ngx.yml` (0640) | ✓ | |
+| `/etc/pangolin/tun.yml` (0640) | | ✓ |
+| `/var/lib/pangolin` (WORKDIR + VOLUME) | ✓ | |
+| `/var/lib/pangolin-tun` (WORKDIR + VOLUME) | | ✓ |
+| `/var/log/pangolin/bots`, `/var/log/pangolin/referers` | ✓ | |
+| `/var/cache/pangolin/bots`, `/var/cache/pangolin/cache` | ✓ | |
+
+The directories are the ones the packages own, and no others. The
+gateway image declares `80/tcp`, `443/tcp`, `9081/tcp` and `9001/udp`
++ `9001/tcp`; the tunnel node image declares `9001/udp` and
+`9001/tcp` — QUIC and the TCP fallback share the port number.
+
+The tunnel node *dials* the gateway's `tunnel.addr` and never listens
+on 9001 itself, so its image needs no inbound port; the gateway is
+the side that binds it.
+
+The log and cache directories are declared through their **parent**
+directories (`/var/log/pangolin`, `/var/cache/pangolin`), because
+those are the volumes an operator mounts. The subdirectories still
+have to exist in the image: Docker copies a volume's content out of
+the image when it creates the volume, and a subdirectory that is not
+in the image would not come back with the volume.
+
+Both images run as **root**: the packaged configuration binds the
+privileged ports 80 and 443, and a non-root process cannot bind them
+without `CAP_NET_BIND_SERVICE`. The container is the isolation
+boundary, and making the operator remember `--cap-add` on every
+`docker run` is a worse trade.
+
+### The two jobs
+
+| Job | What it does | Permissions |
+| --- | --- | --- |
+| `docker` | One job per Linux architecture, on the runner of that architecture. It unpacks the release binaries, assembles the staging context, asserts that the base image is new enough for the binaries, pushes each image **by digest** and checks that the image reports the release version and ships no compiler. | `packages: write` |
+| `docker-manifest` | Merges the per-architecture digests into the tagged manifest lists, asserts that both architectures are listed under both tags, and tries to make the GHCR packages public. | `packages: write` |
+
+Neither job is in the `release` job's `needs`: **a registry that is
+down must not keep the operators from getting the binaries and the
+packages.** A failed image push turns the workflow red, leaves
+`latest` on the last version that was pushed, and changes nothing
+about the GitHub Release or the apt / yum repository — both are
+published either way.
+
+The single-architecture images are pushed **by digest**, without a
+tag, and the tags are created by the manifest job. A single
+architecture must never hold `v<version>`, not even for a moment: a
+`docker pull` in that window would fetch the wrong architecture.
+
+The manifest job serializes its writes with a job-level `concurrency`
+group (`ghcr-push`, `cancel-in-progress: false`) — the same reasoning
+as the `deploy-repo` job's `pages-deploy` group: two releases pushing
+at the same time would race, and the loser would leave `latest`
+pointing at the older version.
+
+### GHCR visibility is a one-time manual step
+
+A GHCR package is **private by default**, and an anonymous `docker
+pull` of a private package is rejected. The manifest job tries to
+flip both packages to public and only warns when it cannot — a
+permission problem must not turn the whole release red, and the
+images are pushed either way.
+
+The first release therefore usually needs one manual step: open the
+package's settings on GitHub and flip **Visibility** to **Public**,
+once per package:
+
+- <https://github.com/orgs/cnlangzi/packages/container/package/pangolin-ngx/settings>
+- <https://github.com/orgs/cnlangzi/packages/container/package/pangolin-tun/settings>
+
+The workflow's attempt is a convenience, not a guarantee: the token
+the workflow holds is a `GITHUB_TOKEN`, and it may not be allowed to
+change the visibility of an organization package.
 
 ## The installer contract
 
