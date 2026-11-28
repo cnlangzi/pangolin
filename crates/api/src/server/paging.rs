@@ -36,14 +36,14 @@ impl Page {
     /// field — the same shape the `date` parameter of the raw log
     /// endpoints answers with.
     pub fn from_ctx(ctx: &Ctx<'_>) -> Result<Self, ApiError> {
-        let limit = match ctx.query_param("limit") {
-            Some(raw) => Some(parse_limit(&raw)?),
-            None => None,
-        };
-        let offset = match ctx.query_param("offset") {
-            Some(raw) => Some(parse_offset(&raw)?),
-            None => None,
-        };
+        let limit = ctx
+            .query_param("limit")
+            .map(|raw| parse_limit(&raw))
+            .transpose()?;
+        let offset = ctx
+            .query_param("offset")
+            .map(|raw| parse_offset(&raw))
+            .transpose()?;
         Ok(Self { limit, offset })
     }
 
