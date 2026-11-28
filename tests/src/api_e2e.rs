@@ -210,6 +210,46 @@ async fn the_node_executes_a_command_the_dashboard_sends() {
     assert_eq!(json, serde_json::json!([]));
 }
 
+/// A command with a query string answers with the page it asked for.
+///
+/// The paging parameters are part of the request target, and the
+/// target is what the node signs — so a paged read travels down the
+/// channel without a change of the protocol.
+#[tokio::test]
+async fn a_paged_command_answers_with_the_page_it_asked_for() {
+    let dashboard = MockDashboard::start(TOKEN).await;
+    let node = start_node(dashboard.base_url(), TOKEN).await;
+
+    // Two sites, so a page of one is not the whole list.
+    {
+        let db = node.app.db.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        for name in ["first", "second"] {
+            db.execute(
+                "INSERT INTO sites (name, backend, enabled, host_mode, host_custom, created_at, updated_at)
+                 VALUES (?1, 'http://127.0.0.1:9999', 1, 'passthrough', NULL, ?2, ?2)",
+                rusqlite::params![name, now],
+            )
+            .expect("insert the site");
+        }
+    }
+
+    dashboard
+        .send_get("c-13", "/api/v1/sites?limit=1&offset=1")
+        .await;
+    let report = dashboard
+        .wait_for_report(REPORT_TIMEOUT)
+        .await
+        .expect("the node reports the result");
+
+    assert_eq!(report["id"], "c-13");
+    assert_eq!(report["status"], 200, "{report}");
+    let body = decode_body(&report);
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("the body is json");
+    assert_eq!(json.as_array().map(|a| a.len()), Some(1), "{json}");
+    assert_eq!(json[0]["name"], "second", "{json}");
+}
+
 /// A write command is executed and its result reported.
 #[tokio::test]
 async fn the_node_executes_a_write_command() {

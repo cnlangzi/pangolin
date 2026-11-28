@@ -46,6 +46,7 @@ lives in its own document: [admin.md](admin.md).
 - [The write semantics](#the-write-semantics)
 - [The logs](#the-logs)
 - [The limits](#the-limits)
+- [Paging](#paging)
 - [The runtime state](#the-runtime-state)
 - [The versions](#the-versions)
 - [The onboarding guide](#the-onboarding-guide)
@@ -325,29 +326,29 @@ it.
 
 ### Reads
 
-| method | path | answers |
-| --- | --- | --- |
-| `GET` | `/api/v1/instance` | what this node tells about itself |
-| `GET` | `/api/v1/sites` | `Site[]` |
-| `GET` | `/api/v1/sites/{name}` | `Site` |
-| `GET` | `/api/v1/domains` | `Domain[]` |
-| `GET` | `/api/v1/domains/{domain}` | `Domain` |
-| `GET` | `/api/v1/dns_providers` | `DnsProviderView[]` |
-| `GET` | `/api/v1/dns_providers/{name}` | `DnsProviderView` |
-| `GET` | `/api/v1/tun` | `TunView[]` |
-| `GET` | `/api/v1/tun/{name}` | `TunView` |
-| `GET` | `/api/v1/ip_rules` | `IpRule[]` |
-| `GET` | `/api/v1/site_rate_limits` | `SiteRateLimitView[]` |
-| `GET` | `/api/v1/site_rate_limits/{site}` | `SiteRateLimitView` |
-| `GET` | `/api/v1/site_rate_limit_bots` | `SiteRateLimitBotsView[]` |
-| `GET` | `/api/v1/site_rate_limit_bots/{site}` | `SiteRateLimitBotsView` |
-| `GET` | `/api/v1/site_providers` | `SiteProviderView[]` |
-| `GET` | `/api/v1/site_providers/{site}` | `SiteProviderView` |
-| `GET` | `/api/v1/site_origin_allow` | `SiteOriginAllowView[]` |
-| `GET` | `/api/v1/site_origin_allow/{site}` | `SiteOriginAllowView` |
-| `GET` | `/api/v1/system_config` | `SystemConfig` |
-| `GET` | `/api/v1/badbots_config` | `BadbotsSettingsView` |
-| `GET` | `/api/v1/providers` | `ProvidersView` |
+| method | path | answers | paging |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/instance` | what this node tells about itself | — |
+| `GET` | `/api/v1/sites` | `Site[]` | yes |
+| `GET` | `/api/v1/sites/{name}` | `Site` | — |
+| `GET` | `/api/v1/domains` | `Domain[]` | yes |
+| `GET` | `/api/v1/domains/{domain}` | `Domain` | — |
+| `GET` | `/api/v1/dns_providers` | `DnsProviderView[]` | yes |
+| `GET` | `/api/v1/dns_providers/{name}` | `DnsProviderView` | — |
+| `GET` | `/api/v1/tun` | `TunView[]` | yes |
+| `GET` | `/api/v1/tun/{name}` | `TunView` | — |
+| `GET` | `/api/v1/ip_rules` | `IpRule[]` | yes |
+| `GET` | `/api/v1/site_rate_limits` | `SiteRateLimitView[]` | yes |
+| `GET` | `/api/v1/site_rate_limits/{site}` | `SiteRateLimitView` | — |
+| `GET` | `/api/v1/site_rate_limit_bots` | `SiteRateLimitBotsView[]` | yes |
+| `GET` | `/api/v1/site_rate_limit_bots/{site}` | `SiteRateLimitBotsView` | — |
+| `GET` | `/api/v1/site_providers` | `SiteProviderView[]` | yes |
+| `GET` | `/api/v1/site_providers/{site}` | `SiteProviderView` | — |
+| `GET` | `/api/v1/site_origin_allow` | `SiteOriginAllowView[]` | yes |
+| `GET` | `/api/v1/site_origin_allow/{site}` | `SiteOriginAllowView` | — |
+| `GET` | `/api/v1/system_config` | `SystemConfig` | — |
+| `GET` | `/api/v1/badbots_config` | `BadbotsSettingsView` | — |
+| `GET` | `/api/v1/providers` | `ProvidersView` | — |
 
 ### Writes
 
@@ -809,6 +810,79 @@ busy day, say — is answered with an **error**: the node reports
 `413 result_too_large` instead of the body. The dashboard learns that
 the command failed; it does not wait for an answer that never comes.
 A resource that does not fit has to be fetched in pieces.
+
+## Paging
+
+A list that does not fit into one report has to be fetched in pieces
+(see [The limits](#the-limits)). Every **list** endpoint therefore
+takes two **optional** query parameters:
+
+| parameter | meaning | accepted |
+| --- | --- | --- |
+| `limit` | the most entries this answer carries | a positive decimal integer |
+| `offset` | the entries this answer skips | a non-negative decimal integer |
+
+The two are independent:
+
+```text
+GET /api/v1/domains?limit=500&offset=0     → [ … 500 entries … ]
+GET /api/v1/domains?limit=500&offset=500   → [ … 500 entries … ]
+GET /api/v1/domains?limit=500&offset=1000  → [ … the rest … ]
+GET /api/v1/domains                        → [ … all of them … ]
+```
+
+`limit` alone takes the first `limit` entries; `offset` alone skips
+`offset` entries and takes the rest; together they take the entries
+`offset + 1 … offset + limit`. Without either parameter the answer is
+the whole list — the shape and the contents are exactly what they
+were before the parameters existed.
+
+The answer is still a **bare JSON array**: no envelope, no total, no
+`Link` header. A client has read to the end when an answer carries
+**fewer entries than the `limit` it asked for** — that is the only
+end-of-list signal there is.
+
+An `offset` past the end of the list is an **empty array** (`200`),
+not an error: reading to the end is a normal path. A parameter that
+is not a valid integer is a `422`:
+
+| request | answer |
+| --- | --- |
+| `?limit=abc` | `422 limit_invalid` — `error.field` is `limit` |
+| `?limit=0` | `422 limit_invalid` |
+| `?limit=1.5` | `422 limit_invalid` |
+| `?offset=-1` | `422 offset_invalid` — `error.field` is `offset` |
+
+The endpoints that take the parameters are the nine list endpoints:
+`/api/v1/sites`, `/api/v1/domains`, `/api/v1/dns_providers`,
+`/api/v1/tun`, `/api/v1/ip_rules`, `/api/v1/site_rate_limits`,
+`/api/v1/site_rate_limit_bots`, `/api/v1/site_providers` and
+`/api/v1/site_origin_allow`. Every other endpoint ignores them — a
+single resource is not paged, and a write does not read them.
+
+**The order is stable.** The pages of a list follow one order, and it
+is the order an unpaged read answers in:
+
+| list | order |
+| --- | --- |
+| `/api/v1/sites` | `name` |
+| `/api/v1/domains` | `domain` |
+| `/api/v1/dns_providers` | `name` |
+| `/api/v1/tun` | `name` |
+| `/api/v1/ip_rules` | `scope`, `kind`, `cidr` |
+| `/api/v1/site_rate_limits` | `site_name` |
+| `/api/v1/site_rate_limit_bots` | `site_name`, `bot_name` |
+| `/api/v1/site_providers` | `site_name` |
+| `/api/v1/site_origin_allow` | `site_name` |
+
+The orders of the first five come with the node's own query. The
+per-site lists are read out of a map, so the API settles their order
+by the site name before it cuts a page; the bots of a site keep the
+order the node stores them in.
+
+The order is a property of the node's **live** data: a list that
+changes while it is being read is read as it is. A mirror of the node
+is the state the dashboard saw, not a snapshot.
 
 ## The runtime state
 

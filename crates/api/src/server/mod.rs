@@ -18,6 +18,7 @@
 //!    the channel either.
 //! 2. The request is dispatched to a handler.
 
+pub mod paging;
 pub mod read;
 pub mod write;
 

@@ -67,3 +67,9 @@ hex.workspace = true
 
 # Percent-encoding for the form bodies the admin parsers read.
 urlencoding = "2"
+
+# The endpoint suite runs against a gateway on a temporary database.
+# A dev-dependency only — the shipped crate gains no runtime
+# dependency.
+[dev-dependencies]
+tempfile = { workspace = true }
