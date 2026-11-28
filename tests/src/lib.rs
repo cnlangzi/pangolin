@@ -108,6 +108,16 @@ mod install_script;
 #[cfg(all(test, unix))]
 mod packaging;
 
+// Container-image regression tests (the runtime images the release
+// publishes to GHCR, issue #275).  Like the packaging tests above,
+// these need neither the `integration` feature nor a real binary:
+// they read the release workflow and the runtime Dockerfile, and
+// drive the staging script with throwaway binaries.
+//
+// Unix-only: the staging script is a POSIX shell script.
+#[cfg(all(test, unix))]
+mod container_image;
+
 #[cfg(feature = "integration")]
 mod backend;
 

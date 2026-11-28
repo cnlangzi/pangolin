@@ -102,6 +102,14 @@ curl -fsSL https://github.com/cnlangzi/pangolin/releases/latest/download/install
 
 **装完一定要改**：管理密码（默认的 `pangolin` 是公开的）和管理界面监听地址（默认 `0.0.0.0:9081`，等于对整个网络开放）。完整清单见 [安装与上线](./docs/getting-started.md)。
 
+想在容器里跑（不想在机器上装包）：
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+镜像是多架构的（`linux/amd64` / `linux/arm64`），里面跑的是和 deb 包一样的二进制和配置。隧道节点是另一个镜像 `ghcr.io/cnlangzi/pangolin-tun`。要挂哪些 volume、暴露哪些端口，见 [安装与上线](./docs/getting-started.md)。
+
 想手动装（或者用 Windows 的 `.zip`）——下面以 `v0.3.0` 为例，换成你要装的版本号即可：
 
 ```bash

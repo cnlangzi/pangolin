@@ -101,6 +101,14 @@ The script works out the platform, downloads the matching release archive, verif
 
 **Two things have to change afterwards**: the admin password (the shipped `pangolin` is public) and the admin interface's listen address (`0.0.0.0:9081` exposes it to the whole network). The full checklist is in [getting-started.en-US.md](./docs/getting-started.en-US.md).
 
+Prefer a container over a package on the host?
+
+```bash
+docker pull ghcr.io/cnlangzi/pangolin-ngx:v0.3.0
+```
+
+The images are multi-architecture (`linux/amd64` / `linux/arm64`) and carry the same binary and the same configuration the deb package installs. The tunnel node is a second image, `ghcr.io/cnlangzi/pangolin-tun`. The volumes and the ports are in [getting-started.en-US.md](./docs/getting-started.en-US.md).
+
 Prefer to install by hand (or you are on Windows with the `.zip`)? `v0.3.0` below is an example; substitute the version you want:
 
 ```bash

@@ -1040,6 +1040,365 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------
+  # Docker: build the runtime images and push them by digest
+  #
+  # The images are *assembled* from the `build` job's binaries, never
+  # compiled inside the container.  The image has to carry the bytes
+  # the GitHub Release ships, and the other Docker pipeline of this
+  # repository (build/docker/dist.dockerfile) compiles with rustc
+  # 1.98.1 — a toolchain no CI job runs — on a base image with a
+  # different glibc floor.  Compiling here would cost another 26
+  # minutes and produce "another binary".
+  #
+  # Each architecture is pushed *by digest*, without a tag, and the
+  # `docker-manifest` job below creates the tags and the manifest
+  # lists.  A single-architecture image must never hold `v<version>`,
+  # not even for a moment: a `docker pull` in that window would fetch
+  # the wrong architecture.
+  #
+  # The job runs on the runner of the architecture it builds, for the
+  # same reason the `package` job does: the glibc floor is measured
+  # with `objdump`, and Ubuntu's binutils only knows the architecture
+  # it was built for.
+  # ----------------------------------------------------------------
+  docker:
+    name: Container image (${{ matrix.target }})
+    needs: [build]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 20
+    # `packages: write` is what lets the job push to GHCR.  The
+    # workflow's top-level `contents: read` stays: this job pushes
+    # images, not commits.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux/amd64
+            slug: linux-amd64
+            runs-on: ubuntu-22.04
+          - target: linux/arm64
+            slug: linux-arm64
+            runs-on: ubuntu-22.04-arm
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_OWNER: cnlangzi
+      BASE_IMAGE: debian:bookworm-slim
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install the packaging tools
+        # binutils for `objdump`, which reads the glibc symbol
+        # versions out of the binary.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils
+
+      # The default builder of a runner is the `docker` driver, and
+      # that driver cannot push by digest.  The container driver can.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pangolin-${{ matrix.slug }}
+          path: dist
+
+      - name: Unpack the release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          tar -xzf dist/pangolin_*.tar.gz -C bin
+          ls -l bin
+
+      - name: Assemble the staging context
+        # The context holds the two binaries and the two *packaged*
+        # configuration templates — not the development configuration
+        # the release archive carries.  The repository root is not the
+        # context, so `.dockerignore` does not apply here.
+        run: |
+          set -euo pipefail
+          sh packaging/container/stage.sh --bin-dir bin --out-dir container
+          ls -l container
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assert the base image is new enough for the binaries
+        run: |
+          set -euo pipefail
+          # The base image's glibc has to be at least as new as the
+          # highest `GLIBC_x.y` symbol version the binaries record.
+          # The floor is *measured*, never written down — the same rule
+          # the packages follow (see docs/release.md).
+          floor=0
+          for binary in bin/pangolin-ngx bin/pangolin-tun; do
+            # `|| true` so that a binary without a GLIBC symbol reaches
+            # the check below with an empty value instead of killing
+            # the step on `pipefail` — the message there says which
+            # binary it was.
+            needed=$(objdump -T "$binary" \
+              | grep -o 'GLIBC_[0-9][0-9.]*' \
+              | sort -V \
+              | tail -1 \
+              | sed 's/^GLIBC_//' || true)
+            if [ -z "$needed" ]; then
+              echo "::error::could not read a GLIBC symbol version out of $binary"
+              exit 1
+            fi
+            echo "$binary needs glibc $needed"
+            floor=$(printf '%s\n%s\n' "$floor" "$needed" | sort -V | tail -1)
+          done
+          base=$(docker run --rm "$BASE_IMAGE" getconf GNU_LIBC_VERSION | awk '{print $2}')
+          echo "$BASE_IMAGE ships glibc $base"
+          # The base image has to be at least as new as the floor.
+          # `sort -V` orders the two versions; the base is too old
+          # when the *floor* is the newer of the two.
+          if [ "$floor" != "$base" ] \
+             && [ "$(printf '%s\n%s\n' "$floor" "$base" | sort -V | tail -1)" = "$floor" ]; then
+            echo "::error::$BASE_IMAGE ships glibc $base, but the binaries need glibc $floor — the images would not start"
+            exit 1
+          fi
+
+      - name: Build and push the images by digest
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          for image in pangolin-ngx pangolin-tun; do
+            case "$image" in
+              pangolin-ngx) target=ngx ;;
+              pangolin-tun) target=tun ;;
+            esac
+            repo="$REGISTRY/$IMAGE_OWNER/$image"
+            metadata="$PWD/metadata-$image.json"
+            # `push-by-digest=true` pushes the image without a tag:
+            # the tag is created by the manifest job, so a single
+            # architecture never occupies `v<version>`.
+            #
+            # `--provenance=false` keeps the pushed object a plain
+            # image manifest.  With the provenance attestation on, the
+            # digest names an *index* — the manifest plus the
+            # attestation — and the manifest list the next job builds
+            # would carry an `unknown/unknown` entry per
+            # architecture.  The commit the image was built from is
+            # named by its OCI label anyway.
+            docker buildx build \
+              --file packaging/container/runtime.dockerfile \
+              --target "$target" \
+              --platform "${{ matrix.target }}" \
+              --provenance=false \
+              --build-arg "IMAGE_VERSION=$RELEASE_VERSION" \
+              --build-arg "IMAGE_REVISION=$REVISION" \
+              --output "type=image,name=$repo,push-by-digest=true,push=true" \
+              --metadata-file "$metadata" \
+              container
+            digest=$(grep -o '"containerimage.digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]*"' "$metadata" \
+              | head -1 \
+              | grep -o 'sha256:[0-9a-f]*')
+            if [ -z "$digest" ]; then
+              echo "::error::could not read the digest of $repo out of $metadata"
+              exit 1
+            fi
+            echo "$digest" > "digests/$image"
+            echo "$repo@$digest"
+          done
+
+      - name: Assert the images carry the release binary
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for image in pangolin-ngx pangolin-tun; do
+            repo="$REGISTRY/$IMAGE_OWNER/$image"
+            digest=$(cat "digests/$image")
+            # The builder of the runner is a container driver, so the
+            # image it pushed is not in the daemon's image store: it
+            # has to be pulled before it can be run.
+            docker pull "$repo@$digest"
+            # The image ships a binary, not a toolchain: a compiler in
+            # the image would mean the image was built from source
+            # instead of assembled from the release artifact.
+            tooling=$(docker run --rm --entrypoint sh "$repo@$digest" \
+              -c 'command -v cargo; command -v rustc' || true)
+            if [ -n "$tooling" ]; then
+              echo "::error::the $image image ships '$tooling' — the image must carry the release binary, not a compiler"
+              exit 1
+            fi
+            # The digest pushed above has to be the one the release
+            # binary came from — that is what makes the image and the
+            # GitHub Release the same artefact.
+            version=$(docker run --rm "$repo@$digest" --version)
+            echo "$repo@$digest --version → $version"
+            if [[ "$version" != *"$RELEASE_VERSION"* ]]; then
+              echo "::error::$repo reports '$version', expected it to contain '$RELEASE_VERSION'"
+              exit 1
+            fi
+          done
+
+      - name: Upload the image digests
+        uses: actions/upload-artifact@v6
+        with:
+          name: pangolin-image-${{ matrix.slug }}
+          path: digests/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Docker-manifest: turn the per-architecture digests into tagged
+  # multi-architecture manifest lists
+  #
+  # The tags are created *here*, after every architecture has been
+  # pushed, so `v<version>` only ever names a complete image.  A
+  # failed architecture leaves the tag uncreated and `latest` on the
+  # last version that was pushed successfully.
+  #
+  # The job is deliberately *not* in the `release` job's `needs`: a
+  # registry that is down must not keep the operators from getting
+  # the binaries and the packages.
+  # ----------------------------------------------------------------
+  docker-manifest:
+    name: Publish the container image manifests
+    needs: [docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    # Two releases must not write the `latest` tag at the same time:
+    # the one that finishes last wins, and it may be the *older*
+    # version.  `cancel-in-progress: false` keeps a push that is
+    # already running from being cancelled — the same reasoning as the
+    # `deploy-repo` job's `pages-deploy` group.
+    concurrency:
+      group: ghcr-push
+      cancel-in-progress: false
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_OWNER: cnlangzi
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: docker/setup-buildx-action@v3
+
+      # One artifact per architecture, and they are *not* merged: both
+      # carry a file named after the image, and merging them would
+      # have the second architecture overwrite the first one's digest.
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: pangolin-image-*
+          path: digests
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the tags and the manifest lists
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for image in pangolin-ngx pangolin-tun; do
+            repo="$REGISTRY/$IMAGE_OWNER/$image"
+            sources=()
+            for slug in linux-amd64 linux-arm64; do
+              digest=$(cat "digests/pangolin-image-$slug/$image")
+              sources+=("$repo@$digest")
+            done
+            # The tag is the release tag, verbatim — the leading `v`
+            # stays, the same way it does in the tag, in the archive
+            # name and in `--version`.  `latest` points at the last
+            # version that was pushed successfully.
+            docker buildx imagetools create \
+              --tag "$repo:$RELEASE_VERSION" \
+              --tag "$repo:latest" \
+              "${sources[@]}"
+          done
+
+      - name: Assert the manifest lists carry both architectures
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for image in pangolin-ngx pangolin-tun; do
+            repo="$REGISTRY/$IMAGE_OWNER/$image"
+            for tag in "$RELEASE_VERSION" latest; do
+              inspect=$(docker buildx imagetools inspect "$repo:$tag")
+              echo "$inspect"
+              for platform in linux/amd64 linux/arm64; do
+                if ! grep -q "$platform" <<<"$inspect"; then
+                  echo "::error::$repo:$tag does not list $platform"
+                  exit 1
+                fi
+              done
+            done
+          done
+
+      - name: Make the packages public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # A GHCR package is private by default, so an anonymous
+          # `docker pull` of a freshly published image would be
+          # rejected.  The workflow tries to flip the packages to
+          # public and only *warns* when it cannot: a permission
+          # problem must not turn the whole release red, and the
+          # images are already pushed either way.
+          for image in pangolin-ngx pangolin-tun; do
+            found=""
+            visibility=""
+            for owner in orgs users; do
+              endpoint="https://api.github.com/$owner/$IMAGE_OWNER/packages/container/$image"
+              headers=(
+                -H "Authorization: Bearer $GH_TOKEN"
+                -H "Accept: application/vnd.github+json"
+                -H "X-GitHub-Api-Version: 2022-11-28"
+              )
+              current=$(curl -sS "${headers[@]}" "$endpoint" 2>/dev/null \
+                | tr -d '[:space:]' \
+                | grep -o '"visibility":"[a-z]*"' \
+                | head -1 \
+                | cut -d'"' -f4)
+              if [ -z "$current" ]; then
+                # The owner is not an organization, or the token
+                # cannot see the package: try the next endpoint.
+                continue
+              fi
+              found="$owner"
+              if [ "$current" != "public" ]; then
+                curl -sS -X PATCH "${headers[@]}" \
+                  -d '{"visibility":"public"}' "$endpoint" >/dev/null 2>&1 || true
+                current=$(curl -sS "${headers[@]}" "$endpoint" 2>/dev/null \
+                  | tr -d '[:space:]' \
+                  | grep -o '"visibility":"[a-z]*"' \
+                  | head -1 \
+                  | cut -d'"' -f4)
+              fi
+              visibility="$current"
+              break
+            done
+            if [ "$visibility" = "public" ]; then
+              echo "$image is public ($found)"
+            else
+              echo "::warning::the GHCR package $image is not public — flip it to Public in the package settings before you announce the release"
+            fi
+          done
+
+  # ----------------------------------------------------------------
   # Release: publish the archives + checksums to the GitHub Release
   # of the pushed tag. No tests run here — the operator tags a commit
   # whose CI run on `main` was already green.
@@ -1099,6 +1458,28 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
+          # The body names the container images, so the Release page is
+          # the one place that tells the operator every shape of the
+          # release.  `generate_release_notes` still adds the notes
+          # GitHub derives from the commits — GitHub puts the body in
+          # front of them.
+          body: |
+            ## Container images
+
+            Every release also publishes two multi-architecture images to GitHub
+            Container Registry. They carry the same binaries as the assets below.
+
+            * `ghcr.io/cnlangzi/pangolin-ngx:${{ github.ref_name }}` — the gateway
+              (`linux/amd64`, `linux/arm64`)
+            * `ghcr.io/cnlangzi/pangolin-tun:${{ github.ref_name }}` — the tunnel
+              node (`linux/amd64`, `linux/arm64`)
+
+            ```bash
+            docker pull ghcr.io/cnlangzi/pangolin-ngx:${{ github.ref_name }}
+            ```
+
+            The images are pushed in parallel with the release, so they can show
+            up a few minutes after the tag.
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
